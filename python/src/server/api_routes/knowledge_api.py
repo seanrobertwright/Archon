@@ -1347,3 +1347,348 @@ async def stop_crawl_task(progress_id: str):
             f"Failed to stop crawl task | error={str(e)} | progress_id={progress_id}"
         )
         raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+# =====================================================
+# FOLDER MANAGEMENT ENDPOINTS
+# =====================================================
+
+@router.get("/folders")
+async def list_folders(parent_id: str | None = None):
+    """
+    List folders, optionally filtered by parent.
+    
+    Query params:
+        parent_id: Parent folder UUID (omit for root folders)
+    
+    Returns:
+        List of folders with counts
+    """
+    try:
+        from uuid import UUID
+        from ..services.folder_service import FolderService
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        parent_uuid = UUID(parent_id) if parent_id else None
+        folders = await folder_service.list_folders(parent_id=parent_uuid, include_counts=True)
+        
+        return {
+            "folders": [folder.model_dump() for folder in folders],
+            "total": len(folders),
+        }
+    except Exception as e:
+        safe_logfire_error(f"Failed to list folders: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.get("/folders/tree")
+async def get_folder_tree():
+    """
+    Get complete folder hierarchy as a tree structure.
+    
+    Returns:
+        Tree of folders with nested children
+    """
+    try:
+        from ..services.folder_service import FolderService
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        tree = await folder_service.get_folder_tree()
+        
+        return {
+            "tree": [node.model_dump() for node in tree],
+            "total_folders": len(tree),
+        }
+    except Exception as e:
+        safe_logfire_error(f"Failed to get folder tree: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.get("/folders/{folder_id}")
+async def get_folder(folder_id: str):
+    """
+    Get a specific folder by ID.
+    
+    Args:
+        folder_id: Folder UUID
+    
+    Returns:
+        Folder details with counts
+    """
+    try:
+        from uuid import UUID
+        from ..services.folder_service import FolderService
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        folder = await folder_service.get_folder_by_id(UUID(folder_id))
+        
+        if not folder:
+            raise HTTPException(status_code=404, detail={"error": "Folder not found"})
+        
+        return folder.model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        safe_logfire_error(f"Failed to get folder {folder_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.get("/folders/{folder_id}/contents")
+async def get_folder_contents(
+    folder_id: str,
+    include_sources: bool = True,
+    include_subfolders: bool = True,
+):
+    """
+    Get folder with its immediate contents (non-recursive).
+    
+    Args:
+        folder_id: Folder UUID
+        include_sources: Whether to include sources in response
+        include_subfolders: Whether to include subfolders in response
+    
+    Returns:
+        Folder with contents and breadcrumb path
+    """
+    try:
+        from uuid import UUID
+        from ..services.folder_service import FolderService
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        contents = await folder_service.get_folder_contents(
+            UUID(folder_id),
+            include_sources=include_sources,
+            include_subfolders=include_subfolders,
+        )
+        
+        return contents.model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        safe_logfire_error(f"Failed to get folder contents for {folder_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.post("/folders")
+async def create_folder(folder_data: dict):
+    """
+    Create a new folder.
+    
+    Request body:
+        name: Folder name (required)
+        description: Optional description
+        parent_id: Parent folder UUID (null for root)
+        color: Optional hex color (e.g., #00ff41)
+        icon: Optional icon identifier
+        position: Sort order (default: 0)
+        metadata: Optional metadata dict
+    
+    Returns:
+        Created folder with ID
+    """
+    try:
+        from ..models.folder_models import FolderCreate
+        from ..services.folder_service import FolderService
+        
+        # Validate and parse request
+        folder_create = FolderCreate(**folder_data)
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        folder = await folder_service.create_folder(folder_create)
+        
+        return {
+            "success": True,
+            "message": "Folder created successfully",
+            "folder": folder.model_dump(),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": str(e)})
+    except Exception as e:
+        safe_logfire_error(f"Failed to create folder: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.put("/folders/{folder_id}")
+async def update_folder(folder_id: str, updates: dict):
+    """
+    Update a folder's properties.
+    
+    Args:
+        folder_id: Folder UUID
+        updates: Fields to update (name, description, color, icon, position, parent_id, metadata)
+    
+    Returns:
+        Updated folder
+    """
+    try:
+        from uuid import UUID
+        from ..models.folder_models import FolderUpdate
+        from ..services.folder_service import FolderService
+        
+        # Validate and parse request
+        folder_update = FolderUpdate(**updates)
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        folder = await folder_service.update_folder(UUID(folder_id), folder_update)
+        
+        return {
+            "success": True,
+            "message": "Folder updated successfully",
+            "folder": folder.model_dump(),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": str(e)})
+    except Exception as e:
+        safe_logfire_error(f"Failed to update folder {folder_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.delete("/folders/{folder_id}")
+async def delete_folder(
+    folder_id: str,
+    move_contents_to_parent: bool = True,
+):
+    """
+    Delete a folder.
+    
+    Args:
+        folder_id: Folder UUID to delete
+        move_contents_to_parent: If true, move contents to parent. If false, delete recursively.
+    
+    Returns:
+        Success status
+    """
+    try:
+        from uuid import UUID
+        from ..services.folder_service import FolderService
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        result = await folder_service.delete_folder(
+            UUID(folder_id),
+            move_contents_to_parent=move_contents_to_parent,
+        )
+        
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail={"error": str(e)})
+    except Exception as e:
+        safe_logfire_error(f"Failed to delete folder {folder_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.post("/folders/{folder_id}/move")
+async def move_folder(folder_id: str, new_parent_id: str | None = None):
+    """
+    Move a folder to a new parent.
+    
+    Args:
+        folder_id: Folder UUID to move
+        new_parent_id: New parent UUID (null for root)
+    
+    Returns:
+        Updated folder
+    """
+    try:
+        from uuid import UUID
+        from ..models.folder_models import FolderUpdate
+        from ..services.folder_service import FolderService
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        parent_uuid = UUID(new_parent_id) if new_parent_id else None
+        updates = FolderUpdate(parent_id=parent_uuid)
+        
+        folder = await folder_service.update_folder(UUID(folder_id), updates)
+        
+        return {
+            "success": True,
+            "message": "Folder moved successfully",
+            "folder": folder.model_dump(),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": str(e)})
+    except Exception as e:
+        safe_logfire_error(f"Failed to move folder {folder_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.post("/sources/{source_id}/move")
+async def move_source_to_folder(source_id: str, folder_id: str | None = None):
+    """
+    Move a source to a folder.
+    
+    Args:
+        source_id: Source ID to move
+        folder_id: Target folder UUID (null for root)
+    
+    Returns:
+        Success status
+    """
+    try:
+        from uuid import UUID
+        from ..services.folder_service import FolderService
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        folder_uuid = UUID(folder_id) if folder_id else None
+        result = await folder_service.move_source_to_folder(source_id, folder_uuid)
+        
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail={"error": str(e)})
+    except Exception as e:
+        safe_logfire_error(f"Failed to move source {source_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@router.post("/sources/batch-move")
+async def batch_move_sources(request: dict):
+    """
+    Move multiple sources to a folder in a single operation.
+    
+    Request body:
+        source_ids: List of source IDs to move
+        folder_id: Target folder UUID (null for root)
+    
+    Returns:
+        Success status with count
+    """
+    try:
+        from uuid import UUID
+        from ..models.folder_models import BatchMoveSourcesRequest
+        from ..services.folder_service import FolderService
+        
+        # Validate request
+        batch_request = BatchMoveSourcesRequest(**request)
+        
+        supabase = get_supabase_client()
+        folder_service = FolderService(supabase)
+        
+        folder_uuid = batch_request.folder_id
+        result = await folder_service.batch_move_sources(
+            batch_request.source_ids,
+            folder_uuid,
+        )
+        
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": str(e)})
+    except Exception as e:
+        safe_logfire_error(f"Failed to batch move sources: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": str(e)})

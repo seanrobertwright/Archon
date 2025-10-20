@@ -4,3 +4,6 @@ export * from "./KnowledgeList";
 export * from "./KnowledgeTypeSelector";
 export * from "./LevelSelector";
 export * from "./TagInput";
+export * from "./FolderTree";
+export * from "./FolderBreadcrumb";
+export * from "./CreateFolderDialog";
