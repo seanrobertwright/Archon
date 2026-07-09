@@ -46,11 +46,14 @@ export function builderToFlowEdges(bw: BuilderWorkflow): BuilderFlowEdge[] {
   return edges;
 }
 
-/** Map a `BuilderWorkflow` (+ saved positions) to xyflow nodes and edges. */
+/** Map a `BuilderWorkflow` (+ saved positions) to xyflow nodes and edges. `ghosts`, when
+ *  supplied, tags each matching node's data so `BuilderNodeView` can render the Builder
+ *  Copilot's Proposal overlay (add/changed/remove) without a separate render path. */
 export function builderToFlow(
   bw: BuilderWorkflow,
   positions?: ReadonlyMap<string, XYPosition>,
-  selectedNodeIds: ReadonlySet<string> = new Set()
+  selectedNodeIds: ReadonlySet<string> = new Set(),
+  ghosts?: ReadonlyMap<string, 'add' | 'changed' | 'remove'>
 ): { nodes: BuilderFlowNode[]; edges: BuilderFlowEdge[] } {
   const edges = builderToFlowEdges(bw);
 
@@ -87,7 +90,7 @@ export function builderToFlow(
       // the node's real rendered height on the canvas.
       initialWidth: NODE_WIDTH,
       initialHeight: NODE_HEIGHT,
-      data: { node, label: VARIANT_REGISTRY[node.variant].label },
+      data: { node, label: VARIANT_REGISTRY[node.variant].label, ghost: ghosts?.get(node.id) },
     };
   });
 

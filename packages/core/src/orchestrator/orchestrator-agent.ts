@@ -27,6 +27,7 @@ import { toError } from '../utils/error';
 import { safeDeactivateSession } from '../state/session-transitions';
 import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
 import { buildManageRunTool } from './manage-run-tool';
+import { buildProposeWorkflowEditsTool } from './propose-workflow-edits-tool';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
 import {
@@ -68,6 +69,7 @@ import { IsolationBlockedError } from '@archon/isolation';
 import {
   buildOrchestratorSystemAppend,
   buildRunManagementSection,
+  buildBuilderCopilotSection,
   formatWorkflowContextSection,
 } from './prompt-builder';
 import type { WorkflowResultContext } from './prompt-builder';
@@ -1143,7 +1145,8 @@ function buildFullPrompt(
   issueContext: string | undefined,
   threadContext: string | undefined,
   attachedFiles?: AttachedFile[],
-  workflowContext?: string
+  workflowContext?: string,
+  canvasState?: string
 ): string {
   const contextSuffix = issueContext ? '\n\n---\n\n## Additional Context\n\n' + issueContext : '';
 
@@ -1157,11 +1160,21 @@ function buildFullPrompt(
 
   const workflowContextSuffix = workflowContext ? '\n\n---\n\n' + workflowContext : '';
 
+  // The builder Copilot's live (possibly-unsaved) canvas state — resent every
+  // turn since the author can edit the canvas between messages. Fenced as JSON
+  // so the agent can read it without confusing it for a workflow to invoke.
+  const canvasStateSuffix = canvasState
+    ? '\n\n---\n\n## Current Canvas State (live, possibly unsaved)\n\n```json\n' +
+      canvasState +
+      '\n```'
+    : '';
+
   if (threadContext) {
     return (
       '## Thread Context (previous messages)\n\n' +
       threadContext +
       workflowContextSuffix +
+      canvasStateSuffix +
       '\n\n---\n\n## Current Request\n\n' +
       message +
       contextSuffix +
@@ -1170,7 +1183,12 @@ function buildFullPrompt(
   }
 
   return (
-    workflowContextSuffix + '\n\n---\n\n## User Message\n\n' + message + contextSuffix + fileSuffix
+    workflowContextSuffix +
+    canvasStateSuffix +
+    '\n\n---\n\n## User Message\n\n' +
+    message +
+    contextSuffix +
+    fileSuffix
   );
 }
 
@@ -1195,6 +1213,8 @@ export async function handleMessage(
     isolationHints,
     attachedFiles,
     userId,
+    builderMode,
+    canvasState,
   } = context ?? {};
   try {
     getLog().debug({ conversationId, userId }, 'orchestrator_message_received');
@@ -1504,7 +1524,8 @@ export async function handleMessage(
       issueContext,
       threadContext,
       attachedFiles,
-      workflowContext
+      workflowContext,
+      builderMode ? canvasState : undefined
     );
     const scopedCodebase =
       conversation.codebase_id !== null
@@ -1674,6 +1695,13 @@ export async function handleMessage(
     if (scopedCaps !== null && !scopedCaps.nativeTools) {
       systemAppend += `\n\n${buildRunManagementSection()}`;
     }
+    // Builder Copilot steering (propose-not-do): only when the tool is actually
+    // being injected below (builder-mode + nativeTools-capable provider) — on a
+    // non-nativeTools provider the tool isn't offered, so this section would
+    // describe a capability the agent doesn't have.
+    if (builderMode === true && scopedCaps?.nativeTools === true) {
+      systemAppend += `\n\n${buildBuilderCopilotSection()}`;
+    }
     const systemPrompt =
       providerKey === 'claude'
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemAppend }
@@ -1768,6 +1796,14 @@ export async function handleMessage(
           },
         }),
       ];
+      // Builder Copilot: a SEPARATE, narrower gate on top of the project-scoped +
+      // nativeTools condition above — only conversations the web message route
+      // flagged `builderMode: true` (the console builder's Copilot panel) get
+      // this tool. Ordinary project chats, Slack, Telegram, GitHub, and CLI
+      // never see it. Appended, not replacing manage_run — both are available.
+      if (builderMode === true) {
+        requestOptions.nativeTools.push(buildProposeWorkflowEditsTool());
+      }
     }
 
     const mode = platform.getStreamingMode();

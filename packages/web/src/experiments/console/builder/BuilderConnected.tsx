@@ -25,6 +25,9 @@ import {
 } from 'react';
 import { useNavigate, useParams, useLocation, useSearchParams } from 'react-router';
 import { BuilderPage } from './BuilderPage';
+import { CopilotPanel } from './copilot/CopilotPanel';
+import type { ProposalPreview as ProposalPreviewData } from './copilot/preview-diff';
+import type { EditorAction } from './editor/state';
 import { fromWorkflowDefinition, toWorkflowDefinition } from './model';
 import { runValidation } from './validation';
 import { makeIssue } from './validation/make-issue';
@@ -202,6 +205,21 @@ export function BuilderConnected(): ReactElement {
   const handleChange = useCallback((bw: BuilderWorkflow): void => {
     setCurrentWorkflow(bw);
     setDirty(true);
+  }, []);
+
+  // Builder Copilot: the preview overlay and apply-batch trigger fed into
+  // `BuilderPage` (Pre-flight #5). Owned here (not inside `BuilderPage`) so a
+  // Proposal survives the panel re-rendering and both sit as siblings.
+  const [copilotPreview, setCopilotPreview] = useState<ProposalPreviewData | null>(null);
+  const applyBatchNonceRef = useRef(0);
+  const [applyBatch, setApplyBatch] = useState<{
+    actions: readonly EditorAction[];
+    nonce: number;
+  } | null>(null);
+  const handleCopilotAccept = useCallback((actions: readonly EditorAction[]): void => {
+    applyBatchNonceRef.current += 1;
+    setApplyBatch({ actions, nonce: applyBatchNonceRef.current });
+    setCopilotPreview(null);
   }, []);
 
   const extraIssues = useMemo(
@@ -591,12 +609,24 @@ export function BuilderConnected(): ReactElement {
             </EmptyState>
           )
         ) : imported !== null && currentWorkflow !== null ? (
-          <BuilderPage
-            key={editorKey}
-            initialWorkflow={imported.workflow}
-            onChange={handleChange}
-            extraIssues={extraIssues}
-          />
+          <div className="flex h-full min-h-0">
+            <div className="min-w-0 flex-1">
+              <BuilderPage
+                key={editorKey}
+                initialWorkflow={imported.workflow}
+                onChange={handleChange}
+                extraIssues={extraIssues}
+                preview={copilotPreview}
+                applyBatch={applyBatch}
+              />
+            </div>
+            <CopilotPanel
+              projectId={projectId}
+              currentWorkflow={currentWorkflow}
+              onPreviewChange={setCopilotPreview}
+              onAccept={handleCopilotAccept}
+            />
+          </div>
         ) : (
           <EmptyState>Loading workflow…</EmptyState>
         )}
