@@ -267,7 +267,35 @@ describe('GitHubAdapter', () => {
     let originalAllowedUsers: string | undefined;
 
     /**
+     * 401 "Bad credentials" — exactly what api.github.com returns for the fake
+     * token these tests construct the adapter with. Reproducing it locally keeps
+     * the exercised code path byte-identical to the live one (PAT mode rethrows
+     * 401 immediately; only App mode retries — see withTokenRefresh).
+     */
+    function badCredentials(): Error {
+      return Object.assign(new Error('Bad credentials'), { status: 401 });
+    }
+
+    /**
      * Creates an adapter with mocked signature verification for self-filtering tests.
+     *
+     * The private Octokit client is stubbed. Without it, every payload that
+     * survives self-filtering runs handleWebhook() into step 7 (`repos.get`) and
+     * its error path (`postComment`), issuing two REAL requests to
+     * api.github.com per test. That made these unit tests depend on an external
+     * service inside Bun's 5000 ms per-test budget, which is the root cause of
+     * the intermittent timeouts in #2186. See also the sibling
+     * `webhook delivery dedup` block, which has always stubbed its client.
+     *
+     * COUPLING — why these tests can safely `await handleWebhook` unwrapped:
+     * handleWebhook has no top-level try/catch and its containment is per-step
+     * and partial (step 6b throws deliberately). Nothing throws here only
+     * because the stubbed 401 lands in step 7's catch, which sends the error
+     * message and RETURNS (adapter.ts:1094-1107), so steps 8-10 —
+     * `ensureRepoReady`, `getLinkedIssueNumbers`, `pulls.get`, `handleMessage`,
+     * all unmocked — are never reached. Make `repos.get` RESOLVE instead of
+     * reject and all these tests fall through into that unmocked territory at
+     * once. If you need that, stub steps 8-10 too (see `createDedupAdapter`).
      */
     function createSelfFilterAdapter(botMention = 'archon'): GitHubAdapter {
       const adapter = new GitHubAdapter(
@@ -278,6 +306,17 @@ describe('GitHubAdapter', () => {
       );
       // @ts-expect-error - accessing private method for testing
       adapter.verifySignature = mock(() => true);
+      // @ts-expect-error - replacing private Octokit client for testing
+      adapter.octokit = {
+        rest: {
+          repos: {
+            get: mock(() => Promise.reject(badCredentials())),
+          },
+          issues: {
+            createComment: mock(() => Promise.reject(badCredentials())),
+          },
+        },
+      };
       return adapter;
     }
 
@@ -332,11 +371,7 @@ describe('GitHubAdapter', () => {
       const payload = createCommentPayload('@archon help', undefined); // no comment.user
       // sender.login defaults to 'user123' in createCommentPayload when commentAuthor is undefined.
 
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected — Octokit not mocked for the message path.
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       // Identity resolution must run, and must have used sender.login.
       const calls = mockFindOrCreateUserByPlatformIdentity.mock.calls;
@@ -369,11 +404,7 @@ describe('GitHubAdapter', () => {
         sender: { login: 'pr-author' },
       });
 
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected — Octokit not mocked.
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       const calls = mockFindOrCreateUserByPlatformIdentity.mock.calls;
       expect(calls.length).toBeGreaterThan(0);
@@ -386,11 +417,9 @@ describe('GitHubAdapter', () => {
       mockFindOrCreateUserByPlatformIdentity.mockRejectedValueOnce(new Error('db down'));
       const payload = createCommentPayload('@archon help', 'user123');
 
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Octokit not mocked downstream — that's fine.
-      }
+      // Deliberately NOT wrapped in try/catch: "never throws" is the assertion.
+      await adapter.handleWebhook(payload, 'mock-signature');
+
       // The user-resolution failure was caught and warn-logged; the webhook
       // handler proceeded past it (DB write for the conversation still happened).
       expect(mockGetOrCreateConversation).toHaveBeenCalled();
@@ -421,11 +450,7 @@ describe('GitHubAdapter', () => {
       const payload = createCommentPayload('@archon please help', 'user123');
 
       // handleWebhook progresses past self-filtering into DB/Octokit operations
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected - Octokit API not mocked for this test
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       // Real user comments proceed to conversation creation (not self-filtered)
       expect(mockGetOrCreateConversation).toHaveBeenCalled();
@@ -451,11 +476,7 @@ describe('GitHubAdapter', () => {
       const payload = createCommentPayload('@archon fix this', 'Wirasm');
 
       // handleWebhook progresses past self-filtering into DB/Octokit operations
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected - Octokit API not mocked for this test
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       // Comment without marker proceeds to conversation creation (not self-filtered)
       expect(mockGetOrCreateConversation).toHaveBeenCalled();
@@ -466,11 +487,7 @@ describe('GitHubAdapter', () => {
       const payload = createCommentPayload('@archon help', undefined); // No user field
 
       // Should not crash on undefined user
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected - Octokit API not mocked for this test
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       // Missing user should not trigger self-filtering (proceeds to conversation creation)
       expect(mockGetOrCreateConversation).toHaveBeenCalled();
