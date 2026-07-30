@@ -21,6 +21,7 @@ import type {
   NodeConfig,
   ProviderCapabilities,
   TokenUsage,
+  ResolvedModel,
   ExecutionContext,
   OverlayChangeSummary,
 } from '@archon/providers/types';
@@ -1385,7 +1386,7 @@ async function executeNodeInternal(
   let nodeCostUsd: number | undefined;
   let nodeStopReason: string | undefined;
   let nodeNumTurns: number | undefined;
-  let nodeModelUsage: Record<string, unknown> | undefined;
+  let nodeResolvedModel: ResolvedModel | undefined;
   const batchMessages: string[] = [];
 
   // Create per-node abort controller for idle timeout cleanup
@@ -1644,7 +1645,12 @@ async function executeNodeInternal(
         if (msg.cost !== undefined) nodeCostUsd = msg.cost;
         if (msg.stopReason !== undefined) nodeStopReason = msg.stopReason;
         if (msg.numTurns !== undefined) nodeNumTurns = msg.numTurns;
-        if (msg.modelUsage) nodeModelUsage = msg.modelUsage;
+        // Assigned UNCONDITIONALLY. A guarded assignment cannot CLEAR a stale value:
+        // Pi/Copilot reask loops yield several result chunks, and Pi omits resolvedModel
+        // when its later assistant message has no responseModel — so an earlier attempt's
+        // model would be persisted as the final attempt's answer. Fabricated attribution
+        // is the exact defect #2314 exists to prevent; absence must stay absence.
+        nodeResolvedModel = msg.resolvedModel;
         if (msg.structuredOutput !== undefined) structuredOutput = msg.structuredOutput;
         // Fail the node if the SDK reports a cost cap exceeded error
         if (msg.isError && msg.errorSubtype === 'error_max_budget_usd') {
@@ -2247,7 +2253,9 @@ async function executeNodeInternal(
           ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
-          ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
+          ...(nodeResolvedModel
+            ? { model_usage: { requested: resolvedModel, resolved: nodeResolvedModel.id } }
+            : {}),
           // Background Agent tasks still live when the stream ended (#2083) —
           // this node's artifacts may be incomplete.
           ...(backgroundTasksIncomplete.length > 0
@@ -3755,7 +3763,9 @@ async function executeLoopNode(
   issueContext?: string,
   configuredCommandFolder?: string,
   stepNamePrefix = '',
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  resolvedModel?: string,
+  resolvedTier?: TierName
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3782,7 +3792,16 @@ async function executeLoopNode(
       workflow_run_id: workflowRun.id,
       event_type: 'node_started',
       step_name: stepName,
-      data: { type: 'loop', command: loop.command ?? null },
+      data: {
+        type: 'loop',
+        command: loop.command ?? null,
+        // Requested-model attribution, same fields the AI-node path records
+        // (#2314) — every iteration runs on this one resolved provider/model,
+        // so it belongs on the node's single _started row.
+        provider: workflowProvider,
+        model: resolvedModel,
+        tier: resolvedTier,
+      },
     })
     .catch((err: Error) => {
       getLog().error(
@@ -3796,6 +3815,9 @@ async function executeLoopNode(
     runId: workflowRun.id,
     nodeId: node.id,
     nodeName: node.id,
+    provider: workflowProvider,
+    model: resolvedModel,
+    tier: resolvedTier,
   });
 
   /**
@@ -3941,6 +3963,10 @@ async function executeLoopNode(
   let loopFinalStopReason: string | undefined;
   let loopTotalNumTurns: number | undefined;
   let loopTotalTokens: TokenUsage | undefined;
+  // Concrete model the provider resolved to (#2314). Last-seen wins, like
+  // loopFinalStopReason: every iteration runs on the same resolved provider and
+  // model, so the final iteration's report is the node's report.
+  let loopResolvedModel: ResolvedModel | undefined;
   // Union of task ids still live when ANY iteration's stream ended abnormally
   // (idle timeout / subprocess death) — #2083. Union rather than last-iteration:
   // a mid-loop iteration that lost its background tasks may have produced
@@ -4185,6 +4211,10 @@ async function executeLoopNode(
           if (msg.numTurns !== undefined) {
             iterationNumTurns = msg.numTurns;
           }
+          // Unconditional, for the same reason as the AI-node path above: a later
+          // iteration or result chunk that reports no resolved model must clear the
+          // previous one rather than leave it to be recorded as this node's answer.
+          loopResolvedModel = msg.resolvedModel;
           if (msg.structuredOutput !== undefined) {
             lastIterationStructuredOutput = msg.structuredOutput;
           }
@@ -4623,6 +4653,12 @@ async function executeLoopNode(
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
             ...(loopFinalStopReason ? { stop_reason: loopFinalStopReason } : {}),
             ...(loopTotalNumTurns !== undefined ? { num_turns: loopTotalNumTurns } : {}),
+            // Requested alias vs the model the provider actually ran (#2314) —
+            // mirrors the AI-node path. Omitted entirely when the provider
+            // reports no resolved model (e.g. Codex), never faked.
+            ...(loopResolvedModel
+              ? { model_usage: { requested: resolvedModel, resolved: loopResolvedModel.id } }
+              : {}),
             // Background Agent tasks still live when any iteration's stream
             // ended (#2083) — this node's artifacts may be incomplete, even
             // though a later iteration signaled completion.
@@ -5678,21 +5714,25 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
 
           // 3b. Loop node dispatch — manages its own AI sessions and iteration
           if (isLoopNode(node)) {
-            const { provider: loopProvider, options: loopOptions } =
-              await resolveNodeProviderAndModel(
-                node,
-                workflowProvider,
-                workflowModel,
-                config,
-                platform,
-                conversationId,
-                workflowRun.id,
-                cwd,
-                workflowLevelOptions,
-                aiProfile,
-                workflowPreset,
-                execContext
-              );
+            const {
+              provider: loopProvider,
+              options: loopOptions,
+              model: resolvedLoopModel,
+              tier: resolvedLoopTier,
+            } = await resolveNodeProviderAndModel(
+              node,
+              workflowProvider,
+              workflowModel,
+              config,
+              platform,
+              conversationId,
+              workflowRun.id,
+              cwd,
+              workflowLevelOptions,
+              aiProfile,
+              workflowPreset,
+              execContext
+            );
 
             const output = await executeLoopNode(
               deps,
@@ -5712,7 +5752,9 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               issueContext,
               configuredCommandFolder,
               stepNamePrefix,
-              execContext
+              execContext,
+              resolvedLoopModel,
+              resolvedLoopTier
             );
             // Loop nodes run every iteration on the same resolved provider, so the
             // result session (if any) is attributable to loopProvider — tag it so a
