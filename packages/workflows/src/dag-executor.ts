@@ -1641,7 +1641,24 @@ async function executeNodeInternal(
         }
         if (msg.sessionId) newSessionId = msg.sessionId;
         if (msg.resumed !== undefined) nodeResumed = msg.resumed;
-        if (msg.tokens) nodeTokens = msg.tokens;
+        if (msg.tokens !== undefined) {
+          // Normalized to `{input, output}` — the ONLY two fields every provider
+          // reports the same way, and therefore the only shape a consumer can read
+          // without knowing which provider produced the row. `total` is
+          // provider-defined and is NOT input + output (Pi folds cacheRead/cacheWrite
+          // into it, OpenCode sums its own per-agent totals); `cost` duplicates the
+          // separately-persisted `cost_usd`. Same NaN guard rationale as the
+          // DAG-level accumulator: a non-finite value must be dropped loudly, not
+          // persisted as a wrong number that gets believed.
+          if (Number.isFinite(msg.tokens.input) && Number.isFinite(msg.tokens.output)) {
+            nodeTokens = { input: msg.tokens.input, output: msg.tokens.output };
+          } else {
+            getLog().warn(
+              { nodeId: node.id, tokens: msg.tokens },
+              'dag_node.usage_tokens_non_finite_ignored'
+            );
+          }
+        }
         if (msg.cost !== undefined) nodeCostUsd = msg.cost;
         if (msg.stopReason !== undefined) nodeStopReason = msg.stopReason;
         if (msg.numTurns !== undefined) nodeNumTurns = msg.numTurns;
@@ -2250,6 +2267,7 @@ async function executeNodeInternal(
         data: {
           duration_ms: duration,
           node_output: nodeOutputText,
+          ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
           ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
@@ -3010,12 +3028,39 @@ function buildHonestGateMessage(
 }
 
 /**
+ * Narrow the token usage a loop gate persisted in its approval context (#2333).
+ *
+ * `metadata.approval` is free-form JSON read back from the DB and `isApprovalContext`
+ * only vouches for nodeId/message, so the declared type carries no runtime authority
+ * here: a run paused by a build that predates the field has none, and a malformed or
+ * non-finite value must be dropped rather than persisted onward as a number a
+ * consumer would believe.
+ */
+function readSignaledTokens(raw: unknown): TokenUsage | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const { input, output } = raw as { input?: unknown; output?: unknown };
+  if (typeof input !== 'number' || typeof output !== 'number') return undefined;
+  if (!Number.isFinite(input) || !Number.isFinite(output)) return undefined;
+  return { input, output };
+}
+
+/**
  * Finalize-on-approve (#2074), shared by executeLoopNode and executeLoopGroupNode:
  * a gate that paused on a signal-bearing iteration, resumed WITHOUT feedback,
  * completes the node from the persisted `signaledOutput` instead of re-running
  * the (expensive) iteration. Sends the user notice and writes/emits the
  * node_completed pair; the caller builds its own return value (the single-node
  * loop also threads the restored sessionId).
+ *
+ * `finalizeTokens` is the usage the pausing invocation actually consumed, carried
+ * across the gate in the approval context (#2333) — without it this path persists a
+ * node_completed reporting no usage for iterations that really ran. Passed by the
+ * single-node loop ONLY: its per-iteration rows carry no tokens, so this row is the
+ * only record. A loop_group omits it — its body nodes persisted their own namespaced
+ * rows (with tokens) before the pause, and those rows survive it, so repeating the
+ * total here would double-count in the one event stream. `cost_usd` and the resolved
+ * model are lost across the same gate; both are part of the single "preserve terminal
+ * provider stats across a gate" fix in #2345.
  */
 async function finalizeLoopFromSignal(
   deps: WorkflowDeps,
@@ -3025,7 +3070,8 @@ async function finalizeLoopFromSignal(
   nodeId: string,
   stepName: string,
   nodeLabel: string,
-  finalizeOutput: string
+  finalizeOutput: string,
+  finalizeTokens?: TokenUsage
 ): Promise<void> {
   // Impossible by construction today (the gate writes signaledOutput whenever
   // completionSignaled is true) — this warn guards a future decoupling so a
@@ -3047,7 +3093,11 @@ async function finalizeLoopFromSignal(
       workflow_run_id: workflowRun.id,
       event_type: 'node_completed',
       step_name: stepName,
-      data: { duration_ms: 0, node_output: finalizeOutput },
+      data: {
+        duration_ms: 0,
+        node_output: finalizeOutput,
+        ...(finalizeTokens !== undefined ? { tokens: finalizeTokens } : {}),
+      },
     })
     .catch((err: Error) => {
       getLog().error(
@@ -3158,6 +3208,14 @@ async function executeLoopGroupNode(
       stepName,
       'Loop-group node',
       finalizeOutput
+      // NO finalizeTokens, deliberately — same double-count reasoning as the
+      // natural-completion group row below. A loop_group's body nodes wrote their own
+      // `<groupId>.<nodeId>` node_completed rows (with tokens) BEFORE the gate paused,
+      // and those rows survive the pause: they are already in the event stream this
+      // finalize row is appended to. Reporting the group total here would make a
+      // consumer summing `data.tokens` count the pausing iteration twice. The plain
+      // `loop` DOES pass it — its per-iteration rows carry no tokens, so its finalize
+      // row is the only record of the usage.
     );
     return { state: 'completed', output: finalizeOutput };
   }
@@ -3505,6 +3563,21 @@ async function executeLoopGroupNode(
           data: {
             duration_ms: duration,
             node_output: lastIterationOutput,
+            // NO `tokens` here, deliberately. Unlike every other node type, a
+            // loop_group's body nodes write their OWN node_completed rows (namespaced
+            // `<groupId>.<nodeId>`, one per iteration) and those already carry the
+            // tokens. Persisting the group total under the SAME field name would make
+            // a consumer summing `data.tokens` across node_completed rows count this
+            // group's usage twice with nothing in the row to mark it as an aggregate.
+            // The leaves are authoritative: they are per-provider (a body node may
+            // override `provider:`, so the group total can mix providers and is
+            // useless for the cross-provider comparison #2333 exists to enable), and
+            // the group total is recoverable by summing the `<groupId>.` prefix.
+            // The RETURN value below still carries `tokens` — that is the run-level
+            // roll-up path, which counts each group exactly once (body results land in
+            // the scoped iteration ctx, never the run ctx).
+            // NOTE: `cost_usd` has this same double-count shape and predates #2333;
+            // it is left as-is rather than silently changed under a token fix.
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
           },
         })
@@ -3588,6 +3661,10 @@ async function executeLoopGroupNode(
         // for honesty; pauseWorkflowRun nulls both on every fresh pause.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        // NO `signaledTokens` — a loop_group gate has no consumer for it. The body's
+        // own `<groupId>.<nodeId>` rows already persisted this iteration's usage before
+        // the pause, so the finalize path deliberately writes no `tokens` (see the
+        // finalizeLoopFromSignal call above). Only the plain `loop` gate carries it.
       });
       return {
         state: 'completed',
@@ -3897,7 +3974,8 @@ async function executeLoopNode(
       node.id,
       stepName,
       'Loop node',
-      finalizeOutput
+      finalizeOutput,
+      readSignaledTokens(loopGateMeta.signaledTokens)
     );
     return { state: 'completed', output: finalizeOutput, sessionId: currentSessionId };
   }
@@ -4650,6 +4728,7 @@ async function executeLoopNode(
           data: {
             duration_ms: Date.now() - iterationStart,
             node_output: lastIterationOutput,
+            ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
             ...(loopFinalStopReason ? { stop_reason: loopFinalStopReason } : {}),
             ...(loopTotalNumTurns !== undefined ? { num_turns: loopTotalNumTurns } : {}),
@@ -4757,6 +4836,9 @@ async function executeLoopNode(
         // for honesty; pauseWorkflowRun nulls both on every fresh pause.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        // Usage consumed up to this gate, so a bare approve (finalize, no re-run)
+        // can persist it on node_completed instead of reporting nothing (#2333).
+        signaledTokens: completionDetected ? (loopTotalTokens ?? null) : null,
         // Read-once command body for command-backed loops: the resumed invocation
         // reuses this snapshot instead of re-reading the file (explicit null for
         // prompt-based loops — same json_patch convention as `sessionId`).
@@ -5148,6 +5230,12 @@ async function executeWorkflowNode(
           type: 'workflow',
           child_run_id: outcome.childRunId,
           ...(outcome.costUsd !== undefined ? { cost_usd: outcome.costUsd } : {}),
+          // Rolled up from the child run's persisted totals, exactly like cost_usd —
+          // tokens are the axis every provider reports (Codex reports no cost at all),
+          // so dropping them here while keeping cost would hide the one comparable
+          // number. Does not double count WITHIN this run: the child's own per-node
+          // rows are filed under `child_run_id`, a different workflow_run_id.
+          ...(outcome.tokens !== undefined ? { tokens: outcome.tokens } : {}),
         },
       })
       .catch((err: Error) => {
