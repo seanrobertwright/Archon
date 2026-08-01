@@ -143,7 +143,12 @@ function createMockStore(): IWorkflowStore {
     releaseWritebackClaim: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve()),
     createWorkflowEvent: mock(() => Promise.resolve()),
-    getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
+    getDagResumeSnapshot: mock(() =>
+      Promise.resolve({
+        completedNodeOutputs: new Map<string, string>(),
+        tokens: { input: 0, output: 0 },
+      })
+    ),
     getCodebase: mock(() => Promise.resolve(null)),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
     getWorkflowNodeSession: mock(() => Promise.resolve(null)),
@@ -4562,6 +4567,150 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(2);
   });
 
+  it('reconciles total tokens across a failed run and its resume', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('resume-token-reconciliation');
+    const workflow = {
+      name: 'resume-token-reconciliation',
+      nodes: [
+        { id: 'step1', command: 'step1' },
+        { id: 'step2', command: 'step2', depends_on: ['step1'] },
+      ],
+    };
+
+    let firstInvocationCall = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      firstInvocationCall++;
+      if (firstInvocationCall === 1) {
+        yield { type: 'assistant', content: 'first execution output' };
+        yield {
+          type: 'result',
+          sessionId: 'first-execution-session',
+          tokens: { input: 40, output: 4 },
+        };
+        return;
+      }
+      // A result without assistant output fails step2 after step1 has persisted
+      // its node_completed event.
+      yield { type: 'result', sessionId: 'failed-step-session' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-resume-tokens',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+
+    const firstExecutionEvents = (
+      store.createWorkflowEvent as ReturnType<typeof mock>
+    ).mock.calls.map(
+      (call: unknown[]) =>
+        call[0] as {
+          event_type: string;
+          step_name?: string;
+          data?: Record<string, unknown>;
+        }
+    );
+    const priorCompletedNodes = new Map<string, string>();
+    const priorTokenUsage = { input: 0, output: 0 };
+    for (const event of firstExecutionEvents) {
+      if (event.event_type !== 'node_completed' || !event.step_name) continue;
+      if (typeof event.data?.node_output === 'string') {
+        priorCompletedNodes.set(event.step_name, event.data.node_output);
+      }
+      const eventTokens = event.data?.tokens as { input?: unknown; output?: unknown } | undefined;
+      if (
+        typeof eventTokens?.input === 'number' &&
+        typeof eventTokens.output === 'number' &&
+        Number.isFinite(eventTokens.input) &&
+        Number.isFinite(eventTokens.output)
+      ) {
+        priorTokenUsage.input += eventTokens.input;
+        priorTokenUsage.output += eventTokens.output;
+      }
+    }
+    expect(priorCompletedNodes).toEqual(new Map([['step1', 'first execution output']]));
+    expect(priorTokenUsage).toEqual({ input: 40, output: 4 });
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'resumed execution output' };
+      yield {
+        type: 'result',
+        sessionId: 'resumed-execution-session',
+        tokens: { input: 60, output: 6 },
+      };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-resume-tokens',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      priorTokenUsage
+    );
+
+    const completionCalls = (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls;
+    expect(completionCalls).toHaveLength(1);
+    expect(completionCalls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        total_tokens_in: 100,
+        total_tokens_out: 10,
+      })
+    );
+
+    const completedEvents = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+      .map(
+        (call: unknown[]) =>
+          call[0] as {
+            event_type: string;
+            data?: { tokens?: { input: number; output: number } };
+          }
+      )
+      .filter(event => event.event_type === 'node_completed' && event.data?.tokens !== undefined);
+    const eventTokenTotal = completedEvents.reduce(
+      (total, event) => ({
+        input: total.input + (event.data?.tokens?.input ?? 0),
+        output: total.output + (event.data?.tokens?.output ?? 0),
+      }),
+      { input: 0, output: 0 }
+    );
+    expect(eventTokenTotal).toEqual({ input: 100, output: 10 });
+  });
+
   // #2091: on resume, prior completed nodes are rehydrated from text only, so the
   // producer's output_format field set must be re-derived from the loaded definition —
   // otherwise the strict `$node.output.field` contract downgrades to the schemaless
@@ -6962,6 +7111,77 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       );
       expect(completed.length).toBe(1);
       expect(completed[0][0].data).not.toHaveProperty('tokens');
+    });
+
+    it('warns and omits malformed persisted gate token usage on bare approval', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'should never run' };
+        yield { type: 'result', sessionId: 'never' };
+      });
+
+      const mockDeps = createMockDeps();
+      const workflowRun = makeWorkflowRun('finalize-invalid-tokens-run', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            sessionId: 'sig-session-1',
+            message: 'gate',
+            completionSignaled: true,
+            signaledOutput: 'REPORT',
+            signaledTokens: { input: Number.NaN, output: 4 },
+          },
+          loop_user_input: 'Approved',
+          loop_feedback_given: false,
+        },
+      });
+
+      await executeDagWorkflow(
+        mockDeps,
+        createMockPlatform(),
+        'conv-dag',
+        testDir,
+        {
+          name: 'finalize-invalid-tokens',
+          nodes: [
+            {
+              id: 'refine',
+              loop: {
+                prompt: 'Refine.',
+                until: 'APPROVED',
+                max_iterations: 10,
+                interactive: true,
+                gate_message: 'Review.',
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const warnCalls = mockLogFn.mock.calls.filter(
+        (call: unknown[]) => call[1] === 'dag_loop.signaled_tokens_invalid_ignored'
+      );
+      expect(warnCalls).toHaveLength(1);
+      expect(warnCalls[0]?.[0]).toEqual(
+        expect.objectContaining({ workflowRunId: workflowRun.id, nodeId: 'refine' })
+      );
+      const completed = (mockDeps.store.createWorkflowEvent as Mock).mock.calls.find(
+        (call: unknown[]) =>
+          (call[0] as { event_type: string }).event_type === 'node_completed' &&
+          (call[0] as { step_name: string }).step_name === 'refine'
+      );
+      expect((completed?.[0] as { data: Record<string, unknown> }).data).not.toHaveProperty(
+        'tokens'
+      );
     });
 
     it('iterates at resume when feedback was given, even on a signal-bearing gate (#2074 C)', async () => {
@@ -9468,7 +9688,7 @@ describe('executeDagWorkflow -- approval node', () => {
 
     // The on_reject synthetic node must NOT produce a node_completed event with
     // step_name equal to the approval gate's own ID ('review'). If it did, a
-    // subsequent resume would find the event via getCompletedDagNodeOutputs and
+    // subsequent resume would find the event via the DAG resume snapshot and
     // skip the approval gate entirely, bypassing the human gate.
     const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
     const nodeCompletedEvents = eventCalls.filter(
