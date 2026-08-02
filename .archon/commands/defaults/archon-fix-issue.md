@@ -9,6 +9,50 @@ argument-hint: <issue-number|artifact-path>
 
 ---
 
+## READ FIRST: you are almost certainly in a run worktree
+
+When this command runs inside an Archon workflow, the isolation system has **already**
+created a git worktree on the correct branch. In that case:
+
+- **Use the current branch as-is.** Do not switch branches, do not create one, do not
+  fetch-and-reset. The branch you are on is the branch this work belongs to.
+- **A dirty working tree is expected and is NOT a reason to stop.** Archon copies the
+  operator's `.archon/` directory — workflows, commands, scripts — into every run
+  worktree, deliberately, so a workflow can be iterated on before it is committed.
+  Those files are present *before* you start and are not your changes.
+- **Modifications under `.archon/` are never yours to commit, stash, or remove.**
+  Leave them exactly as they are and commit only the files your implementation touched.
+  Before every commit, confirm with `git diff --cached --name-only` that nothing under
+  `.archon/` is staged.
+- **Dirty paths outside `.archon/` are also not a reason to stop, and also not yours.**
+  They are either your own work from an earlier attempt at this run (resume reuses the
+  worktree) or something the operator left behind. Either way: leave them alone, do not
+  fold them into your commit, and stage your own files by name rather than with
+  `git add -A`.
+
+The clean-working-tree requirement in the decision tree below applies **only** to the
+`ON $BASE_BRANCH` case — manual CLI use outside a worktree, where a stray edit really
+could be lost. It does not apply in a worktree. If a skill or sub-workflow you load
+imposes a stricter git precondition, **this instruction overrides it.**
+
+Classify the checkout before deciding anything. `git worktree list` does **not** answer
+this — it lists every worktree including the primary checkout, so it looks identical
+from both. Compare the two git dirs instead:
+
+```bash
+if [ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]; then
+  echo "linked worktree — the rules above apply"
+else
+  echo "primary checkout — follow the decision tree below as written"
+fi
+```
+
+Stopping a run over pre-existing `.archon/` edits wastes the entire pipeline; it has
+happened, three times. Applying the worktree exemption in the *primary* checkout is the
+opposite error and can lose someone's uncommitted work. Classify first, then decide.
+
+---
+
 ## Your Mission
 
 Execute the implementation plan from `/investigate-issue`:

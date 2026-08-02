@@ -240,12 +240,18 @@ export function buildDetachedRunCmd(
   cwd: string,
   extraArgs: string[]
 ): string[] {
-  // In a compiled binary, execPath IS the archon binary and there is no
-  // entry-script argv[1]; in dev, execPath is bun and argv[1] is the cli entry.
+  // Only the command prefix differs between modes: in a compiled binary
+  // execPath IS the archon binary and re-invoking it needs no entry script; in
+  // dev, execPath is bun and argv[1] is the cli entry that bun must be handed.
   const baseCmd = isBinary ? [execPath] : [execPath, argv[1]];
-  const userArgs = (isBinary ? argv.slice(1) : argv.slice(2)).filter(
-    arg => arg !== '--detach' && arg !== '--json'
-  );
+  // User args always start at argv[2] in BOTH modes. A Bun single-file
+  // executable does have an argv[1] — the virtual entry path
+  // (`/$bunfs/root/<name>`, `B:/~BUN/root/<name>.exe` on Windows) — so slicing
+  // from 1 in binary mode leaked that path in as the child's first token and
+  // the child died with `Unknown command: B:/~BUN/root/archon-...exe` (#2248).
+  // cli.ts's own parser reads `process.argv.slice(2)` unconditionally, which is
+  // the contract this must match.
+  const userArgs = argv.slice(2).filter(arg => arg !== '--detach' && arg !== '--json');
   // --cwd is appended last (parseArgs last-wins) so the child resolves the same
   // absolute working dir regardless of any relative --cwd the caller passed.
   return [...baseCmd, ...userArgs, '--cwd', cwd, ...extraArgs];
@@ -1349,8 +1355,8 @@ export async function workflowRunCommand(
           : undefined,
         baseBranch: codebaseDefaultBranch ? git.toBranchName(codebaseDefaultBranch) : undefined,
         codebaseId: codebase.id,
-        // owner/repo name lets resolveOwnerRepo skip the path heuristic, which
-        // throws for single-segment checkout paths like /workspace (#2022)
+        // owner/repo name lets resolveOwnerRepo use the registered identity
+        // instead of the _local/<basename> path fallback (#2022, #2227)
         codebaseName: codebase.name,
         canonicalRepoPath: git.toRepoPath(codebase.default_cwd),
         description: `CLI workflow: ${workflowName}`,
@@ -2373,7 +2379,7 @@ export async function workflowAbandonCommand(
   if (json) {
     try {
       const resolvedId = await resolveRunIdArg(runId, cwd);
-      const run = await abandonWorkflow(resolvedId);
+      const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
       console.log(
         JSON.stringify(
           {
@@ -2382,6 +2388,8 @@ export async function workflowAbandonCommand(
             action: 'abandon',
             status: 'cancelled',
             workflowName: run.workflow_name,
+            ...(cascadeFailures > 0 ? { cascadeFailures } : {}),
+            ...(blockedParentRunId ? { blockedParentRunId } : {}),
           },
           null,
           2
@@ -2394,9 +2402,22 @@ export async function workflowAbandonCommand(
   }
 
   const resolvedId = await resolveRunIdArg(runId, cwd);
-  const run = await abandonWorkflow(resolvedId);
+  const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
   console.log(`Abandoned workflow run: ${resolvedId}`);
   console.log(`Workflow: ${run.workflow_name}`);
+  if (cascadeFailures > 0) {
+    console.log(
+      `Warning: ${String(cascadeFailures)} sub-run(s) could not be cancelled and may still be running — check \`archon workflow status\`.`
+    );
+  }
+  if (blockedParentRunId) {
+    console.log(
+      `Warning: parent run ${blockedParentRunId} was blocked on this sub-run and stays paused.`
+    );
+    console.log(
+      `  Resume it to fail the node cleanly (archon workflow resume ${blockedParentRunId}) or abandon it too.`
+    );
+  }
 }
 
 /**
