@@ -1037,7 +1037,14 @@ async function main(): Promise<number> {
   }
 }
 
-// Run main and exit with the returned code
+// Exit explicitly so a lingering handle (DB pool, spawned child, timer) can
+// never leave the CLI hanging after its work is done.
+//
+// This is safe for piped output because every machine-readable payload is
+// emitted through `writeStdout()`/`writeJsonLine()` (src/utils/stdout.ts), which
+// resolves only once the bytes have reached the OS. The #2384 truncation
+// happened inside `console.log` at call time — not at exit — so deferring the
+// exit would not have recovered it.
 main()
   .then(exitCode => {
     process.exit(exitCode);

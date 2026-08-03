@@ -208,15 +208,44 @@ mock.module('@archon/core/db/workflow-node-sessions', () => ({
   upsertWorkflowNodeSession: mock(() => Promise.resolve()),
 }));
 
+/**
+ * Capture machine-readable (`--json`) payloads.
+ *
+ * They are emitted through `writeJsonLine()` (src/utils/stdout.ts) — i.e.
+ * `process.stdout.write` with a completion callback — rather than `console.log`,
+ * so a piped consumer can never receive a truncated document (#2384).
+ *
+ * This helper only CAPTURES what a command emitted. That the bytes actually
+ * survive a real pipe is proven end-to-end in src/utils/stdout.test.ts, which
+ * spawns the CLI through a genuine shell pipeline — deliberately not here,
+ * because a test that mocks `process.stdout.write` cannot observe the truncation
+ * this fix is about.
+ */
+function spyOnJsonStdout(): ReturnType<typeof spyOn> {
+  return spyOn(process.stdout, 'write').mockImplementation((...args: unknown[]) => {
+    const callback = args.find(arg => typeof arg === 'function');
+    if (typeof callback === 'function') (callback as () => void)();
+    return true;
+  });
+}
+
+/** The first `--json` document a command wrote, trailing newline stripped. */
+function firstJsonPayload(spy: ReturnType<typeof spyOn>): string {
+  return ((spy.mock.calls[0]?.[0] as string) ?? '').trimEnd();
+}
+
 describe('workflowListCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
   });
 
   afterEach(() => {
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('should display message when no workflows found', async () => {
@@ -272,8 +301,8 @@ describe('workflowListCommand', () => {
 
     await workflowListCommand('/test/path', true);
 
-    expect(consoleSpy).toHaveBeenCalledTimes(1);
-    const output = consoleSpy.mock.calls[0][0] as string;
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    const output = firstJsonPayload(stdoutSpy);
     const parsed = JSON.parse(output) as { workflows: unknown[]; errors: unknown[] };
     expect(parsed.workflows).toHaveLength(2);
     expect(parsed.errors).toHaveLength(0);
@@ -297,7 +326,7 @@ describe('workflowListCommand', () => {
 
     await workflowListCommand('/test/path', true);
 
-    const output = consoleSpy.mock.calls[0][0] as string;
+    const output = firstJsonPayload(stdoutSpy);
     const parsed = JSON.parse(output) as {
       workflows: unknown[];
       errors: Array<{ filename: string; error: string; errorType: string }>;
@@ -320,9 +349,9 @@ describe('workflowListCommand', () => {
 
     await workflowListCommand('/test/path', true);
 
-    // Only one console.log call (the JSON), no "Discovering workflows" text
-    expect(consoleSpy).toHaveBeenCalledTimes(1);
-    const output = consoleSpy.mock.calls[0][0] as string;
+    // Exactly one JSON document written, and no "Discovering workflows" header
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    const output = firstJsonPayload(stdoutSpy);
     expect(output).not.toContain('Discovering workflows');
     // Output must be valid JSON
     expect(() => JSON.parse(output)).not.toThrow();
@@ -346,7 +375,7 @@ describe('workflowListCommand', () => {
 
     await workflowListCommand('/test/path', true);
 
-    const output = consoleSpy.mock.calls[0][0] as string;
+    const output = firstJsonPayload(stdoutSpy);
     const parsed = JSON.parse(output) as {
       workflows: Array<Record<string, string>>;
       errors: unknown[];
@@ -2438,13 +2467,16 @@ describe('workflowRunCommand', () => {
 
 describe('workflowStatusCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
   });
 
   afterEach(() => {
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('should print message when no active runs', async () => {
@@ -2483,7 +2515,10 @@ describe('workflowStatusCommand', () => {
 
     await workflowStatusCommand(true);
 
-    expect(consoleSpy).toHaveBeenCalledWith(JSON.stringify({ runs: [] }, null, 2));
+    expect(stdoutSpy).toHaveBeenCalledWith(
+      `${JSON.stringify({ runs: [] }, null, 2)}\n`,
+      expect.any(Function)
+    );
   });
 
   it('should show node summaries in verbose mode', async () => {
@@ -2624,7 +2659,7 @@ describe('workflowStatusCommand', () => {
 
     await workflowStatusCommand(true, true);
 
-    const jsonOutput = consoleSpy.mock.calls[0]?.[0] as string;
+    const jsonOutput = stdoutSpy.mock.calls[0]?.[0] as string;
     const parsed = JSON.parse(jsonOutput) as { runs: Array<{ events: unknown[] }> };
     expect(parsed.runs[0].events).toHaveLength(1);
   });
@@ -2642,13 +2677,16 @@ const EMPTY_COUNTS = {
 
 describe('workflowGetCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
   });
 
   afterEach(() => {
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('prints not-found (human) and exits non-zero for a missing run', async () => {
@@ -2668,8 +2706,8 @@ describe('workflowGetCommand', () => {
 
     const code = await workflowGetCommand('nope', true);
 
-    expect(consoleSpy).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(consoleSpy.mock.calls[0][0] as string)).toEqual({
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
       ok: false,
       runId: 'nope',
       error: 'not_found',
@@ -2685,7 +2723,7 @@ describe('workflowGetCommand', () => {
 
     await workflowGetCommand('run-x', true);
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       ok: boolean;
       runId: string;
       error: string;
@@ -2727,8 +2765,8 @@ describe('workflowGetCommand', () => {
 
     const code = await workflowGetCommand('run-json', true);
 
-    expect(consoleSpy).toHaveBeenCalledTimes(1);
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       id: string;
       status: string;
     };
@@ -2759,7 +2797,7 @@ describe('workflowGetCommand', () => {
 
     const code = await workflowGetCommand('run-gate-json', true);
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       metadata: { approval: { completionSignaled: boolean; signaledOutput: string } };
     };
     // The agent read surface: the C fields flow through the CLI --json dump unchanged.
@@ -2817,7 +2855,7 @@ describe('workflowGetCommand', () => {
 
     await workflowGetCommand('run-v', true, true);
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as { events: unknown[] };
+    const parsed = JSON.parse(stdoutSpy.mock.calls[0][0] as string) as { events: unknown[] };
     expect(Array.isArray(parsed.events)).toBe(true);
     expect(parsed.events).toHaveLength(1);
   });
@@ -2827,9 +2865,11 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
   const FULL_ID = '0b1ee8da-1111-2222-3333-444455556666';
   const CODEBASE = { id: 'cb-1', name: 'proj', default_cwd: '/repo' };
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(async () => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
     (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockClear();
@@ -2839,6 +2879,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
 
   afterEach(() => {
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('resolves a unique short prefix to the full run id (get)', async () => {
@@ -2936,7 +2977,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
 
     await workflowAbandonCommand('0b1ee8da', true, '/repo');
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       ok: boolean;
       runId: string;
       action: string;
@@ -2997,7 +3038,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     await workflowAbandonCommand('0b1ee8da', true, '/repo');
 
     expect(workflowDb.cancelWorkflowRun).toHaveBeenCalledWith(FULL_ID);
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       ok: boolean;
       runId: string;
     };
@@ -3028,7 +3069,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     await workflowApproveCommand('0b1ee8da', 'lgtm', true, '/repo');
 
     expect(workflowDb.getWorkflowRun).toHaveBeenCalledWith(FULL_ID);
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
     expect(parsed).toMatchObject({ ok: true, runId: FULL_ID, action: 'approve' });
   });
 
@@ -3058,7 +3099,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     await workflowRejectCommand('0b1ee8da', 'nope', true, '/repo');
 
     expect(workflowDb.getWorkflowRun).toHaveBeenCalledWith(FULL_ID);
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
     expect(parsed).toMatchObject({
       ok: true,
       runId: FULL_ID,
@@ -3082,13 +3123,16 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
 
 describe('workflowRunsCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
   });
 
   afterEach(() => {
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('scopes to the cwd-resolved codebase id', async () => {
@@ -3146,8 +3190,8 @@ describe('workflowRunsCommand', () => {
 
     await workflowRunsCommand('/test/path', { json: true });
 
-    expect(consoleSpy).toHaveBeenCalledTimes(1);
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       runs: unknown[];
       total: number;
       scopeFallback: boolean;
@@ -3174,7 +3218,7 @@ describe('workflowRunsCommand', () => {
 
     await workflowRunsCommand('/test/path', { json: true });
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as { scopeFallback: boolean };
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { scopeFallback: boolean };
     expect(parsed.scopeFallback).toBe(false);
   });
 
@@ -3206,7 +3250,7 @@ describe('workflowRunsCommand', () => {
   it('emits {ok:false} JSON (never throws) on an invalid --status in --json mode', async () => {
     await workflowRunsCommand('/test/path', { status: 'bogus', json: true });
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       ok: boolean;
       error: string;
     };
@@ -3217,13 +3261,16 @@ describe('workflowRunsCommand', () => {
 
 describe('write command --json output', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
   });
 
   afterEach(() => {
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('abandon --json emits a structured cancelled result', async () => {
@@ -3239,8 +3286,8 @@ describe('write command --json output', () => {
 
     await workflowAbandonCommand('run-ab', true);
 
-    expect(consoleSpy).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(consoleSpy.mock.calls[0][0] as string)).toEqual({
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
       ok: true,
       runId: 'run-ab',
       action: 'abandon',
@@ -3255,7 +3302,7 @@ describe('write command --json output', () => {
 
     await workflowAbandonCommand('missing', true);
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as {
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       ok: boolean;
       error: string;
     };
@@ -3281,7 +3328,7 @@ describe('write command --json output', () => {
 
     await workflowApproveCommand('run-ap', 'lgtm', true);
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
     expect(parsed).toMatchObject({
       ok: true,
       runId: 'run-ap',
@@ -3314,7 +3361,7 @@ describe('write command --json output', () => {
 
     await workflowRejectCommand('run-rj', 'nope', true);
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
     // No onRejectPrompt in approval metadata → run is cancelled, not resumable
     expect(parsed).toMatchObject({
       ok: true,
@@ -3340,7 +3387,7 @@ describe('write command --json output', () => {
 
     await workflowResumeCommand('run-rs', true);
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
     expect(parsed).toMatchObject({
       ok: true,
       runId: 'run-rs',
@@ -3354,6 +3401,7 @@ describe('write command --json output', () => {
 
 describe('workflowRunCommand — detach', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   function createDetachedChildFixture(pid: number | null = 12345): {
     child: ReturnType<typeof Bun.spawn>;
@@ -3391,11 +3439,13 @@ describe('workflowRunCommand — detach', () => {
   beforeEach(() => {
     jest.useFakeTimers();
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
   });
 
   afterEach(() => {
     jest.useRealTimers();
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('spawns a detached child (minus --detach, plus --branch/--conversation-id) and does NOT await executeWorkflow', async () => {
@@ -3534,7 +3584,7 @@ describe('workflowRunCommand — detach', () => {
       spawnSpy.mockRestore();
     }
 
-    const parsed = JSON.parse(consoleSpy.mock.calls[0][0] as string) as Record<string, unknown>;
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
     expect(parsed).toMatchObject({ ok: true, action: 'run', detached: true, workflow: 'assist' });
     expect(typeof parsed.conversationId).toBe('string');
   });
@@ -5425,15 +5475,18 @@ describe('extractStaleWorkspaceEntry', () => {
 
 describe('workflowResetSessionsCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
     mockDeleteNodeSessions.mockClear();
     mockDeleteNodeSessions.mockResolvedValue({ deleted: 0 });
   });
 
   afterEach(() => {
     consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
   });
 
   it('refuses a cross-scope reset without --scope and without --yes', async () => {
@@ -5472,7 +5525,7 @@ describe('workflowResetSessionsCommand', () => {
 
     await workflowResetSessionsCommand('feature-dev', { scope: 'conv-1', json: true });
 
-    expect(consoleSpy).toHaveBeenCalledWith(
+    expect(firstJsonPayload(stdoutSpy)).toBe(
       JSON.stringify({ workflow: 'feature-dev', deleted: 2, scope: 'conv-1', node: null })
     );
   });
