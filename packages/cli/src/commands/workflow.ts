@@ -90,12 +90,20 @@ function getLog(): ReturnType<typeof createLogger> {
  * --no-worktree: opt out of isolation, run in live checkout.
  * --resume: reuse worktree from last failed run.
  * --from: override base branch (start-point for worktree).
+ * --base: per-dispatch PR base + worktree cut-from override (wins over config).
  *
- * Mutually exclusive: --branch + --no-worktree, --resume + --branch.
+ * Mutually exclusive: --branch + --no-worktree, --resume + --branch,
+ * --base + --no-worktree.
  */
 export interface WorkflowRunOptions {
   branchName?: string;
   fromBranch?: string;
+  /**
+   * Per-dispatch base-branch override (`--base <branch>`). Wins over repo config
+   * and the codebase default for BOTH the worktree cut-from and the PR target
+   * (`$BASE_BRANCH`). Mutually exclusive with `--no-worktree`.
+   */
+  baseBranch?: string;
   noWorktree?: boolean;
   /**
    * Register the current non-git cwd as a folder project on first use and run
@@ -378,12 +386,32 @@ function buildRegistrationFailureError(action: string, error: Error): Error {
   );
 }
 
-/** Error for --branch/--from used against a folder project (no worktree). */
+/** Error for --branch/--from/--base used against a folder project (no worktree). */
 function folderWorktreeOptionError(): Error {
   return new Error(
     'Worktree options require a git-repo project.\n' +
-      '  --branch/--from create an isolated git worktree, which folder projects do not use.\n' +
-      '  Drop --branch/--from — folder projects always run in place.'
+      '  --branch/--from/--base act on an isolated git worktree, which folder projects do not use.\n' +
+      '  Drop --branch/--from/--base — folder projects always run in place.'
+  );
+}
+
+/**
+ * Warn that `--base` is only HALF applied when an existing worktree is adopted
+ * (`--branch` reuse or `--resume`): its cut-from is already fixed, but the
+ * override still reaches `$BASE_BRANCH` and retargets the PR.
+ *
+ * Deliberately not `--from`'s "was not applied" wording — that is accurate for
+ * `--from`, which is wholly inert on reuse, and would understate this case.
+ */
+function warnBaseOverrideOnReuse(workingPath: string, flagBase: string): void {
+  getLog().warn(
+    { path: workingPath, baseBranch: flagBase },
+    'worktree.reuse_base_override_partial'
+  );
+  console.warn(
+    `Warning: Reusing existing worktree at ${workingPath}. ` +
+      `--base ${flagBase} did not change the cut-from (worktree already exists); ` +
+      'it still applies to the PR target.'
   );
 }
 
@@ -412,15 +440,24 @@ function buildFolderRegistrationFailureError(error: Error): Error {
 }
 
 /**
- * Fail fast if `--branch`/`--from` (git-worktree-only options) are used against a
- * folder project. Called at three sites — flag-declared (pre-detach), the detach
- * fast-path, and post-lookup (authoritative) — so the check lives in one place.
+ * Fail fast if `--branch`/`--from`/`--base` (git-worktree-only options) are used
+ * against a folder project. Called at three sites — flag-declared (pre-detach), the
+ * detach fast-path, and post-lookup (authoritative) — so the check lives in one place.
+ *
+ * `--base` belongs here even though a folder run creates no worktree for it to
+ * redirect: it would still reach `$BASE_BRANCH`, giving the run a PR target with
+ * no worktree behind it.
  */
 function assertNoWorktreeOptionsForFolder(
   isFolderProject: boolean,
   options: WorkflowRunOptions
 ): void {
-  if (isFolderProject && (options.branchName !== undefined || options.fromBranch !== undefined)) {
+  if (
+    isFolderProject &&
+    (options.branchName !== undefined ||
+      options.fromBranch !== undefined ||
+      options.baseBranch !== undefined)
+  ) {
     throw folderWorktreeOptionError();
   }
 }
@@ -804,6 +841,11 @@ export async function workflowRunCommand(
         'Remove --from or drop --no-worktree.'
     );
   }
+  if (options.noWorktree && options.baseBranch !== undefined) {
+    throw new Error(
+      '--base has no effect with --no-worktree.\n' + 'Remove --base or drop --no-worktree.'
+    );
+  }
   if (options.resume && options.branchName !== undefined) {
     throw new Error(
       '--resume and --branch are mutually exclusive.\n' +
@@ -811,6 +853,15 @@ export async function workflowRunCommand(
         '  Remove --branch when using --resume.'
     );
   }
+
+  // Per-dispatch --base override, normalized once. Wins over repo config + the
+  // codebase default for both the worktree cut-from (the provider request's
+  // `baseOverride` below) and the PR target / $BASE_BRANCH (executeWorkflow's
+  // `baseOverride` opt). Both halves need their own channel: the `baseBranch`
+  // field on either side is the codebase-default FALLBACK and ranks below repo
+  // config, so routing the flag through it would silently lose to a repo that
+  // sets `worktree.baseBranch`.
+  const flagBase = options.baseBranch?.trim() || undefined;
 
   // Reconcile workflow-level worktree policy with invocation flags.
   // The workflow YAML's `worktree.enabled` pins isolation regardless of caller —
@@ -830,6 +881,13 @@ export async function workflowRunCommand(
         `Workflow '${workflow.name}' sets worktree.enabled: false (runs in live checkout).\n` +
           '  --from/--from-branch only applies when a worktree is created.\n' +
           "  Drop --from or change the workflow's worktree.enabled."
+      );
+    }
+    if (options.baseBranch !== undefined) {
+      throw new Error(
+        `Workflow '${workflow.name}' sets worktree.enabled: false (runs in live checkout).\n` +
+          '  --base only applies when a worktree is created.\n' +
+          "  Drop --base or change the workflow's worktree.enabled."
       );
     }
     // --no-worktree is redundant but not contradictory — silently accept.
@@ -1143,6 +1201,13 @@ export async function workflowRunCommand(
     console.log(`Resuming workflow run: ${resumable.id}`);
     console.log(`Working path: ${workingCwd}`);
     console.log('');
+
+    // --resume adopts the prior run's worktree, so --base is half-applied here
+    // exactly as it is on --branch reuse above: the cut-from is already fixed,
+    // but flagBase still rides opts.baseOverride into $BASE_BRANCH.
+    if (flagBase) {
+      warnBaseOverrideOnReuse(workingCwd, flagBase);
+    }
   }
 
   const isFolderCodebase = codebase?.kind === 'folder';
@@ -1306,13 +1371,21 @@ export async function workflowRunCommand(
             `--from ${options.fromBranch} was not applied (worktree already exists).`
         );
       }
+      if (flagBase) {
+        warnBaseOverrideOnReuse(existingEnv.working_path, flagBase);
+      }
       // Validate base branch before reuse (warning-only — non-blocking)
       try {
         const repoConfig = await loadRepoConfig(codebase.default_cwd);
         const rawBase = repoConfig?.worktree?.baseBranch?.trim();
-        // Three-level fallback: repo config → codebase default → git auto-detect.
+        // Four-level fallback: --base override → repo config → codebase default →
+        // git auto-detect. Mirrors WorktreeProvider and executeWorkflow, so the
+        // reuse check validates against the base this dispatch actually asked
+        // for instead of reporting a mismatch nobody requested.
         let configuredBase: git.BranchName;
-        if (rawBase) {
+        if (flagBase) {
+          configuredBase = git.toBranchName(flagBase);
+        } else if (rawBase) {
           configuredBase = git.toBranchName(rawBase);
         } else if (codebaseDefaultBranch) {
           configuredBase = git.toBranchName(codebaseDefaultBranch);
@@ -1354,6 +1427,7 @@ export async function workflowRunCommand(
           ? git.toBranchName(options.fromBranch.trim())
           : undefined,
         baseBranch: codebaseDefaultBranch ? git.toBranchName(codebaseDefaultBranch) : undefined,
+        baseOverride: flagBase ? git.toBranchName(flagBase) : undefined,
         codebaseId: codebase.id,
         // owner/repo name lets resolveOwnerRepo use the registered identity
         // instead of the _local/<basename> path fallback (#2022, #2227)
@@ -1646,6 +1720,7 @@ export async function workflowRunCommand(
           source: workflowSource,
           userId: cliUserId,
           baseBranch: codebaseDefaultBranch,
+          baseOverride: flagBase,
           execContext,
           container: containerRunCtx,
           ...prepared,
@@ -1655,6 +1730,7 @@ export async function workflowRunCommand(
           source: workflowSource,
           userId: cliUserId,
           baseBranch: codebaseDefaultBranch,
+          baseOverride: flagBase,
           execContext,
           container: containerRunCtx,
         };
