@@ -553,11 +553,21 @@ async function* streamCodexEvents(
             const exitCode = item.exit_code as number | null | undefined;
             const exitSuffix =
               exitCode != null && exitCode !== 0 ? `\n[exit code: ${String(exitCode)}]` : '';
+            let toolOutcome: 'success' | 'error' | 'unknown';
+            if (exitCode === 0) {
+              toolOutcome = 'success';
+            } else if (exitCode == null) {
+              toolOutcome = 'unknown';
+            } else {
+              toolOutcome = 'error';
+            }
             yield {
               type: 'tool_result',
               toolName: cmd,
               toolOutput: ((item.aggregated_output as string) ?? '') + exitSuffix,
               toolCallId: itemId,
+              toolOutcome,
+              ...(exitCode != null ? { exitCode } : {}),
             };
           } else {
             getLog().warn({ itemId: item.id }, 'command_execution_missing_command');
@@ -578,6 +588,7 @@ async function* streamCodexEvents(
               toolName: searchToolName,
               toolOutput: '',
               toolCallId: itemId,
+              toolOutcome: 'unknown',
             };
           } else {
             getLog().debug({ itemId: item.id }, 'web_search_missing_query');
@@ -665,6 +676,7 @@ async function* streamCodexEvents(
               toolName: mcpToolName,
               toolOutput: errMsg,
               toolCallId: itemId,
+              toolOutcome: 'error',
             };
           } else {
             let toolOutput = '';
@@ -684,7 +696,13 @@ async function* streamCodexEvents(
                 );
               }
             }
-            yield { type: 'tool_result', toolName: mcpToolName, toolOutput, toolCallId: itemId };
+            yield {
+              type: 'tool_result',
+              toolName: mcpToolName,
+              toolOutput,
+              toolCallId: itemId,
+              toolOutcome: 'success',
+            };
           }
           break;
         }
