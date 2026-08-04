@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-08-04
+
+Workflow runs now record what they actually resolved to — assistant, model, effort, isolation, base branch — so two runs can be told apart after the fact. Plus retry classification for transient Codex failures, and a batch of installer and CLI repairs.
+
+### Added
+
+- **Per-dispatch `--base` override** — `archon workflow run --base <branch>` sets the branch the worktree is cut from and the PR targets, for that run only. Base resolution was static per codebase (`worktree.baseBranch` → `default_branch` → git auto-detect), all of which describe the repo rather than the run, so fanning out parallel dispatches against one repo with different bases had no encoding short of editing repo config. (#2203)
+- **`archon-parse-user-request`** replaces `extract-issue-number`, parsing the operator's message into structured fields — the verbatim request, issue number, repo shorthand, and repo URL — instead of a number alone. (#2420)
+- **Compact node summaries in verbose JSON** — `--verbose --json` returns ordered node summaries including `startedAt` by default, with stable ordering for tied timestamps, so machine consumers no longer have to recreate the CLI's node-state fold or filter tool-event noise. (#2414)
+
+### Changed
+
+- **Run start events snapshot the resolved configuration.** `workflow_started` previously carried only the workflow name, forcing consumers to reconstruct run context from other records. It now records the resolved assistant/provider/model, isolation mode, base branch, and persisted user/input context, so a run is classifiable from a single durable event. (#2428)
+- **Tool lifecycle events can be correlated.** `tool_called` and `tool_completed` now carry the resolved `tool_call_id`, a structured `tool_outcome`, and an optional `exit_code` through persistence, SSE, and CLI — so repeated or interleaved tool calls can be paired, and per-invocation latency and failures are traceable. (#2421)
+- **Resolved effort is recorded on node start.** Effort was applied to node execution but discarded before `node_started` was persisted, leaving two runs indistinguishable when effort was their only material difference. (#2415)
+- **`archon complete` counts only commits reachable solely from the refs being deleted.** Dev-based worktree branches holding no unique work are no longer blocked behind `--force`, which would also have bypassed unrelated safety checks. (#2416)
+- **Bash node stdout previews are retained** after a successful run, so gate verdicts stay auditable. (#2388)
+- **Planning treats issue comments as authoritative** — comments outrank the issue body, and linked issues count as part of the input. (#2404, #2411)
+- Documentation points GUI callers at the native CLI. (#2387)
+
+### Fixed
+
+- **Transient Codex availability failures retry again.** `classifyError` tested `FATAL_PATTERNS` first, and that list held the bare substring `auth error` — so Codex's circuit-breaker text `auth error: 503` classified FATAL and never reached the transient check two lines below. Because FATAL is an absolute veto, `on_error: all` did not rescue it either; there was no author-side escape hatch. Classification is now three-tier: decisive fatal evidence (explicit credentials, authorization, quota and limit windows) first, transient second, and the ambiguous `auth error` wrapper last. Separately, `Selected model is at capacity` matched neither list and fell through to `UNKNOWN`; it is now transient. (#2434, closes #2386 and #2425)
+- **SQLite upgrades no longer break on `event_order`** — the index and trigger ran before the `ALTER` that adds the column. (#2418)
+- **Issue URLs keep their repository identity.** A bare issue number no longer resolves against whatever checkout the run happens to be in; this also unblocks fixes that target `.archon/` itself. (#2417)
+- **Piped `--json` output no longer truncates** mid-stream. (#2389)
+- **`workflow resume` guidance in the CLI is correct.** (#2422)
+- **Detached workflow startup acknowledgement.** (#2390)
+- **Codex tool duration reporting.** (#2378)
+- **Git repositories without remotes no longer error.** (#2380)
+- **The PowerShell installer fails when its version check exits non-zero**, instead of reporting a successful install. (#2391)
+- **Incompatible x64 quick installs are rejected** rather than installing a binary that cannot run. (#2379)
+- **`archon doctor` honors the `claudeBinaryPath` config fallback.** (#2275, #2263)
+
 ## [0.7.0] - 2026-08-01
 
 Runtime sub-runs (`workflow:`), the connected Studio builder, usage accounting you can trust, a repaired `curl | bash` install path, and a security batch across cloning, transport, and path resolution.
