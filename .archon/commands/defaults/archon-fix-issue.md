@@ -20,10 +20,47 @@ created a git worktree on the correct branch. In that case:
   operator's `.archon/` directory — workflows, commands, scripts — into every run
   worktree, deliberately, so a workflow can be iterated on before it is committed.
   Those files are present *before* you start and are not your changes.
-- **Modifications under `.archon/` are never yours to commit, stash, or remove.**
-  Leave them exactly as they are and commit only the files your implementation touched.
-  Before every commit, confirm with `git diff --cached --name-only` that nothing under
-  `.archon/` is staged.
+- **Pre-existing modifications under `.archon/` are never yours to commit, stash, or
+  remove.** Leave them exactly as they are and commit only the files your implementation
+  touched. Before every commit, confirm with `git diff --cached --name-only` that no
+  `.archon/` file you did not deliberately change is staged.
+- **The exception: when the issue's fix genuinely lives under `.archon/`.** Workflows,
+  commands and scripts are source too, and an issue can legitimately target one. If your
+  plan says to edit a specific `.archon/` file, edit and commit **that file** — the rule
+  above exists to stop you sweeping up the operator's unrelated copied-in edits, not to
+  make a whole directory unfixable.
+
+  Distinguish the two by intent, not by path: a file your plan names is your work; every
+  other dirty `.archon/` file is not. On 2026-08-03 a run blocked outright on this,
+  correctly reporting "contradictory instructions" because the issue required editing a
+  workflow YAML while this section forbade touching anything under `.archon/`. It was
+  right to refuse rather than guess — and the rule was wrong to be absolute.
+
+  **A named file is not a blank cheque for that file.** It may already carry copied-in
+  edits from before you started, and staging it whole would commit those too — the
+  path-level check above cannot see inside a file. So before you touch a planned
+  `.archon/` file, record its baseline:
+
+  ```bash
+  # HEAD, not the index: `git diff -- <file>` compares the worktree against the
+  # INDEX, so pre-existing changes that are already STAGED do not appear — and
+  # `git add -p` will neither show nor remove them, so they ride into your commit
+  # invisibly. Diffing against HEAD captures staged and unstaged alike.
+  git diff HEAD -- <the-planned-file> > /tmp/archon-baseline.diff   # empty if clean
+  ```
+
+  Then, before staging anything of your own, clear that file out of the index so the
+  only thing you can stage is what you deliberately pick:
+
+  ```bash
+  git restore --staged <the-planned-file>   # no-op if nothing was staged
+  git add -p <the-planned-file>             # stage ONLY your own hunks
+  ```
+
+  Reject any hunk that also appears in the baseline. If yours and theirs are entangled
+  such that you cannot separate them, stop and say so rather than committing someone
+  else's work under your change. That is the same call the 2026-08-03 run made, and it
+  was the right one.
 - **Dirty paths outside `.archon/` are also not a reason to stop, and also not yours.**
   They are either your own work from an earlier attempt at this run (resume reuses the
   worktree) or something the operator left behind. Either way: leave them alone, do not

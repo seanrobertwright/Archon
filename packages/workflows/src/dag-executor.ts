@@ -131,6 +131,26 @@ function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
   return 'prompt';
 }
 
+interface RunningTool {
+  toolName: string;
+  startedAt: number;
+}
+
+function findRunningTool(
+  runningTools: Map<string, RunningTool>,
+  toolName: string,
+  toolCallId: string | undefined
+): [string, RunningTool] | undefined {
+  if (toolCallId) {
+    const tool = runningTools.get(toolCallId);
+    return tool ? [toolCallId, tool] : undefined;
+  }
+
+  return Array.from(runningTools.entries())
+    .reverse()
+    .find(([, tool]) => tool.toolName === toolName);
+}
+
 /**
  * Usage totals for the terminal telemetry event. Fields are omitted (not sent
  * as zero) when nothing was reported, so absence in PostHog means "providers
@@ -527,17 +547,6 @@ function getEffectiveNodeRetryConfig(node: DagNode): {
 }
 
 /**
- * Check if a NodeOutput failure is transient by delegating to classifyError.
- * FATAL patterns (auth, permission, credits) take priority over TRANSIENT patterns,
- * matching the same precedence rules as classifyError(). This prevents an error
- * message that contains both a FATAL substring and a TRANSIENT substring (e.g.
- * "unauthorized: process exited with code 1") from being silently retried.
- */
-function isTransientNodeError(errorMessage: string): boolean {
-  return classifyError(new Error(errorMessage)) === 'TRANSIENT';
-}
-
-/**
  * Retry config for a deterministic (bash/script) node.
  *
  * Same field mapping as {@link getEffectiveNodeRetryConfig}, but deterministic
@@ -557,10 +566,10 @@ function getExplicitNodeRetryConfig(
  * Decide whether a failed node output warrants another retry attempt.
  *
  * Shared by {@link runNodeRetryLoop} for every node type so the retry decision
- * cannot drift. FATAL errors (auth, permissions, credit balance) are never
- * retried, even when `on_error: all` — matching {@link classifyError}'s
- * FATAL-over-TRANSIENT precedence. Also returns `isTransient` so callers can
- * label the notification.
+ * cannot drift. Decisive FATAL errors (credentials, authorization, quota/limit
+ * windows) are never retried, even when `on_error: all`; generic "auth error"
+ * text is fatal only when no transient signal matches. Also returns `isTransient`
+ * so callers can label the notification.
  */
 function shouldRetryNodeFailure(
   output: NodeOutput,
@@ -572,8 +581,9 @@ function shouldRetryNodeFailure(
   if (output.state !== 'failed') {
     return { shouldRetry: false, isTransient: false };
   }
-  const isFatal = output.error ? classifyError(new Error(output.error)) === 'FATAL' : false;
-  const isTransient = output.error ? isTransientNodeError(output.error) : false;
+  const errorType = output.error ? classifyError(new Error(output.error)) : undefined;
+  const isFatal = errorType === 'FATAL';
+  const isTransient = errorType === 'TRANSIENT';
   const shouldRetry = !isFatal && (onError === 'all' || (onError === 'transient' && isTransient));
   return { shouldRetry, isTransient };
 }
@@ -918,6 +928,7 @@ async function resolveNodeProviderAndModel(
   model: string | undefined;
   options: SendQueryOptions | undefined;
   tier?: TierName;
+  effort?: string;
 }> {
   const configuredProvider: string = node.provider ?? workflowProvider;
   let provider: string = configuredProvider;
@@ -1108,6 +1119,19 @@ async function resolveNodeProviderAndModel(
     nodeConfig,
     assistantConfig
   );
+  // Read POST-routing values only. applyPresetOptions -> routePresetEffort has
+  // already placed effort where the provider actually consumes it — nodeConfig
+  // for providers taking a node-level `effort:`, assistantConfig for Codex's
+  // modelReasoningEffort — and warned + dropped it where unsupported. So both
+  // reads below hold effort that will genuinely be applied.
+  //
+  // Do NOT gate this on caps.effortControl: that flag means "accepts the
+  // node-level effort: field", not "can apply reasoning effort". Codex is
+  // effortControl:false yet applies effort via modelReasoningEffort, so gating
+  // on it would drop a real, applied value from node_started.
+  const assistantEffort = assistantConfig.modelReasoningEffort;
+  const resolvedEffort: string | undefined =
+    nodeConfig.effort ?? (typeof assistantEffort === 'string' ? assistantEffort : undefined);
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -1126,7 +1150,7 @@ async function resolveNodeProviderAndModel(
         ? workflowLevelOptions.workflowTier
         : undefined;
 
-  return { provider, model, options, tier };
+  return { provider, model, options, tier, effort: resolvedEffort };
 }
 
 /** Evaluate trigger rule for a node given its upstream states */
@@ -1237,6 +1261,7 @@ async function executeNodeInternal(
   issueContext?: string,
   resolvedModel?: string,
   resolvedTier?: TierName,
+  resolvedEffort?: string,
   stepNamePrefix = '',
   iteration?: number
 ): Promise<NodeExecutionResult> {
@@ -1265,6 +1290,7 @@ async function executeNodeInternal(
         provider,
         model: resolvedModel,
         tier: resolvedTier,
+        ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
         ...iterationData,
       },
     })
@@ -1284,6 +1310,7 @@ async function executeNodeInternal(
     provider,
     model: resolvedModel,
     tier: resolvedTier,
+    ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
   });
 
   // Load prompt
@@ -1400,7 +1427,9 @@ async function executeNodeInternal(
   };
   let nodeIdleTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
-  let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+  const runningTools = new Map<string, RunningTool>();
+  let anonymousToolSequence = 0;
+  let lastAnonymousToolCallId: string | undefined;
   // Task ids still live when the stream ended abnormally (idle timeout /
   // subprocess death) — recorded on the node_completed event so an incomplete
   // node never masquerades as a clean success (#2083).
@@ -1510,16 +1539,22 @@ async function executeNodeInternal(
         await logAssistant(logDir, workflowRun.id, msg.content);
       } else if (msg.type === 'tool' && msg.toolName) {
         const now = Date.now();
+        const toolCallId = msg.toolCallId ?? `anonymous-${String(++anonymousToolSequence)}`;
 
-        // Emit tool_completed for the previous tool (fire-and-forget)
-        if (lastToolStartedAt) {
-          const prevTool = lastToolStartedAt;
+        // Providers without stable IDs report sequential tool calls. Preserve their
+        // legacy boundary while allowing identified calls to overlap.
+        const previousTool = lastAnonymousToolCallId
+          ? runningTools.get(lastAnonymousToolCallId)
+          : undefined;
+        if (previousTool && lastAnonymousToolCallId !== undefined) {
           getWorkflowEventEmitter().emit({
             type: 'tool_completed',
             runId: workflowRun.id,
-            toolName: prevTool.toolName,
+            toolName: previousTool.toolName,
             stepName: node.id,
-            durationMs: now - prevTool.startedAt,
+            durationMs: now - previousTool.startedAt,
+            toolCallId: lastAnonymousToolCallId,
+            toolOutcome: 'unknown',
           });
           deps.store
             .createWorkflowEvent({
@@ -1527,8 +1562,10 @@ async function executeNodeInternal(
               event_type: 'tool_completed',
               step_name: stepName,
               data: {
-                tool_name: prevTool.toolName,
-                duration_ms: now - prevTool.startedAt,
+                tool_name: previousTool.toolName,
+                duration_ms: now - previousTool.startedAt,
+                tool_call_id: lastAnonymousToolCallId,
+                tool_outcome: 'unknown',
               },
             })
             .catch((err: Error) => {
@@ -1537,8 +1574,10 @@ async function executeNodeInternal(
                 'workflow_event_persist_failed'
               );
             });
+          runningTools.delete(lastAnonymousToolCallId);
         }
-        lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
+        runningTools.set(toolCallId, { toolName: msg.toolName, startedAt: now });
+        if (!msg.toolCallId) lastAnonymousToolCallId = toolCallId;
 
         // Emit tool_started for the current tool (fire-and-forget)
         getWorkflowEventEmitter().emit({
@@ -1546,6 +1585,7 @@ async function executeNodeInternal(
           runId: workflowRun.id,
           toolName: msg.toolName,
           stepName: node.id,
+          toolCallId,
         });
 
         if (streamingMode === 'stream') {
@@ -1570,6 +1610,7 @@ async function executeNodeInternal(
             data: {
               tool_name: msg.toolName,
               tool_input: msg.toolInput ?? {},
+              tool_call_id: toolCallId,
             },
           })
           .catch((err: Error) => {
@@ -1580,14 +1621,18 @@ async function executeNodeInternal(
           });
       } else if (msg.type === 'tool_result' && msg.toolName) {
         const now = Date.now();
-        if (lastToolStartedAt) {
-          const completedTool = lastToolStartedAt;
+        const completedTool = findRunningTool(runningTools, msg.toolName, msg.toolCallId);
+        if (completedTool) {
+          const [completedToolCallId, tool] = completedTool;
           getWorkflowEventEmitter().emit({
             type: 'tool_completed',
             runId: workflowRun.id,
-            toolName: completedTool.toolName,
+            toolName: tool.toolName,
             stepName: node.id,
-            durationMs: now - completedTool.startedAt,
+            durationMs: now - tool.startedAt,
+            toolCallId: completedToolCallId,
+            ...(msg.toolOutcome !== undefined ? { toolOutcome: msg.toolOutcome } : {}),
+            ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
           });
           deps.store
             .createWorkflowEvent({
@@ -1595,8 +1640,11 @@ async function executeNodeInternal(
               event_type: 'tool_completed',
               step_name: stepName,
               data: {
-                tool_name: completedTool.toolName,
-                duration_ms: now - completedTool.startedAt,
+                tool_name: tool.toolName,
+                duration_ms: now - tool.startedAt,
+                tool_call_id: completedToolCallId,
+                ...(msg.toolOutcome !== undefined ? { tool_outcome: msg.toolOutcome } : {}),
+                ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
               },
             })
             .catch((err: Error) => {
@@ -1605,21 +1653,25 @@ async function executeNodeInternal(
                 'workflow_event_persist_failed'
               );
             });
-          lastToolStartedAt = null;
+          runningTools.delete(completedToolCallId);
+          if (completedToolCallId === lastAnonymousToolCallId) {
+            lastAnonymousToolCallId = undefined;
+          }
         }
         if (streamingMode === 'stream' && platform.sendStructuredEvent) {
           await platform.sendStructuredEvent(conversationId, msg);
         }
       } else if (msg.type === 'result') {
-        // Emit tool_completed for the last tool in the node
-        if (lastToolStartedAt) {
-          const prevTool = lastToolStartedAt;
+        // A terminal result closes every outstanding lifecycle.
+        for (const [toolCallId, prevTool] of runningTools) {
           getWorkflowEventEmitter().emit({
             type: 'tool_completed',
             runId: workflowRun.id,
             toolName: prevTool.toolName,
             stepName: node.id,
             durationMs: Date.now() - prevTool.startedAt,
+            toolCallId,
+            toolOutcome: 'unknown',
           });
           deps.store
             .createWorkflowEvent({
@@ -1629,6 +1681,8 @@ async function executeNodeInternal(
               data: {
                 tool_name: prevTool.toolName,
                 duration_ms: Date.now() - prevTool.startedAt,
+                tool_call_id: toolCallId,
+                tool_outcome: 'unknown',
               },
             })
             .catch((err: Error) => {
@@ -1637,7 +1691,7 @@ async function executeNodeInternal(
                 'workflow_event_persist_failed'
               );
             });
-          lastToolStartedAt = null;
+          runningTools.delete(toolCallId);
         }
         if (msg.sessionId) newSessionId = msg.sessionId;
         if (msg.resumed !== undefined) nodeResumed = msg.resumed;
@@ -2448,6 +2502,49 @@ async function runSubprocess(
  *  instead of inlined as bash -c arguments, to avoid silent data corruption. */
 const NODE_OUTPUT_FILE_THRESHOLD = 32_768;
 
+/** Maximum UTF-8 bytes retained for successful bash stdout in workflow events. */
+const PERSISTED_BASH_OUTPUT_MAX_BYTES = 32 * 1024;
+
+function utf8SequenceLength(leadByte: number): number {
+  if (leadByte < 0x80) return 1;
+  if (leadByte < 0xe0) return 2;
+  if (leadByte < 0xf0) return 3;
+  return 4;
+}
+
+function formatPersistedBashOutput(output: string): {
+  nodeOutput: string;
+  truncated: boolean;
+  originalBytes?: number;
+} {
+  const outputBytes = Buffer.from(output, 'utf8');
+  if (outputBytes.byteLength <= PERSISTED_BASH_OUTPUT_MAX_BYTES) {
+    return { nodeOutput: output, truncated: false };
+  }
+
+  const marker = `\n\n… [truncated; original output was ${String(outputBytes.byteLength)} bytes]`;
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  let headEnd = PERSISTED_BASH_OUTPUT_MAX_BYTES - markerBytes;
+
+  // The byte cap can land inside a multi-byte code point. Inspect the final
+  // sequence in the prefix and drop it when it is incomplete before decoding.
+  let sequenceStart = headEnd - 1;
+  while (sequenceStart >= 0 && (outputBytes[sequenceStart] & 0xc0) === 0x80) {
+    sequenceStart--;
+  }
+  if (sequenceStart >= 0) {
+    const leadByte = outputBytes[sequenceStart];
+    const expectedLength = utf8SequenceLength(leadByte);
+    if (headEnd - sequenceStart < expectedLength) headEnd = sequenceStart;
+  }
+
+  return {
+    nodeOutput: outputBytes.subarray(0, headEnd).toString('utf8') + marker,
+    truncated: true,
+    originalBytes: outputBytes.byteLength,
+  };
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via `bash -c`, captures stdout as node output.
@@ -2567,12 +2664,25 @@ async function executeBashNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
+    const persistedOutput = formatPersistedBashOutput(output);
+
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: stepName,
-        data: { duration_ms: duration, type: 'bash', node_output: output, ...iterationData },
+        data: {
+          duration_ms: duration,
+          type: 'bash',
+          node_output: persistedOutput.nodeOutput,
+          ...(persistedOutput.truncated
+            ? {
+                node_output_truncated: true,
+                node_output_original_bytes: persistedOutput.originalBytes,
+              }
+            : {}),
+          ...iterationData,
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -3854,7 +3964,8 @@ async function executeLoopNode(
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
   resolvedModel?: string,
-  resolvedTier?: TierName
+  resolvedTier?: TierName,
+  resolvedEffort?: string
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3890,6 +4001,7 @@ async function executeLoopNode(
         provider: workflowProvider,
         model: resolvedModel,
         tier: resolvedTier,
+        ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
       },
     })
     .catch((err: Error) => {
@@ -3907,6 +4019,7 @@ async function executeLoopNode(
     provider: workflowProvider,
     model: resolvedModel,
     tier: resolvedTier,
+    ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
   });
 
   /**
@@ -4202,7 +4315,9 @@ async function executeLoopNode(
       };
 
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
-      let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
+      const runningTools = new Map<string, RunningTool>();
+      let anonymousToolSequence = 0;
+      let lastAnonymousToolCallId: string | undefined;
 
       const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
 
@@ -4257,15 +4372,16 @@ async function executeLoopNode(
           }
           await logAssistant(logDir, workflowRun.id, msg.content);
         } else if (msg.type === 'result') {
-          // Emit tool_completed for the last tool in the iteration
-          if (lastToolStartedAt) {
-            const prevTool = lastToolStartedAt;
+          // A terminal result closes every outstanding lifecycle.
+          for (const [toolCallId, prevTool] of runningTools) {
             getWorkflowEventEmitter().emit({
               type: 'tool_completed',
               runId: workflowRun.id,
               toolName: prevTool.toolName,
               stepName: node.id,
               durationMs: Date.now() - prevTool.startedAt,
+              toolCallId,
+              toolOutcome: 'unknown',
             });
             deps.store
               .createWorkflowEvent({
@@ -4275,12 +4391,14 @@ async function executeLoopNode(
                 data: {
                   tool_name: prevTool.toolName,
                   duration_ms: Date.now() - prevTool.startedAt,
+                  tool_call_id: toolCallId,
+                  tool_outcome: 'unknown',
                 },
               })
               .catch((err: Error) => {
                 logEventStoreError(err, i);
               });
-            lastToolStartedAt = null;
+            runningTools.delete(toolCallId);
           }
           if (msg.sessionId) currentSessionId = msg.sessionId;
           // Overwrite, don't accumulate — a later result in the same iteration
@@ -4366,29 +4484,42 @@ async function executeLoopNode(
           backgroundTasks.update(msg.tasks);
         } else if (msg.type === 'tool' && msg.toolName) {
           const now = Date.now();
+          const toolCallId = msg.toolCallId ?? `anonymous-${String(++anonymousToolSequence)}`;
 
-          // Emit tool_completed for the previous tool
-          if (lastToolStartedAt) {
-            const prevTool = lastToolStartedAt;
+          // Providers without stable IDs report sequential tool calls. Preserve their
+          // legacy boundary while allowing identified calls to overlap.
+          const previousTool = lastAnonymousToolCallId
+            ? runningTools.get(lastAnonymousToolCallId)
+            : undefined;
+          if (previousTool && lastAnonymousToolCallId !== undefined) {
             getWorkflowEventEmitter().emit({
               type: 'tool_completed',
               runId: workflowRun.id,
-              toolName: prevTool.toolName,
+              toolName: previousTool.toolName,
               stepName: node.id,
-              durationMs: now - prevTool.startedAt,
+              durationMs: now - previousTool.startedAt,
+              toolCallId: lastAnonymousToolCallId,
+              toolOutcome: 'unknown',
             });
             deps.store
               .createWorkflowEvent({
                 workflow_run_id: workflowRun.id,
                 event_type: 'tool_completed',
                 step_name: stepName,
-                data: { tool_name: prevTool.toolName, duration_ms: now - prevTool.startedAt },
+                data: {
+                  tool_name: previousTool.toolName,
+                  duration_ms: now - previousTool.startedAt,
+                  tool_call_id: lastAnonymousToolCallId,
+                  tool_outcome: 'unknown',
+                },
               })
               .catch((err: Error) => {
                 logEventStoreError(err, i);
               });
+            runningTools.delete(lastAnonymousToolCallId);
           }
-          lastToolStartedAt = { toolName: msg.toolName, startedAt: now };
+          runningTools.set(toolCallId, { toolName: msg.toolName, startedAt: now });
+          if (!msg.toolCallId) lastAnonymousToolCallId = toolCallId;
 
           // Emit tool_started for the current tool (fire-and-forget)
           getWorkflowEventEmitter().emit({
@@ -4396,6 +4527,7 @@ async function executeLoopNode(
             runId: workflowRun.id,
             toolName: msg.toolName,
             stepName: node.id,
+            toolCallId,
           });
 
           if (platform.getStreamingMode() === 'stream') {
@@ -4425,21 +4557,29 @@ async function executeLoopNode(
               workflow_run_id: workflowRun.id,
               event_type: 'tool_called',
               step_name: stepName,
-              data: { tool_name: msg.toolName, tool_input: toolInput },
+              data: {
+                tool_name: msg.toolName,
+                tool_input: toolInput,
+                tool_call_id: toolCallId,
+              },
             })
             .catch((err: Error) => {
               logEventStoreError(err, i);
             });
         } else if (msg.type === 'tool_result' && msg.toolName) {
           const now = Date.now();
-          if (lastToolStartedAt) {
-            const completedTool = lastToolStartedAt;
+          const completedTool = findRunningTool(runningTools, msg.toolName, msg.toolCallId);
+          if (completedTool) {
+            const [completedToolCallId, tool] = completedTool;
             getWorkflowEventEmitter().emit({
               type: 'tool_completed',
               runId: workflowRun.id,
-              toolName: completedTool.toolName,
+              toolName: tool.toolName,
               stepName: node.id,
-              durationMs: now - completedTool.startedAt,
+              durationMs: now - tool.startedAt,
+              toolCallId: completedToolCallId,
+              ...(msg.toolOutcome !== undefined ? { toolOutcome: msg.toolOutcome } : {}),
+              ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
             });
             deps.store
               .createWorkflowEvent({
@@ -4447,14 +4587,20 @@ async function executeLoopNode(
                 event_type: 'tool_completed',
                 step_name: stepName,
                 data: {
-                  tool_name: completedTool.toolName,
-                  duration_ms: now - completedTool.startedAt,
+                  tool_name: tool.toolName,
+                  duration_ms: now - tool.startedAt,
+                  tool_call_id: completedToolCallId,
+                  ...(msg.toolOutcome !== undefined ? { tool_outcome: msg.toolOutcome } : {}),
+                  ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
                 },
               })
               .catch((err: Error) => {
                 logEventStoreError(err, i);
               });
-            lastToolStartedAt = null;
+            runningTools.delete(completedToolCallId);
+            if (completedToolCallId === lastAnonymousToolCallId) {
+              lastAnonymousToolCallId = undefined;
+            }
           }
           if (platform.sendStructuredEvent) {
             await platform.sendStructuredEvent(conversationId, msg);
@@ -5053,6 +5199,7 @@ async function executeApprovalNode(
       model: resolvedNodeModel,
       options: nodeOptions,
       tier: resolvedTier,
+      effort: resolvedEffort,
     } = await resolveNodeProviderAndModel(
       syntheticNode,
       workflowProvider,
@@ -5087,6 +5234,7 @@ async function executeApprovalNode(
       issueContext,
       resolvedNodeModel,
       resolvedTier,
+      resolvedEffort,
       stepNamePrefix,
       iteration
     );
@@ -5822,6 +5970,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               options: loopOptions,
               model: resolvedLoopModel,
               tier: resolvedLoopTier,
+              effort: resolvedLoopEffort,
             } = await resolveNodeProviderAndModel(
               node,
               workflowProvider,
@@ -5857,7 +6006,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               stepNamePrefix,
               execContext,
               resolvedLoopModel,
-              resolvedLoopTier
+              resolvedLoopTier,
+              resolvedLoopEffort
             );
             // Loop nodes run every iteration on the same resolved provider, so the
             // result session (if any) is attributable to loopProvider — tag it so a
@@ -6024,6 +6174,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             model: resolvedNodeModel,
             options: nodeOptions,
             tier: resolvedTier,
+            effort: resolvedEffort,
           } = await resolveNodeProviderAndModel(
             node,
             workflowProvider,
@@ -6169,6 +6320,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 issueContext,
                 resolvedNodeModel,
                 resolvedTier,
+                resolvedEffort,
                 stepNamePrefix,
                 iteration
               ),
