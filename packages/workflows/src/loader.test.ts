@@ -3932,6 +3932,48 @@ nodes:
       expect(err?.error).toContain("sibling node '$sib'");
     });
 
+    it('should fail expansion when a resolved block command file references an include input', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      const commandsDir = join(testDir, '.archon', 'commands');
+      await mkdir(workflowDir, { recursive: true });
+      await mkdir(commandsDir, { recursive: true });
+
+      await writeFile(join(commandsDir, 'parameterized-runner.md'), 'Review $INPUTS.scope.');
+      await writeFile(
+        join(workflowDir, 'parameterized-block.yaml'),
+        `
+name: parameterized-block
+description: Block whose command references an include input
+nodes:
+  - id: runner
+    command: parameterized-runner
+`
+      );
+      await writeFile(
+        join(workflowDir, 'parameterized-parent.yaml'),
+        `
+name: parameterized-parent
+description: Includes the parameterized command block
+nodes:
+  - id: review
+    include: parameterized-block
+    with:
+      scope: main
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows.some(w => w.workflow.name === 'parameterized-parent')).toBe(false);
+      const message = result.errors.find(
+        error => error.filename === 'parameterized-parent.yaml'
+      )?.error;
+      expect(message).toContain("Node 'review'");
+      expect(message).toContain("included block 'parameterized-block'");
+      expect(message).toContain("command file 'parameterized-runner.md'");
+      expect(message).toContain("parameter '$INPUTS.scope'");
+      expect(message).toContain('inline the prompt');
+    });
+
     it('should scan block command files in a configured custom command folder (config parity)', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       const customCmds = join(testDir, 'my-cmds');
@@ -4006,13 +4048,54 @@ nodes:
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      // Unresolvable command → WARN, never a hard expansion error.
+      // Unresolvable command → WARN, never a hard expansion error. The scan is
+      // best-effort by construction; a file it cannot read is unverified, not unsafe,
+      // and dropping the workflow would break includes that never used this feature.
       const parentErrors = result.errors.filter(e => e.filename === 'ghost-parent.yaml');
       expect(parentErrors).toHaveLength(0);
       expect(result.workflows.some(w => w.workflow.name === 'ghost-parent')).toBe(true);
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.objectContaining({ include: 'g', command: 'ghost-cmd-does-not-exist-xyz' }),
         'include.command_file_unresolved_for_ref_scan'
+      );
+    });
+
+    it('should scan an included loop.command file for include inputs', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      const commandDir = join(testDir, '.archon', 'commands');
+      await mkdir(workflowDir, { recursive: true });
+      await mkdir(commandDir, { recursive: true });
+      await writeFile(join(commandDir, 'loop-review.md'), 'Review $INPUTS.scope.');
+      await writeFile(
+        join(workflowDir, 'loop-block.yaml'),
+        `
+name: loop-block
+description: Block with a deferred loop prompt
+nodes:
+  - id: repeat
+    loop:
+      command: loop-review
+      until: DONE
+      max_iterations: 1
+`
+      );
+      await writeFile(
+        join(workflowDir, 'loop-parent.yaml'),
+        `
+name: loop-parent
+description: Includes the loop block
+nodes:
+  - id: review
+    include: loop-block
+    with:
+      scope: production
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows.some(w => w.workflow.name === 'loop-parent')).toBe(false);
+      expect(result.errors.find(error => error.filename === 'loop-parent.yaml')?.error).toContain(
+        "command file 'loop-review.md'"
       );
     });
   });

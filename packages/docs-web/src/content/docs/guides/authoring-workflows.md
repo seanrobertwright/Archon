@@ -954,12 +954,59 @@ written the nodes by hand. There is no separate child run.
 - **Output.** `$<includeId>.output` in another node resolves to the block's primary sink.
   In the example, `$review.output` is the output of the block's `implement-fixes` node.
 
+### Passing values into an included block
+
+An include can pass an identifier-keyed string map through `with:`. The included block uses
+those values through `$INPUTS.<name>` in its inline text:
+
+```yaml
+# parent workflow
+nodes:
+  - id: plan
+    prompt: Plan the requested change.
+
+  - id: review
+    include: reusable-review
+    depends_on: [plan]
+    with:
+      plan: $plan.output
+      base_branch: main
+```
+
+```yaml
+# reusable-review workflow
+nodes:
+  - id: inspect
+    prompt: Review $INPUTS.plan against $INPUTS.base_branch.
+```
+
+Input names must start with a letter or underscore and may then contain letters, numbers,
+underscores, or hyphens. Values must be strings and are inserted verbatim during load-time
+expansion — they are **never expressions**: nothing is evaluated, computed, or interpreted,
+and the value is spliced in as text exactly as written. An inserted `$node.output` reference
+remains a reference and resolves through the normal runtime output substitution. A missing
+input is a load error; extra caller keys are ignored until workflow input declarations ship.
+
+Substitution applies everywhere the value could reach the model or the shell, including
+inside Markdown code fences and inline code spans — `$INPUTS.<name>` has no
+documentation-only meaning, so a fenced occurrence is still a live parameter.
+
+#### Command bodies cannot use include inputs
+
+Phase 1 cannot parameterize a `command:` file or `loop.command` file used by an included
+block. Command bodies are read at execution time, after load-time include expansion has
+finished. When such a file can be read at load time and contains `$INPUTS.<name>` anywhere —
+including inside a code fence — workflow loading fails with a message directing you to inline
+the prompt text. Use an inline `prompt:` when the block needs include inputs.
+
+This check is best-effort, so a clean load is not a guarantee. It covers the block's
+top-level `command:`/`loop.command` nodes only, so a command nested inside a `loop_group`
+body is not scanned; and a command file that cannot be resolved at load time is logged as a
+warning and skipped rather than failing the workflow. This restriction applies to `include:`;
+named `with:` mappings for `workflow:` sub-runs have not shipped.
+
 ### Non-goals (Phase 1)
 
-- **No `with:` input mapping yet.** Passing values into an included block is not supported;
-  an include node with a `with:` key is rejected with a clear error. A block reaches parent
-  context only through workflow variables (`$BASE_BRANCH`, `$ARTIFACTS_DIR`, …) and command
-  files, which is enough for the shared-review-block use case.
 - **No deep access.** A parent can read `$includeId.output` (the terminal) but not the
   output of an individual node inside the block. The block's internal node names are an
   implementation detail.
