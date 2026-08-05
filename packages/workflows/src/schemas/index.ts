@@ -42,6 +42,7 @@ export {
   scriptNodeSchema,
   includeNodeSchema,
   workflowNodeSchema,
+  fanOutConfigSchema,
   dagNodeSchema,
   isBashNode,
   isLoopNode,
@@ -80,6 +81,7 @@ export type {
   ScriptNode,
   IncludeNode,
   WorkflowNode,
+  FanOutConfig,
   DagNode,
   EffortLevel,
   ThinkingConfig,
@@ -118,6 +120,8 @@ export {
   RESUMABLE_WORKFLOW_STATUSES,
   isApprovalContext,
   isRunBlockedOnChild,
+  SUBRUN_METADATA_KEYS,
+  readSubrunMetadata,
 } from './workflow-run';
 export type {
   WorkflowRunStatus,

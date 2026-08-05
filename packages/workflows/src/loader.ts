@@ -98,6 +98,16 @@ function formatNodeIssue(id: string, issue: z.ZodIssue): string {
  * Replaces the former parseDagNode + parseRetryConfig + parseToolList +
  * parseNodeHooks + parseIdleTimeout functions.
  */
+/**
+ * The one shape of a `$nodeId.output` reference. Both scanners below build their own
+ * RegExp from it — a `g`-flagged one for the multi-match dangling-ref sweep and a plain one
+ * for `fan_out.items` — because a `g` regex carries mutable `lastIndex` and sharing a single
+ * instance across call sites is how that turns into skipped matches. Sharing the SOURCE is
+ * the part that matters: a second hand-written copy inside a function that already warns
+ * "KEEP IN SYNC" is exactly the drift that warning is about.
+ */
+const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
+
 function parseDagNode(raw: unknown, index: number, errors: string[]): DagNode | null {
   // Extract id early for error messages (may be empty/invalid — schema will catch it)
   const rawId =
@@ -221,8 +231,8 @@ export function validateDagStructure(
   // Check $nodeId.output references across EVERY field the executor substitutes at
   // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
   // (prompt, bash, script, approval.message, cancel, loop.prompt, loop.until_bash,
-  // loop_group.until_bash, workflow.input). A dangling ref in any of them silently
-  // substitutes to '' at run time, so all must be validated here.
+  // loop_group.until_bash, workflow.input, workflow.fan_out.items). A dangling ref in
+  // any of them silently substitutes to '' at run time, so all must be validated here.
   //
   // KEEP IN SYNC (three ref-surface enumerations must agree):
   //   1. this scan (loader validateDagStructure) — validates refs,
@@ -236,7 +246,7 @@ export function validateDagStructure(
   // inside a script-node example); strip those before scanning so they don't false-match.
   // The code/expression fields (bash / script / until_bash / cancel) and when: clauses
   // carry live refs (not documentation), so they are scanned verbatim.
-  const outputRefPattern = /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output/g;
+  const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
   const stripMarkdownCode = (s: string): string =>
     s.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]*`/g, '');
   for (const node of nodes) {
@@ -248,8 +258,12 @@ export function validateDagStructure(
     if (isBashNode(node)) sources.push(node.bash);
     if (isScriptNode(node)) sources.push(node.script);
     // workflow.input is a live ref surface (a data string), scanned verbatim like
-    // bash/script — not prose, so no markdown stripping.
-    if (isWorkflowNode(node) && node.input) sources.push(node.input);
+    // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
+    // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
+    if (isWorkflowNode(node)) {
+      if (node.input) sources.push(node.input);
+      if (node.fan_out) sources.push(node.fan_out.items);
+    }
     if (isCancelNode(node)) sources.push(node.cancel);
     if (isApprovalNode(node)) sources.push(node.approval.message);
     if (isLoopNode(node)) {
@@ -280,6 +294,34 @@ export function validateDagStructure(
     }
   }
 
+  // fan_out.items (slice 2, PR-C) must reference the output of a node that is a
+  // TRANSITIVE dependency of the fan-out node — so the item array is guaranteed
+  // produced before the node expands. A same-layer or downstream producer would race
+  // (the ref resolves to nothing → the node fails closed at run time); catch it at
+  // load time with an actionable message instead. A literal `items` with no `$…output`
+  // ref is left to the runtime fail-closed check (it must still parse to an array).
+  const directDeps = new Map<string, string[]>(nodes.map(n => [n.id, n.depends_on ?? []]));
+  const transitiveDepsOf = (nodeId: string): Set<string> => {
+    const seen = new Set<string>();
+    const stack = [...(directDeps.get(nodeId) ?? [])];
+    while (stack.length > 0) {
+      const dep = stack.pop();
+      if (dep === undefined || seen.has(dep)) continue;
+      seen.add(dep);
+      stack.push(...(directDeps.get(dep) ?? []));
+    }
+    return seen;
+  };
+  for (const node of nodes) {
+    if (!isWorkflowNode(node) || !node.fan_out) continue;
+    const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);
+    const producerId = refMatch?.[1];
+    if (producerId === undefined) continue; // no ref surface — runtime fail-closed owns it
+    if (!transitiveDepsOf(node.id).has(producerId)) {
+      return `Node '${node.id}' fan_out.items references '$${producerId}.output', which is not an upstream dependency — add '${producerId}' to '${node.id}'.depends_on so its item array is produced first`;
+    }
+  }
+
   // Recursively validate loop_group bodies as scoped sub-DAGs. A loop_group body is
   // sealed for GRAPH edges: its depends_on edges resolve within the body (not the
   // outer DAG), and the body is itself a DAG (unique ids, no cycles). $nodeId.output
@@ -297,9 +339,11 @@ export function validateDagStructure(
       if (includeInBody) {
         return `loop_group '${node.id}' body: 'include' is not supported inside a loop_group body`;
       }
-      // `workflow:` (sub-run) inside a loop_group body is rejected in slice 1 (bounds
-      // the interaction surface — see the plan's NOT Building). A sub-run per
-      // iteration needs the fan-out semantics deferred to slice 2.
+      // `workflow:` (sub-run) inside a loop_group body is rejected (bounds the
+      // interaction surface — see the plan's NOT Building). This wholesale rejection
+      // also covers a fan-out (`fan_out:`) workflow node in a loop_group body (slice 2,
+      // PR-C): a fan-out is a `workflow:` node, so nesting it per-iteration is likewise
+      // out of scope.
       const workflowInBody = node.loop_group.nodes.find(isWorkflowNode);
       if (workflowInBody) {
         return `loop_group '${node.id}' body: 'workflow' (sub-run) is not supported inside a loop_group body`;

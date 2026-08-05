@@ -198,7 +198,7 @@ nodes:
 | `approval` | object | Pauses workflow for human review. See [Approval Nodes](/guides/approval-nodes/) |
 | `cancel` | string | Terminates the workflow run with a reason string. Uses existing cancellation plumbing — in-flight parallel nodes are stopped |
 | `include` | string | Name of another workflow whose nodes are inlined into this DAG at load time as a namespaced sub-DAG. See [Reusing a Shared Sub-DAG](#reusing-a-shared-sub-dag-with-include) |
-| `workflow` | string | Name of another workflow to run as a governed **child sub-run** at execution time — its own run record, gates, artifacts, and cost. Optional `input` (data string) and `isolation` (`'inherit'` \| `'worktree'`). See [Composing a Governed Sub-Run](#composing-a-governed-sub-run-with-workflow) |
+| `workflow` | string | Name of another workflow to run as a governed **child sub-run** at execution time — its own run record, gates, artifacts, and cost. Optional `input` (data string), `isolation` (`'inherit'` \| `'worktree'`), and `fan_out` (one child per item of a runtime list). See [Composing a Governed Sub-Run](#composing-a-governed-sub-run-with-workflow) |
 
 **Common fields** — apply to all node types:
 
@@ -207,7 +207,7 @@ nodes:
 | `id` | string | required | Unique node identifier. Used in `depends_on`, `when:`, and `$id.output` substitution |
 | `depends_on` | string[] | `[]` | Node IDs that must complete before this node runs |
 | `when` | string | — | Condition expression. Node is skipped if false. See [Condition Syntax](#when-condition-syntax) |
-| `trigger_rule` | string | `all_success` | Join semantics when multiple upstreams exist |
+| `trigger_rule` | string | `all_success` | Join semantics when multiple upstreams exist. Distinct from a fan-out node's [`fan_out.join`](#the-four-fields), which reduces one node's N children and defaults to `all_done` |
 | `context` | `'fresh'` \| `'shared'` | — | `fresh` = new session; `shared` = inherit from prior node. Defaults to `fresh` for parallel layers, inherited for sequential |
 | `idle_timeout` | number | — | Kill node if idle for this many milliseconds |
 | `retry` | object | — | Per-node retry configuration. See [Retry Configuration](#retry-configuration) |
@@ -347,6 +347,19 @@ nodes:
 | `one_success` | Run if at least one upstream dep completed successfully |
 | `none_failed_min_one_success` | Run if no deps failed AND at least one succeeded (skipped deps are ok) |
 | `all_done` | Run when all deps are in a terminal state (completed, failed, or skipped) |
+
+:::note[`trigger_rule` is not `fan_out.join`]
+They share value names and have **different defaults**, so it is worth keeping straight:
+
+- **`trigger_rule`** (any node) decides whether *this* node runs, given the states of the
+  nodes it `depends_on`. Default `all_success` — don't run if an upstream failed.
+- **[`fan_out.join`](#the-four-fields)** (fan-out nodes only) reduces the outcomes of one
+  node's N children into that node's single outcome. Default `all_done` — children are
+  independent, so one failing still yields the others.
+
+Upstream dependencies are steps you chose to sequence; fan-out children are N instances of
+one step. Hence the different defaults.
+:::
 
 ### `when:` Condition Syntax
 
@@ -1105,12 +1118,261 @@ time.** Two children in the same layer that both pause for approval contend for 
 run's single approval slot — the second pause fails its node. Sequence gated sub-runs with
 `depends_on` until a later slice adds real concurrent gating.
 
+### Fanning out over a list with `fan_out:`
+
+`fan_out:` turns one `workflow:` node into **N child runs** — one per element of a list
+produced at run time — and reduces their results back into a single node output. Each
+child is a full governance object in its own right: its own run record, artifacts, cost
+line and audit trail, exactly like a 1:1 sub-run.
+
+```yaml
+nodes:
+  - id: pick-files
+    bash: |
+      git diff --name-only origin/main \
+        | jq -R -s -c 'split("\n") | map(select(length > 0))'
+
+  # review-one-file declares `mutates_checkout: false` — see "Isolation" below.
+  - id: review-each
+    workflow: review-one-file
+    depends_on: [pick-files]
+    fan_out:
+      items: "$pick-files.output"    # must resolve to a JSON array
+      max_parallel: 3
+      # join defaults to all_done: one file failing to review still yields the rest
+
+  - id: summarize
+    prompt: "Summarize these per-file reviews:\n\n$review-each.output"
+    depends_on: [review-each]
+```
+
+Each item becomes one child's `$ARGUMENTS`. `$review-each.output` is a JSON array of the
+children's terminal outputs **in item order**, not completion order — so a downstream node
+can line results up against the input list positionally.
+
+#### The four fields
+
+| Field | Default | What it does |
+|-------|---------|--------------|
+| `items` | required | A `$node.output` (or `$node.output.field`) reference that must resolve to a **JSON array** at run time. Anything else — an object, a bare string, malformed JSON, a dangling ref — fails the node before any child is created. It never fans out over the characters of a string, and never silently degrades to zero items. An empty array is legal: the node completes immediately with `[]`. |
+| `as` | — | Reserved for a future `$INPUTS.<as>` channel ([#2214](https://github.com/coleam00/Archon/issues/2214)) and **rejected at load** until then, rather than accepted and ignored — writing `as: task` and then `$INPUTS.task` in the child would otherwise deliver the literal string to the model. The item reaches the child as `$ARGUMENTS`. |
+| `max_parallel` | `5` | How many children may be **in flight at once**. |
+| `join` | `all_done` | How N child outcomes reduce to one node outcome (below). |
+
+The `items` producer must be an upstream dependency — the loader rejects a reference to a
+node this one doesn't transitively depend on, so the array can never be read before it is
+written.
+
+#### `max_parallel` bounds concurrency, not count
+
+`max_parallel` is a sliding window, not a limit on how many children exist. `items` is
+**unbounded**: a 400-element array produces 400 child runs regardless of the window. Two
+consequences worth planning for:
+
+- Cost scales with `items.length`, not with `max_parallel`. Bound the list in the producer
+  node, not here.
+- Abandoning the parent cascade-cancels at most 500 descendant runs (`MAX_CASCADE_RUNS`).
+  A fan-out wider than that can leave children uncancelled and still billing; they have to
+  be abandoned individually. A run-tree-wide budget ceiling is tracked in
+  [#1961](https://github.com/coleam00/Archon/issues/1961).
+
+#### Join semantics
+
+| `join` | The node succeeds when… | `$<id>.output` |
+|--------|------------------------|----------------|
+| `all_done` (default) | every child reached a terminal state | JSON array in item order, with each failed/cancelled child represented as `{ error, status }` in its slot |
+| `all_success` | every child completed | same array; any failed or cancelled child fails the node instead |
+| `first_success` | — | Racing: **rejected**, not deferred — see below. Rejected at load rather than silently treated as another join |
+
+**Every child runs to its own terminal state before the join reduces, under both joins.** A
+child that fails does not stop its siblings, does not stop later items from being spawned,
+and does not change any other child's outcome. `all_success` still fails the node if any
+child failed — it just reaches that verdict after everyone has finished rather than by
+ending the others early. The failure message names the child that failed.
+
+##### Why `all_done` is the default
+
+Because fan-out children are **independent**. Two research children with different scopes,
+or ten triage children over ten issues, are not one job split ten ways — they are ten jobs
+that happen to run together, and one of them failing says nothing about the other nine. If
+the default were all-or-nothing, a single failed child would discard nine good results at
+the join, after you had already paid for them.
+
+So the default treats **failure as data**. Every terminal outcome reaches the aggregate,
+failed ones as `{ error, status }` in their slot, and the node succeeds. What to do about
+the gaps is then an ordinary decision made by an ordinary node:
+
+```yaml
+  - id: triage-each
+    workflow: triage-one-issue
+    depends_on: [list-issues]
+    fan_out:
+      items: "$list-issues.output"      # join: all_done — the default
+
+  - id: check
+    script: |
+      const results = $triage-each.output;
+      const ok = results.filter(r => typeof r === 'string');
+      console.log(JSON.stringify({ ok: ok.length, total: results.length }));
+    runtime: bun
+    depends_on: [triage-each]
+
+  - id: report
+    prompt: "Summarize the $check.output.ok successful triages:\n\n$triage-each.output"
+    depends_on: [check]
+    when: "$check.output.ok != '0'"
+```
+
+That shape is deliberate, and it is why there is no `join` value meaning *"succeed if at
+least K children completed"*. **How many results are enough is judgement about your work,
+not a join rule** — it depends on which children failed and why, and it changes between
+runs. A script or prompt node reading the aggregate can weigh that; an enum cannot, and
+adding a threshold would start a policy language inside a YAML field. `when:` gates whatever
+comes next.
+
+Use `all_success` when the children genuinely are one job — when a gap makes the aggregate
+meaningless rather than smaller. That is the uncommon case, which is exactly why it is the
+one you have to ask for.
+
+##### Why there is no racing join
+
+`join: first_success` — run N children, keep whichever finishes first, drop the rest — is
+**rejected**, not postponed. Writing it fails at load with a message saying so.
+
+Racing only works by ending the losers: the moment a winner appears, the others are aborted
+and cancelled. That is one child's outcome deciding its siblings', which is precisely the
+coupling the independence rule forbids — and it cannot be reshaped, because a race that
+lets the losers finish is not a race.
+
+The want underneath it is real: *several genuinely different attempts, best result forward.*
+That is served without any mutual cancellation — write the attempts as **separate nodes**,
+each with its own model or prompt, all feeding one collector node that picks:
+
+```yaml
+  - id: attempt-a
+    prompt: "Solve $ARGUMENTS using the existing helper."
+    model: large
+  - id: attempt-b
+    prompt: "Solve $ARGUMENTS from scratch."
+    model: medium
+
+  - id: pick
+    prompt: "Two attempts. Choose the better and explain why.\n\nA:\n$attempt-a.output\n\nB:\n$attempt-b.output"
+    depends_on: [attempt-a, attempt-b]
+    trigger_rule: none_failed_min_one_success
+```
+
+This is strictly better than racing at what racing was wanted for: the attempts can differ
+by **model**, which a fan-out cannot express, every output is preserved for the collector to
+weigh instead of thrown away, and selection is a judgement made by a node that can read the
+work rather than a stopwatch.
+
+This is a deliberate trade, and the cost is yours to plan for: **a fan-out whose first child
+fails still runs every remaining child.** Worst-case spend is `items.length` attempts, not
+"until the first failure". `max_parallel` caps how many run at once, never how many run in
+total, so a 200-item fan-out over a child that fails on item 1 still costs 200 children.
+Bound the list in the producer node if that matters, and treat the abandon-cascade note
+above as a real limit rather than a footnote — this is what makes
+[#1961](https://github.com/coleam00/Archon/issues/1961)'s budget ceiling load-bearing.
+
+#### Isolation: the same explicit rule, and one sharp edge
+
+Fan-out changes nothing about [`isolation:`](#choosing-the-childs-checkout-with-isolation).
+The engine does not infer a worktree from `fan_out:` — how many children a node spawns says
+nothing about whether they write. N review or research children over the parent's checkout
+is the ordinary case and needs no isolation at all.
+
+But N children sharing one checkout **are siblings of each other**, so they meet the path
+lock described in [Running sub-runs side by side](#running-sub-runs-side-by-side): all but
+one would cancel themselves, and a lock-cancelled child is not recoverable by resume. So
+Archon refuses that expansion **before creating a single child**:
+
+```text
+fan_out node 'review-each': up to 3 children of 'review-one-file' would run at once in the
+parent checkout, and that workflow does not declare `mutates_checkout: false`. Concurrent
+runs on one checkout take a path-exclusive lock, so all but the first would cancel
+themselves — and a lock-cancelled child is not recoverable by resume (#2180). Choose one:
+add `mutates_checkout: false` to 'review-one-file' if it only reads the repo; set
+`isolation: worktree` on 'review-each' if the children write to it; or set
+`fan_out.max_parallel: 1` to run them one at a time.
+```
+
+Three ways out, and which one is right is a statement about the children:
+
+| The children… | Do this |
+|---------------|---------|
+| only read the repo (review, research, summarize) | `mutates_checkout: false` on the **child workflow** |
+| write to the repo | `isolation: worktree` on the **fan-out node** — every child gets its own worktree and branch, at the [cost described above](#what-isolation-worktree-gives-you-and-what-it-costs), multiplied by N |
+| write, but can be serialized | `fan_out.max_parallel: 1` — one child at a time in the parent checkout, so no two ever contend |
+
+The check runs at **spawn** time, not load time: the child target resolves when the node
+executes (that is deliberate — it's what lets a workflow generate another workflow and then
+run it), so `archon validate workflows` cannot see the child's `mutates_checkout`. What it
+can guarantee is that you find out before any child exists and before any money is spent.
+
+#### Gates: around a fan-out, never inside one
+
+A fan-out is an **autonomous** stretch of a run. A parent run has a single approval slot, so
+N children cannot each hold it — a child that pauses at a gate fails the fan-out node
+instead of pausing the tree ([#2438](https://github.com/coleam00/Archon/issues/2438)).
+
+That is the intended shape, not a missing feature: gates **bracket** the autonomous middle.
+
+- An `approval:` node **before** the fan-out is an ordinary parent gate — approve, then the
+  expansion runs.
+- An `approval:` node **after** it resumes correctly: the completed fan-out node is skipped
+  on resume and `$<id>.output` still holds the full aggregate.
+- A gate **inside a 1:1 sub-run** (no `fan_out:`) also works — the child pauses, the tree
+  pauses, and approving the child by its run id auto-resumes the parent.
+
+The one asymmetry to know about: the *same* child workflow pauses correctly when spawned
+1:1 and hard-fails when fanned out. If you wrap an existing gated workflow in `fan_out:`,
+move the gate into the parent DAG around the node.
+
+A paused child is the single case where a fan-out cancels a run it did not have to. A pause
+is not a terminal state and the parent cannot hand its one approval slot to N children, so
+the child would wait for something it can never be given — cancelling it (tagged
+`fan_out_gate`, so removing the gate and resuming re-drives it) is what makes it terminal.
+It happens as soon as the pause is seen rather than at the end, because a non-terminal run
+still holds its working path: left paused, it would take the path lock out from under the
+next sibling on a shared checkout. Its siblings are unaffected either way — they run to
+their own terminal states, and the node fails afterwards.
+
+#### Resume, and what `child_index` keys
+
+Children are keyed by their position in the item list (`metadata.child_index`), which is
+what makes a parent resume cheap and predictable:
+
+- Completed children are threaded from their existing rows — never re-run, never re-billed.
+- Failed children are re-driven in place, in the same row.
+- Children Archon itself cancelled — in practice a gate rejection (below) — are tagged and
+  re-driven too, so *"remove the gate and resume"* actually completes the node. A child
+  **you** cancelled out of band stays cancelled and is never resurrected.
+- A child left `running` or `pending` by an interrupted process is **not** auto-cancelled —
+  Archon can't tell a crash orphan from a live run elsewhere. The node fails with the child's
+  run id and tells you to wait or abandon it.
+
+Because the key is the index, the `items` list changing between attempts matters:
+
+- **The list got shorter** — a child whose index no longer exists is logged and, if still
+  running, cancelled as an orphan. It is never silently dropped.
+- **An item at some index changed** (a non-deterministic producer) — resume still re-keys by
+  index and warns (`workflow.fan_out_item_content_changed`) that a child's item is not the
+  one it was spawned with. In the normal case this can't happen: the producer's output is
+  cached from the first attempt and replayed on resume. It shows up when the producer node
+  is marked `always_run: true`, or when its output genuinely isn't stable.
+
+If you want a fan-out whose item list is guaranteed identical across attempts, keep the
+producer deterministic — write the list to `$ARTIFACTS_DIR` and read it back rather than
+re-deriving it.
+
 ### Non-goals (this slice)
 
 - **No `with:` named-parameter mapping** — use `input:` (a single data string). A
   `workflow:` node with a `with:` key is rejected with a clear error.
-- **No dynamic fan-out / variable N** and **no racing** — both reserved for a later slice.
-- **Not inside a `loop_group` body** — rejected at load time.
+- **No racing** (`join: first_success`) — rejected outright, not deferred (see [Why there is no racing join](#why-there-is-no-racing-join)).
+- **Not inside a `loop_group` body** — a `workflow:` node, fanned out or not, is rejected
+  there at load time ([#2439](https://github.com/coleam00/Archon/issues/2439)).
 - **Static target only.** `workflow:` takes a literal workflow name — no
   `workflow: $something`. Self-reference and ancestor cycles (`A` → `B` → `A`) are rejected
   at run time, and the sub-run tree is depth-capped.

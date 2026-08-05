@@ -466,6 +466,55 @@ export type IncludeNode = z.infer<typeof includeNodeSchema> & {
 };
 
 /**
+ * Dynamic fan-out config for a `workflow:` node (#2121 slice 2, PR-C). Expands the
+ * node into N governed child runs — one per element of a runtime-length item list —
+ * joined into a single node outcome. `items` is a `$node.output[.field]` ref that
+ * MUST resolve to a JSON array at run time (DATA, per the constitution's
+ * §load-time-composition — the child target stays a static name; only the item
+ * COUNT is runtime). Each item becomes a child's `input`/`$ARGUMENTS`. `max_parallel`
+ * bounds a sliding-window concurrency pool (default 5 — documented + defeatable, so
+ * an author can't trivially create a runaway N-wide layer, #1961). It is also the serial
+ * escape from the shared-checkout collision: `max_parallel: 1` runs the children one at a
+ * time, so no two of them contend for the parent checkout's path lock. `max_parallel` caps
+ * *concurrency*, NOT the total child count — `items.length` is unbounded here, so a very
+ * large list (≳ the abandon-time cascade bound `MAX_CASCADE_RUNS`, currently 500) can
+ * leave some children uncancelled when the parent is abandoned; a run-tree-wide count/
+ * budget ceiling is deferred to #1961. `join` reduces the
+ * N child outcomes into the node's single outcome + `$<id>.output` aggregate:
+ *   - `all_done` (DEFAULT): the node succeeds once every child is terminal; failed and
+ *      cancelled entries are represented as `{ error, status }` objects in the array.
+ *      Default because fan-out children are independent by default (see the constitution's
+ *      independence rule) — two researchers with different scopes, or ten triage children
+ *      over ten issues, do not depend on each other, so one failing must not discard the
+ *      others' output. Failure is DATA here; deciding how many successes are enough is
+ *      judgement and belongs in a downstream node reading the aggregate, never in this enum.
+ *   - `all_success`: all must complete; `$<id>.output` = JSON array of child outputs in
+ *      item order; any child failing/cancelled fails the node. For the genuinely dependent
+ *      case, where the author says so.
+ *   - `first_success`: racing — REJECTED, not deferred. A winner aborting and cancelling
+ *      the losers couples children's fates, which the constitution's independence rule
+ *      forbids, and racing cannot be reshaped without it. The enum value is retained only
+ *      so existing YAML gets a message explaining the rejection.
+ *
+ * `as` is a forward seam reserved for PR-B (#2214, `with:`/`$INPUTS`): it will name the
+ * per-item value as `$INPUTS.<as>` inside the child. The key is accepted here so PR-B
+ * needs no schema migration, but until PR-B lands the superRefine REJECTS it at load —
+ * it has no runtime effect, and silently ignoring it would deliver a literal
+ * `$INPUTS.<as>` to the model. The item travels as the child's `$ARGUMENTS` today.
+ */
+export const fanOutConfigSchema = z.object({
+  items: z
+    .string()
+    .min(1, "'fan_out.items' must reference a node output that produces a JSON array"),
+  as: z.string().optional(),
+  max_parallel: z.number().int().min(1, "'fan_out.max_parallel' must be >= 1").default(5),
+  join: z.enum(['all_success', 'all_done', 'first_success']).default('all_done'),
+});
+
+/** Dynamic fan-out configuration for a `workflow:` sub-run node (#2121 slice 2, PR-C). */
+export type FanOutConfig = z.infer<typeof fanOutConfigSchema>;
+
+/**
  * Workflow (sub-run) node schema — starts another workflow as a CHILD RUN of the
  * current run at execution time (see executeWorkflowNode in dag-executor.ts). Unlike
  * `include:` (which flattens another workflow's nodes into ONE run at load time), a
@@ -475,7 +524,10 @@ export type IncludeNode = z.infer<typeof includeNodeSchema> & {
  * substituted) forwarded as the child's user message. `isolation` selects the
  * child's checkout: `'inherit'` (default) shares the parent's checkout; `'worktree'`
  * (slice 2, PR-A) runs the child in its own git worktree via an injected
- * child-isolation resolver. `output_format`/`output_type` from the base stay
+ * child-isolation resolver — never inferred, including from `fan_out`. `fan_out` (slice 2,
+ * PR-C) expands the node into N child runs over a data-driven item list; concurrent
+ * children sharing the parent checkout are the author's call to make, declared by
+ * `mutates_checkout: false` on the child workflow. `output_format`/`output_type` from the base stay
  * meaningful (the child's terminal output threads back as `$<id>.output`,
  * field-accessible when a schema is declared and the child emits JSON).
  */
@@ -483,6 +535,7 @@ export const workflowNodeSchema = dagNodeBaseSchema.extend({
   workflow: z.string().min(1, "'workflow' must be a non-empty workflow name"),
   input: z.string().optional(),
   isolation: z.enum(['inherit', 'worktree']).optional(),
+  fan_out: fanOutConfigSchema.optional(),
 });
 
 /** DAG node that runs another workflow as a governed child sub-run at execution time */
@@ -640,6 +693,10 @@ export const dagNodeSchema = dagNodeBaseSchema
     // `'worktree'` (slice 2, PR-A) runs the child in its own git worktree via an
     // injected child-isolation resolver.
     isolation: z.enum(['inherit', 'worktree']).optional(),
+    // Dynamic fan-out (slice 2, PR-C) — expand the workflow node into N child runs
+    // over a data-driven item list. Only meaningful on a `workflow:` node (guarded in
+    // superRefine).
+    fan_out: fanOutConfigSchema.optional(),
     // Reserved for Phase 1b input mapping. Present only so the superRefine below can
     // fail fast when it appears on an include or workflow node ("not yet supported").
     with: z.unknown().optional(),
@@ -736,6 +793,52 @@ export const dagNodeSchema = dagNodeBaseSchema
         code: z.ZodIssueCode.custom,
         message: "'isolation' is only supported on workflow (sub-run) nodes.",
         path: ['isolation'],
+      });
+    }
+    // Dynamic fan-out (slice 2, PR-C) is meaningful ONLY on a `workflow:` node — it
+    // multiplies a child sub-run. On any other node type it would be silently dropped,
+    // so reject it fail-fast (mirrors the `isolation` guard above).
+    if (!hasWorkflow && data.fan_out !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'fan_out' is only supported on workflow (sub-run) nodes.",
+        path: ['fan_out'],
+      });
+    }
+    // `first_success` racing is REJECTED, not deferred — the earlier deferral is dead. A
+    // winner aborting and cancelling its losers is one child's outcome ending its siblings',
+    // which the independence rule forbids, and racing without terminating the losers is not
+    // racing. So there is no PR to wait for and the message must not imply one.
+    //
+    // The enum value stays even though its original "so the eventual PR only lifts a guard"
+    // justification is gone. A better one replaces it: an author whose YAML already says
+    // `first_success` gets a message naming the rejection and the shape that serves the want,
+    // instead of an opaque unrecognised-enum-value error. Do not remove it as dead weight.
+    if (hasWorkflow && data.fan_out?.join === 'first_success') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "'fan_out.join: first_success' (racing) is rejected, not deferred: a winner cancels " +
+          "the losers, which couples children that are meant to be independent. Use 'all_done' " +
+          '(the default). For several genuinely different attempts, write them as separate ' +
+          'nodes with their own models feeding one collector node — every attempt is kept and ' +
+          'nothing is cancelled.',
+        path: ['fan_out', 'join'],
+      });
+    }
+    // `as` names the per-item value for the `$INPUTS.<as>` channel that PR-B (#2214) will
+    // add. Accept the key in the schema (so PR-B lifts a guard rather than migrating YAML)
+    // but reject it fail-fast now, exactly as `first_success` above. `$INPUTS` exists
+    // nowhere in the engine today, so an author writing `as: task` and `$INPUTS.task` in
+    // the child gets the literal string delivered to the model — silently wrong output
+    // with no error. A field that quietly does nothing reads as a working feature.
+    if (hasWorkflow && data.fan_out?.as !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "'fan_out.as' (the $INPUTS channel) is not yet supported (PR-B, #2214). Remove it — " +
+          "each item is delivered to the child as $ARGUMENTS, which the child's prompts can use today.",
+        path: ['fan_out', 'as'],
       });
     }
 
@@ -949,7 +1052,13 @@ export const dagNodeSchema = dagNodeBaseSchema
         ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
         workflow: data.workflow.trim(),
         ...(data.input !== undefined ? { input: data.input } : {}),
+        // Isolation is EXPLICIT-ONLY — never inferred, including from `fan_out`. How many
+        // children a node spawns says nothing about whether they write; N review or
+        // research children over the shared checkout is the common case. A shared-checkout
+        // fan-out whose children would collide is caught at spawn time instead
+        // (executeFanOutWorkflowNode), where the child's `mutates_checkout` is knowable.
         ...(data.isolation !== undefined ? { isolation: data.isolation } : {}),
+        ...(data.fan_out !== undefined ? { fan_out: data.fan_out } : {}),
       } as WorkflowNode;
     }
     // loop_group — guaranteed by superRefine to be defined at this point.
