@@ -1578,6 +1578,68 @@ archon validate workflows <name>
 
 This checks resource resolution beyond what load-time validation covers. Bundled and global workflows also reject `@custom` model aliases because those refs are not portable across projects. Use `--json` for machine-readable output. See the [CLI Reference](/reference/cli/) for details.
 
+### Unknown Keys Are Reported, Not Rejected
+
+A key Archon does not recognise is dropped from the parsed workflow — the YAML still loads and the workflow still runs. Because a dropped key can be one an author believed was doing something (the classic case is `interactive: true` on a command node, which reads like a human gate and is not one), Archon reports every dropped key as a **warning** naming the key, where it was found, and what to write instead:
+
+```text
+WARNING [unknown_key] Node 'plan': unknown key 'interactive' will be ignored.
+  Nothing on this node gates. For a human gate, use an 'approval:' node; to gate
+  each iteration of a loop, set BOTH 'loop.interactive: true' and
+  'loop.gate_message' ('gate_message' on its own does not gate). Workflow-level
+  'interactive:' is a different setting, and only on the web UI — it keeps the
+  run in the foreground there; chat platforms already run in the foreground, so
+  it does nothing for them.
+```
+
+(The `WARNING [unknown_key]` prefix is `archon validate workflows` formatting; the other surfaces below render the same message text differently.)
+
+**What is checked.** The workflow root, every node, the nested config blocks (`approval:`, `approval.on_reject:`, `retry:`, `loop:`, `loop_group:`, `pi:`, each `agents:` entry, `worktree:`, `container:`, `evidence_policy:`), and every node inside a `loop_group` body.
+
+**What is exempt**, because nothing is dropped from these — a key you write is a key that survives:
+
+| Block | Why exempt |
+|---|---|
+| `output_format:` | Free-form JSON Schema; every key is accepted |
+| `sandbox:` | Passthrough — unknown keys are preserved, not stripped |
+| `thinking:` | A preprocessed union, not an object shape |
+| `hooks:` | Strict — an unknown key is already a hard **error**, not a warning |
+
+**Where the warnings appear.**
+
+| Surface | Where |
+|---|---|
+| `archon validate workflows` | A `WARNING [unknown_key]` issue (also in `--json`) |
+| `archon workflow list` | Inline under the workflow; `parseWarnings` on each `--json` entry |
+| `archon workflow run` | On **stderr** before the run starts (`--detach --json` keeps stdout to the payload) |
+| Chat (`/workflow list`) | Inline with the workflow that raised it |
+| Any run that starts | **Recorded on the run** as a `workflow_parse_warnings` event — always |
+| Chat / console (starting a run) | Also posted to the conversation, best-effort |
+| Console workflow picker | A ⚠ marker on the row; full text in the tooltip |
+
+**Recorded on the run, whatever started it.** When a run begins, the engine writes
+the dropped keys to the run's event log as `workflow_parse_warnings`. This happens
+for every run — CLI, chat, console, REST, and sub-runs — not only the ones with a
+conversation to post into, and it is written by the engine rather than by the
+notification path, so a failed message cannot take the record with it. Read it back
+with:
+
+```bash
+archon workflow get <run-id> --verbose          # human-readable
+archon workflow get <run-id> --verbose --json   # `parseWarnings` on the payload
+```
+
+(`--verbose` is required: the plain form returns the run row without reading the
+event log.)
+
+The chat/console message at run start is a **notification on top of that record**.
+It is sent once and not retried: if the platform call fails (a revoked token, a rate
+limit) the run still starts and that message is lost, leaving a `WARN` log line —
+failing a run over an undeliverable warning would be worse. The finding is not lost
+with it; it is on the run, and still on `validate`, `list`, and the console picker.
+
+**Known gap — `include:`.** Warnings belong to the file that declared the key. If workflow A `include:`s workflow B and B has an unknown key, the warning is reported against **B**, not against A. Running A surfaces nothing. Check the included block directly (`archon validate workflows <block-name>`) when auditing a composed workflow.
+
 ### Example: Config Defaults + Workflow Override
 
 **`.archon/config.yaml`:**

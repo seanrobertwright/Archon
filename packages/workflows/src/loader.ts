@@ -27,16 +27,22 @@ import {
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
   WORKFLOW_NODE_IGNORED_FIELDS,
+  KNOWN_DAG_NODE_KEYS,
+  KNOWN_NODE_NESTED_KEYS,
   effortLevelSchema,
   thinkingConfigSchema,
   sandboxSettingsSchema,
   betasSchema,
 } from './schemas/dag-node';
+import type { NestedKeySpec } from './schemas/dag-node';
 import {
   modelReasoningEffortSchema,
   webSearchModeSchema,
   workflowRequirementSchema,
   workflowEvidencePolicySchema,
+  KNOWN_WORKFLOW_KEYS,
+  KNOWN_WORKFLOW_NESTED_KEYS,
+  WORKFLOW_ONLY_KEYS,
 } from './schemas/workflow';
 import type { WorkflowRequirement, WorkflowEvidencePolicy } from './schemas/workflow';
 import { workflowNodeHooksSchema } from './schemas/hooks';
@@ -94,11 +100,6 @@ function formatNodeIssue(id: string, issue: z.ZodIssue): string {
 }
 
 /**
- * Validate and parse a single DagNode from raw YAML data.
- * Replaces the former parseDagNode + parseRetryConfig + parseToolList +
- * parseNodeHooks + parseIdleTimeout functions.
- */
-/**
  * The one shape of a `$nodeId.output` reference. Both scanners below build their own
  * RegExp from it — a `g`-flagged one for the multi-match dangling-ref sweep and a plain one
  * for `fan_out.items` — because a `g` regex carries mutable `lastIndex` and sharing a single
@@ -108,13 +109,175 @@ function formatNodeIssue(id: string, issue: z.ZodIssue): string {
  */
 const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
 
-function parseDagNode(raw: unknown, index: number, errors: string[]): DagNode | null {
-  // Extract id early for error messages (may be empty/invalid — schema will catch it)
+/**
+ * The node's `id` for messages, falling back to its 1-based position when the
+ * id is missing or blank (the schema reports that separately as an error).
+ */
+function nodeIdForMessages(raw: unknown, index: number): string {
   const rawId =
     raw !== null && typeof raw === 'object' && 'id' in raw
       ? String((raw as Record<string, unknown>).id)
       : '';
-  const id = rawId.trim() || `#${String(index + 1)}`;
+  return rawId.trim() || `#${String(index + 1)}`;
+}
+
+/**
+ * Guidance for a key the engine drops, appended to the unknown-key warning.
+ *
+ * `interactive` gets its own text because it is the reported failure (#2213):
+ * an author writes it expecting a human gate, the key is dropped, and the run
+ * proceeds unattended. Both escapes offered here actually gate — in particular
+ * `loop.gate_message` ALONE does not: the executor requires
+ * `loop.interactive && loop.gate_message` (dag-executor.ts, `runLoopNode` /
+ * `runLoopGroupNode`), so naming only `gate_message` would hand the author a
+ * loop with a message and no gate.
+ */
+function unknownNodeKeyHint(key: string): string {
+  if (key === 'interactive') {
+    return (
+      " Nothing on this node gates. For a human gate, use an 'approval:' node; to gate each" +
+      " iteration of a loop, set BOTH 'loop.interactive: true' and 'loop.gate_message'" +
+      " ('gate_message' on its own does not gate). Workflow-level 'interactive:' is a" +
+      ' different setting, and only on the web UI — it keeps the run in the foreground' +
+      ' there; chat platforms already run in the foreground, so it does nothing for them.'
+    );
+  }
+  if (WORKFLOW_ONLY_KEYS.has(key)) {
+    return ` ('${key}' is valid at workflow level, not on individual nodes.)`;
+  }
+  return '';
+}
+
+/**
+ * Record one unknown-key warning, both for callers and for the run-time log.
+ *
+ * `id` is the bare node or workflow id — a stable value a log consumer can
+ * filter on. `label` is its human rendering (it may carry a breadcrumb, e.g.
+ * `Node 'refine' → loop_group node 'check'`) and appears only inside the
+ * message prose, never as a structured field.
+ */
+function pushUnknownKeyWarning(
+  id: string,
+  label: string,
+  key: string,
+  hint: string,
+  event: string,
+  warnings: string[]
+): void {
+  const message = `${label}: unknown key '${key}' will be ignored.${hint}`;
+  warnings.push(message);
+  // Carry the prose, not just the payload: the run path (`archon workflow run`)
+  // reads this log line and never reads the warning string (#2213).
+  getLog().warn({ id, key, warning: message }, event);
+}
+
+/**
+ * Warn about keys Zod silently stripped from a nested config object, recursing
+ * through the sub-objects `spec` describes. `keyPath` is the dotted prefix that
+ * locates the key inside the node (e.g. `approval.on_reject.`).
+ */
+function collectUnknownConfigKeys(
+  raw: unknown,
+  spec: NestedKeySpec,
+  id: string,
+  label: string,
+  keyPath: string,
+  event: string,
+  warnings: string[]
+): void {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return;
+  const obj = raw as Record<string, unknown>;
+
+  if (spec.kind === 'record') {
+    for (const [entryKey, entryValue] of Object.entries(obj)) {
+      collectUnknownConfigKeys(
+        entryValue,
+        spec.entry,
+        id,
+        label,
+        `${keyPath}${entryKey}.`,
+        event,
+        warnings
+      );
+    }
+    return;
+  }
+
+  for (const key of Object.keys(obj)) {
+    if (!spec.keys.has(key)) {
+      pushUnknownKeyWarning(id, label, `${keyPath}${key}`, '', event, warnings);
+      continue;
+    }
+    const child = spec.children?.get(key);
+    if (child) {
+      collectUnknownConfigKeys(obj[key], child, id, label, `${keyPath}${key}.`, event, warnings);
+    }
+  }
+}
+
+/**
+ * Warn about unknown keys on a raw node that Zod silently stripped (#2213).
+ * Catches misplaced workflow-level keys (`interactive:` on a command node),
+ * typos (`contxt:` instead of `context:`), and the same mistakes one level down
+ * inside `approval:` / `retry:` / `loop:` / `agents:`.
+ *
+ * Recurses into a `loop_group` body: those entries are full DAG nodes parsed by
+ * the same schema, so they strip unknown keys just as silently — and a body node
+ * is exactly where an `interactive: true` gate is most likely to be attempted.
+ */
+function collectUnknownNodeKeys(raw: unknown, id: string, label: string, warnings: string[]): void {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return;
+  const obj = raw as Record<string, unknown>;
+
+  for (const key of Object.keys(obj)) {
+    if (!KNOWN_DAG_NODE_KEYS.has(key)) {
+      pushUnknownKeyWarning(
+        id,
+        label,
+        key,
+        unknownNodeKeyHint(key),
+        'node_unknown_key_ignored',
+        warnings
+      );
+      continue;
+    }
+    const nested = KNOWN_NODE_NESTED_KEYS.get(key);
+    if (nested) {
+      collectUnknownConfigKeys(
+        obj[key],
+        nested,
+        id,
+        label,
+        `${key}.`,
+        'node_unknown_key_ignored',
+        warnings
+      );
+    }
+  }
+
+  const group = obj.loop_group;
+  if (group === null || typeof group !== 'object' || Array.isArray(group)) return;
+  const body = (group as Record<string, unknown>).nodes;
+  if (!Array.isArray(body)) return;
+  body.forEach((bodyNode: unknown, i: number) => {
+    const bodyId = nodeIdForMessages(bodyNode, i);
+    collectUnknownNodeKeys(bodyNode, bodyId, `${label} → loop_group node '${bodyId}'`, warnings);
+  });
+}
+
+/**
+ * Validate and parse a single DagNode from raw YAML data.
+ * Replaces the former parseDagNode + parseRetryConfig + parseToolList +
+ * parseNodeHooks + parseIdleTimeout functions.
+ */
+function parseDagNode(
+  raw: unknown,
+  index: number,
+  errors: string[],
+  warnings: string[]
+): DagNode | null {
+  // Extract id early for error messages (may be empty/invalid — schema will catch it)
+  const id = nodeIdForMessages(raw, index);
 
   const result = dagNodeSchema.safeParse(raw);
   if (!result.success) {
@@ -125,6 +288,8 @@ function parseDagNode(raw: unknown, index: number, errors: string[]): DagNode | 
   }
 
   const node = result.data;
+
+  collectUnknownNodeKeys(raw, id, `Node '${id}'`, warnings);
 
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
   let nonAiNode: { type: string; fields: readonly string[] } | undefined;
@@ -360,8 +525,8 @@ export function validateDagStructure(
 }
 
 export type ParseResult =
-  | { workflow: WorkflowDefinition; error: null }
-  | { workflow: null; error: WorkflowLoadError };
+  | { workflow: WorkflowDefinition; error: null; warnings: string[] }
+  | { workflow: null; error: WorkflowLoadError; warnings?: never };
 
 /**
  * Parse and validate a workflow YAML file
@@ -437,8 +602,9 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
 
     // Parse DAG nodes using dagNodeSchema
     const validationErrors: string[] = [];
+    const parseWarnings: string[] = [];
     const dagNodes = (raw.nodes as unknown[])
-      .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors))
+      .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors, parseWarnings))
       .filter((n): n is DagNode => n !== null);
 
     if (dagNodes.length !== (raw.nodes as unknown[]).length) {
@@ -789,6 +955,39 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
+    // Detect unknown workflow-level keys, and unknown keys inside the nested
+    // workflow-level configs (#2213)
+    const workflowName = raw.name;
+    const workflowLabel = `Workflow '${workflowName}'`;
+    for (const key of Object.keys(raw)) {
+      if (!KNOWN_WORKFLOW_KEYS.has(key)) {
+        const hint = KNOWN_DAG_NODE_KEYS.has(key)
+          ? ` ('${key}' is valid on individual nodes, not at workflow level.)`
+          : '';
+        pushUnknownKeyWarning(
+          workflowName,
+          workflowLabel,
+          key,
+          hint,
+          'workflow_unknown_key_ignored',
+          parseWarnings
+        );
+        continue;
+      }
+      const nested = KNOWN_WORKFLOW_NESTED_KEYS.get(key);
+      if (nested) {
+        collectUnknownConfigKeys(
+          raw[key],
+          nested,
+          workflowName,
+          workflowLabel,
+          `${key}.`,
+          'workflow_unknown_key_ignored',
+          parseWarnings
+        );
+      }
+    }
+
     return {
       workflow: {
         name: raw.name,
@@ -813,6 +1012,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         ...(requires !== undefined ? { requires } : {}),
       },
       error: null,
+      warnings: parseWarnings,
     };
   } catch (error) {
     const err = error as Error;
