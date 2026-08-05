@@ -246,6 +246,13 @@ neighbours had to edit config -- global, and racy when several runs dispatch at
 once. `--base` is the per-dispatch level, which is what makes parallel multi-base
 dispatch (epic slices, A/B variants) config-free.
 
+**Scope: the dispatched run only.** A `workflow:` node with `isolation: worktree`
+creates a worktree for its child run, and that worktree is cut using levels 2--4
+only -- `--base` and `--from` do **not** propagate to sub-run children. A parent
+dispatched with `--base release/2.0` still branches its isolated children off the
+repo's configured base. See [Choosing the child's
+checkout](/guides/authoring-workflows/#choosing-the-childs-checkout-with-isolation).
+
 **Driving cut-from and PR target separately.** `--from` overrides only the
 cut-from, so pairing the two flags splits them:
 
@@ -443,6 +450,12 @@ archon isolation list
 ```
 
 Groups by codebase, shows branch, workflow type, platform, and days since activity.
+
+Includes worktrees created for `workflow:` sub-run children that declared `isolation: worktree`
+(branch `archon/task-<parentRunId8>-<nodeId>-<hash>-child-<n>`) — they are tracked and cleaned
+up exactly like top-level run worktrees. Avoid `cleanup`/`complete` on one while its run tree
+is still resumable: a resume reuses the child's recorded worktree and fails if it has been
+removed.
 
 ### `isolation cleanup [days]`
 

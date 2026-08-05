@@ -2,6 +2,7 @@
  * Workflow Executor - runs DAG-based workflows
  */
 import { mkdir, writeFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
@@ -36,6 +37,12 @@ import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers'
 import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
+import type { ChildIsolationResolver, ChildIsolationResult } from './child-isolation';
+export type {
+  ChildIsolationResolver,
+  ChildIsolationRequest,
+  ChildIsolationResult,
+} from './child-isolation';
 import {
   classifyError,
   toTelemetryErrorClass,
@@ -448,6 +455,16 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * write-back. Absent for host runs.
    */
   container?: ContainerRunContext;
+  /**
+   * Per-child isolation resolver (#2121 slice 2, PR-A). A structural port the
+   * engine calls once per `workflow:` child whose node declares
+   * `isolation: 'worktree'`, to obtain a per-child worktree cwd + branch. Built by
+   * the caller (CLI/orchestrator via `@archon/core`) over `WorktreeProvider` so
+   * `@archon/workflows` never imports `@archon/isolation`. Absent → a
+   * `isolation: 'worktree'` node fails fast (never a silent shared-checkout
+   * fallback). Threaded into the child-spawn closure.
+   */
+  resolveChildIsolation?: ChildIsolationResolver;
 };
 
 /**
@@ -547,7 +564,8 @@ async function gatherDescendantRunIds(deps: WorkflowDeps, rootId: string): Promi
 async function runChildWorkflow(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
-  args: RunChildWorkflowArgs
+  args: RunChildWorkflowArgs,
+  resolveChildIsolation?: ChildIsolationResolver
 ): Promise<ChildWorkflowOutcome> {
   const {
     parentRun,
@@ -559,6 +577,7 @@ async function runChildWorkflow(
     conversationDbId,
     userId,
     codebaseId,
+    isolation,
     resumeFailedChild,
   } = args;
 
@@ -613,20 +632,97 @@ async function runChildWorkflow(
     );
   }
 
-  // 3. Create the child run row (fresh) or hydrate the failed one (resume path).
+  // 3. Resolve the child's execution cwd (slice 2, PR-A). `isolation: 'worktree'`
+  //    runs the child in its own git worktree obtained from the injected resolver.
+  //    A resume whose child run row still exists reuses that row's recorded path
+  //    instead of resolving again; a resume whose child row is GONE (never written,
+  //    or deleted) falls through to the fresh-spawn path and does re-resolve —
+  //    safely, because the identifier is deterministic per (parent, node, index)
+  //    and the env-row write is an upsert (see child-isolation-resolver.ts).
+  //    `inherit` (or undefined) shares the parent's checkout — slice-1 behavior.
+  //    Resolving AFTER the name + cycle guards means a bad reference never leaves an
+  //    orphan worktree behind. The resolver throwing surfaces as a failed outcome
+  //    (never a silent shared-checkout fallback — a parallel write into the shared
+  //    checkout is the exact collision worktree isolation prevents).
+  let childCwd: string;
+  // Populated only when THIS spawn created a fresh isolated worktree — its env id +
+  // branch are stamped into the child's metadata (S3; PR-E console grouping reads it).
+  let childIsolationEnv: ChildIsolationResult | undefined;
+  if (resumeFailedChild) {
+    // Reuse the child's own recorded working_path: its worktree for an isolated
+    // child, the shared parent checkout for `inherit`. Reaching this branch at all
+    // means the child row survived, so there is nothing to re-resolve.
+    const priorPath = resumeFailedChild.working_path;
+    // An isolated child's worktree can be pruned by `isolation cleanup`/`complete`
+    // between its failure and this resume. Reusing a vanished path would surface as a
+    // deep ENOENT mid-run; fail fast with the same guidance the top-level CLI resume
+    // gives (workflow.ts resume precedent).
+    if (priorPath && !existsSync(priorPath)) {
+      return failOutcome(
+        `Cannot resume sub-run '${childWorkflowName}': its working path no longer exists ` +
+          `(${priorPath}). The worktree may have been cleaned up — start a fresh run.`,
+        resumeFailedChild.id
+      );
+    }
+    // `working_path` is nullable in the schema, and falling back to the parent's
+    // `cwd` here would be the one silent shared-checkout fallback in this function —
+    // for an ISOLATED child that is exactly the concurrent-write collision the
+    // isolation was requested to prevent. Unreachable today (every child row is
+    // created with a real path, see the createWorkflowRun call below), so this is
+    // defense-in-depth: fail loudly rather than resume somewhere the author didn't ask for.
+    if (!priorPath) {
+      return failOutcome(
+        `Cannot resume sub-run '${childWorkflowName}': its run row has no recorded working ` +
+          'path, so the checkout it ran in is unknown — start a fresh run.',
+        resumeFailedChild.id
+      );
+    }
+    childCwd = priorPath;
+  } else if (isolation === 'worktree') {
+    if (!resolveChildIsolation) {
+      return failOutcome(
+        `isolation: 'worktree' on sub-run '${childWorkflowName}' requires an injected ` +
+          'child-isolation resolver (available for git-repo codebases run via the CLI or ' +
+          "orchestrator). Remove the isolation or use 'inherit' (shared checkout)."
+      );
+    }
+    try {
+      childIsolationEnv = await resolveChildIsolation.resolve({
+        parentRun,
+        nodeId,
+        codebaseId,
+      });
+      childCwd = childIsolationEnv.cwd;
+    } catch (err) {
+      // The resolver already classified + logged the failure (child-isolation-resolver);
+      // prepend the sub-run context for the node-facing outcome.
+      return failOutcome(
+        `Failed to create isolated worktree for sub-run '${childWorkflowName}': ${(err as Error).message}`
+      );
+    }
+  } else {
+    childCwd = cwd;
+  }
+
+  // 4. Create the child run row (fresh) or hydrate the failed one (resume path).
   let childOpts: ExecuteWorkflowOptions;
   let childRunId: string;
+  // Thread the resolver into every child so a NESTED grandchild `workflow:` node can
+  // also request its own worktree (nesting is first-class up to the depth cap) — the
+  // recursive executeWorkflow otherwise has no resolver and would fail-fast. (The
+  // sibling `container:` context has the same non-propagation gap today; out of scope
+  // for this PR, but noted so it isn't mistaken for intentional.)
   try {
     if (resumeFailedChild) {
       const hydrated = await hydrateResumableRun(deps, resumeFailedChild);
       if (hydrated) {
-        childOpts = { ...hydrated, codebaseId };
+        childOpts = { ...hydrated, codebaseId, resolveChildIsolation };
         childRunId = hydrated.preCreatedRun.id;
       } else {
         // Failed child with no completed nodes — flip it back to running and re-run
         // from the top (nothing to skip).
         const preCreatedRun = await deps.store.resumeWorkflowRun(resumeFailedChild.id);
-        childOpts = { preCreatedRun, codebaseId };
+        childOpts = { preCreatedRun, codebaseId, resolveChildIsolation };
         childRunId = preCreatedRun.id;
       }
     } else {
@@ -635,15 +731,26 @@ async function runChildWorkflow(
         conversation_id: conversationDbId,
         codebase_id: codebaseId,
         user_message: input,
-        working_path: cwd,
+        working_path: childCwd,
         parent_run_id: parentRun.id,
         // Share the parent's parent_conversation_id back-link so approve/reject
         // auto-resume scoping keeps working for the child on chat platforms.
         parent_conversation_id: parentRun.parent_conversation_id ?? undefined,
         user_id: userId,
-        metadata: { parent_node_id: nodeId },
+        metadata: {
+          parent_node_id: nodeId,
+          // Record the child's own worktree env + branch (mirrors the container path's
+          // isolation_env_id) so `isolation list` correlation + PR-E console grouping
+          // can find it. Absent for `inherit`/shared-checkout children.
+          ...(childIsolationEnv
+            ? {
+                isolation_env_id: childIsolationEnv.envId,
+                branch_name: childIsolationEnv.branchName,
+              }
+            : {}),
+        },
       });
-      childOpts = { preCreatedRun: childRun, codebaseId };
+      childOpts = { preCreatedRun: childRun, codebaseId, resolveChildIsolation };
       childRunId = childRun.id;
     }
   } catch (err) {
@@ -652,21 +759,22 @@ async function runChildWorkflow(
     );
   }
 
-  // 4. Run the child in-process (reuses the whole lifecycle). Its terminal output +
-  //    cost + tokens land in the child run metadata on completion.
+  // 5. Run the child in-process (reuses the whole lifecycle) in its resolved cwd
+  //    (its own worktree when isolated, else the parent's checkout). Its terminal
+  //    output + cost + tokens land in the child run metadata on completion.
   try {
     await executeWorkflow(
       deps,
       platform,
       conversationId,
-      cwd,
+      childCwd,
       childWorkflow,
       input,
       conversationDbId,
       childOpts
     );
 
-    // 5. Read the child back for the node-facing outcome (status + summary + cost +
+    // 6. Read the child back for the node-facing outcome (status + summary + cost +
     //    tokens). Works for synchronous completion AND a child paused at its gate.
     const finalChild = await deps.store.getWorkflowRun(childRunId);
     if (!finalChild) {
@@ -713,13 +821,24 @@ async function runChildWorkflow(
  * failure. Every await is guarded here (a parent-side failure is logged, and a
  * post-CAS failure marks the parent 'failed' so it stays resumable); the caller's
  * `.catch` is a belt-and-braces backstop, not the contract.
+ *
+ * `resolveChildIsolation` is a plain parameter rather than part of the resume state:
+ * {@link ResumePayload} carries what was RECORDED about the prior run, and a resolver
+ * is a live capability of the surface driving this process — it cannot be rehydrated
+ * from a run row. It has to be forwarded because the parent picks up here *mid-DAG*:
+ * a parent whose gated child just finished may still have `isolation: 'worktree'`
+ * nodes ahead of it, and re-entering without the resolver fails them with
+ * "requires an injected child-isolation resolver" even though the surface wired one.
+ * The child's resolver is the right one to pass: a child inherits the parent's
+ * `codebase_id`, and the resolver is codebase-bound and rejects a mismatch loudly.
  */
 async function maybeResumeParentRun(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   conversationId: string,
   conversationDbId: string,
-  childRun: WorkflowRun
+  childRun: WorkflowRun,
+  resolveChildIsolation?: ChildIsolationResolver
 ): Promise<void> {
   const parentRunId = childRun.parent_run_id;
   if (!parentRunId) return;
@@ -846,6 +965,7 @@ async function maybeResumeParentRun(
       {
         ...hydrated,
         codebaseId: parent.codebase_id ?? undefined,
+        resolveChildIsolation,
       }
     );
   } catch (err) {
@@ -902,6 +1022,7 @@ export async function executeWorkflow(
     baseOverride: callerBaseOverride,
     execContext = { kind: 'host' },
     container: containerCtx,
+    resolveChildIsolation,
   } = opts;
 
   // Guard: a container run MUST be resumed with its container rewired (the CLI does
@@ -1542,8 +1663,10 @@ export async function executeWorkflow(
       containerCtx,
       // Sub-run closure (#2121 Phase 2): captures executeWorkflow (this module — no
       // import cycle) so a `workflow:` node can spawn a governed child run in-process.
+      // Also captures the per-child isolation resolver (slice 2, PR-A) so an
+      // `isolation: 'worktree'` child gets its own worktree cwd.
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
-        runChildWorkflow(deps, platform, childArgs),
+        runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
       dagPriorTokenUsage
     );
 
@@ -1564,7 +1687,12 @@ export async function executeWorkflow(
         platform,
         conversationId,
         conversationDbId,
-        finalStatus
+        finalStatus,
+        // The parent resumes mid-DAG and may still have isolated sub-run nodes ahead
+        // of it; without this it would fail them for a missing resolver the surface
+        // did inject. Same resolver the child ran with — it is codebase-bound and the
+        // child shares the parent's codebase.
+        resolveChildIsolation
       ).catch((err: unknown) => {
         getLog().error(
           {
