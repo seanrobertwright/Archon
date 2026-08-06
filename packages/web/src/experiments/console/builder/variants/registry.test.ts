@@ -12,7 +12,7 @@
  * ADDED, so the build breaks here with a message naming the file to mirror.
  */
 import { describe, expect, test } from 'bun:test';
-import { VARIANTS, isVariantId } from './registry';
+import { VARIANTS, VARIANT_REGISTRY, isVariantId } from './registry';
 import { NODE_ID_PATTERN } from '../editor/state';
 
 /** Keep in sync with `KNOWN_VARIANTS` in
@@ -41,5 +41,27 @@ describe('variant registry ↔ @archon/core mirror', () => {
 
   test('NODE_ID_PATTERN matches the pattern mirrored in propose-workflow-edits-tool.ts', () => {
     expect(NODE_ID_PATTERN.source).toBe(CORE_MIRRORED_ID_PATTERN);
+  });
+
+  /**
+   * The Copilot tool's `inputSchema` enumerates these field names so the agent
+   * emits the right `data` keys. A live Claude turn guessed `script` for bash
+   * (it is `bash`) and `prompt` for approval (it is `message`), producing a
+   * proposal blocked by "must not be empty" — so these names are load-bearing,
+   * not documentation.
+   */
+  test('per-variant data keys match those enumerated in propose-workflow-edits-tool.ts', () => {
+    const actual = Object.fromEntries(
+      VARIANTS.map(v => [v, Object.keys(VARIANT_REGISTRY[v].defaultData()).sort()])
+    );
+    expect(actual).toEqual({
+      prompt: ['prompt'],
+      command: ['command'],
+      bash: ['bash'],
+      script: ['runtime', 'script'],
+      loop: ['fresh_context', 'max_iterations', 'prompt', 'until'],
+      approval: ['message'],
+      cancel: ['reason'],
+    });
   });
 });

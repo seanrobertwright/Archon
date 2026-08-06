@@ -7,7 +7,7 @@
  * `@archon/core`) — the two are kept intentionally textually identical; a
  * change here should be mirrored there.
  */
-import { isVariantId } from '../variants';
+import { isVariantId, VARIANT_REGISTRY } from '../variants';
 import { NODE_ID_PATTERN } from '../editor/state';
 import type { VariantId } from '../types';
 
@@ -58,6 +58,23 @@ function validateOp(raw: unknown): { ok: true; op: ProposedEdit } | { ok: false;
         typeof r.data === 'object' && r.data !== null
           ? (r.data as Record<string, unknown>)
           : undefined;
+      // Reject unknown `data` keys instead of letting `translate-ops` merge them
+      // over the variant defaults, which leaves the real field empty and surfaces
+      // as an unexplained "must not be empty" on the preview. Derived from the
+      // registry, so unlike the server-side mirror this cannot drift.
+      if (data !== undefined) {
+        const allowed = Object.keys(VARIANT_REGISTRY[variant].defaultData());
+        const unknown = Object.keys(data).filter(k => !allowed.includes(k));
+        if (unknown.length > 0) {
+          return {
+            ok: false,
+            error:
+              `addNode '${id}': ${variant} data does not accept ` +
+              `${unknown.map(k => `'${k}'`).join(', ')}. ` +
+              `Use a flat object with only: ${allowed.join(', ')}.`,
+          };
+        }
+      }
       return { ok: true, op: { op: 'addNode', id, variant, data } };
     }
     case 'connect': {

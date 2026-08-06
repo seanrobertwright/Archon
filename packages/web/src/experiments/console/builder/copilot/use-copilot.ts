@@ -20,6 +20,21 @@ import { opsToEditorActions } from './translate-ops';
 
 const PROPOSE_TOOL_NAME = 'propose_workflow_edits';
 
+/**
+ * Match the `propose_workflow_edits` tool call by either name a gated provider
+ * can persist it under.
+ *
+ * Claude registers in-process native tools through an MCP server named `archon`,
+ * so the call lands in message metadata as `mcp__archon__propose_workflow_edits`
+ * (`@archon/providers` `claude/native-tools.ts` — "tools are callable as
+ * `mcp__archon__<name>`"). Pi passes the bare `spec.name` through unchanged
+ * (`community/pi/native-tools.ts`). Matching only the bare name meant the
+ * Proposal never surfaced on Claude at all.
+ */
+export function isProposeToolCall(name: string): boolean {
+  return name === PROPOSE_TOOL_NAME || name.endsWith(`__${PROPOSE_TOOL_NAME}`);
+}
+
 export interface CopilotProposal {
   /** Identifies the source tool call so Accept/Reject can be recorded per-call. */
   key: string;
@@ -69,7 +84,7 @@ export function useCopilot(
     for (let i = messageList.length - 1; i >= 0; i -= 1) {
       const m = messageList[i];
       if (m?.role !== 'assistant') continue;
-      const call = m.toolCalls.find(c => c.name === PROPOSE_TOOL_NAME);
+      const call = m.toolCalls.find(c => isProposeToolCall(c.name));
       if (call === undefined) continue;
       const key = `${m.id}:${PROPOSE_TOOL_NAME}`;
       return resolvedKeys.has(key) ? null : { key, input: call.input };

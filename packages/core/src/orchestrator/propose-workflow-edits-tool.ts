@@ -42,6 +42,29 @@ const KNOWN_VARIANTS = new Set([
  */
 const NODE_ID_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
 
+/**
+ * Accepted `data` keys per variant — mirrors each variant's `defaultData()` in
+ * the console registry, guarded by the same tripwire as `KNOWN_VARIANTS`
+ * (`builder/variants/registry.test.ts`).
+ *
+ * Validated rather than merely documented because describing the shapes in the
+ * tool description is NOT reliable: across three live Claude turns the agent
+ * guessed `{"script":...}`, then `{"approval":{"message":...}}`, then
+ * `{"prompt":...}`/`{"run":...}` for the same two nodes. An unknown key silently
+ * produced an empty node, so the author got a proposal blocked by "must not be
+ * empty" with no hint why. Rejecting here turns that into an in-turn error the
+ * agent can correct on its own.
+ */
+const VARIANT_DATA_KEYS: Record<string, readonly string[]> = {
+  prompt: ['prompt'],
+  command: ['command'],
+  bash: ['bash'],
+  script: ['script', 'runtime'],
+  loop: ['prompt', 'until', 'max_iterations', 'fresh_context'],
+  approval: ['message'],
+  cancel: ['reason'],
+};
+
 const INPUT_SCHEMA: Record<string, unknown> = {
   type: 'object',
   properties: {
@@ -54,6 +77,24 @@ const INPUT_SCHEMA: Record<string, unknown> = {
         'Node ids must match /^[a-zA-Z_][a-zA-Z0-9_-]*$/ — letters, digits, underscore and hyphen ' +
         'only, never starting with a digit and never containing spaces (use "my_gate" or ' +
         '"my-gate", not "my gate"). ' +
+        // Without this the agent guesses field names and the author gets a proposal
+        // blocked by "must not be empty" errors. Note `bash` takes a field literally
+        // named `bash` (NOT `script` — that is a different variant), and `approval`
+        // takes `message` (NOT `prompt`); both are easy wrong guesses.
+        '`data` must be a FLAT object — never nest it under the variant name. ' +
+        'Copy these shapes exactly, one per variant: ' +
+        'prompt → {"prompt":"..."}; ' +
+        'command → {"command":"..."}; ' +
+        'bash → {"bash":"<the shell script>"} (the key is "bash", not "script"); ' +
+        'script → {"script":"<code>","runtime":"bun"}; ' +
+        'loop → {"prompt":"...","until":"COMPLETE","max_iterations":10,"fresh_context":false}; ' +
+        'approval → {"message":"..."} (the key is "message", not "prompt" and not "approval"); ' +
+        'cancel → {"reason":"..."}. ' +
+        'So an approval node is {"op":"addNode","id":"gate","variant":"approval",' +
+        '"data":{"message":"Approve to continue?"}} — NOT ' +
+        '{"data":{"approval":{"message":"..."}}}. ' +
+        'Always fill the main text field when you add a node — a node left empty fails ' +
+        'validation and the author cannot accept the batch. ' +
         '{"op":"connect","source":"<id>","target":"<id>"} (target depends on source), ' +
         '{"op":"setField","id":"<id>","path":"data.<field>"|"base.<field>","value":<any>}, ' +
         '{"op":"rename","id":"<id>","nextId":"<new-id>"}, ' +
@@ -109,6 +150,19 @@ function validateOp(raw: unknown): { ok: true; op: ProposedEditOp } | { ok: fals
         typeof r.data === 'object' && r.data !== null
           ? (r.data as Record<string, unknown>)
           : undefined;
+      if (data !== undefined) {
+        const allowed = VARIANT_DATA_KEYS[variant] ?? [];
+        const unknown = Object.keys(data).filter(k => !allowed.includes(k));
+        if (unknown.length > 0) {
+          return {
+            ok: false,
+            error:
+              `addNode '${id}': ${variant} data does not accept ` +
+              `${unknown.map(k => `'${k}'`).join(', ')}. ` +
+              `Use a flat object with only: ${allowed.join(', ')}.`,
+          };
+        }
+      }
       return { ok: true, op: { op: 'addNode', id, variant, data } };
     }
     case 'connect': {

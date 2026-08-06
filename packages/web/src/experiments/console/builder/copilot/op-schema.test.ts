@@ -153,4 +153,45 @@ describe('parseAndValidateOps', () => {
       if (!result.ok) expect(result.error).toContain('must match');
     });
   });
+
+  // Every case below is a shape a live Claude turn actually emitted across three
+  // runs of the same request. Left unvalidated, each merged over the variant
+  // defaults and surfaced as an unexplained "must not be empty" on the preview.
+  describe('addNode data keys (regression: observed live mis-guesses)', () => {
+    test.each([
+      ['bash given "script"', 'bash', { script: 'bun run test' }, 'bash'],
+      ['bash given "run"', 'bash', { run: 'bun run test' }, 'bash'],
+      ['approval nested under variant name', 'approval', { approval: { message: 'x' } }, 'message'],
+      ['approval given "prompt"', 'approval', { prompt: 'x' }, 'message'],
+    ])('rejects %s', (_label, variant, data, allowed) => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'addNode', id: 'n1', variant, data }])
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toContain('does not accept');
+        expect(result.error).toContain(allowed);
+      }
+    });
+
+    test.each([
+      ['approval', { message: 'Approve to continue?' }],
+      ['bash', { bash: 'bun run test' }],
+      ['prompt', { prompt: 'Do the thing' }],
+      ['script', { script: 'print(1)', runtime: 'uv' }],
+      ['cancel', { reason: 'no longer needed' }],
+    ])('accepts a correctly-shaped %s node', (variant, data) => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'addNode', id: 'n1', variant, data }])
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    test('omitting data entirely is still allowed', () => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'addNode', id: 'n1', variant: 'approval' }])
+      );
+      expect(result.ok).toBe(true);
+    });
+  });
 });
