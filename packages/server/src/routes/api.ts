@@ -3991,7 +3991,6 @@ export function registerApiRoutes(
       buildMarketplaceBundle,
       runPreflightGates,
       sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-      serverCwd: process.cwd(),
       env: process.env,
       appVersion,
     };

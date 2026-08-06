@@ -77,3 +77,27 @@ Two smaller corrections, same rationale (implementation-time verification, not a
 the registry PR targets upstream **`dev`** (the upstream default branch, confirmed via
 `git remote show upstream`), not `main`; and `MarketplaceEntry` has no `version` field, so an
 update touches only `sha` (+ the sha embedded in `sourceUrl`), not a version bump.
+
+## Amendment (2026-08-06) — pre-flight gates moved in-process, closing the compiled-binary gap
+
+The original pre-flight design shelled the real CI scripts (`bun <script-path>`) with their paths
+resolved from the **server process's own git checkout** (`findRepoRoot(serverCwd)`). That works for
+a source install but always blocks for a compiled-binary-only install (no source tree on disk) —
+flagged as a residual, undecided risk in the PR-4 code review and left unfixed pending this
+follow-up.
+
+The fix: `marketplace-validate-schema.ts` and `marketplace-security-scan.ts`'s core logic moved
+into `@archon/workflows/marketplace-checks` as two pure, exported functions
+(`validateMarketplaceWorkflowFiles`, `scanMarketplaceFilesForSecurityIssues`) operating on an
+in-memory file list. Both CI scripts are now thin wrappers — read `$ARTIFACTS_DIR/source/`, call
+the shared function, print the identical JSON shape — and `preflight.ts` calls the **same
+functions directly, in-process**, on the bundle's in-memory files. No scratch directory, no
+`execFileAsync`, no server-checkout dependency.
+
+This is a stronger reuse guarantee than shelling out was: CI and pre-flight now call the literal
+same function object (compiled into whichever build, source or binary), not just "the same script
+file resolved two different ways." Verified byte-identical output against the original scripts'
+documented degenerate-case contract (`no source directory` / `no yaml files found` / `no workflow
+yaml files` / OS-native `files[].name` behavior — the last one simplifies to always-forward-slash
+now that there's no filesystem `path.relative` call in the server's in-process path; still purely
+informational, never parsed, so this is a no-op for any consumer).

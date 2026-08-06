@@ -139,7 +139,7 @@ function makeDeps(overrides: Partial<PublishDeps> = {}): PublishDeps {
     readFile: async () => YAML_CONTENT,
     parseWorkflow: () => ({ workflow: WORKFLOW, error: null }) as never,
     buildMarketplaceBundle: async () => BUNDLE,
-    runPreflightGates: async () => ({
+    runPreflightGates: () => ({
       passed: true,
       gates: [
         { name: 'schema-validate', passed: true, detail: { valid: true, files: [] } },
@@ -151,7 +151,6 @@ function makeDeps(overrides: Partial<PublishDeps> = {}): PublishDeps {
       ],
     }),
     sleep: async () => undefined,
-    serverCwd: '/fake/archon',
     env: { GITHUB_TOKEN: SECRET_TOKEN },
     appVersion: '0.5.0',
     ...overrides,
@@ -201,7 +200,7 @@ describe('submitToMarketplace — happy path', () => {
     let preflightCalledAt = -1;
     const deps = makeDeps({
       octokitFactory: () => makeOctokit(log),
-      runPreflightGates: async () => {
+      runPreflightGates: () => {
         preflightCalledAt = log.calls.length;
         return {
           passed: true,
@@ -344,7 +343,7 @@ describe('submitToMarketplace — block-before-write cases', () => {
     const log: CallLog = { calls: [] };
     const deps = makeDeps({
       octokitFactory: () => makeOctokit(log),
-      runPreflightGates: async () => ({
+      runPreflightGates: () => ({
         passed: false,
         gates: [
           { name: 'schema-validate', passed: false, detail: { valid: false, files: [] } },

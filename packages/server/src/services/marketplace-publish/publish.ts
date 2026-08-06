@@ -125,8 +125,6 @@ export interface PublishDeps {
   buildMarketplaceBundle: typeof buildMarketplaceBundle;
   runPreflightGates: typeof runPreflightGates;
   sleep: (ms: number) => Promise<void>;
-  /** Archon server's OWN checkout (for finding ITS OWN `.archon/scripts/` — S1). */
-  serverCwd: string;
   env: NodeJS.ProcessEnv;
   /** Archon's own version string (`api.ts` appVersion) — drives `archonVersionCompat`. */
   appVersion: string;
@@ -450,8 +448,9 @@ export async function submitToMarketplace(
     throw err;
   }
 
-  // 6. Pre-flight gates — against Archon's OWN repo checkout (S1), not the project's.
-  const preflight = await deps.runPreflightGates(bundle, deps.serverCwd);
+  // 6. Pre-flight gates — in-process (pure, synchronous), no dependency on the
+  // server's own checkout.
+  const preflight = deps.runPreflightGates(bundle);
   if (!preflight.passed) {
     throw new SubmitBlockedError(
       { kind: 'preflight', gates: preflight.gates },
