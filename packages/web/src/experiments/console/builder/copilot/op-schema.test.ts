@@ -114,4 +114,43 @@ describe('parseAndValidateOps', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain('op[1]');
   });
+
+  // Regression: before this guard, an id failing NODE_ID_PATTERN was accepted here,
+  // then silently replaced by the reducer's synthesized `<variant>-N`. The batch's
+  // later ops kept referencing the REQUESTED id, so they applied against a node that
+  // was never created — with no issue raised and Accept still enabled.
+  describe('node-id pattern (regression: silent reducer substitution)', () => {
+    test.each([
+      ['a space', 'my gate'],
+      ['a leading digit', '2nd-review'],
+      ['punctuation', 'check-tests!'],
+      ['a leading hyphen', '-gate'],
+      ['a dot', 'my.gate'],
+    ])('rejects addNode with %s', (_label, id) => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'addNode', id, variant: 'approval' }])
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('must match');
+    });
+
+    test.each([
+      ['valid snake_case', 'my_gate'],
+      ['valid kebab-case', 'my-gate'],
+      ['a leading underscore', '_gate'],
+    ])('accepts addNode with %s', (_label, id) => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'addNode', id, variant: 'approval' }])
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    test('rejects rename to a pattern-invalid nextId', () => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'rename', id: 'gate', nextId: 'my gate' }])
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('must match');
+    });
+  });
 });

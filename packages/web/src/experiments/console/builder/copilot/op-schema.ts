@@ -8,6 +8,7 @@
  * change here should be mirrored there.
  */
 import { isVariantId } from '../variants';
+import { NODE_ID_PATTERN } from '../editor/state';
 import type { VariantId } from '../types';
 
 export type ProposedEdit =
@@ -42,6 +43,14 @@ function validateOp(raw: unknown): { ok: true; op: ProposedEdit } | { ok: false;
       const id = typeof r.id === 'string' ? r.id : '';
       const variant = typeof r.variant === 'string' ? r.variant : '';
       if (id === '') return { ok: false, error: 'addNode requires id' };
+      // Reject here rather than letting the reducer's `add-node` silently fall
+      // back to a synthesized `<variant>-N` id: the translator would keep the
+      // REQUESTED id in `knownIds`, so later ops in the same batch would
+      // reference a node that was never created — a silent mis-apply with no
+      // issue raised and Accept still enabled.
+      if (!NODE_ID_PATTERN.test(id)) {
+        return { ok: false, error: `addNode: id '${id}' must match ${NODE_ID_PATTERN.source}` };
+      }
       if (!isVariantId(variant)) {
         return { ok: false, error: `addNode: unknown variant '${variant}'` };
       }
@@ -78,6 +87,14 @@ function validateOp(raw: unknown): { ok: true; op: ProposedEdit } | { ok: false;
       const nextId = typeof r.nextId === 'string' ? r.nextId : '';
       if (id === '' || nextId === '') {
         return { ok: false, error: 'rename requires id and nextId' };
+      }
+      // `rename-node` has no synthesize-a-fallback branch, but an invalid target
+      // id would still produce a node the DAG loader later rejects — fail here.
+      if (!NODE_ID_PATTERN.test(nextId)) {
+        return {
+          ok: false,
+          error: `rename: nextId '${nextId}' must match ${NODE_ID_PATTERN.source}`,
+        };
       }
       return { ok: true, op: { op: 'rename', id, nextId } };
     }

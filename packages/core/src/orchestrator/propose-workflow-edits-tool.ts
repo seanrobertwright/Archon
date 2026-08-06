@@ -12,8 +12,15 @@ export type ProposedEditOp =
   | { op: 'remove'; id: string };
 
 const KNOWN_OPS = new Set(['addNode', 'connect', 'setField', 'rename', 'remove']);
-/** Mirrors the console's `VariantId` union (builder/types/variant.ts) — duplicated here
- * because `@archon/core` cannot import a web package; keep the two lists in sync. */
+/**
+ * Mirrors the console's `VariantId` union (builder/types/variant.ts) — duplicated here
+ * because `@archon/core` cannot import a web package.
+ *
+ * Drift is guarded from the web side: `builder/variants/registry.test.ts` asserts
+ * `VARIANTS` still equals this list and fails with a message naming THIS file, so
+ * adding an eighth variant breaks the build here rather than silently making the
+ * Copilot reject it at proposal time.
+ */
 const KNOWN_VARIANTS = new Set([
   'prompt',
   'command',
@@ -23,6 +30,17 @@ const KNOWN_VARIANTS = new Set([
   'approval',
   'cancel',
 ]);
+/**
+ * Mirrors `NODE_ID_PATTERN` in the console's `builder/editor/state.ts` — same
+ * duplication reason and same drift guard as `KNOWN_VARIANTS` above.
+ *
+ * Validated here so a bad id is an in-turn tool error the agent can correct,
+ * rather than a "success" summary the client later rejects. The reducer's
+ * `add-node` silently synthesizes a `<variant>-N` id when the requested one is
+ * invalid, which would desync the batch's later ops from the nodes actually
+ * created.
+ */
+const NODE_ID_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
 
 const INPUT_SCHEMA: Record<string, unknown> = {
   type: 'object',
@@ -33,6 +51,9 @@ const INPUT_SCHEMA: Record<string, unknown> = {
         'JSON array of edit ops (the whole batch as ONE array — never call this tool more ' +
         'than once per proposal). Each op is one of: ' +
         '{"op":"addNode","id":"<new-id>","variant":"prompt|command|bash|script|loop|approval|cancel","data"?:{...variant fields}}, ' +
+        'Node ids must match /^[a-zA-Z_][a-zA-Z0-9_-]*$/ — letters, digits, underscore and hyphen ' +
+        'only, never starting with a digit and never containing spaces (use "my_gate" or ' +
+        '"my-gate", not "my gate"). ' +
         '{"op":"connect","source":"<id>","target":"<id>"} (target depends on source), ' +
         '{"op":"setField","id":"<id>","path":"data.<field>"|"base.<field>","value":<any>}, ' +
         '{"op":"rename","id":"<id>","nextId":"<new-id>"}, ' +
@@ -78,6 +99,9 @@ function validateOp(raw: unknown): { ok: true; op: ProposedEditOp } | { ok: fals
       const id = typeof r.id === 'string' ? r.id : '';
       const variant = typeof r.variant === 'string' ? r.variant : '';
       if (id === '') return { ok: false, error: 'addNode requires id' };
+      if (!NODE_ID_PATTERN.test(id)) {
+        return { ok: false, error: `addNode: id '${id}' must match ${NODE_ID_PATTERN.source}` };
+      }
       if (!KNOWN_VARIANTS.has(variant)) {
         return { ok: false, error: `addNode: unknown variant '${variant}'` };
       }
@@ -114,6 +138,12 @@ function validateOp(raw: unknown): { ok: true; op: ProposedEditOp } | { ok: fals
       const nextId = typeof r.nextId === 'string' ? r.nextId : '';
       if (id === '' || nextId === '') {
         return { ok: false, error: 'rename requires id and nextId' };
+      }
+      if (!NODE_ID_PATTERN.test(nextId)) {
+        return {
+          ok: false,
+          error: `rename: nextId '${nextId}' must match ${NODE_ID_PATTERN.source}`,
+        };
       }
       return { ok: true, op: { op: 'rename', id, nextId } };
     }

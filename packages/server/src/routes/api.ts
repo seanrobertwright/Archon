@@ -1942,6 +1942,12 @@ export function registerApiRoutes(
   /** Maximum number of files per message (enforced server-side) */
   const MAX_FILES_PER_MESSAGE = 5;
   /**
+   * Maximum serialized builder-canvas size accepted on a Copilot turn (256 KB).
+   * Sized well above any hand-authored workflow — it is a runaway guard, not a
+   * working limit. See the `canvasState` check in the message route.
+   */
+  const MAX_CANVAS_STATE_CHARS = 256 * 1024;
+  /**
    * Binary (non-text) MIME types explicitly allowed for upload.
    * All text/* types are accepted separately via isAllowedUploadType().
    */
@@ -2620,6 +2626,21 @@ export function registerApiRoutes(
       message = body.message;
       builderMode = body.builderMode === true;
       canvasState = typeof body.canvasState === 'string' ? body.canvasState : undefined;
+      // `canvasState` is re-injected into the prompt on EVERY copilot turn, so an
+      // unbounded canvas is a per-turn token cost with no ceiling. Reject loudly
+      // rather than silently forwarding it into a billed prompt.
+      if (canvasState !== undefined && canvasState.length > MAX_CANVAS_STATE_CHARS) {
+        getLog().warn(
+          { conversationId, canvasStateChars: canvasState.length },
+          'message.canvas_state_too_large'
+        );
+        return c.json(
+          {
+            error: `canvasState must be at most ${MAX_CANVAS_STATE_CHARS.toString()} characters (got ${canvasState.length.toString()})`,
+          },
+          400
+        );
+      }
     }
 
     // Look up conversation for message persistence

@@ -122,7 +122,14 @@ export function useCopilot(
   );
 
   const accept = useCallback((): readonly EditorAction[] | null => {
+    // `proposal?.` also covers the null-proposal case: `undefined !== null` is true,
+    // so we return early and TS narrows `proposal` to non-null below.
     if (proposal?.invalidReason !== null) return null;
+    // A Proposal is atomic: a batch carrying any error-severity issue is never
+    // partially applied. `ProposalPreview` also disables the Accept button, but
+    // the invariant belongs here — a second caller (keyboard shortcut, an
+    // "accept all" affordance) must not be able to bypass a UI-only guard.
+    if (proposal.preview?.issues.some(i => i.severity === 'error') === true) return null;
     setResolvedKeys(prev => new Set(prev).add(proposal.key));
     return proposal.actions;
   }, [proposal]);

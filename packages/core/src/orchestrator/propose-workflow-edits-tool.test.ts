@@ -161,4 +161,50 @@ describe('buildProposeWorkflowEditsTool', () => {
     const result = await tool.handler({});
     expect(result).toContain('ops is required');
   });
+
+  // Regression: without this guard the tool returned a SUCCESS summary for an id the
+  // builder's reducer would then silently rename, so the agent believed the proposal
+  // landed as written while the client rejected or mis-applied it.
+  describe('node-id pattern', () => {
+    test.each([['my gate'], ['2nd-review'], ['check-tests!'], ['-gate'], ['my.gate']])(
+      'rejects addNode id %p',
+      id => {
+        const result = parseAndValidateOps(
+          JSON.stringify([{ op: 'addNode', id, variant: 'approval' }])
+        );
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.error).toContain('must match');
+      }
+    );
+
+    test.each([['my_gate'], ['my-gate'], ['_gate']])('accepts addNode id %p', id => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'addNode', id, variant: 'approval' }])
+      );
+      expect(result.ok).toBe(true);
+    });
+
+    test('rejects rename to a pattern-invalid nextId', () => {
+      const result = parseAndValidateOps(
+        JSON.stringify([{ op: 'rename', id: 'gate', nextId: 'my gate' }])
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('must match');
+    });
+
+    test('handler surfaces a bad id as an in-turn error, not a success summary', async () => {
+      const tool = buildProposeWorkflowEditsTool();
+      const result = await tool.handler({
+        ops: JSON.stringify([{ op: 'addNode', id: 'my gate', variant: 'approval' }]),
+      });
+      expect(result).toContain('Invalid ops:');
+      expect(result).not.toContain('Proposed 1 edit');
+    });
+  });
+
+  test('the tool description states the node-id pattern so the agent self-corrects', () => {
+    const tool = buildProposeWorkflowEditsTool();
+    const ops = (tool.inputSchema.properties as { ops: { description: string } }).ops;
+    expect(ops.description).toContain('[a-zA-Z_][a-zA-Z0-9_-]*');
+  });
 });
