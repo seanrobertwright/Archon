@@ -105,6 +105,36 @@ describe('unsupported node kinds round-trip verbatim', () => {
   });
 });
 
+describe('the Copilot cannot silently no-op on an unsupported node', () => {
+  it('rejects a data.* setField and names the reason', async () => {
+    // Before the guard this was ACCEPTED: `data` gained a junk key, a "changed"
+    // ghost rendered, the tool reported success — and the edit vanished on save
+    // because `unsupportedToDag` emits nothing. Same silent-failure class this
+    // whole change exists to close, so it is tested here rather than in isolation.
+    const { opsToEditorActions } = await import('../copilot/translate-ops');
+    const { workflow } = fromWorkflowDefinition(defOf([{ id: 'inc', include: 'blk' }]));
+    const r = opsToEditorActions(
+      [{ op: 'setField', id: 'inc', path: 'data.prompt', value: 'x' }] as never,
+      workflow
+    );
+    expect(r.actions).toEqual([]);
+    expect(r.issues).toHaveLength(1);
+    expect(r.issues[0]?.message).toContain('include');
+    expect(r.issues[0]?.message).toContain('YAML');
+  });
+
+  it('still allows base.* edits so `connect` can rewire the graph', async () => {
+    const { opsToEditorActions } = await import('../copilot/translate-ops');
+    const { workflow } = fromWorkflowDefinition(defOf([{ id: 'inc', include: 'blk' }]));
+    const r = opsToEditorActions(
+      [{ op: 'setField', id: 'inc', path: 'base.depends_on', value: ['a'] }] as never,
+      workflow
+    );
+    expect(r.issues).toEqual([]);
+    expect(r.actions).toHaveLength(1);
+  });
+});
+
 describe('unmodelled fields on modelled variants round-trip verbatim', () => {
   it('preserves settingSources, pi, and node-level description', () => {
     const def = defOf([

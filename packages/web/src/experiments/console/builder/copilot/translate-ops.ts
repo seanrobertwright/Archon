@@ -124,6 +124,25 @@ export function opsToEditorActions(
           issues.push(issue('copilot.setField.badPath', `Malformed path '${op.path}'.`, op.id));
           break;
         }
+        // An `'unsupported'` node has no editable variant data — its payload is
+        // preserved verbatim on `extra` and `unsupportedToDag` emits nothing. A
+        // `data.*` patch would therefore be accepted, render a "changed" ghost,
+        // report success, and then vanish on save: a silent no-op the author is
+        // told succeeded. Reject it with a message that names the real fix.
+        //
+        // `base.*` stays allowed on purpose — `depends_on` is how `connect`
+        // rewires the graph, and an unsupported node still participates in it.
+        if (existing.variant === 'unsupported' && op.path.startsWith('data.')) {
+          issues.push(
+            issue(
+              'copilot.setField.unsupportedNode',
+              `Node '${op.id}' is a '${existing.data.kind}' node, which has no editor in this ` +
+                'build. Its content can only be changed in the YAML file directly.',
+              op.id
+            )
+          );
+          break;
+        }
         const patched = patchField(existing, op.path, op.value);
         actions.push({ type: 'patch-node', node: patched, at: 0 });
         working.set(op.id, patched);
