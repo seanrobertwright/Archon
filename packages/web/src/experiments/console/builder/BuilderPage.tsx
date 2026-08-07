@@ -21,7 +21,7 @@ import {
 import type { ReactFlowInstance } from '@xyflow/react';
 import { useKeymap } from '../lib/keymap';
 import { KeymapHelp } from '../components/KeymapHelp';
-import type { BuilderWorkflow, Issue, VariantId } from './types';
+import type { BuilderWorkflow, CreatableVariantId, Issue } from './types';
 import { runValidation } from './validation';
 import { toWorkflowDefinition } from './model';
 import { serializeToYaml } from './yaml';
@@ -221,7 +221,7 @@ export function BuilderPage({
   );
 
   const handleAddNode = useCallback(
-    (variant: VariantId, position: XYPosition): void => {
+    (variant: CreatableVariantId, position: XYPosition): void => {
       stamped({ type: 'add-node', variant, position });
     },
     [stamped]
@@ -229,7 +229,7 @@ export function BuilderPage({
 
   // Palette click (no drag): stagger new nodes from a fixed corner.
   const handlePaletteAdd = useCallback(
-    (variant: VariantId): void => {
+    (variant: CreatableVariantId): void => {
       const n = state.workflow.nodes.length;
       stamped({ type: 'add-node', variant, position: { x: 60 + (n % 5) * 36, y: 60 + n * 28 } });
     },

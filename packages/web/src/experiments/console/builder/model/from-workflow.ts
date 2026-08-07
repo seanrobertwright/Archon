@@ -9,6 +9,7 @@
  */
 import type { BuilderNode, BuilderWorkflow, Issue, WireWorkflowDefinition } from '../types';
 import {
+  detectUnsupportedKind,
   detectVariantOrNull,
   defaultPromptData,
   partitionNode,
@@ -29,9 +30,38 @@ function nodeFromDag(node: WireWorkflowDefinition['nodes'][number], issues: Issu
 
   const variant = detectVariantOrNull(node);
   if (variant === null) {
-    // No mode field at all (malformed or future-schema input). Surface the
-    // problem and fall back to an empty prompt node so the workflow stays
-    // editable rather than failing the whole import.
+    const unsupportedKind = detectUnsupportedKind(variantSpecific);
+    if (unsupportedKind !== null) {
+      // A node kind the ENGINE supports but this build has no editor for
+      // (`loop_group`, `include`, `workflow`). Preserve the entire wire
+      // fragment on `extra` so save is lossless, and render it read-only.
+      // Severity is `warning`, not `error`: the node round-trips perfectly, so
+      // blocking the save would strand every workflow that uses one.
+      issues.push(
+        makeIssue({
+          rule: 'structural.variant.unsupported',
+          severity: 'warning',
+          source: 'client-instant',
+          message:
+            `'${unsupportedKind}' nodes have no editor in this build; ` +
+            'the node is preserved exactly as written and cannot be edited here',
+          path: { nodeId: id },
+        })
+      );
+      return {
+        id,
+        variant: 'unsupported',
+        base,
+        data: { kind: unsupportedKind },
+        extra: variantSpecific,
+      };
+    }
+
+    // No recognizable mode field at all — genuinely malformed. Preserve whatever
+    // was there on `extra` (so a save cannot erase it) and fall back to an empty
+    // prompt node so the rest of the workflow stays editable. Severity stays
+    // `error`: unlike the case above, this node is NOT valid engine input, and
+    // the empty prompt keeps the save blocked until a human resolves it.
     issues.push(
       makeIssue({
         rule: 'structural.variant.unknown',
@@ -42,7 +72,13 @@ function nodeFromDag(node: WireWorkflowDefinition['nodes'][number], issues: Issu
         path: { nodeId: id },
       })
     );
-    return { id, variant: 'prompt', base, data: defaultPromptData() };
+    return {
+      id,
+      variant: 'prompt',
+      base,
+      data: defaultPromptData(),
+      ...(Object.keys(variantSpecific).length > 0 ? { extra: variantSpecific } : {}),
+    };
   }
 
   if (
@@ -79,21 +115,28 @@ function nodeFromDag(node: WireWorkflowDefinition['nodes'][number], issues: Issu
     );
   }
 
-  // Warn about wire keys the variant's converters do not carry — the engine
-  // emits some fields only on specific variants (e.g. `timeout` on bash/script),
-  // so anything else here cannot survive the round-trip.
+  // Wire keys the variant's converters do not carry. These are PRESERVED on
+  // `extra` and re-emitted verbatim rather than dropped — before this, a field
+  // a newer engine had added (e.g. `settingSources`, #2216) was warned about and
+  // then silently erased on the next save, because a warning does not block the
+  // save gate (`blockingErrors` filters severity `'error'`).
+  //
   // Widen to `string[]` so the `.includes(key)` membership test accepts the
   // arbitrary keys present on the wire node (the registry types these as
   // `keyof WireDagNode` for compile-time drift safety).
   const wireKeys: readonly string[] = VARIANT_REGISTRY[variant].wireKeys;
-  for (const key of Object.keys(variantSpecific)) {
+  const extra: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(variantSpecific)) {
     if (!wireKeys.includes(key)) {
+      extra[key] = value;
       issues.push(
         makeIssue({
           rule: 'structural.field.unsupported',
           severity: 'warning',
           source: 'client-instant',
-          message: `field '${key}' is not supported on ${variant} nodes and was dropped`,
+          message:
+            `field '${key}' has no editor on ${variant} nodes; ` +
+            'it is preserved as written but cannot be edited here',
           path: { nodeId: id, field: key },
         })
       );
@@ -104,7 +147,13 @@ function nodeFromDag(node: WireWorkflowDefinition['nodes'][number], issues: Issu
   // The (variant, data) pair is consistent by construction — detectVariantOrNull
   // and variantDataFromDag read the same fields — so this assembles a valid
   // member of the BuilderNode discriminated union.
-  return { id, variant, base, data } as BuilderNode;
+  return {
+    id,
+    variant,
+    base,
+    data,
+    ...(Object.keys(extra).length > 0 ? { extra } : {}),
+  } as BuilderNode;
 }
 
 /** Convert a wire workflow definition into a `BuilderWorkflow` plus import issues. */

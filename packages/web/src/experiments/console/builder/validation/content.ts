@@ -43,6 +43,12 @@ function textBodies(node: BuilderNode): string[] {
       return node.data.prompt !== undefined ? [node.data.prompt] : [];
     case 'cancel':
       return [];
+    case 'unsupported':
+      // The wire payload is preserved verbatim but not parsed, so any
+      // `$nodeId.output` refs inside it are invisible to this scan. Returning
+      // `[]` means such refs are neither validated nor falsely reported — the
+      // engine still validates them at load time, which is the backstop.
+      return [];
   }
 }
 

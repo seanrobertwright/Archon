@@ -9,7 +9,7 @@
  * undo history, and the clipboard envelope.
  */
 import { VARIANT_REGISTRY } from '../variants';
-import type { BuilderNode, BuilderWorkflow, VariantId } from '../types';
+import type { BuilderNode, BuilderWorkflow, CreatableVariantId } from '../types';
 import { NODE_HEIGHT, NODE_WIDTH, layoutWithDagre } from '../flow/layout';
 import { builderToFlowEdges, edgeId } from '../flow/to-flow';
 import type { XYPosition } from '../flow/types';
@@ -52,7 +52,7 @@ export const NODE_ID_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
 export type EditorAction =
   | {
       type: 'add-node';
-      variant: VariantId;
+      variant: CreatableVariantId;
       position: XYPosition;
       at: number;
       /**
@@ -128,7 +128,7 @@ function remember(state: EditorState, kind: string, at: number): History {
 }
 
 /** `variant-1`, `variant-2`, … skipping taken ids. */
-function uniqueNodeId(variant: VariantId, taken: ReadonlySet<string>): string {
+function uniqueNodeId(variant: CreatableVariantId, taken: ReadonlySet<string>): string {
   let n = 1;
   while (taken.has(`${variant}-${n}`)) n += 1;
   return `${variant}-${n}`;

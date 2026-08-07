@@ -13,13 +13,21 @@ export type ProposedEditOp =
 
 const KNOWN_OPS = new Set(['addNode', 'connect', 'setField', 'rename', 'remove']);
 /**
- * Mirrors the console's `VariantId` union (builder/types/variant.ts) — duplicated here
- * because `@archon/core` cannot import a web package.
+ * Mirrors the console's `VARIANTS` list — the CREATABLE variants
+ * (`CreatableVariantId` in builder/types/variant.ts) — duplicated here because
+ * `@archon/core` cannot import a web package.
+ *
+ * Deliberately NOT the console's full `VariantId` union. That union also carries
+ * `'unsupported'`, the read-only passthrough for engine node kinds the builder
+ * cannot edit (`loop_group`, `include`, `workflow`). Such a node has no
+ * authorable payload — its wire fragment is preserved verbatim from import — so
+ * letting the Copilot propose `addNode` with it would create a node that is
+ * empty by construction. Never add `'unsupported'` to this set.
  *
  * Drift is guarded from the web side: `builder/variants/registry.test.ts` asserts
  * `VARIANTS` still equals this list and fails with a message naming THIS file, so
- * adding an eighth variant breaks the build here rather than silently making the
- * Copilot reject it at proposal time.
+ * adding an eighth creatable variant breaks the build here rather than silently
+ * making the Copilot reject it at proposal time.
  */
 const KNOWN_VARIANTS = new Set([
   'prompt',

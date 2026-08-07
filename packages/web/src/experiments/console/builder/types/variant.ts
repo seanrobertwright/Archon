@@ -13,11 +13,27 @@ import type { WorkflowNodeKind } from '../../primitives/workflow-graph';
 import type { WireDagNode, WireWorkflowDefinition } from './wire';
 
 /**
- * The seven representable node variants — an alias of the console's
+ * The seven variants a user can CREATE — an alias of the console's
  * `WorkflowNodeKind` primitive so the builder and the graph renderer share one
  * union (the builder does not redefine the kinds).
  */
-export type VariantId = WorkflowNodeKind;
+export type CreatableVariantId = WorkflowNodeKind;
+
+/**
+ * Every variant the builder can REPRESENT: the seven creatable kinds plus
+ * `'unsupported'`, the read-only passthrough for engine node kinds this build
+ * has no editor for (`loop_group`, `include`, `workflow`, …).
+ *
+ * Kept distinct from {@link CreatableVariantId} on purpose. `'unsupported'` is
+ * an import-only artifact: it must never reach the node palette, the drag-drop
+ * payload, or the Copilot's `addNode`, so those surfaces iterate `VARIANTS`
+ * (creatable) while the registry, capabilities map, and `BuilderNode` union are
+ * keyed by `VariantId` (representable). Widening happens HERE rather than in
+ * `WorkflowNodeKind` because the run-graph renderer's `kindGlyph` switch is
+ * exhaustive over that primitive and a run graph never shows an unsupported
+ * node — it renders the engine's own expanded DAG.
+ */
+export type VariantId = CreatableVariantId | 'unsupported';
 
 // ---------------------------------------------------------------------------
 // Base fields — shared across every variant (the wire base keys minus `id`)
@@ -59,7 +75,15 @@ export type WireBaseKey =
   | 'sandbox'
   | 'always_run'
   | 'persist_session'
-  | 'output_type';
+  | 'output_type'
+  // Base fields that apply to any node kind. `description` is the node-level
+  // doc string (distinct from the workflow-level `description`); `settingSources`
+  // (#2216) and `pi` (#2144) are per-node provider posture. All three predate
+  // this classification and were previously dropped on import — see
+  // `wire-coverage.ts` for the assert that keeps this list exhaustive.
+  | 'description'
+  | 'settingSources'
+  | 'pi';
 
 /** Shared base fields carried verbatim across the round-trip. All optional. */
 export type BaseFields = Pick<WireDagNode, WireBaseKey>;
@@ -130,6 +154,19 @@ export interface BashNodeData {
   timeout?: number;
 }
 
+/**
+ * Read-only passthrough for an engine node kind this build cannot edit.
+ *
+ * Carries no payload of its own — the node's entire variant-specific wire
+ * fragment rides in `BuilderNode.extra` and is re-emitted verbatim on export,
+ * so an unsupported node survives an open/save cycle byte-identical. `kind` is
+ * the mode-field name (`'loop_group'`, `'include'`, `'workflow'`, …) and exists
+ * only so the canvas and inspector can name what they are refusing to edit.
+ */
+export interface UnsupportedNodeData {
+  kind: string;
+}
+
 /** Maps each variant id to its concrete data shape. */
 export interface VariantDataMap {
   loop: LoopNodeData;
@@ -139,6 +176,7 @@ export interface VariantDataMap {
   command: CommandNodeData;
   prompt: PromptNodeData;
   bash: BashNodeData;
+  unsupported: UnsupportedNodeData;
 }
 
 /** Union of all variant data shapes. */
@@ -161,6 +199,23 @@ export type BuilderNode = {
     variant: K;
     base: BaseFields;
     data: VariantDataMap[K];
+    /**
+     * Wire keys this build cannot model, preserved verbatim and re-emitted on
+     * export. Two populations land here:
+     *   - an `'unsupported'` node's whole mode payload (`loop_group: {…}`)
+     *   - any wire key absent from both `WireBaseKey` and the variant's
+     *     `wireKeys` — i.e. a field a NEWER engine added that this build
+     *     predates
+     *
+     * The second case is why this exists at runtime rather than being solved
+     * purely by `wire-coverage.ts`: that assert only fires once
+     * `api.generated.d.ts` has been regenerated, so a build running against a
+     * newer server would otherwise silently erase the field on save.
+     *
+     * Optional so the many `BuilderNode` object literals (tests, clipboard,
+     * `addNode`) stay valid — a node the user authored has nothing to preserve.
+     */
+    extra?: Record<string, unknown>;
   };
 }[VariantId];
 

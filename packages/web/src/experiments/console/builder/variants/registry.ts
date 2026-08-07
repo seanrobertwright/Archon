@@ -8,8 +8,16 @@
  * type-safe for `toDag` (the data type cannot be correlated with the variant key
  * once destructured). The helpers recover that correlation without `any`.
  */
-import type { BuilderNode, VariantData, VariantDataMap, VariantId, WireDagNode } from '../types';
+import type {
+  BuilderNode,
+  CreatableVariantId,
+  VariantData,
+  VariantDataMap,
+  VariantId,
+  WireDagNode,
+} from '../types';
 import { VARIANT_CAPABILITIES, type VariantCapabilities } from './capabilities';
+import { defaultUnsupportedData, unsupportedFromDag, unsupportedToDag } from './unsupported';
 import { defaultLoopData, loopFromDag, loopToDag } from './loop';
 import { approvalFromDag, approvalToDag, defaultApprovalData } from './approval';
 import { cancelFromDag, cancelToDag, defaultCancelData } from './cancel';
@@ -18,8 +26,17 @@ import { commandFromDag, commandToDag, defaultCommandData } from './command';
 import { defaultPromptData, promptFromDag, promptToDag } from './prompt';
 import { bashFromDag, bashToDag, defaultBashData } from './bash';
 
-/** Canonical variant order (three existing kinds, then the four new variants). */
-export const VARIANTS: readonly VariantId[] = [
+/**
+ * Canonical order of the CREATABLE variants — what the node palette and the
+ * canvas context menu offer, and what the Copilot's `addNode` accepts.
+ *
+ * Deliberately excludes `'unsupported'`: that variant is import-only (a
+ * read-only passthrough for engine kinds this build cannot edit), so offering
+ * it as something a user or the Copilot could ADD would be nonsense. The
+ * registry below is still keyed by the full `VariantId` because an unsupported
+ * node must round-trip like any other.
+ */
+export const VARIANTS: readonly CreatableVariantId[] = [
   'prompt',
   'command',
   'bash',
@@ -31,8 +48,11 @@ export const VARIANTS: readonly VariantId[] = [
 
 const VARIANT_SET: ReadonlySet<string> = new Set(VARIANTS);
 
-/** Narrow an untrusted string to a `VariantId` (e.g. a drag-and-drop payload). */
-export function isVariantId(value: string): value is VariantId {
+/**
+ * Narrow an untrusted string to a CREATABLE variant (e.g. a drag-and-drop
+ * payload). Returns `false` for `'unsupported'` — see `VARIANTS` above.
+ */
+export function isVariantId(value: string): value is CreatableVariantId {
   return VARIANT_SET.has(value);
 }
 
@@ -45,10 +65,11 @@ export interface VariantRegistryEntry<K extends VariantId> {
   capabilities: VariantCapabilities;
   /**
    * The wire keys this variant's converters consume from `variantSpecific`.
-   * The importer warns about (and drops) any other key that lands there, so a
-   * field the round-trip cannot carry is never lost silently. Typed as
-   * `keyof WireDagNode` so a typo or a renamed wire field fails to compile
-   * rather than silently classifying every key as unsupported.
+   * The importer warns about any other key that lands there and preserves it on
+   * `BuilderNode.extra` for verbatim re-export, so a field the converters cannot
+   * carry is neither lost nor silent. Typed as `keyof WireDagNode` so a typo or
+   * a renamed wire field fails to compile rather than silently classifying every
+   * key as unsupported.
    */
   wireKeys: readonly (keyof WireDagNode)[];
   /**
@@ -144,6 +165,19 @@ export const VARIANT_REGISTRY: { [K in VariantId]: VariantRegistryEntry<K> } = {
     dataKeys: ['reason'],
     capabilities: VARIANT_CAPABILITIES.cancel,
   },
+  unsupported: {
+    label: 'Unsupported',
+    defaultData: defaultUnsupportedData,
+    fromDag: unsupportedFromDag,
+    toDag: unsupportedToDag,
+    // Empty on purpose. `wireKeys` drives the importer's "field not carried"
+    // warning; an unsupported node preserves its ENTIRE variant-specific
+    // fragment through `BuilderNode.extra`, so declaring keys here would
+    // suppress nothing and wrongly imply the converters read them.
+    wireKeys: [],
+    dataKeys: ['kind'],
+    capabilities: VARIANT_CAPABILITIES.unsupported,
+  },
 };
 
 /**
@@ -179,5 +213,7 @@ export function nodeDataToDag(node: BuilderNode): Partial<WireDagNode> {
       return promptToDag(node.data);
     case 'bash':
       return bashToDag(node.data);
+    case 'unsupported':
+      return unsupportedToDag(node.data);
   }
 }

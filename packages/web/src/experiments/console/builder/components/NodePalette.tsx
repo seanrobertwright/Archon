@@ -6,14 +6,17 @@
  */
 import type { CSSProperties, DragEvent, ReactElement } from 'react';
 import { VARIANTS, VARIANT_REGISTRY } from '../variants';
-import type { VariantId } from '../types';
+import type { CreatableVariantId } from '../types';
 import { PALETTE_DATA_KEY } from './BuilderCanvas';
 
 interface NodePaletteProps {
-  onAddVariant: (variant: VariantId) => void;
+  onAddVariant: (variant: CreatableVariantId) => void;
 }
 
-function variantHint(variant: VariantId): string {
+// `CreatableVariantId`, not `VariantId`: the palette iterates `VARIANTS`, which
+// excludes the import-only `'unsupported'` passthrough. Typing it narrowly means
+// adding a future non-creatable variant cannot silently leak into the palette.
+function variantHint(variant: CreatableVariantId): string {
   switch (variant) {
     case 'prompt':
       return 'Inline AI prompt';

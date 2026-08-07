@@ -20,9 +20,17 @@ function sparsifyNode(merged: Record<string, unknown>): WireDagNode {
   return out as WireDagNode;
 }
 
-/** Reassemble a single builder node into a sparse wire node. */
+/**
+ * Reassemble a single builder node into a sparse wire node.
+ *
+ * `extra` (wire fields this build cannot model — an unsupported node's whole
+ * mode payload, or a field a newer engine added) is spread BEFORE the variant
+ * data so a modelled field always wins over a preserved one. For an
+ * `'unsupported'` node `nodeDataToDag` returns `{}`, so `extra` supplies the
+ * entire fragment and the node round-trips byte-identical.
+ */
 function nodeToDag(node: BuilderNode): WireDagNode {
-  return sparsifyNode({ ...node.base, ...nodeDataToDag(node), id: node.id });
+  return sparsifyNode({ ...node.base, ...node.extra, ...nodeDataToDag(node), id: node.id });
 }
 
 /** Convert a `BuilderWorkflow` back into a wire workflow definition. */

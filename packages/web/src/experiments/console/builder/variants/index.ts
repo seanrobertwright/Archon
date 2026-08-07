@@ -17,3 +17,10 @@ export { defaultScriptData, scriptFromDag, scriptToDag } from './script';
 export { defaultCommandData, commandFromDag, commandToDag } from './command';
 export { defaultPromptData, promptFromDag, promptToDag } from './prompt';
 export { defaultBashData, bashFromDag, bashToDag } from './bash';
+export {
+  UNSUPPORTED_MODE_FIELDS,
+  defaultUnsupportedData,
+  detectUnsupportedKind,
+  unsupportedFromDag,
+  unsupportedToDag,
+} from './unsupported';

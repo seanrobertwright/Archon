@@ -30,7 +30,7 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react';
 import { VARIANTS, VARIANT_REGISTRY, isVariantId } from '../variants';
-import type { VariantId } from '../types';
+import type { CreatableVariantId } from '../types';
 import type { BuilderFlowEdge, BuilderFlowNode, XYPosition } from '../flow/types';
 import { BUILDER_NODE_TYPE } from '../flow/to-flow';
 import { NODE_HEIGHT, NODE_WIDTH } from '../flow/layout';
@@ -54,7 +54,7 @@ interface BuilderCanvasProps {
     edges: readonly { id: string; selected: boolean }[]
   ) => void;
   onConnect: (source: string, target: string) => void;
-  onAddNode: (variant: VariantId, position: XYPosition) => void;
+  onAddNode: (variant: CreatableVariantId, position: XYPosition) => void;
   onInit: (instance: ReactFlowInstance<BuilderFlowNode, BuilderFlowEdge>) => void;
   /** Replace the whole selection (used when right-clicking an unselected element). */
   onSetSelection: (nodeIds: readonly string[], edgeIds: readonly string[]) => void;

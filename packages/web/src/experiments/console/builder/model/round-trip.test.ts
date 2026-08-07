@@ -115,10 +115,16 @@ describe('import issues', () => {
     if (node.variant === 'script') expect(node.data.runtime).toBe('bun');
   });
 
-  test('a wire key the variant cannot carry is dropped with a warning, matching the engine', () => {
+  test('a wire key the variant cannot carry is preserved with a warning', () => {
     // The engine's transform emits `timeout` only on bash/script nodes, so a
-    // prompt node carrying one is not engine-producible input; the importer
-    // drops it loudly rather than silently.
+    // prompt node carrying one is not engine-producible input. The importer
+    // warns AND preserves it rather than dropping it.
+    //
+    // Preserving is safe: `dagNodeSchema.safeParse({id,prompt,timeout})` is
+    // ACCEPTED and simply strips `timeout` on the next load, so writing it back
+    // cannot make the workflow invalid. The general rule matters more than this
+    // synthetic case — the same code path is what stops a field a NEWER engine
+    // added (e.g. `settingSources`, #2216) from being erased on save.
     const { workflow, issues } = fromWorkflowDefinition(
       wire([{ id: 'p', prompt: 'hi', timeout: 5000 }])
     );
@@ -127,7 +133,7 @@ describe('import issues', () => {
     expect(issues[0].severity).toBe('warning');
     expect(issues[0].path).toEqual({ nodeId: 'p', field: 'timeout' });
     const out = toWorkflowDefinition(workflow);
-    expect('timeout' in out.nodes[0]).toBe(false);
+    expect(out.nodes[0]).toEqual({ id: 'p', prompt: 'hi', timeout: 5000 });
   });
 
   test('a loop with both prompt and command is flagged with an error and keeps the prompt', () => {
@@ -172,9 +178,20 @@ describe('import issues', () => {
 
 describe('fromDag fail-fast contract', () => {
   test('every fromDag throws when its mode field is absent', async () => {
-    const { VARIANT_REGISTRY } = await import('../variants');
-    for (const entry of Object.values(VARIANT_REGISTRY)) {
-      expect(() => entry.fromDag({})).toThrow(/has no '.+' field/);
+    const { VARIANT_REGISTRY, VARIANTS } = await import('../variants');
+    // Iterate `VARIANTS` (creatable) rather than every registry key: the
+    // `'unsupported'` passthrough is defined by having NO modelled mode field,
+    // so "throws when the mode field is absent" is meaningless for it. It is
+    // covered instead by `passthrough.test.ts`.
+    for (const variant of VARIANTS) {
+      expect(() => VARIANT_REGISTRY[variant].fromDag({})).toThrow(/has no '.+' field/);
     }
+  });
+
+  test('unsupportedFromDag does not throw on an unrecognized fragment', async () => {
+    // Complements the contract above: this variant must degrade to a named
+    // passthrough rather than fail, or an unsupported node would break import.
+    const { VARIANT_REGISTRY } = await import('../variants');
+    expect(VARIANT_REGISTRY.unsupported.fromDag({})).toEqual({ kind: 'unknown' });
   });
 });

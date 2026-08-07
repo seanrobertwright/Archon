@@ -29,6 +29,10 @@ export function contentPreview(node: BuilderNode): string {
       return node.data.message.split('\n')[0] ?? '';
     case 'cancel':
       return node.data.reason.split('\n')[0] ?? '';
+    case 'unsupported':
+      // No editor for this kind, so there is no modelled body to preview. Name
+      // the engine node kind instead — that is the one thing worth showing.
+      return `${node.data.kind} node (read-only)`;
   }
 }
 

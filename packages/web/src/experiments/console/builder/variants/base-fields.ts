@@ -45,6 +45,9 @@ const BASE_FIELD_KEY_RECORD: Record<WireBaseKey, true> = {
   always_run: true,
   persist_session: true,
   output_type: true,
+  description: true,
+  settingSources: true,
+  pi: true,
 };
 
 const BASE_FIELD_KEY_SET = new Set<string>(Object.keys(BASE_FIELD_KEY_RECORD));

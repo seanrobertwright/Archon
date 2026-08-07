@@ -11,7 +11,12 @@ export default tseslint.config(
       'packages/*/dist/**',
       'dist/**',
       'coverage/**',
-      '.agents/examples/**',
+      // Entire tree is gitignored (.gitignore: `.agents/`) — locally-installed
+      // agent skills and review notes, never committed and never in a tsconfig
+      // project. Previously only `examples/` was ignored, so a skill dropped in
+      // `.agents/skills/` broke `bun run validate` with a type-information error
+      // on a file CI never sees. Mirrors the existing `.claude/skills/**` entry.
+      '.agents/**',
       'packages/docs-web/**',
       'workspace/**',
       'worktrees/**',

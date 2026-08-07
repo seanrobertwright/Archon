@@ -9,10 +9,10 @@
  */
 import { isVariantId, VARIANT_REGISTRY } from '../variants';
 import { NODE_ID_PATTERN } from '../editor/state';
-import type { VariantId } from '../types';
+import type { CreatableVariantId } from '../types';
 
 export type ProposedEdit =
-  | { op: 'addNode'; id: string; variant: VariantId; data?: Record<string, unknown> }
+  | { op: 'addNode'; id: string; variant: CreatableVariantId; data?: Record<string, unknown> }
   | { op: 'connect'; source: string; target: string }
   | { op: 'setField'; id: string; path: string; value: unknown }
   | { op: 'rename'; id: string; nextId: string }

@@ -92,4 +92,54 @@ describe('variant registry ↔ @archon/core mirror', () => {
       }
     }
   });
+
+  /**
+   * `'unsupported'` is representable but NOT creatable. If it ever leaks into
+   * `VARIANTS` it would appear in the node palette and in the Copilot's
+   * `addNode` allow-list, letting a user author a node whose payload is empty by
+   * construction — the exact corruption the passthrough exists to prevent.
+   */
+  test("'unsupported' is representable but never creatable", () => {
+    expect(VARIANTS as readonly string[]).not.toContain('unsupported');
+    expect(isVariantId('unsupported')).toBe(false);
+    // …yet the registry must still carry it, or import/export cannot round-trip.
+    expect(VARIANT_REGISTRY.unsupported.capabilities.readOnly).toBe(true);
+  });
+});
+
+/**
+ * `types/wire-coverage.ts` asserts at COMPILE time that every wire `DagNode` key
+ * is classified. Its `VariantWireKey` union is hand-maintained (deriving it from
+ * the registry would be an import cycle: the registry imports the type layer),
+ * so this test is what keeps the hand-written union honest. Without it, a
+ * variant could gain a `wireKey` that the assert still believes is unclassified
+ * — or, worse, the assert could be quietly satisfied by a stale union member
+ * that no variant actually reads.
+ */
+describe('variant registry ↔ wire-coverage assert', () => {
+  test('VariantWireKey equals the union of every variant wireKeys', () => {
+    const fromRegistry = new Set<string>();
+    for (const v of VARIANTS) {
+      for (const k of VARIANT_REGISTRY[v].wireKeys as readonly string[]) fromRegistry.add(k);
+    }
+    // Mirrors `VariantWireKey` in types/wire-coverage.ts.
+    const MIRRORED_VARIANT_WIRE_KEYS = [
+      'prompt',
+      'command',
+      'bash',
+      'script',
+      'runtime',
+      'deps',
+      'timeout',
+      'loop',
+      'approval',
+      'cancel',
+    ];
+    expect([...fromRegistry].sort()).toEqual([...MIRRORED_VARIANT_WIRE_KEYS].sort());
+  });
+
+  test('the unsupported variant declares no wireKeys', () => {
+    // Its payload rides on `BuilderNode.extra`, not through the converters.
+    expect(VARIANT_REGISTRY.unsupported.wireKeys).toEqual([]);
+  });
 });

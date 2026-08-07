@@ -107,7 +107,41 @@ function VariantFields({
           }}
         />
       );
+    case 'unsupported':
+      // No fields, by design. This build has no editor for the kind, so its wire
+      // payload is preserved verbatim; offering a partial editor would let a user
+      // half-edit a shape the builder does not understand and corrupt it on save.
+      return <UnsupportedFields kind={node.data.kind} wire={node.extra} />;
   }
+}
+
+/**
+ * Read-only surface for an `'unsupported'` node: names the engine node kind and
+ * shows the preserved payload so the author can see it is intact, with a pointer
+ * to the one tool that CAN edit it.
+ */
+function UnsupportedFields({
+  kind,
+  wire,
+}: {
+  kind: string;
+  wire: Record<string, unknown> | undefined;
+}): ReactElement {
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="rounded-[8px] border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-text-secondary">
+        <span className="font-semibold text-warning">{kind}</span> nodes have no editor in this
+        build. This node is preserved exactly as written and saving will not change it — edit it in
+        the YAML file directly.
+      </div>
+      <label className="text-[11px] font-medium tracking-wide text-text-tertiary uppercase">
+        Preserved payload
+      </label>
+      <pre className="max-h-64 overflow-auto rounded-[8px] border border-border bg-surface px-3 py-2 font-mono text-[11px] whitespace-pre-wrap text-text-secondary">
+        {JSON.stringify(wire ?? {}, null, 2)}
+      </pre>
+    </div>
+  );
 }
 
 export function Inspector({
