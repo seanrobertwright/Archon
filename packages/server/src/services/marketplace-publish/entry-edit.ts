@@ -199,9 +199,15 @@ export function emitEntry(candidate: MarketplaceEntryCandidate): string {
  * reach this function with one.
  *
  * UPDATE touches ONLY the matched entry block's `sha` literal and the sha
- * embedded in `sourceUrl` — they are the same 40-hex string (S4), so a single
- * substring replace within the entry's own text handles both, plus a refresh
- * of `archonVersionCompat`. No other field changes.
+ * embedded in `sourceUrl` — they are the same 40-hex string (S4) — plus a
+ * refresh of `archonVersionCompat`. No other field changes.
+ *
+ * The two rewrites are FIELD-SCOPED rather than a single entry-wide substring
+ * replace: a 40-hex string can legitimately appear elsewhere in the block (a
+ * `description` quoting a commit, a tag, a trailing comment), and an entry-wide
+ * replace would silently rewrite it too. `sourceUrl` is matched for both quote
+ * styles the registry uses (single-quoted, as `emitEntry` writes, and template
+ * literal) so a hand-authored entry keeps the same behavior it had before.
  */
 export function applyEdit(
   sourceText: string,
@@ -232,7 +238,15 @@ export function applyEdit(
       `Cannot update entry "${existing.slug}": no quoted 40-hex "sha" literal found to replace.`
     );
   }
-  let updatedEntryText = existing.text.split(oldSha).join(candidate.sha);
+  let updatedEntryText = existing.text.replace(
+    /(\bsha:\s*')[0-9a-f]{40}(')/,
+    `$1${candidate.sha}$2`
+  );
+  updatedEntryText = updatedEntryText.replace(
+    /(\bsourceUrl:\s*)(['`])([^'`]*)\2/,
+    (_match, prefix: string, quote: string, url: string) =>
+      `${prefix}${quote}${url.split(oldSha).join(candidate.sha)}${quote}`
+  );
   updatedEntryText = updatedEntryText.replace(
     /archonVersionCompat:\s*'[^']*'/,
     `archonVersionCompat: '${escapeSingleQuoted(candidate.archonVersionCompat)}'`

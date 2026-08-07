@@ -10,10 +10,15 @@ endpoints and a GitHub-publish service, and it performs git/GitHub writes.
 
 ## What Submit does
 
+> The sections below describe what Submit does **today**. Two dated amendments at the end of this
+> file record where the shipped implementation revised the original decision and why — they are the
+> history, this is the current behavior.
+
 1. Hosts the workflow in the **project's own GitHub repo** (the project the workflow already lives
    in). It assembles a directory bundle at `.archon/marketplace/<slug>/` (the workflow YAML plus any
-   `command:`/`script:`-referenced files), commits + pushes it to the default branch, and pins that
-   commit SHA. Blocks if the project repo is private or has no GitHub origin.
+   `command:`/`script:`-referenced files), creates a commit on the default branch and advances that
+   branch's ref through the **GitHub Git Data API** (no local `git push` — see Amendment 2026-07-03
+   §1), and pins that commit SHA. Blocks if the project repo is private or has no GitHub origin.
 2. Runs **pre-flight gates mirroring the marketplace CI** (schema-validate, security-scan,
    slug-policy, SHA-resolves, version-compat) so a submitted PR can never bounce on CI.
 3. Forks `coleam00/Archon`, adds or updates the `MarketplaceEntry` in
@@ -26,8 +31,9 @@ endpoints and a GitHub-publish service, and it performs git/GitHub writes.
   resolution; works on both solo (PAT) and multi-user installs.
 - **Bundled resources:** detect `command:`/`script:` references and bundle them into the directory
   layout, so an installed workflow is never missing its files.
-- **Re-submission:** if the slug exists under the caller's own GitHub login, Submit UPDATES that
-  entry's SHA/version in place; a different author's slug is a hard collision and blocks.
+- **Re-submission:** if the slug exists under the caller's own GitHub login, Submit updates that
+  entry's `sha` and the SHA embedded in `sourceUrl` in place (`MarketplaceEntry` has no `version`
+  field); a different author's slug is a hard collision and blocks.
 
 ## Considered alternatives
 
@@ -42,8 +48,10 @@ endpoints and a GitHub-publish service, and it performs git/GitHub writes.
   carry the usual auth/secret-handling discipline (never echo tokens; mask in logs).
 - Submit writes new files (`.archon/marketplace/<slug>/`) into the user's project repo on their
   default branch — a visible, persistent side effect they must understand and consent to.
-- Bulletproofness depends on reusing the existing CI scripts
-  (`.archon/scripts/marketplace-*.ts`) as the pre-flight gates rather than reimplementing them.
+- Bulletproofness depends on pre-flight and CI sharing their check logic rather than reimplementing
+  it. That reuse is the in-process `@archon/workflows/marketplace-checks` functions, which the CI
+  scripts (`.archon/scripts/marketplace-*.ts`) and server pre-flight both call — see Amendment
+  2026-08-06.
 
 ## Amendment (2026-07-03) — implementation spikes revised two decisions
 

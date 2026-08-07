@@ -244,6 +244,85 @@ describe('applyEdit — update', () => {
     // Untouched fields survive verbatim.
     expect(updated).toContain("name: 'My Flow'");
   });
+
+  test('does not rewrite the old sha where it appears outside the sha/sourceUrl fields', () => {
+    const OLD = '1111111111111111111111111111111111111111';
+    const NEW = '2222222222222222222222222222222222222222';
+    // The old sha also appears inside `description` and a tag. Only the `sha`
+    // field and the sha embedded in `sourceUrl` may change.
+    const fixture = `export const marketplaceEntries: MarketplaceEntry[] = [
+  {
+    slug: 'my-flow',
+    name: 'My Flow',
+    author: 'seanrobertwright',
+    description: 'Pinned at ${OLD} for reproducibility.',
+    sourceUrl: 'https://github.com/seanrobertwright/proj/tree/${OLD}/.archon/marketplace/my-flow',
+    sha: '${OLD}',
+    tags: ['build-${OLD}'],
+    archonVersionCompat: '>=0.4.0',
+  },
+];
+`;
+    const parsed = parseEntries(fixture);
+    const action = decideAction(parsed.entries, 'my-flow', 'seanrobertwright');
+    expect(action.kind).toBe('update');
+
+    const candidate: MarketplaceEntryCandidate = {
+      slug: 'my-flow',
+      name: 'My Flow',
+      author: 'seanrobertwright',
+      description: `Pinned at ${OLD} for reproducibility.`,
+      sourceUrl: `https://github.com/seanrobertwright/proj/tree/${NEW}/.archon/marketplace/my-flow`,
+      sha: NEW,
+      tags: [`build-${OLD}`],
+      archonVersionCompat: '>=0.5.0',
+    };
+    const updated = applyEdit(fixture, parsed, action, candidate);
+
+    // The two intended sites moved to the new sha...
+    expect(updated).toContain(`sha: '${NEW}'`);
+    expect(updated).toContain(`/tree/${NEW}/.archon/marketplace/my-flow`);
+    // ...and the incidental occurrences kept the old one.
+    expect(updated).toContain(`description: 'Pinned at ${OLD} for reproducibility.'`);
+    expect(updated).toContain(`tags: ['build-${OLD}']`);
+    expect(parseEntries(updated).entries).toHaveLength(1);
+  });
+
+  test('rewrites the sha inside a template-literal sourceUrl', () => {
+    const OLD = '1111111111111111111111111111111111111111';
+    const NEW = '2222222222222222222222222222222222222222';
+    const fixture = `export const marketplaceEntries: MarketplaceEntry[] = [
+  {
+    slug: 'my-flow',
+    name: 'My Flow',
+    author: 'seanrobertwright',
+    description: 'A flow.',
+    sourceUrl: \`https://github.com/seanrobertwright/proj/tree/${OLD}/x.yaml\`,
+    sha: '${OLD}',
+    tags: ['development'],
+    archonVersionCompat: '>=0.4.0',
+  },
+];
+`;
+    const parsed = parseEntries(fixture);
+    const action = decideAction(parsed.entries, 'my-flow', 'seanrobertwright');
+    expect(action.kind).toBe('update');
+
+    const updated = applyEdit(fixture, parsed, action, {
+      slug: 'my-flow',
+      name: 'My Flow',
+      author: 'seanrobertwright',
+      description: 'A flow.',
+      sourceUrl: `https://github.com/seanrobertwright/proj/tree/${NEW}/x.yaml`,
+      sha: NEW,
+      tags: ['development'],
+      archonVersionCompat: '>=0.5.0',
+    });
+
+    expect(updated).toContain(`sha: '${NEW}'`);
+    expect(updated).toContain(`\`https://github.com/seanrobertwright/proj/tree/${NEW}/x.yaml\``);
+    expect(updated).not.toContain(OLD);
+  });
 });
 
 describe('applyEdit — update defensive error', () => {

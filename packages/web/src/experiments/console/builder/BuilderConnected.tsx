@@ -403,6 +403,13 @@ export function BuilderConnected(): ReactElement {
   const saveLabel = readOnly ? 'Save as' : 'Save';
   const canSave = !busy && (readOnly || dirty || isCreateMode);
   const workflowOpen = name !== undefined && imported !== null;
+  // BuilderConnected is reused across route/project changes, so an open Submit
+  // modal would otherwise survive into the new context — and since editorKey
+  // carries cwd, that includes the same workflow name under a different project
+  // (where SubmitModal would receive a new cwd without resetting its own state).
+  useEffect(() => {
+    setSubmitOpen(false);
+  }, [editorKey, workflowOpen]);
   // Submit needs a saved project workflow on disk: readOnly (bundled) has no
   // project-local file yet (Save as first), create mode hasn't saved, and a
   // dirty edit hasn't landed on disk — the server re-reads the file, it never
