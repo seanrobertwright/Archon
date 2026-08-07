@@ -66,3 +66,59 @@ describe('computeProposalPreview', () => {
     expect(preview.workflow.nodes.map(n => n.id).sort()).toEqual(['classify', 'fix', 'report']);
   });
 });
+
+/**
+ * These fold through `editorReducer`, which is the only place the original
+ * `setField` corruption became visible: `patch-node` REPLACES a node rather than
+ * merging it, so a second patch built from the stale pre-batch node silently
+ * reverted the first. Asserting on the translated actions alone is a weaker
+ * guard than asserting on the folded result.
+ */
+describe('computeProposalPreview — batch-local setField composition', () => {
+  test('two setFields on the same node both survive the fold', () => {
+    const preview = computeProposalPreview(workflow(), [
+      { op: 'setField', id: 'classify', path: 'base.output_type', value: 'FIRST' },
+      { op: 'setField', id: 'classify', path: 'base.trigger_rule', value: 'all_done' },
+    ] as ProposedEdit[]);
+    expect(preview.issues).toHaveLength(0);
+    const node = preview.workflow.nodes.find(n => n.id === 'classify');
+    expect(node?.base.output_type).toBe('FIRST');
+    expect(node?.base.trigger_rule).toBe('all_done');
+  });
+
+  test('last write wins when the same field is set twice', () => {
+    const preview = computeProposalPreview(workflow(), [
+      { op: 'setField', id: 'classify', path: 'base.output_type', value: 'first' },
+      { op: 'setField', id: 'classify', path: 'base.output_type', value: 'second' },
+    ] as ProposedEdit[]);
+    expect(preview.issues).toHaveLength(0);
+    expect(preview.workflow.nodes.find(n => n.id === 'classify')?.base.output_type).toBe('second');
+  });
+
+  test('rename then setField on the new id lands on the renamed node', () => {
+    const preview = computeProposalPreview(workflow(), [
+      { op: 'rename', id: 'classify', nextId: 'triage' },
+      { op: 'setField', id: 'triage', path: 'base.output_type', value: 'after rename' },
+    ] as ProposedEdit[]);
+    expect(preview.issues.filter(i => i.severity === 'error')).toHaveLength(0);
+    const node = preview.workflow.nodes.find(n => n.id === 'triage');
+    expect(node?.base.output_type).toBe('after rename');
+  });
+
+  test('a proposed connection ghosts as an added edge', () => {
+    const preview = computeProposalPreview(workflow(), [
+      { op: 'addNode', id: 'gate', variant: 'approval', data: { message: 'ok?' } },
+      { op: 'connect', source: 'classify', target: 'gate' },
+    ] as ProposedEdit[]);
+    const added = [...preview.edgeGhosts.entries()].filter(([, k]) => k === 'add');
+    expect(added.length).toBeGreaterThan(0);
+  });
+
+  test('removing a node ghosts the edges that disappear with it', () => {
+    const before = computeProposalPreview(workflow(), [
+      { op: 'remove', id: 'classify' },
+    ] as ProposedEdit[]);
+    const removed = [...before.edgeGhosts.entries()].filter(([, k]) => k === 'remove');
+    expect(removed.length).toBeGreaterThan(0);
+  });
+});

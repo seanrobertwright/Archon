@@ -289,3 +289,29 @@ describe('opsToEditorActions — batch-local node state', () => {
     expect(issues[0]?.rule).toBe('copilot.setField.unknownNode');
   });
 });
+
+describe('opsToEditorActions — rename interactions', () => {
+  test('rename then remove targets the renamed node', () => {
+    const { actions, issues } = opsToEditorActions(
+      [
+        { op: 'rename', id: 'classify', nextId: 'triage' },
+        { op: 'remove', id: 'triage' },
+      ],
+      workflow()
+    );
+    expect(issues).toHaveLength(0);
+    expect(actions.map(a => a.type)).toEqual(['rename-node', 'remove-nodes']);
+  });
+
+  test('rename then remove using the OLD id reports it as unknown', () => {
+    const { issues } = opsToEditorActions(
+      [
+        { op: 'rename', id: 'classify', nextId: 'triage' },
+        { op: 'remove', id: 'classify' },
+      ],
+      workflow()
+    );
+    expect(issues).toHaveLength(1);
+    expect(issues[0]?.rule).toBe('copilot.remove.unknownNode');
+  });
+});
