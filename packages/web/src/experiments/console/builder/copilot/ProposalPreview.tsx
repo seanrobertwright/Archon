@@ -25,7 +25,7 @@ export function ProposalPreview({
 }: ProposalPreviewProps): ReactElement {
   if (proposal.invalidReason !== null || proposal.preview === null) {
     return (
-      <div className="rounded-[10px] border border-error/30 bg-error/[0.06] px-3 py-2.5 text-[12.5px] text-text-secondary">
+      <div className="rounded-[10px] border border-error/30 bg-error/10 px-3 py-2.5 text-[12.5px] text-text-secondary">
         <p className="text-error">
           The proposed edits couldn't be read: {proposal.invalidReason ?? 'unknown error'}.
         </p>

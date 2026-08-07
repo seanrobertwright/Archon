@@ -58,10 +58,19 @@ const NODE_ID_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
 const VARIANT_DATA_KEYS: Record<string, readonly string[]> = {
   prompt: ['prompt'],
   command: ['command'],
-  bash: ['bash'],
-  script: ['script', 'runtime'],
-  loop: ['prompt', 'until', 'max_iterations', 'fresh_context'],
-  approval: ['message'],
+  bash: ['bash', 'timeout'],
+  script: ['script', 'runtime', 'deps', 'timeout'],
+  loop: [
+    'prompt',
+    'command',
+    'until',
+    'max_iterations',
+    'fresh_context',
+    'until_bash',
+    'interactive',
+    'gate_message',
+  ],
+  approval: ['message', 'capture_response', 'on_reject'],
   cancel: ['reason'],
 };
 

@@ -65,6 +65,8 @@ interface BuilderPageProps {
   preview?: {
     workflow: BuilderWorkflow;
     ghosts: ReadonlyMap<string, 'add' | 'changed' | 'remove'>;
+    /** Proposed connection changes, keyed by edge id — added links render dashed-accent, dropped ones struck. */
+    edgeGhosts?: ReadonlyMap<string, 'add' | 'remove'>;
     positions: ReadonlyMap<string, XYPosition>;
     issues: readonly Issue[];
   } | null;
@@ -144,7 +146,13 @@ export function BuilderPage({
     const positions = preview
       ? new Map([...preview.positions, ...state.positions])
       : state.positions;
-    const derived = builderToFlow(displayWorkflow, positions, state.selectedNodes, preview?.ghosts);
+    const derived = builderToFlow(
+      displayWorkflow,
+      positions,
+      state.selectedNodes,
+      preview?.ghosts,
+      preview?.edgeGhosts
+    );
     return {
       nodes: derived.nodes,
       // Override the edge's inline stroke when selected: xyflow's `.selected`

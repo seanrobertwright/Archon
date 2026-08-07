@@ -62,8 +62,12 @@ function validateOp(raw: unknown): { ok: true; op: ProposedEdit } | { ok: false;
       // over the variant defaults, which leaves the real field empty and surfaces
       // as an unexplained "must not be empty" on the preview. Derived from the
       // registry, so unlike the server-side mirror this cannot drift.
+      //
+      // `dataKeys`, NOT `Object.keys(defaultData())` — the latter covers only the
+      // initialized fields and would reject legitimate optional ones (bash
+      // `timeout`, script `deps`, approval `capture_response`, …).
       if (data !== undefined) {
-        const allowed = Object.keys(VARIANT_REGISTRY[variant].defaultData());
+        const allowed: readonly string[] = VARIANT_REGISTRY[variant].dataKeys;
         const unknown = Object.keys(data).filter(k => !allowed.includes(k));
         if (unknown.length > 0) {
           return {

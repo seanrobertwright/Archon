@@ -52,16 +52,44 @@ describe('variant registry ↔ @archon/core mirror', () => {
    */
   test('per-variant data keys match those enumerated in propose-workflow-edits-tool.ts', () => {
     const actual = Object.fromEntries(
-      VARIANTS.map(v => [v, Object.keys(VARIANT_REGISTRY[v].defaultData()).sort()])
+      VARIANTS.map(v => [v, [...(VARIANT_REGISTRY[v].dataKeys as readonly string[])].sort()])
     );
     expect(actual).toEqual({
       prompt: ['prompt'],
       command: ['command'],
-      bash: ['bash'],
-      script: ['runtime', 'script'],
-      loop: ['fresh_context', 'max_iterations', 'prompt', 'until'],
-      approval: ['message'],
+      bash: ['bash', 'timeout'],
+      script: ['deps', 'runtime', 'script', 'timeout'],
+      loop: [
+        'command',
+        'fresh_context',
+        'gate_message',
+        'interactive',
+        'max_iterations',
+        'prompt',
+        'until',
+        'until_bash',
+      ],
+      approval: ['capture_response', 'message', 'on_reject'],
       cancel: ['reason'],
     });
+  });
+
+  /**
+   * `dataKeys` must be a SUPERSET of the initialized fields. Deriving the
+   * Copilot allow-list from `defaultData()` alone was the original bug: it
+   * silently rejected every optional field (bash `timeout`, script `deps`,
+   * approval `capture_response`, …) that the workflow schema supports.
+   */
+  test('dataKeys is a superset of defaultData() keys for every variant', () => {
+    for (const v of VARIANTS) {
+      const declared = new Set<string>(VARIANT_REGISTRY[v].dataKeys as readonly string[]);
+      for (const k of Object.keys(VARIANT_REGISTRY[v].defaultData())) {
+        expect({ variant: v, key: k, declared: declared.has(k) }).toEqual({
+          variant: v,
+          key: k,
+          declared: true,
+        });
+      }
+    }
   });
 });

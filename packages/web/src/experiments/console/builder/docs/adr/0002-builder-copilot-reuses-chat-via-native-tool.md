@@ -8,9 +8,19 @@ persistence, `ChatStream`/`ChatComposer` UI, SSE streaming, multi-turn) rather t
 endpoint. The structured edits travel through a new in-process **native tool**,
 `propose_workflow_edits(ops)` — a direct sibling of `manage_run`
 (`packages/core/src/orchestrator/manage-run-tool.ts`). The builder client reads the tool call off
-the SSE stream and renders an atomic preview (ghost nodes / dashed edges) that the user Accepts or
-Rejects; Accept applies the ops through the PR-2 `editorReducer`, so undo/redo + validation come for
-free.
+the **completed assistant message's `metadata.toolCalls[]`** once the turn lands — not off the SSE
+stream. The server does emit a mid-stream `tool_call` event carrying `input`, but the console's SSE
+consumers are deliberately signal-only (they invalidate the message cache and nothing more), so the
+Copilot follows the same `useEntity(K.messages)` + `useConversationSSE` path as `ChatPage` rather
+than inventing a parallel data route. The practical consequence is that a Proposal appears when the
+assistant turn completes, not mid-stream. It then renders as an atomic preview (ghost nodes / dashed
+edges) that the user Accepts or Rejects; Accept applies the ops through the PR-2 `editorReducer`, so
+undo/redo + validation come for free.
+
+Note that the tool call is persisted under a provider-dependent name: Claude registers in-process
+native tools through an MCP server named `archon`, so it lands as
+`mcp__archon__propose_workflow_edits`, while Pi passes the bare `propose_workflow_edits` through.
+The client matches both.
 
 ## Why this shape
 

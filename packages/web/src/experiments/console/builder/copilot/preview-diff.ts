@@ -6,6 +6,7 @@
  * `BuilderPage` renders on canvas (Pre-flight #5).
  */
 import { createEditorState, editorReducer } from '../editor/state';
+import { builderToFlowEdges } from '../flow/to-flow';
 import type { XYPosition } from '../flow/types';
 import type { BuilderNode, BuilderWorkflow, Issue } from '../types';
 import { runValidation } from '../validation';
@@ -13,11 +14,19 @@ import { opsToEditorActions } from './translate-ops';
 import type { ProposedEdit } from './op-schema';
 
 export type GhostKind = 'add' | 'remove' | 'changed';
+/** Edges only ever appear or disappear — there is no "changed" edge. */
+export type EdgeGhostKind = 'add' | 'remove';
 
 export interface ProposalPreview {
   /** Union workflow: the folded result's nodes PLUS any removed nodes re-included (struck-through). */
   workflow: BuilderWorkflow;
   ghosts: ReadonlyMap<string, GhostKind>;
+  /**
+   * Proposed connection changes, keyed by xyflow edge id. Without this a
+   * proposed `connect` renders as an ordinary solid edge and a dropped one just
+   * vanishes — so the author could not see which links the batch would change.
+   */
+  edgeGhosts: ReadonlyMap<string, EdgeGhostKind>;
   /** Positions for nodes new to the union (added ghosts). Merge UNDER the live position map — the
    *  fold recomputes a full-graph layout, which must not clobber the author's saved positions. */
   positions: ReadonlyMap<string, XYPosition>;
@@ -60,9 +69,19 @@ export function computeProposalPreview(
     nodes: [...result.workflow.nodes, ...removedNodes],
   };
 
+  // Diff the derived edge sets rather than the ops: a `remove` op strips the
+  // dependent edges too (via the reducer's `stripDeps`), so an op-level diff
+  // would miss the connections that disappear as a side effect.
+  const currentEdgeIds = new Set(builderToFlowEdges(workflow).map(e => e.id));
+  const nextEdgeIds = new Set(builderToFlowEdges(result.workflow).map(e => e.id));
+  const edgeGhosts = new Map<string, EdgeGhostKind>();
+  for (const id of nextEdgeIds) if (!currentEdgeIds.has(id)) edgeGhosts.set(id, 'add');
+  for (const id of currentEdgeIds) if (!nextEdgeIds.has(id)) edgeGhosts.set(id, 'remove');
+
   return {
     workflow: unionWorkflow,
     ghosts,
+    edgeGhosts,
     positions: result.positions,
     issues: [...opIssues, ...(actions.length > 0 ? runValidation(result.workflow) : [])],
   };

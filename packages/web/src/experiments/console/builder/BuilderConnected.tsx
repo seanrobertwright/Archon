@@ -216,11 +216,30 @@ export function BuilderConnected(): ReactElement {
     actions: readonly EditorAction[];
     nonce: number;
   } | null>(null);
-  const handleCopilotAccept = useCallback((actions: readonly EditorAction[]): void => {
-    applyBatchNonceRef.current += 1;
-    setApplyBatch({ actions, nonce: applyBatchNonceRef.current });
-    setCopilotPreview(null);
-  }, []);
+  // Accept is not instantaneous: `BuilderPage` applies the batch in one effect and
+  // reports the resulting workflow in a later one. Until that lands,
+  // `currentWorkflow` is still PRE-batch, so a send in that window would hand the
+  // agent a canvas that no longer matches what the author just accepted. Hold the
+  // composer closed across the gap.
+  const [applyingBatch, setApplyingBatch] = useState(false);
+  const workflowAtAcceptRef = useRef<BuilderWorkflow | null>(null);
+  const handleCopilotAccept = useCallback(
+    (actions: readonly EditorAction[]): void => {
+      applyBatchNonceRef.current += 1;
+      workflowAtAcceptRef.current = currentWorkflow;
+      setApplyingBatch(true);
+      setApplyBatch({ actions, nonce: applyBatchNonceRef.current });
+      setCopilotPreview(null);
+    },
+    [currentWorkflow]
+  );
+  useEffect(() => {
+    // Cleared by identity, not by a timer — the post-batch workflow is a new
+    // object, so this releases exactly when the apply has actually round-tripped.
+    if (applyingBatch && currentWorkflow !== workflowAtAcceptRef.current) {
+      setApplyingBatch(false);
+    }
+  }, [applyingBatch, currentWorkflow]);
 
   const extraIssues = useMemo(
     () => [...(imported?.issues ?? []), ...serverIssues],
@@ -625,6 +644,7 @@ export function BuilderConnected(): ReactElement {
               currentWorkflow={currentWorkflow}
               onPreviewChange={setCopilotPreview}
               onAccept={handleCopilotAccept}
+              applying={applyingBatch}
             />
           </div>
         ) : (

@@ -51,16 +51,20 @@ export function opsToEditorActions(
 ): { actions: EditorAction[]; issues: Issue[] } {
   const actions: EditorAction[] = [];
   const issues: Issue[] = [];
-  // Ids as the batch would apply them, in order — lets a later op in the SAME
-  // batch reference a node an earlier op in that batch just added/renamed.
-  const knownIds = new Set(workflow.nodes.map(n => n.id));
-  const addedThisBatch = new Set<string>();
+  // The workflow AS THE BATCH WOULD LEAVE IT, rebuilt op by op. Resolving
+  // `setField` against the original `workflow` instead was two bugs at once:
+  // a second `setField` on one node rebuilt its patch from the stale original
+  // and silently reverted the first (patch-node is a whole-node REPLACE, not a
+  // merge), and `rename` then `setField` on the new id failed with a misleading
+  // "Unknown node" because the original still held the old id. Keying this map
+  // by CURRENT id makes both correct and makes `knownIds` redundant.
+  const working = new Map<string, BuilderNode>(workflow.nodes.map(n => [n.id, n]));
   let addedCount = 0;
 
   for (const op of ops) {
     switch (op.op) {
       case 'addNode': {
-        if (knownIds.has(op.id)) {
+        if (working.has(op.id)) {
           issues.push(issue('copilot.addNode.duplicate', `Node '${op.id}' already exists.`, op.id));
           break;
         }
@@ -71,36 +75,32 @@ export function opsToEditorActions(
           position: staggeredPosition(workflow.nodes.length + addedCount),
           at: 0,
         });
+        // Merge proposed fields over the variant's defaults so a partial addNode
+        // (e.g. only `message` for an approval node) still produces a fully-shaped
+        // node. Recorded in `working` either way, so a later op in the same batch
+        // resolves against the node this one will create.
+        const merged = {
+          id: op.id,
+          variant: op.variant,
+          base: {},
+          data: { ...VARIANT_REGISTRY[op.variant].defaultData(), ...(op.data ?? {}) },
+        } as BuilderNode;
         if (op.data !== undefined && Object.keys(op.data).length > 0) {
-          // Merge proposed fields over the variant's defaults so a partial
-          // addNode (e.g. only `message` for an approval node) still produces
-          // a fully-shaped node — one follow-up patch-node in the same batch.
-          const defaultData = VARIANT_REGISTRY[op.variant].defaultData();
-          actions.push({
-            type: 'patch-node',
-            node: {
-              id: op.id,
-              variant: op.variant,
-              base: {},
-              data: { ...defaultData, ...op.data },
-            } as BuilderNode,
-            at: 0,
-          });
+          actions.push({ type: 'patch-node', node: merged, at: 0 });
         }
-        knownIds.add(op.id);
-        addedThisBatch.add(op.id);
+        working.set(op.id, merged);
         addedCount += 1;
         break;
       }
 
       case 'connect': {
-        if (!knownIds.has(op.source)) {
+        if (!working.has(op.source)) {
           issues.push(
             issue('copilot.connect.unknownSource', `Unknown node '${op.source}'.`, op.source)
           );
           break;
         }
-        if (!knownIds.has(op.target)) {
+        if (!working.has(op.target)) {
           issues.push(
             issue('copilot.connect.unknownTarget', `Unknown node '${op.target}'.`, op.target)
           );
@@ -111,25 +111,10 @@ export function opsToEditorActions(
       }
 
       case 'setField': {
-        if (!knownIds.has(op.id)) {
-          issues.push(issue('copilot.setField.unknownNode', `Unknown node '${op.id}'.`, op.id));
-          break;
-        }
-        if (addedThisBatch.has(op.id)) {
-          // The node's shape comes from a pending patch-node (the addNode
-          // branch above), not from `workflow` yet — composing a further
-          // setField against it is out of scope for v1. Fold the field into
-          // addNode's `data` instead of a separate setField in the same batch.
-          issues.push(
-            issue(
-              'copilot.setField.addedThisBatch',
-              `Cannot set a field on '${op.id}' in the same batch it was added — include it in addNode's data instead.`,
-              op.id
-            )
-          );
-          break;
-        }
-        const existing = workflow.nodes.find(n => n.id === op.id);
+        // One lookup, against the batch-local state — so this resolves a node an
+        // earlier op renamed or added, and composes with an earlier setField on
+        // the same node instead of rebuilding from the stale original.
+        const existing = working.get(op.id);
         if (existing === undefined) {
           issues.push(issue('copilot.setField.unknownNode', `Unknown node '${op.id}'.`, op.id));
           break;
@@ -139,36 +124,39 @@ export function opsToEditorActions(
           issues.push(issue('copilot.setField.badPath', `Malformed path '${op.path}'.`, op.id));
           break;
         }
-        actions.push({ type: 'patch-node', node: patchField(existing, op.path, op.value), at: 0 });
+        const patched = patchField(existing, op.path, op.value);
+        actions.push({ type: 'patch-node', node: patched, at: 0 });
+        working.set(op.id, patched);
         break;
       }
 
       case 'rename': {
-        if (!knownIds.has(op.id)) {
+        const node = working.get(op.id);
+        if (node === undefined) {
           issues.push(issue('copilot.rename.unknownNode', `Unknown node '${op.id}'.`, op.id));
           break;
         }
-        if (knownIds.has(op.nextId)) {
+        if (working.has(op.nextId)) {
           issues.push(
             issue('copilot.rename.collision', `A node named '${op.nextId}' already exists.`, op.id)
           );
           break;
         }
         actions.push({ type: 'rename-node', id: op.id, nextId: op.nextId, at: 0 });
-        knownIds.delete(op.id);
-        knownIds.add(op.nextId);
-        if (addedThisBatch.delete(op.id)) addedThisBatch.add(op.nextId);
+        // Re-key under the new id AND carry the node's own `id` across, so a
+        // later setField patches a node that agrees with itself.
+        working.delete(op.id);
+        working.set(op.nextId, { ...node, id: op.nextId } as BuilderNode);
         break;
       }
 
       case 'remove': {
-        if (!knownIds.has(op.id)) {
+        if (!working.has(op.id)) {
           issues.push(issue('copilot.remove.unknownNode', `Unknown node '${op.id}'.`, op.id));
           break;
         }
         actions.push({ type: 'remove-nodes', ids: [op.id], at: 0 });
-        knownIds.delete(op.id);
-        addedThisBatch.delete(op.id);
+        working.delete(op.id);
         break;
       }
     }

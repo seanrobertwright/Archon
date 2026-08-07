@@ -64,6 +64,17 @@ export async function sendMessage(
 ): Promise<void> {
   const url = `/api/conversations/${encodeURIComponent(conversationPlatformId)}/message`;
 
+  // The server reads `builderMode`/`canvasState` only on the JSON branch, so
+  // pairing them with files would drop them silently and the Copilot would
+  // reason about a canvas it was never given. Fail loudly instead — the Copilot
+  // never attaches files, so this combination is always a caller bug.
+  if (builderOptions !== undefined && files !== undefined && files.length > 0) {
+    throw new Error(
+      'sendMessage: builder-mode options cannot be combined with file attachments ' +
+        '(the multipart branch cannot carry them).'
+    );
+  }
+
   if (files === undefined || files.length === 0) {
     await requestJson<{ accepted: boolean; status: string }>(url, {
       method: 'POST',

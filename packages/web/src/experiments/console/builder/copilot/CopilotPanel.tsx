@@ -25,6 +25,12 @@ interface CopilotPanelProps {
   onPreviewChange: (preview: ProposalPreviewData | null) => void;
   /** Fired on Accept with the batch to apply — the parent dispatches it via `BuilderPage.applyBatch`. */
   onAccept: (actions: readonly EditorAction[]) => void;
+  /**
+   * True while an accepted batch is still being applied by `BuilderPage`. During
+   * that window `currentWorkflow` is still the PRE-batch one, so sending would
+   * serialize a stale canvas — the composer stays closed until it lands.
+   */
+  applying?: boolean;
 }
 
 export function CopilotPanel({
@@ -32,6 +38,7 @@ export function CopilotPanel({
   currentWorkflow,
   onPreviewChange,
   onAccept,
+  applying = false,
 }: CopilotPanelProps): ReactElement {
   const { messages, busy, error, proposal, send, accept, reject } = useCopilot(
     projectId,
@@ -73,7 +80,7 @@ export function CopilotPanel({
       </header>
 
       {canDriveCanvas === false ? (
-        <div className="border-b border-warning/30 bg-warning/[0.08] px-3 py-2 text-[11.5px] text-text-secondary">
+        <div className="border-b border-warning/30 bg-warning/10 px-3 py-2 text-[11.5px] text-text-secondary">
           Copilot needs Claude or Pi to edit the canvas —{' '}
           {activeProvider?.displayName ?? 'the active assistant'} can still answer questions, but
           can't propose edits.
@@ -102,7 +109,7 @@ export function CopilotPanel({
       </div>
 
       {error !== null ? (
-        <div className="border-t border-error/30 bg-error/[0.06] px-3 py-2 font-mono text-[11px] text-error">
+        <div className="border-t border-error/30 bg-error/10 px-3 py-2 font-mono text-[11px] text-error">
           {error}
         </div>
       ) : null}
@@ -111,8 +118,14 @@ export function CopilotPanel({
         onSend={text => {
           void send(text);
         }}
-        disabled={busy || currentWorkflow === null}
-        disabledReason={currentWorkflow === null ? 'Open a workflow first.' : undefined}
+        disabled={busy || applying || currentWorkflow === null}
+        disabledReason={
+          currentWorkflow === null
+            ? 'Open a workflow first.'
+            : applying
+              ? 'Applying the accepted edits…'
+              : undefined
+        }
       />
     </div>
   );

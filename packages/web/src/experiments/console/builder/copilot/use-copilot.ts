@@ -84,10 +84,19 @@ export function useCopilot(
     for (let i = messageList.length - 1; i >= 0; i -= 1) {
       const m = messageList[i];
       if (m?.role !== 'assistant') continue;
-      const call = m.toolCalls.find(c => isProposeToolCall(c.name));
-      if (call === undefined) continue;
-      const key = `${m.id}:${PROPOSE_TOOL_NAME}`;
-      return resolvedKeys.has(key) ? null : { key, input: call.input };
+      // Keyed per CALL, not per message: the tool description asks for one call
+      // per proposal, but nothing enforces it. Keying by message id alone made a
+      // second call in the same turn invisible forever, and let resolving the
+      // first silently resolve it too. Surface them oldest-first, one at a time.
+      const calls = m.toolCalls
+        .map((c, index) => ({ c, index }))
+        .filter(({ c }) => isProposeToolCall(c.name));
+      if (calls.length === 0) continue;
+      for (const { c, index } of calls) {
+        const key = `${m.id}:${PROPOSE_TOOL_NAME}:${index.toString()}`;
+        if (!resolvedKeys.has(key)) return { key, input: c.input };
+      }
+      return null;
     }
     return null;
   }, [messageList, resolvedKeys]);
@@ -119,7 +128,14 @@ export function useCopilot(
           if (creatingRef.current === null) {
             creatingRef.current = skill
               .createConversation(projectId)
-              .then(conv => conv.conversationId);
+              .then(conv => conv.conversationId)
+              .catch((e: unknown) => {
+                // Without this the ref keeps the REJECTED promise, so every later
+                // send awaits the same rejection and the panel is permanently
+                // unusable until remount. Clear it so the next send can retry.
+                creatingRef.current = null;
+                throw e;
+              });
           }
           id = await creatingRef.current;
           setConvId(id);

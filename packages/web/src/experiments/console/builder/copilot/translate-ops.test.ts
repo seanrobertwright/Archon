@@ -135,7 +135,13 @@ describe('opsToEditorActions — setField', () => {
     expect(issues[0]?.rule).toBe('copilot.setField.unknownNode');
   });
 
-  test('setField on a node added earlier in the same batch is an issue, not silently dropped', () => {
+  // BEHAVIOUR CHANGE: this previously asserted a `copilot.setField.addedThisBatch`
+  // issue. That guard existed ONLY because `setField` resolved against the
+  // original, pre-batch workflow and so could not see a node the same batch had
+  // just added. Resolving through batch-local state removed the limitation, so
+  // the guard was removed with it — this is a special case deleted, not a
+  // feature added.
+  test('setField on a node added earlier in the same batch now applies', () => {
     const { actions, issues } = opsToEditorActions(
       [
         { op: 'addNode', id: 'gate', variant: 'approval' },
@@ -143,10 +149,11 @@ describe('opsToEditorActions — setField', () => {
       ],
       workflow()
     );
-    // The add-node action still applies; only the setField is refused.
+    expect(issues).toHaveLength(0);
     expect(actions.some(a => a.type === 'add-node')).toBe(true);
-    expect(issues).toHaveLength(1);
-    expect(issues[0]?.rule).toBe('copilot.setField.addedThisBatch');
+    const last = actions[actions.length - 1];
+    if (last?.type !== 'patch-node') throw new Error('expected a trailing patch-node');
+    expect((last.node.data as { message?: string }).message).toBe('Proceed?');
   });
 });
 
@@ -201,5 +208,84 @@ describe('opsToEditorActions — mixed batch', () => {
     expect(issues[0]?.rule).toBe('copilot.remove.unknownNode');
     const kinds = actions.map(a => a.type);
     expect(kinds).toEqual(['add-node', 'patch-node', 'add-edge', 'rename-node']);
+  });
+});
+
+/**
+ * Regression: `setField` used to resolve its target against the ORIGINAL,
+ * pre-batch workflow. Because `patch-node` is a whole-node REPLACE (not a
+ * merge), that made a second `setField` silently revert the first, and made
+ * `rename` → `setField` fail with a misleading "Unknown node". Both were
+ * verified against the real reducer before the fix.
+ */
+describe('opsToEditorActions — batch-local node state', () => {
+  const firstNodeId = (): string => {
+    const id = workflow().nodes[0]?.id;
+    if (id === undefined) throw new Error('fixture has no nodes');
+    return id;
+  };
+
+  test('two setFields on the same node compose instead of the second reverting the first', () => {
+    const id = firstNodeId();
+    const { actions, issues } = opsToEditorActions(
+      [
+        { op: 'setField', id, path: 'base.when', value: 'FIRST' },
+        { op: 'setField', id, path: 'base.trigger_rule', value: 'all_done' },
+      ],
+      workflow()
+    );
+    expect(issues).toHaveLength(0);
+    expect(actions).toHaveLength(2);
+    // The SECOND patch must carry the first edit forward — that is the whole bug.
+    const second = actions[1];
+    expect(second?.type).toBe('patch-node');
+    if (second?.type !== 'patch-node') throw new Error('expected patch-node');
+    expect(second.node.base.when).toBe('FIRST');
+    expect(second.node.base.trigger_rule).toBe('all_done');
+  });
+
+  test('rename then setField on the NEW id resolves instead of erroring', () => {
+    const id = firstNodeId();
+    const { actions, issues } = opsToEditorActions(
+      [
+        { op: 'rename', id, nextId: 'renamed-node' },
+        { op: 'setField', id: 'renamed-node', path: 'base.when', value: 'after rename' },
+      ],
+      workflow()
+    );
+    expect(issues).toHaveLength(0);
+    expect(actions.map(a => a.type)).toEqual(['rename-node', 'patch-node']);
+    const patch = actions[1];
+    if (patch?.type !== 'patch-node') throw new Error('expected patch-node');
+    // The patched node must agree with its own new id, or the reducer targets nothing.
+    expect(patch.node.id).toBe('renamed-node');
+    expect(patch.node.base.when).toBe('after rename');
+  });
+
+  test('setField on a node added in the same batch now composes', () => {
+    const { actions, issues } = opsToEditorActions(
+      [
+        { op: 'addNode', id: 'gate', variant: 'approval', data: { message: 'first' } },
+        { op: 'setField', id: 'gate', path: 'data.message', value: 'second' },
+      ],
+      workflow()
+    );
+    expect(issues).toHaveLength(0);
+    const last = actions[actions.length - 1];
+    if (last?.type !== 'patch-node') throw new Error('expected patch-node');
+    expect((last.node.data as { message?: string }).message).toBe('second');
+  });
+
+  test('setField after remove still reports the node as unknown', () => {
+    const id = firstNodeId();
+    const { issues } = opsToEditorActions(
+      [
+        { op: 'remove', id },
+        { op: 'setField', id, path: 'base.when', value: 'x' },
+      ],
+      workflow()
+    );
+    expect(issues).toHaveLength(1);
+    expect(issues[0]?.rule).toBe('copilot.setField.unknownNode');
   });
 });
