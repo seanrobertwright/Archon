@@ -3437,11 +3437,11 @@ nodes:
       expect(err?.error).toContain("references unknown node '$ghost.output'");
     });
 
-    it("rejects 'with:' on a workflow node (deferred to slice 2)", async () => {
+    it("accepts 'with:' on a workflow node (#2470)", async () => {
       const result = await loadOne(
-        'with-reject',
+        'with-accept',
         `
-name: with-reject
+name: with-accept
 description: with on a workflow node
 nodes:
   - id: sub
@@ -3450,9 +3450,30 @@ nodes:
       foo: bar
 `
       );
-      const err = result.errors.find(e => e.filename === 'with-reject.yaml');
+      const err = result.errors.find(e => e.filename === 'with-accept.yaml');
+      expect(err).toBeUndefined();
+      const wf = result.workflows.find(w => w.workflow.name === 'with-accept');
+      const node = wf?.workflow.nodes.find(n => n.id === 'sub');
+      expect(node && 'with' in node ? node.with : undefined).toEqual({ foo: 'bar' });
+    });
+
+    it("rejects 'with:' and 'input:' together on a workflow node (#2470)", async () => {
+      const result = await loadOne(
+        'with-input-reject',
+        `
+name: with-input-reject
+description: with and input on a workflow node
+nodes:
+  - id: sub
+    workflow: child-wf
+    input: hello
+    with:
+      foo: bar
+`
+      );
+      const err = result.errors.find(e => e.filename === 'with-input-reject.yaml');
       expect(err).toBeDefined();
-      expect(err?.error).toContain("'with:'");
+      expect(err?.error).toContain("'with:' and 'input:'");
     });
 
     it("rejects 'retry:' on a workflow node", async () => {
@@ -3705,12 +3726,12 @@ nodes:
       expect(err?.error).toContain('collector');
     });
 
-    it("rejects 'fan_out.as' ($INPUTS channel staged for PR-B) instead of ignoring it", async () => {
+    it("accepts 'fan_out.as' now that the $INPUTS channel exists (#2470)", async () => {
       const result = await loadOne(
         'fan-as',
         `
 name: fan-as
-description: as names an $INPUTS channel that does not exist yet
+description: as names the per-item $INPUTS channel
 nodes:
   - id: plan
     prompt: "emit tasks"
@@ -3722,13 +3743,36 @@ nodes:
       as: task
 `
       );
-      // Accepting it silently would deliver a literal '$INPUTS.task' to the model — the
-      // field reads as a working feature while doing nothing.
       const err = result.errors.find(e => e.filename === 'fan-as.yaml');
+      expect(err).toBeUndefined();
+      const wf = result.workflows.find(w => w.workflow.name === 'fan-as');
+      const node = wf?.workflow.nodes.find(n => n.id === 'work');
+      expect(node && 'fan_out' in node ? node.fan_out?.as : undefined).toBe('task');
+    });
+
+    it("rejects 'fan_out.as' colliding with a 'with:' key (#2470)", async () => {
+      const result = await loadOne(
+        'fan-as-collide',
+        `
+name: fan-as-collide
+description: as collides with a with key
+nodes:
+  - id: plan
+    prompt: "emit tasks"
+  - id: work
+    workflow: child-wf
+    depends_on: [plan]
+    with:
+      task: static
+    fan_out:
+      items: "$plan.output.tasks"
+      as: task
+`
+      );
+      const err = result.errors.find(e => e.filename === 'fan-as-collide.yaml');
       expect(err).toBeDefined();
       expect(err?.error).toContain('fan_out.as');
-      expect(err?.error).toContain('#2214');
-      expect(err?.error).toContain('$ARGUMENTS');
+      expect(err?.error).toContain('collides');
     });
 
     it("rejects 'max_parallel: 0' (must be >= 1)", async () => {
@@ -5036,6 +5080,185 @@ nodes:
 });
 
 // ---------------------------------------------------------------------------
+// Workflow signature: inputs / returns (#2470)
+// ---------------------------------------------------------------------------
+
+describe('workflow signature: inputs / returns (#2470)', () => {
+  it('parses declared inputs and returns', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: sig
+description: signature block
+returns: build
+inputs:
+  diff:
+    required: true
+    description: the diff to review
+  style:
+    default: strict
+nodes:
+  - id: build
+    prompt: "do it with $INPUTS.diff and $INPUTS.style"
+`,
+      'sig.yaml'
+    );
+    expect(error).toBeNull();
+    expect(workflow?.returns).toBe('build');
+    expect(workflow?.inputs?.diff?.required).toBe(true);
+    expect(workflow?.inputs?.style?.default).toBe('strict');
+  });
+
+  it('rejects returns naming a non-existent top-level node', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: bad-returns
+description: returns names nothing
+returns: nope
+nodes:
+  - id: build
+    prompt: "hi"
+`,
+      'bad-returns.yaml'
+    );
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain("returns: 'nope'");
+  });
+
+  it('rejects an empty returns value instead of falling back to a positional sink', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: empty-returns
+description: invalid empty selector
+returns: "   "
+nodes:
+  - id: build
+    prompt: "hi"
+`,
+      'empty-returns.yaml'
+    );
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toContain("Invalid 'returns'");
+  });
+
+  it('rejects a non-string returns value instead of falling back to a positional sink', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: object-returns
+description: invalid object selector
+returns: { node: build }
+nodes:
+  - id: build
+    prompt: "hi"
+`,
+      'object-returns.yaml'
+    );
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toContain("Invalid 'returns'");
+  });
+
+  it('drops a contradictory required+default input (warn-and-drop)', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: contradiction
+description: required and default together
+inputs:
+  x:
+    required: true
+    default: v
+nodes:
+  - id: build
+    prompt: "hi"
+`,
+      'contradiction.yaml'
+    );
+    expect(error).toBeNull();
+    // The single contradictory key is dropped, leaving no inputs.
+    expect(workflow?.inputs).toBeUndefined();
+  });
+
+  it('drops an invalid input name with a warning while preserving the workflow', () => {
+    mockLogger.warn.mockClear();
+    const { workflow, error } = parseWorkflow(
+      `
+name: invalid-input-name
+description: invalid input name
+inputs:
+  bad.name:
+    default: value
+nodes:
+  - id: build
+    prompt: "hi"
+`,
+      'invalid-input-name.yaml'
+    );
+    expect(error).toBeNull();
+    expect(workflow?.inputs).toBeUndefined();
+    expect(mockLogger.warn.mock.calls.map(call => call[1])).toContain(
+      'invalid_workflow_input_name_ignored'
+    );
+  });
+
+  it('ignores a non-object inputs block with a warning while preserving the workflow', () => {
+    mockLogger.warn.mockClear();
+    const { workflow, error } = parseWorkflow(
+      `
+name: invalid-inputs-block
+description: invalid inputs block
+inputs: [wrong]
+nodes:
+  - id: build
+    prompt: "hi"
+`,
+      'invalid-inputs-block.yaml'
+    );
+    expect(error).toBeNull();
+    expect(workflow?.inputs).toBeUndefined();
+    expect(mockLogger.warn.mock.calls.map(call => call[1])).toContain(
+      'invalid_workflow_inputs_block_ignored'
+    );
+  });
+
+  it('rejects two input names that mangle to the same env key', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: collide
+description: env-key collision
+inputs:
+  foo-bar:
+    description: hyphen form
+  foo_bar:
+    description: underscore form
+nodes:
+  - id: build
+    prompt: "hi"
+`,
+      'collide.yaml'
+    );
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('INPUTS_FOO_BAR');
+  });
+
+  it('flags a dangling $node.output ref inside a workflow: with value', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: with-ref
+description: with value references an unknown node
+nodes:
+  - id: sub
+    workflow: child-wf
+    with:
+      plan: "$nosuch.output"
+`,
+      'with-ref.yaml'
+    );
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('nosuch');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Workflow-level field parity (#2457)
 // ---------------------------------------------------------------------------
 
@@ -5116,6 +5339,12 @@ describe('workflow-level field parity (#2457)', () => {
       yaml: 'requires:\n  - github',
       present: w => w.requires?.includes('github') === true,
     },
+    inputs: {
+      yaml: 'inputs:\n  diff:\n    required: true',
+      present: w => w.inputs?.diff?.required === true,
+    },
+    // `returns` must name a real top-level node id — the fixture's single node is `only`.
+    returns: { yaml: 'returns: only', present: w => w.returns === 'only' },
   };
 
   const schemaKeys = Object.keys(workflowDefinitionSchema.shape);
