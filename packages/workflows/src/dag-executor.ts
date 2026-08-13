@@ -86,6 +86,7 @@ import {
 } from './output-ref';
 import { buildTruncationMarker } from './utils/output-truncation';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
+import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import {
   logNodeStart,
   logNodeComplete,
@@ -760,10 +761,11 @@ function shellQuoteOrFile(
  * Substitute $node_id.output and $node_id.output.field references in a prompt.
  * Called AFTER the standard substituteWorkflowVariables pass.
  *
- * KEEP IN SYNC (three ref-surface enumerations must agree): the fields this is called on
- * (search call sites below), the loader's validateDagStructure scan (which validates the
- * same refs), and rewriteNodeOutputRefs in include-expander.ts (which renames them on
- * inline). Adding a substituted field to one means updating all three.
+ * KEEP IN SYNC: public YAML call sites, the loader's validateDagStructure scan, and
+ * rewriteNodeOutputRefs must cover the same runtime node-ref surfaces. Included
+ * loop-command bodies are validated separately during materialization. applyInputsMacro is
+ * intentionally a superset because some AI configuration strings accept include inputs
+ * without receiving runtime node-output substitution.
  *
  * @param escapedForBash - When true, wraps substituted values in single quotes so
  *   they are safe to embed in bash scripts passed to `bash -c`. Set true only for
@@ -780,10 +782,10 @@ export function substituteNodeOutputRefs(
     (match, nodeId: string, field: string | undefined) => {
       const nodeOutput = nodeOutputs.get(nodeId);
       if (!nodeOutput) {
-        // A `.field` ref that resolves to no output (a typo the load-time validator
-        // can't always see — refs in bash/script/approval/cancel fields and inside
-        // command-file content aren't scanned — or a real node that hasn't run before
-        // this reference) fails the consuming node loudly, matching the strict
+        // A `.field` ref that resolves to no output (for example, a programmatically
+        // constructed definition that bypassed discovery, or a real producer whose
+        // output is unavailable on this execution path) fails the consuming node loudly,
+        // matching the strict
         // no-silent-drop posture for known-producer field access below. The whole-text
         // `$id.output` form stays lenient ('') as a long-documented surface (changing
         // it is a bigger compatibility break).
@@ -4190,23 +4192,36 @@ async function executeLoopNode(
     return { state: 'completed', output: finalizeOutput, sessionId: currentSessionId };
   }
 
-  // Resolve the iteration prompt source. `loop.prompt` is used directly;
-  // `loop.command` is read ONCE per run/node: the first invocation loads the
-  // command file, and the interactive gate persists the loaded text
-  // (`commandSnapshot` in the pause context) so a resumed invocation reuses the
-  // snapshot instead of re-reading — a command file edited or deleted while the
-  // run sat paused at a gate can neither change nor break the running loop's
-  // prompt. The schema guarantees exactly one of prompt/command is defined.
+  // Resolve the iteration prompt source once per run/node. The interactive gate
+  // persists the resolved template (`commandSnapshot` in the pause context) for
+  // both inline and command-backed loops. Included loops retain their command identity
+  // plus a load-time compiled prompt/error; rediscovery after a pause cannot change their
+  // running prompt because a persisted snapshot takes precedence over that metadata.
+  // The schema guarantees exactly one of prompt/command is defined.
   let loopPromptTemplate: string;
-  if (typeof loop.prompt === 'string') {
-    loopPromptTemplate = loop.prompt;
+  if (isLoopResume && typeof loopGateMeta?.commandSnapshot === 'string') {
+    loopPromptTemplate = loopGateMeta.commandSnapshot;
   } else if (typeof loop.command === 'string') {
-    if (isLoopResume && typeof loopGateMeta?.commandSnapshot === 'string') {
-      loopPromptTemplate = loopGateMeta.commandSnapshot;
+    const compiled = (loop as typeof loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND];
+    const hasCompiledError = compiled !== undefined && typeof compiled.error === 'string';
+    const hasCompiledPrompt = compiled !== undefined && typeof compiled.prompt === 'string';
+    if (hasCompiledError && !hasCompiledPrompt) {
+      getLog().error(
+        { nodeId: node.id, command: loop.command, error: compiled.error },
+        'loop_node.command_compilation_failed'
+      );
+      return failLoopNode(compiled.error, { data: { command: loop.command } });
+    }
+    if (hasCompiledPrompt && !hasCompiledError) {
+      loopPromptTemplate = compiled.prompt;
+    } else if (compiled !== undefined) {
+      const errorMsg = `Loop node '${node.id}' has malformed compiled command metadata for '${loop.command}' — expected exactly one string prompt or error.`;
+      getLog().error(
+        { nodeId: node.id, command: loop.command, compiled },
+        'loop_node.command_compilation_metadata_invalid'
+      );
+      return failLoopNode(errorMsg, { data: { command: loop.command } });
     } else {
-      // Fresh execution — or a resume of a run paused under a build that
-      // predates commandSnapshot: fall back to a fresh read (documented,
-      // fail-safe) rather than failing an otherwise-valid resume.
       const promptResult = await loadCommandPrompt(
         deps,
         cwd,
@@ -4218,12 +4233,12 @@ async function executeLoopNode(
           { nodeId: node.id, command: loop.command, error: promptResult.message },
           'loop_node.command_load_failed'
         );
-        // The failing command name travels on the node_failed payload so the
-        // event stream carries the same context as the structured log.
         return failLoopNode(promptResult.message, { data: { command: loop.command } });
       }
       loopPromptTemplate = promptResult.content;
     }
+  } else if (typeof loop.prompt === 'string') {
+    loopPromptTemplate = loop.prompt;
   } else {
     // Unreachable: superRefine on loopNodeConfigSchema enforces exactly-one.
     throw new Error(
@@ -5083,10 +5098,10 @@ async function executeLoopNode(
         // Usage consumed up to this gate, so a bare approve (finalize, no re-run)
         // can persist it on node_completed instead of reporting nothing (#2333).
         signaledTokens: completionDetected ? (loopTotalTokens ?? null) : null,
-        // Read-once command body for command-backed loops: the resumed invocation
-        // reuses this snapshot instead of re-reading the file (explicit null for
-        // prompt-based loops — same json_patch convention as `sessionId`).
-        commandSnapshot: typeof loop.command === 'string' ? loopPromptTemplate : null,
+        // Read-once resolved template for both prompt- and command-backed loops.
+        // Included command-backed loops use their load-time compiled body here, so
+        // snapshotting both forms preserves resume determinism after source deletion.
+        commandSnapshot: loopPromptTemplate,
       });
       // Return completed — the between-layer status check sees 'paused' and halts cleanly.
       // This mirrors the approval-node pattern, preventing false "DAG nodes failed" warnings
