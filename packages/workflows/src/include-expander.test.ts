@@ -772,6 +772,122 @@ describe('expandWorkflowIncludes — command-file ref scan', () => {
     );
   });
 
+  test('fails when a nested loop command file references a renamed top-level node', () => {
+    const block = wf('nested-loopblk', [
+      { id: 'seed', bash: 'echo seed' },
+      {
+        id: 'group',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 1,
+          nodes: [
+            {
+              id: 'repeat',
+              loop: { command: 'nested-loop-cmd', until: 'DONE', max_iterations: 1 },
+            },
+          ],
+        },
+      },
+    ]);
+    const parent = wf('parent', [{ id: 'inc', include: 'nested-loopblk' }]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['nested-loop-cmd', 'Read $seed.output and continue.']])
+    );
+    expect(workflows.has('parent')).toBe(false);
+    const message = errors.find(error => error.filename === 'parent')?.error;
+    expect(message).toContain("command file 'nested-loop-cmd.md'");
+    expect(message).toContain("sibling node '$seed'");
+  });
+
+  test('fails for a command node inside a second-level nested loop group', () => {
+    const block = wf('deep-command-block', [
+      { id: 'seed', bash: 'echo seed' },
+      {
+        id: 'outer',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 1,
+          nodes: [
+            {
+              id: 'inner',
+              loop_group: {
+                until: 'DONE',
+                max_iterations: 1,
+                nodes: [{ id: 'review', command: 'deep-command' }],
+              },
+            },
+          ],
+        },
+      },
+    ]);
+    const parent = wf('parent', [{ id: 'inc', include: 'deep-command-block' }]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['deep-command', 'Read $seed.output and continue.']])
+    );
+
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "command file 'deep-command.md'"
+    );
+  });
+
+  test('fails when a nested loop command file references an include input', () => {
+    const block = wf('nested-input-loopblk', [
+      {
+        id: 'group',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 1,
+          nodes: [
+            {
+              id: 'repeat',
+              loop: { command: 'nested-input-cmd', until: 'DONE', max_iterations: 1 },
+            },
+          ],
+        },
+      },
+    ]);
+    const parent = wf('parent', [
+      { id: 'inc', include: 'nested-input-loopblk', with: { scope: 'prod' } },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['nested-input-cmd', 'Review $INPUTS.scope.']])
+    );
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "parameter '$INPUTS.scope'"
+    );
+  });
+
+  test('passes when a nested loop command file references a local body node', () => {
+    const block = wf('nested-local-loopblk', [
+      {
+        id: 'group',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 1,
+          nodes: [
+            { id: 'seed', bash: 'echo seed' },
+            {
+              id: 'repeat',
+              loop: { command: 'nested-local-cmd', until: 'DONE', max_iterations: 1 },
+            },
+          ],
+        },
+      },
+    ]);
+    const parent = wf('parent', [{ id: 'inc', include: 'nested-local-loopblk' }]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['nested-local-cmd', 'Read $seed.output and continue.']])
+    );
+    expect(errors).toHaveLength(0);
+    expect(workflows.has('parent')).toBe(true);
+  });
+
   test('skips the scan entirely when no commandContents map is supplied', () => {
     const [block, parent] = blockWithCommand();
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));

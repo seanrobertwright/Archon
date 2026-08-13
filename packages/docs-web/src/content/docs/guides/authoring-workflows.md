@@ -948,10 +948,13 @@ written the nodes by hand. There is no separate child run.
   `id: review` yields `review__verify-pr-base`, `review__sync`, `review__implement-fixes`,
   and so on. These namespaced ids are what appear in the event stream and in
   `archon workflow get <id>`.
-- **Edges.** Internal `depends_on` edges and `$id.output` references inside the block are
-  rewired to the namespaced ids automatically. The include node's own `depends_on` /
-  `when` / `trigger_rule` attach to the block's **entry** nodes (those with no upstream
-  inside the block).
+- **Edges.** Internal `depends_on` edges and `$id.output` references in inline node text are
+  rewired to the namespaced ids automatically. Named `command:` and `loop.command` files
+  remain external and cannot be rewritten; when a readable command body references a
+  top-level block node whose id will be namespaced, workflow loading fails. This best-effort
+  scan includes nested `loop_group` bodies; unresolved files warn and are skipped. The include
+  node's own `depends_on` / `when` / `trigger_rule` attach to the block's **entry** nodes
+  (those with no upstream inside the block).
 - **Sink asymmetry (a downstream node depending on the include).** A `depends_on:
   [<includeId>]` on a downstream node fans out to **all** of the block's sink nodes (every
   node with no dependents inside the block), so it waits for the whole block to finish.
@@ -1011,10 +1014,10 @@ finished. When such a file can be read at load time and contains `$INPUTS.<name>
 including inside a code fence — workflow loading fails with a message directing you to inline
 the prompt text. Use an inline `prompt:` when the block needs include inputs.
 
-This check is best-effort, so a clean load is not a guarantee. It covers the block's
-top-level `command:`/`loop.command` nodes only, so a command nested inside a `loop_group`
-body is not scanned; and a command file that cannot be resolved at load time is logged as a
-warning and skipped rather than failing the workflow. This restriction applies to `include:`
+This check is best-effort, so a clean load is not a guarantee. It covers `command:` and
+`loop.command` files throughout the block, including nested `loop_group` bodies. A command
+file that cannot be resolved at load time is logged as a warning and skipped rather than
+failing the workflow. This restriction applies to `include:`
 only — a `workflow:` sub-run's named inputs **do** reach `command:` bodies, because they
 resolve at runtime rather than at load time (see the binding-time table in
 [Workflow Signature](#workflow-signature-inputs-returns-and-inputs)).
