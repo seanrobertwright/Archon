@@ -77,7 +77,7 @@ describe('CodexProvider', () => {
         sessionResume: true,
         mcp: true,
         hooks: false,
-        skills: true,
+        skills: false,
         agents: false,
         toolRestrictions: false,
         structuredOutput: 'enforced',
@@ -95,6 +95,168 @@ describe('CodexProvider', () => {
   });
 
   describe('sendQuery', () => {
+    test.each([
+      ['omitted', undefined],
+      ['empty', []],
+      ['non-empty', ['prp-issue']],
+    ])(
+      'disables automatic skill instructions for workflow nodes when skills are %s',
+      async (_label, skills) => {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          nodeConfig: { nodeId: 'investigate', ...(skills === undefined ? {} : { skills }) },
+        })) {
+          // consume
+        }
+
+        expect(MockCodex).toHaveBeenCalledWith(
+          expect.objectContaining({
+            config: { skills: { include_instructions: false } },
+          })
+        );
+      }
+    );
+
+    test('leaves direct non-workflow Codex calls on the native skill setting', async () => {
+      for await (const _ of client.sendQuery('test prompt', '/workspace')) {
+        // consume
+      }
+
+      expect(MockCodex).toHaveBeenCalledTimes(1);
+      expect(MockCodex.mock.calls[0]?.[0]).not.toHaveProperty('config');
+    });
+
+    test('uses the workflow skill-catalog override when resuming a thread', async () => {
+      for await (const _ of client.sendQuery('test prompt', '/workspace', 'existing-thread', {
+        nodeConfig: { nodeId: 'investigate' },
+      })) {
+        // consume
+      }
+
+      expect(MockCodex).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: { skills: { include_instructions: false } },
+        })
+      );
+      expect(mockResumeThread).toHaveBeenCalledWith(
+        'existing-thread',
+        expect.objectContaining({ workingDirectory: '/workspace' })
+      );
+    });
+
+    test('warns and retries a resumed MCP thread without catalog suppression when the binary rejects the key', async () => {
+      const testDir = await mkdtemp(join(tmpdir(), 'codex-provider-skill-fallback-'));
+      await writeFile(
+        join(testDir, 'mcp.json'),
+        JSON.stringify({ figma: { type: 'http', url: 'http://127.0.0.1:3845/mcp' } })
+      );
+      let calls = 0;
+      mockRunStreamed.mockImplementation(() => {
+        calls++;
+        const call = calls;
+        return Promise.resolve({
+          events: (async function* () {
+            if (call === 1) {
+              throw new Error(
+                'Error loading config: unknown field `include_instructions` in `skills`'
+              );
+            }
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+      });
+
+      const chunks = [];
+      try {
+        for await (const chunk of client.sendQuery('test prompt', testDir, 'existing-thread', {
+          nodeConfig: { nodeId: 'investigate', mcp: 'mcp.json' },
+        })) {
+          chunks.push(chunk);
+        }
+      } finally {
+        await rm(testDir, { recursive: true, force: true });
+      }
+
+      expect(MockCodex).toHaveBeenCalledTimes(2);
+      expect(MockCodex.mock.calls[0]?.[0]).toMatchObject({
+        config: {
+          skills: { include_instructions: false },
+          mcp_servers: { figma: expect.objectContaining({ url: 'http://127.0.0.1:3845/mcp' }) },
+        },
+      });
+      const initialConfig = MockCodex.mock.calls[0]?.[0]?.config;
+      const fallbackConfig = MockCodex.mock.calls[1]?.[0]?.config;
+      expect(initialConfig).toBeDefined();
+      const { skills: _skills, ...initialConfigWithoutSkills } = initialConfig ?? {};
+      expect(fallbackConfig).toEqual(initialConfigWithoutSkills);
+      expect(mockResumeThread).toHaveBeenCalledTimes(2);
+      expect(mockResumeThread).toHaveBeenNthCalledWith(
+        2,
+        'existing-thread',
+        expect.objectContaining({ workingDirectory: testDir })
+      );
+      expect(chunks[0]).toEqual({
+        type: 'system',
+        content: expect.stringContaining('Continuing with native skill discovery enabled'),
+      });
+      expect(chunks.at(-1)).toMatchObject({
+        type: 'result',
+        sessionId: 'resumed-thread-id',
+        resumed: true,
+      });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ nodeId: 'investigate' }),
+        'codex.workflow_skill_catalog_suppression_unsupported'
+      );
+    });
+
+    test('does not replay a turn when a catalog config error arrives after provider output', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield {
+            type: 'item.completed',
+            item: { id: 'message-1', type: 'agent_message', text: 'already emitted' },
+          };
+          throw new Error('Error loading config: unknown field `include_instructions` in `skills`');
+        })(),
+      });
+
+      const chunks = [];
+      await expect(
+        (async (): Promise<void> => {
+          for await (const chunk of client.sendQuery('test prompt', '/workspace', undefined, {
+            nodeConfig: { nodeId: 'investigate' },
+          })) {
+            chunks.push(chunk);
+          }
+        })()
+      ).rejects.toThrow('include_instructions');
+
+      expect(chunks).toContainEqual({ type: 'assistant', content: 'already emitted' });
+      expect(MockCodex).toHaveBeenCalledTimes(1);
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'codex.workflow_skill_catalog_suppression_unsupported'
+      );
+    });
+
+    test('does not treat unrelated Codex failures as catalog compatibility errors', async () => {
+      mockRunStreamed.mockRejectedValue(new Error('authentication failed'));
+
+      expect(
+        (async (): Promise<void> => {
+          for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+            nodeConfig: { nodeId: 'investigate' },
+          })) {
+            // consume
+          }
+        })()
+      ).rejects.toThrow('Codex auth error');
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'codex.workflow_skill_catalog_suppression_unsupported'
+      );
+    });
+
     test('yields text events from agent_message items', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
@@ -1188,7 +1350,7 @@ describe('CodexProvider', () => {
         });
 
         for await (const _ of client.sendQuery('test prompt', testDir, undefined, {
-          nodeConfig: { mcp: 'mcp.json' },
+          nodeConfig: { nodeId: 'notify', mcp: 'mcp.json' },
         })) {
           // consume
         }
@@ -1196,6 +1358,7 @@ describe('CodexProvider', () => {
         expect(MockCodex).toHaveBeenCalledWith(
           expect.objectContaining({
             config: expect.objectContaining({
+              skills: { include_instructions: false },
               mcp_servers: expect.objectContaining({
                 figma: expect.objectContaining({
                   url: 'http://127.0.0.1:3845/mcp',
