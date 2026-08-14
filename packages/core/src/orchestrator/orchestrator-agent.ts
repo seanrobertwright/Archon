@@ -1459,6 +1459,11 @@ export async function handleMessage(
     attachedFiles,
     userId,
   } = context ?? {};
+  // Anchor "is this a slash command" at the true start of the message —
+  // leading whitespace (e.g. from a platform that doesn't pre-trim after
+  // stripping a bot mention) must not let a command masquerade as a plain
+  // AI turn. Mirrors the trim already done inside commandHandler.parseCommand.
+  const trimmedMessage = message.trim();
   try {
     getLog().debug({ conversationId, userId }, 'orchestrator_message_received');
 
@@ -1483,7 +1488,7 @@ export async function handleMessage(
     );
 
     // 2. Check for deterministic commands
-    if (message.startsWith('/')) {
+    if (trimmedMessage.startsWith('/')) {
       const { command } = commandHandler.parseCommand(message);
       const deterministicCommands = [
         'help',
@@ -1881,7 +1886,7 @@ export async function handleMessage(
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
     }
 
-    if (!conversation.title && !message.startsWith('/')) {
+    if (!conversation.title && !trimmedMessage.startsWith('/')) {
       const titleRequest = resolveModelRequest(aiProfile, 'small', configuredProviderKey);
       const titleOptions: SendQueryOptions = {
         model: titleRequest.model,

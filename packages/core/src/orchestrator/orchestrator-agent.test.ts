@@ -2673,6 +2673,26 @@ describe('paused approval gate routing', () => {
     expect(toolReplies[0]).toContain('Nothing further runs');
   });
 
+  test('slash command with leading whitespace still bypasses approval interception (regression)', async () => {
+    // Some inbound surfaces (e.g. a platform that doesn't pre-trim after
+    // stripping a bot mention) can hand handleMessage a command with leading
+    // whitespace. It must still be recognized as a command, not treated as
+    // a natural-language approval response or routed to the AI.
+    const conversation = makeConversation({ codebase_id: 'codebase-1' });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({ success: true, message: 'status ok', workflow: undefined })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '   /status');
+
+    expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    expect(mockHandleCommand).toHaveBeenCalledWith(conversation, '   /status');
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'status ok');
+  });
+
   test('a provider crash after the gate is resolved still continues the run', async () => {
     // The resolution commits to the DB the moment the tool call returns. If the
     // rest of the turn throws — a provider subprocess crash, a dropped stream —
