@@ -2673,7 +2673,7 @@ describe('paused approval gate routing', () => {
     expect(toolReplies[0]).toContain('Nothing further runs');
   });
 
-  test('slash command with leading whitespace still bypasses approval interception (regression)', async () => {
+  test('slash command with leading whitespace still bypasses approval interception (regression)', async (): Promise<void> => {
     // Some inbound surfaces (e.g. a platform that doesn't pre-trim after
     // stripping a bot mention) can hand handleMessage a command with leading
     // whitespace. It must still be recognized as a command, not treated as
