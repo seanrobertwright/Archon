@@ -1149,6 +1149,52 @@ describe('ClaudeProvider', () => {
       expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
+    // The SDK reports a spawn failure caused by a MISSING WORKING DIRECTORY as a
+    // libc/architecture mismatch, because posix_spawn returns ENOENT against the
+    // executable's path and the SDK only checks that the executable exists.
+    test('reports a missing working directory instead of the SDK libc message', async () => {
+      const error = new Error(
+        'Claude Code native binary at /pkg/claude exists but failed to launch. ' +
+          "This usually means the binary does not match this system's libc."
+      );
+      mockQuery.mockImplementation(async function* () {
+        throw error;
+      });
+
+      const consumeGenerator = async () => {
+        for await (const _ of client.sendQuery('test', '/worktrees/removed-by-cleanup')) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        /working directory "\/worktrees\/removed-by-cleanup" does not exist/
+      );
+      // The message names libc only to tell the operator to disregard it.
+      await expect(consumeGenerator()).rejects.toThrow(/The binary is fine/);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    });
+
+    test('keeps the original launch error when the working directory exists', async () => {
+      const error = new Error(
+        'Claude Code native binary at /pkg/claude exists but failed to launch. ' +
+          "This usually means the binary does not match this system's libc."
+      );
+      mockQuery.mockImplementation(async function* () {
+        throw error;
+      });
+
+      const consumeGenerator = async () => {
+        // process.cwd() is a real directory, so the cwd explanation does not apply
+        // and a genuine libc mismatch must still surface as itself.
+        for await (const _ of client.sendQuery('test', process.cwd())) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(/failed to launch/);
+    });
+
     test('classifies "Operation aborted" errors as crash and retries', async () => {
       const error = new Error('Operation aborted');
       mockQuery.mockImplementation(async function* () {

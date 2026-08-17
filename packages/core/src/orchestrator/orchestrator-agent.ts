@@ -1419,6 +1419,44 @@ export async function handleMessage(
       }
     }
 
+    // A conversation's `cwd` override can outlive the directory it names. Every
+    // path that tears a worktree down (`archon isolation cleanup`, the periodic
+    // reaper, the isolation API route, a user's own `rm -rf`) marks the env row
+    // destroyed without touching the conversation row, so `cwd` keeps pointing at
+    // a path that is gone. Only the WORKFLOW path re-resolves isolation and
+    // notices; a chat turn reads `cwd` verbatim and hands it to the provider,
+    // which spawns its subprocess there and fails ENOENT — an error the Claude
+    // SDK reports as a binary/libc mismatch, sending the operator after entirely
+    // the wrong thing.
+    //
+    // Deliberately does NOT fall back to codebase.default_cwd: this conversation
+    // asked to work in an isolated worktree, and quietly relocating the agent
+    // into the live checkout would widen its write scope without consent. Runs
+    // before the persist below so a refused turn leaves no `user` row without its
+    // `assistant` pair, and after the deterministic-command early-returns above
+    // so `/worktree remove` and `/setproject` — the way out of this state — keep
+    // working.
+    if (conversation.codebase_id !== null && conversation.cwd !== null) {
+      if (!existsSync(conversation.cwd)) {
+        getLog().warn(
+          {
+            conversationId: conversation.id,
+            cwd: conversation.cwd,
+            isolationEnvId: conversation.isolation_env_id,
+          },
+          'orchestrator.conversation_cwd_missing'
+        );
+        await platform.sendMessage(
+          conversationId,
+          `This conversation's working directory no longer exists:\n\`${conversation.cwd}\`\n\n` +
+            'Its isolated worktree was removed after this conversation was bound to it. ' +
+            'Run `/worktree remove` to detach and go back to the project root, or ' +
+            '`/setproject <name>` to rebind this conversation to a project.'
+        );
+        return;
+      }
+    }
+
     // Persist the inbound user message for non-web platforms (Slack/Telegram/
     // GitHub/Discord/CLI) — the web adapter's route persists web turns itself.
     // Placed AFTER the deterministic-command and approval early-returns so only

@@ -48,7 +48,7 @@ import type {
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
-import { resolveClaudeBinaryPath } from './binary-resolver';
+import { resolveClaudeBinaryPath, pathKind } from './binary-resolver';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
@@ -246,6 +246,19 @@ const AUTH_PATTERNS = [
   '403',
 ];
 const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'operation aborted'];
+
+/**
+ * Errors that mean "the subprocess never started", as opposed to "it started
+ * and then failed". Both spellings name the EXECUTABLE even when the executable
+ * is fine, because `posix_spawn` reports a missing working directory as ENOENT
+ * against the path it was asked to run — see the cwd check in
+ * classifyAndEnrichError for why that distinction matters.
+ *
+ * 'failed to launch' is the Claude Agent SDK's own wording (it wraps the spawn
+ * error after confirming the binary exists on disk, and concludes libc
+ * mismatch); 'enoent' is the raw Node/Bun spawn error when nothing wraps it.
+ */
+const SPAWN_FAILURE_PATTERNS = ['failed to launch', 'enoent'];
 
 function classifySubprocessError(
   errorMessage: string,
@@ -1210,11 +1223,18 @@ async function* streamClaudeMessages(
 /**
  * Classify a subprocess error and enrich with stderr context.
  * Returns null if the error should be retried (caller handles retry logic).
+ *
+ * `hostCwd` is the directory the subprocess was to be spawned in, and only when
+ * that directory is on THIS host — container runs pass undefined, because their
+ * cwd names a path inside the container that is not expected to exist here.
+ * It is inspected only on the spawn-failure path (see the SPAWN_FAILURE_PATTERNS
+ * branch), so the happy path pays no filesystem cost.
  */
 function classifyAndEnrichError(
   error: Error,
   stderrLines: string[],
-  controller: AbortController
+  controller: AbortController,
+  hostCwd: string | undefined
 ): { enrichedError: Error; errorClass: string; shouldRetry: boolean } {
   // If the controller was aborted by withFirstMessageTimeout, the original
   // timeout error carries the diagnostic message and #1067 breadcrumb.
@@ -1256,6 +1276,35 @@ function classifyAndEnrichError(
 
   const stderrContext = stderrLines.join('\n');
   const errorClass = classifySubprocessError(error.message, stderrContext);
+
+  // A spawn that fails because the WORKING DIRECTORY is gone reports ENOENT
+  // against the executable's path, not the cwd's. The SDK sees that, confirms
+  // the executable does exist on disk, and concludes the binary must be built
+  // for the wrong libc — so the operator is told to go chase musl-vs-glibc
+  // while the actual cause is a deleted worktree. Ask the one question the SDK
+  // never asks, and report what is really wrong.
+  if (
+    hostCwd !== undefined &&
+    SPAWN_FAILURE_PATTERNS.some(p => error.message.toLowerCase().includes(p))
+  ) {
+    const kind = pathKind(hostCwd);
+    if (kind !== 'directory') {
+      const detail =
+        kind === 'file'
+          ? 'is a file, not a directory'
+          : 'does not exist (it may have been removed)';
+      const enrichedError = new Error(
+        `Claude Code could not be started: its working directory "${hostCwd}" ${detail}. ` +
+          'A process cannot be spawned in a missing directory, and the failure is reported ' +
+          'against the executable rather than the directory — so the underlying SDK error ' +
+          'names the Claude Code binary and blames a libc mismatch. The binary is fine. ' +
+          'If this was an isolated worktree, recreate it or point this run at a directory ' +
+          'that exists.'
+      );
+      enrichedError.cause = error;
+      return { enrichedError, errorClass: 'cwd_missing', shouldRetry: false };
+    }
+  }
 
   if (errorClass === 'auth') {
     const enrichedError = new Error(
@@ -1455,7 +1504,8 @@ export class ClaudeProvider implements IAgentProvider {
         const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichError(
           err,
           stderrLines,
-          controller
+          controller,
+          isContainerRun ? undefined : cwd
         );
 
         getLog().error(
