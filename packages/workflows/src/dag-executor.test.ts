@@ -84,6 +84,11 @@ import { dagNodeSchema } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
+import {
+  COMPILED_LOOP_COMMAND,
+  type CompiledLoopCommand,
+  type LoopWithCompiledCommand,
+} from './compiled-command';
 import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
@@ -820,9 +825,9 @@ describe('substituteNodeOutputRefs', () => {
 
   it('unknown node ref WITH a field throws (no-silent-drop, unknown-node)', () => {
     // The whole-text `$missing.output` form stays lenient ('' — see test above), but a
-    // `.field` ref to an unknown id is a typo the load-time validator can't always see
-    // (bash/script/approval/cancel + command-file refs aren't scanned). It must fail the
-    // consuming node loudly, matching known-producer strict-field posture.
+    // `.field` ref to an unknown id can still reach the executor through a programmatically
+    // constructed definition that bypasses discovery. It must fail the consuming node
+    // loudly, matching known-producer strict-field posture.
     const outputs = new Map([['analyze', makeOutput('completed', '{"type":"BUG"}')]]);
     let caught: unknown;
     try {
@@ -4095,7 +4100,7 @@ describe('executeDagWorkflow -- skills options', () => {
     expect(nodeConfig?.allowed_tools).toEqual(['Read', 'Grep']);
   });
 
-  it('does not warn about skills on Codex DAG node — Codex auto-discovers skills from .agents/skills/', async () => {
+  it('warns that Codex ignores the YAML skills list', async () => {
     mockGetAgentProviderDag.mockReturnValue({
       sendQuery: mockSendQueryDag,
       getType: () => 'codex',
@@ -4128,11 +4133,12 @@ describe('executeDagWorkflow -- skills options', () => {
       { ...minimalConfig, assistant: 'codex' }
     );
 
-    // No warning about skills should be sent — Codex supports skills via filesystem auto-discovery
+    // Codex workflow nodes suppress the ambient catalog. Authors invoke installed
+    // native skills explicitly in the command/prompt with `$skill-name` instead.
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
     const warning = messages.find(m => m.includes('skills') && m.includes('codex'));
-    expect(warning).toBeUndefined();
+    expect(warning).toBeDefined();
   });
 
   it('passes agents to sendQuery nodeConfig when node has inline agents', async () => {
@@ -4261,7 +4267,7 @@ nodes:
     expect(result.error!.error).toContain('skills');
   });
 
-  it('rejects empty skills array', () => {
+  it('accepts empty skills array', () => {
     const yaml = `
 name: empty-skills
 description: test
@@ -4271,8 +4277,8 @@ nodes:
     skills: []
 `;
     const result = parseWorkflow(yaml, 'empty.yaml');
-    expect(result.error).not.toBeNull();
-    expect(result.error!.error).toContain('skills');
+    expect(result.error).toBeNull();
+    expect(result.workflow?.nodes[0].skills).toEqual([]);
   });
 
   it('ignores skills on bash nodes with warning', () => {
@@ -8469,6 +8475,249 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(failed).toHaveLength(0);
     });
 
+    it('reuses the pause-time prompt snapshot after a composed loop prompt is rediscovered', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'iteration output, no signal yet' };
+        yield { type: 'result', sessionId: 'sid-prompt-1' };
+      });
+
+      const platform = createMockPlatform();
+      const firstDeps = createMockDeps();
+      const blockWorkflow = {
+        name: 'materialized-loop-block',
+        description: 'Command-backed loop block',
+        nodes: [
+          {
+            id: 'gated-loop',
+            loop: {
+              command: 'materialized-loop-command',
+              until: 'COMPLETE',
+              max_iterations: 5,
+              interactive: true,
+              gate_message: 'Review materialized prompt.',
+            },
+          } satisfies DagNode,
+        ],
+      } satisfies WorkflowDefinition;
+      const parentWorkflow = {
+        name: 'materialized-loop-gated',
+        description: 'Includes the command-backed loop',
+        nodes: [{ id: 'included', include: 'materialized-loop-block' } satisfies DagNode],
+      } satisfies WorkflowDefinition;
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      const commandPath = join(testDir, '.archon', 'commands', 'materialized-loop-command.md');
+      await mkdir(workflowDir, { recursive: true });
+      await Promise.all([
+        writeFile(join(workflowDir, 'materialized-block.yaml'), JSON.stringify(blockWorkflow)),
+        writeFile(join(workflowDir, 'materialized-parent.yaml'), JSON.stringify(parentWorkflow)),
+        writeFile(commandPath, 'ORIGINAL materialized command. USER=<<$LOOP_USER_INPUT>>'),
+      ]);
+      const firstDiscovery = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(firstDiscovery.errors).toHaveLength(0);
+      const originalWorkflow = firstDiscovery.workflows.find(
+        item => item.workflow.name === parentWorkflow.name
+      )?.workflow;
+      expect(originalWorkflow).toBeDefined();
+
+      await executeDagWorkflow(
+        firstDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        originalWorkflow!,
+        makeWorkflowRun(),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const pauseCalls = (
+        firstDeps.store.pauseWorkflowRun as Mock<
+          (id: string, ctx: Record<string, unknown>) => Promise<void>
+        >
+      ).mock.calls;
+      const pausedContext = pauseCalls[0]?.[1] as Record<string, unknown>;
+      expect(pausedContext.commandSnapshot).toContain('ORIGINAL materialized command.');
+
+      mockSendQueryDag.mockClear();
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'refined. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'sid-prompt-2' };
+      });
+      // Cold filesystem rediscovery after the source command was deleted still returns the
+      // workflow. Its engine-private compilation error blocks a fresh run, while
+      // this resumed run can reach and reuse the persisted snapshot.
+      unlinkSync(commandPath);
+      const rediscovery = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(rediscovery.errors).toHaveLength(0);
+      const rediscoveredWorkflow = rediscovery.workflows.find(
+        item => item.workflow.name === parentWorkflow.name
+      )?.workflow;
+      expect(rediscoveredWorkflow).toBeDefined();
+      mockSendQueryDag.mockClear();
+      const freshStore = createMockStore();
+      await executeDagWorkflow(
+        createMockDeps(freshStore),
+        platform,
+        'conv-dag',
+        testDir,
+        rediscoveredWorkflow!,
+        makeWorkflowRun('fresh-invalid-command-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      const freshFailures = (
+        freshStore.createWorkflowEvent as ReturnType<typeof mock>
+      ).mock.calls.filter(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+      );
+      expect(freshFailures).toHaveLength(1);
+
+      const resumedRun = makeWorkflowRun('materialized-resume-run', {
+        metadata: {
+          approval: { ...pausedContext },
+          loop_user_input: 'tighten the summary',
+          loop_feedback_given: true,
+        },
+      });
+
+      mockSendQueryDag.mockClear();
+      await executeDagWorkflow(
+        createMockDeps(createMockStore()),
+        platform,
+        'conv-dag',
+        testDir,
+        rediscoveredWorkflow!,
+        resumedRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const resumedPrompt = mockSendQueryDag.mock.calls[0]?.[0] as string;
+      expect(resumedPrompt).toContain('ORIGINAL materialized command.');
+      expect(resumedPrompt).toContain('USER=<<tighten the summary>>');
+      expect(resumedPrompt).not.toContain('could not be resolved');
+    });
+
+    it('fails before provider invocation when compiled loop metadata is malformed', async () => {
+      const loop: Extract<DagNode, { loop: unknown }>['loop'] & LoopWithCompiledCommand = {
+        command: 'malformed-compiled-command',
+        until: 'DONE',
+        max_iterations: 1,
+      };
+      loop[COMPILED_LOOP_COMMAND] = {} as CompiledLoopCommand;
+      const store = createMockStore();
+
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-dag',
+        testDir,
+        {
+          name: 'malformed-compiled-command-workflow',
+          nodes: [{ id: 'repeat', loop }],
+        },
+        makeWorkflowRun('malformed-compiled-command-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      const failures = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+      );
+      expect(failures).toHaveLength(1);
+      expect((failures[0]?.[0] as { data: { error: string } }).data.error).toContain(
+        'malformed compiled command metadata'
+      );
+    });
+
+    it('keeps a whitespace-only included loop discoverable but fails a fresh run', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await Promise.all([
+        writeFile(
+          join(workflowDir, 'empty-loop-block.yaml'),
+          JSON.stringify({
+            name: 'empty-loop-block',
+            description: 'Whitespace loop command block',
+            nodes: [
+              {
+                id: 'repeat',
+                loop: { command: 'empty-included-loop', until: 'DONE', max_iterations: 1 },
+              },
+            ],
+          })
+        ),
+        writeFile(
+          join(workflowDir, 'empty-loop-parent.yaml'),
+          JSON.stringify({
+            name: 'empty-loop-parent',
+            description: 'Includes whitespace loop command block',
+            nodes: [{ id: 'inc', include: 'empty-loop-block' }],
+          })
+        ),
+        writeFile(join(testDir, '.archon', 'commands', 'empty-included-loop.md'), '  \n\t'),
+      ]);
+      const discovery = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(discovery.errors).toHaveLength(0);
+      const workflow = discovery.workflows.find(
+        item => item.workflow.name === 'empty-loop-parent'
+      )?.workflow;
+      expect(workflow).toBeDefined();
+      const store = createMockStore();
+
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-dag',
+        testDir,
+        workflow!,
+        makeWorkflowRun('empty-included-loop-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      const failures = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+      );
+      expect(failures).toHaveLength(1);
+      expect((failures[0]?.[0] as { data: { error: string } }).data.error).toContain(
+        "command 'empty-included-loop' is empty"
+      );
+    });
+
     it('closes the loop lifecycle with exactly one node_failed on max-iterations exhaustion', async () => {
       // Failure finalizer contract: every failed exit after node_started goes
       // through one finalizer — exactly one node_failed row per started loop
@@ -10864,6 +11113,284 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     const warning = messages.find(m => m.includes('effort') && m.toLowerCase().includes('codex'));
     expect(warning).toBeDefined();
   });
+
+  it('forwards workflow-level modelReasoningEffort and webSearchMode to a Codex node', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-workflow-options-test',
+        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        modelReasoningEffort: 'minimal',
+        webSearchMode: 'live',
+      },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
+    expect(assistantConfig?.modelReasoningEffort).toBe('minimal');
+    expect(assistantConfig?.webSearchMode).toBe('live');
+  });
+
+  it('workflow-level modelReasoningEffort beats a preset-routed effort, and node_started reports the applied value', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const aiProfile = buildAiProfile('claude', {
+      repoTiers: {
+        medium: { provider: 'codex', model: 'gpt-5.5', effort: 'medium' },
+      },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-workflow-beats-preset-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        modelReasoningEffort: 'xhigh',
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      aiProfile
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
+    expect(assistantConfig?.modelReasoningEffort).toBe('xhigh');
+
+    // The write must land BEFORE resolvedEffort is captured, or the audit trail and
+    // console report an effort the node did not run at.
+    const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
+    const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
+    expect(nodeStartedCall?.[0].data?.effort).toBe('xhigh');
+  });
+
+  it('workflow-level modelReasoningEffort does not strip preset effort from a Claude node', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const aiProfile = buildAiProfile('claude', {
+      repoTiers: {
+        medium: { provider: 'claude', model: 'sonnet', effort: 'medium' },
+      },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'mixed-provider-preset-effort-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        // Declared for the workflow's Codex nodes; must not affect this Claude node.
+        modelReasoningEffort: 'high',
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      aiProfile
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
+    const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
+    expect(nodeConfig?.effort).toBe('medium');
+    expect(assistantConfig?.modelReasoningEffort).toBeUndefined();
+  });
+
+  it('warns when workflow-level Codex options land on a non-Codex node', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-options-on-claude-test',
+        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        modelReasoningEffort: 'high',
+        webSearchMode: 'live',
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const warning = messages.find(
+      m => m.includes('modelReasoningEffort') && m.includes('webSearchMode')
+    );
+    expect(warning).toBeDefined();
+
+    // Nothing meaningless is written onto a provider that cannot read it.
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
+    expect(assistantConfig?.modelReasoningEffort).toBeUndefined();
+    expect(assistantConfig?.webSearchMode).toBeUndefined();
+  });
+
+  it('reports modelReasoningEffort in node_started, not the effort Codex ignores', async () => {
+    // A mixed-provider workflow is told by the authoring guide to set `effort:` for its
+    // Claude/Pi nodes and `modelReasoningEffort:` for Codex. nodeConfig.effort is populated
+    // for every provider and only warned about on Codex, never stripped — so the event
+    // stream must not prefer it over the value Codex actually ran at.
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-effort-telemetry-test',
+        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        effort: 'max',
+        modelReasoningEffort: 'low',
+      },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
+    expect(assistantConfig?.modelReasoningEffort).toBe('low');
+
+    const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
+    const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
+    expect(nodeStartedCall?.[0].data?.effort).toBe('low');
+  });
+
+  it('warns when a node in a Codex workflow resolves away to Claude via a tier', async () => {
+    // The mixed-provider direction: the workflow-level provider IS codex, so a check
+    // against the CONFIGURED provider would stay silent. Only the resolved provider
+    // reveals that this node cannot read either field.
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const aiProfile = buildAiProfile('codex', {
+      repoTiers: {
+        medium: { provider: 'claude', model: 'sonnet' },
+      },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-workflow-node-resolves-to-claude-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        modelReasoningEffort: 'high',
+        webSearchMode: 'live',
+      },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      aiProfile
+    );
+
+    expect(mockGetAgentProviderDag.mock.calls[0][0]).toBe('claude');
+
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const warning = messages.find(
+      m => m.includes('modelReasoningEffort') && m.includes('webSearchMode')
+    );
+    expect(warning).toBeDefined();
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
+    expect(assistantConfig?.modelReasoningEffort).toBeUndefined();
+    expect(assistantConfig?.webSearchMode).toBeUndefined();
+  });
 });
 
 describe('executeDagWorkflow -- cost tracking', () => {
@@ -11537,6 +12064,59 @@ describe('executeDagWorkflow -- script nodes', () => {
     const prompt = mockSendQueryDag.mock.calls[0][0] as string;
     expect(prompt).toContain(`script=${stateDir}`);
     expect(prompt).toContain(`bash=${stateDir}`);
+  });
+
+  it('WORKFLOW_ID reaches script and bash subprocesses as an env var, not just as text', async () => {
+    // $WORKFLOW_ID substitutes into the body, so a node that spells it inline
+    // always worked. A heredoc'd python/node block reads os.environ instead,
+    // and found WORKFLOW_ID missing while ARTIFACTS_DIR/STATE_DIR/LOG_DIR beside
+    // it were all present — an inconsistency that fails only at runtime, inside
+    // the nested interpreter, with a bare KeyError.
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const runId = 'wf-workflowid-env';
+    const workflowRun = makeWorkflowRun(runId, {
+      workflow_name: 'workflow-id-env-test',
+      conversation_id: 'conv-wfid',
+      user_message: 'workflow id env test',
+    });
+
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(
+      join(commandsDir, 'check-wfid.md'),
+      'script=$from-script.output bash=$from-bash.output'
+    );
+
+    const nodes: DagNode[] = [
+      // Neither body contains the literal `$WORKFLOW_ID`, so the textual
+      // substitution path cannot make this pass — only the env bag can.
+      { id: 'from-script', script: 'console.log(process.env.WORKFLOW_ID)', runtime: 'bun' },
+      { id: 'from-bash', bash: 'printf %s "${WORKFLOW_ID}"' },
+      { id: 'check', command: 'check-wfid', depends_on: ['from-script', 'from-bash'] },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-wfid',
+      testDir,
+      { name: 'workflow-id-env', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const prompt = mockSendQueryDag.mock.calls[0][0] as string;
+    expect(prompt).toContain(`script=${runId}`);
+    expect(prompt).toContain(`bash=${runId}`);
   });
 
   it('named script not found at runtime results in failed state and platform message', async () => {
@@ -16760,7 +17340,7 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
 // top-level nodes for events, terminal-output selection, resume-skip, and always_run.
 // ---------------------------------------------------------------------------
 
-describe('executeDagWorkflow -- include expansion (zero runtime machinery)', () => {
+describe('executeDagWorkflow -- flattened include expansion', () => {
   let testDir: string;
 
   beforeEach(async () => {

@@ -53,6 +53,8 @@ import type {
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
+  ModelReasoningEffort,
+  WebSearchMode,
   WorkflowSource,
   WorkflowDefinition,
   LoopGateRunMetadata,
@@ -71,6 +73,7 @@ import {
   isPersistableNode,
   readSubrunMetadata,
   isApprovalContext,
+  inputEnvKey,
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger, captureWorkflowCompleted } from '@archon/paths';
@@ -85,6 +88,7 @@ import {
 } from './output-ref';
 import { buildTruncationMarker } from './utils/output-truncation';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
+import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import {
   logNodeStart,
   logNodeComplete,
@@ -136,6 +140,25 @@ function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
   if (isCancelNode(node)) return 'cancel';
   if ('command' in node) return 'command';
   return 'prompt';
+}
+
+/**
+ * Resolve this run's named inputs (#2470) from persisted sub-run metadata. Non-empty
+ * only for `workflow:` sub-run children (the parent stamps `metadata.inputs` at spawn);
+ * a top-level run has none. Threaded into every AI/prompt substitution so `$INPUTS.<name>`
+ * resolves, and mangled to `INPUTS_<UPPER_SNAKE>` env vars for bash/script nodes.
+ */
+function resolveRunInputs(workflowRun: WorkflowRun): Record<string, string> | undefined {
+  return readSubrunMetadata(workflowRun.metadata as Record<string, unknown> | undefined).inputs;
+}
+
+/** Env-var bag delivering this run's named inputs to bash/script sub-run nodes (#2470). */
+function inputEnvVars(workflowRun: WorkflowRun): NodeJS.ProcessEnv {
+  const inputs = resolveRunInputs(workflowRun);
+  if (!inputs) return {};
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(inputs)) env[inputEnvKey(name)] = value;
+  return env;
 }
 
 interface RunningTool {
@@ -316,13 +339,22 @@ export async function loadConfiguredMcpServerNames(
   }
 }
 
-/** Workflow-level Claude SDK options — per-node overrides take precedence via ?? */
+/** Workflow-level provider options. The first five have node-level counterparts and
+ *  are resolved as `node.X ?? workflowLevelOptions.X`; the two Codex fields below have
+ *  NO node-level equivalent (they are absent from `dagNodeSchema`), so a workflow-level
+ *  value is the only value. */
 interface WorkflowLevelOptions {
   effort?: EffortLevel;
   thinking?: ThinkingConfig;
   fallbackModel?: string;
   betas?: string[];
   sandbox?: SandboxSettings;
+  /** Codex-only: reasoning effort, consumed as `assistantConfig.modelReasoningEffort`.
+   *  Written only when the resolved provider is Codex — see `resolveNodeProviderAndModel`. */
+  modelReasoningEffort?: ModelReasoningEffort;
+  /** Codex-only: web-search mode, consumed as `assistantConfig.webSearchMode`. Same
+   *  provider gate as `modelReasoningEffort`. */
+  webSearchMode?: WebSearchMode;
   /** Workflow-level tier keyword (when `workflow.model` is small/medium/large), so
    *  nodes that inherit the workflow model can still surface the `← tier` annotation. */
   workflowTier?: 'small' | 'medium' | 'large';
@@ -390,6 +422,13 @@ export interface RunChildWorkflowArgs {
   itemHash?: string;
   /** Present only when re-driving a FAILED child on parent resume (D5 recovery path). */
   resumeFailedChild?: WorkflowRun;
+  /**
+   * Named inputs (#2470) — the resolved `with:` map the parent supplied, plus (for a
+   * fan-out child) the per-item `fan_out.as` entry. Persisted to the child's
+   * `metadata.inputs` at spawn so `$INPUTS.<name>` resolves at runtime and reconstitutes
+   * on cold resume. Undefined/empty when the node declares no `with:`/`as`.
+   */
+  inputs?: Record<string, string>;
 }
 
 /**
@@ -733,10 +772,11 @@ function shellQuoteOrFile(
  * Substitute $node_id.output and $node_id.output.field references in a prompt.
  * Called AFTER the standard substituteWorkflowVariables pass.
  *
- * KEEP IN SYNC (three ref-surface enumerations must agree): the fields this is called on
- * (search call sites below), the loader's validateDagStructure scan (which validates the
- * same refs), and rewriteNodeOutputRefs in include-expander.ts (which renames them on
- * inline). Adding a substituted field to one means updating all three.
+ * KEEP IN SYNC: public YAML call sites, the loader's validateDagStructure scan, and
+ * rewriteNodeOutputRefs must cover the same runtime node-ref surfaces. Included
+ * loop-command bodies are validated separately during materialization. applyInputsMacro is
+ * intentionally a superset because some AI configuration strings accept include inputs
+ * without receiving runtime node-output substitution.
  *
  * @param escapedForBash - When true, wraps substituted values in single quotes so
  *   they are safe to embed in bash scripts passed to `bash -c`. Set true only for
@@ -753,10 +793,10 @@ export function substituteNodeOutputRefs(
     (match, nodeId: string, field: string | undefined) => {
       const nodeOutput = nodeOutputs.get(nodeId);
       if (!nodeOutput) {
-        // A `.field` ref that resolves to no output (a typo the load-time validator
-        // can't always see — refs in bash/script/approval/cancel fields and inside
-        // command-file content aren't scanned — or a real node that hasn't run before
-        // this reference) fails the consuming node loudly, matching the strict
+        // A `.field` ref that resolves to no output (for example, a programmatically
+        // constructed definition that bypassed discovery, or a real producer whose
+        // output is unavailable on this execution path) fails the consuming node loudly,
+        // matching the strict
         // no-silent-drop posture for known-producer field access below. The whole-text
         // `$id.output` form stays lenient ('') as a long-documented surface (changing
         // it is a bigger compatibility break).
@@ -1020,6 +1060,15 @@ async function resolveNodeProviderAndModel(
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
 
+  // Codex is the only provider that takes reasoning effort and web-search mode from
+  // `assistantConfig` (codex/provider.ts:92-93), and it ignores the node-level `effort:`
+  // field entirely. Three decisions below hang on that one fact — whether to warn, whether
+  // to write, and which field holds the effort that will actually be applied — so it is
+  // named once here rather than spelled as three independent string comparisons that a
+  // later change could update apart. There is deliberately no ProviderCapabilities axis
+  // for this; see #2556.
+  const readsAssistantConfigOptions = provider === 'codex';
+
   // Runtime backstop for container dispatch: the run-start pre-scan
   // (collectContainerIncompatibleProviders) hand-mirrors this same provider
   // resolution, so it could drift. Re-check the RESOLVED provider here, at the
@@ -1063,6 +1112,19 @@ async function resolveNodeProviderAndModel(
     }
   }
 
+  // `modelReasoningEffort`/`webSearchMode` have no ProviderCapabilities axis, so capChecks
+  // above cannot see them. Surfacing them here reuses the existing loud-mismatch path so a
+  // workflow that declares either one on a node that cannot read them gets the same warning
+  // every other capability mismatch produces, instead of a silent no-op.
+  if (!readsAssistantConfigOptions) {
+    if (workflowLevelOptions.modelReasoningEffort !== undefined) {
+      unsupported.push('modelReasoningEffort');
+    }
+    if (workflowLevelOptions.webSearchMode !== undefined) {
+      unsupported.push('webSearchMode');
+    }
+  }
+
   if (unsupported.length > 0) {
     getLog().warn({ nodeId: node.id, provider, unsupported }, 'dag.unsupported_capabilities');
     const delivered = await safeSendMessage(
@@ -1074,23 +1136,6 @@ async function resolveNodeProviderAndModel(
     if (!delivered) {
       getLog().error({ nodeId: node.id, workflowRunId }, 'dag.capability_warning_delivery_failed');
     }
-  }
-
-  // Surface agents + skills ID collision — user-defined 'dag-node-skills'
-  // silently overrides Archon's skills wrapper. User wins (by design) but
-  // the operator should know they've neutered the wrapper.
-  if (
-    node.agents?.['dag-node-skills'] !== undefined &&
-    node.skills !== undefined &&
-    node.skills.length > 0
-  ) {
-    getLog().warn({ nodeId: node.id }, 'dag.agents_skills_id_collision');
-    await safeSendMessage(
-      platform,
-      conversationId,
-      `Warning: Node '${node.id}' defines an agent with reserved ID 'dag-node-skills' AND uses 'skills:'. Your inline agent overrides Archon's automatic skills wrapper — the 'skills:' field will NOT take effect. Rename the agent or remove 'skills:' to fix.`,
-      { workflowId: workflowRunId, nodeName: node.id }
-    );
   }
 
   // Build universal base options
@@ -1146,19 +1191,49 @@ async function resolveNodeProviderAndModel(
     nodeConfig,
     assistantConfig
   );
+  // Workflow-level Codex options (#2246). Applied AFTER applyPresetOptions so an
+  // explicit workflow literal beats a preset-routed effort — precedence is
+  // workflow-level > tier preset > config.yaml — and BEFORE the resolvedEffort read
+  // below so telemetry reports the value that actually runs.
+  //
+  // Gated on the resolved provider: an ungated write would land on Copilot too, which
+  // reads the same key from assistantConfig with a narrower enum. Declaring either field
+  // on a node that cannot read it warns via the capability block above instead.
+  if (readsAssistantConfigOptions) {
+    if (workflowLevelOptions.modelReasoningEffort !== undefined) {
+      assistantConfig.modelReasoningEffort = workflowLevelOptions.modelReasoningEffort;
+    }
+    if (workflowLevelOptions.webSearchMode !== undefined) {
+      assistantConfig.webSearchMode = workflowLevelOptions.webSearchMode;
+    }
+  }
+
   // Read POST-routing values only. applyPresetOptions -> routePresetEffort has
   // already placed effort where the provider actually consumes it — nodeConfig
   // for providers taking a node-level `effort:`, assistantConfig for Codex's
-  // modelReasoningEffort — and warned + dropped it where unsupported. So both
-  // reads below hold effort that will genuinely be applied.
+  // modelReasoningEffort — and warned + dropped it where unsupported; the
+  // workflow-level override above has already been applied. So both reads below
+  // hold effort that will genuinely be applied.
   //
   // Do NOT gate this on caps.effortControl: that flag means "accepts the
   // node-level effort: field", not "can apply reasoning effort". Codex is
   // effortControl:false yet applies effort via modelReasoningEffort, so gating
   // on it would drop a real, applied value from node_started.
-  const assistantEffort = assistantConfig.modelReasoningEffort;
-  const resolvedEffort: string | undefined =
-    nodeConfig.effort ?? (typeof assistantEffort === 'string' ? assistantEffort : undefined);
+  //
+  // The branch matters. `nodeConfig.effort` is populated for every provider, and
+  // capChecks only WARNS that Codex ignores it — it never strips it. So on Codex a
+  // plain `nodeConfig.effort ?? assistantEffort` reports the declared-but-ignored
+  // `effort:` in preference to the `modelReasoningEffort` the node actually ran at.
+  // A mixed-provider workflow setting both (which the authoring guide recommends)
+  // hits that directly, and it is the #2395 failure mode: an event stream that does
+  // not say what ran.
+  const assistantEffort =
+    typeof assistantConfig.modelReasoningEffort === 'string'
+      ? assistantConfig.modelReasoningEffort
+      : undefined;
+  const resolvedEffort: string | undefined = readsAssistantConfigOptions
+    ? assistantEffort
+    : (nodeConfig.effort ?? assistantEffort);
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -1389,7 +1464,7 @@ async function executeNodeInternal(
       docsDir,
       issueContext,
       `dag node '${node.id}' prompt`,
-      { stateDir }
+      { stateDir, inputs: resolveRunInputs(workflowRun) }
     );
   } catch (error) {
     const err = error as Error;
@@ -2656,9 +2731,17 @@ async function executeBashNode(
   // host token via runSubprocess's process.env layering — the scrub is unaffected.
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...(envVars ?? {}),
+    // Named sub-run inputs as INPUTS_<UPPER_SNAKE> env vars (#2470). Spread after
+    // envVars so a configured project env var can never shadow an input's delivery,
+    // and before the engine-reserved keys so those still win (same ordering rationale).
+    ...inputEnvVars(workflowRun),
     ARTIFACTS_DIR: artifactsDir,
     STATE_DIR: stateDir,
     LOG_DIR: logDir,
+    // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
+    // reads os.environ and found it missing while its siblings above were all
+    // present. Deliver it the same way.
+    WORKFLOW_ID: workflowRun.id,
     BASE_BRANCH: baseBranch,
     USER_MESSAGE: workflowRun.user_message,
     ARGUMENTS: workflowRun.user_message,
@@ -2927,9 +3010,16 @@ async function executeScriptNode(
   // and still override the ambient host token via runSubprocess (scrub unaffected).
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...(envVars ?? {}),
+    // Named sub-run inputs as INPUTS_<UPPER_SNAKE> env vars (#2470) — same ordering
+    // rationale as executeBashNode: after envVars, before the engine-reserved keys.
+    ...inputEnvVars(workflowRun),
     ARTIFACTS_DIR: artifactsDir,
     STATE_DIR: stateDir,
     LOG_DIR: logDir,
+    // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
+    // reads os.environ and found it missing while its siblings above were all
+    // present. Deliver it the same way.
+    WORKFLOW_ID: workflowRun.id,
     BASE_BRANCH: baseBranch,
     USER_MESSAGE: workflowRun.user_message,
     ARGUMENTS: workflowRun.user_message,
@@ -3579,6 +3669,10 @@ async function executeLoopGroupNode(
 
     // Determine this iteration's terminal output (first completed terminal node in
     // definition order — mirrors the top-level run's terminal-output selection).
+    // DELIBERATELY NOT `returns:`-aware (#2470): a loop_group's per-iteration output is
+    // the iteration's own result, not a caller contract — `returns:` selects a WORKFLOW's
+    // result and only rebinds a child run's terminal output (see executeDagWorkflow). Leave
+    // this positional scan as-is; do not "fix" the inconsistency.
     const allDeps = new Set(iterBodyNodes.flatMap(n => n.depends_on ?? []));
     const terminalOutput = iterBodyNodes
       .filter(n => !allDeps.has(n.id))
@@ -4144,23 +4238,36 @@ async function executeLoopNode(
     return { state: 'completed', output: finalizeOutput, sessionId: currentSessionId };
   }
 
-  // Resolve the iteration prompt source. `loop.prompt` is used directly;
-  // `loop.command` is read ONCE per run/node: the first invocation loads the
-  // command file, and the interactive gate persists the loaded text
-  // (`commandSnapshot` in the pause context) so a resumed invocation reuses the
-  // snapshot instead of re-reading — a command file edited or deleted while the
-  // run sat paused at a gate can neither change nor break the running loop's
-  // prompt. The schema guarantees exactly one of prompt/command is defined.
+  // Resolve the iteration prompt source once per run/node. The interactive gate
+  // persists the resolved template (`commandSnapshot` in the pause context) for
+  // both inline and command-backed loops. Included loops retain their command identity
+  // plus a load-time compiled prompt/error; rediscovery after a pause cannot change their
+  // running prompt because a persisted snapshot takes precedence over that metadata.
+  // The schema guarantees exactly one of prompt/command is defined.
   let loopPromptTemplate: string;
-  if (typeof loop.prompt === 'string') {
-    loopPromptTemplate = loop.prompt;
+  if (isLoopResume && typeof loopGateMeta?.commandSnapshot === 'string') {
+    loopPromptTemplate = loopGateMeta.commandSnapshot;
   } else if (typeof loop.command === 'string') {
-    if (isLoopResume && typeof loopGateMeta?.commandSnapshot === 'string') {
-      loopPromptTemplate = loopGateMeta.commandSnapshot;
+    const compiled = (loop as typeof loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND];
+    const hasCompiledError = compiled !== undefined && typeof compiled.error === 'string';
+    const hasCompiledPrompt = compiled !== undefined && typeof compiled.prompt === 'string';
+    if (hasCompiledError && !hasCompiledPrompt) {
+      getLog().error(
+        { nodeId: node.id, command: loop.command, error: compiled.error },
+        'loop_node.command_compilation_failed'
+      );
+      return failLoopNode(compiled.error, { data: { command: loop.command } });
+    }
+    if (hasCompiledPrompt && !hasCompiledError) {
+      loopPromptTemplate = compiled.prompt;
+    } else if (compiled !== undefined) {
+      const errorMsg = `Loop node '${node.id}' has malformed compiled command metadata for '${loop.command}' — expected exactly one string prompt or error.`;
+      getLog().error(
+        { nodeId: node.id, command: loop.command, compiled },
+        'loop_node.command_compilation_metadata_invalid'
+      );
+      return failLoopNode(errorMsg, { data: { command: loop.command } });
     } else {
-      // Fresh execution — or a resume of a run paused under a build that
-      // predates commandSnapshot: fall back to a fresh read (documented,
-      // fail-safe) rather than failing an otherwise-valid resume.
       const promptResult = await loadCommandPrompt(
         deps,
         cwd,
@@ -4172,12 +4279,12 @@ async function executeLoopNode(
           { nodeId: node.id, command: loop.command, error: promptResult.message },
           'loop_node.command_load_failed'
         );
-        // The failing command name travels on the node_failed payload so the
-        // event stream carries the same context as the structured log.
         return failLoopNode(promptResult.message, { data: { command: loop.command } });
       }
       loopPromptTemplate = promptResult.content;
     }
+  } else if (typeof loop.prompt === 'string') {
+    loopPromptTemplate = loop.prompt;
   } else {
     // Unreachable: superRefine on loopNodeConfigSchema enforces exactly-one.
     throw new Error(
@@ -4342,7 +4449,7 @@ async function executeLoopNode(
         i === startIteration ? loopUserInput : '',
         undefined, // rejectionReason
         i === startIteration ? '' : lastIterationOutput,
-        { stateDir }
+        { stateDir, inputs: resolveRunInputs(workflowRun) }
       );
       const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
@@ -5037,10 +5144,10 @@ async function executeLoopNode(
         // Usage consumed up to this gate, so a bare approve (finalize, no re-run)
         // can persist it on node_completed instead of reporting nothing (#2333).
         signaledTokens: completionDetected ? (loopTotalTokens ?? null) : null,
-        // Read-once command body for command-backed loops: the resumed invocation
-        // reuses this snapshot instead of re-reading the file (explicit null for
-        // prompt-based loops — same json_patch convention as `sessionId`).
-        commandSnapshot: typeof loop.command === 'string' ? loopPromptTemplate : null,
+        // Read-once resolved template for both prompt- and command-backed loops.
+        // Included command-backed loops use their load-time compiled body here, so
+        // snapshotting both forms preserves resume determinism after source deletion.
+        commandSnapshot: loopPromptTemplate,
       });
       // Return completed — the between-layer status check sees 'paused' and halts cleanly.
       // This mirrors the approval-node pattern, preventing false "DAG nodes failed" warnings
@@ -5211,7 +5318,7 @@ async function executeApprovalNode(
       undefined, // loopUserInput
       rejectionReason,
       undefined, // loopPrevOutput
-      { stateDir }
+      { stateDir, inputs: resolveRunInputs(workflowRun) }
     );
 
     // Build a synthetic PromptNode to reuse executeNodeInternal.
@@ -5391,6 +5498,10 @@ async function executeWorkflowNode(
     return executeFanOutWorkflowNode(node, ctx, node.fan_out, ctx.runChildWorkflow);
   }
 
+  // This run's named inputs (#2470), resolved once — threaded identically into the
+  // `input:` string and every `with:` value below.
+  const parentInputs = resolveRunInputs(parentRun);
+
   // Resolve the input data string (workflow vars + $node.output refs), exactly as
   // prompt/bash nodes resolve their text surface.
   const rawInput = node.input ?? '';
@@ -5405,9 +5516,39 @@ async function executeWorkflowNode(
     undefined, // loopUserInput
     undefined, // rejectionReason
     undefined, // loopPrevOutput
-    { stateDir: ctx.stateDir }
+    // Thread the parent run's inputs so `$INPUTS.<name>` resolves in an `input:` string
+    // exactly as it does in the sibling `with:` values below (a nested sub-run forwarding
+    // a parent input into a grandchild's $ARGUMENTS). Without this the token would throw
+    // "This run has no declared inputs" on a run that DOES have inputs (#2470 parity).
+    { stateDir: ctx.stateDir, inputs: parentInputs }
   );
   const input = substituteNodeOutputRefs(substitutedInput, ctx.nodeOutputs);
+
+  // Resolve the node's `with:` map (#2470) into concrete strings — same two-pass
+  // resolution as `input`: workflow vars (non-shellSafe: these values become the child's
+  // `$INPUTS`, not shell source) then `$node.output` refs. The result is persisted to the
+  // child's metadata.inputs at spawn and reconstituted on cold resume. Throws on a bad ref
+  // exactly as the input surface does — caught by the caller's try/catch → fail closed.
+  let resolvedInputs: Record<string, string> | undefined;
+  if (node.with !== undefined) {
+    resolvedInputs = {};
+    for (const [name, rawValue] of Object.entries(node.with)) {
+      const { prompt: substituted } = substituteWorkflowVariables(
+        rawValue,
+        parentRun.id,
+        parentRun.user_message ?? '',
+        ctx.artifactsDir,
+        ctx.baseBranch,
+        ctx.docsDir,
+        ctx.issueContext,
+        undefined,
+        undefined,
+        undefined,
+        { stateDir: ctx.stateDir, inputs: parentInputs }
+      );
+      resolvedInputs[name] = substituteNodeOutputRefs(substituted, ctx.nodeOutputs);
+    }
+  }
 
   // Producer's declared field set (only when output_format declares object
   // properties) so a downstream `$node.output.field` on a JSON-emitting child
@@ -5570,6 +5711,7 @@ async function executeWorkflowNode(
     userId: parentRun.user_id ?? undefined,
     codebaseId: parentRun.codebase_id ?? undefined,
     isolation: node.isolation,
+    ...(resolvedInputs !== undefined ? { inputs: resolvedInputs } : {}),
   };
 
   try {
@@ -5987,6 +6129,37 @@ async function executeFanOutWorkflowNode(
     return failResult(msg);
   }
 
+  // Resolve the node's static `with:` map (#2470) once — the same $INPUTS applied to EVERY
+  // fan-out child. Per-item, the `fan_out.as` channel adds `$INPUTS.<as> = <item>` on top
+  // (load-time collision-checked so `as` never overwrites a `with:` key). Resolved here
+  // rather than per-child because the values don't depend on the item.
+  const fanOutStaticInputs: Record<string, string> = {};
+  const parentInputs = resolveRunInputs(parentRun);
+  try {
+    if (node.with !== undefined) {
+      for (const [name, rawValue] of Object.entries(node.with)) {
+        const { prompt: substituted } = substituteWorkflowVariables(
+          rawValue,
+          parentRun.id,
+          parentRun.user_message ?? '',
+          ctx.artifactsDir,
+          ctx.baseBranch,
+          ctx.docsDir,
+          ctx.issueContext,
+          undefined,
+          undefined,
+          undefined,
+          { stateDir: ctx.stateDir, inputs: parentInputs }
+        );
+        fanOutStaticInputs[name] = substituteNodeOutputRefs(substituted, ctx.nodeOutputs);
+      }
+    }
+  } catch (err) {
+    const msg = `fan_out 'with:' on '${node.id}' could not be resolved: ${(err as Error).message}`;
+    await notify(`❌ **Fan-out failed** (node \`${node.id}\`): ${msg}`);
+    return failResult(msg);
+  }
+
   // 2. Empty array → a valid zero-width expansion (#977 acceptance): complete with '[]'.
   if (items.length === 0) {
     getLog().info({ parentRunId: parentRun.id, nodeId: node.id }, 'workflow.fan_out_empty');
@@ -6205,6 +6378,13 @@ async function executeFanOutWorkflowNode(
         return childOutcomeFromRun(existing);
       }
       const input = itemToInput(item);
+      // Per-child $INPUTS (#2470): the static `with:` map plus the per-item `fan_out.as`
+      // channel (the item value under `$INPUTS.<as>`). `as` is load-time guaranteed not to
+      // collide with a `with:` key, so this spread order is unambiguous.
+      const childInputs: Record<string, string> = {
+        ...fanOutStaticInputs,
+        ...(fanOut.as !== undefined ? { [fanOut.as]: input } : {}),
+      };
       // A fan-out-recoverable-cancelled child (gate/sibling) can't be resumed while
       // 'cancelled' (resumeWorkflowRun rejects that status) — clear it to 'failed' first,
       // then re-drive through the failed path. Our own tagged cancel is terminal state we
@@ -6236,6 +6416,7 @@ async function executeFanOutWorkflowNode(
         isolation: node.isolation,
         childIndex: i,
         itemHash: hashFanOutItem(input),
+        ...(Object.keys(childInputs).length > 0 ? { inputs: childInputs } : {}),
         ...(resumeChild ? { resumeFailedChild: resumeChild } : {}),
       });
       // A paused child is cancelled HERE rather than at the join, and the timing is
@@ -7859,6 +8040,8 @@ export async function executeDagWorkflow(
     model?: string;
     /** Terminal-success evidence gate (#2230) — read at the completion path. */
     evidence_policy?: WorkflowEvidencePolicy;
+    /** Declared `returns:` node id (#2470) — rebinds a CHILD run's terminal output. */
+    returns?: string;
   } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
@@ -7977,6 +8160,8 @@ export async function executeDagWorkflow(
     fallbackModel: workflow.fallbackModel,
     betas: workflow.betas,
     sandbox: workflow.sandbox,
+    modelReasoningEffort: workflow.modelReasoningEffort,
+    webSearchMode: workflow.webSearchMode,
     workflowTier,
   };
   const layers = buildTopologicalLayers(workflow.nodes);
@@ -8363,15 +8548,39 @@ export async function executeDagWorkflow(
     if (gate === 'paused') return;
   }
 
-  // Terminal output (first sink node, non-blank, definition order) — the run's
-  // "summary". Computed BEFORE completeWorkflowRun so a sub-run can persist it into
-  // its own metadata: a `workflow:` parent re-reads it from there on auto-resume
-  // (the child's executeWorkflow return value is discarded across the human gate).
-  const allDependencies = new Set(workflow.nodes.flatMap(n => n.depends_on ?? []));
-  const terminalOutput = workflow.nodes
-    .filter(n => !allDependencies.has(n.id))
-    .map(n => nodeOutputs.get(n.id))
-    .find(o => o?.state === 'completed' && o.output.trim().length > 0)?.output;
+  // Terminal output (the run's "summary"). Computed BEFORE completeWorkflowRun so a
+  // sub-run can persist it into its own metadata: a `workflow:` parent re-reads it from
+  // there on auto-resume (the child's executeWorkflow return value is discarded across the
+  // human gate).
+  //
+  // #2470: when a CHILD run's workflow declares `returns:`, its terminal output is THAT
+  // node's output — even a non-sink — instead of the positional first-sink scan. Gated on
+  // parent_run_id: a top-level run's summary stays the sink-scan chat/CLI affordance, not a
+  // caller contract. A `returns` node that didn't complete / produced blank output threads
+  // '' with a WARN and does NOT fall through to the sink scan (that would resurrect the
+  // positional accident under a new name). The loop_group per-iteration terminal scan
+  // (~executeLoopGroupNode) is byte-identical and DELIBERATELY unchanged — its result is
+  // the iteration's, never a caller's.
+  let terminalOutput: string | undefined;
+  if (workflow.returns !== undefined && workflowRun.parent_run_id) {
+    const returnsOutput = nodeOutputs.get(workflow.returns);
+    const value = returnsOutput?.state === 'completed' ? returnsOutput.output : undefined;
+    if (value !== undefined && value.trim().length > 0) {
+      terminalOutput = value;
+    } else {
+      getLog().warn(
+        { workflowRunId: workflowRun.id, returns: workflow.returns },
+        'workflow.returns_node_blank_output'
+      );
+      terminalOutput = '';
+    }
+  } else {
+    const allDependencies = new Set(workflow.nodes.flatMap(n => n.depends_on ?? []));
+    terminalOutput = workflow.nodes
+      .filter(n => !allDependencies.has(n.id))
+      .map(n => nodeOutputs.get(n.id))
+      .find(o => o?.state === 'completed' && o.output.trim().length > 0)?.output;
+  }
 
   // Update DB and emit completion
   try {

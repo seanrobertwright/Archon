@@ -53,6 +53,12 @@ import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
 import { withResumedOutcome, resumedOutcome } from '../shared/resumed';
+import {
+  claudeSkillSearchRoots,
+  findInstalledSkillNames,
+  resolveClaudeSkillDirectories,
+  skillSearchRoots,
+} from '../shared/skills';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -445,18 +451,94 @@ interface ProviderWarning {
 
 /**
  * Translate nodeConfig into Claude SDK-specific options.
- * Called inside sendQuery when nodeConfig is present (workflow path).
+ * Called inside sendQuery when nodeConfig is present. A non-empty nodeId marks
+ * the workflow path; partial non-workflow configs keep ambient SDK behavior.
  * Returns structured warnings that the caller should yield as system chunks.
  */
 async function applyNodeConfig(
   options: Options,
   nodeConfig: NodeConfig,
-  cwd: string
+  cwd: string,
+  skillSearch: {
+    userConfigDir?: string;
+    includeProject: boolean;
+    includeUser: boolean;
+    isContainer: boolean;
+  }
 ): Promise<ProviderWarning[]> {
   const warnings: ProviderWarning[] = [];
-  // allowed_tools → tools
+  const isWorkflowNode =
+    typeof nodeConfig.nodeId === 'string' && nodeConfig.nodeId.trim().length > 0;
+  if (isWorkflowNode) {
+    // Workflow nodes are declared-only capability boundaries. Keep normal
+    // project/user settings (CLAUDE.md and agents), but exclude ambient skills
+    // and MCP unless the workflow names them explicitly.
+    options.skills = nodeConfig.skills ?? [];
+    options.strictMcpConfig = true;
+
+    if (nodeConfig.skills && nodeConfig.skills.length > 0) {
+      const { missing } = resolveClaudeSkillDirectories(cwd, nodeConfig.skills, skillSearch);
+      if (missing.length > 0) {
+        // Split by whether the name exists on disk at all. A skill that resolves
+        // under some other root — `.agents/skills/`, or a scope this node's
+        // settingSources disables — is installed but unreachable, so fail before
+        // spend with the exact remediation. A name that resolves nowhere may be
+        // one of Claude's built-in or `plugin:skill` entries, which live outside
+        // every filesystem root: the SDK is the authority on those, so warn
+        // rather than block a capability Claude genuinely provides.
+        const unreachable = findInstalledSkillNames(
+          [
+            ...skillSearchRoots(cwd),
+            ...claudeSkillSearchRoots(cwd, {
+              ...(skillSearch.userConfigDir ? { userConfigDir: skillSearch.userConfigDir } : {}),
+              includeProject: true,
+              includeUser: true,
+            }),
+          ],
+          missing
+        );
+
+        if (unreachable.length > 0) {
+          const enabledRoots = [
+            ...(skillSearch.includeProject ? ['project-local .claude/skills/'] : []),
+            ...(skillSearch.includeUser ? ['the effective Claude config directory skills/'] : []),
+          ];
+          const installLocation =
+            enabledRoots.length > 0
+              ? enabledRoots.join(' or ')
+              : 'an enabled Claude setting source (effective settingSources currently enables none)';
+          const containerNote = skillSearch.isContainer
+            ? ' Container workflows cannot use host user-global skills.'
+            : '';
+          getLog().error(
+            { nodeId: nodeConfig.nodeId, unreachable, skillSearch },
+            'claude.declared_skills_unreachable'
+          );
+          throw new Error(
+            `Claude skill${unreachable.length === 1 ? '' : 's'} not found in an enabled Claude-native skill directory: ${unreachable.join(', ')}. Install ${unreachable.length === 1 ? 'it' : 'them'} under ${installLocation}.${containerNote}`
+          );
+        }
+
+        getLog().warn(
+          { nodeId: nodeConfig.nodeId, missing, skillSearch },
+          'claude.declared_skills_unresolved'
+        );
+        warnings.push({
+          code: 'claude_skills_unresolved',
+          message: `Claude skill${missing.length === 1 ? '' : 's'} not found on disk: ${missing.join(', ')}. This is expected for Claude's built-in skills and for plugin-qualified names (plugin:skill), which the SDK resolves itself. If you meant an installed skill, check the name — an unknown name is ignored rather than loaded.`,
+        });
+      }
+    }
+  }
+
+  // allowed_tools → tools. `Skill` is re-added only on the workflow path, which
+  // is the only one that narrows `options.skills`; adding it for a non-workflow
+  // caller would expose the ambient catalog instead of a declared subset.
+  const selectsSkills = isWorkflowNode && (nodeConfig.skills?.length ?? 0) > 0;
   if (nodeConfig.allowed_tools !== undefined) {
-    options.tools = nodeConfig.allowed_tools;
+    options.tools = selectsSkills
+      ? [...new Set([...nodeConfig.allowed_tools, 'Skill'])]
+      : nodeConfig.allowed_tools;
   }
 
   // denied_tools → disallowedTools
@@ -518,52 +600,19 @@ async function applyNodeConfig(
     }
   }
 
-  // skills → AgentDefinition wrapping
-  if (nodeConfig.skills) {
-    const skills = nodeConfig.skills;
-    const agentId = 'dag-node-skills';
-    const agentDef: {
-      description: string;
-      prompt: string;
-      skills: string[];
-      tools?: string[];
-      model?: string;
-    } = {
-      description: 'DAG node with skills',
-      prompt: `You have preloaded skills: ${skills.join(', ')}. Use them when relevant.`,
-      skills,
-    };
-    if (options.tools) {
-      agentDef.tools = [...(options.tools as string[]), 'Skill'];
-    }
-    if (options.model) agentDef.model = options.model;
-    options.agents = { [agentId]: agentDef };
-    options.agent = agentId;
+  // Native skill selection. The SDK requires Skill to remain allowed when an
+  // explicit tool list is present; without a list, its normal tool set applies.
+  if (selectsSkills) {
     if (!options.allowedTools?.includes('Skill')) {
       options.allowedTools = [...(options.allowedTools ?? []), 'Skill'];
     }
-    getLog().info({ skills, agentId }, 'claude.skills_agent_created');
+    getLog().info({ skills: nodeConfig.skills }, 'claude.skills_selected');
   }
 
   // agents → inline AgentDefinition pass-through.
-  // Runs AFTER skills: so user-defined agents win on ID collision with
-  // the internal 'dag-node-skills' wrapper.
-  // options.agent is intentionally left alone — inline agents are sub-agents
-  // invokable via the Task tool, not the primary agent for the query.
+  // Inline agents remain sub-agents invokable through the Agent tool; native
+  // skill selection does not replace the query's primary agent.
   if (nodeConfig.agents) {
-    // Warn loudly when a user-defined agent overrides the internal
-    // 'dag-node-skills' wrapper set by the skills: block above. The
-    // merge is by design (user wins) but silent capability removal
-    // is the exact failure mode we want to avoid.
-    if (
-      Object.hasOwn(nodeConfig.agents, 'dag-node-skills') &&
-      options.agents?.['dag-node-skills'] !== undefined
-    ) {
-      getLog().warn(
-        { nodeSkills: nodeConfig.skills ?? [] },
-        'claude.inline_agents_override_skills_wrapper'
-      );
-    }
     options.agents = {
       ...(options.agents ?? {}),
       ...(nodeConfig.agents as NonNullable<Options['agents']>),
@@ -693,7 +742,8 @@ function buildBaseClaudeOptions(
   stderrLines: string[],
   toolResultQueue: ToolResultEntry[],
   env: NodeJS.ProcessEnv,
-  cliPath: string | undefined
+  cliPath: string | undefined,
+  settingSources: ('project' | 'user')[]
 ): Options {
   const isJsExecutable = shouldPassNoEnvFile(cliPath);
   getLog().debug({ cliPath: cliPath ?? null, isJsExecutable }, 'claude.subprocess_env_file_flag');
@@ -744,8 +794,7 @@ function buildBaseClaudeOptions(
     systemPrompt: requestOptions?.systemPrompt ?? { type: 'preset', preset: 'claude_code' },
     // Per-node override wins over the assistant-level default; the final
     // fallback stays ['project', 'user'] (the SDK-loading default Archon ships).
-    settingSources: requestOptions?.nodeConfig?.settingSources ??
-      assistantDefaults.settingSources ?? ['project', 'user'],
+    settingSources,
     hooks: buildToolCaptureHooks(toolResultQueue),
     stderr: (data: string): void => {
       const output = data.trim();
@@ -1289,15 +1338,30 @@ export class ClaudeProvider implements IAgentProvider {
     // process.env never crosses the boundary (the isolation invariant); the host
     // path inherits the (already-cleaned) process env exactly as before.
     const env = buildRequestSubprocessEnv(requestOptions);
+    const settingSources =
+      requestOptions?.nodeConfig?.settingSources ??
+      assistantDefaults.settingSources ??
+      (['project', 'user'] as const);
 
     // Apply nodeConfig translation once (deterministic, not retry-dependent)
     // We need a throwaway Options to extract warnings from applyNodeConfig,
     // then re-apply per attempt. But nodeConfig warnings are deterministic,
     // so we compute them once and yield them before the first attempt.
     let nodeConfigWarnings: ProviderWarning[] = [];
+    const skillSearch = {
+      ...(env.CLAUDE_CONFIG_DIR ? { userConfigDir: env.CLAUDE_CONFIG_DIR } : {}),
+      includeProject: settingSources.includes('project'),
+      includeUser: !isContainerRun && settingSources.includes('user'),
+      isContainer: isContainerRun,
+    };
     if (requestOptions?.nodeConfig) {
       const tempOptions: Options = {} as Options;
-      nodeConfigWarnings = await applyNodeConfig(tempOptions, requestOptions.nodeConfig, cwd);
+      nodeConfigWarnings = await applyNodeConfig(
+        tempOptions,
+        requestOptions.nodeConfig,
+        cwd,
+        skillSearch
+      );
     }
 
     // Yield provider warnings once before retries
@@ -1334,12 +1398,13 @@ export class ClaudeProvider implements IAgentProvider {
         stderrLines,
         toolResultQueue,
         env,
-        resolvedCliPath
+        resolvedCliPath,
+        [...settingSources]
       );
 
       // 2. Apply nodeConfig translation (re-applied per attempt since options are fresh)
       if (requestOptions?.nodeConfig) {
-        await applyNodeConfig(options, requestOptions.nodeConfig, cwd);
+        await applyNodeConfig(options, requestOptions.nodeConfig, cwd, skillSearch);
       }
 
       // 2b. Register in-process native tools (e.g. manage_run) as an archon MCP

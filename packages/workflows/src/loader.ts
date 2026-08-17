@@ -40,11 +40,17 @@ import {
   webSearchModeSchema,
   workflowRequirementSchema,
   workflowEvidencePolicySchema,
+  workflowInputSpecSchema,
   KNOWN_WORKFLOW_KEYS,
   KNOWN_WORKFLOW_NESTED_KEYS,
   WORKFLOW_ONLY_KEYS,
 } from './schemas/workflow';
-import type { WorkflowRequirement, WorkflowEvidencePolicy } from './schemas/workflow';
+import type {
+  WorkflowRequirement,
+  WorkflowEvidencePolicy,
+  WorkflowInputSpec,
+} from './schemas/workflow';
+import { INPUT_NAME_PATTERN, inputEnvKey } from './schemas/dag-node';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { z } from '@hono/zod-openapi';
 
@@ -108,6 +114,9 @@ function formatNodeIssue(id: string, issue: z.ZodIssue): string {
  * "KEEP IN SYNC" is exactly the drift that warning is about.
  */
 const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
+
+/** `when:` also accepts `$nodeId.field` as shorthand for `$nodeId.output.field`. */
+const WHEN_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z_][a-zA-Z0-9_]*)`;
 
 /**
  * The node's `id` for messages, falling back to its 1-based position when the
@@ -327,7 +336,8 @@ function parseDagNode(
 
 /**
  * Validate DAG structure: unique IDs, depends_on references exist, no cycles,
- * and $nodeId.output refs in when:/prompt: fields point to known nodes.
+ * and every runtime-substituted node-output reference points to a known node in its
+ * current or enclosing loop scope.
  * Returns error message or null if valid.
  *
  * Exported so the include-expander can re-run the same structural checks on the
@@ -393,67 +403,98 @@ export function validateDagStructure(
     return `Cycle detected among nodes: ${cycleNodes.join(', ')}`;
   }
 
-  // Check $nodeId.output references across EVERY field the executor substitutes at
+  // Check $nodeId.output references across every public YAML field the executor substitutes at
   // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
-  // (prompt, bash, script, approval.message, cancel, loop.prompt, loop.until_bash,
-  // loop_group.until_bash, workflow.input, workflow.fan_out.items). A dangling ref in
-  // any of them silently substitutes to '' at run time, so all must be validated here.
+  // (prompt, bash, script, approval.message/on_reject.prompt, cancel, loop.prompt,
+  // loop.until_bash, loop_group.until_bash, workflow.input/with/fan_out.items). A dangling
+  // ref in any of them can bind the wrong flat-DAG output or fail at run time, so all must
+  // be validated here.
   //
-  // KEEP IN SYNC (three ref-surface enumerations must agree):
+  // KEEP IN SYNC (public runtime node-ref surfaces):
   //   1. this scan (loader validateDagStructure) — validates refs,
   //   2. rewriteNodeOutputRefs (include-expander.ts) — renames refs on inline,
-  //   3. the substituteNodeOutputRefs call sites (dag-executor.ts) — resolves refs at run.
-  // Adding a substituted field to one means updating all three.
+  //   3. the substituteNodeOutputRefs call sites (dag-executor.ts) — resolves refs at run,
+  // Adding a substituted field to one means updating all three. Included loop-command
+  // bodies are validated separately while materialized, then rewritten by (2).
+  // applyInputsMacro is intentionally a superset because some AI configuration strings
+  // accept include inputs without being runtime node-ref surfaces.
   //
-  // Prose fields (prompt / loop.prompt) may contain triple-backtick fenced blocks or
-  // single-backtick inline code that are documentation meant to render literally to
-  // the LLM (e.g. the workflow-builder shows authors how to write `$<other-node>.output`
-  // inside a script-node example); strip those before scanning so they don't false-match.
-  // The code/expression fields (bash / script / until_bash / cancel) and when: clauses
-  // carry live refs (not documentation), so they are scanned verbatim.
+  // Runtime substitution is syntax-agnostic: canonical refs inside Markdown fences and
+  // inline code are live too. Validation therefore scans every surface verbatim.
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
-  const stripMarkdownCode = (s: string): string =>
-    s.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]*`/g, '');
+  const whenRefPattern = new RegExp(WHEN_REF_SOURCE, 'g');
   for (const node of nodes) {
-    const sources: string[] = [];
-    if (node.when) sources.push(node.when);
+    const sources: { field: string; text: string }[] = [];
     if ('prompt' in node && typeof node.prompt === 'string') {
-      sources.push(stripMarkdownCode(node.prompt));
+      sources.push({ field: 'prompt', text: node.prompt });
     }
-    if (isBashNode(node)) sources.push(node.bash);
-    if (isScriptNode(node)) sources.push(node.script);
+    if (isBashNode(node)) sources.push({ field: 'bash', text: node.bash });
+    if (isScriptNode(node)) sources.push({ field: 'script', text: node.script });
     // workflow.input is a live ref surface (a data string), scanned verbatim like
     // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
     // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
     if (isWorkflowNode(node)) {
-      if (node.input) sources.push(node.input);
-      if (node.fan_out) sources.push(node.fan_out.items);
-    }
-    if (isCancelNode(node)) sources.push(node.cancel);
-    if (isApprovalNode(node)) sources.push(node.approval.message);
-    if (isLoopNode(node)) {
-      // Only inline `loop.prompt` is scanned for `$nodeId.output` refs. A
-      // command-backed loop (`loop.command`) loads its prompt text from a file
-      // at runtime; that file's contents are the author's responsibility, the
-      // same way a `command:` node's body is not scanned at parse time.
-      if (typeof node.loop.prompt === 'string') {
-        sources.push(stripMarkdownCode(node.loop.prompt));
+      if (node.input) sources.push({ field: 'input', text: node.input });
+      if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
+      // A `workflow:` node's `with:` values (#2470) are live ref surfaces: unlike
+      // an `include:` node's `with:` (inlined by the macro and caught post-expansion
+      // by this same scan), sub-run `with:` values are never inlined — they resolve
+      // at runtime into `$INPUTS.<name>` — so scan them here for dangling refs.
+      if (node.with) {
+        for (const [name, value] of Object.entries(node.with)) {
+          sources.push({ field: `with.${name}`, text: value });
+        }
       }
-      if (node.loop.until_bash) sources.push(node.loop.until_bash);
+    }
+    if (isCancelNode(node)) sources.push({ field: 'cancel', text: node.cancel });
+    if (isApprovalNode(node)) {
+      sources.push({ field: 'approval.message', text: node.approval.message });
+      if (node.approval.on_reject !== undefined) {
+        sources.push({
+          field: 'approval.on_reject.prompt',
+          text: node.approval.on_reject.prompt,
+        });
+      }
+    }
+    if (isLoopNode(node)) {
+      if (typeof node.loop.prompt === 'string') {
+        sources.push({ field: 'loop.prompt', text: node.loop.prompt });
+      }
+      if (node.loop.until_bash) {
+        sources.push({ field: 'loop.until_bash', text: node.loop.until_bash });
+      }
     }
     if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-      sources.push(node.loop_group.until_bash);
+      sources.push({ field: 'loop_group.until_bash', text: node.loop_group.until_bash });
     }
     for (const source of sources) {
       let m: RegExpExecArray | null;
       outputRefPattern.lastIndex = 0; // reset stateful g-flag regex before each new source string
-      while ((m = outputRefPattern.exec(source)) !== null) {
+      while ((m = outputRefPattern.exec(source.text)) !== null) {
         const refNodeId = m[1];
+        // `$INPUTS.name` is an input macro. In particular, `$INPUTS.output` also
+        // matches the canonical node-ref grammar, so the macro must take precedence.
+        if (refNodeId === 'INPUTS') continue;
         // Output refs (unlike depends_on) may also reach ENCLOSING-scope nodes: the
         // executor seeds a loop_group iteration's scoped output map with the outer
         // DAG's outputs, so `$outerNode.output` inside a body prompt is valid.
         if (refNodeId !== undefined && !ids.has(refNodeId) && !enclosingIds?.has(refNodeId)) {
-          return `Node '${node.id}' references unknown node '$${refNodeId}.output'`;
+          return `Node '${node.id}' field '${source.field}' references unknown node '$${refNodeId}.output'. In a composed workflow, pass caller data through declared 'inputs:' and caller 'with:' instead of referencing a caller node directly`;
+        }
+      }
+    }
+
+    if (node.when !== undefined) {
+      let m: RegExpExecArray | null;
+      whenRefPattern.lastIndex = 0;
+      while ((m = whenRefPattern.exec(node.when)) !== null) {
+        const refNodeId = m[1];
+        const field = m[2];
+        // `$INPUTS.name` is an include-time macro, not a node reference. It is
+        // resolved (or rejected as missing) before the composed graph is revalidated.
+        if (refNodeId === 'INPUTS') continue;
+        if (refNodeId !== undefined && !ids.has(refNodeId) && !enclosingIds?.has(refNodeId)) {
+          return `Node '${node.id}' field 'when' references unknown node '$${refNodeId}.${field ?? ''}'. In a composed workflow, pass caller data through declared 'inputs:' and caller 'with:' instead of referencing a caller node directly`;
         }
       }
     }
@@ -893,6 +934,101 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.requires }, 'invalid_workflow_requires_block_ignored');
     }
 
+    // Parse optional inputs — the declared signature (#2470). Per-key warn-and-drop:
+    // an invalid spec, a non-identifier name (env mangling needs identifier names), or
+    // a contradictory `required: true` + `default:` pair is dropped with a warning. The
+    // surviving record is set only when non-empty. Absent/invalid block leaves `inputs`
+    // undefined — a workflow with no declared inputs keeps Phase-1 behaviour untouched.
+    let inputs: Record<string, WorkflowInputSpec> | undefined;
+    const rawInputs = raw.inputs;
+    if (rawInputs !== undefined) {
+      if (
+        typeof rawInputs === 'object' &&
+        rawInputs !== null &&
+        !Array.isArray(rawInputs) &&
+        (Object.getPrototypeOf(rawInputs) === Object.prototype ||
+          Object.getPrototypeOf(rawInputs) === null)
+      ) {
+        const valid: Record<string, WorkflowInputSpec> = {};
+        for (const [name, spec] of Object.entries(rawInputs as Record<string, unknown>)) {
+          if (!INPUT_NAME_PATTERN.test(name)) {
+            getLog().warn({ filename, name }, 'invalid_workflow_input_name_ignored');
+            continue;
+          }
+          const parsed = workflowInputSpecSchema.safeParse(spec);
+          if (!parsed.success) {
+            getLog().warn({ filename, name, value: spec }, 'invalid_workflow_input_spec_ignored');
+            continue;
+          }
+          if (parsed.data.required === true && parsed.data.default !== undefined) {
+            getLog().warn(
+              { filename, name },
+              'contradictory_workflow_input_required_with_default_ignored'
+            );
+            continue;
+          }
+          valid[name] = parsed.data;
+        }
+        // Reject env-key mangling collisions: two names that fold to the same
+        // INPUTS_<UPPER_SNAKE> env key would silently clobber each other for
+        // bash/script sub-run nodes (Task 17). Catch it here where all names are
+        // visible; a colliding pair is a hard load error, not a warn-and-drop.
+        const envKeyOwners = new Map<string, string>();
+        for (const name of Object.keys(valid)) {
+          const envKey = inputEnvKey(name);
+          const existing = envKeyOwners.get(envKey);
+          if (existing !== undefined) {
+            return {
+              workflow: null,
+              error: {
+                filename,
+                error: `Workflow inputs '${existing}' and '${name}' both map to env var '${envKey}' — rename one so each input has a unique env key`,
+                errorType: 'validation_error',
+              },
+            };
+          }
+          envKeyOwners.set(envKey, name);
+        }
+        if (Object.keys(valid).length > 0) inputs = valid;
+      } else {
+        getLog().warn({ filename, value: rawInputs }, 'invalid_workflow_inputs_block_ignored');
+      }
+    }
+
+    // Parse optional returns — the node id whose output IS this workflow's result
+    // (#2470). Accept a non-empty string; reject every other present value. Silently
+    // dropping an invalid selector would change the workflow result by falling back to
+    // positional sink selection. The referenced id
+    // must name a top-level node — checked below once dagNodes is assembled.
+    let returns: string | undefined;
+    if (typeof raw.returns === 'string' && raw.returns.trim().length > 0) {
+      returns = raw.returns.trim();
+    } else if (raw.returns !== undefined) {
+      getLog().warn({ filename, value: raw.returns }, 'invalid_workflow_returns_value_rejected');
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error:
+            "Invalid 'returns': expected the non-empty id of a top-level node whose output is this workflow's result",
+          errorType: 'validation_error',
+        },
+      };
+    }
+    // `returns` must name a top-level node id. Done here (not in validateDagStructure,
+    // which takes nodes and is reused for loop_group bodies / the expander with no
+    // `returns` in scope) now that dagNodes is computed.
+    if (returns !== undefined && !dagNodes.some(n => n.id === returns)) {
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error: `Workflow declares returns: '${returns}' but no top-level node has that id`,
+          errorType: 'validation_error',
+        },
+      };
+    }
+
     // Parse workflow-level fallback fields. Same warn-and-drop pattern as
     // `modelReasoningEffort` / `webSearchMode` above. These are declared on
     // `workflowBaseSchema` and consumed by the DAG executor's
@@ -1010,6 +1146,8 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         ...(evidencePolicy !== undefined ? { evidence_policy: evidencePolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
         ...(requires !== undefined ? { requires } : {}),
+        ...(inputs !== undefined ? { inputs } : {}),
+        ...(returns !== undefined ? { returns } : {}),
       },
       error: null,
       warnings: parseWarnings,
