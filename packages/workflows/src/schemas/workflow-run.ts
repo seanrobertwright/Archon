@@ -291,14 +291,13 @@ export interface ApprovalContext {
    *
    * Scope note: this is the PAUSING invocation's total, matching what the normal
    * (re-run) completion path reports — a loop that gates more than once attributes each
-   * invocation's usage to that invocation, and EARLIER invocations' usage is reported
-   * nowhere: a pausing invocation never reaches completeWorkflowRun (the status is
-   * `paused`, so the pre-complete status check bails), and `total_tokens_*` are written
-   * only there. So on a twice-gated loop the surviving node row and the run row both
-   * report only the final invocation. That under-report predates this field (before
+   * invocation's usage to that invocation, so on a twice-gated loop the surviving NODE
+   * row reports only the final invocation. That under-report predates this field (before
    * #2333 nothing was persisted at all) and belongs to the "preserve terminal provider
    * stats across a gate" fix tracked by #2345, which also covers the `cost_usd` and
-   * resolved-model loss at the same gate.
+   * resolved-model loss at the same gate. The RUN row is no longer affected: since #2469
+   * the executor persists `total_tokens_*` / `total_cost_usd` at the run tail on every
+   * disposition, pause included, rather than only inside completeWorkflowRun.
    */
   signaledTokens?: { input: number; output: number } | null;
   /**

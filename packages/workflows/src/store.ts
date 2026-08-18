@@ -20,6 +20,8 @@ export interface DagResumeSnapshot {
     input: number;
     output: number;
   };
+  /** Cumulative USD cost of the run's already-completed nodes across prior passes. */
+  costUsd: number;
 }
 
 /** Composite primary key identifying a single persisted node session row. */

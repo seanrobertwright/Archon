@@ -173,6 +173,7 @@ function createMockStore(): MockWorkflowStore {
       Promise.resolve({
         completedNodeOutputs: new Map<string, string>(),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })
     ),
     getCodebase: mock<IWorkflowStore['getCodebase']>(async _id => null),
@@ -185,6 +186,25 @@ function createMockStore(): MockWorkflowStore {
       async _filter => ({ deleted: 0 })
     ),
   };
+}
+
+/**
+ * The run-level usage metadata the executor persisted, in call order (#2469). Usage is
+ * written through `updateWorkflowRun` at the run tail on EVERY disposition, so this is
+ * the single surface a usage assertion should read — regardless of whether the run then
+ * completed, failed, was cancelled, or paused. Other `updateWorkflowRun` writes
+ * (output_root, evidence_validation, …) are filtered out by key.
+ */
+function runUsageWrites(store: ReturnType<typeof createMockStore>): Record<string, unknown>[] {
+  return (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+    .map((call: unknown[]) => (call[1] as { metadata?: Record<string, unknown> })?.metadata)
+    .filter(
+      (metadata): metadata is Record<string, unknown> =>
+        metadata !== undefined &&
+        ('total_cost_usd' in metadata ||
+          'total_tokens_in' in metadata ||
+          'total_tokens_out' in metadata)
+    );
 }
 
 /** All-true capabilities for Claude mock */
@@ -4939,7 +4959,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(2);
   });
 
-  it('reconciles total tokens across a failed run and its resume', async () => {
+  it('reconciles total usage across a failed run and its resume', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
@@ -4960,6 +4980,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         yield {
           type: 'result',
           sessionId: 'first-execution-session',
+          cost: 0.02,
           tokens: { input: 40, output: 4 },
         };
         return;
@@ -4989,6 +5010,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(store.failWorkflowRun).toHaveBeenCalled();
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
 
+    // #2469 (AC1): the run FAILED, and it still recorded what step1 burned before
+    // step2 died. Before the fix this run's row carried nothing but { error }.
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.02, total_tokens_in: 40, total_tokens_out: 4 },
+    ]);
+    (store.updateWorkflowRun as ReturnType<typeof mock>).mockClear();
+
     const firstExecutionEvents = (
       store.createWorkflowEvent as ReturnType<typeof mock>
     ).mock.calls.map(
@@ -5000,7 +5028,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         }
     );
     const priorCompletedNodes = new Map<string, string>();
-    const priorTokenUsage = { input: 0, output: 0 };
+    const priorUsage = { tokens: { input: 0, output: 0 }, costUsd: 0 };
     for (const event of firstExecutionEvents) {
       if (event.event_type !== 'node_completed' || !event.step_name) continue;
       if (typeof event.data?.node_output === 'string') {
@@ -5013,18 +5041,25 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         Number.isFinite(eventTokens.input) &&
         Number.isFinite(eventTokens.output)
       ) {
-        priorTokenUsage.input += eventTokens.input;
-        priorTokenUsage.output += eventTokens.output;
+        priorUsage.tokens.input += eventTokens.input;
+        priorUsage.tokens.output += eventTokens.output;
+      }
+      const eventCost = event.data?.cost_usd;
+      if (typeof eventCost === 'number' && Number.isFinite(eventCost)) {
+        priorUsage.costUsd += eventCost;
       }
     }
     expect(priorCompletedNodes).toEqual(new Map([['step1', 'first execution output']]));
-    expect(priorTokenUsage).toEqual({ input: 40, output: 4 });
+    // Both axes are reconstructable from the event log — this mirrors what
+    // getDagResumeSnapshot does, and cost is now among them (#2469).
+    expect(priorUsage).toEqual({ tokens: { input: 40, output: 4 }, costUsd: 0.02 });
 
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'resumed execution output' };
       yield {
         type: 'result',
         sessionId: 'resumed-execution-session',
+        cost: 0.03,
         tokens: { input: 60, output: 6 },
       };
     });
@@ -5054,17 +5089,21 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       undefined,
       undefined,
       undefined,
-      priorTokenUsage
+      priorUsage
     );
 
+    // #2469 (AC4): the resumed run reports pass 1 + pass 2 on BOTH axes. Cost used to
+    // reset to 0 on every pass, so a run that failed at 0.02 and then completed would
+    // have reported 0.03 — a figure that goes DOWN.
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.05, total_tokens_in: 100, total_tokens_out: 10 },
+    ]);
+
+    // Usage has exactly one writer now; completeWorkflowRun carries only node_counts.
     const completionCalls = (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls;
     expect(completionCalls).toHaveLength(1);
-    expect(completionCalls[0]?.[1]).toEqual(
-      expect.objectContaining({
-        total_tokens_in: 100,
-        total_tokens_out: 10,
-      })
-    );
+    expect(completionCalls[0]?.[1]).not.toHaveProperty('total_tokens_in');
+    expect(completionCalls[0]?.[1]).not.toHaveProperty('total_cost_usd');
 
     const completedEvents = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
       .map(
@@ -12601,7 +12640,7 @@ describe('executeDagWorkflow -- cost tracking', () => {
     }
   });
 
-  it('passes total_cost_usd to completeWorkflowRun when node yields cost', async () => {
+  it('persists total_cost_usd on the run row when a node yields cost', async () => {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'done' };
       yield { type: 'result', sessionId: 'sid-cost', cost: 0.0042 };
@@ -12629,6 +12668,8 @@ describe('executeDagWorkflow -- cost tracking', () => {
       minimalConfig
     );
 
+    expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.0042 }]);
+    // Exactly one writer: completeWorkflowRun keeps node_counts, not usage (#2469).
     const completeCalls = (
       store.completeWorkflowRun as Mock<
         (id: string, metadata?: Record<string, unknown>) => Promise<void>
@@ -12637,7 +12678,6 @@ describe('executeDagWorkflow -- cost tracking', () => {
     expect(completeCalls.length).toBe(1);
     expect(completeCalls[0][1]).toEqual({
       node_counts: { completed: 1, failed: 0, skipped: 0, total: 1 },
-      total_cost_usd: 0.0042,
     });
   });
 
@@ -12677,16 +12717,10 @@ describe('executeDagWorkflow -- cost tracking', () => {
       minimalConfig
     );
 
-    const completeCalls = (
-      store.completeWorkflowRun as Mock<
-        (id: string, metadata?: Record<string, unknown>) => Promise<void>
-      >
-    ).mock.calls;
-    expect(completeCalls.length).toBe(1);
-    expect(completeCalls[0][1]).toMatchObject({ total_cost_usd: 0.002 });
+    expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.002 }]);
   });
 
-  it('omits total_cost_usd from completeWorkflowRun when no cost yielded', async () => {
+  it('writes no usage metadata at all when no node yielded cost or tokens', async () => {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'Some output' };
       yield { type: 'result', sessionId: 'sid-no-cost' };
@@ -12714,6 +12748,9 @@ describe('executeDagWorkflow -- cost tracking', () => {
       minimalConfig
     );
 
+    // A zero must stay ABSENT, not written as 0 — a bash-only workflow reading as a
+    // free AI run is the misleading shape the `> 0` guards exist to prevent.
+    expect(runUsageWrites(store)).toEqual([]);
     const completeCalls = (
       store.completeWorkflowRun as Mock<
         (id: string, metadata?: Record<string, unknown>) => Promise<void>
@@ -12723,7 +12760,7 @@ describe('executeDagWorkflow -- cost tracking', () => {
     expect(completeCalls[0][1]).not.toHaveProperty('total_cost_usd');
   });
 
-  it('accumulates cost across loop iterations and includes in completeWorkflowRun', async () => {
+  it('accumulates cost across loop iterations', async () => {
     let callCount = 0;
     mockSendQueryDag.mockImplementation(async function* () {
       callCount++;
@@ -12767,13 +12804,199 @@ describe('executeDagWorkflow -- cost tracking', () => {
     );
 
     // 3 iterations: 0.001 + 0.001 + 0.002 = 0.004
-    const completeCalls = (
-      store.completeWorkflowRun as Mock<
-        (id: string, metadata?: Record<string, unknown>) => Promise<void>
-      >
-    ).mock.calls;
-    expect(completeCalls.length).toBe(1);
-    expect(completeCalls[0][1]).toMatchObject({ total_cost_usd: 0.004 });
+    expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.004 }]);
+  });
+});
+
+/**
+ * #2469 — a run's spend has to survive its outcome. Usage used to be written only in
+ * the metadata argument of completeWorkflowRun, so anything other than a clean
+ * completion recorded nothing at all: the number was simply lower than reality, in the
+ * direction that does not prompt investigation.
+ */
+describe('executeDagWorkflow -- run usage survives every disposition', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-usage-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockLogFn.mockClear();
+
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('records what a FAILED run burned before it died', async () => {
+    let call = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      call++;
+      if (call === 1) {
+        yield { type: 'assistant', content: 'first output' };
+        yield {
+          type: 'result',
+          sessionId: 'sid-1',
+          cost: 0.05,
+          tokens: { input: 900, output: 90 },
+        };
+        return;
+      }
+      // No assistant output → the second node fails, failing the run.
+      yield { type: 'result', sessionId: 'sid-2' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-usage',
+      testDir,
+      {
+        name: 'usage-on-failure',
+        nodes: [
+          { id: 'spend', prompt: 'Burn some tokens.' },
+          { id: 'die', prompt: 'Fail here.', depends_on: ['spend'] },
+        ],
+      },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.05, total_tokens_in: 900, total_tokens_out: 90 },
+    ]);
+  });
+
+  it('records usage when the run is CANCELLED out of band mid-flight', async () => {
+    // A cancel is driven by another process (CLI abandon, the API abandon route, a
+    // fan-out cancelling a child), so the cancelling side has no usage in scope. The
+    // executing side notices at its next status check and bails out of BOTH terminal
+    // writers — which is exactly why the usage write cannot live in either of them.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'work done before the cancel landed' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-cancel',
+        cost: 0.02,
+        tokens: { input: 30, output: 3 },
+      };
+    });
+
+    const store = createMockStore();
+    // The cancel lands the moment the node finishes — pinned to the node's own
+    // node_completed write so the run is unambiguously past accumulation and the
+    // during-streaming cancel check never tears the node down mid-stream.
+    let nodeFinished = false;
+    const realCreateEvent = store.createWorkflowEvent;
+    store.createWorkflowEvent = mock((data: { event_type: string }) => {
+      if (data.event_type === 'node_completed') nodeFinished = true;
+      return realCreateEvent(data);
+    });
+    store.getWorkflowRunStatus = mock(() =>
+      Promise.resolve(nodeFinished ? ('cancelled' as const) : ('running' as const))
+    );
+    const mockDeps = createMockDeps(store);
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-usage',
+      testDir,
+      { name: 'usage-on-cancel', nodes: [{ id: 'spend', prompt: 'Burn some tokens.' }] },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.02, total_tokens_in: 30, total_tokens_out: 3 },
+    ]);
+  });
+
+  it('records usage accumulated before an approval gate PAUSES the run', async () => {
+    // A fan-out child that pauses at a gate is cancelled by the parent (`fan_out_gate`),
+    // so the pause is its only chance to record what it spent.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'analysis' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-pause',
+        cost: 0.04,
+        tokens: { input: 60, output: 6 },
+      };
+    });
+
+    const store = createMockStore();
+    let paused = false;
+    store.pauseWorkflowRun = mock(() => {
+      paused = true;
+      return Promise.resolve();
+    });
+    store.getWorkflowRunStatus = mock(() =>
+      Promise.resolve(paused ? ('paused' as const) : ('running' as const))
+    );
+    const mockDeps = createMockDeps(store);
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-usage',
+      testDir,
+      {
+        name: 'usage-on-pause',
+        nodes: [
+          { id: 'analyze', prompt: 'Analyze.' },
+          { id: 'review', approval: { message: 'Ship it?' }, depends_on: ['analyze'] },
+        ],
+      },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.pauseWorkflowRun).toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.04, total_tokens_in: 60, total_tokens_out: 6 },
+    ]);
   });
 });
 
@@ -17248,14 +17471,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
     );
 
     expect(calls).toBe(2);
-    const completeCalls = (
-      store.completeWorkflowRun as Mock<
-        (id: string, metadata?: Record<string, unknown>) => Promise<void>
-      >
-    ).mock.calls;
-    expect(completeCalls.length).toBe(1);
     // 0.01 + 0.02 = 0.03 accumulated across the group's 2 iterations.
-    expect(completeCalls[0][1]).toMatchObject({ total_cost_usd: 0.03 });
+    expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.03 }]);
   });
 
   it('COST: accumulates token usage across loop_group iterations', async () => {

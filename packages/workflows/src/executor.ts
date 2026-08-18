@@ -28,7 +28,7 @@ import {
   readSubrunMetadata,
 } from './schemas';
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
-import type { RunChildWorkflowArgs, ChildWorkflowOutcome } from './dag-executor';
+import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
 import { maybeWarnLegacyStatePath, maybeWarnLegacyArtifactsPath } from './state-migration';
 import { resolveWorkflowName } from './router';
@@ -437,12 +437,12 @@ type ResumePayload =
   | {
       preCreatedRun: WorkflowRun;
       priorCompletedNodes?: Map<string, string>;
-      priorTokenUsage?: { input: number; output: number };
+      priorUsage?: PriorRunUsage;
     }
   | {
       preCreatedRun?: undefined;
       priorCompletedNodes?: undefined;
-      priorTokenUsage?: undefined;
+      priorUsage?: undefined;
     };
 
 /**
@@ -578,7 +578,7 @@ export async function hydrateResumableRun(
 ): Promise<{
   preCreatedRun: WorkflowRun;
   priorCompletedNodes: Map<string, string>;
-  priorTokenUsage: { input: number; output: number };
+  priorUsage: PriorRunUsage;
 } | null> {
   const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
   const priorCompletedNodes = snapshot.completedNodeOutputs;
@@ -603,7 +603,11 @@ export async function hydrateResumableRun(
     { workflowRunId: preCreatedRun.id, priorCompletedCount: priorCompletedNodes.size },
     'workflow.dag_resuming'
   );
-  return { preCreatedRun, priorCompletedNodes, priorTokenUsage: snapshot.tokens };
+  return {
+    preCreatedRun,
+    priorCompletedNodes,
+    priorUsage: { tokens: snapshot.tokens, costUsd: snapshot.costUsd },
+  };
 }
 
 /** Depth cap on the `workflow:` sub-run tree (D9). A node nested deeper fails fast. */
@@ -1154,7 +1158,7 @@ export async function executeWorkflow(
     parentConversationId,
     preCreatedRun,
     priorCompletedNodes,
-    priorTokenUsage,
+    priorUsage,
     userId,
     source,
     parseWarnings,
@@ -1366,7 +1370,7 @@ export async function executeWorkflow(
   // preCreatedRun (from hydrateResumableRun) + priorCompletedNodes via opts.
   // When both are absent the executor creates a fresh row below.
   const dagPriorCompletedNodes = priorCompletedNodes;
-  const dagPriorTokenUsage = priorTokenUsage;
+  const dagPriorUsage = priorUsage;
   let workflowRun: WorkflowRun | undefined = preCreatedRun;
 
   if (preCreatedRun && priorCompletedNodes !== undefined) {
@@ -1911,7 +1915,7 @@ export async function executeWorkflow(
       // `isolation: 'worktree'` child gets its own worktree cwd.
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
         runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
-      dagPriorTokenUsage
+      dagPriorUsage
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

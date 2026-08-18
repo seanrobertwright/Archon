@@ -1432,7 +1432,10 @@ sub-pipeline.**
   hard subprocess kill yet).
 - **Cost roll-up.** The child's total cost rolls up into the `workflow:` node's cost and
   the parent's aggregate, and `parent_run_id` on the child row makes the run tree visible
-  in `archon workflow runs` and the console.
+  in `archon workflow runs` and the console. A run records what it spent whatever its
+  outcome, so a child that burned tokens and then failed or was cancelled still counts —
+  a partly-failed fan-out reports the spend of every child, not just the ones that
+  finished.
 
 ### Choosing the child's checkout with `isolation:`
 

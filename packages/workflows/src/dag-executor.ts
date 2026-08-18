@@ -425,6 +425,17 @@ type NodeExecutionResult = NodeOutput & {
 // workflow: (sub-run) node — cross-run composition (#2121 Phase 2)
 // ---------------------------------------------------------------------------
 
+/**
+ * Usage a resumed run already consumed in earlier passes, rebuilt from its persisted
+ * `node_completed` events by `getDagResumeSnapshot`. Both axes travel together because
+ * they are one concept — what this run has spent so far — and seeding only one of them
+ * is how cost came to under-report every resumed run while tokens did not (#2469).
+ */
+export interface PriorRunUsage {
+  tokens: { input: number; output: number };
+  costUsd: number;
+}
+
 /** Terminal (or paused) outcome of a child sub-run, as consumed by a `workflow:` node. */
 export interface ChildWorkflowOutcome {
   childRunId: string;
@@ -493,11 +504,12 @@ export interface RunChildWorkflowArgs {
 export type RunChildWorkflowFn = (args: RunChildWorkflowArgs) => Promise<ChildWorkflowOutcome>;
 
 /**
- * Derive a child's node-facing outcome from its persisted run row. Cost, tokens,
- * and the terminal `summary` are written into the child run's metadata at
- * completion (see executeDagWorkflow completion + Task 12), so both the
- * synchronous path (runChildWorkflow reads the row back) and the re-entry path
- * (executeWorkflowNode finds an already-terminal child) read the same source.
+ * Derive a child's node-facing outcome from its persisted run row. Cost and tokens are
+ * written into the child's metadata at its run tail regardless of outcome (#2469) and
+ * the terminal `summary` at completion, so both the synchronous path (runChildWorkflow
+ * reads the row back) and the re-entry path (executeWorkflowNode finds an
+ * already-terminal child) read the same source — and a child that burned tokens and
+ * then failed or was cancelled still reports what it spent.
  */
 export function childOutcomeFromRun(run: WorkflowRun): ChildWorkflowOutcome {
   if (run.status === 'running' || run.status === 'pending') {
@@ -6274,15 +6286,10 @@ async function resolveFanOutChildDefinition(
  * node's own `costUsd` stays absent (a misleading `0` would look like a free run) —
  * matching the run-level aggregation's "only write when > 0" posture.
  *
- * UNDER-REPORTS: this is Σ of *completed* children, not Σ of children. Usage metadata is
- * persisted in exactly one place — inside `completeWorkflowRun` — so a child that burned
- * tokens and then failed or was cancelled records no spend, and `childOutcomeFromRun`
- * returns undefined for it. A 10-item fan-out where 3 children burn tokens and fail reports
- * the spend of 7. Inherited from the 1:1 sub-run path, but fan-out is what makes it
- * material, and `all_done` being the default makes a partly-failed run the ordinary case
- * rather than the exceptional one. The real fix is upstream: `failWorkflowRun` would have
- * to persist usage the way `completeWorkflowRun` does. Tracked with the run-tree budget
- * work (#1961).
+ * This is Σ of every child, not only the completed ones: a child persists its usage at
+ * its run tail whatever its outcome (#2469), so a failed or cancelled child still
+ * contributes what it burned. That matters most here — `all_done` is the default join,
+ * which makes a partly-failed fan-out the ordinary case rather than the exceptional one.
  */
 function sumFanOutCost(outcomes: readonly ChildWorkflowOutcome[]): number | undefined {
   let sum = 0;
@@ -6297,9 +6304,8 @@ function sumFanOutCost(outcomes: readonly ChildWorkflowOutcome[]): number | unde
 }
 
 /**
- * Σ of defined child token usage; undefined when no child reported tokens. Carries the same
- * completed-only caveat as {@link sumFanOutCost} — a child that burned tokens and then
- * failed contributes nothing.
+ * Σ of defined child token usage; undefined when no child reported tokens. Like
+ * {@link sumFanOutCost}, this covers every child regardless of outcome.
  */
 function sumFanOutTokens(outcomes: readonly ChildWorkflowOutcome[]): TokenUsage | undefined {
   let input = 0;
@@ -6406,11 +6412,11 @@ async function executeFanOutWorkflowNode(
           type: 'workflow',
           fan_out: true,
           ...(costUsd !== undefined ? { cost_usd: costUsd } : {}),
-          // Tokens are the axis that survives resume: getDagResumeSnapshot rebuilds
-          // cumulative usage by summing `data.tokens` and never reads `cost_usd`, so
-          // dropping them here made every resumed run under-report by exactly the
-          // children's tokens — silently, since an absent key is skipped without warning.
-          // On Codex the loss is total, because that provider reports no cost either.
+          // Both usage keys are what survives resume: getDagResumeSnapshot rebuilds a
+          // run's cumulative usage by summing `data.tokens` and `data.cost_usd` off
+          // these events, so dropping either here makes every resumed run under-report
+          // by exactly the children's usage — silently, since an absent key is skipped
+          // without warning.
           ...(tokens !== undefined ? { tokens } : {}),
         },
       })
@@ -8502,7 +8508,7 @@ export async function executeDagWorkflow(
    */
   runChildWorkflow?: RunChildWorkflowFn,
   /** Cumulative usage restored from prior node_completed events on resume. */
-  priorTokenUsage?: { input: number; output: number }
+  priorUsage?: PriorRunUsage
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
 
@@ -8674,13 +8680,62 @@ export async function executeDagWorkflow(
     priorCompletedNodes,
     lastSequentialSession: undefined,
     warnedProviderConflicts: new Set<string>(),
-    totalCostUsd: 0,
-    totalTokensIn: priorTokenUsage?.input ?? 0,
-    totalTokensOut: priorTokenUsage?.output ?? 0,
+    totalCostUsd: priorUsage?.costUsd ?? 0,
+    totalTokensIn: priorUsage?.tokens.input ?? 0,
+    totalTokensOut: priorUsage?.tokens.output ?? 0,
     totalLoopIterations: 0,
     stepNamePrefix: '',
   };
-  await runLayers(runCtx);
+
+  /**
+   * Persist what this run spent, whatever becomes of it (#2469).
+   *
+   * Usage used to be written in exactly one place — the metadata argument of
+   * `completeWorkflowRun` below — which tied the record to a single outcome. A run
+   * that burned tokens and then failed, was cancelled out of band, or paused at a
+   * gate recorded no spend at all, and since `childOutcomeFromRun` reads cost and
+   * tokens straight off the child's row, a fan-out aggregate silently became Σ of
+   * *completed* children. With `all_done` the default join, that made partial failure
+   * — the ordinary case — under-report with no warning.
+   *
+   * Every disposition below (container pause, external cancel/pause, the two failure
+   * branches, the evidence gate, the write-back gate, completion) is reached from the
+   * one point where the accumulators are settled and identical, so the write belongs
+   * HERE rather than in each of them. It goes through `updateWorkflowRun`, not the
+   * terminal writers, because that merge carries no `WHERE status = 'running'` guard
+   * and so still lands on a row another process has already flipped to `cancelled`.
+   * Same ordering as the evidence gate: metadata first, terminal status after.
+   *
+   * Best-effort by design — a bookkeeping write must not fail an otherwise-fine run —
+   * but never silent: the whole defect was a number quietly going missing.
+   */
+  const persistRunUsage = async (): Promise<void> => {
+    const usage = {
+      // A zero stays absent: a bash-only workflow must not read as a free AI run.
+      ...(runCtx.totalCostUsd > 0 ? { total_cost_usd: runCtx.totalCostUsd } : {}),
+      ...(runCtx.totalTokensIn > 0 ? { total_tokens_in: runCtx.totalTokensIn } : {}),
+      ...(runCtx.totalTokensOut > 0 ? { total_tokens_out: runCtx.totalTokensOut } : {}),
+    };
+    if (Object.keys(usage).length === 0) return;
+    await deps.store
+      .updateWorkflowRun(workflowRun.id, { metadata: usage })
+      .catch((dbErr: Error) => {
+        getLog().error(
+          { err: dbErr, workflowRunId: workflowRun.id },
+          'dag.run_usage_persist_failed'
+        );
+      });
+  };
+
+  try {
+    await runLayers(runCtx);
+  } finally {
+    // `finally`, not a plain call: a throw out of runLayers unwinds to executor.ts's
+    // top-level handler, which marks the run FAILED — a real terminal outcome the
+    // invariant has to cover. persistRunUsage swallows its own errors, so it can
+    // never displace an in-flight exception.
+    await persistRunUsage();
+  }
   // Pull the mutated accumulators back into local scope for the terminal tally below.
   const totalCostUsd = runCtx.totalCostUsd;
   const totalTokensIn = runCtx.totalTokensIn;
@@ -8785,7 +8840,8 @@ export async function executeDagWorkflow(
       ...runUsageProps,
     });
     // Note: nodeCounts not stored for failed runs — failWorkflowRun only stores { error }.
-    // Frontend guards with isValidNodeCounts so missing node_counts is safe.
+    // Frontend guards with isValidNodeCounts so missing node_counts is safe. (Usage IS
+    // stored: persistRunUsage wrote it at the run tail, before this branch — #2469.)
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
@@ -9004,12 +9060,9 @@ export async function executeDagWorkflow(
   try {
     await deps.store.completeWorkflowRun(workflowRun.id, {
       node_counts: nodeCounts,
-      // totalCostUsd starts at 0; only write metadata when at least one node reported cost
-      ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
-      // Persist token totals (D8) so a `workflow:` parent rolls up tokens as well as
-      // cost. Only when non-zero (telemetry-only fields otherwise).
-      ...(totalTokensIn > 0 ? { total_tokens_in: totalTokensIn } : {}),
-      ...(totalTokensOut > 0 ? { total_tokens_out: totalTokensOut } : {}),
+      // Cost and token totals are NOT written here — `persistRunUsage` already wrote
+      // them at the run tail, before this branch was chosen (#2469). Keeping a second
+      // copy here would be two writers of the same three keys, free to drift.
       // A sub-run persists its terminal summary so the parent can thread it as
       // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
       // growth to child runs only (top-level runs return the summary directly).
