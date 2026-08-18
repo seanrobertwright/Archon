@@ -13029,11 +13029,26 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       return realCreateEvent(data);
     });
 
+    // Ordering is the real discriminator. The `finally` runs AFTER runLayers throws, so
+    // the usage write must land after the fatal send. A write placed inside runLayers
+    // (per-node or per-layer) would satisfy a bare "usage was persisted" assertion while
+    // recording BEFORE the send — and would not need the finally at all.
+    const order: string[] = [];
+    const realUpdateRun = store.updateWorkflowRun;
+    store.updateWorkflowRun = mock(
+      (id: string, updates: { metadata?: Record<string, unknown> }): Promise<void> => {
+        if (updates.metadata && 'total_cost_usd' in updates.metadata) order.push('usage-write');
+        return realUpdateRun(id, updates);
+      }
+    );
+
     // Auth dies only once the AI node has completed, so its usage is accumulated first.
     const platform = createMockPlatform();
-    platform.sendMessage = mock(() =>
-      nodeFinished ? Promise.reject(new Error('unauthorized')) : Promise.resolve()
-    );
+    platform.sendMessage = mock((): Promise<void> => {
+      if (!nodeFinished) return Promise.resolve();
+      order.push('fatal-send');
+      return Promise.reject(new Error('unauthorized'));
+    });
 
     await expect(
       executeDagWorkflow(
@@ -13066,6 +13081,9 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     expect(runUsageWrites(store)).toEqual([
       { total_cost_usd: 0.01, total_tokens_in: 20, total_tokens_out: 2 },
     ]);
+    // The usage write is the LAST thing that happens, after the send that killed the run.
+    expect(order[0]).toBe('fatal-send');
+    expect(order[order.length - 1]).toBe('usage-write');
   });
 });
 
