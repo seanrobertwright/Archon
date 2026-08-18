@@ -53,7 +53,6 @@ import type {
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
-  ModelReasoningEffort,
   WebSearchMode,
   WorkflowSource,
   WorkflowDefinition,
@@ -119,7 +118,7 @@ import {
   isLiteralSpec,
   isTierName,
   resolveModelSpec,
-  routePresetEffort,
+  resolvePresetEffort,
   type ModelAliasPreset,
   type ResolvedAiProfile,
   type TierName,
@@ -247,8 +246,8 @@ function applyPresetOptions(
   preset: ModelAliasPreset | undefined,
   node: DagNode,
   workflowLevelOptions: WorkflowLevelOptions,
-  nodeConfig: NodeConfig,
-  assistantConfig: Record<string, unknown>
+  declaredEffort: string | undefined,
+  nodeConfig: NodeConfig
 ): void {
   if (!preset) return;
 
@@ -260,30 +259,30 @@ function applyPresetOptions(
     nodeConfig.thinking = preset.thinking;
   }
 
-  if (
-    preset.effort === undefined ||
-    node.effort !== undefined ||
-    workflowLevelOptions.effort !== undefined
-  ) {
-    return;
-  }
+  // An effort declared on the node or workflow outranks the preset's. Passed in
+  // rather than re-derived so this cannot disagree with the chain that builds
+  // `nodeConfig.effort` below — the two disagreeing is exactly what made an
+  // explicit `effort:` on a Codex node suppress its tier's effort and apply
+  // nothing at all (#2556).
+  if (preset.effort === undefined || declaredEffort !== undefined) return;
 
-  const routed = routePresetEffort(provider, preset.effort);
-  if (!routed) {
-    // Cross-provider effort mismatch (e.g. a `tiers:` entry sets `effort: max`
-    // on a Codex tier). Warn rather than silently drop it — fail-loud per the
-    // project's fail-fast guideline.
+  // Shared with the chat orchestrator's `applyPresetToRequestOptions`, so the
+  // same tier cannot mean one depth in a workflow and another in chat. The
+  // classifier returns the reason; each caller keeps its own event namespace.
+  const decision = resolvePresetEffort(provider, preset.effort);
+  if (!decision.ok) {
+    // Warn rather than silently drop it — fail-loud per the project's fail-fast
+    // guideline. `unsupported` means the resolved provider has no reasoning
+    // control at all (e.g. a `tiers:` entry sets `effort` on an OpenCode tier).
     getLog().warn(
-      { provider, effort: preset.effort, nodeId: node.id },
-      'dag.preset_effort_unsupported'
+      { provider, effort: preset.effort, nodeId: node.id, valid: decision.valid },
+      decision.reason === 'unsupported'
+        ? 'dag.preset_effort_unsupported'
+        : 'dag.preset_effort_unknown'
     );
     return;
   }
-  if (routed.field === 'effort') {
-    nodeConfig.effort = routed.value;
-  } else {
-    assistantConfig.modelReasoningEffort = routed.value;
-  }
+  nodeConfig.effort = preset.effort;
 }
 
 /**
@@ -339,21 +338,20 @@ export async function loadConfiguredMcpServerNames(
   }
 }
 
-/** Workflow-level provider options. The first five have node-level counterparts and
- *  are resolved as `node.X ?? workflowLevelOptions.X`; the two Codex fields below have
- *  NO node-level equivalent (they are absent from `dagNodeSchema`), so a workflow-level
- *  value is the only value. */
+/** Workflow-level provider options. The provider options have node-level
+ *  counterparts and are resolved as `node.X ?? workflowLevelOptions.X`. Two do
+ *  not: `webSearchMode`, absent from `dagNodeSchema` so a workflow-level value
+ *  is the only value, and `workflowTier`, which is not an author-facing field at
+ *  all — it carries the workflow's resolved tier keyword for annotation. */
 interface WorkflowLevelOptions {
   effort?: EffortLevel;
   thinking?: ThinkingConfig;
   fallbackModel?: string;
   betas?: string[];
   sandbox?: SandboxSettings;
-  /** Codex-only: reasoning effort, consumed as `assistantConfig.modelReasoningEffort`.
-   *  Written only when the resolved provider is Codex — see `resolveNodeProviderAndModel`. */
-  modelReasoningEffort?: ModelReasoningEffort;
-  /** Codex-only: web-search mode, consumed as `assistantConfig.webSearchMode`. Same
-   *  provider gate as `modelReasoningEffort`. */
+  /** Codex-only: web-search mode, consumed as `assistantConfig.webSearchMode`.
+   *  Permanently workflow-level-only — decided in #2556, and the ONLY
+   *  workflow-level field with no per-node counterpart. */
   webSearchMode?: WebSearchMode;
   /** Workflow-level tier keyword (when `workflow.model` is small/medium/large), so
    *  nodes that inherit the workflow model can still surface the `← tier` annotation. */
@@ -1060,14 +1058,18 @@ async function resolveNodeProviderAndModel(
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
 
-  // Codex is the only provider that takes reasoning effort and web-search mode from
-  // `assistantConfig` (codex/provider.ts:92-93), and it ignores the node-level `effort:`
-  // field entirely. Three decisions below hang on that one fact — whether to warn, whether
-  // to write, and which field holds the effort that will actually be applied — so it is
-  // named once here rather than spelled as three independent string comparisons that a
-  // later change could update apart. There is deliberately no ProviderCapabilities axis
-  // for this; see #2556.
-  const readsAssistantConfigOptions = provider === 'codex';
+  // `webSearchMode:` is Codex's alone — no other provider reads it, and #2556
+  // decided it keeps no node-level form, making it the single workflow-level
+  // field with no per-node counterpart. There is deliberately no
+  // ProviderCapabilities axis for one provider's one field.
+  //
+  // Reasoning depth is NOT in this category any more: the loader translates the
+  // deprecated `modelReasoningEffort:` into `effort:`, so the executor sees one
+  // provider-agnostic field and needs no Codex branch for it.
+  const isCodex = provider === 'codex';
+
+  // The one reasoning depth this node will run at, before any preset fallback.
+  const declaredEffort: string | undefined = node.effort ?? workflowLevelOptions.effort;
 
   // Runtime backstop for container dispatch: the run-start pre-scan
   // (collectContainerIncompatibleProviders) hand-mirrors this same provider
@@ -1092,7 +1094,7 @@ async function resolveNodeProviderAndModel(
     ['mcp', 'mcp', node.mcp !== undefined],
     ['skills', 'skills', node.skills !== undefined && node.skills.length > 0],
     ['agents', 'agents', node.agents !== undefined],
-    ['effort', 'effortControl', (node.effort ?? workflowLevelOptions.effort) !== undefined],
+    ['effort', 'effortControl', declaredEffort !== undefined],
     ['thinking', 'thinkingControl', (node.thinking ?? workflowLevelOptions.thinking) !== undefined],
     ['maxBudgetUsd', 'costControl', node.maxBudgetUsd !== undefined],
     [
@@ -1112,17 +1114,12 @@ async function resolveNodeProviderAndModel(
     }
   }
 
-  // `modelReasoningEffort`/`webSearchMode` have no ProviderCapabilities axis, so capChecks
-  // above cannot see them. Surfacing them here reuses the existing loud-mismatch path so a
-  // workflow that declares either one on a node that cannot read them gets the same warning
-  // every other capability mismatch produces, instead of a silent no-op.
-  if (!readsAssistantConfigOptions) {
-    if (workflowLevelOptions.modelReasoningEffort !== undefined) {
-      unsupported.push('modelReasoningEffort');
-    }
-    if (workflowLevelOptions.webSearchMode !== undefined) {
-      unsupported.push('webSearchMode');
-    }
+  // `webSearchMode` has no ProviderCapabilities axis, so capChecks above cannot
+  // see it. Surfacing it here reuses the existing loud-mismatch path so a
+  // workflow that declares it on a node that cannot read it gets the same
+  // warning every other capability mismatch produces, instead of a silent no-op.
+  if (!isCodex && workflowLevelOptions.webSearchMode !== undefined) {
+    unsupported.push('webSearchMode');
   }
 
   if (unsupported.length > 0) {
@@ -1170,7 +1167,12 @@ async function resolveNodeProviderAndModel(
     pi: node.pi,
     allowed_tools: node.allowed_tools,
     denied_tools: node.denied_tools,
-    effort: node.effort ?? workflowLevelOptions.effort,
+    // Dropped for a provider with no reasoning control, matching what the preset
+    // path does two functions up. `capChecks` has already told the author it
+    // will be ignored; writing it anyway would make `node_started` report a
+    // depth that was never applied, and would leave declared and preset effort
+    // behaving oppositely on the same provider.
+    effort: caps.effortControl ? declaredEffort : undefined,
     thinking: node.thinking ?? workflowLevelOptions.thinking,
     sandbox: node.sandbox ?? workflowLevelOptions.sandbox,
     betas: node.betas ?? workflowLevelOptions.betas,
@@ -1188,52 +1190,30 @@ async function resolveNodeProviderAndModel(
     effectivePreset,
     node,
     workflowLevelOptions,
-    nodeConfig,
-    assistantConfig
+    declaredEffort,
+    nodeConfig
   );
-  // Workflow-level Codex options (#2246). Applied AFTER applyPresetOptions so an
-  // explicit workflow literal beats a preset-routed effort — precedence is
-  // workflow-level > tier preset > config.yaml — and BEFORE the resolvedEffort read
-  // below so telemetry reports the value that actually runs.
-  //
-  // Gated on the resolved provider: an ungated write would land on Copilot too, which
-  // reads the same key from assistantConfig with a narrower enum. Declaring either field
-  // on a node that cannot read it warns via the capability block above instead.
-  if (readsAssistantConfigOptions) {
-    if (workflowLevelOptions.modelReasoningEffort !== undefined) {
-      assistantConfig.modelReasoningEffort = workflowLevelOptions.modelReasoningEffort;
-    }
-    if (workflowLevelOptions.webSearchMode !== undefined) {
-      assistantConfig.webSearchMode = workflowLevelOptions.webSearchMode;
-    }
+  // `webSearchMode:` has no node-level form and no other consumer, so the
+  // workflow-level value is the only value — written only where it is read.
+  if (isCodex && workflowLevelOptions.webSearchMode !== undefined) {
+    assistantConfig.webSearchMode = workflowLevelOptions.webSearchMode;
   }
 
-  // Read POST-routing values only. applyPresetOptions -> routePresetEffort has
-  // already placed effort where the provider actually consumes it — nodeConfig
-  // for providers taking a node-level `effort:`, assistantConfig for Codex's
-  // modelReasoningEffort — and warned + dropped it where unsupported; the
-  // workflow-level override above has already been applied. So both reads below
-  // hold effort that will genuinely be applied.
+  // There is one effort channel now, so telemetry has one place to read (#2556).
+  // `nodeConfig.effort` holds whatever will be applied — declared, or filled in
+  // from the preset just above, or absent when the provider warned and dropped
+  // it. `assistants.<provider>.modelReasoningEffort` from config.yaml never
+  // enters nodeConfig, so it stays the fallback.
   //
-  // Do NOT gate this on caps.effortControl: that flag means "accepts the
-  // node-level effort: field", not "can apply reasoning effort". Codex is
-  // effortControl:false yet applies effort via modelReasoningEffort, so gating
-  // on it would drop a real, applied value from node_started.
-  //
-  // The branch matters. `nodeConfig.effort` is populated for every provider, and
-  // capChecks only WARNS that Codex ignores it — it never strips it. So on Codex a
-  // plain `nodeConfig.effort ?? assistantEffort` reports the declared-but-ignored
-  // `effort:` in preference to the `modelReasoningEffort` the node actually ran at.
-  // A mixed-provider workflow setting both (which the authoring guide recommends)
-  // hits that directly, and it is the #2395 failure mode: an event stream that does
-  // not say what ran.
+  // Providers clamp a rung their SDK lacks (`max` → `xhigh` on Codex/Copilot),
+  // and this reports the declared rung rather than the clamped one — consistent
+  // across providers, and no longer able to name a field the provider ignored,
+  // which was the #2395 failure mode.
   const assistantEffort =
     typeof assistantConfig.modelReasoningEffort === 'string'
       ? assistantConfig.modelReasoningEffort
       : undefined;
-  const resolvedEffort: string | undefined = readsAssistantConfigOptions
-    ? assistantEffort
-    : (nodeConfig.effort ?? assistantEffort);
+  const resolvedEffort: string | undefined = nodeConfig.effort ?? assistantEffort;
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -8165,7 +8145,6 @@ export async function executeDagWorkflow(
     fallbackModel: workflow.fallbackModel,
     betas: workflow.betas,
     sandbox: workflow.sandbox,
-    modelReasoningEffort: workflow.modelReasoningEffort,
     webSearchMode: workflow.webSearchMode,
     workflowTier,
   };

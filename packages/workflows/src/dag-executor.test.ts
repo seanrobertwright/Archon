@@ -49,13 +49,21 @@ mock.module('@archon/paths', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
-import { registerBuiltinProviders, registerPiProvider, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerPiProvider,
+  registerOpencodeProvider,
+  clearRegistry,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
 // Pi is a community provider (best-effort structured output) — register it so the
 // reask-loop tests can resolve `getProviderCapabilities('pi')` to 'best-effort'.
 // deps.getAgentProvider is mocked, so the real Pi SDK is never loaded.
 registerPiProvider();
+// OpenCode is the only registered provider with `effortControl: false` — it is what
+// makes `resolvePresetEffort`'s rejection branch reachable at this call site (#2556).
+registerOpencodeProvider();
 
 // --- Imports (after mocks) ---
 import {
@@ -190,7 +198,9 @@ const mockCodexCapabilities = () => ({
   structuredOutput: 'enforced' as const,
   envInjection: true,
   costControl: false,
-  effortControl: false,
+  // Codex takes the node-level `effort:` field and translates it to the SDK's
+  // modelReasoningEffort internally (#2556) — mirrors CODEX_CAPABILITIES.
+  effortControl: true,
   thinkingControl: false,
   fallbackModel: false,
   sandbox: false,
@@ -1271,7 +1281,7 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     expect(warnings[0]).toContain("doesn't support");
   });
 
-  it('routes Codex tier effort to assistantConfig.modelReasoningEffort', async () => {
+  it('routes Codex tier effort to nodeConfig.effort like every other provider', async () => {
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
       getType: () => 'codex',
@@ -1316,13 +1326,71 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     expect(optionsArg.model).toBe('gpt-5.5');
     const assistantConfig = optionsArg.assistantConfig as Record<string, unknown>;
     const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
-    expect(assistantConfig.modelReasoningEffort).toBe('medium');
-    expect(nodeConfig.effort).toBeUndefined();
+    // #2556: the engine no longer knows which field Codex wants — it writes the
+    // one `effort` channel and the Codex provider translates it internally.
+    expect(nodeConfig.effort).toBe('medium');
+    expect(assistantConfig.modelReasoningEffort).toBeUndefined();
 
     const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
       .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
     const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
+    // The observable contract is unchanged: node_started still reports the depth.
     expect(nodeStartedCall?.[0].data?.effort).toBe('medium');
+  });
+
+  // The regression this refactor exists to prevent. `applyPresetOptions` bails
+  // when an explicit effort is declared, on the assumption it outranks the
+  // preset. Before #2556 that explicit value landed on nodeConfig, which Codex
+  // ignored — so adding `effort: high` to a Codex node using a tier made it run
+  // at LESS depth than omitting the line entirely.
+  it('an explicit effort on a Codex node beats its tier preset instead of erasing both', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const aiProfile = buildAiProfile('claude', {
+      repoTiers: {
+        medium: { provider: 'codex', model: 'gpt-5.5', effort: 'medium' },
+      },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-explicit-effort-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium', effort: 'high' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      aiProfile
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig.effort).toBe('high');
+
+    const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
+    const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
+    expect(nodeStartedCall?.[0].data?.effort).toBe('high');
   });
 
   it('applies inherited workflow tier effort to nodes without model overrides', async () => {
@@ -1372,8 +1440,116 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     expect(optionsArg.model).toBe('gpt-5.5');
     const assistantConfig = optionsArg.assistantConfig as Record<string, unknown>;
     const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
-    expect(assistantConfig.modelReasoningEffort).toBe('high');
+    expect(nodeConfig.effort).toBe('high');
+    expect(assistantConfig.modelReasoningEffort).toBeUndefined();
+  });
+
+  // The rejection half of the shared `resolvePresetEffort` gate. Both callers
+  // (here and the chat orchestrator) act on its verdict, and neither proved it
+  // obeyed one — the branch was reachable pre-#2556 too and equally untested.
+  // OpenCode is the only registered provider with `effortControl: false`.
+  it('drops a tier effort for a provider with no reasoning control, and applies nothing', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'opencode',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const aiProfile = buildAiProfile('claude', {
+      repoTiers: {
+        medium: { provider: 'opencode', model: 'anthropic/claude-sonnet-4-6', effort: 'high' },
+      },
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'opencode-tier-effort-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      aiProfile
+    );
+
+    expect(mockGetAgentProviderDag.mock.calls[0][0]).toBe('opencode');
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
+    const assistantConfig = optionsArg.assistantConfig as Record<string, unknown>;
+    // Dropped on both channels — not quietly written somewhere the provider ignores.
     expect(nodeConfig.effort).toBeUndefined();
+    expect(assistantConfig.modelReasoningEffort).toBeUndefined();
+
+    // And the run does not claim a depth it never applied.
+    const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
+    const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
+    expect(nodeStartedCall?.[0].data?.effort).toBeUndefined();
+  });
+
+  // CodeRabbit found the other half of the drop the preset test above pins: a
+  // DECLARED effort took the opposite path, warned as unsupported and then
+  // written anyway, so `node_started` reported a depth the provider never
+  // applied. Both paths now drop it.
+  it('drops a declared effort for a provider with no reasoning control', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'opencode',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'opencode-declared-effort-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'opencode', effort: 'high' }],
+      },
+      workflowRun,
+      'opencode',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig.effort).toBeUndefined();
+
+    // The author is still told — the drop is loud, not silent.
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    expect(messages.find(m => m.includes('effort'))).toBeDefined();
+
+    const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
+    const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
+    expect(nodeStartedCall?.[0].data?.effort).toBeUndefined();
   });
 
   it('routes Claude tier effort to nodeConfig.effort', async () => {
@@ -11077,7 +11253,10 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     expect(nodeConfig?.effort).toBe('max');
   });
 
-  it('warns user when Codex node has Claude-only options (effort)', async () => {
+  // #2556 inverted this: `effort:` used to be treated as Claude-only and warned
+  // about on a Codex node. It is now the one spelling and reaches Codex, so the
+  // warning would be false and the value must actually be applied.
+  it('applies node-level effort on a Codex node without warning', async () => {
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
       getType: () => 'codex',
@@ -11110,11 +11289,95 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
-    const warning = messages.find(m => m.includes('effort') && m.toLowerCase().includes('codex'));
-    expect(warning).toBeDefined();
+    expect(
+      messages.find(m => m.includes('effort') && m.includes("doesn't support"))
+    ).toBeUndefined();
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig?.effort).toBe('high');
   });
 
-  it('forwards workflow-level modelReasoningEffort and webSearchMode to a Codex node', async () => {
+  it('applies workflow-level effort to a Codex node', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-workflow-effort-test',
+        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        effort: 'xhigh',
+      },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig?.effort).toBe('xhigh');
+
+    const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
+    const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
+    expect(nodeStartedCall?.[0].data?.effort).toBe('xhigh');
+  });
+
+  it('applies the node-level effort; the deprecated field is inert at this layer', async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-node-effort-beats-deprecated-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', effort: 'minimal' }],
+        modelReasoningEffort: 'high',
+      },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig?.effort).toBe('minimal');
+  });
+
+  it('forwards workflow-level webSearchMode to a Codex node', async () => {
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
       getType: () => 'codex',
@@ -11132,7 +11395,10 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       {
         name: 'codex-workflow-options-test',
         nodes: [{ id: 'step1', command: 'my-cmd' }],
-        modelReasoningEffort: 'minimal',
+        // #2556: the loader translates `modelReasoningEffort:` into `effort:`,
+        // so the executor only ever sees the canonical field. `webSearchMode:`
+        // keeps its Codex gate and its assistantConfig home.
+        effort: 'minimal',
         webSearchMode: 'live',
       },
       workflowRun,
@@ -11148,12 +11414,13 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
 
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
     const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
-    expect(assistantConfig?.modelReasoningEffort).toBe('minimal');
+    expect(nodeConfig?.effort).toBe('minimal');
     expect(assistantConfig?.webSearchMode).toBe('live');
   });
 
-  it('workflow-level modelReasoningEffort beats a preset-routed effort, and node_started reports the applied value', async () => {
+  it('workflow-level effort beats a preset-routed effort, and node_started reports the applied value', async () => {
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
       getType: () => 'codex',
@@ -11176,7 +11443,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       {
         name: 'codex-workflow-beats-preset-test',
         nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
-        modelReasoningEffort: 'xhigh',
+        effort: 'xhigh',
       },
       workflowRun,
       'claude',
@@ -11195,8 +11462,8 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     );
 
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
-    const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
-    expect(assistantConfig?.modelReasoningEffort).toBe('xhigh');
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig?.effort).toBe('xhigh');
 
     // The write must land BEFORE resolvedEffort is captured, or the audit trail and
     // console report an effort the node did not run at.
@@ -11224,7 +11491,9 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       {
         name: 'mixed-provider-preset-effort-test',
         nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
-        // Declared for the workflow's Codex nodes; must not affect this Claude node.
+        // A definition that still carries the deprecated field — only a
+        // loader-bypassing caller can produce one. It affects nothing: the
+        // executor never reads it (the loader translates it away).
         modelReasoningEffort: 'high',
       },
       workflowRun,
@@ -11250,7 +11519,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     expect(assistantConfig?.modelReasoningEffort).toBeUndefined();
   });
 
-  it('warns when workflow-level Codex options land on a non-Codex node', async () => {
+  it('warns when workflow-level webSearchMode lands on a non-Codex node', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
@@ -11263,7 +11532,6 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       {
         name: 'codex-options-on-claude-test',
         nodes: [{ id: 'step1', command: 'my-cmd' }],
-        modelReasoningEffort: 'high',
         webSearchMode: 'live',
       },
       workflowRun,
@@ -11279,23 +11547,21 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
-    const warning = messages.find(
-      m => m.includes('modelReasoningEffort') && m.includes('webSearchMode')
-    );
+    const warning = messages.find(m => m.includes('webSearchMode'));
     expect(warning).toBeDefined();
 
     // Nothing meaningless is written onto a provider that cannot read it.
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
-    expect(assistantConfig?.modelReasoningEffort).toBeUndefined();
     expect(assistantConfig?.webSearchMode).toBeUndefined();
   });
 
-  it('reports modelReasoningEffort in node_started, not the effort Codex ignores', async () => {
-    // A mixed-provider workflow is told by the authoring guide to set `effort:` for its
-    // Claude/Pi nodes and `modelReasoningEffort:` for Codex. nodeConfig.effort is populated
-    // for every provider and only warned about on Codex, never stripped — so the event
-    // stream must not prefer it over the value Codex actually ran at.
+  it('ignores modelReasoningEffort entirely — the executor has no deprecated-field path', async () => {
+    // #2556 resolves the deprecation in the LOADER: `modelReasoningEffort:` is
+    // translated into `effort:` and never reaches here. Passing both directly to
+    // `executeDagWorkflow` is something only a loader-bypassing caller can do,
+    // and it pins the absence of any residual Codex branch for reasoning depth —
+    // the executor applies `effort:` and does not look at the old field.
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
       getType: () => 'codex',
@@ -11328,19 +11594,21 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     );
 
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
     const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
-    expect(assistantConfig?.modelReasoningEffort).toBe('low');
+    expect(nodeConfig?.effort).toBe('max');
+    expect(assistantConfig?.modelReasoningEffort).toBeUndefined();
 
     const createEventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock
       .calls as Array<[{ event_type: string; data?: Record<string, unknown> }]>;
     const nodeStartedCall = createEventCalls.find(([arg]) => arg.event_type === 'node_started');
-    expect(nodeStartedCall?.[0].data?.effort).toBe('low');
+    expect(nodeStartedCall?.[0].data?.effort).toBe('max');
   });
 
   it('warns when a node in a Codex workflow resolves away to Claude via a tier', async () => {
     // The mixed-provider direction: the workflow-level provider IS codex, so a check
     // against the CONFIGURED provider would stay silent. Only the resolved provider
-    // reveals that this node cannot read either field.
+    // reveals that this node cannot read `webSearchMode`.
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
@@ -11358,7 +11626,6 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       {
         name: 'codex-workflow-node-resolves-to-claude-test',
         nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
-        modelReasoningEffort: 'high',
         webSearchMode: 'live',
       },
       workflowRun,
@@ -11381,14 +11648,11 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
-    const warning = messages.find(
-      m => m.includes('modelReasoningEffort') && m.includes('webSearchMode')
-    );
+    const warning = messages.find(m => m.includes('webSearchMode'));
     expect(warning).toBeDefined();
 
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     const assistantConfig = optionsArg?.assistantConfig as Record<string, unknown>;
-    expect(assistantConfig?.modelReasoningEffort).toBeUndefined();
     expect(assistantConfig?.webSearchMode).toBeUndefined();
   });
 });

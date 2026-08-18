@@ -811,7 +811,10 @@ interface WorkflowJsonEntry {
   description: string;
   provider?: string;
   model?: string;
-  modelReasoningEffort?: string;
+  /** Reasoning depth — the one spelling, on every provider that has one (#2556).
+   *  A workflow written with the deprecated `modelReasoningEffort:` reports its
+   *  value here, since the loader translates the two into one field. */
+  effort?: string;
   webSearchMode?: string;
   /** Keys the workflow's YAML declares that the engine drops (#2213). */
   parseWarnings?: string[];
@@ -832,8 +835,7 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
         };
         if (w.provider !== undefined) entry.provider = w.provider;
         if (w.model !== undefined) entry.model = w.model;
-        if (w.modelReasoningEffort !== undefined)
-          entry.modelReasoningEffort = w.modelReasoningEffort;
+        if (w.effort !== undefined) entry.effort = w.effort;
         if (w.webSearchMode !== undefined) entry.webSearchMode = w.webSearchMode;
         if (parseWarnings && parseWarnings.length > 0) entry.parseWarnings = [...parseWarnings];
         return entry;

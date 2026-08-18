@@ -151,13 +151,24 @@ mock.module('@archon/workflows/executor', () => ({
   hydrateResumableRun: mockHydrateResumableRun,
 }));
 
+/** Baseline capabilities the mocked registry reports. Tests that narrow this
+ *  must restore THIS object, not a hand-written subset — dropping a flag here
+ *  leaks into every later test in the file (it is how `effortControl` went
+ *  missing for `resolveTitleRequest`). */
+const DEFAULT_PROVIDER_CAPS = { envInjection: true, effortControl: true } as const;
+
 mock.module('@archon/providers', () => ({
   getAgentProvider: mock(() => ({
     sendQuery: mockSendQuery,
     getType: mock(() => 'claude'),
     getCapabilities: mock(() => ({})),
   })),
-  getProviderCapabilities: mock(() => ({ envInjection: true })),
+  // `effortControl` decides whether a tier's `effort` reaches the provider, and
+  // `isRegisteredProvider` gates that lookup — both read by
+  // `validEffortsForProvider` (@archon/workflows/model-validation, #2556).
+  // Omitting either lets the REAL implementation run against an empty registry.
+  getProviderCapabilities: mock(() => ({ ...DEFAULT_PROVIDER_CAPS })),
+  isRegisteredProvider: mock(() => true),
   getRegisteredProviders: mock(() => []),
   // Vendor → env-var map consumed by credentials/delivery (#1955). A realistic
   // subset of the generated map (the chat inject tests deliver through it).
@@ -1346,7 +1357,7 @@ describe('discoverAllWorkflows — remote sync', () => {
   test('appends the run-management section (and no native tool) for a project-scoped non-native-tool provider', async () => {
     const providers = await import('@archon/providers');
     const capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
-    capsMock.mockReturnValue({ envInjection: true, nativeTools: false });
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, nativeTools: false });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(
       Promise.resolve(makeConversation({ ai_assistant_type: 'codex', codebase_id: 'codebase-1' }))
@@ -1364,14 +1375,14 @@ describe('discoverAllWorkflows — remote sync', () => {
       // Providers without native tools get NO in-process tool — bash CLI only.
       expect(requestOptions.nativeTools).toBeUndefined();
     } finally {
-      capsMock.mockReturnValue({ envInjection: true });
+      capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
     }
   });
 
   test('omits the run-management section and injects the native tool for a project-scoped native-tool provider', async () => {
     const providers = await import('@archon/providers');
     const capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
-    capsMock.mockReturnValue({ envInjection: true, nativeTools: true });
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, nativeTools: true });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(
       Promise.resolve(makeConversation({ ai_assistant_type: 'claude', codebase_id: 'codebase-1' }))
@@ -1391,7 +1402,7 @@ describe('discoverAllWorkflows — remote sync', () => {
       // Native-tool provider gets the manage_run tool instead.
       expect(Array.isArray(requestOptions.nativeTools)).toBe(true);
     } finally {
-      capsMock.mockReturnValue({ envInjection: true });
+      capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
     }
   });
 });
@@ -2441,7 +2452,7 @@ describe('paused approval gate routing', () => {
     // for `manage_run` to be injected. Restored in afterEach.
     const providers = await import('@archon/providers');
     capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
-    capsMock.mockReturnValue({ envInjection: true, nativeTools: true });
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, nativeTools: true });
     // `fs.existsSync` is a file-wide mock other suites mutate (#2551 turns it
     // into a shared predicate reset in only one describe). Force the value these
     // tests need rather than inheriting whatever ran last — a false here would
@@ -2451,7 +2462,11 @@ describe('paused approval gate routing', () => {
   });
 
   afterEach(() => {
-    capsMock.mockReturnValue({ envInjection: true });
+    // Restore the shared baseline, not a hand-written subset. A subset here
+    // silently drops every other flag for the REST OF THE FILE — that is how
+    // `effortControl` went missing for `resolveTitleRequest` once already
+    // (#2556), and this block reintroduced it on merge.
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
   });
 
   // ── The removed behaviour: prose no longer decides the gate ────────────────
@@ -4808,11 +4823,32 @@ describe('resolveTitleRequest', () => {
     expect(req.provider).toBe('codex');
     // Built-in codex small tier — NOT the (ChatGPT-plan-unsupported) assistants default.
     expect(req.options.model).toBe('gpt-5.5');
-    // Preset effort is routed to the Codex reasoning-effort field.
-    expect(req.options.assistantConfig).toEqual({
-      model: 'gpt-5.3-codex',
-      modelReasoningEffort: 'minimal',
-    });
+    // #2556: preset effort rides the one nodeConfig channel on every provider;
+    // assistantConfig carries only what config.yaml put there.
+    expect(req.options.assistantConfig).toEqual({ model: 'gpt-5.3-codex' });
+    expect(req.options.nodeConfig).toEqual({ effort: 'minimal' });
+  });
+
+  // The chat half of the shared `resolvePresetEffort` gate (#2556). Chat and the
+  // DAG executor must agree on when a preset's effort is dropped, or the same
+  // tier means different depths in a workflow and in a chat turn — so the
+  // rejection is pinned on both sides, not just the acceptance.
+  test('drops a tier effort when the resolved provider has no reasoning control', async () => {
+    const providers = await import('@archon/providers');
+    const capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, effortControl: false });
+
+    try {
+      const req = await resolveTitleRequest('codex');
+
+      expect(req.options.model).toBe('gpt-5.5');
+      // The tier still selects the model; only its effort is dropped, and it is
+      // not quietly written onto the other channel either.
+      expect(req.options.nodeConfig?.effort).toBeUndefined();
+      expect(req.options.assistantConfig).toEqual({ model: 'gpt-5.3-codex' });
+    } finally {
+      capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+    }
   });
 
   test('a configured small tier wins (including a provider switch)', async () => {

@@ -11,6 +11,7 @@
  * so a flat schema with superRefine is cleaner than a z.union() with implicit discriminants.
  */
 import { z } from '@hono/zod-openapi';
+import { EFFORT_LADDER } from '@archon/providers/effort';
 import { stepRetryConfigSchema } from './retry';
 import { loopNodeConfigSchema, loopControlSchema, type LoopControl } from './loop';
 import { workflowNodeHooksSchema } from './hooks';
@@ -36,10 +37,20 @@ export const TRIGGER_RULES: readonly TriggerRule[] = triggerRuleSchema.options;
 // Claude SDK option schemas
 // ---------------------------------------------------------------------------
 
-/** Claude Agent SDK effort level — controls reasoning depth. Different from Codex modelReasoningEffort. */
-export const effortLevelSchema = z.enum(['low', 'medium', 'high', 'max']);
+/**
+ * Reasoning depth — the one spelling, on every provider that has the control
+ * (#2556). The vocabulary is the union of the effort-capable SDKs' enums, and
+ * a provider clamps a rung it doesn't offer to the nearest one it does
+ * (`clampEffort` in @archon/providers): Pi takes all six, while `max` → `xhigh`
+ * on Codex/Copilot and `minimal` → `low` on Claude/Copilot. Derived from `EFFORT_LADDER` rather than
+ * restated, so the YAML enum and the clamp cannot disagree.
+ */
+export const effortLevelSchema = z.enum(EFFORT_LADDER);
 
 export type EffortLevel = z.infer<typeof effortLevelSchema>;
+
+/** Canonical list of effort levels — derived from schema, do not duplicate. */
+export const EFFORT_LEVELS: readonly EffortLevel[] = effortLevelSchema.options;
 
 /**
  * Claude Agent SDK beta header list. Non-empty array of non-empty strings —
@@ -137,8 +148,11 @@ export type AgentDefinition = z.infer<typeof agentDefinitionSchema>;
  * machine's `config.yaml`. Highest-precedence layer: node YAML `pi:` > config
  * `nodes.<id>` > assistant-level `assistants.pi.*`. Structurally identical to the
  * providers-side `PiNodeOverride` (@archon/providers/pi/config) — hand-mirrored
- * because @archon/workflows cannot import runtime values from @archon/providers
- * (only the contract subpath @archon/providers/types).
+ * because that module is not reachable from here. The constraint is SDK-free,
+ * not type-only: @archon/workflows may import runtime values from a leaf subpath
+ * with no SDK dependencies (@archon/providers/types, @archon/providers/effort —
+ * see EFFORT_LADDER at the top of this file), but `pi/config` pulls in the Pi
+ * SDK, so this shape stays mirrored.
  *
  * Pi-only, like Claude's `hooks`/`mcp`/`skills`/`agents`. Other providers ignore
  * it; non-AI node types warn it's ignored (see BASH_NODE_AI_FIELDS).

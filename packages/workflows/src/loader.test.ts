@@ -640,10 +640,166 @@ nodes:
       const workflows = result.workflows.map(ws => ws.workflow);
 
       expect(workflows).toHaveLength(1);
-      expect(workflows[0].modelReasoningEffort).toBe('medium');
+      // #2556: translated into `effort:` at load, never carried forward.
+      expect(workflows[0].effort).toBe('medium');
+      expect(workflows[0].modelReasoningEffort).toBeUndefined();
       expect(workflows[0].webSearchMode).toBe('live');
       // The removed field is not carried onto the workflow object.
       expect((workflows[0] as Record<string, unknown>).additionalDirectories).toBeUndefined();
+    });
+
+    it('should translate modelReasoningEffort into effort and say so', async () => {
+      // #2556: warn-and-TRANSLATE. The value must survive to the executor — an
+      // author who reads the warning and does nothing must see no change in the
+      // depth their nodes run at — but it survives as `effort:`, the field that
+      // has a node-level counterpart. That is what makes the deprecation
+      // terminal, and what lets a later pass collapse workflow-level config onto
+      // nodes (#1764) without a hole for this field.
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: deprecated-effort-spelling
+description: Uses the old Codex-only spelling
+provider: codex
+modelReasoningEffort: xhigh
+nodes:
+  - id: test
+    command: test
+`;
+      await writeFile(join(workflowDir, 'deprecated.yaml'), yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      // The value arrives under the canonical spelling; the deprecated key is gone.
+      expect(result.workflows[0].workflow.effort).toBe('xhigh');
+      expect(result.workflows[0].workflow.modelReasoningEffort).toBeUndefined();
+
+      const pw = result.workflows[0].parseWarnings ?? [];
+      const deprecation = pw.find(w => w.includes('modelReasoningEffort'));
+      expect(deprecation).toBeDefined();
+      expect(deprecation).toContain('deprecated');
+      // The message must name what actually happened, not just what to write —
+      // an author who reads "deprecated" and nothing else cannot tell whether
+      // their value still applies.
+      expect(deprecation).toContain("has been applied as 'effort: xhigh'");
+      // The scope change must be disclosed, not just the rename. The old field
+      // was Codex-only; `effort:` is not, so a workflow that declares only the
+      // deprecated field now reasons deeper on its Claude/Pi/Copilot nodes too,
+      // where before it affected none of them. Silent is exactly what this
+      // issue exists to remove.
+      expect(deprecation).toContain('EVERY node');
+      expect(deprecation).toContain('non-Codex');
+    });
+
+    it('translates for a NON-Codex workflow too — the widening, pinned', async () => {
+      // R22's cost, as behavior rather than a sentence. The deprecated field was
+      // Codex-gated in the executor: on a Claude workflow it applied to nothing
+      // and warned. Translation is provider-blind (the loader cannot know which
+      // nodes resolve to Codex), so it now applies. That is deliberate and
+      // disclosed — and a plausible "fix" would be to re-add a Codex gate here,
+      // which would silently restore the two-field hole #1764 Task 1 needs gone.
+      // This test is what makes that regression fail.
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: deprecated-on-claude
+description: Codex-only spelling on a Claude workflow
+provider: claude
+modelReasoningEffort: high
+nodes:
+  - id: test
+    command: test
+`;
+      await writeFile(join(workflowDir, 'claude-deprecated.yaml'), yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      const w = result.workflows[0].workflow;
+      expect(w.provider).toBe('claude');
+      // Applied, not dropped, and under the canonical spelling.
+      expect(w.effort).toBe('high');
+      expect(w.modelReasoningEffort).toBeUndefined();
+    });
+
+    it('should ignore modelReasoningEffort when effort is also declared, and say which won', async () => {
+      // The loader cannot know which nodes resolve to Codex, so the deprecated
+      // field's Codex-only precedence is not expressible at load time. `effort:`
+      // wins, and the warning has to say so plainly — silently picking one of
+      // two declared depths is the failure this issue exists to remove.
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: both-spellings
+description: Declares both reasoning-depth fields
+provider: codex
+effort: minimal
+modelReasoningEffort: xhigh
+nodes:
+  - id: test
+    command: test
+`;
+      await writeFile(join(workflowDir, 'both.yaml'), yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.effort).toBe('minimal');
+      expect(result.workflows[0].workflow.modelReasoningEffort).toBeUndefined();
+
+      const pw = result.workflows[0].parseWarnings ?? [];
+      const deprecation = pw.find(w => w.includes('modelReasoningEffort'));
+      expect(deprecation).toBeDefined();
+      expect(deprecation).toContain('IGNORED');
+      expect(deprecation).toContain('effort: minimal');
+    });
+
+    it('should not warn about deprecation when modelReasoningEffort is absent', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: current-effort-spelling
+description: Uses the one spelling
+provider: codex
+effort: xhigh
+nodes:
+  - id: test
+    command: test
+`;
+      await writeFile(join(workflowDir, 'current.yaml'), yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.effort).toBe('xhigh');
+      expect(result.workflows[0].parseWarnings ?? []).toEqual([]);
+    });
+
+    it('should accept the widened effort ladder on NODES, not just at workflow level', async () => {
+      // `effortLevelSchema` backs both the workflow field and the node field, but
+      // only the workflow one was proven against real YAML. The node field is the
+      // headline of #2556 — "effort: works per node on every provider" — and it
+      // crosses `dagNodeSchema.safeParse()`, a boundary no other effort test
+      // touches (the executor and provider suites build objects in memory).
+      // Narrowing the node enum would pass every one of those and fail the WHOLE
+      // workflow to load, not just the field.
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: node-effort-rungs
+description: Node-level effort across the full ladder
+provider: codex
+nodes:
+  - id: shallow
+    command: test
+    effort: minimal
+  - id: deep
+    command: test
+    effort: xhigh
+    depends_on: [shallow]
+`;
+      await writeFile(join(workflowDir, 'node-effort.yaml'), yaml);
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      expect(result.workflows).toHaveLength(1);
+
+      const nodes = result.workflows[0].workflow.nodes;
+      expect(nodes.find(n => n.id === 'shallow')?.effort).toBe('minimal');
+      expect(nodes.find(n => n.id === 'deep')?.effort).toBe('xhigh');
+      expect(result.workflows[0].parseWarnings ?? []).toEqual([]);
     });
 
     it('should round-trip workflow-level effort/thinking/fallbackModel/betas/sandbox', async () => {
@@ -5777,9 +5933,14 @@ describe('workflow-level field parity (#2457)', () => {
     nodes: { yaml: '', present: w => w.nodes?.length === 1 },
     provider: { yaml: 'provider: claude', present: w => w.provider === 'claude' },
     model: { yaml: 'model: sonnet', present: w => w.model === 'sonnet' },
+    // The one field that survives as a DIFFERENT key. #2556 deprecated it and
+    // the loader translates it into `effort:`, so asserting `w.modelReasoningEffort`
+    // would now fail for the right reason. The guard's invariant is "a schema
+    // field must not be silently inert", and translation satisfies it — so the
+    // fixture proves the value arrived, and that the deprecated key did not.
     modelReasoningEffort: {
       yaml: 'modelReasoningEffort: high',
-      present: w => w.modelReasoningEffort === 'high',
+      present: w => w.effort === 'high' && w.modelReasoningEffort === undefined,
     },
     webSearchMode: { yaml: 'webSearchMode: live', present: w => w.webSearchMode === 'live' },
     interactive: { yaml: 'interactive: true', present: w => w.interactive === true },

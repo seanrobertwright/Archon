@@ -1,6 +1,24 @@
 import type { CopilotProviderDefaults } from '../../types';
+import { clampEffort } from '../../shared/effort';
 
 export type { CopilotProviderDefaults };
+
+/**
+ * The reasoning-depth rungs Copilot's SDK accepts, weakest → strongest.
+ *
+ * Copilot's SDK does not export its `ReasoningEffort` union, so the type is
+ * hand-mirrored on `CopilotProviderDefaults` — which makes this the one provider
+ * where a pin matters most and is easiest to lose. `satisfies` binds the list to
+ * that type, and `provider.ts` imports this array rather than restating it
+ * (same shape as `CODEX_EFFORTS` in ../../codex/config.ts), so the config key and
+ * the node-level `effort:` path can never disagree about what Copilot accepts.
+ */
+export const COPILOT_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+] as const satisfies readonly NonNullable<CopilotProviderDefaults['modelReasoningEffort']>[];
 
 /**
  * Parse raw `assistants.copilot` config into a typed `CopilotProviderDefaults`.
@@ -17,16 +35,13 @@ export function parseCopilotConfig(raw: Record<string, unknown>): CopilotProvide
     config.model = raw.model;
   }
 
-  if (typeof raw.modelReasoningEffort === 'string') {
-    const v = raw.modelReasoningEffort;
-    if (v === 'low' || v === 'medium' || v === 'high' || v === 'xhigh') {
-      config.modelReasoningEffort = v;
-    } else if (v === 'max') {
-      // Accept Archon's workflow-schema alias for the top tier. Normalizing
-      // at parse time keeps `CopilotProviderDefaults.modelReasoningEffort`
-      // aligned with the SDK's enum (which has no 'max').
-      config.modelReasoningEffort = 'xhigh';
-    }
+  // Accept any rung of Archon's shared ladder and clamp it to the SDK's enum
+  // (which has neither `minimal` nor `max`), so `assistants.copilot.*` takes
+  // the same vocabulary a workflow's `effort:` does. Normalizing at parse time
+  // keeps `CopilotProviderDefaults.modelReasoningEffort` SDK-shaped.
+  const effort = clampEffort(raw.modelReasoningEffort, COPILOT_EFFORTS);
+  if (effort !== undefined) {
+    config.modelReasoningEffort = effort;
   }
 
   if (typeof raw.copilotCliPath === 'string') {
