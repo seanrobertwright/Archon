@@ -25,8 +25,23 @@ function stripCode(text: string): string {
   return text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`]*`/g, ' ');
 }
 
+/**
+ * Base-field text bodies — valid on every variant, so they are collected outside the
+ * variant switch. `systemPrompt` and `agents.*` became runtime `$nodeId.output` surfaces
+ * in the engine (#1764/#2476), where a dangling ref is now a load error; without them here
+ * the builder would let an author write one and only learn at save.
+ */
+function baseTextBodies(node: BuilderNode): string[] {
+  const bodies: string[] = [];
+  if (node.base.systemPrompt !== undefined) bodies.push(node.base.systemPrompt);
+  for (const agent of Object.values(node.base.agents ?? {})) {
+    bodies.push(agent.prompt, agent.description);
+  }
+  return bodies;
+}
+
 /** The text bodies that carry `$nodeId.output` references for a given variant. */
-function textBodies(node: BuilderNode): string[] {
+function variantTextBodies(node: BuilderNode): string[] {
   switch (node.variant) {
     case 'prompt':
       return [node.data.prompt];
@@ -37,13 +52,18 @@ function textBodies(node: BuilderNode): string[] {
     case 'script':
       return [node.data.script];
     case 'approval':
-      return [node.data.message];
+      // `on_reject.prompt` is an ordinary prompt the engine substitutes and scans.
+      return [node.data.message, ...(node.data.on_reject ? [node.data.on_reject.prompt] : [])];
     case 'loop':
       // A command-backed loop has no inline text to scan — the command file's
       // body is loaded at runtime (same posture as the engine loader's ref scan).
-      return node.data.prompt !== undefined ? [node.data.prompt] : [];
+      // `until_bash` IS inline and is a live ref surface the loader scans.
+      return [
+        ...(node.data.prompt !== undefined ? [node.data.prompt] : []),
+        ...(node.data.until_bash !== undefined ? [node.data.until_bash] : []),
+      ];
     case 'cancel':
-      return [];
+      return [node.data.reason];
   }
 }
 
@@ -74,7 +94,7 @@ export function validateContent(workflow: BuilderWorkflow): Issue[] {
     const upstream = upstreamSet(node.id, depsById);
 
     // Output-reference scan over the node's text bodies.
-    for (const body of textBodies(node)) {
+    for (const body of [...baseTextBodies(node), ...variantTextBodies(node)]) {
       for (const refId of findOutputRefs(stripCode(body))) {
         if (!upstream.has(refId)) {
           issues.push(

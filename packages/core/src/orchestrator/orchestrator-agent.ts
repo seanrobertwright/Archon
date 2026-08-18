@@ -44,6 +44,7 @@ import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor
 import {
   assertWorkflowRequirementsMet,
   WorkflowRequirementError,
+  ComposedApprovalGateError,
   resolveTopLevelInputs,
   WorkflowMissingInputsError,
 } from '@archon/workflows/utils/workflow-requirements';
@@ -1074,23 +1075,38 @@ async function dispatchOrchestratorWorkflow(
     // Background dispatch: web-only, non-interactive workflows with no resumable run.
     // This is the console's default path, so it is exactly where a console-supplied
     // input map must not be dropped.
-    await dispatchBackgroundWorkflow(
-      {
-        platform,
-        conversationId,
-        cwd,
-        originalMessage: userMessage,
-        conversationDbId: conversation.id,
-        codebaseId: codebase.id,
-        availableWorkflows: [workflow],
-        isolationHints,
-        userId,
-        source,
-        parseWarnings: options?.parseWarnings,
-        inputs: resolvedInputs,
-      },
-      workflow
-    );
+    //
+    // `dispatchBackgroundWorkflow` refuses a composed approval gate a background run
+    // cannot present (#1764); turn that into a message rather than an unhandled throw.
+    try {
+      await dispatchBackgroundWorkflow(
+        {
+          platform,
+          conversationId,
+          cwd,
+          originalMessage: userMessage,
+          conversationDbId: conversation.id,
+          codebaseId: codebase.id,
+          availableWorkflows: [workflow],
+          isolationHints,
+          userId,
+          source,
+          parseWarnings: options?.parseWarnings,
+          inputs: resolvedInputs,
+        },
+        workflow
+      );
+    } catch (err) {
+      if (err instanceof ComposedApprovalGateError) {
+        getLog().info(
+          { workflowName: workflow.name, conversationId, gate: err.gate },
+          'workflow.composed_gate_undriveable'
+        );
+        await platform.sendMessage(conversationId, err.message);
+        return;
+      }
+      throw err;
+    }
   } else {
     // Fresh foreground execution: web interactive workflows + all chat platforms
     await executeWorkflow(

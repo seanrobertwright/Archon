@@ -14,6 +14,15 @@ import {
   substituteWorkflowVariables,
 } from './executor-shared';
 import {
+  resolveNodeModel,
+  resolveWorkflowModelScope,
+  assistantModelDefaults,
+  type NodeModelResolution,
+  type WorkflowModelScope,
+} from './node-model-resolution';
+import type { ResolvedAiProfile } from './model-validation';
+import type { WorkflowConfig } from './deps';
+import {
   isApprovalNode,
   isBashNode,
   isCancelNode,
@@ -46,12 +55,43 @@ const dryRunNodeTypeSchema = z.enum([
   'workflow',
 ]);
 
+/**
+ * Where a node's provider/model will come from at run time.
+ *
+ * The reason this is reported rather than required per node: after composition collapses a
+ * workflow's config onto its own nodes (#1764), the honest answer to "what will this node
+ * run on" is a chain, and making every node restate provider+model to make it visible
+ * would be ~54 redundant lines in a 27-node workflow. Legibility instead of redundancy.
+ */
+const dryRunResolutionSchema = z.object({
+  provider: z.string(),
+  model: z.string().optional(),
+  effort: z.string().optional(),
+  /** Where each value came from — 'node', 'model ref', 'workflow', 'assistant config', … */
+  providerFrom: z.string(),
+  modelFrom: z.string(),
+  effortFrom: z.string(),
+  /** The workflow file this node was authored in, when it arrived through `include:`. */
+  authoredIn: z.string().optional(),
+  /**
+   * Set when the node names one provider while its `model:` ref resolves to another. A
+   * real run warns the user about this and uses the resolved provider; a dry run that
+   * silently omitted it would report the outcome without the reason for it.
+   */
+  providerConflict: z
+    .object({ declared: z.string(), resolved: z.string(), modelRef: z.string() })
+    .optional(),
+});
+export type DryRunResolution = z.infer<typeof dryRunResolutionSchema>;
+
 const dryRunTraceBaseSchema = z.object({
   nodeId: z.string(),
   nodeType: dryRunNodeTypeSchema,
   resolvedText: z.string().optional(),
   output: z.string().optional(),
   iteration: z.number().int().positive().optional(),
+  /** Present for nodes that take an AI turn; absent for bash/script/approval/cancel. */
+  resolution: dryRunResolutionSchema.optional(),
 });
 
 export const dryRunTraceEntrySchema = z.discriminatedUnion('state', [
@@ -158,6 +198,10 @@ interface DryRunContext {
   consumedStubs: Set<string>;
   missingStubs: Set<string>;
   halted?: 'paused' | 'cancelled';
+  /** Workflow-level provider/model fallbacks, for the per-node resolution report. */
+  scope: WorkflowModelScope;
+  assistantModels: Readonly<Record<string, string | undefined>>;
+  aiProfile?: ResolvedAiProfile;
 }
 
 async function loadDryRunCommand(cwd: string, command: string): Promise<string> {
@@ -204,6 +248,43 @@ function resolveText(
   return substituteNodeOutputRefs(substituted, outputs, escapeNodeOutputs);
 }
 
+/**
+ * Report which provider and model an AI-turn node will run on, and where each value came
+ * from. Non-AI nodes (bash / script / approval / cancel / include / workflow) make no
+ * provider call, so they carry no resolution.
+ *
+ * Uses the executor's own resolver, never a copy of the chain: a second implementation
+ * would drift, and a drifted report is worse than no report.
+ */
+function resolutionFor(node: DagNode, ctx: DryRunContext): DryRunResolution | undefined {
+  const type = nodeType(node);
+  if (type !== 'command' && type !== 'prompt' && type !== 'loop' && type !== 'loop_group') {
+    return undefined;
+  }
+  const resolved: NodeModelResolution = resolveNodeModel(
+    node,
+    ctx.scope,
+    ctx.assistantModels,
+    ctx.aiProfile
+  );
+  return {
+    provider: resolved.provider,
+    ...(resolved.model !== undefined ? { model: resolved.model } : {}),
+    ...(resolved.effort !== undefined ? { effort: resolved.effort } : {}),
+    providerFrom: resolved.providerOrigin,
+    modelFrom: resolved.modelOrigin,
+    effortFrom: resolved.effortOrigin,
+    ...(resolved.authoredIn !== undefined ? { authoredIn: resolved.authoredIn } : {}),
+    ...(resolved.providerConflict ? { providerConflict: resolved.providerConflict } : {}),
+  };
+}
+
+/** Spread helper: `{ resolution }` for an AI-turn node, `{}` otherwise. */
+function withResolution(node: DagNode, ctx: DryRunContext): { resolution?: DryRunResolution } {
+  const resolution = resolutionFor(node, ctx);
+  return resolution ? { resolution } : {};
+}
+
 function recordSkipped(
   node: DagNode,
   outputs: Map<string, NodeOutput>,
@@ -237,6 +318,9 @@ function recordFailed(
     reason,
     ...(resolvedText !== undefined ? { resolvedText } : {}),
     ...(iteration ? { iteration } : {}),
+    // A node that failed for want of a stub is exactly the one an author is inspecting,
+    // so it keeps its resolution report.
+    ...withResolution(node, ctx),
   });
 }
 
@@ -417,6 +501,7 @@ async function simulateLoop(
         resolvedText,
         output: previous,
         ...(iteration ? { iteration } : {}),
+        ...withResolution(node, ctx),
       });
       return;
     }
@@ -471,6 +556,7 @@ async function simulateLoopGroup(
         reason: completionReason(groupCompletion, node.loop_group, current),
         output: lastOutput,
         ...(iteration ? { iteration } : {}),
+        ...withResolution(node, ctx),
       });
       return;
     }
@@ -599,6 +685,7 @@ async function simulateNode(
         resolvedText,
         output: hydrated.output,
         ...(iteration ? { iteration } : {}),
+        ...withResolution(node, ctx),
       });
       return;
     }
@@ -655,7 +742,15 @@ export async function dryRunWorkflow(options: {
   stubs?: DryRunStubs;
   execCode?: boolean;
   pauseAtGates?: boolean;
+  /**
+   * The install's resolved config and AI profile. Supplying them is what makes the
+   * per-node provider/model report match what a real run would do; without them the
+   * report falls back to the bare default assistant with no tier or alias resolution.
+   */
+  config?: WorkflowConfig;
+  aiProfile?: ResolvedAiProfile;
 }): Promise<DryRunResult> {
+  const assistantModels = options.config ? assistantModelDefaults(options.config) : {};
   const ctx: DryRunContext = {
     workflow: options.workflow,
     userMessage: options.userMessage,
@@ -666,6 +761,14 @@ export async function dryRunWorkflow(options: {
     trace: [],
     consumedStubs: new Set<string>(),
     missingStubs: new Set<string>(),
+    scope: resolveWorkflowModelScope(
+      options.workflow,
+      options.config?.assistant ?? 'claude',
+      assistantModels,
+      options.aiProfile
+    ),
+    assistantModels,
+    ...(options.aiProfile ? { aiProfile: options.aiProfile } : {}),
   };
   const outputs = new Map<string, NodeOutput>();
   await simulateNodes(options.workflow.nodes, outputs, ctx);
@@ -704,6 +807,21 @@ export function formatDryRunTrace(result: DryRunResult): string {
     lines.push(
       `${entry.state.toUpperCase().padEnd(9)} ${entry.nodeId} (${entry.nodeType})${iteration}${suffix}`
     );
+    if (entry.resolution) {
+      const r = entry.resolution;
+      const authored = r.authoredIn ? ` [from ${r.authoredIn}]` : '';
+      const model = r.model ?? '(provider default)';
+      lines.push(
+        `  runs on: ${r.provider} (${r.providerFrom}) / ${model} (${r.modelFrom})${authored}`
+      );
+      if (r.effort) lines.push(`  effort: ${r.effort} (${r.effortFrom})`);
+      if (r.providerConflict) {
+        const c = r.providerConflict;
+        lines.push(
+          `  warning: declares provider '${c.declared}' but model '${c.modelRef}' resolves to '${c.resolved}' — using '${c.resolved}'`
+        );
+      }
+    }
     if (entry.resolvedText) lines.push(`  resolved: ${entry.resolvedText}`);
     if (entry.output !== undefined) lines.push(`  output: ${entry.output}`);
   }

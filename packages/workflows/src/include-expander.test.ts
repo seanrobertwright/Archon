@@ -2,7 +2,13 @@ import { describe, test, expect } from 'bun:test';
 import { expandWorkflowIncludes, INCLUDE_MAX_DEPTH } from './include-expander';
 import { dagNodeSchema } from './schemas';
 import type { WorkflowDefinition, DagNode } from './schemas';
-import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
+import {
+  COMPILED_LOOP_COMMAND,
+  COMPOSED_NODE,
+  type ComposedNodeMeta,
+  type LoopWithCompiledCommand,
+  type NodeWithComposedMeta,
+} from './compiled-command';
 
 // ---------------------------------------------------------------------------
 // Helpers — build WorkflowDefinitions in-memory (pure: no parseWorkflow, no
@@ -23,6 +29,18 @@ function mapOf(...workflows: WorkflowDefinition[]): Map<string, WorkflowDefiniti
 
 function nodeById(w: WorkflowDefinition, id: string): DagNode | undefined {
   return w.nodes.find(n => n.id === id);
+}
+
+function composedMeta(node: DagNode | undefined): ComposedNodeMeta | undefined {
+  return node === undefined ? undefined : (node as DagNode & NodeWithComposedMeta)[COMPOSED_NODE];
+}
+
+function composedInputs(node: DagNode | undefined): Record<string, string> | undefined {
+  return composedMeta(node)?.inputs;
+}
+
+function composedOrigin(node: DagNode | undefined): string | undefined {
+  return composedMeta(node)?.origin;
 }
 
 function compiledLoopPrompt(node: DagNode | undefined): string | undefined {
@@ -227,9 +245,14 @@ describe('expandWorkflowIncludes — with input mapping', () => {
         },
       },
     ]);
-    const parent = wf('parent', [
-      { id: 'review', include: 'parameterized', with: { detail: 'CLEAN-TEMP-FILES' } },
-    ]);
+    // `interactive: true` because the block carries an approval gate — a composed gate a
+    // background run cannot drive is a load error (#1764).
+    const parent = {
+      ...wf('parent', [
+        { id: 'review', include: 'parameterized', with: { detail: 'CLEAN-TEMP-FILES' } },
+      ]),
+      interactive: true,
+    };
 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
@@ -429,9 +452,10 @@ describe('expandWorkflowIncludes — with input mapping', () => {
         },
       },
     ]);
-    const parent = wf('parent', [
-      { id: 'review', include: 'parameterized', with: { value: 'done' } },
-    ]);
+    const parent = {
+      ...wf('parent', [{ id: 'review', include: 'parameterized', with: { value: 'done' } }]),
+      interactive: true, // the block carries an approval gate (#1764)
+    };
 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
@@ -698,10 +722,13 @@ describe('expandWorkflowIncludes — refs in Markdown code spans', () => {
         depends_on: ['plan'],
       },
     ]);
-    const parent = wf('parent', [
-      { id: 'plan', prompt: 'parent plan' },
-      { id: 'inc', include: 'approval-block', depends_on: ['plan'] },
-    ]);
+    const parent = {
+      ...wf('parent', [
+        { id: 'plan', prompt: 'parent plan' },
+        { id: 'inc', include: 'approval-block', depends_on: ['plan'] },
+      ]),
+      interactive: true, // the block carries an approval gate (#1764)
+    };
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const gate = nodeById(workflows.get('parent')!, 'inc__gate');
@@ -1290,13 +1317,33 @@ describe('expandWorkflowIncludes — determinism', () => {
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
   });
 
-  test('include-free workflows pass through unchanged (fast path)', () => {
-    const plain = wf('plain', [{ id: 'a', prompt: 'a' }]);
-    const raw = mapOf(plain);
-    const { workflows, errors } = expandWorkflowIncludes(raw);
+  test('include-free workflows are collapsed too, so composition cannot change behaviour', () => {
+    // There is no byte-for-byte fast path any more (#1764). Collapsing only workflows that
+    // happen to contain an `include:` would make a workflow's own nodes resolve differently
+    // depending on an unrelated authoring choice, which is the defect this fixes.
+    const plain: WorkflowDefinition = {
+      ...wf('plain', [
+        { id: 'a', prompt: 'a' },
+        { id: 'b', prompt: 'b', provider: 'codex' },
+      ]),
+      provider: 'pi',
+      model: 'large',
+    };
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(plain));
     expect(errors).toHaveLength(0);
-    // Byte-identical object identity: the fast path returns the raw workflow.
-    expect(workflows.get('plain')).toBe(plain);
+
+    const expanded = workflows.get('plain')!;
+    expect(expanded).not.toBe(plain);
+    expect(expanded.provider).toBeUndefined();
+    expect(expanded.model).toBeUndefined();
+    expect(nodeById(expanded, 'a')).toMatchObject({ provider: 'pi', model: 'large' });
+    // The node's own value always wins over the workflow's — and a node that switches
+    // provider does NOT inherit the other provider's model string, matching what the
+    // executor does with a workflow-level model today.
+    expect(nodeById(expanded, 'b')).toMatchObject({ provider: 'codex' });
+    expect((nodeById(expanded, 'b') as Record<string, unknown>).model).toBeUndefined();
+    // The input is never mutated — discovery hands the same object to display surfaces.
+    expect(plain.provider).toBe('pi');
   });
 });
 
@@ -1448,5 +1495,216 @@ describe('expandWorkflowIncludes — workflow: node `with:` values (#2470)', () 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(workflows.has('parent')).toBe(false);
     expect(errors.find(e => e.filename === 'parent')?.error).toContain("requires input 'diff'");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Composed-node metadata (#1764) — the engine-private stamp that carries a
+// node's authoring workflow, its resolved inputs, and its block-entry position.
+// ---------------------------------------------------------------------------
+
+describe('expandWorkflowIncludes — composed-node metadata survives nesting', () => {
+  test('a node stamped at the INNER level keeps that stamp two levels out', () => {
+    // inner declares `plan`; mid forwards its own `topic` into it; top supplies `topic`.
+    // `mid__blk__run` is cloned TWICE (inner→mid, then mid→top). structuredClone drops
+    // symbol keys, so without explicit preservation the stamp vanishes at the second
+    // clone and the composed script silently sees no INPUTS_PLAN.
+    const inner = withSignature(wf('inner', [{ id: 'run', bash: 'echo run' }]), {
+      inputs: { plan: { required: true } },
+    });
+    const mid = withSignature(
+      wf('mid', [{ id: 'blk', include: 'inner', with: { plan: '$INPUTS.topic' } }]),
+      { inputs: { topic: { required: true } } }
+    );
+    const top = wf('top', [{ id: 'mid', include: 'mid', with: { topic: 'ship it' } }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(inner, mid, top));
+    expect(errors).toHaveLength(0);
+
+    const run = nodeById(workflows.get('top')!, 'mid__blk__run')!;
+    // Write-once: the INNER workflow's own input name, not the outer's `topic`.
+    expect(composedInputs(run)).toEqual({ plan: 'ship it' });
+    expect(composedOrigin(run)).toBe('inner');
+  });
+});
+
+describe('expandWorkflowIncludes — systemPrompt/agents are node-ref surfaces (#2476)', () => {
+  test('namespaces $node.output refs in systemPrompt and every agents field', () => {
+    const block = wf('blk', [
+      { id: 'gather', bash: 'echo data' },
+      {
+        id: 'use',
+        prompt: 'work',
+        depends_on: ['gather'],
+        systemPrompt: 'context: $gather.output',
+        agents: {
+          helper: { description: 'reads $gather.output', prompt: 'act on $gather.output' },
+        },
+      },
+    ]);
+    const parent = wf('parent', [{ id: 'inc', include: 'blk' }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+
+    const use = nodeById(workflows.get('parent')!, 'inc__use')!;
+    expect(use.systemPrompt).toBe('context: $inc__gather.output');
+    expect(use.agents?.helper.description).toBe('reads $inc__gather.output');
+    expect(use.agents?.helper.prompt).toBe('act on $inc__gather.output');
+  });
+});
+
+describe('expandWorkflowIncludes — composed approval gates are stamped, not rejected (#1764)', () => {
+  const gateBlock = (): WorkflowDefinition =>
+    wf('gate-blk', [
+      { id: 'plan', prompt: 'plan' },
+      { id: 'gate', approval: { message: 'Approve?' }, depends_on: ['plan'] },
+    ]);
+
+  test('a composed gate carries its origin so invocation can decide', () => {
+    // Expansion records WHERE the gate came from; whether a run can drive it is a
+    // question only the invoked workflow can answer (see assertComposedGateDriveable).
+    const parent = wf('parent', [{ id: 'inc', include: 'gate-blk' }]);
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(gateBlock(), parent));
+
+    expect(errors).toHaveLength(0);
+    expect(composedOrigin(nodeById(workflows.get('parent')!, 'inc__gate'))).toBe('gate-blk');
+  });
+
+  test('a non-interactive INTERMEDIATE block still expands — it is never the run owner', () => {
+    // The regression this replaced: rejecting at every expansion level made a valid
+    // three-level composition unloadable even when the top-level workflow declared
+    // `interactive: true`, because the intermediate block has no reason to declare it.
+    const mid = wf('mid', [{ id: 'i', include: 'gate-blk' }]);
+    const top = { ...wf('top', [{ id: 'm', include: 'mid' }]), interactive: true };
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(gateBlock(), mid, top));
+    expect(errors).toHaveLength(0);
+    expect(workflows.has('top')).toBe(true);
+    expect(workflows.has('mid')).toBe(true);
+    // The stamp names the file that authored the gate, three levels down.
+    expect(composedOrigin(nodeById(workflows.get('top')!, 'm__i__gate'))).toBe('gate-blk');
+  });
+
+  test("a parent's OWN approval node carries no composed origin", () => {
+    // One file, one reader: the gate and the missing `interactive:` are visible together,
+    // so invocation has nothing to refuse.
+    const plain = wf('plain-blk', [{ id: 'work', prompt: 'work' }]);
+    const parent = wf('parent', [
+      { id: 'inc', include: 'plain-blk' },
+      { id: 'gate', approval: { message: 'Approve?' }, depends_on: ['inc'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(plain, parent));
+    expect(errors).toHaveLength(0);
+    expect(composedOrigin(nodeById(workflows.get('parent')!, 'gate'))).toBeUndefined();
+  });
+
+  test('a composed gate nested inside a loop_group body is stamped too', () => {
+    const block = wf('lg-gate-blk', [
+      {
+        id: 'group',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 2,
+          nodes: [{ id: 'gate', approval: { message: 'Approve?' } }],
+        },
+      },
+    ]);
+    const parent = wf('parent', [{ id: 'inc', include: 'lg-gate-blk' }]);
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+    const group = nodeById(workflows.get('parent')!, 'inc__group') as {
+      loop_group: { nodes: DagNode[] };
+    };
+    expect(composedOrigin(group.loop_group.nodes[0])).toBe('lg-gate-blk');
+  });
+});
+
+describe('expandWorkflowIncludes — requires: unions instead of dropping (#1764)', () => {
+  test("a composed block's requirement reaches the composing workflow, de-duplicated", () => {
+    const inner = { ...wf('inner', [{ id: 'a', prompt: 'a' }]), requires: ['github' as const] };
+    const mid = { ...wf('mid', [{ id: 'i', include: 'inner' }]), requires: ['github' as const] };
+    const top = wf('top', [{ id: 'm', include: 'mid' }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(inner, mid, top));
+    expect(errors).toHaveLength(0);
+    expect(workflows.get('top')!.requires).toEqual(['github']);
+    expect(workflows.get('mid')!.requires).toEqual(['github']);
+  });
+
+  test('a workflow composing nothing that requires anything keeps requires undefined', () => {
+    const block = wf('plain', [{ id: 'a', prompt: 'a' }]);
+    const parent = wf('parent', [{ id: 'inc', include: 'plain' }]);
+    const { workflows } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(workflows.get('parent')!.requires).toBeUndefined();
+  });
+});
+
+describe('expandWorkflowIncludes — where a workflow-level model: travels (#1764)', () => {
+  const collapse = (w: WorkflowDefinition): DagNode[] =>
+    expandWorkflowIncludes(mapOf(w)).workflows.get(w.name)!.nodes;
+
+  test('travels to a node that declares no provider of its own', () => {
+    const nodes = collapse({
+      ...wf('w', [{ id: 'n', prompt: 'p' }]),
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+    });
+    expect(nodes[0]).toMatchObject({ provider: 'codex', model: 'gpt-5.6-sol' });
+  });
+
+  test('travels to a node that redundantly re-declares the SAME provider', () => {
+    // The branch a regression would most plausibly drop, and a common authoring habit.
+    const nodes = collapse({
+      ...wf('w', [{ id: 'n', prompt: 'p', provider: 'codex' }]),
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+    });
+    expect(nodes[0]).toMatchObject({ provider: 'codex', model: 'gpt-5.6-sol' });
+  });
+
+  test('does NOT travel to a node that switches provider', () => {
+    const nodes = collapse({
+      ...wf('w', [{ id: 'n', prompt: 'p', provider: 'claude' }]),
+      provider: 'codex',
+      model: 'gpt-5.6-sol',
+    });
+    expect((nodes[0] as Record<string, unknown>).model).toBeUndefined();
+  });
+
+  test('does NOT travel when the workflow declares a model but no provider — the known divergence', () => {
+    // Pinned deliberately: the pre-collapse chain compared the node against the RESOLVED
+    // workflow provider, so a tier resolving to `codex` DID reach a `provider: codex`
+    // node. Load time cannot resolve tiers (they depend on the acting user's prefs), so
+    // the model stays behind and the node uses its own provider's configured default.
+    const nodes = collapse({
+      ...wf('w', [{ id: 'n', prompt: 'p', provider: 'codex' }]),
+      model: 'large',
+    });
+    expect((nodes[0] as Record<string, unknown>).model).toBeUndefined();
+    expect((nodes[0] as Record<string, unknown>).provider).toBe('codex');
+  });
+
+  test('every other node-affecting field travels regardless of the node provider', () => {
+    // `model` alone carries a provider condition, because it alone is a provider-specific
+    // string the executor already refused to inherit across providers. `effort`/`thinking`/
+    // `sandbox`/`betas`/`fallbackModel` had no such condition before the collapse and must
+    // not gain one, or the collapse stops being behaviour-preserving.
+    const nodes = collapse({
+      ...wf('w', [{ id: 'n', prompt: 'p', provider: 'claude' }]),
+      provider: 'codex',
+      effort: 'high',
+      thinking: { type: 'enabled', budgetTokens: 4000 },
+      sandbox: { enabled: true },
+      betas: ['beta-x'],
+      fallbackModel: 'fallback-1',
+    });
+    expect(nodes[0]).toMatchObject({
+      effort: 'high',
+      thinking: { type: 'enabled', budgetTokens: 4000 },
+      sandbox: { enabled: true },
+      betas: ['beta-x'],
+      fallbackModel: 'fallback-1',
+    });
   });
 });
