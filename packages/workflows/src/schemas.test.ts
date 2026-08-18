@@ -880,12 +880,32 @@ describe('dagNodeSchema — loop_group', () => {
     }
   });
 
-  test('loop_group requires until (completion signal)', () => {
+  test('loop_group rejects a body with no completion channel', () => {
     const result = dagNodeSchema.safeParse({
       id: 'grp',
       loop_group: { max_iterations: 3, nodes: [{ id: 'x', prompt: 'x' }] },
     });
     expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes('completion channel'))).toBe(true);
+    }
+  });
+
+  test('loop_group accepts until_bash alone (no prose signal) — #2563', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'grp',
+      loop_group: {
+        max_iterations: 3,
+        until_bash: 'test -f ./done',
+        nodes: [{ id: 'x', bash: 'echo hi' }],
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const grp = result.data as { loop_group?: { until?: string; until_bash?: string } };
+      expect(grp.loop_group?.until).toBeUndefined();
+      expect(grp.loop_group?.until_bash).toBe('test -f ./done');
+    }
   });
 
   test('nested loop_group body parses (loop_group inside loop_group)', () => {
@@ -915,6 +935,141 @@ describe('dagNodeSchema — loop_group', () => {
       const inner = outer.loop_group?.nodes[0];
       expect(isLoopGroupNode(inner as never)).toBe(true);
       expect(inner?.loop_group?.nodes).toHaveLength(1);
+    }
+  });
+});
+
+describe('dagNodeSchema — loop completion channel (#2563)', () => {
+  test('a loop declaring only until_bash parses, with no prose signal', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'deterministic',
+      loop: {
+        prompt: 'fix the failing tests',
+        max_iterations: 5,
+        until_bash: 'bun run test',
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { loop?: { until?: string; until_bash?: string } };
+      expect(node.loop?.until).toBeUndefined();
+      expect(node.loop?.until_bash).toBe('bun run test');
+    }
+  });
+
+  test('a loop declaring only until still parses (unchanged)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'prose',
+      loop: { prompt: 'iterate', until: 'COMPLETE', max_iterations: 5 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { loop?: { until?: string } };
+      expect(node.loop?.until).toBe('COMPLETE');
+    }
+  });
+
+  test('a loop with neither channel is rejected, naming both', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'no-channel',
+      loop: { prompt: 'iterate', max_iterations: 5 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find(i => i.message.includes('completion channel'));
+      expect(issue).toBeDefined();
+      expect(issue?.message).toContain('loop.until');
+      expect(issue?.message).toContain('loop.until_bash');
+      expect(issue?.path).toEqual(['loop', 'until']);
+    }
+  });
+
+  test('an empty-string until is rejected rather than treated as absent', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'blank',
+      loop: { prompt: 'iterate', until: '', max_iterations: 5 },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // Channel-verdict matrix. `structural.test.ts` in @archon/web runs the SAME case
+  // names against the builder's hand-written mirror of these rules — the two cannot
+  // share code (@archon/web must not import @archon/workflows), so matching names are
+  // what makes a future divergence visible. Change one, change both.
+  describe('channel verdict matrix (twin: builder structural.test.ts)', () => {
+    const cases: Array<[string, Record<string, unknown>, boolean]> = [
+      ['neither declared', {}, false],
+      ['until only, real', { until: 'COMPLETE' }, true],
+      ['until_bash only, real', { until_bash: 'bun run test' }, true],
+      ['both real', { until: 'COMPLETE', until_bash: 'bun run test' }, true],
+      ['until blank, no bash', { until: '  ' }, false],
+      ['until blank + real bash', { until: ' ', until_bash: 'bun run test' }, false],
+      ['real until + blank bash', { until: 'COMPLETE', until_bash: '   ' }, false],
+      ['both blank', { until: ' ', until_bash: '\t' }, false],
+      ['until empty string', { until: '' }, false],
+      ['until_bash empty string', { until_bash: '' }, false],
+      ['padded until (legit)', { until: ' COMPLETE ' }, true],
+      ['multiline until_bash (legit)', { until_bash: '  set -e\n  test -f x\n' }, true],
+    ];
+
+    for (const [name, channels, shouldParse] of cases) {
+      test(`${name} -> ${shouldParse ? 'accepted' : 'rejected'}`, () => {
+        const result = dagNodeSchema.safeParse({
+          id: 'l',
+          loop: { prompt: 'iterate', max_iterations: 5, ...channels },
+        });
+        expect(result.success).toBe(shouldParse);
+      });
+    }
+  });
+
+  test('a blank channel is rejected even when its sibling is valid', () => {
+    // The aggregate at-least-one rule only fires when BOTH are blank, so the
+    // per-field checks are what catch these two. Both are broken at runtime, not
+    // merely untidy: `bash -c "   "` exits 0 (completing on iteration 1), and a blank
+    // signal reaches detectCompletionSignal, whose own-line pattern matches any
+    // whitespace-only line the model emits.
+    const blankSignal = dagNodeSchema.safeParse({
+      id: 'a',
+      loop: { prompt: 'p', until: ' ', until_bash: 'bun run test', max_iterations: 5 },
+    });
+    expect(blankSignal.success).toBe(false);
+    if (!blankSignal.success) {
+      expect(blankSignal.error.issues.some(i => i.message.includes("'loop.until' must be"))).toBe(
+        true
+      );
+    }
+
+    const blankCheck = dagNodeSchema.safeParse({
+      id: 'b',
+      loop: { prompt: 'p', until: 'COMPLETE', until_bash: '   ', max_iterations: 5 },
+    });
+    expect(blankCheck.success).toBe(false);
+    if (!blankCheck.success) {
+      expect(
+        blankCheck.error.issues.some(i => i.message.includes("'loop.until_bash' must be"))
+      ).toBe(true);
+    }
+  });
+
+  test('a declared channel is validated but never rewritten', () => {
+    // Trimming for validation is not trimming for storage: `until` is matched
+    // verbatim by detectCompletionSignal and `until_bash` is executed verbatim, so
+    // rewriting either here would silently change what an existing workflow does.
+    const result = dagNodeSchema.safeParse({
+      id: 'verbatim',
+      loop: {
+        prompt: 'p',
+        until: ' COMPLETE ',
+        until_bash: '  set -e\n  test -f x\n',
+        max_iterations: 5,
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { loop?: { until?: string; until_bash?: string } };
+      expect(node.loop?.until).toBe(' COMPLETE ');
+      expect(node.loop?.until_bash).toBe('  set -e\n  test -f x\n');
     }
   });
 });
