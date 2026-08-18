@@ -789,9 +789,10 @@ describe('LOOP_NODE_AI_FIELDS', () => {
   });
 
   test('contains all other AI-specific fields from BASH_NODE_AI_FIELDS', () => {
+    // `output_format` is deliberately absent since #2563 — a loop: node makes its
+    // own sendQuery, so the schema is honoured rather than warned-and-dropped.
     const expectedFields = [
       'context',
-      'output_format',
       'allowed_tools',
       'denied_tools',
       'hooks',
@@ -969,7 +970,7 @@ describe('dagNodeSchema — loop completion channel (#2563)', () => {
     }
   });
 
-  test('a loop with neither channel is rejected, naming both', () => {
+  test('a loop with no channel is rejected, naming every channel it could declare', () => {
     const result = dagNodeSchema.safeParse({
       id: 'no-channel',
       loop: { prompt: 'iterate', max_iterations: 5 },
@@ -980,6 +981,9 @@ describe('dagNodeSchema — loop completion channel (#2563)', () => {
       expect(issue).toBeDefined();
       expect(issue?.message).toContain('loop.until');
       expect(issue?.message).toContain('loop.until_bash');
+      // A `loop:` has three channels, so the message must offer all three — an
+      // author told about two would not learn the one this PR added exists.
+      expect(issue?.message).toContain('loop.until_field');
       expect(issue?.path).toEqual(['loop', 'until']);
     }
   });
@@ -992,12 +996,13 @@ describe('dagNodeSchema — loop completion channel (#2563)', () => {
     expect(result.success).toBe(false);
   });
 
-  // Channel-verdict matrix. `structural.test.ts` in @archon/web runs the SAME case
-  // names against the builder's hand-written mirror of these rules — the two cannot
-  // share code (@archon/web must not import @archon/workflows), so matching names are
-  // what makes a future divergence visible. Change one, change both.
+  // Channel-verdict matrix — this package's half. The cross-package guard that
+  // actually ENFORCES agreement is `scripts/node-ref-parity.test.ts`, which runs both
+  // encodings over one corpus and compares verdicts in CI; this matrix stays as the
+  // engine's own regression coverage. `structural.test.ts` in @archon/web mirrors
+  // these case names. Change one, change both — the guard will say so if you don't.
   describe('channel verdict matrix (twin: builder structural.test.ts)', () => {
-    const cases: Array<[string, Record<string, unknown>, boolean]> = [
+    const cases: Array<[string, Record<string, string>, boolean]> = [
       ['neither declared', {}, false],
       ['until only, real', { until: 'COMPLETE' }, true],
       ['until_bash only, real', { until_bash: 'bun run test' }, true],
@@ -1010,12 +1015,28 @@ describe('dagNodeSchema — loop completion channel (#2563)', () => {
       ['until_bash empty string', { until_bash: '' }, false],
       ['padded until (legit)', { until: ' COMPLETE ' }, true],
       ['multiline until_bash (legit)', { until_bash: '  set -e\n  test -f x\n' }, true],
+      // Third channel (#2563 Part B) — same case names as the builder's twin.
+      ['until_field only, real', { until_field: 'done' }, true],
+      ['until_field blank', { until_field: '  ' }, false],
     ];
+
+    // `until_field` cases need an `output_format` on the node or they would be
+    // rejected for a DIFFERENT reason ("declares no 'output_format'") — which would
+    // make the matrix agree with the builder by accident rather than on the channel
+    // rule it exists to compare. The builder mirrors only the channel rules, so the
+    // schema is supplied here to isolate the same question.
+    const untilFieldSchema = {
+      type: 'object',
+      properties: { done: { type: 'boolean' } },
+      required: ['done'],
+    };
 
     for (const [name, channels, shouldParse] of cases) {
       test(`${name} -> ${shouldParse ? 'accepted' : 'rejected'}`, () => {
+        const needsSchema = 'until_field' in channels;
         const result = dagNodeSchema.safeParse({
           id: 'l',
+          ...(needsSchema ? { output_format: untilFieldSchema } : {}),
           loop: { prompt: 'iterate', max_iterations: 5, ...channels },
         });
         expect(result.success).toBe(shouldParse);
@@ -1074,19 +1095,131 @@ describe('dagNodeSchema — loop completion channel (#2563)', () => {
   });
 });
 
+describe('dagNodeSchema — loop.until_field (#2563)', () => {
+  const schema = {
+    type: 'object',
+    properties: { done: { type: 'boolean' }, note: { type: 'string' } },
+    required: ['done'],
+  };
+  const loopWith = (loop: Record<string, unknown>, output_format?: unknown) =>
+    dagNodeSchema.safeParse({
+      id: 'l',
+      ...(output_format !== undefined ? { output_format } : {}),
+      loop: { prompt: 'p', max_iterations: 5, ...loop },
+    });
+
+  test('a valid until_field parses and keeps output_format on the node', () => {
+    const result = loopWith({ until_field: 'done' }, schema);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { output_format?: unknown; loop?: { until_field?: string } };
+      // Before #2563 the transform dropped output_format for loop nodes entirely.
+      expect(node.output_format).toEqual(schema);
+      expect(node.loop?.until_field).toBe('done');
+    }
+  });
+
+  test('until_field alone satisfies the completion-channel rule', () => {
+    // No `until`, no `until_bash` — the structured channel is a channel.
+    expect(loopWith({ until_field: 'done' }, schema).success).toBe(true);
+  });
+
+  test('until_field without output_format is rejected', () => {
+    const result = loopWith({ until_field: 'done' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes("declares no 'output_format'"))).toBe(
+        true
+      );
+    }
+  });
+
+  test('until_field naming an undeclared property is rejected, listing what is declared', () => {
+    const result = loopWith({ until_field: 'finished' }, schema);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find(i => i.message.includes('not declared'));
+      expect(issue).toBeDefined();
+      expect(issue?.message).toContain('done, note');
+    }
+  });
+
+  test('until_field must be listed in output_format.required', () => {
+    // Otherwise a schema-valid payload may omit it, "absent" reads as "not
+    // complete", and the loop burns max_iterations reporting the wrong cause.
+    const optional = {
+      type: 'object',
+      properties: { done: { type: 'boolean' } },
+    };
+    const result = loopWith({ until_field: 'done' }, optional);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes('output_format.required'))).toBe(
+        true
+      );
+    }
+  });
+
+  test('until_field declared as a non-boolean type is rejected', () => {
+    const stringy = {
+      type: 'object',
+      properties: { done: { type: 'string' } },
+      required: ['done'],
+    };
+    const result = loopWith({ until_field: 'done' }, stringy);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes("must be 'boolean'"))).toBe(true);
+    }
+  });
+
+  test('a property with no declared type is accepted', () => {
+    // JSON Schema does not require `type`; only a WRONG type is a violation.
+    const untyped = { type: 'object', properties: { done: {} }, required: ['done'] };
+    expect(loopWith({ until_field: 'done' }, untyped).success).toBe(true);
+  });
+
+  test('output_format without until_field is fine (structured output, prose termination)', () => {
+    expect(loopWith({ until: 'DONE' }, schema).success).toBe(true);
+  });
+
+  test('until_field on a loop_group is an unknown key, leaving it channel-less', () => {
+    // Declined by design: a loop_group body node can declare output_format and be
+    // read by `until_bash: '[ "$decide.output.done" = "true" ]'`, so the existing
+    // wiring already expresses it there. The key is stripped and the group is left
+    // with no channel at all, which is the error the author sees.
+    const result = dagNodeSchema.safeParse({
+      id: 'g',
+      loop_group: { max_iterations: 3, until_field: 'done', nodes: [{ id: 'x', bash: 'echo' }] },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find(i => i.message.includes('completion channel'));
+      expect(issue).toBeDefined();
+      // The group's message names only the two channels a group has.
+      expect(issue?.message).not.toContain('until_field');
+    }
+  });
+});
+
 describe('LOOP_GROUP_NODE_AI_FIELDS', () => {
   test('excludes model/provider (forwarded to body AI nodes)', () => {
     expect(LOOP_GROUP_NODE_AI_FIELDS).not.toContain('model');
     expect(LOOP_GROUP_NODE_AI_FIELDS).not.toContain('provider');
   });
 
-  test('differs from LOOP_NODE_AI_FIELDS only on pi (#2133)', () => {
-    // A plain loop: node calls sendQuery itself, so pi IS honored there (not warned).
-    // A loop_group node never calls sendQuery — body nodes carry their own pi — so
-    // pi is warned-ignored on the group. That single-key difference is intentional.
+  test('differs from LOOP_NODE_AI_FIELDS on pi (#2133) and output_format (#2563)', () => {
+    // Both differences have the same cause: a plain loop: node calls sendQuery
+    // itself, so its per-node Pi posture AND its output_format schema both reach
+    // that call. A loop_group never calls sendQuery — its body nodes carry their
+    // own — so both stay warned-ignored on the group.
     expect(LOOP_NODE_AI_FIELDS).not.toContain('pi');
+    expect(LOOP_NODE_AI_FIELDS).not.toContain('output_format');
     expect(LOOP_GROUP_NODE_AI_FIELDS).toContain('pi');
-    expect(LOOP_GROUP_NODE_AI_FIELDS.filter(f => f !== 'pi')).toEqual([...LOOP_NODE_AI_FIELDS]);
+    expect(LOOP_GROUP_NODE_AI_FIELDS).toContain('output_format');
+    expect(LOOP_GROUP_NODE_AI_FIELDS.filter(f => f !== 'pi' && f !== 'output_format')).toEqual([
+      ...LOOP_NODE_AI_FIELDS,
+    ]);
   });
 });
 
@@ -1108,9 +1241,13 @@ describe('dagNodeSchema — output_format survival by node type', () => {
    * was stated in five places and derived from none. Its history earned it: the claim was
    * written three times across #2579 and was wrong or imprecise twice.
    *
-   * If a future change (e.g. #2563's loop structured completion) spreads `aiOnly` in the
-   * `loop` branch, THIS is what fails — and the loader message telling authors that
-   * declaring `output_format` on a loop "would change nothing" has to be revisited.
+   * #2563 is the change this tripwire was written to catch, and it fired: a `loop:`
+   * node now KEEPS `output_format` (it makes its own sendQuery, so the schema reaches
+   * the provider and the node's output becomes the validated JSON). The loader message
+   * telling authors that declaring one on a loop "would change nothing" was removed
+   * with it — a `loop:` is now classified `schema-capable` and gets the same remedy as
+   * a prompt node. The asymmetry that remains is `loop_group:`, which never calls the
+   * provider itself.
    */
   const outputFormat = { type: 'object', properties: { done: { type: 'boolean' } } };
 
@@ -1121,10 +1258,10 @@ describe('dagNodeSchema — output_format survival by node type', () => {
     return result.data as { output_format?: unknown };
   }
 
-  test('a loop node DROPS output_format (aiOnly is not spread)', () => {
+  test('a loop node KEEPS output_format (#2563 — it runs its own sendQuery)', () => {
     expect(
       parsedNode({ loop: { until: 'DONE', max_iterations: 3, prompt: 'go' } }).output_format
-    ).toBeUndefined();
+    ).toEqual(outputFormat);
   });
 
   test('a loop_group node KEEPS output_format (aiOnly is spread)', () => {

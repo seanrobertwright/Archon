@@ -7211,6 +7211,672 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(sentinelExists).toBe(false);
     });
 
+    // ─── Structured completion channel: until_field (#2563 Part B) ────────────
+
+    const untilFieldSchema = {
+      type: 'object',
+      properties: { done: { type: 'boolean' }, note: { type: 'string' } },
+      required: ['done'],
+    };
+
+    it('completes on the iteration whose validated payload has until_field true', async () => {
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        calls++;
+        // Grammar-constrained providers routinely emit NO prose — the whole answer
+        // is the payload. The iteration must not be failed as empty for that.
+        yield {
+          type: 'result',
+          sessionId: `s-${String(calls)}`,
+          structuredOutput: { done: calls >= 3, note: `pass ${String(calls)}` },
+        };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-until-field');
+
+      const result = await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-until-field',
+          nodes: [
+            {
+              id: 'my-loop',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'Work until done.', max_iterations: 6, until_field: 'done' },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // false, false, true -> exactly three iterations.
+      expect(calls).toBe(3);
+      // The node's output is the validated payload, not prose.
+      expect(JSON.parse(result ?? '{}')).toMatchObject({ done: true, note: 'pass 3' });
+    });
+
+    it('requests output_format from the provider for a loop node', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'result', sessionId: 's1', structuredOutput: { done: true } };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-of-passthrough');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-of-passthrough',
+          nodes: [
+            {
+              id: 'my-loop',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', max_iterations: 2, until_field: 'done' },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Before #2563 the parse transform dropped output_format for loop nodes, so
+      // the schema never reached sendQuery at all.
+      const options = mockSendQueryDag.mock.calls[0][3] as { outputFormat?: unknown };
+      expect(options.outputFormat).toEqual({ type: 'json_schema', schema: untilFieldSchema });
+    });
+
+    it('fails rather than degrading when a payload never satisfies the schema', async () => {
+      // A string "true" is not a boolean: ajv rejects it, so this is a validation
+      // miss, NOT a quiet "not complete yet" that would burn max_iterations.
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'result', sessionId: 's1', structuredOutput: { done: 'true' } };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-strict-bool');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-strict-bool',
+          nodes: [
+            {
+              id: 'my-loop',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', max_iterations: 5, until_field: 'done' },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Enforced provider -> zero reasks, fails on the first attempt.
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      const failed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+      );
+      expect(failed.length).toBeGreaterThan(0);
+      expect(String((failed[0][0] as { data: { error: string } }).data.error)).toContain(
+        'failed schema validation'
+      );
+    });
+
+    it('re-asks a best-effort provider within the iteration, then completes', async () => {
+      // Attempt 1 violates the schema; attempt 2 satisfies it with done: true.
+      // The reask must not consume a loop iteration — one iteration, two attempts.
+      mockSendQueryDag.mockImplementationOnce(function* () {
+        yield { type: 'result', sessionId: 's1', structuredOutput: { note: 'no done key' } };
+      });
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'result', sessionId: 's2', structuredOutput: { done: true } };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-reask-recover');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-reask-recover',
+          nodes: [
+            {
+              id: 'my-loop',
+              provider: 'pi',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', max_iterations: 4, until_field: 'done' },
+            },
+          ],
+        },
+        workflowRun,
+        'pi',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'pi' }
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(2);
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      // One ITERATION, despite two attempts.
+      const iterationsStarted = events.filter(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'loop_iteration_started'
+      );
+      expect(iterationsStarted.length).toBe(1);
+      const completed = events.filter(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_completed'
+      );
+      expect(completed.length).toBe(1);
+    });
+
+    it('keeps threading the loop session across a mid-loop re-ask', async () => {
+      // A reask runs in a throwaway session by design. Adopting it as the loop's
+      // thread would silently discard every earlier iteration while
+      // `fresh_context: false` still promises "each iteration resumes the prior
+      // conversation" — so attempt 0's session stays the thread.
+      const sessions: Array<string | undefined> = [];
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(function* (
+        _p: unknown,
+        _cwd: unknown,
+        resumeId: string | undefined
+      ) {
+        calls++;
+        sessions.push(resumeId);
+        if (calls === 1) {
+          // iteration 1, attempt 0 — valid but not done; establishes the thread.
+          yield { type: 'result', sessionId: 'thread-1', structuredOutput: { done: false } };
+        } else if (calls === 2) {
+          // iteration 2, attempt 0 — schema miss, triggers a reask.
+          yield { type: 'result', sessionId: 'thread-2', structuredOutput: { note: 'bad' } };
+        } else if (calls === 3) {
+          // iteration 2, reask — fresh throwaway session, repaired but not done.
+          yield { type: 'result', sessionId: 'throwaway', structuredOutput: { done: false } };
+        } else {
+          yield { type: 'result', sessionId: 'thread-3', structuredOutput: { done: true } };
+        }
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-reask-threading');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-reask-threading',
+          nodes: [
+            {
+              id: 'my-loop',
+              provider: 'pi',
+              output_format: untilFieldSchema,
+              loop: {
+                prompt: 'go',
+                max_iterations: 5,
+                until_field: 'done',
+                fresh_context: false,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'pi',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'pi' }
+      );
+
+      // 1: fresh (iteration 1 always is). 2: threads from iteration 1's session.
+      // 3: the reask, deliberately fresh. 4: MUST thread from attempt 0's session,
+      // not from the throwaway one the reask created.
+      expect(sessions[0]).toBeUndefined();
+      expect(sessions[1]).toBe('thread-1');
+      expect(sessions[2]).toBeUndefined();
+      expect(sessions[3]).toBe('thread-2');
+      expect(sessions[3]).not.toBe('throwaway');
+    });
+
+    it('keeps threading when the re-ask happens on iteration 1', async () => {
+      // The i === 1 case. Iteration 1 has no session to resume FROM, so any fix that
+      // restores the pre-iteration cursor is a no-op here and leaves the throwaway
+      // session as the thread — the same defect, one iteration earlier. Attempt 0's
+      // session is the loop's real conversation and is what iteration 2 must resume.
+      const sessions: Array<string | undefined> = [];
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(function* (
+        _p: unknown,
+        _cwd: unknown,
+        resumeId: string | undefined
+      ) {
+        calls++;
+        sessions.push(resumeId);
+        if (calls === 1)
+          yield { type: 'result', sessionId: 'orig-1', structuredOutput: { bad: 1 } };
+        else if (calls === 2)
+          yield { type: 'result', sessionId: 'throwaway', structuredOutput: { done: false } };
+        else yield { type: 'result', sessionId: 'orig-2', structuredOutput: { done: true } };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-reask-iter1');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-reask-iter1',
+          nodes: [
+            {
+              id: 'my-loop',
+              provider: 'pi',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', max_iterations: 5, until_field: 'done', fresh_context: false },
+            },
+          ],
+        },
+        workflowRun,
+        'pi',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'pi' }
+      );
+
+      expect(sessions[0]).toBeUndefined(); // iteration 1, attempt 0 — always fresh
+      expect(sessions[1]).toBeUndefined(); // the reask — deliberately fresh
+      expect(sessions[2]).toBe('orig-1'); // iteration 2 threads the real conversation
+      expect(sessions[2]).not.toBe('throwaway');
+    });
+
+    it('hands the next sequential node the loop conversation, not a re-ask session', async () => {
+      // R7 crosses the node boundary: the loop's completion returns
+      // `sessionId: currentSessionId`, which becomes ctx.lastSequentialSession, and
+      // downstream threading off that cursor is automatic. So a reask on the FINAL
+      // iteration would otherwise hand the next node a single-turn throwaway.
+      const sessions: Array<string | undefined> = [];
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(function* (
+        _p: unknown,
+        _cwd: unknown,
+        resumeId: string | undefined
+      ) {
+        calls++;
+        sessions.push(resumeId);
+        if (calls === 1)
+          yield { type: 'result', sessionId: 'loop-conv', structuredOutput: { x: 1 } };
+        else if (calls === 2)
+          yield { type: 'result', sessionId: 'throwaway', structuredOutput: { done: true } };
+        else yield { type: 'assistant', content: 'downstream ran' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-reask-crossnode');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-reask-crossnode',
+          nodes: [
+            {
+              id: 'my-loop',
+              provider: 'pi',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', max_iterations: 3, until_field: 'done', fresh_context: false },
+            },
+            { id: 'after', provider: 'pi', prompt: 'continue', depends_on: ['my-loop'] },
+          ],
+        },
+        workflowRun,
+        'pi',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'pi' }
+      );
+
+      // The third call is the downstream node; it must inherit the loop's conversation.
+      expect(sessions[2]).toBe('loop-conv');
+      expect(sessions[2]).not.toBe('throwaway');
+    });
+
+    it('fails the node when best-effort re-asks are exhausted', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'result', sessionId: 's', structuredOutput: { note: 'still wrong' } };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-reask-exhausted');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-reask-exhausted',
+          nodes: [
+            {
+              id: 'my-loop',
+              provider: 'pi',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', max_iterations: 4, until_field: 'done' },
+            },
+          ],
+        },
+        workflowRun,
+        'pi',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        { ...minimalConfig, assistant: 'pi' }
+      );
+
+      // Original + 3 reasks, then fail — the loop does NOT keep iterating on a
+      // broken completion channel until max_iterations.
+      expect(mockSendQueryDag.mock.calls.length).toBe(4);
+      const failed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+      );
+      expect(failed.length).toBeGreaterThan(0);
+    });
+
+    it('gives a bare-approve finalize the same strict field contract as a normal completion', async () => {
+      // The finalize-on-approve exit (#2074) is a COMPLETION path, so it must carry
+      // declaredFields like every other one — otherwise a downstream
+      // `$loop.output.<declared-optional>` THROWS here while resolving to '' on the
+      // identical loop that completed without a gate. Re-derived from the definition,
+      // exactly like the resume-hydration path (#2091).
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'should never run' };
+        yield { type: 'result', sessionId: 'never' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      // `note` is declared-optional and ABSENT from the finalized payload: with
+      // declaredFields it resolves to ''; without, it throws an OutputRefError.
+      const workflowRun = makeWorkflowRun('finalize-declared-fields', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'judge',
+            iteration: 1,
+            sessionId: 'sig-1',
+            message: 'gate',
+            completionSignaled: true,
+            signaledOutput: JSON.stringify({ done: true }),
+          },
+          loop_user_input: '',
+          loop_feedback_given: false,
+        },
+      });
+
+      const result = await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'finalize-declared-fields',
+          nodes: [
+            {
+              id: 'judge',
+              output_format: untilFieldSchema,
+              loop: {
+                prompt: 'judge',
+                until: 'APPROVED',
+                max_iterations: 5,
+                until_field: 'done',
+                interactive: true,
+                gate_message: 'Review.',
+              },
+            },
+            {
+              id: 'report',
+              depends_on: ['judge'],
+              bash: 'echo "note=[$judge.output.note]"',
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Declared-but-absent optional resolves to empty (shell-quoted by the
+      // bash-escaped substitution path), not a failed consumer.
+      expect(result).toContain("note=['']");
+    });
+
+    it('still honours an until signal at the very end of the PROSE when output_format is set', async () => {
+      // Regression: detection originally concatenated prose + payload into one
+      // haystack. `detectCompletionSignal`'s end-of-output pattern is anchored with
+      // `$` and NO `m` flag, and an object payload always ends in `}` — so the
+      // documented inline "sentinel at the very end of output" form silently stopped
+      // firing for every loop that declared a schema. The own-line and <promise>
+      // forms survive concatenation, which is why this needs its own test.
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        calls++;
+        yield { type: 'assistant', content: 'All tasks are finished. ALLDONE' };
+        yield {
+          type: 'result',
+          sessionId: `s-${String(calls)}`,
+          structuredOutput: { done: false, note: 'still working' },
+        };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-inline-sentinel');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-inline-sentinel',
+          nodes: [
+            {
+              id: 'my-loop',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', until: 'ALLDONE', max_iterations: 4, until_field: 'done' },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // `done` stays false, so only the prose sentinel can have ended this.
+      expect(calls).toBe(1);
+    });
+
+    it('still honours an until signal emitted inside the structured payload', async () => {
+      // A loop declaring BOTH until: and output_format. On a grammar-constrained
+      // provider the prose is empty, so detection reads the serialized payload too —
+      // otherwise the declared signal channel could never fire, silently.
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        calls++;
+        yield {
+          type: 'result',
+          sessionId: `s-${String(calls)}`,
+          structuredOutput: { done: false, note: '<promise>ALLDONE</promise>' },
+        };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-signal-in-payload');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-signal-in-payload',
+          nodes: [
+            {
+              id: 'my-loop',
+              output_format: untilFieldSchema,
+              loop: {
+                prompt: 'go',
+                until: 'ALLDONE',
+                max_iterations: 4,
+                until_field: 'done',
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // `done` stays false, so only the signal can have ended it.
+      expect(calls).toBe(1);
+    });
+
+    it('gives a downstream node strict field access to the loop output', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'result',
+          sessionId: 's1',
+          structuredOutput: { done: true, note: 'shipped' },
+        };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-downstream-field');
+
+      const result = await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-downstream-field',
+          nodes: [
+            {
+              id: 'my-loop',
+              output_format: untilFieldSchema,
+              loop: { prompt: 'go', max_iterations: 3, until_field: 'done' },
+            },
+            {
+              id: 'report',
+              depends_on: ['my-loop'],
+              bash: 'echo "note=$my-loop.output.note"',
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Shell-quoted by the bash-escaped substitution path, as any $node.output.field is.
+      expect(result).toContain("note='shipped'");
+    });
+
     it('strips <promise> tags from platform output', async () => {
       mockSendQueryDag.mockImplementation(function* () {
         yield { type: 'assistant', content: 'Done! <promise>COMPLETE</promise>' };

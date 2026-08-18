@@ -25,11 +25,13 @@ const isNonBlank = (value: string): boolean => value.trim().length > 0;
  *
  * ## Completion channels (#2563)
  *
- * A loop ends through a **completion channel** it declared. `until` (prose signal)
- * and `until_bash` (deterministic check) are the channels today. No single one is
- * required: a loop whose completion is fully checkable declares only `until_bash`
- * and then has no prose-matching path at all, so a sentinel string the model
- * happens to emit while reasoning cannot end it.
+ * A loop ends through a **completion channel** it declared. This shared surface
+ * carries two — `until` (prose signal) and `until_bash` (deterministic check) —
+ * and `loop:` adds a third, `until_field` (a declared boolean in the node's
+ * `output_format`), which `loop_group:` does not have. No single one is required:
+ * a loop whose completion is fully checkable declares only `until_bash` and then
+ * has no prose-matching path at all, so a sentinel string the model happens to
+ * emit while reasoning cannot end it.
  *
  * Two independent rules govern the set, and both are needed:
  *  - **per channel** — a declared channel must carry a usable (non-blank) value;
@@ -42,10 +44,21 @@ const isNonBlank = (value: string): boolean => value.trim().length > 0;
  * `detectCompletionSignal`, whose own-line and end-of-output patterns then match a
  * whitespace-only markdown line or any output ending in a space.
  *
- * Adding a channel means adding it to BOTH rules, and to the console builder's
- * hand-written mirror in `builder/validation/structural.ts` — @archon/web cannot
- * import this package, so the two encodings agree by convention. Verify agreement
- * by parsing both, never by reading them.
+ * Adding a channel means adding it to BOTH rules here, and to TWO hand-maintained
+ * files in the console builder — @archon/web cannot import this package, so they
+ * agree by convention rather than by type. They fail differently, and the second
+ * is the dangerous one:
+ *  - `builder/validation/structural.ts` mirrors these rules. Miss it and the
+ *    builder reports the wrong verdict for a workflow the engine accepts.
+ *  - `builder/variants/loop.ts` (`loopFromDag`/`loopToDag`) is a hand-written FIELD
+ *    LIST, and the importer's unsupported-key warning only walks TOP-LEVEL wire
+ *    keys — anything nested inside `loop: {…}` is invisible to it. Miss it and the
+ *    field is SILENTLY DELETED the first time anyone opens the workflow in the
+ *    console and saves: no import issue, no warning, the loop just quietly loses a
+ *    completion channel. `signal_completes` behaves this way today.
+ *
+ * Verify agreement by parsing both, never by reading them —
+ * `scripts/node-ref-parity.test.ts` does exactly that, in CI.
  */
 export const loopControlSchema = z
   .object({
@@ -90,28 +103,6 @@ export const loopControlSchema = z
     signal_completes: z.boolean().optional(),
   })
   .superRefine((data, ctx) => {
-    // The across-channels rule: at least one completion channel must be declared.
-    // No single field is required on its own, but a loop with none can only ever end
-    // by exhausting max_iterations, which the engine reports as a failure — so it is
-    // always an authoring mistake.
-    //
-    // This answers a different question from the per-channel `isNonBlank` checks
-    // above ("is anything declared?" vs "is this declared value usable?"), so both
-    // are needed — see the docblock. Blank values are already rejected by the time
-    // this runs, so presence is the only test left here.
-    //
-    // A new channel must be added to this condition too, or a loop declaring only
-    // that channel would be rejected as channel-less.
-    if (data.until === undefined && data.until_bash === undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "loop node requires a completion channel: set 'loop.until' (completion signal string) " +
-          "or 'loop.until_bash' (deterministic check, exit 0 = complete)",
-        path: ['until'],
-      });
-    }
-
     if (data.interactive === true && !data.gate_message) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -122,6 +113,40 @@ export const loopControlSchema = z
   });
 
 export type LoopControl = z.infer<typeof loopControlSchema>;
+
+/**
+ * The across-channels rule, applied by each loop variant to its own channel set.
+ *
+ * It lives here rather than on `loopControlSchema` because the two variants no
+ * longer have the same channels: `until_field` (#2563 Part B) is `loop:`-only, so a
+ * shared check would either reject a valid `loop:` or accept a channel-less
+ * `loop_group:`. A parent refinement cannot be relaxed by a child, so the rule
+ * moves down to where the channel set is known.
+ *
+ * Blank values are already rejected per channel by the time this runs, so presence
+ * is the only test left. `declared` is the list of channel names the variant found,
+ * `available` the ones it accepts (for the message).
+ */
+export function addMissingChannelIssue(
+  ctx: z.RefinementCtx,
+  declared: readonly string[],
+  available: readonly { field: string; describe: string }[]
+): void {
+  if (declared.length > 0) return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    message:
+      'loop node requires a completion channel: set ' +
+      available.map(c => `'loop.${c.field}' (${c.describe})`).join(' or '),
+    path: ['until'],
+  });
+}
+
+/** The two channels every loop variant has. */
+export const BASE_COMPLETION_CHANNELS = [
+  { field: 'until', describe: 'completion signal string' },
+  { field: 'until_bash', describe: 'deterministic check, exit 0 = complete' },
+] as const;
 
 /**
  * `loop:` node config — iteration control plus exactly one iteration-prompt source:
@@ -140,8 +165,44 @@ export const loopNodeConfigSchema = loopControlSchema
      * parse-time validation and fail at runtime with a confusing "not found" error.
      */
     command: z.string().trim().min(1, "'loop.command' must be a non-empty string").optional(),
+    /**
+     * Structured completion channel (#2563 Part B): the name of a property in this
+     * node's `output_format` schema whose validated value `true` ends the loop.
+     *
+     * This is the channel for a loop whose completion is a JUDGMENT the model makes
+     * — "am I done?" — with no externally checkable state to test. `until_bash`
+     * covers the checkable case; before this, judgment had only the prose sentinel.
+     *
+     * `loop:` only, and the asymmetry is principled rather than convenient. A
+     * `loop_group:` body node can already declare `output_format` and be read by
+     * `until_bash: '[ "$decide.output.done" = "true" ]'` — node-output refs are
+     * substituted into `until_bash` against the current iteration's outputs, and
+     * booleans render unquoted. The single-prompt `loop:` has no such handle: its
+     * judgment lives in its own AI turn, which has no node id, and `until_bash` runs
+     * after that turn but can only see the PREVIOUS iteration's text. That is the
+     * gap this fills. On a `loop_group:` the key is unknown and warns.
+     *
+     * The named property must be declared in `output_format.properties`, listed in
+     * `output_format.required`, and typed `boolean` — all checked at load time in
+     * `dagNodeSchema`, which can see both the node's `output_format` and this field.
+     */
+    until_field: z
+      .string()
+      .trim()
+      .min(1, "'loop.until_field' must name a property in the node's output_format")
+      .optional(),
   })
   .superRefine((data, ctx) => {
+    // The across-channels rule for `loop:` — three channels, unlike loop_group's two.
+    addMissingChannelIssue(
+      ctx,
+      [data.until, data.until_bash, data.until_field].filter(v => v !== undefined),
+      [
+        ...BASE_COMPLETION_CHANNELS,
+        { field: 'until_field', describe: 'a declared boolean in output_format' },
+      ]
+    );
+
     const hasPrompt = typeof data.prompt === 'string' && data.prompt.length > 0;
     const hasCommand = typeof data.command === 'string' && data.command.length > 0;
 

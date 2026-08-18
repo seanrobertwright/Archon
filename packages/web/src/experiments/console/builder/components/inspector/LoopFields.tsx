@@ -79,6 +79,20 @@ export function LoopFields({
           onChange({ ...data, until_bash: raw.trim().length > 0 ? raw : undefined });
         }}
       />
+      {/* Names a declared boolean in the node's `output_format`. That schema is carried
+          through the round-trip but is NOT editable in the builder today — there is no
+          output_format editor — so a loop created here needs its schema added in YAML.
+          The engine rejects a name that is not declared, required and boolean, so a
+          mismatch fails loudly at load rather than looping forever. */}
+      <TextField
+        label="Until field (boolean in output_format)"
+        value={data.until_field ?? ''}
+        mono
+        placeholder="done"
+        onChange={(raw): void => {
+          onChange({ ...data, until_field: raw.trim().length > 0 ? raw : undefined });
+        }}
+      />
       <NumberField
         label="Max iterations"
         value={data.max_iterations}

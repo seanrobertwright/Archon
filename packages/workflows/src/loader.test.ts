@@ -2235,11 +2235,7 @@ nodes:
       until: "COMPLETE"
       max_iterations: 3
     model: claude-opus-4-6
-    output_format:
-      type: object
-      properties:
-        status:
-          type: string
+    mcp: ./mcp.json
 `
       );
 
@@ -2247,16 +2243,59 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
 
-      // Should warn about output_format but NOT about model
+      // Should warn about mcp but NOT about model
       const warnCalls = (mockLogger.warn as Mock<() => undefined>).mock.calls;
       const aiFieldWarnings = warnCalls.filter(
         call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
       );
       expect(aiFieldWarnings).toHaveLength(1);
       const warnedFields = (aiFieldWarnings[0][0] as { fields: string[] }).fields;
-      expect(warnedFields).toContain('output_format');
+      expect(warnedFields).toContain('mcp');
       expect(warnedFields).not.toContain('model');
       expect(warnedFields).not.toContain('provider');
+    });
+
+    it('should NOT warn about output_format on a loop node (#2563)', async () => {
+      // A loop: node makes its own sendQuery, so the schema is honoured rather than
+      // warned-and-dropped. It stays warned on loop_group, which never calls sendQuery.
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-structured.yaml'),
+        `
+name: loop-structured
+description: Loop with a structured completion channel
+nodes:
+  - id: iterate
+    output_format:
+      type: object
+      properties:
+        done:
+          type: boolean
+      required: [done]
+    loop:
+      prompt: "Do something"
+      max_iterations: 3
+      until_field: done
+`
+      );
+
+      (mockLogger.warn as Mock<() => undefined>).mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+
+      const aiFieldWarnings = (mockLogger.warn as Mock<() => undefined>).mock.calls.filter(
+        call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(0);
+
+      const wf = result.workflows[0].workflow;
+      expect(isLoopNode(wf.nodes[0])).toBe(true);
+      if (isLoopNode(wf.nodes[0])) {
+        expect(wf.nodes[0].loop.until_field).toBe('done');
+        expect(wf.nodes[0].output_format).toBeDefined();
+      }
     });
 
     it('should NOT warn about pi: on loop nodes and should preserve it (#2133)', async () => {
@@ -2721,21 +2760,22 @@ nodes:
       );
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0].error).toContain("whole output of AI node 'refine'");
-      // `loop:` and `loop_group:` are both rejected but for DIFFERENT reasons, and the
-      // message must name the right one. On a `loop:` the schema is dropped at parse.
-      expect(result.errors[0].error).toContain("dropped from a 'loop:' node");
-      expect(result.errors[0].error).not.toContain("Declare 'output_format'");
+      // Since #2563 a `loop:` is schema-capable, so it gets the SAME remedy as a
+      // prompt node: declare output_format and compare a field. (A `loop_group:` still
+      // gets its own reason — it never calls the provider itself.)
+      expect(result.errors[0].error).toContain("Declare 'output_format'");
     });
 
-    it('rejects it for a loop producer even when it declares an output_format', async () => {
-      // `output_format` never reaches a LoopNode: it is in the schema's `aiOnly` group
-      // and the loop branch of the transform does not spread it. So there is nothing to
-      // opt out with, and the message must not pretend otherwise.
+    it('ACCEPTS a loop producer that declares an output_format (#2563)', async () => {
+      // `output_format` now reaches a LoopNode — it runs its own sendQuery — so the
+      // loop's output IS the validated JSON document and declaring a schema is a real
+      // opt-out, exactly as it is for a prompt node. Before #2563 this was rejected on
+      // the grounds that the schema was dropped at parse, which is no longer true.
       const result = await loadYaml(
         'ai-loop-declared-format.yaml',
         `
 name: ai-loop-declared-format
-description: output_format on a loop node is dropped, so it is not an opt-out
+description: output_format on a loop node is a real opt-out
 nodes:
   - id: refine
     output_format:
@@ -2753,8 +2793,7 @@ nodes:
     when: "$refine.output == 'DONE'"
 `
       );
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0].error).toContain("dropped from a 'loop:' node");
+      expect(result.errors).toHaveLength(0);
     });
 
     it('rejects it for a loop_group producer that declares output_format, for its own reason', async () => {
