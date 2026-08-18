@@ -8730,10 +8730,15 @@ export async function executeDagWorkflow(
   try {
     await runLayers(runCtx);
   } finally {
-    // `finally`, not a plain call: a throw out of runLayers unwinds to executor.ts's
-    // top-level handler, which marks the run FAILED — a real terminal outcome the
-    // invariant has to cover. persistRunUsage swallows its own errors, so it can
-    // never displace an in-flight exception.
+    // `finally`, not a plain call. runLayers guards almost everything — every store
+    // call inside the per-node try, the between-layer status check, the artifact
+    // writes — but `safeSendMessage` deliberately RETHROWS a FATAL-classified platform
+    // error (executor-shared.ts, 'unauthorized'/'forbidden'/'401'…) rather than
+    // swallowing it, and the allSettled `rejected` branch calls it outside any try. So a
+    // platform whose auth dies mid-run throws clean out of runLayers, past every
+    // disposition below, to executeWorkflow's catch-all — which marks the run FAILED, a
+    // terminal outcome the invariant has to cover. persistRunUsage swallows its own
+    // errors, so it can never displace the in-flight exception.
     await persistRunUsage();
   }
   // Pull the mutated accumulators back into local scope for the terminal tally below.

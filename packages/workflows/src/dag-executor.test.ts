@@ -12998,6 +12998,75 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       { total_cost_usd: 0.04, total_tokens_in: 60, total_tokens_out: 6 },
     ]);
   });
+
+  it('records usage when a FATAL platform error throws out of runLayers', async () => {
+    // The `finally` around runLayers exists for exactly this: a throw that skips every
+    // disposition below and unwinds to executeWorkflow's catch-all, which marks the run
+    // FAILED. Without this case the other three would pass with a plain call, so the
+    // guard would never be seen firing and a refactor could drop it silently.
+    //
+    // The reachable path is a platform whose auth dies mid-run: safeSendMessage rethrows
+    // FATAL-classified errors instead of swallowing them (`executor-shared.ts:830-832`,
+    // 'unauthorized' is in FATAL_PATTERNS). A `cancel:` node's message throws inside the
+    // per-node try; the catch's own message throws too, rejecting the node promise; the
+    // allSettled `rejected` branch then throws a third time OUTSIDE any try — out of
+    // runLayers entirely.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'spent before the platform died' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-throw',
+        cost: 0.01,
+        tokens: { input: 20, output: 2 },
+      };
+    });
+
+    const store = createMockStore();
+    let nodeFinished = false;
+    const realCreateEvent = store.createWorkflowEvent;
+    store.createWorkflowEvent = mock((data: { event_type: string }) => {
+      if (data.event_type === 'node_completed') nodeFinished = true;
+      return realCreateEvent(data);
+    });
+
+    // Auth dies only once the AI node has completed, so its usage is accumulated first.
+    const platform = createMockPlatform();
+    platform.sendMessage = mock(() =>
+      nodeFinished ? Promise.reject(new Error('unauthorized')) : Promise.resolve()
+    );
+
+    await expect(
+      executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        'conv-usage',
+        testDir,
+        {
+          name: 'usage-on-throw',
+          nodes: [
+            { id: 'spend', prompt: 'Burn some tokens.' },
+            { id: 'stop', cancel: 'platform is gone', depends_on: ['spend'] },
+          ],
+        },
+        makeWorkflowRun(),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      )
+    ).rejects.toThrow(/authentication\/permission/i);
+
+    // Neither terminal writer ran — the throw skipped them both — yet the spend survived.
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.01, total_tokens_in: 20, total_tokens_out: 2 },
+    ]);
+  });
 });
 
 describe('executeDagWorkflow -- script nodes', () => {
