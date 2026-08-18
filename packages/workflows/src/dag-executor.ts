@@ -3916,21 +3916,27 @@ async function executeLoopGroupNode(
           data: {
             duration_ms: duration,
             node_output: lastIterationOutput,
-            // NO `tokens` here, deliberately. Unlike every other node type, a
-            // loop_group's body nodes write their OWN node_completed rows (namespaced
-            // `<groupId>.<nodeId>`, one per iteration) and those already carry the
-            // tokens. Persisting the group total under the SAME field name would make
-            // a consumer summing `data.tokens` across node_completed rows count this
-            // group's usage twice with nothing in the row to mark it as an aggregate.
-            // The leaves are authoritative: they are per-provider (a body node may
-            // override `provider:`, so the group total can mix providers and is
-            // useless for the cross-provider comparison #2333 exists to enable), and
-            // the group total is recoverable by summing the `<groupId>.` prefix.
-            // The RETURN value below still carries `tokens` — that is the run-level
-            // roll-up path, which counts each group exactly once (body results land in
-            // the scoped iteration ctx, never the run ctx).
-            // NOTE: `cost_usd` has this same double-count shape and predates #2333;
-            // it is left as-is rather than silently changed under a token fix.
+            // This row is an AGGREGATE of rows that are already in the event log.
+            // Unlike every other node type, a loop_group's body nodes write their OWN
+            // node_completed rows (namespaced `<groupId>.<nodeId>`, one per iteration)
+            // carrying their own usage, so any consumer summing usage across
+            // node_completed rows would count this group twice.
+            //
+            // `tokens` is omitted outright: the leaves are authoritative (they are
+            // per-provider — a body node may override `provider:`, so the group total
+            // can mix providers and is useless for the cross-provider comparison #2333
+            // exists to enable) and the group total is recoverable by summing the
+            // `<groupId>.` prefix. The RETURN value below still carries `tokens` — that
+            // is the run-level roll-up path, which counts each group exactly once (body
+            // results land in the scoped iteration ctx, never the run ctx).
+            //
+            // `cost_usd` is KEPT, because the console renders it per event
+            // (web/.../console/primitives/event.ts) and dropping it would blank the
+            // loop_group card's cost. `aggregate: true` is what makes that safe: it
+            // marks the row as derived so a summing consumer can skip it. #2469 added
+            // the first such consumer (getDagResumeSnapshot rebuilds cost across resume
+            // passes), which turned this from a latent shape into a live double count.
+            aggregate: true,
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
           },
         })
@@ -5836,7 +5842,11 @@ async function executeWorkflowNode(
   // does NOT turn into an event — so without this the sub-run failure reason (cycle,
   // unknown target, cancelled child, …) would be swallowed into the run-level DAG
   // summary and never auditable per-node. Fire-and-forget like every other event.
-  const failResult = (error: string): NodeExecutionResult => {
+  const failResult = (
+    error: string,
+    costUsd?: number,
+    tokens?: TokenUsage
+  ): NodeExecutionResult => {
     deps.store
       .createWorkflowEvent({
         workflow_run_id: parentRun.id,
@@ -5857,7 +5867,19 @@ async function executeWorkflowNode(
       nodeName: node.id,
       error,
     });
-    return { state: 'failed', output: '', error };
+    return {
+      state: 'failed',
+      output: '',
+      error,
+      // A child that burned tokens and then failed or was cancelled still spent that
+      // money, and its own row now records it (#2469) — so carry it up rather than
+      // dropping it here. The run-level aggregator reads `costUsd`/`tokens` off the
+      // node result with no gate on `state`, and the fan-out sibling has taken these
+      // for the same reason since #2224. Absent on the pre-spawn failures below, which
+      // fail before any child exists to have spent anything.
+      ...(costUsd !== undefined ? { costUsd } : {}),
+      ...(tokens !== undefined ? { tokens } : {}),
+    };
   };
 
   if (!ctx.runChildWorkflow) {
@@ -6047,9 +6069,17 @@ async function executeWorkflowNode(
       case 'paused':
         return pauseParentOnChild(outcome.childRunId);
       case 'failed':
-        return failResult(outcome.error ?? `Sub-run '${node.workflow}' failed`);
+        return failResult(
+          outcome.error ?? `Sub-run '${node.workflow}' failed`,
+          outcome.costUsd,
+          outcome.tokens
+        );
       case 'cancelled':
-        return failResult(`Sub-run '${node.workflow}' was cancelled`);
+        return failResult(
+          `Sub-run '${node.workflow}' was cancelled`,
+          outcome.costUsd,
+          outcome.tokens
+        );
       default: {
         // Compile-time exhaustiveness + runtime fail-loud: without this, a status
         // outside the union would silently return `undefined` into runLayers.

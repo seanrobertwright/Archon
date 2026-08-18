@@ -295,9 +295,15 @@ export interface ApprovalContext {
    * row reports only the final invocation. That under-report predates this field (before
    * #2333 nothing was persisted at all) and belongs to the "preserve terminal provider
    * stats across a gate" fix tracked by #2345, which also covers the `cost_usd` and
-   * resolved-model loss at the same gate. The RUN row is no longer affected: since #2469
-   * the executor persists `total_tokens_*` / `total_cost_usd` at the run tail on every
-   * disposition, pause included, rather than only inside completeWorkflowRun.
+   * resolved-model loss at the same gate.
+   *
+   * The RUN row has the SAME per-invocation attribution, for the same root cause. Since
+   * #2469 the run-tail write is no longer skipped on pause, so a paused run's row does
+   * carry what that invocation spent — but the baseline it adds to (`priorUsage`) is
+   * rebuilt from `node_completed` rows, and a gate pause deliberately writes none. The
+   * metadata merge replaces each key it names rather than adding to it, so a loop that
+   * gates twice leaves the run row reporting only the final invocation. Same fix
+   * boundary as the node row: #2345.
    */
   signaledTokens?: { input: number; output: number } | null;
   /**

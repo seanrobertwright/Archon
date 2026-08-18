@@ -218,9 +218,19 @@ export async function listWorkflowEventsSince(
  * run. Used by the DAG executor to restore state when resuming a failed run.
  * Throws on DB error — caller owns the degradation policy.
  *
- * Both usage axes are summed from `node_completed` rows only. `node_skipped_prior_success`
- * rows are deliberately excluded: they replay a node an earlier pass already counted, so
- * counting them would multiply that node's usage by the number of resume passes.
+ * Both usage axes are summed from `node_completed` rows only, and only from rows that are
+ * not marked `data.aggregate`. Two distinct duplication hazards:
+ *
+ * - `node_skipped_prior_success` rows replay a node an earlier pass already counted, so
+ *   counting them would multiply that node's usage by the number of resume passes.
+ * - `aggregate: true` rows are derived from other rows already in this log — a
+ *   `loop_group`'s roll-up restates the `cost_usd` its own `<groupId>.<nodeId>` body rows
+ *   carry, so summing both counts that group twice (#2469).
+ *
+ * Rows written before the `aggregate` marker existed carry no flag, so a run that
+ * completed a loop_group under an older build and is resumed under this one can still
+ * double-count its cost. Bounded and self-clearing: only cost is affected (the roll-up
+ * never carried `tokens`), and only until those runs reach a terminal state.
  */
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   completedNodeOutputs: Map<string, string>;
@@ -255,6 +265,8 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
     if (typeof data.node_output === 'string') {
       completedNodeOutputs.set(row.step_name, data.node_output);
     }
+    // A derived row restates usage that other rows in this same log already carry.
+    if (data.aggregate === true) continue;
     if (row.event_type === 'node_completed' && data.tokens !== undefined) {
       const eventTokens = data.tokens;
       if (

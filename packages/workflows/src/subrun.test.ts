@@ -236,6 +236,9 @@ class InMemoryStore implements IWorkflowStore {
         typeof e.step_name === 'string'
       ) {
         completedNodeOutputs.set(e.step_name, String(e.data?.node_output ?? ''));
+        // Mirrors the real store: a derived row (loop_group roll-up) restates usage
+        // other rows already carry, so it contributes output but never usage (#2469).
+        if (e.data?.aggregate === true) continue;
         const eventTokens = e.data?.tokens;
         if (
           e.event_type === 'node_completed' &&
@@ -2631,6 +2634,58 @@ nodes:
     );
     expect(workCompleted?.data?.cost_usd).toBeCloseTo(0.03, 5);
     expect(workCompleted?.data?.tokens).toBeDefined();
+  });
+
+  // #2469 (R1) — the 1:1 topology, not just fan-out. The fan-out `failResult` has
+  // carried a failed child's usage since #2224; the single-child one dropped it, so a
+  // parent with one ordinary `workflow:` node still reported zero for a child that
+  // burned tokens and then failed. That is the more common shape of the two.
+  it("rolls up a failed 1:1 child's spend into the parent (no fan_out)", async () => {
+    await writeWorkflow(
+      'solo-child-doomed',
+      `
+name: solo-child-doomed
+description: one AI turn (canned cost 0.01 / 7 in / 3 out), then fails
+mutates_checkout: false
+nodes:
+  - id: think
+    prompt: "work on $ARGUMENTS"
+  - id: fail
+    depends_on: [think]
+    bash: |
+      exit 1
+`
+    );
+    await writeWorkflow(
+      'solo-parent',
+      `
+name: solo-parent
+description: a single non-fan-out sub-run node whose child fails after spending
+nodes:
+  - id: work
+    workflow: solo-child-doomed
+    input: "the task"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('solo-parent');
+    await executeWorkflow(deps, makePlatform(), 'conv-plat', cwd, parent, 'goal', 'conv-db');
+
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'solo-child-doomed');
+    expect(child?.status).toBe('failed');
+    // The child's own row records the spend (the run-tail write).
+    expect((child?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);
+
+    // ...and so does the parent's, via the node result the failed branch now carries.
+    // The node failed, so the parent run failed too — which is exactly the case that
+    // used to report nothing at all.
+    const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'solo-parent');
+    expect(parentRun?.status).toBe('failed');
+    expect((parentRun?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);
+    expect((parentRun?.metadata as Record<string, unknown>).total_tokens_in).toBe(7);
+    expect((parentRun?.metadata as Record<string, unknown>).total_tokens_out).toBe(3);
   });
 
   // #2469 — the regression proof. `all_done` is the DEFAULT join and a failing child

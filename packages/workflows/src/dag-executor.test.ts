@@ -12999,6 +12999,59 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     ]);
   });
 
+  it('a failed usage write is logged and never fails the run', async () => {
+    // persistRunUsage is documented best-effort: a bookkeeping write must not turn an
+    // otherwise-fine run into a failed one. Documented, but never watched failing — and
+    // the `finally` makes it the last thing standing between the run and its own
+    // completion, so a throw here would be maximally disruptive.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-dbfail',
+        cost: 0.02,
+        tokens: { input: 9, output: 3 },
+      };
+    });
+
+    const store = createMockStore();
+    store.updateWorkflowRun = mock(
+      (_id: string, updates: { metadata?: Record<string, unknown> }): Promise<void> =>
+        updates.metadata && 'total_cost_usd' in updates.metadata
+          ? Promise.reject(new Error('Workflow run not found (id: gone)'))
+          : Promise.resolve()
+    );
+    const mockDeps = createMockDeps(store);
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-usage',
+      testDir,
+      { name: 'usage-write-fails', nodes: [{ id: 'spend', prompt: 'Burn some tokens.' }] },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The run still completes normally — the usage figure is simply absent, and every
+    // reader type-guards that. Absent is safe; plausible-and-wrong is the failure mode.
+    expect(store.completeWorkflowRun).toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    // ...and the loss is recorded rather than swallowed.
+    expect(
+      (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+        call => call[1] === 'dag.run_usage_persist_failed'
+      )
+    ).toBe(true);
+  });
+
   it('records usage when a FATAL platform error throws out of runLayers', async () => {
     // The `finally` around runLayers exists for exactly this: a throw that skips every
     // disposition below and unwinds to executeWorkflow's catch-all, which marks the run
@@ -17560,6 +17613,31 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(calls).toBe(2);
     // 0.01 + 0.02 = 0.03 accumulated across the group's 2 iterations.
     expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.03 }]);
+
+    // #2469 producer half: the group's own node_completed row restates the cost its
+    // `<groupId>.<nodeId>` body rows already carry, so it must be marked as derived —
+    // getDagResumeSnapshot skips marked rows when rebuilding cost across a resume.
+    // Without the marker a resumed run seeds ~2x the true prior spend, silently.
+    const completedEvents = (
+      store.createWorkflowEvent as Mock<
+        (data: {
+          event_type: string;
+          step_name?: string;
+          data?: Record<string, unknown>;
+        }) => Promise<void>
+      >
+    ).mock.calls
+      .map(call => call[0])
+      .filter(e => e.event_type === 'node_completed');
+
+    const groupRollUp = completedEvents.find(e => e.step_name === 'paid');
+    expect(groupRollUp?.data?.cost_usd).toBeCloseTo(0.03, 5);
+    expect(groupRollUp?.data?.aggregate).toBe(true);
+
+    // The body rows are the authoritative leaves and must NOT be marked.
+    const bodyRows = completedEvents.filter(e => e.step_name?.startsWith('paid.'));
+    expect(bodyRows.length).toBeGreaterThan(0);
+    for (const row of bodyRows) expect(row.data?.aggregate).toBeUndefined();
   });
 
   it('COST: accumulates token usage across loop_group iterations', async () => {

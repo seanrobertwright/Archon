@@ -495,6 +495,37 @@ describe('workflow-events', () => {
       expect(mockLogger.warn).not.toHaveBeenCalled();
     });
 
+    // #2469: a loop_group writes a roll-up node_completed row whose cost_usd restates
+    // what its own `<groupId>.<nodeId>` body rows already carry. Summing both counted
+    // that group twice — the same silently-wrong number this work exists to remove,
+    // pointing the other way. The roll-up is marked `aggregate: true` and skipped here.
+    test('excludes usage on aggregate rows while keeping their output', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'group.body',
+            event_type: 'node_completed',
+            data: { node_output: 'iteration 1', cost_usd: 0.01, tokens: { input: 10, output: 1 } },
+          },
+          {
+            step_name: 'group',
+            event_type: 'node_completed',
+            data: { node_output: 'last iteration', cost_usd: 0.01, aggregate: true },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-loop-group');
+
+      // The leaves are authoritative: 0.01 total, not 0.02.
+      expect(result.costUsd).toBeCloseTo(0.01, 10);
+      expect(result.tokens).toEqual({ input: 10, output: 1 });
+      // The roll-up still marks the group node completed, so resume skips it rather
+      // than re-running the whole group.
+      expect(result.completedNodeOutputs.get('group')).toBe('last iteration');
+      expect(result.completedNodeOutputs.get('group.body')).toBe('iteration 1');
+    });
+
     test('returns an empty snapshot when no events exist', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
