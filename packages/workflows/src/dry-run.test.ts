@@ -819,6 +819,53 @@ describe('dryRunWorkflow — declared inputs (#2610)', () => {
     expect(result.trace[0]?.resolvedText).toBe('Work on ship it');
   });
 
+  test('uses the input-bound compiled prompt for a nested included loop command', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-nested-inputs-'));
+    temporaryDirectories.push(cwd);
+    mkdirSync(join(cwd, '.archon', 'commands'), { recursive: true });
+    // The raw source keeps the middle workflow's input name. Loading it at simulation time
+    // reproduces #2629; the expanded node's compiled prompt has already rebound that name.
+    writeFileSync(join(cwd, '.archon', 'commands', 'loop-impl.md'), 'Raw $INPUTS.work');
+
+    const implement = makeTestWorkflow({
+      name: 'implement',
+      inputs: { work: { required: true } },
+      nodes: [
+        { id: 'implement', loop: { command: 'loop-impl', until: 'DONE', max_iterations: 1 } },
+      ],
+    });
+    const deliver = makeTestWorkflow({
+      name: 'deliver',
+      inputs: { work: { required: true } },
+      nodes: [{ id: 'impl', include: 'implement', with: { work: '$INPUTS.work' } }],
+    });
+    const fix = makeTestWorkflow({
+      name: 'fix',
+      inputs: { target: { required: true } },
+      nodes: [{ id: 'deliver', include: 'deliver', with: { work: 'Fix $INPUTS.target' } }],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['implement', implement],
+        ['deliver', deliver],
+        ['fix', fix],
+      ]),
+      new Map([['loop-impl', 'Work on $INPUTS.work']])
+    );
+    expect(errors).toHaveLength(0);
+
+    const result = await dryRunWorkflow({
+      workflow: workflows.get('fix')!,
+      userMessage: '',
+      cwd,
+      stubs: { deliver__impl__implement: '<promise>DONE</promise>' },
+      inputs: { target: 'issue 2629' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.trace[0]?.resolvedText).toBe('Work on Fix issue 2629');
+  });
+
   test('when: conditions branch on the effective input map', async () => {
     const workflow = makeTestWorkflow({
       name: 'inputs-when',

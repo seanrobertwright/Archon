@@ -460,6 +460,40 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     expect(use && 'prompt' in use ? use.prompt : '').toBe('```\nliteral literal\n``` empty=[]');
   });
 
+  test('rejects a when expression made unparseable by input substitution', () => {
+    const block = wf('parameterized', [
+      { id: 'probe', bash: 'echo go' },
+      {
+        id: 'use',
+        prompt: 'work',
+        depends_on: ['probe'],
+        when: "$INPUTS.mode == 'fast' && $probe.output == 'go'",
+      },
+    ]);
+    block.inputs = { mode: { default: 'fast' } };
+    const parent = wf('parent', [{ id: 'review', include: 'parameterized' }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    const error = errors.find(candidate => candidate.filename === 'parent')?.error;
+    expect(error).toContain("Node 'review'");
+    expect(error).toContain("$INPUTS.mode == 'fast' && $review__probe.output == 'go'");
+    expect(error).toContain("fast == 'fast' && $review__probe.output == 'go'");
+    expect(error).toContain('right-hand side');
+  });
+
+  test('does not broaden the load error to an unchanged malformed when expression', () => {
+    const block = wf('parameterized', [{ id: 'use', prompt: 'work', when: 'not an atom' }]);
+    block.inputs = { mode: { default: 'fast' } };
+    const parent = wf('parent', [{ id: 'review', include: 'parameterized' }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(errors).toHaveLength(0);
+    expect(nodeById(workflows.get('parent')!, 'review__use')?.when).toBe('not an atom');
+  });
+
   test('substitutes inputs across every other supported inline node surface', () => {
     const block = wf('parameterized', [
       { id: 'shell', bash: 'echo $INPUTS.value' },

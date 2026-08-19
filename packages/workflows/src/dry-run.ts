@@ -12,6 +12,7 @@ import {
   substituteNodeOutputRefs,
 } from './dag-executor';
 import { evaluateCondition } from './condition-evaluator';
+import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import { declaredFieldsFromSchema } from './output-ref';
 import { discoverScriptsForCwd } from './script-discovery';
 import {
@@ -514,7 +515,29 @@ async function simulateLoop(
 ): Promise<void> {
   if (!isLoopNode(node)) return;
   let previous = '';
-  const template = node.loop.prompt ?? (await loadDryRunCommand(ctx.cwd, node.loop.command ?? ''));
+  let template: string;
+  if (node.loop.prompt !== undefined) {
+    template = node.loop.prompt;
+  } else {
+    const command = node.loop.command ?? '';
+    const compiled = (node.loop as typeof node.loop & LoopWithCompiledCommand)[
+      COMPILED_LOOP_COMMAND
+    ];
+    const hasCompiledError = compiled !== undefined && typeof compiled.error === 'string';
+    const hasCompiledPrompt = compiled !== undefined && typeof compiled.prompt === 'string';
+    if (hasCompiledError && !hasCompiledPrompt) {
+      throw new Error(compiled.error);
+    }
+    if (hasCompiledPrompt && !hasCompiledError) {
+      template = compiled.prompt;
+    } else if (compiled !== undefined) {
+      throw new Error(
+        `Loop node '${node.id}' has malformed compiled command metadata for '${command}' — expected exactly one string prompt or error.`
+      );
+    } else {
+      template = await loadDryRunCommand(ctx.cwd, command);
+    }
+  }
   let resolvedText = template;
   for (let current = 1; current <= node.loop.max_iterations; current++) {
     resolvedText = resolveText(template, ctx, outputs, false, previous);

@@ -56,6 +56,7 @@ import {
 import { createLogger } from '@archon/paths';
 import { validateDagStructure } from './loader';
 import { resolveDeclaredInputs } from './workflow-inputs';
+import { parseWhenAtom, whenAtoms } from './when-atom';
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
@@ -457,7 +458,12 @@ function rewriteNodeOutputRefs(
  * takes include inputs but is NOT a runtime node-ref surface would reopen the #2476 gap;
  * it belongs in one of these two functions, not silently in this one alone.
  */
-function applyInputsMacro(node: DagNode, args: Record<string, string>, missing: Set<string>): void {
+function applyInputsMacro(
+  node: DagNode,
+  args: Record<string, string>,
+  missing: Set<string>,
+  includeNode: IncludeNode
+): void {
   const substitute = (text: string): string =>
     text.replace(INPUTS_REF, (match, name: string) => {
       // `Object.hasOwn` rather than a plain `args[name]` lookup: a bare index read reaches
@@ -473,7 +479,19 @@ function applyInputsMacro(node: DagNode, args: Record<string, string>, missing: 
       return value;
     });
 
-  if (node.when !== undefined) node.when = substitute(node.when);
+  const substituteWhen = (when: string): string => {
+    const expanded = substitute(when);
+    const wasParseable = whenAtoms(when).every(atom => parseWhenAtom(atom) !== null);
+    const isParseable = whenAtoms(expanded).every(atom => parseWhenAtom(atom) !== null);
+    if (expanded !== when && wasParseable && !isParseable) {
+      throw new IncludeExpansionError(
+        `Node '${includeNode.id}': input substitution made included node '${node.id}' field 'when' unparseable: "${when}" became "${expanded}". Put '$INPUTS.<name>' on the right-hand side of a comparison whose left-hand side is a node-output reference.`
+      );
+    }
+    return expanded;
+  };
+
+  if (node.when !== undefined) node.when = substituteWhen(node.when);
 
   // An inherited stamp's values may reference THIS level's inputs — `with: { plan:
   // '$INPUTS.topic' }` one file down. Without this walk the stamp keeps the literal
@@ -483,7 +501,7 @@ function applyInputsMacro(node: DagNode, args: Record<string, string>, missing: 
     for (const [key, value] of Object.entries(stamped)) stamped[key] = substitute(value);
   }
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
-    if (boundary.when !== undefined) boundary.when = substitute(boundary.when);
+    if (boundary.when !== undefined) boundary.when = substituteWhen(boundary.when);
   }
 
   // Base AI-turn fields — valid on every AI node mode (command / prompt / loop_group), so
@@ -510,7 +528,7 @@ function applyInputsMacro(node: DagNode, args: Record<string, string>, missing: 
     if (node.loop_group.until_bash !== undefined) {
       node.loop_group.until_bash = substitute(node.loop_group.until_bash);
     }
-    for (const body of node.loop_group.nodes) applyInputsMacro(body, args, missing);
+    for (const body of node.loop_group.nodes) applyInputsMacro(body, args, missing, includeNode);
   } else if (isApprovalNode(node)) {
     node.approval.message = substitute(node.approval.message);
     if (node.approval.on_reject !== undefined) {
@@ -671,7 +689,7 @@ function inlineInclude(
     // load-bearing: a caller ref such as `$gather.output` must remain parent-scoped even
     // when the included block also has a node named `gather`.
     rewriteNodeOutputRefs(clone, rename, id => [rename(id)]);
-    applyInputsMacro(clone, resolvedInputs, missingInputs);
+    applyInputsMacro(clone, resolvedInputs, missingInputs, includeNode);
     // Stamped AFTER both passes, for the same reason the caller's values are inserted
     // after the rename: these are the CALLER's strings, so they stay parent-scoped here
     // and are walked by the next level out, not by this one. Each node gets its own copy
