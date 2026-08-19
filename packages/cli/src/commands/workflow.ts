@@ -2428,17 +2428,17 @@ export async function workflowGetCommand(
   console.log(`  Status: ${run.status}`);
   console.log(`  Age:    ${formatAge(run.started_at)}`);
   // Paused interactive-loop gate: one honest line so a human (or an agent parsing
-  // the plain output) sees whether the paused iteration emitted its completion
-  // signal (#2074). --json already carries the full metadata.approval.
+  // the plain output) sees whether any declared completion condition completed
+  // the paused iteration (#2074). --json already carries the full metadata.approval.
   const gateMeta = run.metadata.approval;
   if (
     run.status === 'paused' &&
     isApprovalContext(gateMeta) &&
     gateMeta.type === 'interactive_loop'
   ) {
-    const signal = gateMeta.completionSignaled === true ? 'yes' : 'no';
+    const completionMet = gateMeta.completionSignaled === true ? 'yes' : 'no';
     console.log(
-      `  Gate:   awaiting approval — signal detected: ${signal} (iteration ${String(gateMeta.iteration ?? '?')})`
+      `  Gate:   awaiting approval — completion condition met: ${completionMet} (iteration ${String(gateMeta.iteration ?? '?')})`
     );
   }
   const runError = typeof run.metadata.error === 'string' ? run.metadata.error : undefined;

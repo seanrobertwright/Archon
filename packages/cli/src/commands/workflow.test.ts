@@ -3582,7 +3582,7 @@ describe('workflowGetCommand', () => {
     expect(code).toBe(0);
   });
 
-  it('prints a Gate line (human) for a paused interactive_loop run (#2074 E)', async () => {
+  it('prints aggregate completion-condition state for a paused interactive_loop run (#2074 E)', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-gate-human',
@@ -3605,7 +3605,7 @@ describe('workflowGetCommand', () => {
     await workflowGetCommand('run-gate-human');
 
     expect(consoleSpy).toHaveBeenCalledWith(
-      '  Gate:   awaiting approval — signal detected: yes (iteration 2)'
+      '  Gate:   awaiting approval — completion condition met: yes (iteration 2)'
     );
   });
 

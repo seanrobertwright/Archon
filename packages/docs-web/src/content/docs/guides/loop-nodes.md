@@ -499,13 +499,16 @@ The user's feedback is injected into the next iteration's prompt via `$LOOP_USER
 **Approve semantics (finalize vs iterate).** What an approve does depends on whether any declared
 completion channel ended the paused iteration:
 
-- **Gate paused on a completed iteration** (the status line starts "Completion condition met
-  via"): `/workflow approve <id>` with **no feedback** *accepts the completion* — the node
+- **Gate paused on a completed iteration** (the status line starts
+  `✅ Completion condition met via` for one completed channel or
+  `✅ Completion conditions met via` for several): `/workflow approve <id>` with **no
+  feedback** *accepts the completion* — the node
   finalizes from the already-computed output and the workflow proceeds, with **no re-run**.
   Approving **with feedback** discards that completion and runs another iteration with your
   feedback as `$LOOP_USER_INPUT`.
-- **Gate paused without a completed condition** (the status line starts "No completion condition
-  met"): both forms run another iteration (there is nothing to finalize).
+- **Gate paused without a completed condition** (the status line starts
+  `⚠️ No completion condition met in this iteration`): both forms run another iteration
+  (there is nothing to finalize).
 
 The same rule applies on every approve surface: chat `/workflow approve`, the CLI
 (`archon workflow approve <id> [--json]` — omit the comment to finalize), the HTTP

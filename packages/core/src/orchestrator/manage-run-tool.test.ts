@@ -330,7 +330,8 @@ describe('manage_run — destructive confirmation gate', () => {
     const out = await tool.handler({ action: 'approve', runId: 'r1abcdef', confirm: true });
     expect(mockApprove).toHaveBeenCalledWith('r1abcdef-1234', undefined);
     expect(out).toContain('no feedback');
-    expect(out).toContain('finalizes');
+    expect(out).toContain('completion condition was met');
+    expect(out).not.toContain('completion signal');
   });
 
   test('approve with accept:true finalizes even when a message is present (#2074 E)', async () => {

@@ -374,7 +374,7 @@ async function handleWrite(
     }
     case 'approve': {
       // accept=true forces the finalize path (#2074): no feedback reaches the gate,
-      // so a signal-bearing loop completes from its persisted output on resume.
+      // so a loop with a completed condition finalizes from its persisted output on resume.
       const feedback = willFinalize ? undefined : message;
       const result = await approveWorkflow(id, feedback);
       const continues = signalGateResolved(ctx, run, 'approve');
@@ -382,7 +382,7 @@ async function handleWrite(
         return `Approved ${result.workflowName} (${id.slice(0, 8)}).${continues}`;
       }
       return feedback === undefined
-        ? `Approved ${result.workflowName} (${id.slice(0, 8)}) with no feedback. If the gate paused on a completion signal, the node finalizes from its computed output (no re-run); otherwise the loop runs another iteration.${continues}`
+        ? `Approved ${result.workflowName} (${id.slice(0, 8)}) with no feedback. If the gate paused after a completion condition was met, the node finalizes from its computed output (no re-run); otherwise the loop runs another iteration.${continues}`
         : `Feedback recorded for ${result.workflowName} (${id.slice(0, 8)}); the loop runs another iteration with it.${continues}`;
     }
     case 'reject': {
