@@ -4050,8 +4050,11 @@ describe('workflowRunsCommand', () => {
   });
 
   it('scopes to the cwd-resolved codebase id', async () => {
+    const git = await import('@archon/git');
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
     (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'cb-proj',
       name: 'owner/repo',
@@ -4066,6 +4069,7 @@ describe('workflowRunsCommand', () => {
     expect(listSpy).toHaveBeenCalledWith(
       expect.objectContaining({ codebaseId: 'cb-proj', limit: 20 })
     );
+    expect(canonicalSpy).not.toHaveBeenCalled();
   });
 
   it('scopes a linked worktree to its registered primary checkout', async () => {
@@ -4075,11 +4079,13 @@ describe('workflowRunsCommand', () => {
     (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce(
       '/registered/primary'
     );
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
-      id: 'cb-primary',
-      name: 'owner/repo',
-      default_cwd: '/registered/primary',
-    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'cb-primary',
+        name: 'owner/repo',
+        default_cwd: '/registered/primary',
+      });
     const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
     listSpy.mockClear();
     listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
@@ -4092,6 +4098,29 @@ describe('workflowRunsCommand', () => {
       expect.objectContaining({ codebaseId: 'cb-primary', limit: 20 })
     );
     expect(consoleSpy).not.toHaveBeenCalledWith('(not a registered project — showing all runs)');
+  });
+
+  it('preserves a codebase registered at the exact linked-worktree path', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-worktree',
+      name: 'owner/repo-worktree',
+      default_cwd: '/workspace/registered-worktree',
+    });
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand('/workspace/registered-worktree', {});
+
+    expect(canonicalSpy).not.toHaveBeenCalled();
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-worktree', limit: 20 })
+    );
   });
 
   it('prints the unregistered-cwd note and lists globally when no codebase resolves', async () => {

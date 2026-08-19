@@ -32,7 +32,7 @@ const mockFindCodebaseByRepoUrl = mock(() => Promise.resolve(null));
 const mockFindCodebaseByDefaultCwd = mock(() => Promise.resolve(null));
 const mockFindCodebaseByName = mock(() => Promise.resolve(null));
 const mockUpdateCodebase = mock(() => Promise.resolve());
-const mockCreateProjectSourceSymlink = mock(() => Promise.resolve());
+const mockCreateProjectSourceSymlink = mock((): Promise<void> => Promise.resolve());
 
 mock.module('../db/codebases', () => ({
   createCodebase: mockCreateCodebase,
@@ -115,8 +115,9 @@ function setupSpies(): void {
     stdout: '',
     stderr: '',
   });
-  spyGetCanonicalRepoPath = spyOn(gitUtils, 'getCanonicalRepoPath').mockImplementation(async path =>
-    gitUtils.toRepoPath(path)
+  spyGetCanonicalRepoPath = spyOn(gitUtils, 'getCanonicalRepoPath').mockImplementation(
+    (path: string): ReturnType<typeof gitUtils.getCanonicalRepoPath> =>
+      Promise.resolve(gitUtils.toRepoPath(path))
   );
 }
 
