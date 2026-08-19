@@ -34,6 +34,7 @@ Archon provides a unified directory and configuration system with:
 │       ├── worktrees/              # Git worktrees for this project (repo kinds only)
 │       ├── artifacts/              # Workflow artifacts — NEVER in git
 │       │   ├── runs/<run-id>/      #   $ARTIFACTS_DIR for one run
+│       │   │   ├── *.nodeoutput    #     oversized values passed to shell nodes
 │       │   │   └── nodes/          #     typed output sidecars (<id>.md + <id>.meta.json)
 │       │   ├── scopes/<workflow>/<scope>/   # cross-invocation artifacts (persist_session)
 │       │   └── uploads/<conv-id>/  #   Web UI file uploads (ephemeral)
@@ -58,7 +59,10 @@ Archon provides a unified directory and configuration system with:
   project, and `_cwd/<basename>` when a run has no registered codebase at all. Folder
   projects and `_cwd` projects have no `source/` or `worktrees/` — they run in place.
 - `workspaces/<project>/artifacts/` - Run output. `$ARTIFACTS_DIR` is
-  `artifacts/runs/<run-id>/`.
+  `artifacts/runs/<run-id>/`. Oversized values passed to shell nodes are retained here as
+  `.nodeoutput` files so concurrent runs never share the deferred read. Archon currently
+  retains filesystem run artifacts until the operator removes them; `archon workflow cleanup`
+  deletes old database run records, not these directories.
 - `workspaces/<project>/logs/` - One JSONL execution log per run.
 - `workspaces/<project>/state/` - `$STATE_DIR`. Cross-run workflow state, shared by every
   workflow in the project. Survives worktree teardown; never visible to git.

@@ -2837,7 +2837,7 @@ async function executeBashNode(
     undefined,
     { shellSafe: true, stateDir }
   );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, logDir);
+  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, artifactsDir);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   // Archon-managed env only — runSubprocess adds the host env for host runs and
@@ -3705,7 +3705,7 @@ async function executeLoopGroupNode(
         n,
         prevSnapshot,
         userInputForIter,
-        logDir,
+        artifactsDir,
         knownBodyIds,
         directBodyIds
       )
@@ -3887,7 +3887,7 @@ async function executeLoopGroupNode(
           bashPrompt,
           scopedNodeOutputs,
           true, // escapedForBash
-          logDir
+          artifactsDir
         );
         await runSubprocess(execContext, groupBashPath, ['-c', substitutedBash], {
           cwd,
@@ -5383,7 +5383,7 @@ async function executeLoopNode(
           bashPrompt,
           nodeOutputs,
           true, // escapedForBash
-          logDir
+          artifactsDir
         );
         await runSubprocess(execContext, loopBashPath, ['-c', substitutedBash], {
           cwd,

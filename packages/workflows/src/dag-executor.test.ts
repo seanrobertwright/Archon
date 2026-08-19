@@ -1087,6 +1087,36 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
     expect(written).toBe(largeValue);
   });
 
+  it('keeps same-node spills isolated in separate run artifact directories', async () => {
+    const runAArtifacts = join(tempDir, 'run-a');
+    const runBArtifacts = join(tempDir, 'run-b');
+    await Promise.all([
+      mkdir(runAArtifacts, { recursive: true }),
+      mkdir(runBArtifacts, { recursive: true }),
+    ]);
+    const runAOutput = 'a'.repeat(33_000);
+    const runBOutput = 'b'.repeat(33_000);
+
+    const runACommand = substituteNodeOutputRefs(
+      'printf %s $build.output',
+      new Map([['build', makeOutput('completed', runAOutput)]]),
+      true,
+      runAArtifacts
+    );
+    const runBCommand = substituteNodeOutputRefs(
+      'printf %s $build.output',
+      new Map([['build', makeOutput('completed', runBOutput)]]),
+      true,
+      runBArtifacts
+    );
+
+    expect(runACommand).not.toBe(runBCommand);
+    expect(runACommand).toContain(join(runAArtifacts, 'build.nodeoutput'));
+    expect(runBCommand).toContain(join(runBArtifacts, 'build.nodeoutput'));
+    expect(await readFile(join(runAArtifacts, 'build.nodeoutput'), 'utf-8')).toBe(runAOutput);
+    expect(await readFile(join(runBArtifacts, 'build.nodeoutput'), 'utf-8')).toBe(runBOutput);
+  });
+
   it('does not write to file when escapedForBash=false even for large output', () => {
     const largeOutput = 'x'.repeat(33_000);
     const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
@@ -5440,6 +5470,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const mockDeps = createMockDeps(store);
     const workflowRun = makeWorkflowRun('bash-output-live-full');
     const paddingBytes = 33_000;
+    const artifactsDir = join(testDir, 'artifacts');
+    const logDir = join(testDir, 'logs');
+    const producerOutput = `{"status":"PASS","padding":"${'x'.repeat(paddingBytes)}"}`;
+    await mkdir(artifactsDir, { recursive: true });
 
     await executeDagWorkflow(
       mockDeps,
@@ -5464,9 +5498,9 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       workflowRun,
       'claude',
       undefined,
-      join(testDir, 'artifacts'),
+      artifactsDir,
       join(testDir, 'state'),
-      join(testDir, 'logs'),
+      logDir,
       'main',
       'docs/',
       minimalConfig
@@ -5489,6 +5523,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect((consumerEvent![0] as { data: { node_output: string } }).data.node_output).toBe(
       String(paddingBytes + 30)
     );
+    expect(await readFile(join(artifactsDir, 'producer.nodeoutput'), 'utf-8')).toBe(producerOutput);
+    expect(await Bun.file(join(logDir, 'producer.nodeoutput')).exists()).toBe(false);
   });
 
   it('stores node_output in node_completed event data for AI nodes', async () => {
