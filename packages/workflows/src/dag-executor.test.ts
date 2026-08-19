@@ -20102,6 +20102,47 @@ describe('executeDagWorkflow -- addressable session resume', () => {
     ).toBe(true);
   });
 
+  it('fails a required loop source before completion when its session checkpoint cannot be saved', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: '<promise>DONE</promise>' };
+      yield { type: 'result', sessionId: 'loop-session' };
+    });
+    const store = createMockStore();
+    (
+      store.upsertWorkflowRunNodeSession as Mock<typeof store.upsertWorkflowRunNodeSession>
+    ).mockRejectedValue(new Error('checkpoint failed'));
+
+    await runAddressableWorkflow(
+      [
+        {
+          id: 'loop-source',
+          loop: { prompt: 'iterate', until: 'DONE', max_iterations: 1, fresh_context: false },
+        },
+        {
+          id: 'consumer',
+          prompt: 'consumer',
+          context: { resume: 'loop-source' },
+          depends_on: ['loop-source'],
+        },
+      ],
+      store
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string }
+    );
+    expect(
+      events.some(
+        event => event.event_type === 'node_completed' && event.step_name === 'loop-source'
+      )
+    ).toBe(false);
+    expect(
+      events.some(event => event.event_type === 'node_failed' && event.step_name === 'loop-source')
+    ).toBe(true);
+  });
+
   it('does not checkpoint sessions when the workflow has no named consumer', async () => {
     const store = createMockStore();
     (
