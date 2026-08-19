@@ -40,6 +40,7 @@ import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
+import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
@@ -2503,14 +2504,17 @@ export async function workflowRunsCommand(
     statusFilter = parsed.data;
   }
 
-  // Scope to this project by resolving the codebase from cwd (mirror
-  // workflowRunCommand). --all opts out of scoping. A lookup failure or an
-  // unregistered cwd both fall back to the global list — never a silent
-  // wrong-scope (the human path prints an explicit note below).
+  // Scope to this project by exact registration first, then through the
+  // checkout's canonical repository path. This preserves an explicitly
+  // registered linked worktree while allowing another linked worktree to share
+  // its registered primary checkout. Ordinary clones remain unchanged (#2613).
+  // --all opts out of scoping. A lookup failure or an unregistered cwd both
+  // fall back to the global list — never a silent wrong-scope (the human path
+  // prints an explicit note below).
   let codebase = null;
   if (!opts.all) {
     try {
-      codebase = await codebaseDb.findCodebaseByDefaultCwd(cwd);
+      codebase = await findCodebaseForCheckoutPath(cwd);
     } catch (error) {
       getLog().warn({ err: error as Error, cwd }, 'cli.workflow_runs_codebase_lookup_failed');
     }
@@ -2593,11 +2597,11 @@ const FULL_RUN_ID_RE =
  * codebase, a unique match resolves, and an ambiguous prefix errors.
  *
  * Full UUIDs skip resolution entirely — exact lookup is global, so full ids
- * keep working from any directory. Worktree paths are normalized to their
- * canonical checkout before project lookup. By default, an omitted or
- * unregistered cwd and an unmatched prefix pass through unchanged so the
- * downstream exact lookup keeps its existing error surface. Callers without a
- * downstream lookup can require a match instead.
+ * keep working from any directory. Project lookup preserves an exact checkout
+ * registration, then falls back to a linked worktree's canonical checkout. By
+ * default, an omitted or unregistered cwd and an unmatched prefix pass through
+ * unchanged so the downstream exact lookup keeps its existing error surface.
+ * Callers without a downstream lookup can require a match instead.
  */
 async function resolveRunIdArg(
   runId: string,
@@ -2611,8 +2615,7 @@ async function resolveRunIdArg(
     }
     return runId;
   }
-  const canonicalCwd = await git.getCanonicalRepoPath(cwd);
-  const codebase = await codebaseDb.findCodebaseByDefaultCwd(canonicalCwd);
+  const codebase = await findCodebaseForCheckoutPath(cwd);
   if (!codebase) {
     if (requirePrefixMatch) {
       throw new Error(`Cannot resolve run id prefix '${runId}' outside a registered project.`);

@@ -91,6 +91,7 @@ describe('WorktreeProvider', () => {
   let listWorktreesSpy: Mock<typeof git.listWorktrees>;
   let findWorktreeByBranchSpy: Mock<typeof git.findWorktreeByBranch>;
   let getCanonicalRepoPathSpy: Mock<typeof git.getCanonicalRepoPath>;
+  let verifyWorktreeOwnershipSpy: Mock<typeof git.verifyWorktreeOwnership>;
 
   beforeEach(() => {
     mockConfigLoader = async (): Promise<{ baseBranch: git.BranchName }> => ({
@@ -103,6 +104,7 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy = spyOn(git, 'listWorktrees');
     findWorktreeByBranchSpy = spyOn(git, 'findWorktreeByBranch');
     getCanonicalRepoPathSpy = spyOn(git, 'getCanonicalRepoPath');
+    verifyWorktreeOwnershipSpy = spyOn(git, 'verifyWorktreeOwnership');
     getDefaultBranchSpy = spyOn(git, 'getDefaultBranch');
     getDefaultRemoteSpy = spyOn(git, 'getDefaultRemote');
     syncWorkspaceSpy = spyOn(git, 'syncWorkspace');
@@ -114,6 +116,7 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy.mockResolvedValue([]);
     findWorktreeByBranchSpy.mockResolvedValue(null);
     getCanonicalRepoPathSpy.mockImplementation(async path => git.toRepoPath(path));
+    verifyWorktreeOwnershipSpy.mockResolvedValue(undefined);
     // Most paths exist by default (directoryExists checks for destroy etc.),
     // but .gitmodules is absent by default — most repos don't use submodules,
     // and default-on submodule init must skip cleanly in that case.
@@ -149,6 +152,7 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy.mockRestore();
     findWorktreeByBranchSpy.mockRestore();
     getCanonicalRepoPathSpy.mockRestore();
+    verifyWorktreeOwnershipSpy.mockRestore();
     getDefaultBranchSpy.mockRestore();
     getDefaultRemoteSpy.mockRestore();
     syncWorkspaceSpy.mockRestore();
@@ -586,6 +590,9 @@ describe('WorktreeProvider', () => {
     test('throws when worktree belongs to different repo root (cross-checkout)', async () => {
       worktreeExistsSpy.mockResolvedValue(true);
       mockReadFile.mockResolvedValue('gitdir: /different/repo/.git/worktrees/archon/issue-42\n');
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('Worktree belongs to a different clone (/different/repo/.git).')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(/belongs to a different clone/);
     });
@@ -595,6 +602,9 @@ describe('WorktreeProvider', () => {
       const eisdirError = new Error('EISDIR') as NodeJS.ErrnoException;
       eisdirError.code = 'EISDIR';
       mockReadFile.mockRejectedValue(eisdirError);
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('path contains a full git checkout')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(
         /path contains a full git checkout/
@@ -606,6 +616,9 @@ describe('WorktreeProvider', () => {
       const eaccesError = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
       eaccesError.code = 'EACCES';
       mockReadFile.mockRejectedValue(eaccesError);
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('Cannot verify worktree ownership: permission denied')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(
         /Cannot verify worktree ownership/
@@ -614,7 +627,14 @@ describe('WorktreeProvider', () => {
 
     test('throws when .git pointer is not a git-worktree reference (e.g., submodule)', async () => {
       worktreeExistsSpy.mockResolvedValue(true);
-      mockReadFile.mockResolvedValue('gitdir: /workspace/repo/.git/modules/submodule-name\n');
+      const enoentError = new Error('ENOENT') as NodeJS.ErrnoException;
+      enoentError.code = 'ENOENT';
+      mockReadFile
+        .mockResolvedValueOnce('gitdir: /workspace/repo/.git/modules/submodule-name\n')
+        .mockRejectedValueOnce(enoentError);
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('.git pointer is not a git-worktree reference')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(/not a git-worktree reference/);
     });
@@ -685,6 +705,9 @@ describe('WorktreeProvider', () => {
       );
       // .git points to a different clone
       mockReadFile.mockResolvedValue('gitdir: /other/clone/.git/worktrees/feature-auth\n');
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('Worktree belongs to a different clone (/other/clone/.git).')
+      );
 
       await expect(provider.create(request)).rejects.toThrow(/belongs to a different clone/);
     });
@@ -1195,6 +1218,38 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('keeps a durable external Git directory anchor when the linked checkout is supplied', async () => {
+      const worktreePath = git.toWorktreePath('/workspace/external-linked');
+      const branchName = git.toBranchName('external-linked');
+      getCanonicalRepoPathSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(worktreePath, '/metadata/repository')
+      );
+
+      const result = await provider.destroy(worktreePath, {
+        branchName,
+        canonicalRepoPath: git.toRepoPath(worktreePath),
+        deleteRemoteBranch: true,
+      });
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining(['-C', '/metadata/repository', 'worktree', 'remove', worktreePath]),
+        expect.any(Object)
+      );
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/metadata/repository', 'branch', '-D', branchName],
+        expect.any(Object)
+      );
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/metadata/repository', 'push', 'origin', '--delete', branchName],
+        expect.any(Object)
+      );
+      expect(result.branchDeleted).toBe(true);
+      expect(result.remoteBranchDeleted).toBe(true);
+    });
+
     test('uses force flag when specified', async () => {
       const worktreePath = git.toWorktreePath('/workspace/worktrees/repo/issue-42');
 
@@ -1604,6 +1659,22 @@ describe('WorktreeProvider', () => {
       expect(result?.branchName).toBe(git.toBranchName('issue-42'));
     });
 
+    test('queries an external-git-dir linked checkout from its exact path', async () => {
+      const worktreePath = git.toWorktreePath('/workspace/external-linked');
+      worktreeExistsSpy.mockResolvedValue(true);
+      getCanonicalRepoPathSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(worktreePath, '/metadata/repository')
+      );
+      listWorktreesSpy.mockResolvedValue([
+        { path: worktreePath, branch: git.toBranchName('external-linked') },
+      ]);
+
+      const result = await provider.get(worktreePath);
+
+      expect(result?.workingPath).toBe(worktreePath);
+      expect(listWorktreesSpy).toHaveBeenCalledWith(worktreePath);
+    });
+
     test('re-throws errors from getCanonicalRepoPath with logging', async () => {
       worktreeExistsSpy.mockResolvedValue(true);
       getCanonicalRepoPathSpy.mockRejectedValue(new Error('Permission denied'));
@@ -1703,6 +1774,23 @@ describe('WorktreeProvider', () => {
       expect(result?.provider).toBe('worktree');
       expect(result?.branchName).toBe(git.toBranchName('feature/auth'));
       expect(result?.metadata).toHaveProperty('adopted', true);
+    });
+
+    test('adopts an external-git-dir linked checkout from its exact path', async () => {
+      const worktreePath = git.toWorktreePath('/workspace/external-linked');
+      worktreeExistsSpy.mockResolvedValue(true);
+      getCanonicalRepoPathSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(worktreePath, '/metadata/repository')
+      );
+      listWorktreesSpy.mockResolvedValue([
+        { path: worktreePath, branch: git.toBranchName('external-linked') },
+      ]);
+
+      const result = await provider.adopt(worktreePath);
+
+      expect(result?.workingPath).toBe(worktreePath);
+      expect(result?.metadata).toHaveProperty('adopted', true);
+      expect(listWorktreesSpy).toHaveBeenCalledWith(worktreePath);
     });
 
     test('returns null for non-existent path', async () => {

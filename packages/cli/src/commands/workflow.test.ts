@@ -158,9 +158,27 @@ mock.module('@archon/workflows/event-emitter', () => ({
   })),
 }));
 
+class MockCanonicalRepoPathUnavailableError extends Error {
+  constructor(
+    readonly checkoutPath: string,
+    readonly commonGitDir: string
+  ) {
+    super(`Cannot determine the primary checkout for ${checkoutPath}`);
+    this.name = 'CanonicalRepoPathUnavailableError';
+  }
+}
+
 mock.module('@archon/git', () => ({
   findRepoRoot: mock(() => Promise.resolve(null)),
   getCanonicalRepoPath: mock((path: string) => Promise.resolve(path)),
+  getGitCheckoutIdentity: mock((path: string) =>
+    Promise.resolve({
+      gitDir: `${path}/.git`,
+      commonGitDir: `${path}/.git`,
+      linkedWorktree: false,
+    })
+  ),
+  CanonicalRepoPathUnavailableError: MockCanonicalRepoPathUnavailableError,
   getRemoteUrl: mock(() => Promise.resolve(null)),
   checkout: mock(() => Promise.resolve()),
   toRepoPath: mock((path: string) => path),
@@ -180,6 +198,7 @@ mock.module('@archon/core/db/conversations', () => ({
 
 mock.module('@archon/core/db/codebases', () => ({
   findCodebaseByDefaultCwd: mock(() => Promise.resolve(null)),
+  listCodebases: mock(() => Promise.resolve([])),
   findCodebaseByPathPrefix: mock(() => Promise.resolve(null)),
   getCodebase: mock(() => Promise.resolve(null)),
 }));
@@ -3959,9 +3978,9 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
     (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce('/canonical/repo');
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
-      CODEBASE
-    );
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(CODEBASE);
     (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
       { id: FULL_ID },
     ]);
@@ -3974,6 +3993,34 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     );
 
     expect(codebaseDb.findCodebaseByDefaultCwd).toHaveBeenCalledWith('/canonical/repo');
+    expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+      workflow_run_id: FULL_ID,
+      event_type: 'workflow_started',
+      data: undefined,
+    });
+  });
+
+  it('resolves an event prefix from an exact registered linked worktree', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
+      CODEBASE
+    );
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: FULL_ID },
+    ]);
+
+    await workflowEventEmitCommand(
+      '0b1ee8da',
+      'workflow_started',
+      undefined,
+      '/workspace/registered-worktree'
+    );
+
+    expect(canonicalSpy).not.toHaveBeenCalled();
     expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
       workflow_run_id: FULL_ID,
       event_type: 'workflow_started',
@@ -4050,8 +4097,11 @@ describe('workflowRunsCommand', () => {
   });
 
   it('scopes to the cwd-resolved codebase id', async () => {
+    const git = await import('@archon/git');
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
     (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'cb-proj',
       name: 'owner/repo',
@@ -4065,6 +4115,96 @@ describe('workflowRunsCommand', () => {
 
     expect(listSpy).toHaveBeenCalledWith(
       expect.objectContaining({ codebaseId: 'cb-proj', limit: 20 })
+    );
+    expect(canonicalSpy).not.toHaveBeenCalled();
+  });
+
+  it('scopes a linked worktree to its registered primary checkout', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce(
+      '/registered/primary'
+    );
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'cb-primary',
+        name: 'owner/repo',
+        default_cwd: '/registered/primary',
+      });
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand('/workspace/sibling-worktree', {});
+
+    expect(git.getCanonicalRepoPath).toHaveBeenCalledWith('/workspace/sibling-worktree');
+    expect(codebaseDb.findCodebaseByDefaultCwd).toHaveBeenCalledWith('/registered/primary');
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-primary', limit: 20 })
+    );
+    expect(consoleSpy).not.toHaveBeenCalledWith('(not a registered project — showing all runs)');
+  });
+
+  it('preserves a codebase registered at the exact linked-worktree path', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-worktree',
+      name: 'owner/repo-worktree',
+      default_cwd: '/workspace/registered-worktree',
+    });
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand('/workspace/registered-worktree', {});
+
+    expect(canonicalSpy).not.toHaveBeenCalled();
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-worktree', limit: 20 })
+    );
+  });
+
+  it('scopes an external-git-dir worktree through its registered Git identity', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const cwd = '/workspace/external-linked';
+    const commonGitDir = '/metadata/repository';
+    const registered = {
+      id: 'cb-external',
+      name: 'owner/repo',
+      default_cwd: '/workspace/primary',
+      kind: 'repo',
+    };
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new git.CanonicalRepoPathUnavailableError(cwd, commonGitDir)
+    );
+    (git.getGitCheckoutIdentity as ReturnType<typeof mock>)
+      .mockResolvedValueOnce({
+        gitDir: `${commonGitDir}/worktrees/linked`,
+        commonGitDir,
+        linkedWorktree: true,
+      })
+      .mockResolvedValueOnce({
+        gitDir: commonGitDir,
+        commonGitDir,
+        linkedWorktree: false,
+      });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (codebaseDb.listCodebases as ReturnType<typeof mock>).mockResolvedValueOnce([registered]);
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand(cwd, {});
+
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-external', limit: 20 })
     );
   });
 
