@@ -1049,6 +1049,9 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
 describe('substituteNodeOutputRefs -- large output file substitution', () => {
   let tempDir: string;
 
+  const spillPath = (artifactsDir: string, filename: string): string =>
+    join(artifactsDir, '.archon', 'node-output-spills', filename);
+
   beforeEach(async () => {
     tempDir = join(tmpdir(), `archon-test-large-output-${Date.now()}`);
     await mkdir(tempDir, { recursive: true });
@@ -1072,7 +1075,7 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
     expect(result).toContain('a.nodeoutput');
     // Verify file was written with correct content
     const { readFile: readFileAsync } = await import('fs/promises');
-    const written = await readFileAsync(join(tempDir, 'a.nodeoutput'), 'utf-8');
+    const written = await readFileAsync(spillPath(tempDir, 'a.nodeoutput'), 'utf-8');
     expect(written).toBe(largeOutput);
   });
 
@@ -1083,8 +1086,54 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
     expect(result).toContain('$(cat ');
     expect(result).toContain('a.data.nodeoutput');
     const { readFile: readFileAsync } = await import('fs/promises');
-    const written = await readFileAsync(join(tempDir, 'a.data.nodeoutput'), 'utf-8');
+    const written = await readFileAsync(spillPath(tempDir, 'a.data.nodeoutput'), 'utf-8');
     expect(written).toBe(largeValue);
+  });
+
+  it('does not overwrite a workflow-authored root artifact with the same filename', async () => {
+    const workflowArtifact = join(tempDir, 'a.nodeoutput');
+    await writeFile(workflowArtifact, 'workflow-owned');
+    const largeOutput = 'x'.repeat(33_000);
+
+    substituteNodeOutputRefs(
+      'echo $a.output',
+      new Map([['a', makeOutput('completed', largeOutput)]]),
+      true,
+      tempDir
+    );
+
+    expect(await readFile(workflowArtifact, 'utf-8')).toBe('workflow-owned');
+    expect(await readFile(spillPath(tempDir, 'a.nodeoutput'), 'utf-8')).toBe(largeOutput);
+  });
+
+  it('keeps same-node spills isolated in separate run artifact directories', async () => {
+    const runAArtifacts = join(tempDir, 'run-a');
+    const runBArtifacts = join(tempDir, 'run-b');
+    await Promise.all([
+      mkdir(runAArtifacts, { recursive: true }),
+      mkdir(runBArtifacts, { recursive: true }),
+    ]);
+    const runAOutput = 'a'.repeat(33_000);
+    const runBOutput = 'b'.repeat(33_000);
+
+    const runACommand = substituteNodeOutputRefs(
+      'printf %s $build.output',
+      new Map([['build', makeOutput('completed', runAOutput)]]),
+      true,
+      runAArtifacts
+    );
+    const runBCommand = substituteNodeOutputRefs(
+      'printf %s $build.output',
+      new Map([['build', makeOutput('completed', runBOutput)]]),
+      true,
+      runBArtifacts
+    );
+
+    expect(runACommand).not.toBe(runBCommand);
+    expect(runACommand).toContain(spillPath(runAArtifacts, 'build.nodeoutput'));
+    expect(runBCommand).toContain(spillPath(runBArtifacts, 'build.nodeoutput'));
+    expect(await readFile(spillPath(runAArtifacts, 'build.nodeoutput'), 'utf-8')).toBe(runAOutput);
+    expect(await readFile(spillPath(runBArtifacts, 'build.nodeoutput'), 'utf-8')).toBe(runBOutput);
   });
 
   it('does not write to file when escapedForBash=false even for large output', () => {
@@ -1095,11 +1144,12 @@ describe('substituteNodeOutputRefs -- large output file substitution', () => {
     expect(result).not.toContain('$(cat ');
   });
 
-  it('falls back to shell-quoting when file write fails', () => {
+  it('falls back to shell-quoting when file write fails', async () => {
     const largeOutput = 'x'.repeat(33_000);
     const outputs = new Map([['a', makeOutput('completed', largeOutput)]]);
-    // Use a non-existent directory to trigger writeFileSync failure
-    const badDir = '/nonexistent-path-that-does-not-exist';
+    // A regular file cannot contain the engine spill child on any platform.
+    const badDir = join(tempDir, 'not-a-directory');
+    await writeFile(badDir, 'occupied');
     const result = substituteNodeOutputRefs('echo $a.output', outputs, true, badDir);
     // Should fall back to inline shell-quoting instead of crashing
     expect(result).not.toContain('$(cat ');
@@ -5440,6 +5490,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const mockDeps = createMockDeps(store);
     const workflowRun = makeWorkflowRun('bash-output-live-full');
     const paddingBytes = 33_000;
+    const artifactsDir = join(testDir, 'artifacts');
+    const logDir = join(testDir, 'logs');
+    const producerOutput = `{"status":"PASS","padding":"${'x'.repeat(paddingBytes)}"}`;
+    await mkdir(artifactsDir, { recursive: true });
 
     await executeDagWorkflow(
       mockDeps,
@@ -5464,9 +5518,9 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       workflowRun,
       'claude',
       undefined,
-      join(testDir, 'artifacts'),
+      artifactsDir,
       join(testDir, 'state'),
-      join(testDir, 'logs'),
+      logDir,
       'main',
       'docs/',
       minimalConfig
@@ -5489,6 +5543,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect((consumerEvent![0] as { data: { node_output: string } }).data.node_output).toBe(
       String(paddingBytes + 30)
     );
+    expect(
+      await readFile(
+        join(artifactsDir, '.archon', 'node-output-spills', 'producer.nodeoutput'),
+        'utf-8'
+      )
+    ).toBe(producerOutput);
+    expect(await Bun.file(join(logDir, 'producer.nodeoutput')).exists()).toBe(false);
   });
 
   it('stores node_output in node_completed event data for AI nodes', async () => {
@@ -7268,6 +7329,66 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
 
       expect(calls).toBe(2);
       expect((await readFile(counterFile, 'utf8')).trim()).toBe('2');
+    });
+
+    it('reads oversized upstream output in until_bash from the run-owned spill directory', async () => {
+      const artifactsDir = join(testDir, 'loop-until-artifacts');
+      const logDir = join(testDir, 'loop-until-logs');
+      const largeOutput = 'x'.repeat(33_000);
+      let calls = 0;
+      mockSendQueryDag.mockImplementation(async function* () {
+        calls++;
+        yield { type: 'assistant', content: 'working' };
+        yield { type: 'result', sessionId: 's-1' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('loop-large-until-bash');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-large-until-bash',
+          nodes: [
+            {
+              id: 'producer',
+              bash: 'head -c 33000 /dev/zero | tr "\\0" x',
+            },
+            {
+              id: 'my-loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Keep working.',
+                max_iterations: 2,
+                until_bash: 'value=$producer.output; test "${#value}" -eq 33000',
+              },
+              depends_on: ['producer'],
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        join(testDir, 'state'),
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(calls).toBe(1);
+      expect(
+        await readFile(
+          join(artifactsDir, '.archon', 'node-output-spills', 'producer.nodeoutput'),
+          'utf-8'
+        )
+      ).toBe(largeOutput);
+      expect(await Bun.file(join(logDir, 'producer.nodeoutput')).exists()).toBe(false);
     });
 
     it('does not complete a loop with no until when the model emits a sentinel-shaped string', async () => {
@@ -16476,17 +16597,71 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(receivedPrompts[1]).toContain('iter-1-draft');
   });
 
-  it('until_bash reads the current iteration body output and completes', async () => {
-    // No `until` signal from AI; completion is decided solely by until_bash exit code.
-    // The body is a pure bash node that increments a counter file each iteration and
-    // emits the count; until_bash exits 0 once that current body output reaches iter 2.
-    // No AI node → sendQuery unused.
-    const counterFile = join(testDir, 'iter-counter');
-    // The path is interpolated into REAL bash scripts: on Windows, join() yields
-    // backslashes that bash strips as escapes. Use forward slashes + quoting so
-    // the script is valid on every platform (git-bash accepts D:/-style paths).
-    const counterRef = `"${counterFile.replace(/\\/g, '/')}"`;
+  it('reads oversized $LOOP_PREV output from the run-owned spill directory', async () => {
+    const artifactsDir = join(testDir, 'loop-prev-artifacts');
+    const logDir = join(testDir, 'loop-prev-logs');
+    const largeOutput = 'x'.repeat(33_000);
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('lg-large-loopprev');
 
+    const result = await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-lg',
+      testDir,
+      {
+        name: 'lg-large-loopprev',
+        nodes: [
+          {
+            id: 'draft-loop',
+            loop_group: {
+              until: 'DONE',
+              max_iterations: 2,
+              fresh_context: false,
+              nodes: [
+                {
+                  id: 'work',
+                  bash:
+                    'previous=$LOOP_PREV.work.output; ' +
+                    'if [ -z "$previous" ]; then head -c 33000 /dev/zero | tr "\\0" x; ' +
+                    'else printf "%s\\nDONE\\n" "${#previous}"; fi',
+                  depends_on: [],
+                },
+              ],
+            },
+            depends_on: [],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(result).toContain('33000');
+    expect(
+      await readFile(
+        join(artifactsDir, '.archon', 'node-output-spills', 'work.nodeoutput'),
+        'utf-8'
+      )
+    ).toBe(largeOutput);
+    expect(await Bun.file(join(logDir, 'work.nodeoutput')).exists()).toBe(false);
+  });
+
+  it('until_bash reads oversized current body output from the run-owned spill directory', async () => {
+    // No `until` signal from AI; completion is decided solely by until_bash exit code.
+    // The body emits an oversized value and the completion check proves byte-complete
+    // readback through the same substitution path used in production.
+    const artifactsDir = join(testDir, 'group-until-artifacts');
+    const logDir = join(testDir, 'group-until-logs');
+    const largeOutput = 'x'.repeat(33_000);
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('lg-untilbash');
@@ -16498,13 +16673,13 @@ describe('executeDagWorkflow -- loop_group node', () => {
           // No `until` at all (#2563). Before that the schema forced a decoy signal
           // here; a pure-bash body emits no model text, so declaring one described a
           // channel that could never fire.
-          max_iterations: 5,
+          max_iterations: 2,
           fresh_context: false,
-          until_bash: "test $bump.output = 'iter 2'",
+          until_bash: 'value=$bump.output; test "${#value}" -eq 33000',
           nodes: [
             {
               id: 'bump',
-              bash: `n=$(cat ${counterRef} 2>/dev/null || echo 0); echo $((n+1)) > ${counterRef}; echo "iter $((n+1))"`,
+              bash: 'head -c 33000 /dev/zero | tr "\\0" x',
               depends_on: [],
             },
           ],
@@ -16522,22 +16697,22 @@ describe('executeDagWorkflow -- loop_group node', () => {
       workflowRun,
       'claude',
       undefined,
-      join(testDir, 'artifacts'),
+      artifactsDir,
       join(testDir, 'state'),
-      join(testDir, 'logs'),
+      logDir,
       'main',
       'docs/',
       minimalConfig
     );
 
-    // until_bash sees `bump` from the current scoped output map and exits 0 once it
-    // reaches iter 2 → completes after 2 iterations.
-    // The counter file holds the final iteration count (2).
-    const { readFile } = await import('fs/promises');
-    const finalCount = parseInt((await readFile(counterFile, 'utf8')).trim(), 10);
-    expect(finalCount).toBe(2);
-    // The group's output is the terminal body node's (bump) last-iteration stdout.
-    expect(result).toContain('iter 2');
+    expect(result).toBe(largeOutput);
+    expect(
+      await readFile(
+        join(artifactsDir, '.archon', 'node-output-spills', 'bump.nodeoutput'),
+        'utf-8'
+      )
+    ).toBe(largeOutput);
+    expect(await Bun.file(join(logDir, 'bump.nodeoutput')).exists()).toBe(false);
   });
 
   it('INSTANCE 4: single-node body degenerates like loop: and completes in 1 iteration', async () => {
