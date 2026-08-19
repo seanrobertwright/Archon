@@ -8148,9 +8148,10 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
         if (output.loopIterations !== undefined) ctx.totalLoopIterations += output.loopIterations;
         ctx.nodeOutputs.set(nodeId, output);
         // Typed artifact: when a node declares `output_type`, persist its output
-        // as a typed sidecar (nodes/<id>.md + .meta.json) so other nodes and
-        // later runs can locate it by type. Best-effort — a metadata write must
-        // never fail an otherwise-successful node.
+        // as a typed sidecar so other nodes and later runs can locate it by type.
+        // The writer keeps top-level node paths stable and qualifies loop body
+        // paths with ctx.loopGroupPath. Best-effort — a metadata write must never
+        // fail an otherwise-successful node.
         const completedNode = nodeById.get(nodeId);
         if (output.state === 'completed' && completedNode?.output_type) {
           const meta = {
