@@ -1275,13 +1275,14 @@ surfaces it rewrites. That makes the right-hand form work and the left-hand form
 
 ```yaml
 when: "$probe.output == '$INPUTS.mode'"   # ✅ becomes  $probe.output == 'fast'
-when: "$INPUTS.mode == 'fast'"            # ❌ becomes  fast == 'fast'  → unparseable
+when: "$INPUTS.mode == 'fast'"            # ❌ would become  fast == 'fast'
 ```
 
-The second is not a condition any more, so the node is skipped with an unparseable-`when:`
-warning at run time. The left-hand form is a `workflow:`/direct-run feature: those callers
-resolve `$INPUTS` at evaluation time, while an included block is inlined into the caller's
-own run and has no input scope left to resolve against.
+The second would no longer be a condition, so include expansion rejects it at load time and
+shows both the authored and rewritten expressions instead of allowing a runtime skip. The
+left-hand form is a `workflow:`/direct-run feature: those callers resolve `$INPUTS` at
+evaluation time, while an included block is inlined into the caller's own run and has no
+input scope left to resolve against.
 :::
 
 ### Running a workflow that declares inputs
