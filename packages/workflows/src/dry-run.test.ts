@@ -3,7 +3,13 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeTestComposedWorkflow, makeTestWorkflow } from './test-utils';
-import { dryRunWorkflow, formatDryRunTrace, loadDryRunStubs } from './dry-run';
+import {
+  createDryRunStubScaffold,
+  dryRunWorkflow,
+  formatDryRunTrace,
+  loadDryRunStubs,
+  writeDryRunStubScaffold,
+} from './dry-run';
 import type { DryRunResolution } from './dry-run';
 import { buildAiProfile } from './model-validation';
 import { resolveWorkflowModelScope } from './node-model-resolution';
@@ -84,6 +90,201 @@ describe('loadDryRunStubs', () => {
     await expect(loadDryRunStubs(temporaryFile('node: 42\n'))).rejects.toThrow(
       'Invalid dry-run stub file'
     );
+  });
+});
+
+describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
+  test('writes YAML-native schema placeholders for flattened and loop-group node ids', async () => {
+    const block = makeTestWorkflow({
+      name: 'review-block',
+      nodes: [
+        {
+          id: 'classify',
+          prompt: 'classify',
+          output_format: {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', enum: ['bug', 'feature'] },
+              summary: { type: 'string', minLength: 5 },
+              ready: { type: 'boolean' },
+              score: { type: 'number', minimum: 2 },
+              labels: { type: 'array', minItems: 1, items: { type: 'string' } },
+              meta: {
+                type: 'object',
+                properties: { reviewed: { type: 'boolean' } },
+                required: ['reviewed'],
+              },
+            },
+            required: ['kind', 'summary', 'ready', 'score', 'labels', 'meta'],
+          },
+        },
+        {
+          id: 'group',
+          loop_group: {
+            until: 'TODO',
+            max_iterations: 2,
+            nodes: [
+              { id: 'draft', prompt: 'draft' },
+              { id: 'finish', prompt: 'finish', depends_on: ['draft'] },
+            ],
+          },
+          depends_on: ['classify'],
+        },
+      ],
+    });
+    const parent = makeTestWorkflow({
+      name: 'parent',
+      nodes: [
+        { id: 'review', include: 'review-block' },
+        { id: 'approve', approval: { message: 'approve' }, depends_on: ['review'] },
+        { id: 'stop', cancel: 'stop', depends_on: ['approve'] },
+      ],
+    });
+    const workflow = makeTestComposedWorkflow([block, parent], 'parent');
+    const directory = mkdtempSync(join(tmpdir(), 'archon-dry-run-scaffold-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'fixtures', 'stubs.yaml');
+
+    const written = await writeDryRunStubScaffold(workflow, path);
+    const loaded = await loadDryRunStubs(path);
+
+    expect(loaded).toEqual(written);
+    expect(Object.keys(loaded).sort()).toEqual(['draft', 'finish', 'review__classify']);
+    expect(loaded.review__classify).toEqual({
+      kind: 'bug',
+      summary: 'TTTTT',
+      ready: false,
+      score: 2,
+      labels: ['TODO'],
+      meta: { reviewed: false },
+    });
+    expect(await Bun.file(path).text()).toContain('ready: false');
+    await expect(writeDryRunStubScaffold(workflow, path)).rejects.toThrow(
+      'stub scaffold already exists'
+    );
+  });
+
+  test('does not leave a partial file when a placeholder cannot satisfy the schema', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'unsupported-placeholder',
+      nodes: [
+        {
+          id: 'strict',
+          prompt: 'strict',
+          output_format: {
+            type: 'object',
+            properties: { code: { type: 'string', pattern: '^OK$' } },
+            required: ['code'],
+          },
+        },
+      ],
+    });
+    const directory = mkdtempSync(join(tmpdir(), 'archon-dry-run-scaffold-fail-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'stubs.yaml');
+
+    await expect(writeDryRunStubScaffold(workflow, path)).rejects.toThrow(
+      "Cannot generate schema-valid dry-run stub for node 'strict'"
+    );
+    expect(existsSync(path)).toBe(false);
+  });
+
+  test('completes a 36-node composition with only three load-bearing overrides', async () => {
+    const blockNodes = [
+      {
+        id: 'gate',
+        prompt: 'gate',
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string', enum: ['go', 'stop'] } },
+          required: ['verdict'],
+        },
+      },
+      ...Array.from({ length: 11 }, (_, index) => ({
+        id: `step-${String(index + 1)}`,
+        prompt: `step ${String(index + 1)}`,
+        depends_on: [index === 0 ? 'gate' : `step-${String(index)}`],
+        ...(index === 0 ? { when: "$gate.output.verdict == 'go'" } : {}),
+      })),
+    ];
+    const block = makeTestWorkflow({ name: 'large-block', nodes: blockNodes });
+    const parent = makeTestWorkflow({
+      name: 'large-parent',
+      nodes: ['one', 'two', 'three'].map(id => ({ id, include: 'large-block' })),
+    });
+    const workflow = makeTestComposedWorkflow([block, parent], 'large-parent');
+    expect(workflow.nodes).toHaveLength(36);
+    const stubs = {
+      one__gate: { verdict: 'go' },
+      two__gate: { verdict: 'stop' },
+      three__gate: { verdict: 'go' },
+      never_reached: 'unused',
+    };
+
+    const sparse = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs,
+      defaultStubs: true,
+    });
+    const strict = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs,
+    });
+
+    expect(sparse.outcome).toBe('completed');
+    expect(sparse.missingStubs).toEqual([]);
+    expect(sparse.unusedStubs).toEqual(['never_reached']);
+    expect(sparse.trace.find(entry => entry.nodeId === 'one__step-1')?.state).toBe('stubbed');
+    expect(sparse.trace.find(entry => entry.nodeId === 'two__step-1')?.state).toBe('skipped');
+    expect(strict.outcome).toBe('failed');
+    expect(strict.missingStubs).toEqual(['one__step-1', 'three__step-1']);
+  });
+
+  test('defaults loops to completion and still executes code under execCode', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'default-loop-stubs',
+      nodes: [
+        { id: 'signal', loop: { prompt: 'work', until: 'DONE', max_iterations: 2 } },
+        {
+          id: 'field',
+          loop: { prompt: 'work', until_field: 'done', max_iterations: 2 },
+          output_format: {
+            type: 'object',
+            properties: { done: { type: 'boolean' } },
+            required: ['done'],
+          },
+          depends_on: ['signal'],
+        },
+        { id: 'code', bash: 'printf live', depends_on: ['field'] },
+      ],
+    });
+
+    const scaffold = createDryRunStubScaffold(workflow);
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      defaultStubs: true,
+      execCode: true,
+    });
+
+    expect(scaffold).toEqual({ signal: 'DONE', field: { done: true }, code: 'TODO' });
+    expect(result.outcome).toBe('completed');
+    expect(result.trace.find(entry => entry.nodeId === 'signal')?.reason).toContain(
+      'completion signal'
+    );
+    expect(result.trace.find(entry => entry.nodeId === 'field')?.reason).toContain(
+      "'done' is true"
+    );
+    expect(result.trace.find(entry => entry.nodeId === 'code')).toMatchObject({
+      state: 'completed',
+      reason: 'executed locally',
+      output: 'live',
+    });
   });
 });
 

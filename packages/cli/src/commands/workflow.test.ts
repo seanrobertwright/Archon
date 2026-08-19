@@ -122,6 +122,7 @@ mock.module('@archon/workflows/executor', () => ({
 }));
 mock.module('@archon/workflows/dry-run', () => ({
   loadDryRunStubs: mock(() => Promise.resolve({ node: 'stubbed output' })),
+  writeDryRunStubScaffold: mock(() => Promise.resolve({ first: 'TODO', second: 'TODO' })),
   dryRunWorkflow: mock(() =>
     Promise.resolve({
       workflow: 'plan',
@@ -517,6 +518,7 @@ describe('workflowRunCommand — dry-run', () => {
     const dryRun = await import('@archon/workflows/dry-run');
     (executeWorkflow as ReturnType<typeof mock>).mockClear();
     (dryRun.loadDryRunStubs as ReturnType<typeof mock>).mockClear();
+    (dryRun.writeDryRunStubScaffold as ReturnType<typeof mock>).mockClear();
     (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockClear();
     (dryRun.formatDryRunTrace as ReturnType<typeof mock>).mockClear();
     (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValue({
@@ -546,6 +548,7 @@ describe('workflowRunCommand — dry-run', () => {
     await workflowRunCommand('/test/path', 'plan', 'hello', {
       dryRun: true,
       stubsPath: 'fixtures.yaml',
+      defaultStubs: true,
       execCode: true,
       pauseAtGates: true,
       json: true,
@@ -556,6 +559,7 @@ describe('workflowRunCommand — dry-run', () => {
       expect.objectContaining({
         userMessage: 'hello',
         cwd: '/test/path',
+        defaultStubs: true,
         execCode: true,
         pauseAtGates: true,
       })
@@ -567,6 +571,30 @@ describe('workflowRunCommand — dry-run', () => {
       outcome: 'completed',
     });
     expect(consoleSpy).not.toHaveBeenCalled();
+  });
+
+  it('writes a scaffold from the discovered workflow and exits before simulation', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const dryRun = await import('@archon/workflows/dry-run');
+
+    await workflowRunCommand('/test/path', 'plan', '', {
+      dryRun: true,
+      stubsInitPath: 'fixtures/generated.yaml',
+      json: true,
+    });
+
+    expect(dryRun.writeDryRunStubScaffold).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'plan' }),
+      join('/test/path', 'fixtures/generated.yaml')
+    );
+    expect(dryRun.loadDryRunStubs).not.toHaveBeenCalled();
+    expect(dryRun.dryRunWorkflow).not.toHaveBeenCalled();
+    expect(executeWorkflow).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
+      workflow: 'plan',
+      stubsPath: join('/test/path', 'fixtures/generated.yaml'),
+      nodeCount: 2,
+    });
   });
 
   it('writes the human trace through guaranteed stdout delivery', async () => {
@@ -598,8 +626,8 @@ describe('workflowRunCommand — dry-run', () => {
 
   it('rejects dry-run-only and incompatible lifecycle flags', async () => {
     await expect(
-      workflowRunCommand('/test/path', 'plan', '', { stubsPath: 'fixtures.yaml' })
-    ).rejects.toThrow('--stubs requires --dry-run');
+      workflowRunCommand('/test/path', 'plan', '', { stubsInitPath: 'fixtures.yaml' })
+    ).rejects.toThrow('--stubs-init requires --dry-run');
 
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
@@ -607,8 +635,39 @@ describe('workflowRunCommand — dry-run', () => {
       errors: [],
     });
     await expect(
+      workflowRunCommand('/test/path', 'plan', '', { defaultStubs: true })
+    ).rejects.toThrow('--default-stubs requires --dry-run');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+    await expect(
       workflowRunCommand('/test/path', 'plan', '', { dryRun: true, detach: true })
     ).rejects.toThrow('--dry-run cannot be combined with --detach');
+  });
+
+  it('rejects scaffold mode combined with simulation stub options', async () => {
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', {
+        dryRun: true,
+        stubsInitPath: 'generated.yaml',
+        stubsPath: 'overrides.yaml',
+      })
+    ).rejects.toThrow('--stubs-init cannot be combined with --stubs');
+
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', {
+        dryRun: true,
+        stubsInitPath: 'generated.yaml',
+        defaultStubs: true,
+      })
+    ).rejects.toThrow('--stubs-init cannot be combined with --default-stubs');
   });
 
   it('emits failure JSON before returning a nonzero-worthy error', async () => {

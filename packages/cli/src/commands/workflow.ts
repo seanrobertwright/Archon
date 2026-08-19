@@ -48,7 +48,12 @@ import {
   resolveTopLevelInputs,
 } from '@archon/workflows/utils/workflow-requirements';
 import { parseInputAssignments } from '@archon/workflows/workflow-inputs';
-import { dryRunWorkflow, formatDryRunTrace, loadDryRunStubs } from '@archon/workflows/dry-run';
+import {
+  dryRunWorkflow,
+  formatDryRunTrace,
+  loadDryRunStubs,
+  writeDryRunStubScaffold,
+} from '@archon/workflows/dry-run';
 import {
   getWorkflowEventEmitter,
   type WorkflowEmitterEvent,
@@ -220,6 +225,10 @@ export interface WorkflowRunOptions {
   dryRun?: boolean;
   /** YAML mapping of node ids to scalar or structured simulated outputs. */
   stubsPath?: string;
+  /** Write a complete YAML stub scaffold for the discovered workflow and exit. */
+  stubsInitPath?: string;
+  /** Fill reached nodes missing from the supplied stub map with validated placeholders. */
+  defaultStubs?: boolean;
   /** Execute reachable bash/script nodes locally instead of requiring stubs. */
   execCode?: boolean;
   /** Stop at the first approval gate instead of auto-approving it. */
@@ -955,6 +964,8 @@ export async function workflowRunCommand(
 
   const dryRunOnlyOptions = [
     ['--stubs', options.stubsPath !== undefined],
+    ['--stubs-init', options.stubsInitPath !== undefined],
+    ['--default-stubs', options.defaultStubs === true],
     ['--exec-code', options.execCode === true],
     ['--pause-at-gates', options.pauseAtGates === true],
   ] as const;
@@ -978,6 +989,12 @@ export async function workflowRunCommand(
     if (incompatibleFlag) {
       throw new Error(`--dry-run cannot be combined with ${incompatibleFlag}.`);
     }
+    if (options.stubsInitPath !== undefined && options.stubsPath !== undefined) {
+      throw new Error('--stubs-init cannot be combined with --stubs.');
+    }
+    if (options.stubsInitPath !== undefined && options.defaultStubs) {
+      throw new Error('--stubs-init cannot be combined with --default-stubs.');
+    }
 
     // The IDENTICAL invocation gate a real run passes through below (#2610): parse
     // `--input name=value`, validate against the declared `inputs:` contract, and fail
@@ -994,6 +1011,23 @@ export async function workflowRunCommand(
         ? options.stubsPath
         : join(effectiveDiscoveryCwd, options.stubsPath)
       : undefined;
+    const stubsInitPath = options.stubsInitPath
+      ? isAbsolute(options.stubsInitPath)
+        ? options.stubsInitPath
+        : join(effectiveDiscoveryCwd, options.stubsInitPath)
+      : undefined;
+    if (stubsInitPath !== undefined) {
+      const scaffold = await writeDryRunStubScaffold(workflow, stubsInitPath);
+      const nodeCount = Object.keys(scaffold).length;
+      if (options.json) {
+        await writeJsonLine({ workflow: workflow.name, stubsPath: stubsInitPath, nodeCount });
+      } else {
+        await writeStdout(
+          `Created dry-run stub scaffold for ${workflow.name}: ${stubsInitPath} (${String(nodeCount)} nodes)\n`
+        );
+      }
+      return;
+    }
     const stubs = await loadDryRunStubs(stubsPath);
     // The install's config + AI profile are what make the per-node provider/model report
     // match a real run — tier keywords and `@alias` refs resolve through the same profile
@@ -1011,6 +1045,7 @@ export async function workflowRunCommand(
       stubs,
       ...(dryRunInputs ? { inputs: dryRunInputs } : {}),
       execCode: options.execCode,
+      defaultStubs: options.defaultStubs,
       pauseAtGates: options.pauseAtGates,
       config: dryRunConfig,
       aiProfile: buildAiProfile(dryRunConfig.assistant, {
