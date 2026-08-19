@@ -26,6 +26,12 @@ describe('findOutputRefs', () => {
     expect(findOutputRefs('$1step.output')).toEqual(new Set());
   });
 
+  test('skips the reserved INPUTS scope while preserving ordinary near-name ids', () => {
+    expect(
+      findOutputRefs('$INPUTS.output and $real.output and $INPUTSX.output and $inputs.output')
+    ).toEqual(new Set(['real', 'INPUTSX', 'inputs']));
+  });
+
   test('repeated calls are independent — no lastIndex carried between scans', () => {
     // A shared `g` regex would resume from the previous match and lose the
     // first ref on the second call.
