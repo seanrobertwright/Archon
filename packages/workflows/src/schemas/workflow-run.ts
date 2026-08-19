@@ -291,14 +291,19 @@ export interface ApprovalContext {
    *
    * Scope note: this is the PAUSING invocation's total, matching what the normal
    * (re-run) completion path reports — a loop that gates more than once attributes each
-   * invocation's usage to that invocation, and EARLIER invocations' usage is reported
-   * nowhere: a pausing invocation never reaches completeWorkflowRun (the status is
-   * `paused`, so the pre-complete status check bails), and `total_tokens_*` are written
-   * only there. So on a twice-gated loop the surviving node row and the run row both
-   * report only the final invocation. That under-report predates this field (before
+   * invocation's usage to that invocation, so on a twice-gated loop the surviving NODE
+   * row reports only the final invocation. That under-report predates this field (before
    * #2333 nothing was persisted at all) and belongs to the "preserve terminal provider
    * stats across a gate" fix tracked by #2345, which also covers the `cost_usd` and
    * resolved-model loss at the same gate.
+   *
+   * The RUN row has the SAME per-invocation attribution, for the same root cause. Since
+   * #2469 the run-tail write is no longer skipped on pause, so a paused run's row does
+   * carry what that invocation spent — but the baseline it adds to (`priorUsage`) is
+   * rebuilt from `node_completed` rows, and a gate pause deliberately writes none. The
+   * metadata merge replaces each key it names rather than adding to it, so a loop that
+   * gates twice leaves the run row reporting only the final invocation. Same fix
+   * boundary as the node row: #2345.
    */
   signaledTokens?: { input: number; output: number } | null;
   /**

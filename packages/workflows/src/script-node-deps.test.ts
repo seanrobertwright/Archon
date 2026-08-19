@@ -112,6 +112,7 @@ function createMockStore(): IWorkflowStore {
       Promise.resolve({
         completedNodeOutputs: new Map<string, string>(),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })
     ),
     getCodebase: mock(() => Promise.resolve(null)),

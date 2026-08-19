@@ -214,13 +214,28 @@ export async function listWorkflowEventsSince(
 }
 
 /**
- * Return completed node outputs and cumulative token usage for a workflow run.
- * Used by the DAG executor to restore state when resuming a failed run.
+ * Return completed node outputs and cumulative usage (tokens AND cost) for a workflow
+ * run. Used by the DAG executor to restore state when resuming a failed run.
  * Throws on DB error — caller owns the degradation policy.
+ *
+ * Both usage axes are summed from `node_completed` rows only, and only from rows that are
+ * not marked `data.aggregate`. Two distinct duplication hazards:
+ *
+ * - `node_skipped_prior_success` rows replay a node an earlier pass already counted, so
+ *   counting them would multiply that node's usage by the number of resume passes.
+ * - `aggregate: true` rows are derived from other rows already in this log — a
+ *   `loop_group`'s roll-up restates the `cost_usd` its own `<groupId>.<nodeId>` body rows
+ *   carry, so summing both counts that group twice (#2469).
+ *
+ * Rows written before the `aggregate` marker existed carry no flag, so a run that
+ * completed a loop_group under an older build and is resumed under this one can still
+ * double-count its cost. Bounded and self-clearing: only cost is affected (the roll-up
+ * never carried `tokens`), and only until those runs reach a terminal state.
  */
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   completedNodeOutputs: Map<string, string>;
   tokens: { input: number; output: number };
+  costUsd: number;
 }> {
   const result = await pool.query<{
     step_name: string | null;
@@ -234,6 +249,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   );
   const completedNodeOutputs = new Map<string, string>();
   const tokens = { input: 0, output: 0 };
+  let costUsd = 0;
   for (const row of result.rows) {
     if (!row.step_name) continue;
     let data: Record<string, unknown>;
@@ -249,6 +265,8 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
     if (typeof data.node_output === 'string') {
       completedNodeOutputs.set(row.step_name, data.node_output);
     }
+    // A derived row restates usage that other rows in this same log already carry.
+    if (data.aggregate === true) continue;
     if (row.event_type === 'node_completed' && data.tokens !== undefined) {
       const eventTokens = data.tokens;
       if (
@@ -270,6 +288,20 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         );
       }
     }
+    if (row.event_type === 'node_completed' && data.cost_usd !== undefined) {
+      const eventCost = data.cost_usd;
+      // Same guard shape as tokens: a non-finite value from a provider must not
+      // silently poison the total (NaN > 0 is false, which would drop the run's
+      // cost from the persisted metadata with no trace).
+      if (typeof eventCost === 'number' && Number.isFinite(eventCost)) {
+        costUsd += eventCost;
+      } else {
+        getLog().warn(
+          { runId: workflowRunId, stepName: row.step_name, costUsd: eventCost },
+          'db.workflow_dag_node_cost_invalid_ignored'
+        );
+      }
+    }
   }
-  return { completedNodeOutputs, tokens };
+  return { completedNodeOutputs, tokens, costUsd };
 }
