@@ -108,6 +108,13 @@ export const INCLUDE_MAX_DEPTH = 3;
 const OUTPUT_REF_PATTERN = /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output/g;
 
 /**
+ * Cross-iteration body refs use the same executable node ids, under a distinct prefix.
+ * When a reusable block is inlined into a loop_group body, its authored sibling ids must
+ * follow the same namespace rewrite as current-iteration `$id.output` refs.
+ */
+const LOOP_PREV_OUTPUT_REF_PATTERN = /\$LOOP_PREV\.([a-zA-Z_][a-zA-Z0-9_-]*)\.output/g;
+
+/**
  * `when:`-only ref pattern. The condition grammar (condition-evaluator.ts) additionally
  * accepts the SHORTHAND `$id.field` form (equivalent to `$id.output.field`) alongside
  * `$id.output` / `$id.output.field`. So in a `when:` a bare `$id` followed by `.` and a
@@ -129,6 +136,13 @@ function applyOutputRefRename(text: string, rename: (id: string) => string): str
   return text.replace(OUTPUT_REF_PATTERN, (match, id: string) => {
     const renamed = rename(id);
     return renamed === id ? match : `$${renamed}.output`;
+  });
+}
+
+function applyLoopPrevOutputRefRename(text: string, rename: (id: string) => string): string {
+  return text.replace(LOOP_PREV_OUTPUT_REF_PATTERN, (match, id: string) => {
+    const renamed = rename(id);
+    return renamed === id ? match : `$LOOP_PREV.${renamed}.output`;
   });
 }
 
@@ -363,9 +377,11 @@ function collapseWorkflowScope(raw: WorkflowDefinition): WorkflowDefinition {
 function rewriteNodeOutputRefs(
   node: DagNode,
   renameOutputRef: (id: string) => string,
-  expandDependency: (id: string) => string[]
+  expandDependency: (id: string) => string[],
+  renameLoopPrevRef: (id: string) => string
 ): void {
-  const code = (text: string): string => applyOutputRefRename(text, renameOutputRef);
+  const code = (text: string): string =>
+    applyLoopPrevOutputRefRename(applyOutputRefRename(text, renameOutputRef), renameLoopPrevRef);
   const whenExpr = (text: string): string => applyWhenRefRename(text, renameOutputRef);
 
   if (node.when !== undefined) node.when = whenExpr(node.when);
@@ -406,7 +422,7 @@ function rewriteNodeOutputRefs(
       node.loop_group.until_bash = code(node.loop_group.until_bash);
     }
     for (const body of node.loop_group.nodes) {
-      rewriteNodeOutputRefs(body, renameOutputRef, expandDependency);
+      rewriteNodeOutputRefs(body, renameOutputRef, expandDependency, renameLoopPrevRef);
     }
   } else if (isApprovalNode(node)) {
     node.approval.message = code(node.approval.message);
@@ -688,7 +704,7 @@ function inlineInclude(
     // Rewrite child-internal refs before inserting caller values. This ordering is
     // load-bearing: a caller ref such as `$gather.output` must remain parent-scoped even
     // when the included block also has a node named `gather`.
-    rewriteNodeOutputRefs(clone, rename, id => [rename(id)]);
+    rewriteNodeOutputRefs(clone, rename, id => [rename(id)], rename);
     applyInputsMacro(clone, resolvedInputs, missingInputs, includeNode);
     // Stamped AFTER both passes, for the same reason the caller's values are inserted
     // after the rename: these are the CALLER's strings, so they stay parent-scoped here
@@ -970,6 +986,93 @@ export function expandWorkflowIncludes(
   const failed = new Set<string>();
   const errors: WorkflowLoadError[] = [];
 
+  interface ExpandedNodeList {
+    nodes: DagNode[];
+    includedRequirements: WorkflowRequirement[];
+    renameIncludeRef: (id: string) => string;
+  }
+
+  /**
+   * Expand one statically scoped node list. The workflow's top-level DAG and every
+   * loop_group body each own an independent include-id namespace: dependencies and
+   * `$include.output` refs bind only to directives in that list.
+   */
+  function expandNodeList(
+    nodes: DagNode[],
+    workflowName: string,
+    stack: string[]
+  ): ExpandedNodeList {
+    const expandedNodes: DagNode[] = [];
+    const includesById = new Map<string, ExpandedInclude>();
+    const includedRequirements: WorkflowRequirement[] = [];
+
+    for (const node of nodes) {
+      if (isIncludeNode(node)) {
+        let child: WorkflowDefinition;
+        try {
+          child = expandOne(node.include, [...stack, workflowName]);
+        } catch (e) {
+          if (e instanceof IncludeExpansionError) {
+            throw new IncludeExpansionError(`Node '${node.id}': ${e.message}`);
+          }
+          throw e;
+        }
+        warnDroppedWorkflowLevelFields(node, child);
+        includedRequirements.push(...(child.requires ?? []));
+        const inlined = inlineInclude(node, child, commandContents ?? new Map());
+        includesById.set(node.id, inlined);
+        expandedNodes.push(...inlined.namespaced);
+        continue;
+      }
+
+      if (isLoopGroupNode(node)) {
+        const body = expandNodeList(node.loop_group.nodes, workflowName, stack);
+        includedRequirements.push(...body.includedRequirements);
+        expandedNodes.push({
+          ...node,
+          loop_group: {
+            ...node.loop_group,
+            // The completion script runs against THIS body's output map. Rebind an
+            // authored `$include.output` to the included workflow's declared return,
+            // just as refs on ordinary sibling body nodes are rebound below.
+            ...(node.loop_group.until_bash !== undefined
+              ? {
+                  until_bash: applyOutputRefRename(
+                    node.loop_group.until_bash,
+                    body.renameIncludeRef
+                  ),
+                }
+              : {}),
+            nodes: body.nodes,
+          },
+        });
+        continue;
+      }
+
+      // Already a private clone — `collapseWorkflowScope` cloned every node before
+      // writing this workflow's config onto it, so the second pass below can mutate
+      // it without reaching the raw parsed definition discovery still holds.
+      expandedNodes.push(node);
+    }
+
+    // Rewrite only aliases owned by this list. `rewriteNodeOutputRefs` deliberately
+    // recurses into nested loop_group bodies because their text may read enclosing
+    // outputs, while their sealed depends_on edges remain local to their own list.
+    const renameIncludeRef = (id: string): string => includesById.get(id)?.primarySink ?? id;
+    const expandIncludeDependency = (id: string): string[] => includesById.get(id)?.sinks ?? [id];
+    for (const node of expandedNodes) {
+      if (node.depends_on !== undefined) {
+        node.depends_on = node.depends_on.flatMap(expandIncludeDependency);
+      }
+      // `$include.output` is a current-iteration composition alias. It deliberately does
+      // not create a parallel `$LOOP_PREV.<includeId>` grammar: previous-iteration refs
+      // continue to name only the executable body ids produced by `inlineInclude()`.
+      rewriteNodeOutputRefs(node, renameIncludeRef, expandIncludeDependency, id => id);
+    }
+
+    return { nodes: expandedNodes, includedRequirements, renameIncludeRef };
+  }
+
   function expandOne(name: string, stack: string[]): WorkflowDefinition {
     // Cycle + depth are checked BEFORE the memo so a node memoized via a shallow path
     // can never mask a too-deep or cyclic reference reaching it via a longer path.
@@ -999,61 +1102,20 @@ export function expandWorkflowIncludes(
     // cloned now, deliberately: the alternative is a workflow that behaves differently
     // depending on whether it happens to contain an `include:`.
     const collapsed = collapseWorkflowScope(raw);
-
-    if (!collapsed.nodes.some(isIncludeNode)) {
-      memo.set(name, collapsed);
-      return collapsed;
-    }
-
-    const newNodes: DagNode[] = [];
-    const sinksByIncludeId = new Map<string, string[]>();
-    const primarySinkByIncludeId = new Map<string, string>();
     // Capability requirements union UPWARD (#1764): a composed workflow's `requires:` is
     // a fact about what its nodes need, not a choice the composing run makes. Dropping it
     // turned a clean pre-cost refusal into a mid-run failure inside a block the parent
     // cannot inspect. A union can only make a run refuse EARLIER.
-    const requires: WorkflowRequirement[] = [...(collapsed.requires ?? [])];
-
-    for (const node of collapsed.nodes) {
-      if (isIncludeNode(node)) {
-        let child: WorkflowDefinition;
-        try {
-          child = expandOne(node.include, [...stack, name]);
-        } catch (e) {
-          if (e instanceof IncludeExpansionError) {
-            throw new IncludeExpansionError(`Node '${node.id}': ${e.message}`);
-          }
-          throw e;
-        }
-        warnDroppedWorkflowLevelFields(node, child);
-        requires.push(...(child.requires ?? []));
-        const inlined = inlineInclude(node, child, commandContents ?? new Map());
-        sinksByIncludeId.set(node.id, inlined.sinks);
-        primarySinkByIncludeId.set(node.id, inlined.primarySink);
-        newNodes.push(...inlined.namespaced);
-      } else {
-        // Already a private clone — `collapseWorkflowScope` cloned every node before
-        // writing this workflow's config onto it, so the second pass below can mutate
-        // it without reaching the raw parsed definition discovery still holds.
-        newNodes.push(node);
-      }
-    }
-
-    // Second pass — rewrite references to include ids across every node:
-    //   (a) depends_on entries equal to an include id → that include's sink list
-    //   (b) $includeId.output → $<primarySink>.output
-    const renameIncludeRef = (id: string): string => primarySinkByIncludeId.get(id) ?? id;
-    const expandIncludeDependency = (id: string): string[] => sinksByIncludeId.get(id) ?? [id];
-    for (const node of newNodes) {
-      if (node.depends_on !== undefined) {
-        node.depends_on = node.depends_on.flatMap(expandIncludeDependency);
-      }
-      rewriteNodeOutputRefs(node, renameIncludeRef, expandIncludeDependency);
-    }
+    const expanded = expandNodeList(collapsed.nodes, name, stack);
+    const requires: WorkflowRequirement[] = [
+      ...(collapsed.requires ?? []),
+      ...expanded.includedRequirements,
+    ];
 
     // Re-validate the fully-flattened DAG. Catches a namespaced id colliding with a
-    // hand-written node, cycles introduced by edge rewiring, and unknown deps.
-    const structureError = validateDagStructure(newNodes);
+    // hand-written node, cycles introduced by edge rewiring, unknown deps, and the
+    // equivalent failures inside every recursively expanded loop_group body.
+    const structureError = validateDagStructure(expanded.nodes);
     if (structureError) {
       throw new IncludeExpansionError(structureError);
     }
@@ -1061,12 +1123,14 @@ export function expandWorkflowIncludes(
     const dedupedRequires = [...new Set(requires)];
     const result: WorkflowDefinition = {
       ...collapsed,
-      nodes: newNodes,
+      nodes: expanded.nodes,
       // `returns:` may name an include directive that no longer exists after flattening.
       // Rebind it to the same primary sink used for `$includeId.output`; ordinary node ids
       // pass through unchanged. Without this, a nested reusable workflow can finish with a
       // dangling return id even though every node-level reference was rewritten correctly.
-      ...(collapsed.returns !== undefined ? { returns: renameIncludeRef(collapsed.returns) } : {}),
+      ...(collapsed.returns !== undefined
+        ? { returns: expanded.renameIncludeRef(collapsed.returns) }
+        : {}),
       ...(dedupedRequires.length > 0 ? { requires: dedupedRequires } : {}),
     };
     memo.set(name, result);

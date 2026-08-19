@@ -648,16 +648,37 @@ nodes:
 - The body is **sealed**: a body node's `depends_on` may only reference sibling
   body nodes, not outer-DAG nodes. Outer context is still reachable via `$nodeId.output`
   refs in body prompts.
-- Loop-control events (skip, trigger-rule, `when:` evaluations) are namespaced
-  `{groupId}.{nodeId}` in the event log. Body node **lifecycle** events
-  (`node_started`/`node_completed`/`node_failed`, tool events) currently use the
-  raw body-node id — a known v1 limitation, so expect repeated step names across
-  iterations in the event log.
+- Loop-control and body lifecycle events use the namespaced step name
+  `{groupId}.{nodeId}` in the persisted event log, with the iteration recorded in
+  event data. Nested groups compose the prefix.
 - A body node that **fails** fails the whole group immediately with that node's
   error (no further iterations run) — same semantics as a failed node in a
   top-level DAG.
 - `$fix-loop.output` (visible to the outer DAG) is the **final iteration's
   terminal-node output**.
+
+### Reusing a block in the body
+
+`include:` is valid in a `loop_group` body. Discovery expands the block before the run starts,
+so each iteration executes ordinary namespaced body nodes — there is no child run or
+runtime-resolved graph:
+
+```yaml
+- id: converge
+  loop_group:
+    until_bash: test "$review.output.ready" = true
+    max_iterations: 5
+    nodes:
+      - id: review
+        include: reusable-review
+        with:
+          request: $INPUTS.request
+```
+
+The block's `returns:` node supplies `$review.output`, including in `until_bash`. Internal
+dependencies, inputs, gates, and namespacing behave the same as for a top-level include. A
+`workflow:` node still cannot appear in a group body because it creates a separately governed
+runtime sub-run rather than static composition.
 
 ### Cross-iteration references: `$LOOP_PREV`
 

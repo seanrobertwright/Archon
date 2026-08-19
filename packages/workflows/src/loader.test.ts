@@ -35,7 +35,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 import { discoverWorkflows, discoverWorkflowsWithConfig } from './workflow-discovery';
-import { isBashNode, isCancelNode, isLoopNode } from './schemas';
+import { isBashNode, isCancelNode, isLoopGroupNode, isLoopNode } from './schemas';
 import { parseWorkflow } from './loader';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import { workflowDefinitionSchema } from './schemas/workflow';
@@ -4624,31 +4624,75 @@ nodes:
       expect(finish?.depends_on).toEqual(['sub__second']);
     });
 
-    it('should reject an include node inside a loop_group body', async () => {
+    it('should expand an include node inside a loop_group body', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
       await writeFile(
+        join(workflowDir, 'block.yaml'),
+        `
+name: block
+description: Reusable review block
+returns: decide
+nodes:
+  - id: decide
+    prompt: Decide whether the work is done
+    output_format:
+      type: object
+      properties:
+        done:
+          type: boolean
+      required: [done]
+  - id: cleanup
+    bash: echo cleanup
+    depends_on: [decide]
+`
+      );
+      await writeFile(
         join(workflowDir, 'include-in-loop-group.yaml'),
         `
 name: include-in-loop-group
-description: Include nested in a loop_group body (rejected in v1)
+description: Include nested in a loop_group body
 nodes:
   - id: grp
     loop_group:
-      until: DONE
+      until_bash: test "$review.output.done" = true
       max_iterations: 3
       nodes:
-        - id: bad
+        - id: setup
+          bash: echo setup
+        - id: review
           include: block
+          depends_on: [setup]
+        - id: summarize
+          prompt: result=$review.output.done
+          depends_on: [review]
 `
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const err = result.errors.find(e => e.filename === 'include-in-loop-group.yaml');
-      expect(err).toBeDefined();
-      expect(err?.error).toContain('loop_group');
-      expect(err?.error).toContain("'include' is not supported");
+      expect(result.errors.filter(e => e.filename === 'include-in-loop-group.yaml')).toHaveLength(
+        0
+      );
+      const workflow = result.workflows.find(
+        entry => entry.workflow.name === 'include-in-loop-group'
+      )?.workflow;
+      expect(workflow).toBeDefined();
+      const group = workflow?.nodes.find(node => node.id === 'grp');
+      expect(group && isLoopGroupNode(group)).toBe(true);
+      if (!group || !isLoopGroupNode(group)) throw new Error('expected loop_group');
+      expect(group.loop_group.nodes.map(node => node.id)).toEqual([
+        'setup',
+        'review__decide',
+        'review__cleanup',
+        'summarize',
+      ]);
+      expect(group.loop_group.nodes.some(node => 'include' in node)).toBe(false);
+      expect(group.loop_group.until_bash).toBe('test "$review__decide.output.done" = true');
+      expect(group.loop_group.nodes.find(node => node.id === 'summarize')).toMatchObject({
+        prompt: 'result=$review__decide.output.done',
+        depends_on: ['review__cleanup'],
+      });
     });
 
     it('should error two files that declare the same workflow name', async () => {

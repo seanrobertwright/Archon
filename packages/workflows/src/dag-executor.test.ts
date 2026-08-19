@@ -99,8 +99,11 @@ import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
 import {
   COMPILED_LOOP_COMMAND,
+  COMPOSED_NODE,
+  readComposedMeta,
   type CompiledLoopCommand,
   type LoopWithCompiledCommand,
+  type NodeWithComposedMeta,
 } from './compiled-command';
 import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
@@ -16279,6 +16282,169 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(result).toContain('iteration 2 final result');
   });
 
+  it('re-executes a load-time included body block on every loop_group iteration (#2623)', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      yield {
+        type: 'assistant',
+        content: callCount === 1 ? 'iteration 1 still working' : 'iteration 2 DONE',
+      };
+      yield { type: 'result', sessionId: `included-body-${callCount}` };
+    });
+
+    const block = workflowDefinitionSchema.parse({
+      name: 'review-block',
+      description: 'Reusable loop body',
+      returns: 'review',
+      nodes: [{ id: 'review', prompt: 'review this iteration' }],
+    });
+    const parent = workflowDefinitionSchema.parse({
+      name: 'included-loop-group',
+      description: 'Repeats a composed block',
+      nodes: [
+        {
+          id: 'group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 3,
+            nodes: [{ id: 'pass', include: 'review-block' }],
+          },
+        },
+      ],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        [block.name, block],
+        [parent.name, parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get(parent.name);
+    expect(expanded).toBeDefined();
+    if (!expanded) throw new Error('expected expanded workflow');
+
+    const store = createMockStore();
+    const result = await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      expanded,
+      makeWorkflowRun('dag-loopgroup-included'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(2);
+    expect(result).toContain('iteration 2 DONE');
+    const bodyCompletions = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .filter(
+        event => event.event_type === 'node_completed' && event.step_name === 'group.pass__review'
+      );
+    expect(bodyCompletions.map(event => event.data?.iteration)).toEqual([1, 2]);
+  });
+
+  it('resolves an included inner body previous output in nested loop_group until_bash (#2623)', async () => {
+    // This runs the authored include through real load-time expansion before executing the
+    // nested groups. The inner gate combines three scopes: its included body's previous
+    // iteration, that body's current output, and the enclosing group's previous iteration.
+    // Apostrophes in every carried value make unsafe shell interpolation fail visibly.
+    const outerCounter = join(testDir, 'nested-until-outer-counter');
+    const outerCounterRef = `"${outerCounter.replace(/\\/g, '/')}"`;
+
+    const block = workflowDefinitionSchema.parse({
+      name: 'nested-check-block',
+      description: 'Reusable nested loop check',
+      returns: 'check',
+      nodes: [{ id: 'check', bash: `echo "inner's ready"` }],
+    });
+    const parent = workflowDefinitionSchema.parse({
+      name: 'nested-included-loop-group',
+      description: 'Repeats an included block inside nested groups',
+      nodes: [
+        {
+          id: 'outer',
+          loop_group: {
+            max_iterations: 2,
+            until_bash:
+              `test $seed.output = "outer's second" && ` + `test $inner.output = "inner's ready"`,
+            nodes: [
+              {
+                id: 'seed',
+                bash:
+                  `if [ -f ${outerCounterRef} ]; then echo "outer's second"; ` +
+                  `else touch ${outerCounterRef}; echo "outer's first"; fi`,
+              },
+              {
+                id: 'inner',
+                loop_group: {
+                  max_iterations: 2,
+                  until_bash:
+                    `test $LOOP_PREV.pass__check.output = "inner's ready" && ` +
+                    `test $pass.output = "inner's ready" && ` +
+                    `{ { test $seed.output = "outer's first" && ` +
+                    `test -z $LOOP_PREV.seed.output; } || ` +
+                    `{ test $seed.output = "outer's second" && ` +
+                    `test $LOOP_PREV.seed.output = "outer's first"; }; }`,
+                  nodes: [{ id: 'pass', include: 'nested-check-block' }],
+                },
+                depends_on: ['seed'],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        [block.name, block],
+        [parent.name, parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get(parent.name);
+    expect(expanded).toBeDefined();
+    if (!expanded) throw new Error('expected expanded workflow');
+
+    const store = createMockStore();
+    const result = await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      expanded,
+      makeWorkflowRun('dag-nested-loopgroup-included-prev'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Each outer iteration runs two inner iterations: inner iteration 1 sees an empty
+    // previous snapshot, while iteration 2 sees the prior included-node output. The outer
+    // repeats once, proving its own previous `seed` output remains outer-scoped.
+    expect(result).toContain("inner's ready");
+    const includedCompletions = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .filter(
+        event =>
+          event.event_type === 'node_completed' && event.step_name === 'outer.inner.pass__check'
+      );
+    expect(includedCompletions.map(event => event.data?.iteration)).toEqual([1, 2, 1, 2]);
+  });
+
   it('runs a command-backed loop node inside a loop_group body with namespaced lifecycle events', async () => {
     // A `loop:` body node may use `loop.command` like any top-level loop. The
     // command body must reach the AI, and the loop's persisted lifecycle events
@@ -17213,6 +17379,78 @@ describe('executeDagWorkflow -- loop_group node', () => {
       ''
     );
     expect('cancel' in cancelNode && cancelNode.cancel).toBe("stopping: it's done");
+  });
+
+  it('EDGE H (#2623): resolves namespaced $LOOP_PREV across AI config and compiled loop prompts', () => {
+    const prev = new Map<string, NodeOutput>([
+      ['block__review', makeOutput('completed', 'PRIOR', undefined)],
+    ]);
+    const ref = '$LOOP_PREV.block__review.output';
+
+    const aiNode = applyLoopPrevToBodyNode(
+      {
+        id: 'use',
+        prompt: `main=${ref}`,
+        systemPrompt: `system=${ref}`,
+        agents: {
+          helper: {
+            description: `description=${ref}`,
+            prompt: `agent=${ref}`,
+          },
+        },
+        depends_on: [],
+      } as DagNode,
+      prev,
+      ''
+    );
+
+    expect('prompt' in aiNode && aiNode.prompt).toBe('main=PRIOR');
+    expect(aiNode.systemPrompt).toBe('system=PRIOR');
+    expect(aiNode.agents?.helper?.description).toBe('description=PRIOR');
+    expect(aiNode.agents?.helper?.prompt).toBe('agent=PRIOR');
+
+    const commandLoop = dagNodeSchema.parse({
+      id: 'repeat',
+      loop: { command: 'review-command', until: 'DONE', max_iterations: 2 },
+      depends_on: [],
+    });
+    if (!('loop' in commandLoop)) throw new Error('expected loop node');
+    (commandLoop.loop as typeof commandLoop.loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND] =
+      { prompt: `compiled=${ref}` };
+
+    const substitutedLoop = applyLoopPrevToBodyNode(commandLoop, prev, '');
+    if (!('loop' in substitutedLoop)) throw new Error('expected substituted loop node');
+    const compiled = (
+      substitutedLoop.loop as typeof substitutedLoop.loop & LoopWithCompiledCommand
+    )[COMPILED_LOOP_COMMAND];
+    expect(compiled?.prompt).toBe('compiled=PRIOR');
+
+    const gate = dagNodeSchema.parse({
+      id: 'gate',
+      approval: {
+        message: `approve=${ref}`,
+        on_reject: { prompt: `retry=${ref}` },
+      },
+      depends_on: [],
+    });
+    const substitutedGate = applyLoopPrevToBodyNode(gate, prev, '');
+    if (!('approval' in substitutedGate) || substitutedGate.approval === undefined)
+      throw new Error('expected approval node');
+    expect(substitutedGate.approval.message).toBe('approve=PRIOR');
+    expect(substitutedGate.approval.on_reject?.prompt).toBe('retry=PRIOR');
+
+    const script = dagNodeSchema.parse({
+      id: 'script',
+      script: 'console.log(process.env.INPUTS_PREVIOUS)',
+      runtime: 'bun',
+      depends_on: [],
+    });
+    (script as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = {
+      origin: 'review-block',
+      inputs: { previous: ref },
+    };
+    const substitutedScript = applyLoopPrevToBodyNode(script, prev, '');
+    expect(readComposedMeta(substitutedScript)?.inputs).toEqual({ previous: 'PRIOR' });
   });
 
   it('EDGE H: never splices $LOOP_USER_INPUT into a script body — env delivery only (#2115)', () => {

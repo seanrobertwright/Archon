@@ -687,13 +687,6 @@ export function validateDagStructure(
   // list and treat each loop_group as one outer node.
   for (const node of nodes) {
     if (isLoopGroupNode(node)) {
-      // `include` inside a loop_group body is rejected in v1 (bounds the interaction
-      // surface — see the plan's NOT Building). An include is a load-time inlining
-      // directive; nesting it inside a per-iteration sub-DAG body is not yet supported.
-      const includeInBody = node.loop_group.nodes.find(isIncludeNode);
-      if (includeInBody) {
-        return `loop_group '${node.id}' body: 'include' is not supported inside a loop_group body`;
-      }
       // `workflow:` (sub-run) inside a loop_group body is rejected (bounds the
       // interaction surface — see the plan's NOT Building). This wholesale rejection
       // also covers a fan-out (`fan_out:`) workflow node in a loop_group body (slice 2,

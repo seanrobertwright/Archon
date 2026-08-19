@@ -89,8 +89,10 @@ import { buildTruncationMarker } from './utils/output-truncation';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import {
   COMPILED_LOOP_COMMAND,
+  COMPOSED_NODE,
   readComposedMeta,
   type LoopWithCompiledCommand,
+  type NodeWithComposedMeta,
 } from './compiled-command';
 import { assistantModelDefaults, resolveNodeModel } from './node-model-resolution';
 import {
@@ -3873,8 +3875,22 @@ async function executeLoopGroupNode(
       // to the caller instead of being swallowed by the per-iteration catch.
       const groupBashPath = resolveBashPath();
       try {
-        const { prompt: bashPrompt } = substituteWorkflowVariables(
+        // Resolve this group's own cross-iteration refs against the snapshot captured
+        // before its body ran. `loopPrevOutputs` now contains the CURRENT iteration, so
+        // using it here would collapse `$LOOP_PREV` into `$node.output` semantics. Only
+        // direct body ids belong to this scope; refs owned by an enclosing group were
+        // already resolved while preparing this nested group, and descendant ids are not
+        // present in this group's per-iteration output map.
+        const prevResolvedBash = substituteLoopPrevRefs(
           group.until_bash,
+          prevSnapshot,
+          true,
+          logDir,
+          directBodyIds,
+          directBodyIds
+        );
+        const { prompt: bashPrompt } = substituteWorkflowVariables(
+          prevResolvedBash,
           workflowRun.id,
           workflowRun.user_message,
           artifactsDir,
@@ -4138,9 +4154,10 @@ async function executeLoopGroupNode(
  * that uses the run's user_message — not the loop's per-iteration user input — so
  * $LOOP_USER_INPUT must be resolved here, at the loop-group level).
  *
- * Only prompt-bearing fields are substituted in v1; `when:` conditions are NOT (they use
- * evaluateCondition, which does not call substituteLoopPrevRefs). Body authors who need
- * cross-iteration gating should branch on prompt content, not `when:`.
+ * Prompt-bearing fields include node prompts, AI configuration, and load-time compiled loop
+ * command prompts. `when:` conditions are NOT substituted (they use evaluateCondition, which
+ * does not call substituteLoopPrevRefs). Body authors who need cross-iteration gating should
+ * branch on prompt content, not `when:`.
  *
  * `knownBodyIds` (transitive body-id set) and `directBodyIds` (this group's immediate body
  * ids) are threaded UNCHANGED into every substituteLoopPrevRefs call AND into the
@@ -4185,42 +4202,81 @@ export function applyLoopPrevToBodyNode(
     const userInputForField = escapedForBash ? shellQuote(loopUserInput) : loopUserInput;
     return prevResolved.replace(/\$LOOP_USER_INPUT/g, userInputForField);
   };
-  if (isLoopNode(node)) {
+  // AI configuration is live prompt text too. Resolve it in this same per-iteration pass
+  // before the ordinary workflow-variable/node-output pass runs in `runLayers`, otherwise
+  // a namespaced `$LOOP_PREV` inside an included block reaches the provider literally.
+  const substitutedNode: DagNode = {
+    ...node,
+    ...(node.systemPrompt !== undefined ? { systemPrompt: sub(node.systemPrompt) } : {}),
+    ...(node.agents !== undefined
+      ? {
+          agents: Object.fromEntries(
+            Object.entries(node.agents).map(([id, agent]) => [
+              id,
+              {
+                ...agent,
+                description: sub(agent.description),
+                prompt: sub(agent.prompt),
+              },
+            ])
+          ),
+        }
+      : {}),
+  };
+  const composedMeta = readComposedMeta(node);
+  if (composedMeta?.inputs !== undefined) {
+    (substitutedNode as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = {
+      ...composedMeta,
+      inputs: Object.fromEntries(
+        Object.entries(composedMeta.inputs).map(([name, value]) => [name, sub(value)])
+      ),
+    };
+  }
+
+  if (isLoopNode(substitutedNode)) {
     // until_bash is shell-bound: an unresolved $LOOP_PREV would silently degrade to an
     // (empty) shell variable expansion inside bash -c.
+    const loop = {
+      ...substitutedNode.loop,
+      ...(substitutedNode.loop.prompt !== undefined
+        ? { prompt: sub(substitutedNode.loop.prompt) }
+        : {}),
+      ...(substitutedNode.loop.until_bash !== undefined
+        ? { until_bash: sub(substitutedNode.loop.until_bash, true) }
+        : {}),
+    };
+    const compiled = (
+      substitutedNode.loop as typeof substitutedNode.loop & LoopWithCompiledCommand
+    )[COMPILED_LOOP_COMMAND];
+    if (compiled?.prompt !== undefined) {
+      (loop as typeof loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND] = {
+        prompt: sub(compiled.prompt),
+      };
+    }
     return {
-      ...node,
+      ...substitutedNode,
       loop: {
-        ...node.loop,
-        // A command-backed loop has no inline prompt to substitute — its prompt text
-        // is loaded from the command file inside executeLoopNode. Group-level
-        // $LOOP_PREV.<bodyId>.output refs are resolved only in YAML fields (this
-        // pass); they are not scanned inside command-file bodies.
-        ...(node.loop.prompt !== undefined ? { prompt: sub(node.loop.prompt) } : {}),
-        ...(node.loop.until_bash !== undefined
-          ? { until_bash: sub(node.loop.until_bash, true) }
-          : {}),
+        ...loop,
       },
     };
   }
-  if (isLoopGroupNode(node)) {
+  if (isLoopGroupNode(substitutedNode)) {
     // Nested loop_group: recurse into the body. `knownBodyIds`/`directBodyIds` are the OUTER
     // group's sets, threaded UNCHANGED — so during this OUTER pass a ref to an inner-owned id
     // (in knownBodyIds but not directBodyIds) is left intact (return match) for the inner
     // group's own pass, while a ref to an OUTER-direct id resolves here at the outer
     // granularity and a true typo still throws. The inner group's own executeLoopGroupNode
-    // computes fresh sets when it runs, so inner-owned refs resolve at the inner iteration
-    // granularity. The inner group's until_bash is shell-bound and only ever substituted
-    // here for OUTER-loop refs (a nested group's own until_bash cannot reference its own body
-    // via $LOOP_PREV — executeLoopGroupNode does not re-run this pass on the group's until_bash).
+    // computes fresh sets when it runs, so inner-owned refs in both body nodes and its
+    // completion script resolve at the inner iteration granularity. This outer pass still
+    // resolves enclosing-group refs in the nested until_bash before that inner execution.
     return {
-      ...node,
+      ...substitutedNode,
       loop_group: {
-        ...node.loop_group,
-        ...(node.loop_group.until_bash !== undefined
-          ? { until_bash: sub(node.loop_group.until_bash, true) }
+        ...substitutedNode.loop_group,
+        ...(substitutedNode.loop_group.until_bash !== undefined
+          ? { until_bash: sub(substitutedNode.loop_group.until_bash, true) }
           : {}),
-        nodes: node.loop_group.nodes.map(n =>
+        nodes: substitutedNode.loop_group.nodes.map(n =>
           applyLoopPrevToBodyNode(
             n,
             loopPrevOutputs,
@@ -4233,22 +4289,39 @@ export function applyLoopPrevToBodyNode(
       },
     };
   }
-  if (isApprovalNode(node)) {
-    return { ...node, approval: { ...node.approval, message: sub(node.approval.message) } };
+  if (isApprovalNode(substitutedNode)) {
+    return {
+      ...substitutedNode,
+      approval: {
+        ...substitutedNode.approval,
+        message: sub(substitutedNode.approval.message),
+        ...(substitutedNode.approval.on_reject !== undefined
+          ? {
+              on_reject: {
+                ...substitutedNode.approval.on_reject,
+                prompt: sub(substitutedNode.approval.on_reject.prompt),
+              },
+            }
+          : {}),
+      },
+    };
   }
-  if (isBashNode(node)) return { ...node, bash: sub(node.bash, true) };
+  if (isBashNode(substitutedNode))
+    return { ...substitutedNode, bash: sub(substitutedNode.bash, true) };
   // Scripts never pass through a shell (execFile argv) — bash-quoting would inject
   // literal quote artifacts into TS/Python source. $LOOP_PREV.* refs are spliced raw
   // (mirroring executeScriptNode's substituteNodeOutputRefs(..., false)); $LOOP_USER_INPUT
   // is skipped here (skipUserInput) and delivered via env by executeScriptNode (#2115).
-  if (isScriptNode(node)) return { ...node, script: sub(node.script, false, true) };
+  if (isScriptNode(substitutedNode))
+    return { ...substitutedNode, script: sub(substitutedNode.script, false, true) };
   // Cancel reason is display text, never executed — mirrors the normal-path default.
-  if (isCancelNode(node)) return { ...node, cancel: sub(node.cancel) };
-  if ('command' in node && typeof node.command === 'string')
-    return { ...node, command: sub(node.command) };
-  if ('prompt' in node && typeof node.prompt === 'string')
-    return { ...node, prompt: sub(node.prompt) };
-  return node;
+  if (isCancelNode(substitutedNode))
+    return { ...substitutedNode, cancel: sub(substitutedNode.cancel) };
+  if ('command' in substitutedNode && typeof substitutedNode.command === 'string')
+    return { ...substitutedNode, command: sub(substitutedNode.command) };
+  if ('prompt' in substitutedNode && typeof substitutedNode.prompt === 'string')
+    return { ...substitutedNode, prompt: sub(substitutedNode.prompt) };
+  return substitutedNode;
 }
 
 /**
