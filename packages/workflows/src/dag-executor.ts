@@ -555,11 +555,8 @@ interface SequentialSessionCursor {
   provider: string;
 }
 
-/** Exact upstream session selected by `context: { resume: nodeId }`. */
-interface NamedSessionResume {
-  sourceNodeId: string;
-  sourceSessionId: string;
-}
+/** Makes a provider session durable before its node becomes authoritatively complete. */
+type SessionCheckpoint = (sessionId: string) => Promise<void>;
 
 /** Per-node result surfaced by a runLayers layer closure. `sessionProvider` tags which
  *  resolved provider created `output.sessionId` (session-producing paths only). */
@@ -1491,7 +1488,7 @@ async function executeNodeInternal(
   resolvedEffort?: string,
   stepNamePrefix = '',
   iteration?: number,
-  namedSessionResume?: NamedSessionResume
+  checkpointSession?: SessionCheckpoint
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1502,10 +1499,13 @@ async function executeNodeInternal(
   // Only present inside a loop_group body — tags lifecycle rows with the iteration so
   // multi-iteration runs are disaggregatable in the event log.
   const iterationData = iteration !== undefined ? { iteration } : {};
+  const namedResumeSourceNodeId = isNodeContextResume(node.context)
+    ? node.context.resume
+    : undefined;
   const namedSessionAuditData =
-    namedSessionResume !== undefined
+    namedResumeSourceNodeId !== undefined
       ? {
-          session_source_node_id: namedSessionResume.sourceNodeId,
+          session_source_node_id: namedResumeSourceNodeId,
           session_fork_requested: true,
         }
       : {};
@@ -1693,6 +1693,8 @@ async function executeNodeInternal(
   ): Promise<void> => {
     nodeOutputText = '';
     structuredOutput = undefined;
+    newSessionId = undefined;
+    nodeResumed = undefined;
     batchMessages.length = 0; // else a failed attempt's prose flushes during reask
     nodeCostUsd = undefined;
     nodeIdleTimedOut = false;
@@ -2324,9 +2326,12 @@ async function executeNodeInternal(
       await emitReask(reaskAttempt);
     };
     while (true) {
-      // Fresh session per reask attempt (resume only the original session on the
-      // first pass) so a prior invalid turn isn't carried forward.
-      await runStreamPass(reaskPrompt, reaskAttempt === 0 ? resumeSessionId : undefined);
+      // Legacy reasks use a fresh throwaway session so an invalid turn is not carried
+      // forward. Named resume is stricter: every accepted pass must independently fork
+      // the declared source rather than inheriting stale attestation from an earlier pass.
+      const reaskResumeSessionId =
+        namedResumeSourceNodeId !== undefined || reaskAttempt === 0 ? resumeSessionId : undefined;
+      await runStreamPass(reaskPrompt, reaskResumeSessionId);
       if (nodeCostUsd !== undefined) {
         accumulatedCostUsd = (accumulatedCostUsd ?? 0) + nodeCostUsd;
       }
@@ -2556,22 +2561,26 @@ async function executeNodeInternal(
       return { state: 'failed', output: '', error: emptyError };
     }
 
-    if (namedSessionResume !== undefined) {
+    if (namedResumeSourceNodeId !== undefined) {
       if (nodeResumed !== true) {
         throw new Error(
-          `Node '${node.id}' could not resume the exact session from '${namedSessionResume.sourceNodeId}'. The provider reported that prior context was not restored.`
+          `Node '${node.id}' could not resume the exact session from '${namedResumeSourceNodeId}'. The provider reported that prior context was not restored.`
         );
       }
       if (newSessionId === undefined || newSessionId.trim() === '') {
         throw new Error(
-          `Node '${node.id}' forked the session from '${namedSessionResume.sourceNodeId}' but the provider returned no branch session ID.`
+          `Node '${node.id}' forked the session from '${namedResumeSourceNodeId}' but the provider returned no branch session ID.`
         );
       }
-      if (newSessionId === namedSessionResume.sourceSessionId) {
+      if (newSessionId === resumeSessionId) {
         throw new Error(
-          `Node '${node.id}' did not create an immutable fork of '${namedSessionResume.sourceNodeId}': the provider reused the source session ID.`
+          `Node '${node.id}' did not create an immutable fork of '${namedResumeSourceNodeId}': the provider reused the source session ID.`
         );
       }
+    }
+
+    if (newSessionId !== undefined) {
+      await checkpointSession?.(newSessionId);
     }
 
     const duration = Date.now() - nodeStartTime;
@@ -2596,9 +2605,9 @@ async function executeNodeInternal(
           ...(nodeResolvedModel
             ? { model_usage: { requested: resolvedModel, resolved: nodeResolvedModel.id } }
             : {}),
-          ...(namedSessionResume !== undefined
+          ...(namedResumeSourceNodeId !== undefined
             ? {
-                session_source_node_id: namedSessionResume.sourceNodeId,
+                session_source_node_id: namedResumeSourceNodeId,
                 session_forked: true,
               }
             : {}),
@@ -4404,7 +4413,8 @@ async function executeLoopNode(
   execContext: ExecutionContext = { kind: 'host' },
   resolvedModel?: string,
   resolvedTier?: TierName,
-  resolvedEffort?: string
+  resolvedEffort?: string,
+  checkpointSession?: SessionCheckpoint
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -4530,6 +4540,9 @@ async function executeLoopNode(
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
   if (isLoopResume && loopGateMeta?.completionSignaled === true && !feedbackGiven) {
     const finalizeOutput = loopGateMeta.signaledOutput ?? '';
+    if (currentSessionId !== undefined) {
+      await checkpointSession?.(currentSessionId);
+    }
     await finalizeLoopFromSignal(
       deps,
       platform,
@@ -5613,6 +5626,9 @@ async function executeLoopNode(
     const interactiveFirstRun = loop.interactive && !isLoopResume;
     const signalCompletes = loop.signal_completes === true;
     if (completionDetected && (!interactiveFirstRun || signalCompletes)) {
+      if (currentSessionId !== undefined) {
+        await checkpointSession?.(currentSessionId);
+      }
       await safeSendMessage(
         platform,
         conversationId,
@@ -7290,6 +7306,8 @@ interface RunLayersContext {
    * contract yet.
    */
   nodeSessionHandles?: Map<string, SequentialSessionCursor>;
+  /** Top-level node IDs whose sessions are named by at least one downstream consumer. */
+  namedResumeSourceIds?: ReadonlySet<string>;
   /** Sequential-session threading cursor (mutated by runLayers). Provider-tagged so the
    *  session is only threaded into nodes that resolve to the SAME provider (#1992). */
   lastSequentialSession: SequentialSessionCursor | undefined;
@@ -7391,6 +7409,23 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 'Include nodes must be resolved by expandWorkflowIncludes() during discovery.'
             );
           }
+
+          const checkpointSessionForProvider = (
+            provider: string
+          ): SessionCheckpoint | undefined => {
+            const handles = ctx.nodeSessionHandles;
+            if (handles === undefined || ctx.namedResumeSourceIds?.has(node.id) !== true) {
+              return undefined;
+            }
+            return async (sessionId: string): Promise<void> => {
+              await deps.store.upsertWorkflowRunNodeSession({
+                workflow_run_id: workflowRun.id,
+                node_id: node.id,
+                provider,
+                provider_session_id: sessionId,
+              });
+            };
+          };
 
           // `systemPrompt:` and `agents.*` go straight to the provider, so they get the
           // same two substitution passes a `prompt:` does (#2476). Inside a loop_group
@@ -7690,7 +7725,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               execContext,
               resolvedLoopModel,
               resolvedLoopTier,
-              resolvedLoopEffort
+              resolvedLoopEffort,
+              checkpointSessionForProvider(loopProvider)
             );
             // Loop nodes run every iteration on the same resolved provider, so the
             // result session (if any) is attributable to loopProvider — tag it so a
@@ -7884,10 +7920,13 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
 
           // 5. Determine session. An explicit named ancestor has first priority and
           // is independent of the ambient sequential cursor and parallel-layer reset.
-          let namedSessionResume: NamedSessionResume | undefined;
+          const namedResumeSourceNodeId = isNodeContextResume(node.context)
+            ? node.context.resume
+            : undefined;
+          const hasNamedSessionResume = namedResumeSourceNodeId !== undefined;
           let resumeSessionId: string | undefined;
-          if (isNodeContextResume(node.context)) {
-            const sourceNodeId = node.context.resume;
+          if (hasNamedSessionResume) {
+            const sourceNodeId = namedResumeSourceNodeId;
             const sourceHandle = ctx.nodeSessionHandles?.get(sourceNodeId);
             if (sourceHandle === undefined) {
               throw new Error(
@@ -7911,10 +7950,6 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               );
             }
             resumeSessionId = sourceHandle.sessionId;
-            namedSessionResume = {
-              sourceNodeId,
-              sourceSessionId: sourceHandle.sessionId,
-            };
           }
 
           // Legacy scalar/default selection — parallel or context:fresh → always fresh.
@@ -7938,7 +7973,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           const isFreshSequential =
             isParallelLayer || node.context === 'fresh' || composedBlockEntry;
           const cursor = ctx.lastSequentialSession;
-          if (namedSessionResume === undefined) {
+          if (!hasNamedSessionResume) {
             if (isFreshSequential || cursor === undefined) {
               resumeSessionId = undefined;
             } else if (cursor.provider === provider) {
@@ -7969,7 +8004,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 `Node '${node.id}' has persist_session: true but resolved provider '${provider}' does not support sessionResume. Remove persist_session, or use a provider with sessionResume capability.`
               );
             }
-            if (persistScopeKey && namedSessionResume === undefined) {
+            if (persistScopeKey && !hasNamedSessionResume) {
               try {
                 const persisted = await deps.store.getWorkflowNodeSession({
                   workflow_name: workflowName,
@@ -8063,7 +8098,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 resolvedEffort,
                 stepNamePrefix,
                 iteration,
-                namedSessionResume
+                checkpointSessionForProvider(provider)
               ),
             { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult
           );
@@ -8077,7 +8112,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // mistaken for a normal resumed one — but do NOT re-run: a replay would
           // only repeat the same fresh run at double the cost and side effects.
           if (
-            namedSessionResume === undefined &&
+            !hasNamedSessionResume &&
             resumeSessionId !== undefined &&
             output.state === 'completed' &&
             output.resumed === false
@@ -8238,16 +8273,11 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
         ctx.nodeOutputs.set(nodeId, output);
         if (
           ctx.nodeSessionHandles !== undefined &&
+          ctx.namedResumeSourceIds?.has(nodeId) === true &&
           output.state === 'completed' &&
           output.sessionId !== undefined &&
           sessionProvider !== undefined
         ) {
-          await deps.store.upsertWorkflowRunNodeSession({
-            workflow_run_id: workflowRun.id,
-            node_id: nodeId,
-            provider: sessionProvider,
-            provider_session_id: output.sessionId,
-          });
           ctx.nodeSessionHandles.set(nodeId, {
             sessionId: output.sessionId,
             provider: sessionProvider,
@@ -8990,11 +9020,15 @@ export async function executeDagWorkflow(
   // Distinct from AgentRequestOptions.persistSession (Claude SDK on-disk transcript flag).
   const persistScopeKey: string | undefined = workflowRun.conversation_id ?? undefined;
   const workflowPersistSessions = workflow.persist_sessions === true;
+  const namedResumeSourceIds = new Set<string>();
+  for (const node of workflow.nodes) {
+    if (isNodeContextResume(node.context)) namedResumeSourceIds.add(node.context.resume);
+  }
   const nodeSessionHandles = new Map<string, SequentialSessionCursor>();
   for (const row of priorNodeSessions ?? []) {
     // The completed-output snapshot is the authority for which nodes actually
     // survived the previous pass. Never resurrect a handle without its completion.
-    if (nodeOutputs.has(row.node_id)) {
+    if (namedResumeSourceIds.has(row.node_id) && nodeOutputs.has(row.node_id)) {
       nodeSessionHandles.set(row.node_id, {
         sessionId: row.provider_session_id,
         provider: row.provider,
@@ -9037,6 +9071,7 @@ export async function executeDagWorkflow(
     nodeOutputs,
     priorCompletedNodes,
     nodeSessionHandles,
+    namedResumeSourceIds,
     lastSequentialSession: undefined,
     warnedProviderConflicts: new Set<string>(),
     totalCostUsd: priorUsage?.costUsd ?? 0,

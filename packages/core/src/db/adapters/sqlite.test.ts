@@ -768,7 +768,7 @@ describe('SqliteAdapter', () => {
       expect(getSchemaSQL()).toContain('output_root');
     });
 
-    test('run-scoped session handles cascade with their workflow run in both schema shapes', async () => {
+    test('run-scoped session handles cascade with their workflow run in both schema shapes', async (): Promise<void> => {
       db = createTestDb();
       await insertCodebase(db, 'cb-session-cascade');
       await db.query(

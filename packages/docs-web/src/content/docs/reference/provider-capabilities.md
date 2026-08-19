@@ -13,15 +13,17 @@ sidebar:
 
 :::note
 This page is **auto-generated** from each provider's `capabilities.ts` (the same
-constants the workflow engine reads to warn when a node uses a feature its
-provider ignores). Do not edit it by hand — run `bun run generate:capability-matrix`.
+constants the workflow engine reads to enforce provider-specific behavior). Do not
+edit it by hand — run `bun run generate:capability-matrix`.
 A capability change fails `bun run validate` until this page is regenerated.
 :::
 
 Each column is a registered provider id (the value you set as `provider:` in a
 workflow or `.archon/config.yaml`). A ✅ means Archon translates the corresponding
-per-node YAML field for that provider; a ❌ means the field is accepted but ignored
-(the dag-executor emits a visible warning when the run reaches such a node).
+capability for that provider; a ❌ means the capability is unsupported. Unsupported
+behavior is feature-specific: some optional fields are ignored with a warning, while
+strict contracts fail closed. In particular, `context.resume` rejects an explicitly
+unsupported provider at load time and an implicitly resolved one at runtime.
 
 ## Providers
 
@@ -59,7 +61,7 @@ per-node YAML field for that provider; a ❌ means the field is accepted but ign
 
 ## Legend
 
-- **✅ / ❌** — the per-node field is wired for this provider, or accepted-but-ignored.
+- **✅ / ❌** — the capability is supported or unsupported for this provider.
 - **✅¹ (superscript)** — supported, but with semantics that differ from the headline
   meaning of the axis — see [Caveats](#caveats).
 - **Structured output** — `enforced` (the SDK/backend grammar-constrains decoding),

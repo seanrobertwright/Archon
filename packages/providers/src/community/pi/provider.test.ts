@@ -145,7 +145,9 @@ const mockModelRegistryCreate = mock<MockModelRegistryCreate>(
 // to a fresh one.
 const mockSessionCreate = mock((_cwd: string) => ({ __smKind: 'created' }));
 const mockSessionOpen = mock((_path: string) => ({ __smKind: 'opened' }));
-const mockSessionForkFrom = mock(async (_path: string, _cwd: string) => ({ __smKind: 'forked' }));
+const mockSessionForkFrom = mock((_path: string, _cwd: string): { __smKind: string } => ({
+  __smKind: 'forked',
+}));
 const mockSessionList = mock(
   async (_cwd: string) => [] as { id: string; path: string; cwd: string }[]
 );

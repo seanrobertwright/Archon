@@ -36,7 +36,7 @@ registerBuiltinProviders();
 
 import { discoverWorkflows, discoverWorkflowsWithConfig } from './workflow-discovery';
 import { isBashNode, isCancelNode, isLoopGroupNode, isLoopNode } from './schemas';
-import { parseWorkflow } from './loader';
+import { parseWorkflow, type ParseResult } from './loader';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import { workflowDefinitionSchema } from './schemas/workflow';
 import type { WorkflowDefinition } from './schemas/workflow';
@@ -5288,7 +5288,7 @@ nodes:
   });
 
   describe('addressable session resume', () => {
-    function parseAddressable(yaml: string) {
+    function parseAddressable(yaml: string): ParseResult {
       return parseWorkflow(yaml, 'addressable.yaml');
     }
 
@@ -5846,6 +5846,24 @@ nodes:
       ]);
       expect(pw.length).toBe(1);
       expect(pw[0]).toContain("unknown key 'retry.backoff_ms'");
+    });
+
+    it('should warn on an unknown key inside context:', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: source',
+        '    prompt: source',
+        '  - id: consumer',
+        '    prompt: consumer',
+        '    depends_on: [source]',
+        '    context:',
+        '      resume: source',
+        '      fork: false',
+      ]);
+      expect(pw.length).toBe(1);
+      expect(pw[0]).toContain("unknown key 'context.fork'");
     });
 
     it('should warn on an unknown key inside an agents entry', async () => {

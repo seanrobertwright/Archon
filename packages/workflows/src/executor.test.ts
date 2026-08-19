@@ -161,7 +161,7 @@ import {
 import { keepAwake } from './utils/keep-awake';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
-import type { WorkflowDefinition, WorkflowRun } from './schemas';
+import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './schemas';
 
 // --- Helpers ---
 
@@ -1231,9 +1231,44 @@ describe('executeWorkflow', () => {
       expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
 
+    it('rejects prior node sessions owned by a different workflow run at ingress', async () => {
+      const preCreatedRun = makeRun({ id: 'run-a', status: 'running' });
+      const foreignSession: WorkflowRunNodeSession = {
+        workflow_run_id: 'run-b',
+        node_id: 'source',
+        provider: 'claude',
+        provider_session_id: 'private-session',
+        created_at: '2026-08-19T00:00:00Z',
+        updated_at: '2026-08-19T00:00:00Z',
+      };
+      const store = makeStore();
+      const deps = makeDeps(store);
+
+      await expect(
+        executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'test message',
+          'db-conv-1',
+          {
+            preCreatedRun,
+            priorCompletedNodes: new Map([['source', 'prior output']]),
+            priorNodeSessions: [foreignSession],
+          }
+        )
+      ).rejects.toThrow("Cannot resume workflow run 'run-a' with session state from run 'run-b'");
+
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+    });
+
     it('forwards a hydrated resume snapshot into resumed DAG execution', async () => {
       const candidate = makeRun({ id: 'failed-run', status: 'failed' });
-      const resumed = makeRun({ id: 'resumed-run', status: 'running' });
+      const resumed = makeRun({ id: 'failed-run', status: 'running' });
       const completedNodeOutputs = new Map([['node-a', 'first output']]);
       const tokens = { input: 40, output: 4 };
       const costUsd = 0.25;

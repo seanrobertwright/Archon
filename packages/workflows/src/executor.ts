@@ -1180,6 +1180,17 @@ export async function executeWorkflow(
     inputs: suppliedInputs,
   } = opts;
 
+  if (preCreatedRun !== undefined) {
+    const foreignPriorNodeSession = priorNodeSessions?.find(
+      row => row.workflow_run_id !== preCreatedRun.id
+    );
+    if (foreignPriorNodeSession !== undefined) {
+      throw new Error(
+        `Cannot resume workflow run '${preCreatedRun.id}' with session state from run '${foreignPriorNodeSession.workflow_run_id}' (node '${foreignPriorNodeSession.node_id}')`
+      );
+    }
+  }
+
   // Guard: a container run MUST be resumed with its container rewired (the CLI does
   // this via backend.resumeEnv, threading a `container` context). A resume that
   // reaches here for a container run WITHOUT that context — e.g. approving a

@@ -91,6 +91,7 @@ import type {
   ScriptNode,
   NodeOutput,
   WorkflowRun,
+  WorkflowRunNodeSession,
   WorkflowDefinition,
 } from './schemas';
 import { dagNodeSchema, workflowDefinitionSchema } from './schemas';
@@ -19628,20 +19629,17 @@ describe('executeDagWorkflow -- addressable session resume', () => {
 
   afterEach(async () => {
     await rm(testDir, { recursive: true, force: true });
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
   });
 
   async function runAddressableWorkflow(
     nodes: DagNode[],
     store = createMockStore(),
     priorCompletedNodes?: Map<string, string>,
-    priorNodeSessions?: Array<{
-      workflow_run_id: string;
-      node_id: string;
-      provider: string;
-      provider_session_id: string;
-      created_at: string;
-      updated_at: string;
-    }>
+    priorNodeSessions?: readonly WorkflowRunNodeSession[]
   ): Promise<MockWorkflowStore> {
     await executeDagWorkflow(
       createMockDeps(store),
@@ -19791,6 +19789,90 @@ describe('executeDagWorkflow -- addressable session resume', () => {
     expect(namedCalls.every(call => call[3]?.forkSession === true)).toBe(true);
   });
 
+  it('reasks every named structured-output pass from the declared source', async () => {
+    let consumerAttempts = 0;
+    mockSendQueryDag.mockImplementation(async function* (prompt, _cwd, resumeSessionId) {
+      if (prompt === 'source') {
+        yield { type: 'assistant', content: 'source output' };
+        yield { type: 'result', sessionId: 'source-session' };
+        return;
+      }
+      if (prompt === 'final') {
+        yield { type: 'assistant', content: 'final output' };
+        yield { type: 'result', sessionId: 'final-branch', resumed: true };
+        return;
+      }
+      consumerAttempts++;
+      yield {
+        type: 'result',
+        sessionId: `consumer-branch-${String(consumerAttempts)}`,
+        ...(resumeSessionId !== undefined ? { resumed: resumeSessionId === 'source-session' } : {}),
+        structuredOutput: consumerAttempts === 1 ? { wrong: true } : { verdict: 'accepted branch' },
+      };
+    });
+
+    await runAddressableWorkflow([
+      { id: 'source', prompt: 'source', provider: 'pi' },
+      {
+        id: 'consumer',
+        prompt: 'consumer',
+        provider: 'pi',
+        context: { resume: 'source' },
+        depends_on: ['source'],
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+      },
+      {
+        id: 'final',
+        prompt: 'final',
+        provider: 'pi',
+        context: { resume: 'consumer' },
+        depends_on: ['consumer'],
+      },
+    ]);
+
+    expect(mockSendQueryDag.mock.calls.map(call => call[2])).toEqual([
+      undefined,
+      'source-session',
+      'source-session',
+      'consumer-branch-2',
+    ]);
+  });
+
+  it('checkpoints a plain loop source and forks it for a named consumer', async () => {
+    mockSendQueryDag.mockImplementation(async function* (prompt, _cwd, resumeSessionId) {
+      if (resumeSessionId === undefined) {
+        yield { type: 'assistant', content: '<promise>DONE</promise>' };
+        yield { type: 'result', sessionId: 'loop-session' };
+        return;
+      }
+      yield { type: 'assistant', content: String(prompt) };
+      yield { type: 'result', sessionId: 'consumer-branch', resumed: true };
+    });
+
+    const store = await runAddressableWorkflow([
+      {
+        id: 'loop-source',
+        loop: { prompt: 'iterate', until: 'DONE', max_iterations: 1, fresh_context: false },
+      },
+      {
+        id: 'consumer',
+        prompt: 'consumer',
+        context: { resume: 'loop-source' },
+        depends_on: ['loop-source'],
+      },
+    ]);
+
+    expect(store.upsertWorkflowRunNodeSession).toHaveBeenCalledWith(
+      expect.objectContaining({ node_id: 'loop-source', provider_session_id: 'loop-session' })
+    );
+    expect(mockSendQueryDag.mock.calls[1]?.[2]).toBe('loop-session');
+    expect(mockSendQueryDag.mock.calls[1]?.[3]?.forkSession).toBe(true);
+  });
+
   it('hydrates a completed source handle and forks it after a cold resume', async () => {
     mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, resumeSessionId) {
       yield { type: 'assistant', content: 'resumed synthesis' };
@@ -19922,16 +20004,23 @@ describe('executeDagWorkflow -- addressable session resume', () => {
           prompt: 'consumer',
           context: { resume: 'source' },
           depends_on: ['source'],
-          retry: { max_attempts: 0 },
         },
       ]);
 
-      expect(store.failWorkflowRun, failureCase.name).toHaveBeenCalled();
       const completedConsumer = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
         .map(call => call[0] as { event_type: string; step_name?: string })
         .some(event => event.event_type === 'node_completed' && event.step_name === 'consumer');
-      expect(completedConsumer, failureCase.name).toBe(false);
-      expect(mockSendQueryDag.mock.calls[1][2], failureCase.name).toBe('source-session');
+      expect({
+        case: failureCase.name,
+        workflowFailed: store.failWorkflowRun.mock.calls.length > 0,
+        completedConsumer,
+        consumerResumeId: mockSendQueryDag.mock.calls[1]?.[2],
+      }).toEqual({
+        case: failureCase.name,
+        workflowFailed: true,
+        completedConsumer: false,
+        consumerResumeId: 'source-session',
+      });
     }
   });
 
@@ -19977,7 +20066,7 @@ describe('executeDagWorkflow -- addressable session resume', () => {
     expect(capabilityStore.failWorkflowRun).toHaveBeenCalled();
   });
 
-  it('fails the workflow when a required run-scoped handle checkpoint cannot be saved', async () => {
+  it('fails a required source before completion when its session checkpoint cannot be saved', async () => {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'source' };
       yield { type: 'result', sessionId: 'source-session' };
@@ -19987,17 +20076,48 @@ describe('executeDagWorkflow -- addressable session resume', () => {
       store.upsertWorkflowRunNodeSession as Mock<typeof store.upsertWorkflowRunNodeSession>
     ).mockRejectedValue(new Error('checkpoint failed'));
 
-    await expect(
-      runAddressableWorkflow(
-        [
-          { id: 'source', prompt: 'source' },
-          { id: 'later', prompt: 'later', depends_on: ['source'] },
-        ],
-        store
-      )
-    ).rejects.toThrow('checkpoint failed');
+    await runAddressableWorkflow(
+      [
+        { id: 'source', prompt: 'source' },
+        {
+          id: 'consumer',
+          prompt: 'consumer',
+          context: { resume: 'source' },
+          depends_on: ['source'],
+        },
+      ],
+      store
+    );
 
     expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string }
+    );
+    expect(
+      events.some(event => event.event_type === 'node_completed' && event.step_name === 'source')
+    ).toBe(false);
+    expect(
+      events.some(event => event.event_type === 'node_failed' && event.step_name === 'source')
+    ).toBe(true);
+  });
+
+  it('does not checkpoint sessions when the workflow has no named consumer', async () => {
+    const store = createMockStore();
+    (
+      store.upsertWorkflowRunNodeSession as Mock<typeof store.upsertWorkflowRunNodeSession>
+    ).mockRejectedValue(new Error('checkpoint must not run'));
+
+    await runAddressableWorkflow(
+      [
+        { id: 'source', prompt: 'source' },
+        { id: 'later', prompt: 'later', depends_on: ['source'] },
+      ],
+      store
+    );
+
+    expect(store.upsertWorkflowRunNodeSession).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
   });
 });
 

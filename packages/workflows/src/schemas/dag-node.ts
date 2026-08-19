@@ -184,10 +184,11 @@ export const piNodeConfigSchema = z.object({
 
 export type PiNodeConfig = z.infer<typeof piNodeConfigSchema>;
 
-export const nodeContextSchema = z.union([
-  z.enum(['fresh', 'shared']),
-  z.object({ resume: z.string().trim().min(1, "'context.resume' must name a node") }),
-]);
+export const nodeContextResumeSchema = z.object({
+  resume: z.string().trim().min(1, "'context.resume' must name a node"),
+});
+
+export const nodeContextSchema = z.union([z.enum(['fresh', 'shared']), nodeContextResumeSchema]);
 
 export type NodeContext = z.infer<typeof nodeContextSchema>;
 
@@ -1519,6 +1520,7 @@ export const KNOWN_NODE_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = new Ma
     },
   ],
   ['retry', { kind: 'object', keys: new Set(Object.keys(stepRetryConfigSchema.shape)) }],
+  ['context', { kind: 'object', keys: new Set(Object.keys(nodeContextResumeSchema.shape)) }],
   ['loop', { kind: 'object', keys: new Set(Object.keys(loopNodeConfigSchema.shape)) }],
   ['loop_group', { kind: 'object', keys: new Set(Object.keys(loopGroupShape)) }],
   ['pi', { kind: 'object', keys: new Set(Object.keys(piNodeConfigSchema.shape)) }],

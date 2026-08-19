@@ -109,10 +109,16 @@ mock.module('../db/workflow-node-sessions', () => ({
   upsertWorkflowNodeSession: mock(() => Promise.resolve()),
   deleteWorkflowNodeSessions: mock(() => Promise.resolve()),
 }));
-mock.module('../db/workflow-run-node-sessions', () => ({
-  listWorkflowRunNodeSessions: mock(() => Promise.resolve([])),
-  upsertWorkflowRunNodeSession: mock(() => Promise.resolve()),
-}));
+mock.module(
+  '../db/workflow-run-node-sessions',
+  (): {
+    listWorkflowRunNodeSessions: () => Promise<never[]>;
+    upsertWorkflowRunNodeSession: () => Promise<void>;
+  } => ({
+    listWorkflowRunNodeSessions: mock((): Promise<never[]> => Promise.resolve([])),
+    upsertWorkflowRunNodeSession: mock((): Promise<void> => Promise.resolve()),
+  })
+);
 
 const { createWorkflowStore, createWorkflowDeps } = await import('./store-adapter');
 

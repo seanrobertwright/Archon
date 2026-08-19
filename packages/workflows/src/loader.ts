@@ -663,12 +663,8 @@ export function validateDagStructure(
     }
   }
 
-  // fan_out.items (slice 2, PR-C) must reference the output of a node that is a
-  // TRANSITIVE dependency of the fan-out node — so the item array is guaranteed
-  // produced before the node expands. A same-layer or downstream producer would race
-  // (the ref resolves to nothing → the node fails closed at run time); catch it at
-  // load time with an actionable message instead. A literal `items` with no `$…output`
-  // ref is left to the runtime fail-closed check (it must still parse to an array).
+  // A named session source must be in the same static scope and complete before its
+  // consumer. Runtime validation owns provider/session facts that loading cannot know.
   for (const node of nodes) {
     if (!isNodeContextResume(node.context)) continue;
     if (enclosingNodes !== undefined) {
@@ -687,6 +683,12 @@ export function validateDagStructure(
     }
   }
 
+  // fan_out.items (slice 2, PR-C) must reference the output of a node that is a
+  // TRANSITIVE dependency of the fan-out node — so the item array is guaranteed
+  // produced before the node expands. A same-layer or downstream producer would race
+  // (the ref resolves to nothing → the node fails closed at run time); catch it at
+  // load time with an actionable message instead. A literal `items` with no `$…output`
+  // ref is left to the runtime fail-closed check (it must still parse to an array).
   for (const node of nodes) {
     if (!isWorkflowNode(node) || !node.fan_out) continue;
     const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);

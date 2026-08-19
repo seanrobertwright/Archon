@@ -223,6 +223,9 @@ function GeneralTab({
           onChange={(e): void => {
             const newType = e.target.value as DagNodeData['nodeType'];
             const updates: Partial<DagNodeData> = { nodeType: newType };
+            if (newType !== 'command' && newType !== 'prompt' && typeof node.context === 'object') {
+              updates.context = undefined;
+            }
             if (newType === 'command') {
               updates.promptText = undefined;
               updates.bashScript = undefined;
@@ -350,6 +353,8 @@ function ExecutionTab({
   const isBash = node.nodeType === 'bash';
   const canResume = node.nodeType === 'command' || node.nodeType === 'prompt';
   const contextMode = resolveNodeContextMode(node.context);
+  const resumeSource = resumeSourceNodeId(node.context);
+  const resumeSourceMissing = canResume && contextMode === 'resume' && resumeSource.trim() === '';
 
   return (
     <div className="flex flex-col gap-3 p-3">
@@ -389,13 +394,16 @@ function ExecutionTab({
             <Field label="Resume Source Node">
               <input
                 type="text"
-                value={resumeSourceNodeId(node.context)}
+                value={resumeSource}
                 onChange={(e): void => {
                   onUpdate({ context: { resume: e.target.value } });
                 }}
                 placeholder="upstream-node-id"
-                className={cn(inputClass, 'font-mono')}
+                className={cn(inputClass, 'font-mono', resumeSourceMissing && 'border-error')}
               />
+              {resumeSourceMissing && (
+                <p className="text-[10px] text-error">Resume source node is required.</p>
+              )}
             </Field>
           )}
         </>
