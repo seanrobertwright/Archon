@@ -61,6 +61,7 @@ import {
   COMPOSED_NODE,
   isIncludeCommandReadError,
   readComposedMeta,
+  type ComposedBlockBoundary,
   type ComposedNodeMeta,
   type CompiledLoopCommand,
   type IncludeCommandContent,
@@ -149,23 +150,51 @@ class IncludeExpansionError extends Error {}
  * field: the innermost workflow that inlined this node already said the true thing,
  * and an outer level re-stating it would replace one file's answer with another's.
  * `blockEntry` is the exception — it is idempotently true, and a node can legitimately
- * be the entry of two nested blocks at once.
+ * be the entry of two nested blocks at once. `boundaries` is cumulative: each outer
+ * include prepends its own activation predicate without replacing the inner ones.
  */
 function markComposedNode(node: DagNode, patch: ComposedNodeMeta): void {
   const target = node as DagNode & NodeWithComposedMeta;
   const existing = target[COMPOSED_NODE];
+  const cloneBoundaries = (
+    boundaries: ComposedBlockBoundary[] | undefined
+  ): ComposedBlockBoundary[] | undefined => boundaries?.map(boundary => structuredClone(boundary));
   if (existing === undefined) {
-    target[COMPOSED_NODE] = { ...patch };
-  } else if (patch.blockEntry === true) {
-    existing.blockEntry = true;
+    target[COMPOSED_NODE] = {
+      ...patch,
+      ...(patch.boundaries !== undefined ? { boundaries: cloneBoundaries(patch.boundaries) } : {}),
+    };
+  } else {
+    if (patch.blockEntry === true) existing.blockEntry = true;
+    if (patch.boundaries !== undefined) {
+      existing.boundaries = [
+        ...(cloneBoundaries(patch.boundaries) ?? []),
+        ...(existing.boundaries ?? []),
+      ];
+    }
   }
   // A loop_group body node was authored in the same file and reads the same inputs, so
   // it carries the same record — minus `blockEntry`, which is a position in the OUTER
-  // graph and means nothing inside a body.
+  // graph and means nothing inside a body. A body node is likewise never the entry of an
+  // enclosing outer-graph include, though it still inherits that boundary.
   if (isLoopGroupNode(node)) {
     const inherited: ComposedNodeMeta = {
       origin: patch.origin,
       ...(patch.inputs !== undefined ? { inputs: patch.inputs } : {}),
+      ...(patch.boundaries !== undefined
+        ? {
+            boundaries: patch.boundaries.map(boundary => {
+              const clone = structuredClone(boundary);
+              if (!clone.isEntry) return clone;
+              return {
+                dependsOn: clone.dependsOn,
+                entryTriggerRules: clone.entryTriggerRules,
+                ...(clone.when !== undefined ? { when: clone.when } : {}),
+                isEntry: false,
+              };
+            }),
+          }
+        : {}),
     };
     for (const body of node.loop_group.nodes) markComposedNode(body, inherited);
   }
@@ -330,9 +359,13 @@ function collapseWorkflowScope(raw: WorkflowDefinition): WorkflowDefinition {
  * composed and stay literal when run standalone (#2476). Those fields receive runtime
  * substitution since #1764, so they are ordinary node-ref surfaces and are walked here too.
  */
-function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): void {
-  const code = (text: string): string => applyOutputRefRename(text, rename);
-  const whenExpr = (text: string): string => applyWhenRefRename(text, rename);
+function rewriteNodeOutputRefs(
+  node: DagNode,
+  renameOutputRef: (id: string) => string,
+  expandDependency: (id: string) => string[]
+): void {
+  const code = (text: string): string => applyOutputRefRename(text, renameOutputRef);
+  const whenExpr = (text: string): string => applyWhenRefRename(text, renameOutputRef);
 
   if (node.when !== undefined) node.when = whenExpr(node.when);
 
@@ -343,6 +376,10 @@ function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): v
   const stamped = readComposedMeta(node)?.inputs;
   if (stamped !== undefined) {
     for (const [key, value] of Object.entries(stamped)) stamped[key] = code(value);
+  }
+  for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
+    boundary.dependsOn = boundary.dependsOn.flatMap(expandDependency);
+    if (boundary.when !== undefined) boundary.when = whenExpr(boundary.when);
   }
 
   // Node-level AI configuration is a runtime ref surface too (#2476/#1764): the executor
@@ -367,7 +404,9 @@ function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): v
     if (node.loop_group.until_bash !== undefined) {
       node.loop_group.until_bash = code(node.loop_group.until_bash);
     }
-    for (const body of node.loop_group.nodes) rewriteNodeOutputRefs(body, rename);
+    for (const body of node.loop_group.nodes) {
+      rewriteNodeOutputRefs(body, renameOutputRef, expandDependency);
+    }
   } else if (isApprovalNode(node)) {
     node.approval.message = code(node.approval.message);
     if (node.approval.on_reject !== undefined) {
@@ -442,6 +481,9 @@ function applyInputsMacro(node: DagNode, args: Record<string, string>, missing: 
   const stamped = readComposedMeta(node)?.inputs;
   if (stamped !== undefined) {
     for (const [key, value] of Object.entries(stamped)) stamped[key] = substitute(value);
+  }
+  for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
+    if (boundary.when !== undefined) boundary.when = substitute(boundary.when);
   }
 
   // Base AI-turn fields — valid on every AI node mode (command / prompt / loop_group), so
@@ -586,6 +628,16 @@ function inlineInclude(
   const sinkOriginalIds = childNodes.filter(n => !childDeps.has(n.id)).map(n => n.id);
 
   const parentDeps = includeNode.depends_on ?? [];
+  const entryTriggerRules = childNodes
+    .filter(node => (node.depends_on ?? []).length === 0)
+    .map(node => node.trigger_rule ?? includeNode.trigger_rule ?? 'all_success');
+  const [firstEntryTriggerRule, ...remainingEntryTriggerRules] = entryTriggerRules;
+  if (firstEntryTriggerRule === undefined) {
+    throw new IncludeExpansionError(
+      `Node '${includeNode.id}': included workflow '${child.name}' has no entry node`
+    );
+  }
+  const hasActivationBoundary = parentDeps.length > 0 || includeNode.when !== undefined;
   const missingInputs = new Set<string>();
   const resolvedInputs = resolveIncludeInputs(includeNode, child);
 
@@ -600,11 +652,25 @@ function inlineInclude(
       cn.id
     );
     const wasEntry = (cn.depends_on ?? []).length === 0;
+    const boundary: ComposedBlockBoundary = wasEntry
+      ? {
+          dependsOn: [...parentDeps],
+          entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
+          ...(includeNode.when !== undefined ? { when: includeNode.when } : {}),
+          isEntry: true,
+          entryTriggerRule: cn.trigger_rule ?? includeNode.trigger_rule ?? 'all_success',
+        }
+      : {
+          dependsOn: [...parentDeps],
+          entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
+          ...(includeNode.when !== undefined ? { when: includeNode.when } : {}),
+          isEntry: false,
+        };
 
     // Rewrite child-internal refs before inserting caller values. This ordering is
     // load-bearing: a caller ref such as `$gather.output` must remain parent-scoped even
     // when the included block also has a node named `gather`.
-    rewriteNodeOutputRefs(clone, rename);
+    rewriteNodeOutputRefs(clone, rename, id => [rename(id)]);
     applyInputsMacro(clone, resolvedInputs, missingInputs);
     // Stamped AFTER both passes, for the same reason the caller's values are inserted
     // after the rename: these are the CALLER's strings, so they stay parent-scoped here
@@ -614,6 +680,11 @@ function inlineInclude(
       origin: child.name,
       ...(Object.keys(resolvedInputs).length > 0 ? { inputs: { ...resolvedInputs } } : {}),
       ...(wasEntry ? { blockEntry: true as const } : {}),
+      ...(hasActivationBoundary
+        ? {
+            boundaries: [boundary],
+          }
+        : {}),
     });
     clone.id = prefix + cn.id;
 
@@ -954,11 +1025,12 @@ export function expandWorkflowIncludes(
     //   (a) depends_on entries equal to an include id → that include's sink list
     //   (b) $includeId.output → $<primarySink>.output
     const renameIncludeRef = (id: string): string => primarySinkByIncludeId.get(id) ?? id;
+    const expandIncludeDependency = (id: string): string[] => sinksByIncludeId.get(id) ?? [id];
     for (const node of newNodes) {
       if (node.depends_on !== undefined) {
-        node.depends_on = node.depends_on.flatMap(dep => sinksByIncludeId.get(dep) ?? [dep]);
+        node.depends_on = node.depends_on.flatMap(expandIncludeDependency);
       }
-      rewriteNodeOutputRefs(node, renameIncludeRef);
+      rewriteNodeOutputRefs(node, renameIncludeRef, expandIncludeDependency);
     }
 
     // Re-validate the fully-flattened DAG. Catches a namespaced id colliding with a

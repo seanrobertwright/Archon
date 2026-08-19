@@ -5,6 +5,7 @@ import type { WorkflowDefinition, DagNode } from './schemas';
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
+  type ComposedBlockBoundary,
   type ComposedNodeMeta,
   type LoopWithCompiledCommand,
   type NodeWithComposedMeta,
@@ -41,6 +42,10 @@ function composedInputs(node: DagNode | undefined): Record<string, string> | und
 
 function composedOrigin(node: DagNode | undefined): string | undefined {
   return composedMeta(node)?.origin;
+}
+
+function composedBoundaries(node: DagNode | undefined): ComposedBlockBoundary[] | undefined {
+  return composedMeta(node)?.boundaries;
 }
 
 function compiledLoopPrompt(node: DagNode | undefined): string | undefined {
@@ -148,6 +153,40 @@ describe('expandWorkflowIncludes — namespacing', () => {
     expect(ids).toContain('b__verify');
     // b's entry inherits [a] rewired to a's sink.
     expect(nodeById(workflows.get('parent')!, 'b__verify')?.depends_on).toEqual(['a__impl']);
+  });
+
+  test('boundary dependency edges fan out to every sink while scalar refs use the primary sink', () => {
+    const upstream = wf('upstream', [
+      { id: 'primary', bash: 'echo primary' },
+      { id: 'secondary', bash: 'echo secondary' },
+    ]);
+    const downstream = wf('downstream', [
+      { id: 'entry', bash: 'echo entry', trigger_rule: 'one_success' },
+      { id: 'join', bash: 'echo join', depends_on: ['entry'], trigger_rule: 'all_done' },
+    ]);
+    const parent = wf('parent', [
+      { id: 'up', include: 'upstream' },
+      {
+        id: 'down',
+        include: 'downstream',
+        depends_on: ['up'],
+        when: "$up.output == 'primary'",
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(upstream, downstream, parent));
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get('parent')!;
+
+    expect(nodeById(expanded, 'down__entry')?.depends_on).toEqual(['up__primary', 'up__secondary']);
+    expect(composedBoundaries(nodeById(expanded, 'down__join'))).toEqual([
+      {
+        dependsOn: ['up__primary', 'up__secondary'],
+        entryTriggerRules: ['one_success'],
+        when: "$up__primary.output == 'primary'",
+        isEntry: false,
+      },
+    ]);
   });
 
   test('does not mutate the input workflow map', () => {
@@ -1521,6 +1560,95 @@ describe('expandWorkflowIncludes — composed-node metadata survives nesting', (
     // Write-once: the INNER workflow's own input name, not the outer's `topic`.
     expect(composedInputs(run)).toEqual({ plan: 'ship it' });
     expect(composedOrigin(run)).toBe('inner');
+  });
+
+  test('repeated includes keep distinct caller boundaries', () => {
+    const block = wf('gated-block', [
+      { id: 'entry', bash: 'echo entry', trigger_rule: 'all_done' },
+      { id: 'done', bash: 'echo done', depends_on: ['entry'], trigger_rule: 'all_done' },
+    ]);
+    const parent = wf('parent', [
+      { id: 'gate-a', bash: 'echo A' },
+      { id: 'gate-b', bash: 'echo B' },
+      {
+        id: 'first',
+        include: 'gated-block',
+        depends_on: ['gate-a'],
+        when: "$gate-a.output == 'A'",
+        trigger_rule: 'one_success',
+      },
+      {
+        id: 'second',
+        include: 'gated-block',
+        depends_on: ['gate-b'],
+        when: "$gate-b.output == 'B'",
+        trigger_rule: 'one_success',
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+
+    expect(composedBoundaries(nodeById(workflows.get('parent')!, 'first__done'))).toEqual([
+      {
+        dependsOn: ['gate-a'],
+        entryTriggerRules: ['all_done'],
+        when: "$gate-a.output == 'A'",
+        isEntry: false,
+      },
+    ]);
+    expect(composedBoundaries(nodeById(workflows.get('parent')!, 'second__done'))).toEqual([
+      {
+        dependsOn: ['gate-b'],
+        entryTriggerRules: ['all_done'],
+        when: "$gate-b.output == 'B'",
+        isEntry: false,
+      },
+    ]);
+  });
+
+  test('nested include boundaries retain their own namespaced predicates', () => {
+    const leaf = wf('leaf', [{ id: 'work', bash: 'echo work' }]);
+    const middle = withSignature(
+      wf('middle', [
+        { id: 'local-gate', bash: 'echo local' },
+        {
+          id: 'inner',
+          include: 'leaf',
+          depends_on: ['local-gate'],
+          when: "$local-gate.output == '$INPUTS.expected'",
+        },
+      ]),
+      { inputs: { expected: { required: true } } }
+    );
+    const top = wf('top', [
+      { id: 'outer-gate', bash: 'echo outer' },
+      {
+        id: 'outer',
+        include: 'middle',
+        depends_on: ['outer-gate'],
+        when: "$outer-gate.output == 'outer'",
+        with: { expected: 'local' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(leaf, middle, top));
+    expect(errors).toHaveLength(0);
+    expect(composedBoundaries(nodeById(workflows.get('top')!, 'outer__inner__work'))).toEqual([
+      {
+        dependsOn: ['outer-gate'],
+        entryTriggerRules: ['all_success'],
+        when: "$outer-gate.output == 'outer'",
+        isEntry: false,
+      },
+      {
+        dependsOn: ['outer__local-gate'],
+        entryTriggerRules: ['all_success'],
+        when: "$outer__local-gate.output == 'local'",
+        isEntry: true,
+        entryTriggerRule: 'all_success',
+      },
+    ]);
   });
 });
 

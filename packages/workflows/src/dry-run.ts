@@ -5,7 +5,12 @@ import { createLogger, getArchonTempPath } from '@archon/paths';
 import { randomUUID } from 'node:crypto';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { buildTopologicalLayers, checkTriggerRule, substituteNodeOutputRefs } from './dag-executor';
+import {
+  buildTopologicalLayers,
+  checkComposedBlockBoundaries,
+  checkTriggerRule,
+  substituteNodeOutputRefs,
+} from './dag-executor';
 import { evaluateCondition } from './condition-evaluator';
 import { declaredFieldsFromSchema } from './output-ref';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -615,6 +620,10 @@ async function simulateNode(
   ctx: DryRunContext,
   iteration?: number
 ): Promise<void> {
+  if (checkComposedBlockBoundaries(node, outputs, ctx.inputs) === 'skip') {
+    recordSkipped(node, outputs, ctx, 'trigger_rule', iteration);
+    return;
+  }
   if (checkTriggerRule(node, outputs) === 'skip') {
     recordSkipped(node, outputs, ctx, 'trigger_rule', iteration);
     return;

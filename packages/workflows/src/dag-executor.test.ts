@@ -19143,11 +19143,350 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     return [...workflows.get('inc-parent')!.nodes];
   }
 
+  function expandedGatedParentNodes(
+    mode: 'false-condition' | 'skipped-dependency' | 'active',
+    alwaysRunGateAndConsumer = false
+  ): DagNode[] {
+    const child = buildWf('review-block', [
+      { id: 'entry', bash: 'echo started' },
+      {
+        id: 'optional',
+        bash: 'echo optional',
+        depends_on: ['entry'],
+        when: "$entry.output == 'never'",
+      },
+      { id: 'required', bash: 'echo report', depends_on: ['entry'] },
+      {
+        id: 'synthesize',
+        bash: 'echo synthesized',
+        depends_on: ['optional', 'required'],
+        trigger_rule: 'all_done',
+      },
+    ]);
+    const gateNodes =
+      mode === 'skipped-dependency'
+        ? [
+            { id: 'source', bash: 'echo ready' },
+            {
+              id: 'gate',
+              bash: 'echo gate',
+              depends_on: ['source'],
+              when: "$source.output == 'never'",
+            },
+          ]
+        : [
+            {
+              id: 'gate',
+              bash: `echo ${mode === 'active' ? 'run' : 'skip'}`,
+              ...(alwaysRunGateAndConsumer ? { always_run: true } : {}),
+            },
+          ];
+    const parent = buildWf('gated-parent', [
+      ...gateNodes,
+      {
+        id: 'review',
+        include: 'review-block',
+        depends_on: ['gate'],
+        ...(mode === 'skipped-dependency' ? {} : { when: "$gate.output == 'run'" }),
+      },
+      {
+        id: 'consumer',
+        bash: 'echo $review.output',
+        depends_on: ['review'],
+        ...(alwaysRunGateAndConsumer ? { always_run: true } : {}),
+      },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['review-block', child],
+        ['gated-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...workflows.get('gated-parent')!.nodes];
+  }
+
+  function expandedMultiSinkDependencyNodes(
+    entryTriggerRule: 'all_success' | 'one_success'
+  ): DagNode[] {
+    const upstream = buildWf('upstream', [
+      { id: 'start', bash: 'echo start' },
+      { id: 'good', bash: 'echo good', depends_on: ['start'] },
+      {
+        id: 'bad',
+        bash: 'echo bad',
+        depends_on: ['start'],
+        when: "$start.output == 'never'",
+      },
+    ]);
+    const downstream = buildWf('downstream', [
+      { id: 'entry', bash: 'echo entry', trigger_rule: entryTriggerRule },
+      {
+        id: 'synthesize',
+        bash: 'echo synthesized',
+        depends_on: ['entry'],
+        trigger_rule: 'all_done',
+      },
+    ]);
+    const parent = buildWf('multi-sink-parent', [
+      { id: 'up', include: 'upstream' },
+      { id: 'down', include: 'downstream', depends_on: ['up'] },
+      { id: 'consumer', bash: 'echo $down.output', depends_on: ['down'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['upstream', upstream],
+        ['downstream', downstream],
+        ['multi-sink-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...workflows.get('multi-sink-parent')!.nodes];
+  }
+
+  function expandedMixedEntryTriggerNodes(): DagNode[] {
+    const upstream = buildWf('upstream', [
+      { id: 'start', bash: 'echo start' },
+      { id: 'good', bash: 'echo good', depends_on: ['start'] },
+      {
+        id: 'bad',
+        bash: 'echo bad',
+        depends_on: ['start'],
+        when: "$start.output == 'never'",
+      },
+    ]);
+    const downstream = buildWf('downstream', [
+      { id: 'strict', bash: 'echo strict', trigger_rule: 'all_success' },
+      { id: 'lenient', bash: 'echo lenient', trigger_rule: 'one_success' },
+    ]);
+    const parent = buildWf('mixed-entry-parent', [
+      { id: 'up', include: 'upstream' },
+      { id: 'down', include: 'downstream', depends_on: ['up'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['upstream', upstream],
+        ['downstream', downstream],
+        ['mixed-entry-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...workflows.get('mixed-entry-parent')!.nodes];
+  }
+
   function eventList(deps: WorkflowDeps): Array<{ event_type: string; step_name: string }> {
     return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
       (call: unknown[]) => call[0] as { event_type: string; step_name: string }
     );
   }
+
+  async function executeExpanded(
+    nodes: DagNode[],
+    runId: string,
+    priorCompletedNodes?: Map<string, string>
+  ): Promise<{
+    events: Array<{ event_type: string; step_name: string }>;
+    output: string | undefined;
+  }> {
+    const mockDeps = createMockDeps();
+    const output = await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-inc',
+      testDir,
+      { name: 'gated-parent', nodes },
+      makeWorkflowRun(runId, { workflow_name: 'gated-parent' }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+    return { events: eventList(mockDeps), output };
+  }
+
+  it('skips every composed node when the include condition is false', async () => {
+    const { events } = await executeExpanded(
+      expandedGatedParentNodes('false-condition'),
+      'inc-false-condition'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual([
+      'consumer',
+      'review__entry',
+      'review__optional',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(completed).toEqual(['gate']);
+  });
+
+  it('skips every composed node when the include dependencies are ineligible', async () => {
+    const { events } = await executeExpanded(
+      expandedGatedParentNodes('skipped-dependency'),
+      'inc-skipped-dependency'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual([
+      'consumer',
+      'gate',
+      'review__entry',
+      'review__optional',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(completed).toEqual(['source']);
+  });
+
+  it('keeps all_done active for intentionally skipped branches inside a running block', async () => {
+    const { events, output } = await executeExpanded(
+      expandedGatedParentNodes('active'),
+      'inc-active-block'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual(['review__optional']);
+    expect(completed).toEqual([
+      'consumer',
+      'gate',
+      'review__entry',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(output).toContain('synthesized');
+  });
+
+  it('keeps a block inactive when one sink of an included dependency is ineligible', async () => {
+    const { events } = await executeExpanded(
+      expandedMultiSinkDependencyNodes('all_success'),
+      'inc-multi-sink-inactive'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual(['consumer', 'down__entry', 'down__synthesize', 'up__bad']);
+    expect(completed).toEqual(['up__good', 'up__start']);
+  });
+
+  it('keeps a one_success block active when any sink of an included dependency succeeds', async () => {
+    const { events } = await executeExpanded(
+      expandedMultiSinkDependencyNodes('one_success'),
+      'inc-multi-sink-active'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual(['up__bad']);
+    expect(completed).toEqual([
+      'consumer',
+      'down__entry',
+      'down__synthesize',
+      'up__good',
+      'up__start',
+    ]);
+  });
+
+  it('resume discards cached block output when its include gate becomes inactive', async () => {
+    const priorCompletedNodes = new Map<string, string>([
+      ['gate', 'run'],
+      ['review__entry', 'started'],
+      ['review__required', 'report'],
+      ['review__synthesize', 'old-sink'],
+      ['consumer', 'old-consumer'],
+    ]);
+    const { events } = await executeExpanded(
+      expandedGatedParentNodes('false-condition', true),
+      'inc-resume-inactive-block',
+      priorCompletedNodes
+    );
+
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+    const reused = events
+      .filter(event => event.event_type === 'node_skipped_prior_success')
+      .map(event => event.step_name);
+
+    expect(skipped).toEqual([
+      'consumer',
+      'review__entry',
+      'review__optional',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(completed).toEqual(['gate']);
+    expect(reused.filter(stepName => stepName.startsWith('review__'))).toEqual([]);
+  });
+
+  it("resume evaluates each cached block entry with that entry's trigger rule", async () => {
+    const priorCompletedNodes = new Map<string, string>([
+      ['up__start', 'start'],
+      ['up__good', 'good'],
+      ['down__strict', 'old-strict'],
+      ['down__lenient', 'old-lenient'],
+    ]);
+    const { events } = await executeExpanded(
+      expandedMixedEntryTriggerNodes(),
+      'inc-resume-mixed-entry-rules',
+      priorCompletedNodes
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name);
+    const reused = events
+      .filter(event => event.event_type === 'node_skipped_prior_success')
+      .map(event => event.step_name);
+
+    expect(skipped).toContain('down__strict');
+    expect(reused).toContain('down__lenient');
+    expect(reused).not.toContain('down__strict');
+  });
 
   it('emits namespaced step_names and resolves $inc.output to the child terminal node', async () => {
     const mockDeps = createMockDeps();
