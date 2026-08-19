@@ -509,7 +509,7 @@ export function validateDagStructure(
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
   const whenRefPattern = new RegExp(WHEN_REF_SOURCE, 'g');
   for (const node of nodes) {
-    const sources: { field: string; text: string }[] = [];
+    const sources: { field: string; text: string; bodyNodes?: readonly DagNode[] }[] = [];
     if ('prompt' in node && typeof node.prompt === 'string') {
       sources.push({ field: 'prompt', text: node.prompt });
     }
@@ -562,7 +562,14 @@ export function validateDagStructure(
       }
     }
     if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-      sources.push({ field: 'loop_group.until_bash', text: node.loop_group.until_bash });
+      // The group evaluates this field after each body iteration against the same output
+      // map the body populated, so its direct body nodes are visible here in addition to
+      // the current and enclosing DAG scopes.
+      sources.push({
+        field: 'loop_group.until_bash',
+        text: node.loop_group.until_bash,
+        bodyNodes: node.loop_group.nodes,
+      });
     }
     for (const source of sources) {
       let m: RegExpExecArray | null;
@@ -578,8 +585,12 @@ export function validateDagStructure(
         if (
           refNodeId !== undefined &&
           !nodesById.has(refNodeId) &&
-          !enclosingNodes?.has(refNodeId)
+          !enclosingNodes?.has(refNodeId) &&
+          !source.bodyNodes?.some(bodyNode => bodyNode.id === refNodeId)
         ) {
+          if (source.bodyNodes !== undefined) {
+            return `Node '${node.id}' field '${source.field}' references unknown node '$${refNodeId}.output'. Expected a node in the loop_group body or current/enclosing DAG scope`;
+          }
           return `Node '${node.id}' field '${source.field}' references unknown node '$${refNodeId}.output'. In a composed workflow, pass caller data through declared 'inputs:' and caller 'with:' instead of referencing a caller node directly`;
         }
       }

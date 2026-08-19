@@ -3933,6 +3933,60 @@ nodes:
       expect(result.workflows).toHaveLength(1);
     });
 
+    it('should load loop_group until_bash referencing a direct body output', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-body-completion-ref.yaml'),
+        `
+name: loop-group-body-completion-ref
+description: Group completion reads the current body output
+nodes:
+  - id: group
+    loop_group:
+      until_bash: "test $ready-flag.output = ready"
+      max_iterations: 2
+      nodes:
+        - id: ready-flag
+          bash: "echo ready"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+    });
+
+    it('should reject unknown loop_group until_bash refs with body-scope guidance', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-unknown-completion-ref.yaml'),
+        `
+name: loop-group-unknown-completion-ref
+description: Group completion references a node outside its visible scopes
+nodes:
+  - id: group
+    loop_group:
+      until_bash: "test $ghost.output = ready"
+      max_iterations: 2
+      nodes:
+        - id: ready-flag
+          bash: "echo ready"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("field 'loop_group.until_bash'");
+      expect(result.errors[0].error).toContain("unknown node '$ghost.output'");
+      expect(result.errors[0].error).toContain('loop_group body or current/enclosing DAG scope');
+      expect(result.errors[0].error).not.toContain('In a composed workflow');
+    });
+
     it('should accept a body prompt referencing an outer-DAG node via $nodeId.output', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
