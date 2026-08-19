@@ -18687,7 +18687,10 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     nodes: DagNode[],
     runId: string,
     priorCompletedNodes?: Map<string, string>
-  ): Promise<{ events: Array<{ event_type: string; step_name: string }>; output: string }> {
+  ): Promise<{
+    events: Array<{ event_type: string; step_name: string }>;
+    output: string | undefined;
+  }> {
     const mockDeps = createMockDeps();
     const output = await executeDagWorkflow(
       mockDeps,
