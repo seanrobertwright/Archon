@@ -401,6 +401,131 @@ describe('workflow-events', () => {
       expect(result.tokens).toEqual({ input: 10, output: 3 });
     });
 
+    // #2469: cost is restored across resume passes exactly like tokens. Before this,
+    // only tokens were summed, so a resumed run's cost silently reset to the current
+    // pass — and once a FAILED run started persisting cost, the figure would have gone
+    // down after a successful resume.
+    test('sums cost_usd from node_completed events', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'node-a',
+            event_type: 'node_completed',
+            data: { node_output: 'output A', cost_usd: 0.02, tokens: { input: 40, output: 4 } },
+          },
+          {
+            step_name: 'node-b',
+            event_type: 'node_completed',
+            data: { node_output: 'output B', cost_usd: 0.03 },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-cost');
+
+      expect(result.costUsd).toBeCloseTo(0.05, 10);
+      expect(result.tokens).toEqual({ input: 40, output: 4 });
+    });
+
+    test('excludes cost_usd on node_skipped_prior_success rows (multi-resume)', async () => {
+      // A prior-success replay must not re-charge a node an earlier pass already
+      // counted — otherwise every resume multiplies that node's cost.
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'node-a',
+            event_type: 'node_completed',
+            data: { node_output: 'output A', cost_usd: 0.02 },
+          },
+          {
+            step_name: 'node-b',
+            event_type: 'node_skipped_prior_success',
+            data: { reason: 'prior_success', node_output: 'output B', cost_usd: 999 },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-cost-resume');
+
+      expect(result.costUsd).toBeCloseTo(0.02, 10);
+    });
+
+    test('ignores malformed and non-finite cost_usd while keeping valid rows', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'node-a',
+            event_type: 'node_completed',
+            data: { node_output: 'valid', cost_usd: 0.01 },
+          },
+          {
+            step_name: 'node-b',
+            event_type: 'node_completed',
+            data: { node_output: 'string cost', cost_usd: '0.5' },
+          },
+          {
+            step_name: 'node-c',
+            event_type: 'node_completed',
+            data: { node_output: 'nan cost', cost_usd: Number.NaN },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-cost-malformed');
+
+      expect(result.costUsd).toBeCloseTo(0.01, 10);
+      expect(result.completedNodeOutputs.size).toBe(3);
+      expect(mockLogger.warn).toHaveBeenCalledTimes(2);
+    });
+
+    test('does not warn when completed events omit optional cost', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'node-a',
+            event_type: 'node_completed',
+            data: { node_output: 'no cost reported', tokens: { input: 5, output: 1 } },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-cost-absent');
+
+      expect(result.costUsd).toBe(0);
+      expect(mockLogger.warn).not.toHaveBeenCalled();
+    });
+
+    // #2469: a loop_group writes a roll-up node_completed row whose cost_usd restates
+    // what its own `<groupId>.<nodeId>` body rows already carry. Summing both counted
+    // that group twice — the same silently-wrong number this work exists to remove,
+    // pointing the other way. The roll-up is marked `aggregate: true` and skipped here.
+    test('excludes usage on aggregate rows while keeping their output', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'group.body',
+            event_type: 'node_completed',
+            data: { node_output: 'iteration 1', cost_usd: 0.01, tokens: { input: 10, output: 1 } },
+          },
+          {
+            step_name: 'group',
+            event_type: 'node_completed',
+            data: { node_output: 'last iteration', cost_usd: 0.01, aggregate: true },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-loop-group');
+
+      // The leaves are authoritative: 0.01 total, not 0.02.
+      expect(result.costUsd).toBeCloseTo(0.01, 10);
+      expect(result.tokens).toEqual({ input: 10, output: 1 });
+      // The roll-up still marks the group node completed, so resume skips it rather
+      // than re-running the whole group.
+      expect(result.completedNodeOutputs.get('group')).toBe('last iteration');
+      expect(result.completedNodeOutputs.get('group.body')).toBe('iteration 1');
+    });
+
     test('returns an empty snapshot when no events exist', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
@@ -408,6 +533,7 @@ describe('workflow-events', () => {
 
       expect(result.completedNodeOutputs.size).toBe(0);
       expect(result.tokens).toEqual({ input: 0, output: 0 });
+      expect(result.costUsd).toBe(0);
     });
 
     test('throws on DB query error', async () => {

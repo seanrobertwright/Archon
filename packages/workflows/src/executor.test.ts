@@ -181,6 +181,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     getDagResumeSnapshot: mock(async () => ({
       completedNodeOutputs: new Map(),
       tokens: { input: 0, output: 0 },
+      costUsd: 0,
     })),
     resumeWorkflowRun: mock(async () => makeRun()),
     getCodebase: mock(async () => null),
@@ -319,14 +320,17 @@ describe('executeWorkflow', () => {
         {
           preCreatedRun,
           priorCompletedNodes: new Map([['node1', 'out']]),
-          priorTokenUsage: { input: 40, output: 4 },
+          priorUsage: { tokens: { input: 40, output: 4 }, costUsd: 0.5 },
           execContext: { kind: 'container', containerId: 'cid' },
           container: { envId: 'env-x', writeBack: 'approve', backend },
         }
       );
       // Guard passed → DAG entered (mocked no-op) → run completes.
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[24]).toEqual({ input: 40, output: 4 });
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[24]).toEqual({
+        tokens: { input: 40, output: 4 },
+        costUsd: 0.5,
+      });
       expect(result.success).toBe(true);
     });
   });
@@ -1230,8 +1234,9 @@ describe('executeWorkflow', () => {
       const resumed = makeRun({ id: 'resumed-run', status: 'running' });
       const completedNodeOutputs = new Map([['node-a', 'first output']]);
       const tokens = { input: 40, output: 4 };
+      const costUsd = 0.25;
       const store = makeStore({
-        getDagResumeSnapshot: mock(async () => ({ completedNodeOutputs, tokens })),
+        getDagResumeSnapshot: mock(async () => ({ completedNodeOutputs, tokens, costUsd })),
         resumeWorkflowRun: mock(async () => resumed),
       });
       const deps = makeDeps(store);
@@ -1253,7 +1258,9 @@ describe('executeWorkflow', () => {
 
       const dagCall = mockExecuteDagWorkflow.mock.calls[0];
       expect(dagCall?.[16]).toBe(completedNodeOutputs);
-      expect(dagCall?.[24]).toEqual(tokens);
+      // Both usage axes travel as one `priorUsage` bundle (#2469) — cost is restored
+      // across resume exactly like tokens, so a resumed run's total never regresses.
+      expect(dagCall?.[24]).toEqual({ tokens, costUsd });
       expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
   });
@@ -2042,6 +2049,7 @@ describe('hydrateResumableRun', () => {
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: priorNodes,
         tokens: { input: 40, output: 4 },
+        costUsd: 0.75,
       })),
       resumeWorkflowRun: mock(async () => resumed),
     });
@@ -2050,7 +2058,7 @@ describe('hydrateResumableRun', () => {
     expect(result).not.toBeNull();
     expect(result?.preCreatedRun).toBe(resumed);
     expect(result?.priorCompletedNodes).toBe(priorNodes);
-    expect(result?.priorTokenUsage).toEqual({ input: 40, output: 4 });
+    expect(result?.priorUsage).toEqual({ tokens: { input: 40, output: 4 }, costUsd: 0.75 });
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('prior-failed');
   });
 
@@ -2060,6 +2068,7 @@ describe('hydrateResumableRun', () => {
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })),
     });
     const deps = makeDeps(store);
@@ -2080,6 +2089,7 @@ describe('hydrateResumableRun', () => {
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })),
       resumeWorkflowRun: mock(async () => resumed),
     });
@@ -2107,6 +2117,7 @@ describe('hydrateResumableRun', () => {
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map([['n1', 'v1']]),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })),
       resumeWorkflowRun: mock(async () => {
         throw new Error('DB write failed');
