@@ -1315,6 +1315,14 @@ export function checkTriggerRule(
   nodeOutputs: Map<string, NodeOutput>
 ): 'run' | 'skip' {
   const nodeDeps = node.depends_on ?? [];
+  return checkTriggerRuleForDependencies(nodeDeps, node.trigger_rule ?? 'all_success', nodeOutputs);
+}
+
+function checkTriggerRuleForDependencies(
+  nodeDeps: readonly string[],
+  rule: TriggerRule,
+  nodeOutputs: Map<string, NodeOutput>
+): 'run' | 'skip' {
   if (nodeDeps.length === 0) return 'run';
 
   const upstreams = nodeDeps.map(
@@ -1326,8 +1334,6 @@ export function checkTriggerRule(
         error: `upstream '${id}' missing from outputs`,
       } as NodeOutput)
   );
-  const rule: TriggerRule = node.trigger_rule ?? 'all_success';
-
   switch (rule) {
     case 'all_success':
       return upstreams.every(u => u.state === 'completed') ? 'run' : 'skip';
@@ -1341,6 +1347,38 @@ export function checkTriggerRule(
     case 'all_done':
       return upstreams.every(u => u.state !== 'pending' && u.state !== 'running') ? 'run' : 'skip';
   }
+}
+
+/**
+ * Enforce caller-level include predicates that load-time flattening attached to every
+ * descendant. Entry nodes keep using their ordinary trigger/when fields so they retain
+ * the existing diagnostics; only descendants need the recovered boundary guard.
+ */
+export function checkComposedBlockBoundaries(
+  node: DagNode,
+  nodeOutputs: Map<string, NodeOutput>,
+  inputs?: Record<string, string>
+): 'run' | 'skip' {
+  for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
+    if (boundary.isEntry) continue;
+
+    const dependencyEligible = boundary.entryTriggerRules.some(
+      rule => checkTriggerRuleForDependencies(boundary.dependsOn, rule, nodeOutputs) === 'run'
+    );
+    if (!dependencyEligible) return 'skip';
+
+    if (boundary.when !== undefined) {
+      try {
+        const condition = evaluateCondition(boundary.when, nodeOutputs, inputs);
+        if (!condition.parsed || !condition.result) return 'skip';
+      } catch {
+        // Entry nodes own the actionable missing-ref error. Descendants only need to stay
+        // inside the failed boundary, without repeating the same failure for every node.
+        return 'skip';
+      }
+    }
+  }
+  return 'run';
 }
 
 /**
@@ -7213,8 +7251,12 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             }
           }
 
-          // 1. Evaluate trigger rule
-          const triggerDecision = checkTriggerRule(node, ctx.nodeOutputs);
+          // 1. Enforce every enclosing include boundary before this node's local rule.
+          const triggerDecision =
+            checkComposedBlockBoundaries(node, ctx.nodeOutputs, resolveRunInputs(workflowRun)) ===
+            'skip'
+              ? 'skip'
+              : checkTriggerRule(node, ctx.nodeOutputs);
           if (triggerDecision === 'skip') {
             getLog().info({ nodeId: node.id, reason: 'trigger_rule' }, 'dag_node_skipped');
             await logNodeSkip(logDir, workflowRun.id, node.id, 'trigger_rule').catch(

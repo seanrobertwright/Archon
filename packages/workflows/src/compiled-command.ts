@@ -1,3 +1,5 @@
+import type { TriggerRule } from './schemas';
+
 /** Engine-private per-node metadata attached during load-time include expansion.
  * Symbols survive object spreads but stay out of YAML, JSON, API payloads, and
  * persisted workflow definitions.
@@ -20,6 +22,18 @@ export interface LoopWithCompiledCommand {
 export const COMPOSED_NODE = Symbol('archon.composed-node');
 
 /**
+ * The caller-level predicate that decides whether one include instance is active.
+ * Every descendant carries a copy because load-time expansion removes the include node.
+ */
+export interface ComposedBlockBoundary {
+  dependsOn: string[];
+  entryTriggerRules: [TriggerRule, ...TriggerRule[]];
+  when?: string;
+  /** The node's own trigger/when fields already enforce this boundary at the entry. */
+  isEntry: boolean;
+}
+
+/**
  * Per-node record of the workflow a node was AUTHORED in, attached when that
  * workflow is inlined into a parent (#1764). It is what lets a composed node keep
  * behaving like its own file's node instead of the composing parent's:
@@ -33,11 +47,14 @@ export const COMPOSED_NODE = Symbol('archon.composed-node');
  *  - `blockEntry` — this node starts its block. The executor clears the sequential
  *    session cursor there so a composed workflow begins as coldly as it would
  *    standalone.
+ *  - `boundaries` — caller-level activation predicates for enclosing include instances,
+ *    outermost first. Non-entry descendants enforce them before their local trigger rule.
  */
 export interface ComposedNodeMeta {
   origin: string;
   inputs?: Record<string, string>;
   blockEntry?: true;
+  boundaries?: ComposedBlockBoundary[];
 }
 
 export interface NodeWithComposedMeta {

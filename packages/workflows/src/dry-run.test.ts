@@ -2,12 +2,13 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeTestWorkflow } from './test-utils';
+import { makeTestComposedWorkflow, makeTestWorkflow } from './test-utils';
 import { dryRunWorkflow, formatDryRunTrace, loadDryRunStubs } from './dry-run';
 import type { DryRunResolution } from './dry-run';
 import { buildAiProfile } from './model-validation';
 import { resolveWorkflowModelScope } from './node-model-resolution';
 import { expandWorkflowIncludes } from './include-expander';
+import type { WorkflowDefinition } from './schemas';
 
 const temporaryDirectories: string[] = [];
 
@@ -23,6 +24,42 @@ function temporaryFile(content: string): string {
   const path = join(directory, 'stubs.yaml');
   writeFileSync(path, content);
   return path;
+}
+
+function composedReviewWorkflow(gateNodes: unknown[], includeWhen?: string): WorkflowDefinition {
+  const block = makeTestWorkflow({
+    name: 'review-block',
+    nodes: [
+      { id: 'entry', bash: 'echo entry' },
+      {
+        id: 'optional',
+        bash: 'echo optional',
+        depends_on: ['entry'],
+        when: "$entry.output == 'never'",
+      },
+      { id: 'required', bash: 'echo required', depends_on: ['entry'] },
+      {
+        id: 'synthesize',
+        bash: 'echo synthesize',
+        depends_on: ['optional', 'required'],
+        trigger_rule: 'all_done',
+      },
+    ],
+  });
+  const parent = makeTestWorkflow({
+    name: 'parent',
+    nodes: [
+      ...gateNodes,
+      {
+        id: 'review',
+        include: 'review-block',
+        depends_on: ['gate'],
+        ...(includeWhen !== undefined ? { when: includeWhen } : {}),
+      },
+      { id: 'consumer', bash: 'echo consumer', depends_on: ['review'] },
+    ],
+  });
+  return makeTestComposedWorkflow([block, parent], 'parent');
 }
 
 describe('loadDryRunStubs', () => {
@@ -154,6 +191,87 @@ describe('dryRunWorkflow', () => {
     expect(states.one_success).toBe('stubbed');
     expect(states.none_failed).toBe('stubbed');
     expect(states.all_done).toBe('stubbed');
+  });
+
+  test('skips every composed node when the include condition is false', async () => {
+    const result = await dryRunWorkflow({
+      workflow: composedReviewWorkflow(
+        [{ id: 'gate', bash: 'echo gate' }],
+        "$gate.output == 'run'"
+      ),
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: {
+        gate: 'skip',
+        review__synthesize: 'must not run',
+        consumer: 'must not run',
+      },
+    });
+    const states = Object.fromEntries(result.trace.map(entry => [entry.nodeId, entry.state]));
+
+    expect(states).toEqual({
+      gate: 'stubbed',
+      review__entry: 'skipped',
+      review__optional: 'skipped',
+      review__required: 'skipped',
+      review__synthesize: 'skipped',
+      consumer: 'skipped',
+    });
+  });
+
+  test('skips every composed node when the include dependencies are ineligible', async () => {
+    const result = await dryRunWorkflow({
+      workflow: composedReviewWorkflow([
+        { id: 'source', bash: 'echo source' },
+        {
+          id: 'gate',
+          bash: 'echo gate',
+          depends_on: ['source'],
+          when: "$source.output == 'never'",
+        },
+      ]),
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: {
+        source: 'ready',
+        review__synthesize: 'must not run',
+        consumer: 'must not run',
+      },
+    });
+    const states = Object.fromEntries(result.trace.map(entry => [entry.nodeId, entry.state]));
+
+    expect(states).toEqual({
+      source: 'stubbed',
+      gate: 'skipped',
+      review__entry: 'skipped',
+      review__optional: 'skipped',
+      review__required: 'skipped',
+      review__synthesize: 'skipped',
+      consumer: 'skipped',
+    });
+  });
+
+  test('keeps all_done active for intentionally skipped branches inside a running block', async () => {
+    const result = await dryRunWorkflow({
+      workflow: composedReviewWorkflow(
+        [{ id: 'gate', bash: 'echo gate' }],
+        "$gate.output == 'run'"
+      ),
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: {
+        gate: 'run',
+        review__entry: 'started',
+        review__required: 'report',
+        review__synthesize: 'ready',
+        consumer: 'done',
+      },
+    });
+    const states = Object.fromEntries(result.trace.map(entry => [entry.nodeId, entry.state]));
+
+    expect(states.review__optional).toBe('skipped');
+    expect(states.review__synthesize).toBe('stubbed');
+    expect(states.consumer).toBe('stubbed');
   });
 
   test('keeps whole-output references lenient and fails strict unknown fields', async () => {

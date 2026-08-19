@@ -18499,11 +18499,160 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     return [...workflows.get('inc-parent')!.nodes];
   }
 
+  function expandedGatedParentNodes(
+    mode: 'false-condition' | 'skipped-dependency' | 'active'
+  ): DagNode[] {
+    const child = buildWf('review-block', [
+      { id: 'entry', bash: 'echo started' },
+      {
+        id: 'optional',
+        bash: 'echo optional',
+        depends_on: ['entry'],
+        when: "$entry.output == 'never'",
+      },
+      { id: 'required', bash: 'echo report', depends_on: ['entry'] },
+      {
+        id: 'synthesize',
+        bash: 'echo synthesized',
+        depends_on: ['optional', 'required'],
+        trigger_rule: 'all_done',
+      },
+    ]);
+    const gateNodes =
+      mode === 'skipped-dependency'
+        ? [
+            { id: 'source', bash: 'echo ready' },
+            {
+              id: 'gate',
+              bash: 'echo gate',
+              depends_on: ['source'],
+              when: "$source.output == 'never'",
+            },
+          ]
+        : [{ id: 'gate', bash: `echo ${mode === 'active' ? 'run' : 'skip'}` }];
+    const parent = buildWf('gated-parent', [
+      ...gateNodes,
+      {
+        id: 'review',
+        include: 'review-block',
+        depends_on: ['gate'],
+        ...(mode === 'skipped-dependency' ? {} : { when: "$gate.output == 'run'" }),
+      },
+      { id: 'consumer', bash: 'echo $review.output', depends_on: ['review'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['review-block', child],
+        ['gated-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...workflows.get('gated-parent')!.nodes];
+  }
+
   function eventList(deps: WorkflowDeps): Array<{ event_type: string; step_name: string }> {
     return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
       (call: unknown[]) => call[0] as { event_type: string; step_name: string }
     );
   }
+
+  async function executeExpanded(
+    nodes: DagNode[],
+    runId: string
+  ): Promise<{ events: Array<{ event_type: string; step_name: string }>; output: string }> {
+    const mockDeps = createMockDeps();
+    const output = await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-inc',
+      testDir,
+      { name: 'gated-parent', nodes },
+      makeWorkflowRun(runId, { workflow_name: 'gated-parent' }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    return { events: eventList(mockDeps), output };
+  }
+
+  it('skips every composed node when the include condition is false', async () => {
+    const { events } = await executeExpanded(
+      expandedGatedParentNodes('false-condition'),
+      'inc-false-condition'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual([
+      'consumer',
+      'review__entry',
+      'review__optional',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(completed).toEqual(['gate']);
+  });
+
+  it('skips every composed node when the include dependencies are ineligible', async () => {
+    const { events } = await executeExpanded(
+      expandedGatedParentNodes('skipped-dependency'),
+      'inc-skipped-dependency'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual([
+      'consumer',
+      'gate',
+      'review__entry',
+      'review__optional',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(completed).toEqual(['source']);
+  });
+
+  it('keeps all_done active for intentionally skipped branches inside a running block', async () => {
+    const { events, output } = await executeExpanded(
+      expandedGatedParentNodes('active'),
+      'inc-active-block'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual(['review__optional']);
+    expect(completed).toEqual([
+      'consumer',
+      'gate',
+      'review__entry',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(output).toContain('synthesized');
+  });
 
   it('emits namespaced step_names and resolves $inc.output to the child terminal node', async () => {
     const mockDeps = createMockDeps();
