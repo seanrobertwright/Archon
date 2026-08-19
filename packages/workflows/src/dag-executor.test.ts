@@ -18500,7 +18500,8 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
   }
 
   function expandedGatedParentNodes(
-    mode: 'false-condition' | 'skipped-dependency' | 'active'
+    mode: 'false-condition' | 'skipped-dependency' | 'active',
+    alwaysRunGateAndConsumer = false
   ): DagNode[] {
     const child = buildWf('review-block', [
       { id: 'entry', bash: 'echo started' },
@@ -18529,7 +18530,13 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
               when: "$source.output == 'never'",
             },
           ]
-        : [{ id: 'gate', bash: `echo ${mode === 'active' ? 'run' : 'skip'}` }];
+        : [
+            {
+              id: 'gate',
+              bash: `echo ${mode === 'active' ? 'run' : 'skip'}`,
+              ...(alwaysRunGateAndConsumer ? { always_run: true } : {}),
+            },
+          ];
     const parent = buildWf('gated-parent', [
       ...gateNodes,
       {
@@ -18538,7 +18545,12 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
         depends_on: ['gate'],
         ...(mode === 'skipped-dependency' ? {} : { when: "$gate.output == 'run'" }),
       },
-      { id: 'consumer', bash: 'echo $review.output', depends_on: ['review'] },
+      {
+        id: 'consumer',
+        bash: 'echo $review.output',
+        depends_on: ['review'],
+        ...(alwaysRunGateAndConsumer ? { always_run: true } : {}),
+      },
     ]);
     const { workflows, errors } = expandWorkflowIncludes(
       new Map([
@@ -18596,7 +18608,8 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
 
   async function executeExpanded(
     nodes: DagNode[],
-    runId: string
+    runId: string,
+    priorCompletedNodes?: Map<string, string>
   ): Promise<{ events: Array<{ event_type: string; step_name: string }>; output: string }> {
     const mockDeps = createMockDeps();
     const output = await executeDagWorkflow(
@@ -18613,7 +18626,10 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       join(testDir, 'logs'),
       'main',
       'docs/',
-      minimalConfig
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
     );
     return { events: eventList(mockDeps), output };
   }
@@ -18732,6 +18748,43 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       'up__good',
       'up__start',
     ]);
+  });
+
+  it('resume discards cached block output when its include gate becomes inactive', async () => {
+    const priorCompletedNodes = new Map<string, string>([
+      ['gate', 'run'],
+      ['review__entry', 'started'],
+      ['review__required', 'report'],
+      ['review__synthesize', 'old-sink'],
+      ['consumer', 'old-consumer'],
+    ]);
+    const { events } = await executeExpanded(
+      expandedGatedParentNodes('false-condition', true),
+      'inc-resume-inactive-block',
+      priorCompletedNodes
+    );
+
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+    const reused = events
+      .filter(event => event.event_type === 'node_skipped_prior_success')
+      .map(event => event.step_name);
+
+    expect(skipped).toEqual([
+      'consumer',
+      'review__entry',
+      'review__optional',
+      'review__required',
+      'review__synthesize',
+    ]);
+    expect(completed).toEqual(['gate']);
+    expect(reused.filter(stepName => stepName.startsWith('review__'))).toEqual([]);
   });
 
   it('emits namespaced step_names and resolves $inc.output to the child terminal node', async () => {

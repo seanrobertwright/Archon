@@ -1351,16 +1351,18 @@ function checkTriggerRuleForDependencies(
 
 /**
  * Enforce caller-level include predicates that load-time flattening attached to every
- * descendant. Entry nodes keep using their ordinary trigger/when fields so they retain
- * the existing diagnostics; only descendants need the recovered boundary guard.
+ * descendant. Entry nodes normally keep using their ordinary trigger/when fields so they
+ * retain the existing diagnostics. A cached entry is the exception: resume would otherwise
+ * return its prior output before those fields run, so its boundary must be checked here too.
  */
 export function checkComposedBlockBoundaries(
   node: DagNode,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs?: Record<string, string>
+  inputs?: Record<string, string>,
+  evaluateEntryBoundary = false
 ): 'run' | 'skip' {
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
-    if (boundary.isEntry) continue;
+    if (boundary.isEntry && !evaluateEntryBoundary) continue;
 
     const dependencyEligible = boundary.entryTriggerRules.some(
       rule => checkTriggerRuleForDependencies(boundary.dependsOn, rule, nodeOutputs) === 'run'
@@ -7188,9 +7190,21 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               ctx.nodeOutputs
             );
 
-          // 0. Skip if this node completed successfully in a prior run (resume path).
-          // `always_run: true` opts the node out of resume caching — re-execute even
-          // when the prior run completed it.
+          // A prior success is reusable only while every enclosing include is still active.
+          // Unlike ordinary node-local rules, a composed boundary governs the whole block,
+          // so resume must not let a stale completed descendant cross a newly-false gate.
+          const isCachedPriorSuccess =
+            priorCompletedNodes?.has(node.id) === true && !node.always_run;
+          const composedBoundaryDecision = checkComposedBlockBoundaries(
+            node,
+            ctx.nodeOutputs,
+            resolveRunInputs(workflowRun),
+            isCachedPriorSuccess
+          );
+
+          // 0. Skip if this node completed successfully in a prior run (resume path),
+          // unless its composed boundary is now inactive. `always_run: true` opts the
+          // node out of resume caching and re-executes it.
           if (priorCompletedNodes?.has(node.id)) {
             if (node.always_run) {
               getLog().info({ nodeId: node.id }, 'dag.node_always_run_resume_forced');
@@ -7208,7 +7222,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   );
                 });
               // falls through to re-execute the node
-            } else {
+            } else if (composedBoundaryDecision === 'run') {
               getLog().info({ nodeId: node.id }, 'dag.node_skipped_prior_success');
               await logNodeSkip(logDir, workflowRun.id, node.id, 'prior_success').catch(
                 (err: Error) => {
@@ -7253,10 +7267,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
 
           // 1. Enforce every enclosing include boundary before this node's local rule.
           const triggerDecision =
-            checkComposedBlockBoundaries(node, ctx.nodeOutputs, resolveRunInputs(workflowRun)) ===
-            'skip'
-              ? 'skip'
-              : checkTriggerRule(node, ctx.nodeOutputs);
+            composedBoundaryDecision === 'skip' ? 'skip' : checkTriggerRule(node, ctx.nodeOutputs);
           if (triggerDecision === 'skip') {
             getLog().info({ nodeId: node.id, reason: 'trigger_rule' }, 'dag_node_skipped');
             await logNodeSkip(logDir, workflowRun.id, node.id, 'trigger_rule').catch(
