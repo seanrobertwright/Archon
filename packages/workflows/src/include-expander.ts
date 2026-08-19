@@ -377,10 +377,11 @@ function collapseWorkflowScope(raw: WorkflowDefinition): WorkflowDefinition {
 function rewriteNodeOutputRefs(
   node: DagNode,
   renameOutputRef: (id: string) => string,
-  expandDependency: (id: string) => string[]
+  expandDependency: (id: string) => string[],
+  renameLoopPrevRef: (id: string) => string
 ): void {
   const code = (text: string): string =>
-    applyLoopPrevOutputRefRename(applyOutputRefRename(text, renameOutputRef), renameOutputRef);
+    applyLoopPrevOutputRefRename(applyOutputRefRename(text, renameOutputRef), renameLoopPrevRef);
   const whenExpr = (text: string): string => applyWhenRefRename(text, renameOutputRef);
 
   if (node.when !== undefined) node.when = whenExpr(node.when);
@@ -421,7 +422,7 @@ function rewriteNodeOutputRefs(
       node.loop_group.until_bash = code(node.loop_group.until_bash);
     }
     for (const body of node.loop_group.nodes) {
-      rewriteNodeOutputRefs(body, renameOutputRef, expandDependency);
+      rewriteNodeOutputRefs(body, renameOutputRef, expandDependency, renameLoopPrevRef);
     }
   } else if (isApprovalNode(node)) {
     node.approval.message = code(node.approval.message);
@@ -703,7 +704,7 @@ function inlineInclude(
     // Rewrite child-internal refs before inserting caller values. This ordering is
     // load-bearing: a caller ref such as `$gather.output` must remain parent-scoped even
     // when the included block also has a node named `gather`.
-    rewriteNodeOutputRefs(clone, rename, id => [rename(id)]);
+    rewriteNodeOutputRefs(clone, rename, id => [rename(id)], rename);
     applyInputsMacro(clone, resolvedInputs, missingInputs, includeNode);
     // Stamped AFTER both passes, for the same reason the caller's values are inserted
     // after the rename: these are the CALLER's strings, so they stay parent-scoped here
@@ -1002,8 +1003,7 @@ export function expandWorkflowIncludes(
     stack: string[]
   ): ExpandedNodeList {
     const expandedNodes: DagNode[] = [];
-    const sinksByIncludeId = new Map<string, string[]>();
-    const primarySinkByIncludeId = new Map<string, string>();
+    const includesById = new Map<string, ExpandedInclude>();
     const includedRequirements: WorkflowRequirement[] = [];
 
     for (const node of nodes) {
@@ -1020,8 +1020,7 @@ export function expandWorkflowIncludes(
         warnDroppedWorkflowLevelFields(node, child);
         includedRequirements.push(...(child.requires ?? []));
         const inlined = inlineInclude(node, child, commandContents ?? new Map());
-        sinksByIncludeId.set(node.id, inlined.sinks);
-        primarySinkByIncludeId.set(node.id, inlined.primarySink);
+        includesById.set(node.id, inlined);
         expandedNodes.push(...inlined.namespaced);
         continue;
       }
@@ -1059,13 +1058,16 @@ export function expandWorkflowIncludes(
     // Rewrite only aliases owned by this list. `rewriteNodeOutputRefs` deliberately
     // recurses into nested loop_group bodies because their text may read enclosing
     // outputs, while their sealed depends_on edges remain local to their own list.
-    const renameIncludeRef = (id: string): string => primarySinkByIncludeId.get(id) ?? id;
-    const expandIncludeDependency = (id: string): string[] => sinksByIncludeId.get(id) ?? [id];
+    const renameIncludeRef = (id: string): string => includesById.get(id)?.primarySink ?? id;
+    const expandIncludeDependency = (id: string): string[] => includesById.get(id)?.sinks ?? [id];
     for (const node of expandedNodes) {
       if (node.depends_on !== undefined) {
         node.depends_on = node.depends_on.flatMap(expandIncludeDependency);
       }
-      rewriteNodeOutputRefs(node, renameIncludeRef, expandIncludeDependency);
+      // `$include.output` is a current-iteration composition alias. It deliberately does
+      // not create a parallel `$LOOP_PREV.<includeId>` grammar: previous-iteration refs
+      // continue to name only the executable body ids produced by `inlineInclude()`.
+      rewriteNodeOutputRefs(node, renameIncludeRef, expandIncludeDependency, id => id);
     }
 
     return { nodes: expandedNodes, includedRequirements, renameIncludeRef };

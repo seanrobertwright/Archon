@@ -99,8 +99,11 @@ import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
 import {
   COMPILED_LOOP_COMMAND,
+  COMPOSED_NODE,
+  readComposedMeta,
   type CompiledLoopCommand,
   type LoopWithCompiledCommand,
+  type NodeWithComposedMeta,
 } from './compiled-command';
 import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
@@ -17108,6 +17111,78 @@ describe('executeDagWorkflow -- loop_group node', () => {
       ''
     );
     expect('cancel' in cancelNode && cancelNode.cancel).toBe("stopping: it's done");
+  });
+
+  it('EDGE H (#2623): resolves namespaced $LOOP_PREV across AI config and compiled loop prompts', () => {
+    const prev = new Map<string, NodeOutput>([
+      ['block__review', makeOutput('completed', 'PRIOR', undefined)],
+    ]);
+    const ref = '$LOOP_PREV.block__review.output';
+
+    const aiNode = applyLoopPrevToBodyNode(
+      {
+        id: 'use',
+        prompt: `main=${ref}`,
+        systemPrompt: `system=${ref}`,
+        agents: {
+          helper: {
+            description: `description=${ref}`,
+            prompt: `agent=${ref}`,
+          },
+        },
+        depends_on: [],
+      } as DagNode,
+      prev,
+      ''
+    );
+
+    expect('prompt' in aiNode && aiNode.prompt).toBe('main=PRIOR');
+    expect(aiNode.systemPrompt).toBe('system=PRIOR');
+    expect(aiNode.agents?.helper?.description).toBe('description=PRIOR');
+    expect(aiNode.agents?.helper?.prompt).toBe('agent=PRIOR');
+
+    const commandLoop = dagNodeSchema.parse({
+      id: 'repeat',
+      loop: { command: 'review-command', until: 'DONE', max_iterations: 2 },
+      depends_on: [],
+    });
+    if (!('loop' in commandLoop)) throw new Error('expected loop node');
+    (commandLoop.loop as typeof commandLoop.loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND] =
+      { prompt: `compiled=${ref}` };
+
+    const substitutedLoop = applyLoopPrevToBodyNode(commandLoop, prev, '');
+    if (!('loop' in substitutedLoop)) throw new Error('expected substituted loop node');
+    const compiled = (
+      substitutedLoop.loop as typeof substitutedLoop.loop & LoopWithCompiledCommand
+    )[COMPILED_LOOP_COMMAND];
+    expect(compiled?.prompt).toBe('compiled=PRIOR');
+
+    const gate = dagNodeSchema.parse({
+      id: 'gate',
+      approval: {
+        message: `approve=${ref}`,
+        on_reject: { prompt: `retry=${ref}` },
+      },
+      depends_on: [],
+    });
+    const substitutedGate = applyLoopPrevToBodyNode(gate, prev, '');
+    if (!('approval' in substitutedGate) || substitutedGate.approval === undefined)
+      throw new Error('expected approval node');
+    expect(substitutedGate.approval.message).toBe('approve=PRIOR');
+    expect(substitutedGate.approval.on_reject?.prompt).toBe('retry=PRIOR');
+
+    const script = dagNodeSchema.parse({
+      id: 'script',
+      script: 'console.log(process.env.INPUTS_PREVIOUS)',
+      runtime: 'bun',
+      depends_on: [],
+    });
+    (script as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = {
+      origin: 'review-block',
+      inputs: { previous: ref },
+    };
+    const substitutedScript = applyLoopPrevToBodyNode(script, prev, '');
+    expect(readComposedMeta(substitutedScript)?.inputs).toEqual({ previous: 'PRIOR' });
   });
 
   it('EDGE H: never splices $LOOP_USER_INPUT into a script body — env delivery only (#2115)', () => {

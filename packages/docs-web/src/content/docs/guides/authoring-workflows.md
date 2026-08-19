@@ -1039,14 +1039,15 @@ the workflow that owns the run is.
 
 Expansion happens at **load time (discovery)**, before the workflow ever runs. By the time
 the executor sees the DAG there are no include nodes left — the inlined nodes are ordinary
-top-level nodes, so runs, events, resume, and approvals all behave exactly as if you had
-written the nodes by hand. There is no separate child run.
+executable nodes in the include's containing scope, so runs, events, resume, and approvals all
+behave exactly as if you had written the nodes by hand. A top-level include produces top-level
+nodes; an include in a `loop_group` body produces body-local nodes. There is no separate child run.
 
-- **Namespacing.** Each included node `n` becomes a top-level node with id
-  `<includeId>__<n.id>` (double underscore). Including `archon-review-block` under
-  `id: review` yields `review__verify-pr-base`, `review__sync`, `review__implement-fixes`,
-  and so on. These namespaced ids are what appear in the event stream and in
-  `archon workflow get <id>`.
+- **Namespacing.** Each included node `n` receives id `<includeId>__<n.id>` (double
+  underscore) within that scope. Including `archon-review-block` under `id: review` yields
+  `review__verify-pr-base`, `review__sync`, `review__implement-fixes`, and so on. These
+  namespaced ids are what appear in the event stream and in `archon workflow get <id>`;
+  body-local events additionally carry their enclosing group prefix.
 - **Edges and command bodies.** Internal `depends_on` edges and `$id.output` references are
   rewired to the namespaced ids automatically. This includes named `command:` and
   `loop.command` files: discovery resolves their bodies and compiles them into the flat DAG

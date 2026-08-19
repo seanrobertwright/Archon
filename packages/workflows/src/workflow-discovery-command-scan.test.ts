@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 describe('discoverWorkflows — nested included command compilation', () => {
-  test('pre-resolves a command block included directly inside a loop_group body', async () => {
+  test('pre-resolves a command block included below nested loop_group bodies', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'archon-workflow-discovery-'));
     tempDirectories.push(cwd);
     const workflowDir = join(cwd, '.archon', 'workflows');
@@ -38,14 +38,29 @@ describe('discoverWorkflows — nested included command compilation', () => {
       join(workflowDir, 'parent.yaml'),
       JSON.stringify({
         name: 'parent',
-        description: 'Includes a command block inside a group body',
+        description: 'Includes a command block inside nested group bodies',
         nodes: [
           {
             id: 'group',
             loop_group: {
               until: 'DONE',
               max_iterations: 1,
-              nodes: [{ id: 'block', include: 'command-block', with: { context: 'iteration' } }],
+              nodes: [
+                {
+                  id: 'inner',
+                  loop_group: {
+                    until: 'DONE',
+                    max_iterations: 1,
+                    nodes: [
+                      {
+                        id: 'block',
+                        include: 'command-block',
+                        with: { context: 'iteration' },
+                      },
+                    ],
+                  },
+                },
+              ],
             },
           },
         ],
@@ -60,7 +75,10 @@ describe('discoverWorkflows — nested included command compilation', () => {
     const group = parent?.nodes.find(node => node.id === 'group');
     expect(group && isLoopGroupNode(group)).toBe(true);
     if (!group || !isLoopGroupNode(group)) throw new Error('expected loop_group');
-    expect(group.loop_group.nodes).toEqual([
+    const inner = group.loop_group.nodes.find(node => node.id === 'inner');
+    expect(inner && isLoopGroupNode(inner)).toBe(true);
+    if (!inner || !isLoopGroupNode(inner)) throw new Error('expected nested loop_group');
+    expect(inner.loop_group.nodes).toEqual([
       expect.objectContaining({
         id: 'block__review',
         prompt: 'Review iteration and emit DONE.',

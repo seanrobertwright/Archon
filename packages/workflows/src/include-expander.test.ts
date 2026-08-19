@@ -1459,7 +1459,7 @@ describe('expandWorkflowIncludes — loop_group body composition (#2623)', () =>
             },
             {
               id: 'consume',
-              prompt: 'done=$review.output.done',
+              prompt: 'done=$review.output.done previous=$LOOP_PREV.review.output',
               depends_on: ['review'],
             },
           ],
@@ -1491,7 +1491,7 @@ describe('expandWorkflowIncludes — loop_group body composition (#2623)', () =>
     );
     expect(consume?.depends_on).toEqual(['review__cleanup']);
     expect(consume && 'prompt' in consume ? consume.prompt : '').toBe(
-      'done=$review__decide.output.done'
+      'done=$review__decide.output.done previous=$LOOP_PREV.review.output'
     );
     expect(decide && 'prompt' in decide ? decide.prompt : '').toBe('review $seed.output');
     expect(composedOrigin(decide)).toBe('review-block');
