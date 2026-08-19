@@ -3779,7 +3779,6 @@ async function executeLoopGroupNode(
       totalTokensOut: 0,
       totalLoopIterations: 0,
       stepNamePrefix: bodyStepNamePrefix,
-      iteration: i,
       loopGroupPath: [...enclosingLoopGroupPath, { groupId: node.id, iteration: i }],
       // Deliver this iteration's approval-gate free-text to body script: nodes via env
       // (never spliced into source — #2115); matches applyLoopPrevToBodyNode's skip.
@@ -7261,12 +7260,6 @@ interface RunLayersContext {
   /** Complete runtime loop_group lineage for typed body artifacts; empty at top level. */
   loopGroupPath: NodeArtifactLoopFrame[];
   /**
-   * The enclosing loop_group iteration (1-based) when these layers are a group body,
-   * else undefined for the top-level DAG. Tagged into body node lifecycle event `data`
-   * so multi-iteration runs are disaggregatable in the persisted event log (#2090).
-   */
-  iteration?: number;
-  /**
    * Per-iteration `$LOOP_USER_INPUT` free-text for loop_group body `script:` nodes,
    * delivered into the subprocess as an env var (never spliced into TS/Python source —
    * #2115). Only non-empty on the first resumed iteration of an interactive group;
@@ -7313,9 +7306,11 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
     layers,
     priorCompletedNodes,
     stepNamePrefix,
-    iteration,
     loopGroupPath,
   } = ctx;
+  // Lifecycle events expose only the immediate enclosing iteration; artifact
+  // identity retains the complete outermost-to-innermost lineage.
+  const iteration = loopGroupPath.at(-1)?.iteration;
   // nodeOutputs + accumulators + lastSequentialSession are mutated in place on `ctx`.
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
