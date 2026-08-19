@@ -59,4 +59,16 @@ describe('getDebouncedIssues — $nodeId.output references', () => {
   test('ignores a reference whose id starts with a digit', () => {
     expect(refIssues([node('use', { promptText: 'cost is $1.output' })])).toEqual([]);
   });
+
+  test('does not treat the reserved $INPUTS.output macro as a node ref', () => {
+    expect(
+      refIssues([
+        node('use', {
+          when: "$INPUTS.output == 'ready'",
+          promptText: 'read $INPUTS.output',
+          bashScript: 'echo $INPUTS.output',
+        }),
+      ])
+    ).toEqual([]);
+  });
 });

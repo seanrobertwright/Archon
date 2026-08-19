@@ -45,7 +45,9 @@ export function findOutputRefs(text: string): Set<string> {
   const refs = new Set<string>();
   for (const match of text.matchAll(new RegExp(OUTPUT_REF_SOURCE, 'g'))) {
     const id = match[1];
-    if (id !== undefined) refs.add(id);
+    // `$INPUTS.output` names the workflow input `output`, not a node. The engine
+    // gives that reserved scope precedence after the same lexical match.
+    if (id !== undefined && id !== 'INPUTS') refs.add(id);
   }
   return refs;
 }

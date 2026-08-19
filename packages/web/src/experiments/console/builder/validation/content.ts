@@ -1,8 +1,8 @@
 /**
  * Content validation: scan text bodies for `$<nodeId>.output` references that
  * point outside the node's transitive upstream set, and verify each `when:`
- * expression parses. Code spans are stripped first so referenced ids inside
- * fenced/inline code are not flagged.
+ * expression parses and references only upstream nodes. Code spans are stripped
+ * first so referenced ids inside fenced/inline code are not flagged.
  *
  * `content.var.unknown` is a deliberately conservative heuristic: it requires
  * the referenced node to be reachable via explicit `depends_on` edges. A
@@ -124,6 +124,26 @@ export function validateContent(workflow: BuilderWorkflow): Issue[] {
             path: { nodeId: node.id, field: 'when' },
           })
         );
+      } else {
+        const refIds = new Set<string>();
+        for (const group of result.ast.or) {
+          for (const atom of group) {
+            if (atom.kind === 'node') refIds.add(atom.nodeId);
+          }
+        }
+        for (const refId of refIds) {
+          if (!upstream.has(refId)) {
+            issues.push(
+              makeIssue({
+                rule: 'content.var.unknown',
+                severity: 'warning',
+                source: 'client-debounced',
+                message: `node '${node.id}' when references node '${refId}' which is not an upstream dependency`,
+                path: { nodeId: node.id, field: 'when' },
+              })
+            );
+          }
+        }
       }
     }
   }

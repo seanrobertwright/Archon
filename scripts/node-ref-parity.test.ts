@@ -47,10 +47,12 @@ import {
   whenAtoms,
   type WhenAtom,
 } from '../packages/workflows/src/when-atom';
+import { parseWorkflow } from '../packages/workflows/src/loader';
 import {
   ATOM_PATTERN,
   parse,
 } from '../packages/web/src/experiments/console/builder/validation/when-grammar';
+import { findOutputRefs } from '../packages/web/src/lib/node-ref';
 import { dagNodeSchema } from '../packages/workflows/src/schemas';
 import { validateStructural } from '../packages/web/src/experiments/console/builder/validation/structural';
 
@@ -143,6 +145,28 @@ describe('node-ref parity: @archon/web mirrors the engine', () => {
 
     expect(nodeId.test('check-reproduction')).toBe(true);
     expect(nodeId.test('classify-testability')).toBe(true);
+  });
+
+  test('both effective scans reserve $INPUTS.output for workflow inputs', () => {
+    const text = 'compare $INPUTS.output';
+    expect(findOutputRefs(text)).toEqual(new Set());
+
+    const engine = parseWorkflow(
+      `
+name: output-input-parity
+description: Reserved input scope parity
+inputs:
+  output:
+    description: Value named output
+    required: false
+nodes:
+  - id: use
+    prompt: "${text}"
+`,
+      'output-input-parity.yaml'
+    );
+    expect(engine.error).toBeNull();
+    expect(engine.workflow).not.toBeNull();
   });
 });
 

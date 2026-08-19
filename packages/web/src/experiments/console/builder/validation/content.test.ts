@@ -47,6 +47,21 @@ describe('validateContent', () => {
     expect(issues.filter(i => i.rule === 'content.var.unknown')).toEqual([]);
   });
 
+  test('a workflow input named output is not treated as a node ref', () => {
+    const issues = validateContent(
+      wf([
+        {
+          id: 'use',
+          variant: 'prompt',
+          base: {},
+          data: { prompt: 'Read $INPUTS.output.' },
+        },
+      ])
+    );
+
+    expect(issues.filter(i => i.rule === 'content.var.unknown')).toEqual([]);
+  });
+
   test('self-reference warns (a node is not its own upstream)', () => {
     const issues = validateContent(
       wf([{ id: 'me', variant: 'prompt', base: {}, data: { prompt: 'loop on $me.output' } }])
@@ -207,6 +222,75 @@ describe('validateContent', () => {
       ])
     );
     expect(bad.some(i => i.rule === 'content.when.parse')).toBe(true);
+  });
+
+  test('an unknown node ref in when warns', () => {
+    const issues = validateContent(
+      wf([
+        {
+          id: 'use',
+          variant: 'prompt',
+          base: { when: "$ghost.output == 'YES'" },
+          data: { prompt: 'y' },
+        },
+      ])
+    );
+
+    expect(issues).toContainEqual(
+      expect.objectContaining({
+        rule: 'content.var.unknown',
+        severity: 'warning',
+        path: { nodeId: 'use', field: 'when' },
+      })
+    );
+  });
+
+  test('every non-upstream node in a compound when warns, including shorthand', () => {
+    const issues = validateContent(
+      wf([
+        { id: 'sibling', variant: 'bash', base: {}, data: { bash: 'exit 0' } },
+        {
+          id: 'use',
+          variant: 'prompt',
+          base: {
+            when: "$ghost.output == 'YES' || $sibling.exit_code == 0 && $INPUTS.mode == 'fast'",
+          },
+          data: { prompt: 'y' },
+        },
+      ])
+    );
+
+    const warnings = issues.filter(i => i.rule === 'content.var.unknown');
+    expect(warnings).toHaveLength(2);
+    expect(warnings.every(i => i.path.field === 'when')).toBe(true);
+    expect(warnings.map(i => i.message).join('\n')).toContain("node 'ghost'");
+    expect(warnings.map(i => i.message).join('\n')).toContain("node 'sibling'");
+    expect(warnings.map(i => i.message).join('\n')).not.toContain('INPUTS');
+  });
+
+  test('direct and transitive upstream when refs pass in canonical and shorthand forms', () => {
+    const issues = validateContent(
+      wf([
+        { id: 'root', variant: 'prompt', base: {}, data: { prompt: 'x' } },
+        {
+          id: 'middle',
+          variant: 'bash',
+          base: { depends_on: ['root'] },
+          data: { bash: 'exit 0' },
+        },
+        {
+          id: 'use',
+          variant: 'prompt',
+          base: {
+            depends_on: ['middle'],
+            when: "$root.output.status == 'ready' && $middle.exit_code == 0 && $INPUTS.mode == 'fast'",
+          },
+          data: { prompt: 'y' },
+        },
+      ])
+    );
+
+    expect(issues.filter(i => i.rule === 'content.var.unknown')).toEqual([]);
   });
 });
 
