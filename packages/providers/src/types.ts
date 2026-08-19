@@ -444,8 +444,8 @@ export interface AgentRequestOptions {
   /**
    * Request an immutable fork of `resumeSessionId`. Exact-fork callers such as
    * named workflow resume must first verify `sessionFork === true`. Legacy session
-   * reuse may still send this flag to resume-only providers, which must handle an
-   * unsupported fork request explicitly.
+   * reuse may still send this flag to resume-only providers, where behavior is
+   * provider-specific and immutability is not guaranteed.
    */
   forkSession?: boolean;
   /** When false, skip writing session transcript to disk. */
