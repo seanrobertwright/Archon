@@ -153,8 +153,8 @@ export { workflowNodeSessionSchema } from './workflow-node-session';
 export type { WorkflowNodeSession } from './workflow-node-session';
 
 // Node typed-output artifacts (output_type metadata)
-export { nodeArtifactSchema } from './node-artifact';
-export type { NodeArtifact } from './node-artifact';
+export { nodeArtifactSchema, nodeArtifactLoopFrameSchema } from './node-artifact';
+export type { NodeArtifact, NodeArtifactLoopFrame } from './node-artifact';
 
 // Result types (non-schema hand-written types)
 export type {

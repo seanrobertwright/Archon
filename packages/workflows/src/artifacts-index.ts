@@ -1,7 +1,11 @@
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createLogger } from '@archon/paths';
-import { nodeArtifactSchema, type NodeArtifact } from './schemas/node-artifact';
+import {
+  nodeArtifactSchema,
+  type NodeArtifact,
+  type NodeArtifactLoopFrame,
+} from './schemas/node-artifact';
 
 /** Lazy logger (deferred so test mocks can intercept createLogger). */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -22,26 +26,60 @@ function safeSegment(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
+/** Build the single filename segment that identifies one typed node execution. */
+function artifactStem(nodeId: string, loopGroupPath?: NodeArtifactLoopFrame[]): string {
+  const nodeSegment = safeSegment(nodeId);
+  if (loopGroupPath === undefined) return nodeSegment;
+
+  const loopSegments = loopGroupPath.map(
+    frame => `${safeSegment(frame.groupId)}-iteration-${String(frame.iteration)}`
+  );
+  return `${loopSegments.join('__')}__${nodeSegment}`;
+}
+
+type ArtifactOwner = Pick<NodeArtifact, 'nodeId' | 'loopGroupPath'>;
+
+function sameLoopGroupPath(
+  left: NodeArtifactLoopFrame[] | undefined,
+  right: NodeArtifactLoopFrame[] | undefined
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.length === right.length &&
+    left.every(
+      (frame, index) =>
+        frame.groupId === right[index]?.groupId && frame.iteration === right[index]?.iteration
+    )
+  );
+}
+
+function sameArtifactOwner(left: ArtifactOwner, right: ArtifactOwner): boolean {
+  return left.nodeId === right.nodeId && sameLoopGroupPath(left.loopGroupPath, right.loopGroupPath);
+}
+
 /**
- * Read the `nodeId` recorded in an existing `.meta.json`, or `undefined` if the
+ * Read the owner recorded in an existing `.meta.json`, or `undefined` if the
  * file is missing or unreadable. Used only by the collision guard in
  * `writeNodeArtifact` — a missing or corrupt prior file is treated as "no known
  * owner" so the write proceeds (and overwrites the unusable file).
  */
-async function readArtifactNodeId(metaPath: string): Promise<string | undefined> {
+async function readArtifactOwner(metaPath: string): Promise<ArtifactOwner | undefined> {
   try {
-    const parsed = JSON.parse(await readFile(metaPath, 'utf8')) as { nodeId?: unknown };
-    return typeof parsed.nodeId === 'string' ? parsed.nodeId : undefined;
+    const parsed = nodeArtifactSchema
+      .pick({ nodeId: true, loopGroupPath: true })
+      .safeParse(JSON.parse(await readFile(metaPath, 'utf8')));
+    return parsed.success ? parsed.data : undefined;
   } catch {
     return undefined;
   }
 }
 
 /**
- * Write a node's typed output artifact: the output text to `nodes/<id>.md`
- * and its metadata to `nodes/<id>.meta.json`. Per-node files (no shared index):
- * the index is derived on read by globbing, so a node's output is addressable by
- * id and separate nodes / separate runs never overwrite one another's metadata.
+ * Write a node's typed output artifact: the output text and metadata under
+ * `nodes/`. Top-level nodes retain `nodes/<id>.md` + `<id>.meta.json`; a
+ * loop_group body execution qualifies that identity with its ordered loop frames.
+ * Per-execution files (no shared index): the index is derived on read by globbing,
+ * so separate nodes, iterations, and runs never overwrite one another's metadata.
  * Writes are issued sequentially after each layer settles — there is no in-run
  * write contention; the per-node layout is what isolates one node from the next.
  *
@@ -56,26 +94,31 @@ export async function writeNodeArtifact(
 ): Promise<NodeArtifact> {
   const nodesDir = join(artifactsDir, NODES_SUBDIR);
   await mkdir(nodesDir, { recursive: true });
-  const safeId = safeSegment(params.nodeId);
-  const metaPath = join(nodesDir, `${safeId}.meta.json`);
+  const stem = artifactStem(params.nodeId, params.loopGroupPath);
+  const metaPath = join(nodesDir, `${stem}.meta.json`);
 
-  // Collision guard: node ids are unique per workflow, so an existing metadata
-  // file under this safe segment naming a *different* node means safeSegment()
-  // collapsed two distinct ids (e.g. `a.b` and `a_b`) onto one filename. Fail
-  // loudly — the best-effort caller logs it — instead of silently overwriting the
-  // first node's artifact. First writer wins; the second is logged, not lost-silent.
-  const priorNodeId = await readArtifactNodeId(metaPath);
-  if (priorNodeId !== undefined && priorNodeId !== params.nodeId) {
+  // Collision guard: safeSegment() can collapse distinct node or group ids (for
+  // example `a.b` and `a_b`) onto one filename. Compare the complete producer
+  // identity — body node plus ordered loop frames — and fail loudly instead of
+  // silently overwriting a different artifact. The best-effort caller logs it;
+  // first writer wins.
+  const owner: ArtifactOwner = {
+    nodeId: params.nodeId,
+    ...(params.loopGroupPath !== undefined ? { loopGroupPath: params.loopGroupPath } : {}),
+  };
+  const priorOwner = await readArtifactOwner(metaPath);
+  if (priorOwner !== undefined && !sameArtifactOwner(priorOwner, owner)) {
     throw new Error(
-      `node artifact id collision: '${params.nodeId}' and '${priorNodeId}' both map to filename segment '${safeId}'`
+      `node artifact id collision: distinct producers both map to filename segment '${stem}'`
     );
   }
 
-  const relPath = join(NODES_SUBDIR, `${safeId}.md`);
+  const relPath = join(NODES_SUBDIR, `${stem}.md`);
   await writeFile(join(artifactsDir, relPath), outputText, 'utf8');
   const meta: NodeArtifact = {
     nodeId: params.nodeId,
     outputType: params.outputType,
+    ...(params.loopGroupPath !== undefined ? { loopGroupPath: params.loopGroupPath } : {}),
     path: relPath,
     runId: params.runId,
     producedAt: params.producedAt,

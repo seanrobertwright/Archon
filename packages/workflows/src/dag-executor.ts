@@ -59,6 +59,7 @@ import type {
   LoopGateRunMetadata,
   ApprovalContext,
   WorkflowEvidencePolicy,
+  NodeArtifactLoopFrame,
 } from './schemas';
 import {
   isBashNode,
@@ -3572,6 +3573,9 @@ async function executeLoopGroupNode(
    *  could be omitted, silently handing the body an isolated Set and quietly undoing the
    *  de-duplication, with no compiler signal. */
   warnedProviderConflicts: Set<string>,
+  /** Ordered enclosing loop_group frames. Required so nested artifact identity cannot
+   *  silently fall back to only the immediate group. */
+  enclosingLoopGroupPath: NodeArtifactLoopFrame[],
   issueContext?: string,
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
@@ -3776,6 +3780,7 @@ async function executeLoopGroupNode(
       totalLoopIterations: 0,
       stepNamePrefix: bodyStepNamePrefix,
       iteration: i,
+      loopGroupPath: [...enclosingLoopGroupPath, { groupId: node.id, iteration: i }],
       // Deliver this iteration's approval-gate free-text to body script: nodes via env
       // (never spliced into source — #2115); matches applyLoopPrevToBodyNode's skip.
       bodyLoopUserInput: userInputForIter,
@@ -7253,6 +7258,8 @@ interface RunLayersContext {
   totalLoopIterations: number;
   /** Prefix prepended to every persisted `step_name` ('' for top-level, '{groupId}.' for a loop_group body). */
   stepNamePrefix: string;
+  /** Complete runtime loop_group lineage for typed body artifacts; empty at top level. */
+  loopGroupPath: NodeArtifactLoopFrame[];
   /**
    * The enclosing loop_group iteration (1-based) when these layers are a group body,
    * else undefined for the top-level DAG. Tagged into body node lifecycle event `data`
@@ -7307,6 +7314,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
     priorCompletedNodes,
     stepNamePrefix,
     iteration,
+    loopGroupPath,
   } = ctx;
   // nodeOutputs + accumulators + lastSequentialSession are mutated in place on `ctx`.
 
@@ -7688,6 +7696,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               ctx.nodeOutputs,
               config,
               ctx.warnedProviderConflicts,
+              ctx.loopGroupPath,
               issueContext,
               stepNamePrefix,
               execContext,
@@ -8149,6 +8158,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             outputType: completedNode.output_type,
             runId: workflowRun.id,
             producedAt: new Date().toISOString(),
+            ...(loopGroupPath.length > 0 ? { loopGroupPath } : {}),
             // `sessionId` may be undefined (e.g. bash/script nodes have no
             // session); writeNodeArtifact omits it from the metadata when so.
             sessionId: output.sessionId,
@@ -8913,6 +8923,7 @@ export async function executeDagWorkflow(
     totalTokensOut: priorUsage?.tokens.output ?? 0,
     totalLoopIterations: 0,
     stepNamePrefix: '',
+    loopGroupPath: [],
   };
 
   /**

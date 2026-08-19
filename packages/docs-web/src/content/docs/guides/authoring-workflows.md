@@ -887,6 +887,14 @@ When a node sets `output_type`, the executor writes a typed sidecar after the no
 - `$ARTIFACTS_DIR/nodes/<id>.md` — the node's output text
 - `$ARTIFACTS_DIR/nodes/<id>.meta.json` — metadata (`outputType`, `runId`, `producedAt`, `size`, and `sessionId` when available)
 
+That exact layout remains the contract for top-level nodes. A typed node inside a `loop_group`
+writes one pair per successful body execution instead, with the ordered group and iteration lineage
+in its identity: `nodes/<group>-iteration-<n>__<body>.md` and the matching `.meta.json`. Nested
+groups add every outermost-to-innermost frame before the body ID. The metadata records the same
+lineage as `loopGroupPath: [{ groupId, iteration }, ...]`, so repeated inner iteration numbers remain
+distinct beneath different outer iterations. A body node expanded from an `include:` keeps its
+load-time `<include>__<node>` ID as the body component.
+
 This works on **every** node type (`bash`/`script` produce typed outputs too, just without a `sessionId`). The write is **best-effort** — if it fails, the node still succeeds and a warning is logged; the typed sidecar may simply be absent. `output_type` is an open set of labels (`plan`, `findings`, `code`, `summary`, …) — pick a convention and keep casing consistent, since lookup is case-sensitive.
 
 Successful bash stdout is retained by default on the completed run as a bounded audit preview in `node_completed.data.node_output`. Output over 32 KiB (32,768 UTF-8 bytes) ends with a truncation marker, and the event also includes `node_output_truncated: true` plus `node_output_original_bytes`. Because stdout is persisted, never print secrets or credentials from bash nodes. This preview is separate from `output_type`: declaring `output_type` opts into a best-effort file sidecar that may contain the full output and is not required for ordinary bash audit retention.

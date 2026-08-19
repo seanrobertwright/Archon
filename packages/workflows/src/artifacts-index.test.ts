@@ -54,6 +54,55 @@ describe('artifacts-index', () => {
     expect('sessionId' in meta).toBe(false);
   });
 
+  test('loop_group lineages produce distinct readable artifact identities', async () => {
+    const first = await writeNodeArtifact(
+      dir,
+      {
+        nodeId: 'review',
+        outputType: 'findings',
+        loopGroupPath: [
+          { groupId: 'outer', iteration: 1 },
+          { groupId: 'inner', iteration: 1 },
+        ],
+        runId: 'r',
+        producedAt: '2026-06-03T00:00:00.000Z',
+      },
+      'first'
+    );
+    const second = await writeNodeArtifact(
+      dir,
+      {
+        nodeId: 'review',
+        outputType: 'findings',
+        loopGroupPath: [
+          { groupId: 'outer', iteration: 2 },
+          { groupId: 'inner', iteration: 1 },
+        ],
+        runId: 'r',
+        producedAt: '2026-06-03T01:00:00.000Z',
+      },
+      'second'
+    );
+
+    expect(first.path).toBe(join('nodes', 'outer-iteration-1__inner-iteration-1__review.md'));
+    expect(second.path).toBe(join('nodes', 'outer-iteration-2__inner-iteration-1__review.md'));
+    expect(await readFile(join(dir, first.path), 'utf8')).toBe('first');
+    expect(await readFile(join(dir, second.path), 'utf8')).toBe('second');
+    const artifacts = (await readNodeArtifacts(dir)).sort((left, right) =>
+      left.path.localeCompare(right.path)
+    );
+    expect(artifacts.map(entry => entry.loopGroupPath)).toEqual([
+      [
+        { groupId: 'outer', iteration: 1 },
+        { groupId: 'inner', iteration: 1 },
+      ],
+      [
+        { groupId: 'outer', iteration: 2 },
+        { groupId: 'inner', iteration: 1 },
+      ],
+    ]);
+  });
+
   test('readNodeArtifacts returns [] for a dir with no artifacts yet', async () => {
     expect(await readNodeArtifacts(dir)).toEqual([]);
   });
@@ -123,6 +172,72 @@ describe('artifacts-index', () => {
     expect(await readFile(join(dir, 'nodes', 'a_b.md'), 'utf8')).toBe('first');
     const entries = await readNodeArtifacts(dir);
     expect(entries.map(e => e.nodeId)).toEqual(['a.b']);
+  });
+
+  test('distinct loop_group owners that sanitize to one stem fail loudly', async () => {
+    await writeNodeArtifact(
+      dir,
+      {
+        nodeId: 'review',
+        outputType: 'findings',
+        loopGroupPath: [{ groupId: 'a.b', iteration: 1 }],
+        runId: 'r',
+        producedAt: '2026-06-03T00:00:00.000Z',
+      },
+      'first'
+    );
+
+    await expect(
+      writeNodeArtifact(
+        dir,
+        {
+          nodeId: 'review',
+          outputType: 'findings',
+          loopGroupPath: [{ groupId: 'a_b', iteration: 1 }],
+          runId: 'r',
+          producedAt: '2026-06-03T01:00:00.000Z',
+        },
+        'second'
+      )
+    ).rejects.toThrow(/collision/);
+
+    expect(await readFile(join(dir, 'nodes', 'a_b-iteration-1__review.md'), 'utf8')).toBe('first');
+  });
+
+  test('readNodeArtifacts rejects invalid loop_group frame metadata', async () => {
+    await writeNodeArtifact(
+      dir,
+      { nodeId: 'good', outputType: 'plan', runId: 'r', producedAt: '2026-06-03T00:00:00.000Z' },
+      'ok'
+    );
+    await writeFile(
+      join(dir, 'nodes', 'empty-loop.meta.json'),
+      JSON.stringify({
+        nodeId: 'empty-loop',
+        outputType: 'plan',
+        loopGroupPath: [],
+        path: 'nodes/empty-loop.md',
+        runId: 'r',
+        producedAt: '2026-06-03T00:00:00.000Z',
+        size: 1,
+      }),
+      'utf8'
+    );
+    await writeFile(
+      join(dir, 'nodes', 'zero-iteration.meta.json'),
+      JSON.stringify({
+        nodeId: 'zero-iteration',
+        outputType: 'plan',
+        loopGroupPath: [{ groupId: 'group', iteration: 0 }],
+        path: 'nodes/zero-iteration.md',
+        runId: 'r',
+        producedAt: '2026-06-03T00:00:00.000Z',
+        size: 1,
+      }),
+      'utf8'
+    );
+
+    expect((await readNodeArtifacts(dir)).map(entry => entry.nodeId)).toEqual(['good']);
   });
 
   test('re-writing the SAME node id (e.g. on resume) overwrites without a collision error', async () => {
