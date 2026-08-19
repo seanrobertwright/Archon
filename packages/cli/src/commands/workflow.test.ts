@@ -626,10 +626,18 @@ describe('workflowRunCommand — dry-run', () => {
 
   it('rejects dry-run-only and incompatible lifecycle flags', async () => {
     await expect(
+      workflowRunCommand('/test/path', 'plan', '', { stubsPath: 'fixtures.yaml' })
+    ).rejects.toThrow('--stubs requires --dry-run');
+
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+    await expect(
       workflowRunCommand('/test/path', 'plan', '', { stubsInitPath: 'fixtures.yaml' })
     ).rejects.toThrow('--stubs-init requires --dry-run');
 
-    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
       workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
       errors: [],
