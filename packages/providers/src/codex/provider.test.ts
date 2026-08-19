@@ -2,7 +2,7 @@ import { describe, test, expect, mock, beforeEach, type Mock } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import type { Codex as SdkCodex, Thread as SdkThread } from '@openai/codex-sdk';
+import type { Codex as SdkCodex, Thread as SdkThread, Usage } from '@openai/codex-sdk';
 import type { MessageChunk } from '../types';
 import { createMockLogger } from '../test/mocks/logger';
 
@@ -15,9 +15,10 @@ mock.module('@archon/paths', () => ({
 const defaultUsage = {
   input_tokens: 10,
   cached_input_tokens: 0,
+  cache_write_input_tokens: 0,
   output_tokens: 5,
   reasoning_output_tokens: 0,
-};
+} satisfies Usage;
 
 type MockRunStreamed = (
   ...args: Parameters<SdkThread['runStreamed']>
