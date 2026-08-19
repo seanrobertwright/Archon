@@ -12999,6 +12999,65 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     ]);
   });
 
+  it("one node reporting a non-finite cost does not erase the whole run's cost", async () => {
+    // NaN > 0 is false, so an unguarded NaN would drop total_cost_usd for EVERY node in
+    // the run, silently — the exact loss this work exists to remove, arriving through a
+    // provider instead of a code path. Tokens have carried this guard; cost had not.
+    let call = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      call++;
+      if (call === 1) {
+        yield { type: 'assistant', content: 'good node' };
+        yield { type: 'result', sessionId: 'sid-ok', cost: 0.05, tokens: { input: 10, output: 2 } };
+        return;
+      }
+      yield { type: 'assistant', content: 'bad provider' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-nan',
+        cost: Number.NaN,
+        tokens: { input: 4, output: 1 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-usage',
+      testDir,
+      {
+        name: 'usage-nan-cost',
+        nodes: [
+          { id: 'good', prompt: 'Spend normally.' },
+          { id: 'bad', prompt: 'Report a broken cost.', depends_on: ['good'] },
+        ],
+      },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The healthy node's spend survives; only the broken node's contribution is dropped.
+    // Tokens are unaffected — both nodes reported finite ones.
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.05, total_tokens_in: 14, total_tokens_out: 3 },
+    ]);
+    expect(
+      (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+        call => call[1] === 'dag.usage_cost_non_finite_ignored'
+      )
+    ).toBe(true);
+  });
+
   it('a failed usage write is logged and never fails the run', async () => {
     // persistRunUsage is documented best-effort: a bookkeeping write must not turn an
     // otherwise-fine run into a failed one. Documented, but never watched failing — and

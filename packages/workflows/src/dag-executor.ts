@@ -7926,7 +7926,19 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
         // cost/tokens must be summed here and ONLY here — adding a per-node
         // telemetry capture elsewhere would double-count against the totals
         // sent on workflow_completed/workflow_failed.
-        if (output.costUsd !== undefined) ctx.totalCostUsd += output.costUsd;
+        if (output.costUsd !== undefined) {
+          // Same guard as tokens below, and for the same reason: cost comes from
+          // providers (incl. community ones), and one NaN poisons the run total for
+          // every other node — NaN > 0 is false, so the cost is dropped from the run
+          // row and telemetry with no trace. Exactly the silent loss #2469 exists to
+          // remove. Guarded here, at the single aggregation point, so one bad node
+          // costs only its own contribution.
+          if (Number.isFinite(output.costUsd)) {
+            ctx.totalCostUsd += output.costUsd;
+          } else {
+            getLog().warn({ nodeId, costUsd: output.costUsd }, 'dag.usage_cost_non_finite_ignored');
+          }
+        }
         if (output.tokens !== undefined) {
           // Token values come from providers (incl. community ones) — guard so
           // a NaN can't silently poison the totals (NaN > 0 is false, which
