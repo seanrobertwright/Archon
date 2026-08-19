@@ -4068,6 +4068,32 @@ describe('workflowRunsCommand', () => {
     );
   });
 
+  it('scopes a linked worktree to its registered primary checkout', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce(
+      '/registered/primary'
+    );
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-primary',
+      name: 'owner/repo',
+      default_cwd: '/registered/primary',
+    });
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand('/workspace/sibling-worktree', {});
+
+    expect(git.getCanonicalRepoPath).toHaveBeenCalledWith('/workspace/sibling-worktree');
+    expect(codebaseDb.findCodebaseByDefaultCwd).toHaveBeenCalledWith('/registered/primary');
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-primary', limit: 20 })
+    );
+    expect(consoleSpy).not.toHaveBeenCalledWith('(not a registered project — showing all runs)');
+  });
+
   it('prints the unregistered-cwd note and lists globally when no codebase resolves', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');

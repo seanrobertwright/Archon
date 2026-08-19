@@ -2503,14 +2503,17 @@ export async function workflowRunsCommand(
     statusFilter = parsed.data;
   }
 
-  // Scope to this project by resolving the codebase from cwd (mirror
-  // workflowRunCommand). --all opts out of scoping. A lookup failure or an
-  // unregistered cwd both fall back to the global list — never a silent
-  // wrong-scope (the human path prints an explicit note below).
+  // Scope to this project through the checkout's canonical repository path.
+  // A linked worktree shares identity with its registered primary checkout,
+  // while an ordinary clone remains unchanged by getCanonicalRepoPath (#2613).
+  // --all opts out of scoping. A lookup failure or an unregistered cwd both
+  // fall back to the global list — never a silent wrong-scope (the human path
+  // prints an explicit note below).
   let codebase = null;
   if (!opts.all) {
     try {
-      codebase = await codebaseDb.findCodebaseByDefaultCwd(cwd);
+      const canonicalCwd = await git.getCanonicalRepoPath(cwd);
+      codebase = await codebaseDb.findCodebaseByDefaultCwd(canonicalCwd);
     } catch (error) {
       getLog().warn({ err: error as Error, cwd }, 'cli.workflow_runs_codebase_lookup_failed');
     }
