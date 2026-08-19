@@ -5891,8 +5891,8 @@ async function executeWorkflowNode(
       // money, and its own row now records it (#2469) — so carry it up rather than
       // dropping it here. The run-level aggregator reads `costUsd`/`tokens` off the
       // node result with no gate on `state`, and the fan-out sibling has taken these
-      // for the same reason since #2224. Absent on the pre-spawn failures below, which
-      // fail before any child exists to have spent anything.
+      // for the same reason since #2224. Cost and tokens are supplied when a settled
+      // child outcome is available; failure paths without an outcome omit them.
       ...(costUsd !== undefined ? { costUsd } : {}),
       ...(tokens !== undefined ? { tokens } : {}),
     };

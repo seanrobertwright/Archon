@@ -6302,6 +6302,64 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect((completedEvent![0] as { data: { cost_usd?: number } }).data.cost_usd).toBe(0.3);
     });
 
+    it('keeps a finite loop cost when a later result in the same iteration is non-finite', async () => {
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-1', taskType: 'local_agent', description: 'bg work' }],
+        };
+        yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'loop-sid', cost: 0.1 };
+        yield { type: 'background_tasks', tasks: [] };
+        yield { type: 'result', sessionId: 'loop-sid', cost: Number.NaN };
+      });
+
+      const store = createMockStore();
+
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-nan-cost',
+          nodes: [
+            {
+              id: 'my-loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        makeWorkflowRun('loop-nan-cost-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const completedEvent = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+        (call: unknown[]) =>
+          (call[0] as { event_type: string }).event_type === 'node_completed' &&
+          (call[0] as { step_name: string }).step_name === 'my-loop'
+      );
+      expect(completedEvent).toBeDefined();
+      expect((completedEvent![0] as { data: { cost_usd?: number } }).data.cost_usd).toBe(0.1);
+      expect(
+        (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+          call => call[1] === 'loop_node.usage_cost_non_finite_ignored'
+        )
+      ).toBe(true);
+    });
+
     it('records the cross-iteration union of dangling background tasks on node_completed (#2083)', async () => {
       // Iterations 1 and 2 each end with a different task still live (subprocess
       // death analog); iteration 3 finishes cleanly and signals completion. The
