@@ -35,6 +35,8 @@ describe('CLI help output', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('--dry-run');
     expect(result.stdout).toContain('--stubs <path>');
+    expect(result.stdout).toContain('--stubs-init <path>');
+    expect(result.stdout).toContain('--default-stubs');
     expect(result.stdout).toContain('--exec-code');
     expect(result.stdout).toContain('--pause-at-gates');
   });
@@ -185,6 +187,8 @@ describe('CLI argument parsing', () => {
         force: { type: 'boolean' },
         'dry-run': { type: 'boolean' },
         stubs: { type: 'string' },
+        'stubs-init': { type: 'string' },
+        'default-stubs': { type: 'boolean' },
         'exec-code': { type: 'boolean' },
         'pause-at-gates': { type: 'boolean' },
       },
@@ -324,12 +328,17 @@ describe('CLI argument parsing', () => {
         '--dry-run',
         '--stubs',
         'fixtures.yaml',
+        '--stubs-init',
+        'generated.yaml',
+        '--default-stubs',
         '--exec-code',
         '--pause-at-gates',
       ]);
 
       expect(result.values['dry-run']).toBe(true);
       expect(result.values.stubs).toBe('fixtures.yaml');
+      expect(result.values['stubs-init']).toBe('generated.yaml');
+      expect(result.values['default-stubs']).toBe(true);
       expect(result.values['exec-code']).toBe(true);
       expect(result.values['pause-at-gates']).toBe(true);
     });

@@ -8,6 +8,7 @@
     ".": "./src/index.ts",
     "./types": "./src/types.ts",
     "./effort": "./src/shared/effort.ts",
+    "./structured-output": "./src/shared/structured-output.ts",
     "./claude/provider": "./src/claude/provider.ts",
     "./claude/config": "./src/claude/config.ts",
     "./claude/binary-resolver": "./src/claude/binary-resolver.ts",

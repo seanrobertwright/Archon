@@ -2,9 +2,10 @@
 import { z } from '@hono/zod-openapi';
 import { execFileAsync, resolveBashPath } from '@archon/git';
 import { createLogger, getArchonTempPath } from '@archon/paths';
+import { validateStructuredOutput } from '@archon/providers/structured-output';
 import { randomUUID } from 'node:crypto';
-import { mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, open, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import {
   buildTopologicalLayers,
   checkComposedBlockBoundaries,
@@ -56,9 +57,200 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 export const dryRunStubValueSchema = z.union([z.string(), z.record(z.string(), z.unknown())]);
-export const dryRunStubsSchema = z.record(z.string(), dryRunStubValueSchema);
 export type DryRunStubValue = z.infer<typeof dryRunStubValueSchema>;
+export const dryRunStubsSchema = z.unknown().transform((value, ctx) => {
+  if (!isRecord(value)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'expected a mapping of node ids to outputs',
+    });
+    return z.NEVER;
+  }
+
+  const entries: [string, DryRunStubValue][] = [];
+  let invalid = false;
+  for (const [id, candidate] of Object.entries(value)) {
+    const result = dryRunStubValueSchema.safeParse(candidate);
+    if (!result.success) {
+      invalid = true;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [id],
+        message: result.error.issues.map(issue => issue.message).join('; '),
+      });
+      continue;
+    }
+    // Validation establishes the union; retaining the raw value preserves own keys
+    // such as `__proto__` across the YAML → Zod boundary.
+    entries.push([id, candidate as DryRunStubValue]);
+  }
+  return invalid ? z.NEVER : Object.fromEntries(entries);
+});
 export type DryRunStubs = z.infer<typeof dryRunStubsSchema>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function schemaPlaceholder(schema: unknown): unknown {
+  if (!isRecord(schema)) return 'TODO';
+
+  if ('const' in schema) return structuredClone(schema.const);
+  if ('default' in schema) return structuredClone(schema.default);
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    return structuredClone(schema.enum[0]);
+  }
+
+  switch (schema.type) {
+    case 'object': {
+      const properties = isRecord(schema.properties) ? schema.properties : {};
+      const required = Array.isArray(schema.required)
+        ? schema.required.filter((name): name is string => typeof name === 'string')
+        : [];
+      return Object.fromEntries(required.map(name => [name, schemaPlaceholder(properties[name])]));
+    }
+    case 'array': {
+      const minItems =
+        typeof schema.minItems === 'number' && Number.isInteger(schema.minItems)
+          ? Math.max(0, schema.minItems)
+          : 0;
+      return Array.from({ length: minItems }, () => schemaPlaceholder(schema.items));
+    }
+    case 'boolean':
+      return false;
+    case 'integer':
+      return typeof schema.minimum === 'number' ? Math.ceil(schema.minimum) : 0;
+    case 'number':
+      return typeof schema.minimum === 'number' ? schema.minimum : 0;
+    case 'null':
+      return null;
+    case 'string': {
+      const minLength =
+        typeof schema.minLength === 'number' && Number.isInteger(schema.minLength)
+          ? Math.max(0, schema.minLength)
+          : 0;
+      return minLength > 4 ? 'T'.repeat(minLength) : 'TODO';
+    }
+    default:
+      return 'TODO';
+  }
+}
+
+function generatedStubFor(node: DagNode): DryRunStubValue {
+  if (node.output_format === undefined) {
+    return isLoopNode(node) && node.loop.until !== undefined ? node.loop.until : 'TODO';
+  }
+  if (node.output_format.$async === true) {
+    throw new Error(
+      `Cannot generate dry-run stub for node '${node.id}': asynchronous output_format schemas are unsupported`
+    );
+  }
+
+  const value = schemaPlaceholder(node.output_format);
+  if (!isRecord(value)) {
+    throw new Error(
+      `Cannot generate dry-run stub for node '${node.id}': output_format must produce an object value`
+    );
+  }
+  if (isLoopNode(node) && node.loop.until_field !== undefined) {
+    value[node.loop.until_field] = true;
+  }
+
+  let compileError: string | undefined;
+  const validation = validateStructuredOutput(value, node.output_format, message => {
+    compileError = message;
+  });
+  if (compileError !== undefined) {
+    throw new Error(
+      `Cannot generate dry-run stub for node '${node.id}': output_format could not be compiled (${compileError})`
+    );
+  }
+  if (!validation.valid) {
+    throw new Error(
+      `Cannot generate schema-valid dry-run stub for node '${node.id}': ${validation.errors.join('; ')}`
+    );
+  }
+  return value;
+}
+
+function stubSatisfiesNode(node: DagNode, stub: DryRunStubValue): boolean {
+  if (node.output_format !== undefined) {
+    if (!isRecord(stub)) return false;
+    const validation = validateStructuredOutput(stub, node.output_format);
+    if (!validation.valid) return false;
+  }
+  if (isLoopNode(node)) {
+    return loopIterationCompletes(node.loop, completedOutput(node, stub)).kind !== 'incomplete';
+  }
+  return true;
+}
+
+function collectsStub(node: DagNode): boolean {
+  return !(
+    isApprovalNode(node) ||
+    isCancelNode(node) ||
+    isIncludeNode(node) ||
+    isWorkflowNode(node) ||
+    isLoopGroupNode(node)
+  );
+}
+
+/** Build the complete static stub map for an already-expanded workflow definition. */
+export function createDryRunStubScaffold(workflow: WorkflowDefinition): DryRunStubs {
+  const stubs = new Map<string, { candidates: DryRunStubValue[]; consumers: DagNode[] }>();
+  const visit = (nodes: readonly DagNode[]): void => {
+    for (const node of nodes) {
+      if (collectsStub(node)) {
+        const generated = generatedStubFor(node);
+        const existing = stubs.get(node.id);
+        if (existing === undefined) {
+          stubs.set(node.id, { candidates: [generated], consumers: [node] });
+        } else {
+          existing.candidates.push(generated);
+          existing.consumers.push(node);
+        }
+      }
+      if (isLoopGroupNode(node)) visit(node.loop_group.nodes);
+    }
+  };
+  visit(workflow.nodes);
+  return Object.fromEntries(
+    [...stubs].map(([id, entry]) => {
+      const value = entry.candidates.find(candidate =>
+        entry.consumers.every(consumer => stubSatisfiesNode(consumer, candidate))
+      );
+      if (value === undefined) {
+        throw new Error(
+          `Cannot generate dry-run scaffold: nodes sharing stub key '${id}' require incompatible values`
+        );
+      }
+      return [id, value];
+    })
+  );
+}
+
+/** Write a scaffold without ever overwriting an existing fixture. */
+export async function writeDryRunStubScaffold(
+  workflow: WorkflowDefinition,
+  path: string
+): Promise<DryRunStubs> {
+  const stubs = createDryRunStubScaffold(workflow);
+  await mkdir(dirname(path), { recursive: true });
+  let handle;
+  try {
+    handle = await open(path, 'wx');
+    await handle.writeFile(Bun.YAML.stringify(stubs));
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'EEXIST') {
+      throw new Error(`Dry-run stub scaffold already exists: ${path}`);
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+  return stubs;
+}
 
 const dryRunNodeTypeSchema = z.enum([
   'command',
@@ -225,6 +417,7 @@ interface DryRunContext {
   artifactsDir: string;
   stateDir: string;
   execCode: boolean;
+  defaultStubs: boolean;
   pauseAtGates: boolean;
   trace: DryRunTraceEntry[];
   consumedStubs: Set<string>;
@@ -425,9 +618,14 @@ async function executeCodeNode(
 }
 
 function stubFor(node: DagNode, ctx: DryRunContext): DryRunStubValue | undefined {
-  const stub = ctx.stubs[node.id];
-  if (stub !== undefined) ctx.consumedStubs.add(node.id);
-  return stub;
+  if (Object.hasOwn(ctx.stubs, node.id)) {
+    ctx.consumedStubs.add(node.id);
+    return ctx.stubs[node.id];
+  }
+  if (ctx.defaultStubs && !((isBashNode(node) || isScriptNode(node)) && ctx.execCode)) {
+    return generatedStubFor(node);
+  }
+  return undefined;
 }
 
 /** The completion channels a simulated loop may declare. */
@@ -818,6 +1016,8 @@ export async function dryRunWorkflow(options: {
    */
   inputs?: Record<string, string>;
   execCode?: boolean;
+  /** Fill reached nodes without explicit stubs using schema-valid deterministic placeholders. */
+  defaultStubs?: boolean;
   pauseAtGates?: boolean;
   /**
    * The install's resolved config and AI profile. Supplying them is what makes the
@@ -843,6 +1043,7 @@ export async function dryRunWorkflow(options: {
     artifactsDir: join(tempRoot, 'artifacts'),
     stateDir: join(tempRoot, 'state'),
     execCode: options.execCode ?? false,
+    defaultStubs: options.defaultStubs ?? false,
     pauseAtGates: options.pauseAtGates ?? false,
     trace: [],
     consumedStubs: new Set<string>(),
