@@ -325,7 +325,7 @@ async function handleWrite(
     const subject = GATE_ACTIONS.has(action)
       ? `the paused human gate on run ${run.id.slice(0, 8)} (${run.workflow_name})`
       : `run ${run.id.slice(0, 8)} (${run.workflow_name}), currently '${run.status}' — irreversible`;
-    // For approve on a signal-bearing interactive-loop gate, tell the agent which
+    // For approve after an interactive-loop completion condition was met, tell the agent which
     // effect its current args would have (finalize vs iterate) so the confirmed
     // second call is deliberate (#2074).
     let effect = '';
@@ -337,8 +337,8 @@ async function handleWrite(
       approvalMeta.completionSignaled === true
     ) {
       effect = willFinalize
-        ? ' This gate has completionSignaled=true and your args would FINALIZE the node from the already-computed output (no re-run).'
-        : ' This gate has completionSignaled=true and your message would run ANOTHER iteration (pass accept:true or drop the message to finalize instead).';
+        ? ' A completion condition was met at this gate, and your args would FINALIZE the node from the already-computed output (no re-run).'
+        : ' A completion condition was met at this gate, but your message would run ANOTHER iteration (pass accept:true or drop the message to finalize instead).';
     }
     return (
       `⚠️ This will ${action} ${subject}.${effect} ` +
