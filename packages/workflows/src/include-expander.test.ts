@@ -155,6 +155,40 @@ describe('expandWorkflowIncludes — namespacing', () => {
     expect(nodeById(workflows.get('parent')!, 'b__verify')?.depends_on).toEqual(['a__impl']);
   });
 
+  test('boundary dependency edges fan out to every sink while scalar refs use the primary sink', () => {
+    const upstream = wf('upstream', [
+      { id: 'primary', bash: 'echo primary' },
+      { id: 'secondary', bash: 'echo secondary' },
+    ]);
+    const downstream = wf('downstream', [
+      { id: 'entry', bash: 'echo entry', trigger_rule: 'one_success' },
+      { id: 'join', bash: 'echo join', depends_on: ['entry'], trigger_rule: 'all_done' },
+    ]);
+    const parent = wf('parent', [
+      { id: 'up', include: 'upstream' },
+      {
+        id: 'down',
+        include: 'downstream',
+        depends_on: ['up'],
+        when: "$up.output == 'primary'",
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(upstream, downstream, parent));
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get('parent')!;
+
+    expect(nodeById(expanded, 'down__entry')?.depends_on).toEqual(['up__primary', 'up__secondary']);
+    expect(composedBoundaries(nodeById(expanded, 'down__join'))).toEqual([
+      {
+        dependsOn: ['up__primary', 'up__secondary'],
+        entryTriggerRules: ['one_success'],
+        when: "$up__primary.output == 'primary'",
+        isEntry: false,
+      },
+    ]);
+  });
+
   test('does not mutate the input workflow map', () => {
     const parent = wf('parent', [{ id: 'review', include: 'blk' }]);
     const raw = mapOf(blockWorkflow(), parent);

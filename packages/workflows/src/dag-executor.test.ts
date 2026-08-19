@@ -18550,6 +18550,44 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     return [...workflows.get('gated-parent')!.nodes];
   }
 
+  function expandedMultiSinkDependencyNodes(
+    entryTriggerRule: 'all_success' | 'one_success'
+  ): DagNode[] {
+    const upstream = buildWf('upstream', [
+      { id: 'start', bash: 'echo start' },
+      { id: 'good', bash: 'echo good', depends_on: ['start'] },
+      {
+        id: 'bad',
+        bash: 'echo bad',
+        depends_on: ['start'],
+        when: "$start.output == 'never'",
+      },
+    ]);
+    const downstream = buildWf('downstream', [
+      { id: 'entry', bash: 'echo entry', trigger_rule: entryTriggerRule },
+      {
+        id: 'synthesize',
+        bash: 'echo synthesized',
+        depends_on: ['entry'],
+        trigger_rule: 'all_done',
+      },
+    ]);
+    const parent = buildWf('multi-sink-parent', [
+      { id: 'up', include: 'upstream' },
+      { id: 'down', include: 'downstream', depends_on: ['up'] },
+      { id: 'consumer', bash: 'echo $down.output', depends_on: ['down'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['upstream', upstream],
+        ['downstream', downstream],
+        ['multi-sink-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...workflows.get('multi-sink-parent')!.nodes];
+  }
+
   function eventList(deps: WorkflowDeps): Array<{ event_type: string; step_name: string }> {
     return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
       (call: unknown[]) => call[0] as { event_type: string; step_name: string }
@@ -18652,6 +18690,48 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       'review__synthesize',
     ]);
     expect(output).toContain('synthesized');
+  });
+
+  it('keeps a block inactive when one sink of an included dependency is ineligible', async () => {
+    const { events } = await executeExpanded(
+      expandedMultiSinkDependencyNodes('all_success'),
+      'inc-multi-sink-inactive'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual(['consumer', 'down__entry', 'down__synthesize', 'up__bad']);
+    expect(completed).toEqual(['up__good', 'up__start']);
+  });
+
+  it('keeps a one_success block active when any sink of an included dependency succeeds', async () => {
+    const { events } = await executeExpanded(
+      expandedMultiSinkDependencyNodes('one_success'),
+      'inc-multi-sink-active'
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name)
+      .sort();
+    const completed = events
+      .filter(event => event.event_type === 'node_completed')
+      .map(event => event.step_name)
+      .sort();
+
+    expect(skipped).toEqual(['up__bad']);
+    expect(completed).toEqual([
+      'consumer',
+      'down__entry',
+      'down__synthesize',
+      'up__good',
+      'up__start',
+    ]);
   });
 
   it('emits namespaced step_names and resolves $inc.output to the child terminal node', async () => {

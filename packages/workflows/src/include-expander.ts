@@ -353,9 +353,13 @@ function collapseWorkflowScope(raw: WorkflowDefinition): WorkflowDefinition {
  * composed and stay literal when run standalone (#2476). Those fields receive runtime
  * substitution since #1764, so they are ordinary node-ref surfaces and are walked here too.
  */
-function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): void {
-  const code = (text: string): string => applyOutputRefRename(text, rename);
-  const whenExpr = (text: string): string => applyWhenRefRename(text, rename);
+function rewriteNodeOutputRefs(
+  node: DagNode,
+  renameOutputRef: (id: string) => string,
+  expandDependency: (id: string) => string[]
+): void {
+  const code = (text: string): string => applyOutputRefRename(text, renameOutputRef);
+  const whenExpr = (text: string): string => applyWhenRefRename(text, renameOutputRef);
 
   if (node.when !== undefined) node.when = whenExpr(node.when);
 
@@ -368,7 +372,7 @@ function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): v
     for (const [key, value] of Object.entries(stamped)) stamped[key] = code(value);
   }
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
-    boundary.dependsOn = boundary.dependsOn.map(rename);
+    boundary.dependsOn = boundary.dependsOn.flatMap(expandDependency);
     if (boundary.when !== undefined) boundary.when = whenExpr(boundary.when);
   }
 
@@ -394,7 +398,9 @@ function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): v
     if (node.loop_group.until_bash !== undefined) {
       node.loop_group.until_bash = code(node.loop_group.until_bash);
     }
-    for (const body of node.loop_group.nodes) rewriteNodeOutputRefs(body, rename);
+    for (const body of node.loop_group.nodes) {
+      rewriteNodeOutputRefs(body, renameOutputRef, expandDependency);
+    }
   } else if (isApprovalNode(node)) {
     node.approval.message = code(node.approval.message);
     if (node.approval.on_reject !== undefined) {
@@ -644,7 +650,7 @@ function inlineInclude(
     // Rewrite child-internal refs before inserting caller values. This ordering is
     // load-bearing: a caller ref such as `$gather.output` must remain parent-scoped even
     // when the included block also has a node named `gather`.
-    rewriteNodeOutputRefs(clone, rename);
+    rewriteNodeOutputRefs(clone, rename, id => [rename(id)]);
     applyInputsMacro(clone, resolvedInputs, missingInputs);
     // Stamped AFTER both passes, for the same reason the caller's values are inserted
     // after the rename: these are the CALLER's strings, so they stay parent-scoped here
@@ -1006,11 +1012,12 @@ export function expandWorkflowIncludes(
     //   (a) depends_on entries equal to an include id → that include's sink list
     //   (b) $includeId.output → $<primarySink>.output
     const renameIncludeRef = (id: string): string => primarySinkByIncludeId.get(id) ?? id;
+    const expandIncludeDependency = (id: string): string[] => sinksByIncludeId.get(id) ?? [id];
     for (const node of newNodes) {
       if (node.depends_on !== undefined) {
-        node.depends_on = node.depends_on.flatMap(dep => sinksByIncludeId.get(dep) ?? [dep]);
+        node.depends_on = node.depends_on.flatMap(expandIncludeDependency);
       }
-      rewriteNodeOutputRefs(node, renameIncludeRef);
+      rewriteNodeOutputRefs(node, renameIncludeRef, expandIncludeDependency);
     }
 
     // Re-validate the fully-flattened DAG. Catches a namespaced id colliding with a
