@@ -10729,10 +10729,10 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
   });
 
   it('best-effort provider: a non-finite reask cost does not erase prior valid cost', async () => {
-    mockSendQueryDag.mockImplementationOnce(function* () {
+    mockSendQueryDag.mockImplementationOnce(async function* () {
       yield { type: 'result', sessionId: 's1', structuredOutput: { other: 'x' }, cost: 0.01 };
     });
-    mockSendQueryDag.mockImplementation(function* () {
+    mockSendQueryDag.mockImplementation(async function* () {
       yield {
         type: 'result',
         sessionId: 's2',
@@ -12910,7 +12910,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
 
   it('records what a FAILED run burned before it died', async () => {
     let call = 0;
-    mockSendQueryDag.mockImplementation(function* () {
+    mockSendQueryDag.mockImplementation(async function* () {
       call++;
       if (call === 1) {
         yield { type: 'assistant', content: 'first output' };
@@ -12964,7 +12964,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     // fan-out cancelling a child), so the cancelling side has no usage in scope. The
     // executing side notices at its next status check and bails out of BOTH terminal
     // writers — which is exactly why the usage write cannot live in either of them.
-    mockSendQueryDag.mockImplementation(function* () {
+    mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'work done before the cancel landed' };
       yield {
         type: 'result',
@@ -12980,7 +12980,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     // during-streaming cancel check never tears the node down mid-stream.
     let nodeFinished = false;
     const realCreateEvent = store.createWorkflowEvent;
-    store.createWorkflowEvent = mock((data: { event_type: string }) => {
+    store.createWorkflowEvent = mock<IWorkflowStore['createWorkflowEvent']>(data => {
       if (data.event_type === 'node_completed') nodeFinished = true;
       return realCreateEvent(data);
     });
@@ -13016,7 +13016,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
   it('records usage accumulated before an approval gate PAUSES the run', async () => {
     // A fan-out child that pauses at a gate is cancelled by the parent (`fan_out_gate`),
     // so the pause is its only chance to record what it spent.
-    mockSendQueryDag.mockImplementation(function* () {
+    mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'analysis' };
       yield {
         type: 'result',
@@ -13072,7 +13072,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     // the run, silently — the exact loss this work exists to remove, arriving through a
     // provider instead of a code path. Tokens have carried this guard; cost had not.
     let call = 0;
-    mockSendQueryDag.mockImplementation(function* () {
+    mockSendQueryDag.mockImplementation(async function* () {
       call++;
       if (call === 1) {
         yield { type: 'assistant', content: 'good node' };
@@ -13131,7 +13131,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     // otherwise-fine run into a failed one. Documented, but never watched failing — and
     // the `finally` makes it the last thing standing between the run and its own
     // completion, so a throw here would be maximally disruptive.
-    mockSendQueryDag.mockImplementation(function* () {
+    mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'done' };
       yield {
         type: 'result',
@@ -13191,7 +13191,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     // per-node try; the catch's own message throws too, rejecting the node promise; the
     // allSettled `rejected` branch then throws a third time OUTSIDE any try — out of
     // runLayers entirely.
-    mockSendQueryDag.mockImplementation(function* () {
+    mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'spent before the platform died' };
       yield {
         type: 'result',
@@ -13204,7 +13204,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     const store = createMockStore();
     let nodeFinished = false;
     const realCreateEvent = store.createWorkflowEvent;
-    store.createWorkflowEvent = mock((data: { event_type: string }) => {
+    store.createWorkflowEvent = mock<IWorkflowStore['createWorkflowEvent']>(data => {
       if (data.event_type === 'node_completed') nodeFinished = true;
       return realCreateEvent(data);
     });

@@ -2068,6 +2068,7 @@ describe('hydrateResumableRun', () => {
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })),
     });
     const deps = makeDeps(store);
@@ -2088,6 +2089,7 @@ describe('hydrateResumableRun', () => {
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })),
       resumeWorkflowRun: mock(async () => resumed),
     });
@@ -2115,6 +2117,7 @@ describe('hydrateResumableRun', () => {
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map([['n1', 'v1']]),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })),
       resumeWorkflowRun: mock(async () => {
         throw new Error('DB write failed');
