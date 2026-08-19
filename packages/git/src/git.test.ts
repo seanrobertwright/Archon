@@ -181,6 +181,30 @@ describe('git utilities', () => {
       const result = await git.getCanonicalRepoPath(testDir);
       expect(result).toBe(testDir);
     });
+
+    test('resolves a linked submodule worktree to the primary submodule checkout', async () => {
+      const commonGitDir = '/workspace/super/.git/modules/vendor/module';
+      await writeFile(join(testDir, '.git'), `gitdir: ${commonGitDir}/worktrees/linked`);
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
+        stdout: '../../../../vendor/module\n',
+        stderr: '',
+      });
+
+      try {
+        const result = await git.getCanonicalRepoPath(testDir);
+
+        expect(execSpy).toHaveBeenCalledWith('git', [
+          '--git-dir',
+          commonGitDir,
+          'config',
+          '--get',
+          'core.worktree',
+        ]);
+        expect(result).toBe(repo(resolve(commonGitDir, '../../../../vendor/module')));
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
   });
 
   describe('getWorktreeBase', () => {

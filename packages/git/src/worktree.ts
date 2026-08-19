@@ -310,6 +310,37 @@ export async function getCanonicalRepoPath(path: string): Promise<RepoPath> {
     if (match) {
       return toRepoPath(match[1]);
     }
+    const linkedSubmoduleMatch =
+      /^(.*[\\/]\.git[\\/]modules[\\/].*)[\\/]worktrees[\\/][^\\/]+$/.exec(gitDir);
+    if (linkedSubmoduleMatch) {
+      const commonGitDir = linkedSubmoduleMatch[1];
+      try {
+        const { stdout } = await execFileAsync('git', [
+          '--git-dir',
+          commonGitDir,
+          'config',
+          '--get',
+          'core.worktree',
+        ]);
+        const primaryCheckout = stdout.trim();
+        if (primaryCheckout) {
+          return toRepoPath(
+            isAbsolute(primaryCheckout) ? primaryCheckout : resolve(commonGitDir, primaryCheckout)
+          );
+        }
+      } catch (error) {
+        getLog().error(
+          { path, commonGitDir, err: error as Error },
+          'submodule_worktree_path_failed'
+        );
+        throw new Error(
+          `Cannot determine primary checkout for linked submodule worktree at ${path}: ${(error as Error).message}`
+        );
+      }
+      throw new Error(
+        `Git returned an empty core.worktree for linked submodule worktree at ${path}`
+      );
+    }
     // Submodules also use a gitdir file, but they are independent checkout
     // roots rather than linked worktrees of the containing repository.
     if (/(?:^|[\\/])\.git[\\/]modules[\\/]/.test(gitDir)) {
