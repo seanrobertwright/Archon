@@ -614,7 +614,11 @@ describe('WorktreeProvider', () => {
 
     test('throws when .git pointer is not a git-worktree reference (e.g., submodule)', async () => {
       worktreeExistsSpy.mockResolvedValue(true);
-      mockReadFile.mockResolvedValue('gitdir: /workspace/repo/.git/modules/submodule-name\n');
+      const enoentError = new Error('ENOENT') as NodeJS.ErrnoException;
+      enoentError.code = 'ENOENT';
+      mockReadFile
+        .mockResolvedValueOnce('gitdir: /workspace/repo/.git/modules/submodule-name\n')
+        .mockRejectedValueOnce(enoentError);
 
       await expect(provider.create(baseRequest)).rejects.toThrow(/not a git-worktree reference/);
     });
