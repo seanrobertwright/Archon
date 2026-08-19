@@ -25,8 +25,9 @@ import type {
   WorkflowWithSource,
   WorkflowSource,
   DeclaredWorkflowConfig,
+  DagNode,
 } from './schemas';
-import { isIncludeNode } from './schemas';
+import { isIncludeNode, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
 import {
   BUNDLED_WORKFLOWS,
@@ -511,14 +512,17 @@ async function resolveIncludeBlockCommandContents(
   config: CommandScanConfig
 ): Promise<Map<string, IncludeCommandContent>> {
   const targetNames = new Set<string>();
-  const visit = (workflow: WorkflowDefinition): void => {
-    for (const node of workflow.nodes) {
-      if (isIncludeNode(node) && !targetNames.has(node.include)) {
-        targetNames.add(node.include);
-        const target = byName.get(node.include);
-        if (target) visit(target);
-      }
+  const visitNodes = (nodes: readonly DagNode[]): void => {
+    for (const node of nodes) {
+      if (isLoopGroupNode(node)) visitNodes(node.loop_group.nodes);
+      if (!isIncludeNode(node) || targetNames.has(node.include)) continue;
+      targetNames.add(node.include);
+      const target = byName.get(node.include);
+      if (target) visit(target);
     }
+  };
+  const visit = (workflow: WorkflowDefinition): void => {
+    visitNodes(workflow.nodes);
   };
   for (const workflow of byName.values()) visit(workflow);
 

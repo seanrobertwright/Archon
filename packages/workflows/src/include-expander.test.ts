@@ -1417,6 +1417,152 @@ describe('expandWorkflowIncludes — determinism', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Includes inside loop_group bodies (#2623)
+// ---------------------------------------------------------------------------
+
+describe('expandWorkflowIncludes — loop_group body composition (#2623)', () => {
+  test('expands a body include in local scope and binds completion to its declared return', () => {
+    const block: WorkflowDefinition = {
+      ...wf('review-block', [
+        {
+          id: 'decide',
+          prompt: 'review $INPUTS.context',
+          output_format: {
+            type: 'object',
+            properties: { done: { type: 'boolean' } },
+            required: ['done'],
+          },
+        },
+        {
+          id: 'cleanup',
+          bash: 'echo $LOOP_PREV.decide.output.done',
+          depends_on: ['decide'],
+        },
+      ]),
+      inputs: { context: { required: true } },
+      returns: 'decide',
+      requires: ['github'],
+    };
+    const parent = wf('parent', [
+      {
+        id: 'group',
+        loop_group: {
+          until_bash: 'test "$review.output.done" = true',
+          max_iterations: 3,
+          nodes: [
+            { id: 'seed', bash: 'echo context' },
+            {
+              id: 'review',
+              include: 'review-block',
+              depends_on: ['seed'],
+              with: { context: '$seed.output' },
+            },
+            {
+              id: 'consume',
+              prompt: 'done=$review.output.done',
+              depends_on: ['review'],
+            },
+          ],
+        },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get('parent')!;
+    const group = nodeById(expanded, 'group');
+    expect(group?.loop_group?.nodes.map(node => node.id)).toEqual([
+      'seed',
+      'review__decide',
+      'review__cleanup',
+      'consume',
+    ]);
+    expect(group?.loop_group?.nodes.some(node => 'include' in node)).toBe(false);
+    expect(group?.loop_group?.until_bash).toBe('test "$review__decide.output.done" = true');
+
+    const decide = group?.loop_group?.nodes.find(node => node.id === 'review__decide');
+    const cleanup = group?.loop_group?.nodes.find(node => node.id === 'review__cleanup');
+    const consume = group?.loop_group?.nodes.find(node => node.id === 'consume');
+    expect(decide?.depends_on).toEqual(['seed']);
+    expect(cleanup?.depends_on).toEqual(['review__decide']);
+    expect(cleanup && 'bash' in cleanup ? cleanup.bash : '').toBe(
+      'echo $LOOP_PREV.review__decide.output.done'
+    );
+    expect(consume?.depends_on).toEqual(['review__cleanup']);
+    expect(consume && 'prompt' in consume ? consume.prompt : '').toBe(
+      'done=$review__decide.output.done'
+    );
+    expect(decide && 'prompt' in decide ? decide.prompt : '').toBe('review $seed.output');
+    expect(composedOrigin(decide)).toBe('review-block');
+    expect(composedInputs(decide)).toEqual({ context: '$seed.output' });
+    expect(expanded.requires).toEqual(['github']);
+  });
+
+  test('expands independent includes in nested loop_group scopes without leaking directives', () => {
+    const block = wf('block', [{ id: 'work', prompt: 'work' }]);
+    const parent = wf('parent', [
+      {
+        id: 'outer',
+        loop_group: {
+          until_bash: 'true',
+          max_iterations: 1,
+          nodes: [
+            { id: 'first', include: 'block' },
+            { id: 'second', include: 'block', depends_on: ['first'] },
+            {
+              id: 'inner',
+              loop_group: {
+                until_bash: 'test -n "$third.output"',
+                max_iterations: 1,
+                nodes: [{ id: 'third', include: 'block' }],
+              },
+              depends_on: ['second'],
+            },
+          ],
+        },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(errors).toHaveLength(0);
+    const outer = nodeById(workflows.get('parent')!, 'outer');
+    expect(outer?.loop_group?.nodes.map(node => node.id)).toEqual([
+      'first__work',
+      'second__work',
+      'inner',
+    ]);
+    expect(outer?.loop_group?.nodes.find(node => node.id === 'second__work')?.depends_on).toEqual([
+      'first__work',
+    ]);
+    const inner = outer?.loop_group?.nodes.find(node => node.id === 'inner');
+    expect(inner?.loop_group?.nodes.map(node => node.id)).toEqual(['third__work']);
+    expect(inner?.loop_group?.until_bash).toBe('test -n "$third__work.output"');
+  });
+
+  test('fails the owning workflow when a body include target is unknown', () => {
+    const parent = wf('parent', [
+      {
+        id: 'group',
+        loop_group: {
+          until_bash: 'true',
+          max_iterations: 1,
+          nodes: [{ id: 'missing', include: 'does-not-exist' }],
+        },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "Node 'missing': include target 'does-not-exist' not found"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // returns: + declared inputs: (#2470)
 // ---------------------------------------------------------------------------
 

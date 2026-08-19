@@ -16158,6 +16158,76 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(result).toContain('iteration 2 final result');
   });
 
+  it('re-executes a load-time included body block on every loop_group iteration (#2623)', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      yield {
+        type: 'assistant',
+        content: callCount === 1 ? 'iteration 1 still working' : 'iteration 2 DONE',
+      };
+      yield { type: 'result', sessionId: `included-body-${callCount}` };
+    });
+
+    const block = workflowDefinitionSchema.parse({
+      name: 'review-block',
+      description: 'Reusable loop body',
+      returns: 'review',
+      nodes: [{ id: 'review', prompt: 'review this iteration' }],
+    });
+    const parent = workflowDefinitionSchema.parse({
+      name: 'included-loop-group',
+      description: 'Repeats a composed block',
+      nodes: [
+        {
+          id: 'group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 3,
+            nodes: [{ id: 'pass', include: 'review-block' }],
+          },
+        },
+      ],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        [block.name, block],
+        [parent.name, parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get(parent.name);
+    expect(expanded).toBeDefined();
+    if (!expanded) throw new Error('expected expanded workflow');
+
+    const store = createMockStore();
+    const result = await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      expanded,
+      makeWorkflowRun('dag-loopgroup-included'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(2);
+    expect(result).toContain('iteration 2 DONE');
+    const bodyCompletions = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .filter(
+        event => event.event_type === 'node_completed' && event.step_name === 'group.pass__review'
+      );
+    expect(bodyCompletions.map(event => event.data?.iteration)).toEqual([1, 2]);
+  });
+
   it('runs a command-backed loop node inside a loop_group body with namespaced lifecycle events', async () => {
     // A `loop:` body node may use `loop.command` like any top-level loop. The
     // command body must reach the AI, and the loop's persisted lifecycle events

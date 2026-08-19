@@ -219,7 +219,7 @@ per iteration (see [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-
 
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
-| `nodes` | Yes | node[] | Sub-DAG body re-run in full each iteration. Any node type, including nested `loop_group`. `depends_on` is body-scoped; body ids must not shadow outer ids |
+| `nodes` | Yes | node[] | Sub-DAG body re-run in full each iteration. Executable nodes, `include:`, and nested `loop_group` are supported; runtime `workflow:` sub-runs are not. `depends_on` is body-scoped; body ids must not shadow outer ids |
 | `until` | One channel required | string | Completion signal — checked in the body's terminal-node output. Omit it for a deterministic group |
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | `true` starts fresh body AI sessions each iteration (default: false — sessions continue) |

@@ -1067,6 +1067,13 @@ written the nodes by hand. There is no separate child run.
   has multiple leaf nodes.
 - **Output.** `$<includeId>.output` in another node resolves to the block's primary sink.
   In the example, `$review.output` is the output of the block's `implement-fixes` node.
+- **Inside a `loop_group` body.** An include expands inside that sealed body at load time.
+  Its nodes keep the usual `<includeId>__<nodeId>` names, then the loop runtime prefixes
+  persisted step names with the group id (for example `fix-loop.review__synthesize`). Every
+  iteration re-runs the expanded nodes exactly like equivalent inline body nodes. The group's
+  `until_bash` can read `$<includeId>.output` and expansion binds it to the block's declared
+  `returns:` node. A `workflow:` node is different — it creates a child run at runtime and
+  remains unsupported inside a loop-group body.
 
 ### Passing values into an included block
 
@@ -1154,9 +1161,9 @@ in the child's run metadata.
   implementation detail.
 - **Literal targets only.** `include:` takes a literal workflow name — no
   `include: $something` and no cross-repo includes.
-- **Not inside a `loop_group` body.** An include node nested in a `loop_group` body is
-  rejected at load time — and so is a `workflow:` node, which surprises people in both
-  directions. Neither keyword may appear in a loop-group body today.
+- **No child runs inside a `loop_group` body.** A `workflow:` node remains unsupported there;
+  use `include:` when the reusable nodes should participate in the same run and repeat as
+  part of the group's static body.
 - **Depth-capped and cycle-checked.** Includes may nest up to 3 levels deep; cycles
   (`A` includes `B` includes `A`) and over-deep chains are load errors that drop only the
   offending workflow — other workflows still load.

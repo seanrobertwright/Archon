@@ -4,6 +4,7 @@ import { join } from 'path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { discoverWorkflows } from './workflow-discovery';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
+import { isLoopGroupNode } from './schemas';
 
 const tempDirectories: string[] = [];
 
@@ -14,6 +15,59 @@ afterEach(async () => {
 });
 
 describe('discoverWorkflows — nested included command compilation', () => {
+  test('pre-resolves a command block included directly inside a loop_group body', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'archon-workflow-discovery-'));
+    tempDirectories.push(cwd);
+    const workflowDir = join(cwd, '.archon', 'workflows');
+    const commandDir = join(cwd, '.archon', 'commands');
+    await Promise.all([
+      mkdir(workflowDir, { recursive: true }),
+      mkdir(commandDir, { recursive: true }),
+    ]);
+
+    await writeFile(
+      join(workflowDir, 'block.yaml'),
+      JSON.stringify({
+        name: 'command-block',
+        description: 'Command-backed loop body block',
+        inputs: { context: { required: true } },
+        nodes: [{ id: 'review', command: 'body-review' }],
+      })
+    );
+    await writeFile(
+      join(workflowDir, 'parent.yaml'),
+      JSON.stringify({
+        name: 'parent',
+        description: 'Includes a command block inside a group body',
+        nodes: [
+          {
+            id: 'group',
+            loop_group: {
+              until: 'DONE',
+              max_iterations: 1,
+              nodes: [{ id: 'block', include: 'command-block', with: { context: 'iteration' } }],
+            },
+          },
+        ],
+      })
+    );
+    await writeFile(join(commandDir, 'body-review.md'), 'Review $INPUTS.context and emit DONE.');
+
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+
+    expect(result.errors.filter(error => error.filename === 'parent.yaml')).toHaveLength(0);
+    const parent = result.workflows.find(item => item.workflow.name === 'parent')?.workflow;
+    const group = parent?.nodes.find(node => node.id === 'group');
+    expect(group && isLoopGroupNode(group)).toBe(true);
+    if (!group || !isLoopGroupNode(group)) throw new Error('expected loop_group');
+    expect(group.loop_group.nodes).toEqual([
+      expect.objectContaining({
+        id: 'block__review',
+        prompt: 'Review iteration and emit DONE.',
+      }),
+    ]);
+  });
+
   test('pre-resolves and compiles loop_group command files before include expansion', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'archon-workflow-discovery-'));
     tempDirectories.push(cwd);
