@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
 import { writeFile, mkdir as realMkdir, rm } from 'fs/promises';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { tmpdir, homedir } from 'os';
 // Loaded BEFORE mock.module replaces the module in the registry, so these are
 // the REAL identity validators — the mock re-exports them (no drift possible).
@@ -168,6 +168,18 @@ describe('git utilities', () => {
       );
       const result = await git.getCanonicalRepoPath(testDir);
       expect(result).toBe(repo('/home/user/projects/my-app'));
+    });
+
+    test('resolves a relative worktree pointer from the worktree root', async () => {
+      await writeFile(join(testDir, '.git'), 'gitdir: ../primary/.git/worktrees/linked');
+      const result = await git.getCanonicalRepoPath(testDir);
+      expect(result).toBe(repo(resolve(testDir, '../primary')));
+    });
+
+    test('keeps a submodule checkout as its own canonical repository', async () => {
+      await writeFile(join(testDir, '.git'), 'gitdir: ../primary/.git/modules/vendor/module');
+      const result = await git.getCanonicalRepoPath(testDir);
+      expect(result).toBe(testDir);
     });
   });
 

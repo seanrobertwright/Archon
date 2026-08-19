@@ -3959,9 +3959,9 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
     (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce('/canonical/repo');
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
-      CODEBASE
-    );
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(CODEBASE);
     (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
       { id: FULL_ID },
     ]);
@@ -3974,6 +3974,34 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     );
 
     expect(codebaseDb.findCodebaseByDefaultCwd).toHaveBeenCalledWith('/canonical/repo');
+    expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+      workflow_run_id: FULL_ID,
+      event_type: 'workflow_started',
+      data: undefined,
+    });
+  });
+
+  it('resolves an event prefix from an exact registered linked worktree', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
+      CODEBASE
+    );
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: FULL_ID },
+    ]);
+
+    await workflowEventEmitCommand(
+      '0b1ee8da',
+      'workflow_started',
+      undefined,
+      '/workspace/registered-worktree'
+    );
+
+    expect(canonicalSpy).not.toHaveBeenCalled();
     expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
       workflow_run_id: FULL_ID,
       event_type: 'workflow_started',

@@ -1,5 +1,5 @@
 import { readFile, access } from 'fs/promises';
-import { join, resolve } from 'path';
+import { isAbsolute, join, resolve } from 'path';
 import {
   createLogger,
   getArchonWorkspacesPath,
@@ -303,10 +303,17 @@ export async function getCanonicalRepoPath(path: string): Promise<RepoPath> {
     // Read .git file to find main repo
     const gitPath = join(path, '.git');
     const content = await readFile(gitPath, 'utf-8');
-    // gitdir: /path/to/repo/.git/worktrees/branch-name
-    const match = /gitdir: (.+)\/\.git\/worktrees\//.exec(content);
+    // Git may store an absolute pointer or one relative to the worktree root.
+    const pointer = content.slice('gitdir:'.length).trim();
+    const gitDir = isAbsolute(pointer) ? pointer : resolve(path, pointer);
+    const match = /^(.*)[\\/]\.git[\\/]worktrees[\\/]/.exec(gitDir);
     if (match) {
       return toRepoPath(match[1]);
+    }
+    // Submodules also use a gitdir file, but they are independent checkout
+    // roots rather than linked worktrees of the containing repository.
+    if (/(?:^|[\\/])\.git[\\/]modules[\\/]/.test(gitDir)) {
+      return toRepoPath(path);
     }
     // Worktree detected but regex didn't match - this is a real problem
     getLog().error(

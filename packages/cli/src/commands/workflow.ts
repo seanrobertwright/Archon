@@ -2484,6 +2484,17 @@ function readParseWarningEvents(events: readonly WorkflowEventRow[]): string[] {
  * status. `--all` drops the project scope (lists across all projects);
  * `--status` filters to one status; `--limit` caps the count (default 20).
  */
+async function findCodebaseForCheckoutPath(
+  cwd: string
+): Promise<Awaited<ReturnType<typeof codebaseDb.findCodebaseByDefaultCwd>>> {
+  const exact = await codebaseDb.findCodebaseByDefaultCwd(cwd);
+  if (exact) return exact;
+
+  const canonicalCwd = await git.getCanonicalRepoPath(cwd);
+  if (canonicalCwd === cwd) return null;
+  return codebaseDb.findCodebaseByDefaultCwd(canonicalCwd);
+}
+
 export async function workflowRunsCommand(
   cwd: string,
   opts: { json?: boolean; all?: boolean; status?: string; limit?: number } = {}
@@ -2513,13 +2524,7 @@ export async function workflowRunsCommand(
   let codebase = null;
   if (!opts.all) {
     try {
-      codebase = await codebaseDb.findCodebaseByDefaultCwd(cwd);
-      if (!codebase) {
-        const canonicalCwd = await git.getCanonicalRepoPath(cwd);
-        if (canonicalCwd !== cwd) {
-          codebase = await codebaseDb.findCodebaseByDefaultCwd(canonicalCwd);
-        }
-      }
+      codebase = await findCodebaseForCheckoutPath(cwd);
     } catch (error) {
       getLog().warn({ err: error as Error, cwd }, 'cli.workflow_runs_codebase_lookup_failed');
     }
@@ -2602,11 +2607,11 @@ const FULL_RUN_ID_RE =
  * codebase, a unique match resolves, and an ambiguous prefix errors.
  *
  * Full UUIDs skip resolution entirely — exact lookup is global, so full ids
- * keep working from any directory. Worktree paths are normalized to their
- * canonical checkout before project lookup. By default, an omitted or
- * unregistered cwd and an unmatched prefix pass through unchanged so the
- * downstream exact lookup keeps its existing error surface. Callers without a
- * downstream lookup can require a match instead.
+ * keep working from any directory. Project lookup preserves an exact checkout
+ * registration, then falls back to a linked worktree's canonical checkout. By
+ * default, an omitted or unregistered cwd and an unmatched prefix pass through
+ * unchanged so the downstream exact lookup keeps its existing error surface.
+ * Callers without a downstream lookup can require a match instead.
  */
 async function resolveRunIdArg(
   runId: string,
@@ -2620,8 +2625,7 @@ async function resolveRunIdArg(
     }
     return runId;
   }
-  const canonicalCwd = await git.getCanonicalRepoPath(cwd);
-  const codebase = await codebaseDb.findCodebaseByDefaultCwd(canonicalCwd);
+  const codebase = await findCodebaseForCheckoutPath(cwd);
   if (!codebase) {
     if (requirePrefixMatch) {
       throw new Error(`Cannot resolve run id prefix '${runId}' outside a registered project.`);
