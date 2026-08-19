@@ -5,7 +5,7 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
-import { existsSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { isAbsolute, join as joinPath, resolve as resolvePath } from 'path';
 import { execFileAsync, resolveBashPath } from '@archon/git';
@@ -805,19 +805,22 @@ function shellQuote(value: string): string {
 }
 
 /**
- * Shell-quote a value for bash, or write it to a file and return a $(cat ...) reference
- * when the value exceeds the inline size threshold.
+ * Shell-quote a value for bash, or write it under the run artifact directory's
+ * engine-owned spill child and return a $(cat ...) reference when the value exceeds
+ * the inline size threshold.
  */
 function shellQuoteOrFile(
   value: string,
   nodeId: string,
   field: string | undefined,
-  outputFileDir: string | undefined
+  artifactsDir: string | undefined
 ): string {
-  if (outputFileDir && value.length > NODE_OUTPUT_FILE_THRESHOLD) {
+  if (artifactsDir && value.length > NODE_OUTPUT_FILE_THRESHOLD) {
+    const spillDir = joinPath(artifactsDir, '.archon', 'node-output-spills');
     const filename = field ? `${nodeId}.${field}.nodeoutput` : `${nodeId}.nodeoutput`;
-    const filePath = joinPath(outputFileDir, filename);
+    const filePath = joinPath(spillDir, filename);
     try {
+      mkdirSync(spillDir, { recursive: true });
       writeFileSync(filePath, value);
       return `$(cat ${shellQuote(filePath)})`;
     } catch (fileErr) {
@@ -851,7 +854,7 @@ export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
   escapedForBash = false,
-  outputFileDir?: string
+  artifactsDir?: string
 ): string {
   return prompt.replace(
     /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g,
@@ -878,7 +881,7 @@ export function substituteNodeOutputRefs(
       }
       if (!field) {
         return escapedForBash
-          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, outputFileDir)
+          ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, artifactsDir)
           : nodeOutput.output;
       }
       // No-silent-drop field access (resolveNodeOutputField): prefers the parsed
@@ -892,7 +895,7 @@ export function substituteNodeOutputRefs(
       if (resolution.kind === 'empty') return escapedForBash ? "''" : '';
       const value = resolution.value;
       if (typeof value === 'string')
-        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, outputFileDir) : value;
+        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, artifactsDir) : value;
       // numbers and booleans are shell-safe without quoting: JSON disallows
       // NaN/Infinity so String(number) is digits/sign/'.', and String(boolean) is
       // 'true'/'false' — no shell metacharacters.
@@ -900,7 +903,7 @@ export function substituteNodeOutputRefs(
       // arrays and objects: JSON-stringify so downstream tools (jq, etc.) get a
       // single JSON literal argument.
       const json = JSON.stringify(value);
-      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir) : json;
+      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, artifactsDir) : json;
     }
   );
 }
