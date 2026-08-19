@@ -1883,7 +1883,16 @@ async function executeNodeInternal(
             );
           }
         }
-        if (msg.cost !== undefined) nodeCostUsd = msg.cost;
+        if (msg.cost !== undefined) {
+          if (Number.isFinite(msg.cost)) {
+            nodeCostUsd = msg.cost;
+          } else {
+            getLog().warn(
+              { nodeId: node.id, costUsd: msg.cost },
+              'dag_node.usage_cost_non_finite_ignored'
+            );
+          }
+        }
         if (msg.stopReason !== undefined) nodeStopReason = msg.stopReason;
         if (msg.numTurns !== undefined) nodeNumTurns = msg.numTurns;
         // Assigned UNCONDITIONALLY. A guarded assignment cannot CLEAR a stale value:
@@ -4750,7 +4759,14 @@ async function executeLoopNode(
             // Overwrite, don't accumulate — a later result in the same iteration
             // (background-task wait, #2083) carries session-cumulative values.
             if (msg.cost !== undefined) {
-              iterationCost = msg.cost;
+              if (Number.isFinite(msg.cost)) {
+                iterationCost = msg.cost;
+              } else {
+                getLog().warn(
+                  { nodeId: node.id, iteration: i, costUsd: msg.cost },
+                  'loop_node.usage_cost_non_finite_ignored'
+                );
+              }
             }
             if (msg.tokens !== undefined) {
               // Provider-supplied numbers — see the NaN guard rationale at the

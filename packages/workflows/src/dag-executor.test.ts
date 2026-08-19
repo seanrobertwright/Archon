@@ -10728,6 +10728,61 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     expect(cost).toBeCloseTo(0.03, 5);
   });
 
+  it('best-effort provider: a non-finite reask cost does not erase prior valid cost', async () => {
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield { type: 'result', sessionId: 's1', structuredOutput: { other: 'x' }, cost: 0.01 };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 's2',
+        structuredOutput: { verdict: 'review' },
+        cost: Number.NaN,
+      };
+    });
+
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      {
+        name: 'reask-nan-cost',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      makeWorkflowRun(),
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' }
+    );
+
+    expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.01 }]);
+    expect(
+      (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+        call => call[1] === 'dag_node.usage_cost_non_finite_ignored'
+      )
+    ).toBe(true);
+  });
+
   it('best-effort provider: reask exhaustion fails loudly', async () => {
     // Every attempt returns invalid structured output → fail after 1 + maxReasks (3) tries.
     mockSendQueryDag.mockImplementation(async function* () {
@@ -12760,16 +12815,24 @@ describe('executeDagWorkflow -- cost tracking', () => {
     expect(completeCalls[0][1]).not.toHaveProperty('total_cost_usd');
   });
 
-  it('accumulates cost across loop iterations', async () => {
+  it('accumulates finite loop costs and ignores a later non-finite cost', async () => {
     let callCount = 0;
     mockSendQueryDag.mockImplementation(async function* () {
       callCount++;
-      if (callCount < 3) {
+      if (callCount < 4) {
         yield { type: 'assistant', content: 'Still working...' };
-        yield { type: 'result', sessionId: `loop-sid-${String(callCount)}`, cost: 0.001 };
+        yield {
+          type: 'result',
+          sessionId: `loop-sid-${String(callCount)}`,
+          cost: callCount < 3 ? 0.001 : 0.002,
+        };
       } else {
         yield { type: 'assistant', content: 'All done! <promise>COMPLETE</promise>' };
-        yield { type: 'result', sessionId: `loop-sid-${String(callCount)}`, cost: 0.002 };
+        yield {
+          type: 'result',
+          sessionId: `loop-sid-${String(callCount)}`,
+          cost: Number.NaN,
+        };
       }
     });
 
@@ -12803,8 +12866,13 @@ describe('executeDagWorkflow -- cost tracking', () => {
       minimalConfig
     );
 
-    // 3 iterations: 0.001 + 0.001 + 0.002 = 0.004
+    // The final NaN is omitted without erasing the first three iterations.
     expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.004 }]);
+    expect(
+      (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+        call => call[1] === 'loop_node.usage_cost_non_finite_ignored'
+      )
+    ).toBe(true);
   });
 });
 
@@ -13053,7 +13121,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     ]);
     expect(
       (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
-        call => call[1] === 'dag.usage_cost_non_finite_ignored'
+        call => call[1] === 'dag_node.usage_cost_non_finite_ignored'
       )
     ).toBe(true);
   });
