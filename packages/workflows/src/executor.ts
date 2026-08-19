@@ -15,6 +15,7 @@ import type {
   WorkflowRun,
   WorkflowExecutionResult,
   WorkflowSource,
+  WorkflowRunNodeSession,
 } from './schemas';
 import {
   isLoopNode,
@@ -438,11 +439,13 @@ type ResumePayload =
       preCreatedRun: WorkflowRun;
       priorCompletedNodes?: Map<string, string>;
       priorUsage?: PriorRunUsage;
+      priorNodeSessions?: readonly WorkflowRunNodeSession[];
     }
   | {
       preCreatedRun?: undefined;
       priorCompletedNodes?: undefined;
       priorUsage?: undefined;
+      priorNodeSessions?: undefined;
     };
 
 /**
@@ -579,6 +582,7 @@ export async function hydrateResumableRun(
   preCreatedRun: WorkflowRun;
   priorCompletedNodes: Map<string, string>;
   priorUsage: PriorRunUsage;
+  priorNodeSessions: WorkflowRunNodeSession[];
 } | null> {
   const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
   const priorCompletedNodes = snapshot.completedNodeOutputs;
@@ -598,6 +602,10 @@ export async function hydrateResumableRun(
     );
     return null;
   }
+  const completedNodeIds = new Set(priorCompletedNodes.keys());
+  const priorNodeSessions = (await deps.store.listWorkflowRunNodeSessions(candidate.id)).filter(
+    row => completedNodeIds.has(row.node_id)
+  );
   const preCreatedRun = await deps.store.resumeWorkflowRun(candidate.id);
   getLog().info(
     { workflowRunId: preCreatedRun.id, priorCompletedCount: priorCompletedNodes.size },
@@ -607,6 +615,7 @@ export async function hydrateResumableRun(
     preCreatedRun,
     priorCompletedNodes,
     priorUsage: { tokens: snapshot.tokens, costUsd: snapshot.costUsd },
+    priorNodeSessions,
   };
 }
 
@@ -1159,6 +1168,7 @@ export async function executeWorkflow(
     preCreatedRun,
     priorCompletedNodes,
     priorUsage,
+    priorNodeSessions,
     userId,
     source,
     parseWarnings,
@@ -1376,7 +1386,7 @@ export async function executeWorkflow(
   if (preCreatedRun && priorCompletedNodes !== undefined) {
     const resumeMsg =
       priorCompletedNodes.size > 0
-        ? `▶️ **Resuming** workflow \`${workflow.name}\` — skipping ${String(priorCompletedNodes.size)} already-completed node(s).\n\nNote: AI session context from prior nodes is not restored. Nodes that depend on prior context may need to re-read artifacts.`
+        ? `▶️ **Resuming** workflow \`${workflow.name}\` — skipping ${String(priorCompletedNodes.size)} already-completed node(s).`
         : `▶️ **Resuming** workflow \`${workflow.name}\` — continuing interactive loop.`;
     await safeSendMessage(platform, conversationId, resumeMsg);
   }
@@ -1915,7 +1925,8 @@ export async function executeWorkflow(
       // `isolation: 'worktree'` child gets its own worktree cwd.
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
         runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
-      dagPriorUsage
+      dagPriorUsage,
+      priorNodeSessions
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

@@ -182,6 +182,12 @@ function createMockStore(): MockWorkflowStore {
     getCodebase: mock<IWorkflowStore['getCodebase']>(async _id => null),
     getCodebaseEnvVars: mock<IWorkflowStore['getCodebaseEnvVars']>(async _codebaseId => ({})),
     getWorkflowNodeSession: mock<IWorkflowStore['getWorkflowNodeSession']>(async _key => null),
+    listWorkflowRunNodeSessions: mock<IWorkflowStore['listWorkflowRunNodeSessions']>(
+      async _workflowRunId => []
+    ),
+    upsertWorkflowRunNodeSession: mock<IWorkflowStore['upsertWorkflowRunNodeSession']>(
+      async _params => {}
+    ),
     upsertWorkflowNodeSession: mock<IWorkflowStore['upsertWorkflowNodeSession']>(
       async _params => {}
     ),
@@ -213,6 +219,7 @@ function runUsageWrites(store: ReturnType<typeof createMockStore>): Record<strin
 /** All-true capabilities for Claude mock */
 const mockClaudeCapabilities = () => ({
   sessionResume: true,
+  sessionFork: true,
   mcp: true,
   hooks: true,
   skills: true,
@@ -19598,6 +19605,399 @@ describe('executeDagWorkflow -- loop_group body step_name namespacing (#2090)', 
     // The group was skipped via its own id, and finalize genuinely ran.
     expect(eventsWith(store, 'node_skipped_prior_success', 'fixer').length).toBe(1);
     expect(eventsWith(store, 'node_completed', 'finalize').length).toBe(1);
+  });
+});
+
+describe('executeDagWorkflow -- addressable session resume', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-addressable-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  async function runAddressableWorkflow(
+    nodes: DagNode[],
+    store = createMockStore(),
+    priorCompletedNodes?: Map<string, string>,
+    priorNodeSessions?: Array<{
+      workflow_run_id: string;
+      node_id: string;
+      provider: string;
+      provider_session_id: string;
+      created_at: string;
+      updated_at: string;
+    }>
+  ): Promise<MockWorkflowStore> {
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-addressable',
+      testDir,
+      { name: 'addressable', nodes },
+      makeWorkflowRun('addressable-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      priorNodeSessions
+    );
+    return store;
+  }
+
+  it('forks interleaved writer and reviewer lineages from each named ancestor', async () => {
+    const sessionsByPrompt: Record<string, string> = {
+      writer1: 'session-writer-1',
+      reviewer1: 'session-reviewer-1',
+      writer2: 'session-writer-2',
+      reviewer2: 'session-reviewer-2',
+      writer3: 'session-writer-3',
+    };
+    mockSendQueryDag.mockImplementation(async function* (prompt, _cwd, resumeSessionId) {
+      yield { type: 'assistant', content: `done ${prompt}` };
+      yield {
+        type: 'result',
+        sessionId: sessionsByPrompt[prompt],
+        ...(resumeSessionId !== undefined ? { resumed: true } : {}),
+      };
+    });
+
+    const store = await runAddressableWorkflow([
+      { id: 'writer1', prompt: 'writer1' },
+      { id: 'reviewer1', prompt: 'reviewer1', context: 'fresh', depends_on: ['writer1'] },
+      {
+        id: 'writer2',
+        prompt: 'writer2',
+        context: { resume: 'writer1' },
+        depends_on: ['reviewer1'],
+      },
+      {
+        id: 'reviewer2',
+        prompt: 'reviewer2',
+        context: { resume: 'reviewer1' },
+        depends_on: ['writer2'],
+      },
+      {
+        id: 'writer3',
+        prompt: 'writer3',
+        context: { resume: 'writer2' },
+        depends_on: ['reviewer2'],
+      },
+    ]);
+
+    expect(mockSendQueryDag.mock.calls.map(call => call[2])).toEqual([
+      undefined,
+      undefined,
+      'session-writer-1',
+      'session-reviewer-1',
+      'session-writer-2',
+    ]);
+    expect(mockSendQueryDag.mock.calls.slice(2).every(call => call[3]?.forkSession === true)).toBe(
+      true
+    );
+
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+    const writer2Started = events.find(
+      event => event.event_type === 'node_started' && event.step_name === 'writer2'
+    );
+    const writer2Completed = events.find(
+      event => event.event_type === 'node_completed' && event.step_name === 'writer2'
+    );
+    expect(writer2Started?.data).toMatchObject({
+      session_source_node_id: 'writer1',
+      session_fork_requested: true,
+    });
+    expect(writer2Completed?.data).toMatchObject({
+      session_source_node_id: 'writer1',
+      session_forked: true,
+    });
+    const serializedEvents = JSON.stringify(events);
+    for (const sessionId of Object.values(sessionsByPrompt)) {
+      expect(serializedEvents).not.toContain(sessionId);
+    }
+  });
+
+  it('forks parallel consumers from the same immutable source without replacing it', async () => {
+    let sequence = 0;
+    mockSendQueryDag.mockImplementation(async function* (prompt, _cwd, resumeSessionId) {
+      sequence++;
+      yield { type: 'assistant', content: prompt };
+      yield {
+        type: 'result',
+        sessionId: prompt === 'source' ? 'source-session' : `branch-${String(sequence)}`,
+        ...(resumeSessionId !== undefined ? { resumed: true } : {}),
+      };
+    });
+
+    await runAddressableWorkflow([
+      { id: 'source', prompt: 'source' },
+      {
+        id: 'lens-a',
+        prompt: 'lens-a',
+        context: { resume: 'source' },
+        depends_on: ['source'],
+      },
+      {
+        id: 'lens-b',
+        prompt: 'lens-b',
+        context: { resume: 'source' },
+        depends_on: ['source'],
+      },
+      {
+        id: 'synthesis',
+        prompt: 'synthesis',
+        context: { resume: 'source' },
+        depends_on: ['lens-a', 'lens-b'],
+      },
+    ]);
+
+    const namedCalls = mockSendQueryDag.mock.calls.filter(call => call[0] !== 'source');
+    expect(namedCalls.map(call => call[2])).toEqual([
+      'source-session',
+      'source-session',
+      'source-session',
+    ]);
+    expect(namedCalls.every(call => call[3]?.forkSession === true)).toBe(true);
+  });
+
+  it('hydrates a completed source handle and forks it after a cold resume', async () => {
+    mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, resumeSessionId) {
+      yield { type: 'assistant', content: 'resumed synthesis' };
+      yield { type: 'result', sessionId: 'cold-branch', resumed: resumeSessionId !== undefined };
+    });
+
+    await runAddressableWorkflow(
+      [
+        { id: 'source', prompt: 'must be skipped' },
+        {
+          id: 'synthesis',
+          prompt: 'synthesize',
+          context: { resume: 'source' },
+          depends_on: ['source'],
+        },
+      ],
+      createMockStore(),
+      new Map([['source', 'prior output']]),
+      [
+        {
+          workflow_run_id: 'addressable-run',
+          node_id: 'source',
+          provider: 'claude',
+          provider_session_id: 'cold-source',
+          created_at: '2026-08-19T00:00:00Z',
+          updated_at: '2026-08-19T00:00:00Z',
+        },
+      ]
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(mockSendQueryDag.mock.calls[0][2]).toBe('cold-source');
+    expect(mockSendQueryDag.mock.calls[0][3]?.forkSession).toBe(true);
+  });
+
+  it('gives a named source precedence over the consumer persisted-session lookup', async () => {
+    mockSendQueryDag.mockImplementation(async function* (prompt, _cwd, resumeSessionId) {
+      yield { type: 'assistant', content: prompt };
+      yield {
+        type: 'result',
+        sessionId: prompt === 'source' ? 'named-source' : 'named-branch',
+        ...(resumeSessionId !== undefined ? { resumed: true } : {}),
+      };
+    });
+    const store = createMockStore();
+    (store.getWorkflowNodeSession as Mock<typeof store.getWorkflowNodeSession>).mockResolvedValue({
+      workflow_name: 'addressable',
+      node_id: 'consumer',
+      scope_key: 'conv-dag',
+      provider: 'claude',
+      provider_session_id: 'persisted-consumer-session',
+      last_run_id: 'old-run',
+      created_at: '2026-08-19T00:00:00Z',
+      updated_at: '2026-08-19T00:00:00Z',
+    });
+
+    await runAddressableWorkflow(
+      [
+        { id: 'source', prompt: 'source' },
+        {
+          id: 'consumer',
+          prompt: 'consumer',
+          context: { resume: 'source' },
+          persist_session: true,
+          depends_on: ['source'],
+        },
+      ],
+      store
+    );
+
+    expect(store.getWorkflowNodeSession).not.toHaveBeenCalled();
+    expect(mockSendQueryDag.mock.calls[1][2]).toBe('named-source');
+    expect(store.upsertWorkflowNodeSession).toHaveBeenCalledWith(
+      expect.objectContaining({ node_id: 'consumer', provider_session_id: 'named-branch' })
+    );
+  });
+
+  it('fails before the consumer runs when the source completed without a session', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'source output' };
+      yield { type: 'result' };
+    });
+    const store = await runAddressableWorkflow([
+      { id: 'source', prompt: 'source' },
+      {
+        id: 'consumer',
+        prompt: 'consumer',
+        context: { resume: 'source' },
+        depends_on: ['source'],
+      },
+    ]);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    const failedEvents = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      )
+      .filter(event => event.event_type === 'node_failed' && event.step_name === 'consumer');
+    expect(failedEvents[0]?.data).toMatchObject({ session_source_node_id: 'source' });
+  });
+
+  it('fails a named fork on cold fallback, a missing branch ID, or source ID reuse', async () => {
+    const cases = [
+      { name: 'cold fallback', sessionId: 'cold-branch', resumed: false },
+      { name: 'missing branch', sessionId: undefined, resumed: true },
+      { name: 'source reuse', sessionId: 'source-session', resumed: true },
+    ];
+
+    for (const failureCase of cases) {
+      mockSendQueryDag.mockClear();
+      mockSendQueryDag.mockImplementation(async function* (prompt) {
+        yield { type: 'assistant', content: prompt };
+        if (prompt === 'source') {
+          yield { type: 'result', sessionId: 'source-session' };
+        } else {
+          yield {
+            type: 'result',
+            sessionId: failureCase.sessionId,
+            resumed: failureCase.resumed,
+          };
+        }
+      });
+      const store = await runAddressableWorkflow([
+        { id: 'source', prompt: 'source' },
+        {
+          id: 'consumer',
+          prompt: 'consumer',
+          context: { resume: 'source' },
+          depends_on: ['source'],
+          retry: { max_attempts: 0 },
+        },
+      ]);
+
+      expect(store.failWorkflowRun, failureCase.name).toHaveBeenCalled();
+      const completedConsumer = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+        .map(call => call[0] as { event_type: string; step_name?: string })
+        .some(event => event.event_type === 'node_completed' && event.step_name === 'consumer');
+      expect(completedConsumer, failureCase.name).toBe(false);
+      expect(mockSendQueryDag.mock.calls[1][2], failureCase.name).toBe('source-session');
+    }
+  });
+
+  it('fails before provider execution on runtime mismatch or missing fork capability', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'must not run' };
+      yield { type: 'result', sessionId: 'unexpected' };
+    });
+    const priorCompleted = new Map([['source', 'prior output']]);
+    const priorSession = {
+      workflow_run_id: 'addressable-run',
+      node_id: 'source',
+      provider: 'pi',
+      provider_session_id: 'pi-source',
+      created_at: '2026-08-19T00:00:00Z',
+      updated_at: '2026-08-19T00:00:00Z',
+    };
+    const nodes: DagNode[] = [
+      { id: 'source', prompt: 'skipped' },
+      {
+        id: 'consumer',
+        prompt: 'consumer',
+        context: { resume: 'source' },
+        depends_on: ['source'],
+      },
+    ];
+
+    const mismatchStore = await runAddressableWorkflow(nodes, createMockStore(), priorCompleted, [
+      priorSession,
+    ]);
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    expect(mismatchStore.failWorkflowRun).toHaveBeenCalled();
+
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: () => ({ ...mockClaudeCapabilities(), sessionFork: false }),
+    }));
+    const capabilityStore = await runAddressableWorkflow(nodes, createMockStore(), priorCompleted, [
+      { ...priorSession, provider: 'claude' },
+    ]);
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    expect(capabilityStore.failWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('fails the workflow when a required run-scoped handle checkpoint cannot be saved', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'source' };
+      yield { type: 'result', sessionId: 'source-session' };
+    });
+    const store = createMockStore();
+    (
+      store.upsertWorkflowRunNodeSession as Mock<typeof store.upsertWorkflowRunNodeSession>
+    ).mockRejectedValue(new Error('checkpoint failed'));
+
+    await expect(
+      runAddressableWorkflow(
+        [
+          { id: 'source', prompt: 'source' },
+          { id: 'later', prompt: 'later', depends_on: ['source'] },
+        ],
+        store
+      )
+    ).rejects.toThrow('checkpoint failed');
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -193,6 +193,8 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     releaseWritebackClaim: mock(async () => {}),
     cancelWorkflowRun: mock(async () => ({ cancelled: false })),
     getWorkflowNodeSession: mock(async () => null),
+    listWorkflowRunNodeSessions: mock(async () => []),
+    upsertWorkflowRunNodeSession: mock(async () => {}),
     upsertWorkflowNodeSession: mock(async () => {}),
     deleteWorkflowNodeSessions: mock(async () => ({ deleted: 0 })),
     ...overrides,
@@ -1237,6 +1239,16 @@ describe('executeWorkflow', () => {
       const costUsd = 0.25;
       const store = makeStore({
         getDagResumeSnapshot: mock(async () => ({ completedNodeOutputs, tokens, costUsd })),
+        listWorkflowRunNodeSessions: mock(async () => [
+          {
+            workflow_run_id: 'failed-run',
+            node_id: 'node-a',
+            provider: 'claude',
+            provider_session_id: 'source-session',
+            created_at: '2026-08-19T00:00:00Z',
+            updated_at: '2026-08-19T00:00:00Z',
+          },
+        ]),
         resumeWorkflowRun: mock(async () => resumed),
       });
       const deps = makeDeps(store);
@@ -1261,6 +1273,7 @@ describe('executeWorkflow', () => {
       // Both usage axes travel as one `priorUsage` bundle (#2469) — cost is restored
       // across resume exactly like tokens, so a resumed run's total never regresses.
       expect(dagCall?.[24]).toEqual({ tokens, costUsd });
+      expect(dagCall?.[25]).toEqual(hydrated.priorNodeSessions);
       expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
   });
@@ -2051,6 +2064,24 @@ describe('hydrateResumableRun', () => {
         tokens: { input: 40, output: 4 },
         costUsd: 0.75,
       })),
+      listWorkflowRunNodeSessions: mock(async () => [
+        {
+          workflow_run_id: 'prior-failed',
+          node_id: 'n1',
+          provider: 'claude',
+          provider_session_id: 'session-n1',
+          created_at: '2026-08-19T00:00:00Z',
+          updated_at: '2026-08-19T00:00:00Z',
+        },
+        {
+          workflow_run_id: 'prior-failed',
+          node_id: 'not-completed',
+          provider: 'claude',
+          provider_session_id: 'must-be-filtered',
+          created_at: '2026-08-19T00:00:00Z',
+          updated_at: '2026-08-19T00:00:00Z',
+        },
+      ]),
       resumeWorkflowRun: mock(async () => resumed),
     });
     const deps = makeDeps(store);
@@ -2059,6 +2090,8 @@ describe('hydrateResumableRun', () => {
     expect(result?.preCreatedRun).toBe(resumed);
     expect(result?.priorCompletedNodes).toBe(priorNodes);
     expect(result?.priorUsage).toEqual({ tokens: { input: 40, output: 4 }, costUsd: 0.75 });
+    expect(result?.priorNodeSessions.map(row => row.node_id)).toEqual(['n1']);
+    expect(store.listWorkflowRunNodeSessions).toHaveBeenCalledWith('prior-failed');
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('prior-failed');
   });
 

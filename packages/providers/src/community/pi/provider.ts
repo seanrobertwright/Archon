@@ -568,7 +568,11 @@ export class PiProvider implements IAgentProvider {
     //    was provided but not found, it falls through to a new session and
     //    the caller surfaces a resume_failed warning (matches the Codex
     //    provider's fallback pattern for the same condition).
-    const { sessionManager, resumeFailed } = await resolvePiSession(cwd, resumeSessionId);
+    const { sessionManager, resumeFailed } = await resolvePiSession(
+      cwd,
+      resumeSessionId,
+      requestOptions?.forkSession
+    );
     if (resumeFailed) {
       yield {
         type: 'system',

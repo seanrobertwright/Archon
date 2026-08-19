@@ -106,8 +106,12 @@ mock.module('../db/env-vars', () => ({
 }));
 mock.module('../db/workflow-node-sessions', () => ({
   getWorkflowNodeSession: mock(() => Promise.resolve(null)),
-  setWorkflowNodeSession: mock(() => Promise.resolve()),
+  upsertWorkflowNodeSession: mock(() => Promise.resolve()),
   deleteWorkflowNodeSessions: mock(() => Promise.resolve()),
+}));
+mock.module('../db/workflow-run-node-sessions', () => ({
+  listWorkflowRunNodeSessions: mock(() => Promise.resolve([])),
+  upsertWorkflowRunNodeSession: mock(() => Promise.resolve()),
 }));
 
 const { createWorkflowStore, createWorkflowDeps } = await import('./store-adapter');
@@ -135,6 +139,11 @@ describe('createWorkflowStore', () => {
       'getDagResumeSnapshot',
       'getCodebase',
       'getCodebaseEnvVars',
+      'getWorkflowNodeSession',
+      'upsertWorkflowNodeSession',
+      'deleteWorkflowNodeSessions',
+      'listWorkflowRunNodeSessions',
+      'upsertWorkflowRunNodeSession',
     ];
     for (const method of requiredMethods) {
       expect(typeof store[method]).toBe('function');

@@ -216,7 +216,7 @@ nodes:
 | `depends_on` | string[] | `[]` | Node IDs that must complete before this node runs |
 | `when` | string | — | Condition expression. Node is skipped if false. See [Condition Syntax](#when-condition-syntax) |
 | `trigger_rule` | string | `all_success` | Join semantics when multiple upstreams exist. Distinct from a fan-out node's [`fan_out.join`](#the-four-fields), which reduces one node's N children and defaults to `all_done` |
-| `context` | `'fresh'` \| `'shared'` | — | `fresh` = new session; `shared` = inherit from prior node. Defaults to `fresh` for parallel layers, inherited for sequential |
+| `context` | `'fresh'` \| `'shared'` \| `{ resume: node-id }` | — | `fresh` = new session; `shared` = inherit from the ambient prior node; `resume` = fork the exact completed upstream node's session. Defaults to `fresh` for parallel layers, inherited for sequential |
 | `idle_timeout` | number | — | Kill node if idle for this many milliseconds |
 | `retry` | object | — | Per-node retry configuration. See [Retry Configuration](#retry-configuration) |
 | `always_run` | boolean | `false` | Opt out of resume caching: re-run this node on resume even if a prior run completed it. See [Opting Out of Resume Caching](#opting-out-of-resume-caching) |
@@ -243,6 +243,45 @@ nodes:
 | `betas` | string[] | — | SDK beta feature flags (e.g., `'context-1m-2025-08-07'`). Claude only. Also settable at workflow level |
 | `sandbox` | object | — | OS-level filesystem/network restrictions for the Claude subprocess. Claude only. Also settable at workflow level |
 | `settingSources` | (`'project'`\|`'user'`)[] | inherited | Which filesystem setting sources Claude discovers (CLAUDE.md, skills, commands, agents). Workflow `skills:` remains the exact active skill set. Overrides the assistant-level default; unset everywhere = `['project', 'user']`. `[]` loads none. Claude only. Per-node only |
+
+### Addressable session ancestry
+
+Dependency edges determine execution and `$node.output` carries data. When a later command or prompt must continue one particular AI conversation instead of the latest ambient session, name that completed upstream node:
+
+```yaml
+provider: claude
+nodes:
+  - id: scope
+    prompt: Scope the work
+
+  - id: lens-a
+    prompt: Review one aspect of $scope.output
+    context: fresh
+    depends_on: [scope]
+
+  - id: lens-b
+    prompt: Review another aspect of $scope.output
+    context: fresh
+    depends_on: [scope]
+
+  - id: synthesize
+    prompt: Synthesize $lens-a.output and $lens-b.output
+    context:
+      resume: scope
+    depends_on: [lens-a, lens-b]
+```
+
+`synthesize` forks the exact provider session produced by `scope`; the parallel lenses do not change that ancestry. The source must be a transitively upstream command, prompt, or plain `loop:` node, and the consumer must be a command or prompt node. Addressable resume is not supported inside `loop_group` bodies.
+
+This is an exact, immutable fork contract:
+
+- Source and consumer must resolve to the same provider.
+- Claude and Pi support immutable forks. Codex explicitly does not; an omitted fork capability is also unsupported.
+- A missing source handle, unavailable prior context, missing branch handle, or provider that reuses the source session fails the node. Named resume never falls back to a fresh session.
+- Two parallel consumers may name the same source; each receives its own branch while the source remains unchanged.
+- Run resume restores these private handles for completed nodes, so a pause or process restart does not lose declared ancestry. Session IDs remain outside workflow events and API payloads.
+
+This is separate from `persist_session`: `{ resume: source }` selects ancestry within one governed run, while `persist_session` continues the same node across separate workflow invocations. If both apply to a consumer, the named source wins for the current invocation and the resulting branch is still saved for its next invocation.
 
 ### Claude SDK Advanced Options
 
@@ -684,7 +723,7 @@ When a `nodes:` (DAG) workflow fails, the prior run stays in the database as a c
 
 **What happens on resume:**
 
-1. The CLI / orchestrator looks up the resumable run, loads its `node_completed` events to determine which nodes finished successfully, and transitions the row back to `running`.
+1. The CLI / orchestrator looks up the resumable run, loads its `node_completed` events and private addressable-session handles, then transitions the row back to `running`.
 2. Completed nodes are skipped; only failed and not-yet-run nodes are executed.
 3. You receive a platform message like: `Resuming workflow — skipping 3 already-completed node(s).`
 
@@ -699,7 +738,7 @@ Once the row reaches a terminal status, you can resume it explicitly via the pat
 
 > Not to be confused with `archon workflow cleanup [days]`, which **deletes** old terminal runs (`completed`/`failed`/`cancelled`) from the database for disk hygiene. It does not transition `running` rows.
 
-**Known limitation**: AI session context from prior nodes is not restored. If a downstream node relies on in-context knowledge from a prior run's session (rather than artifacts), it may need to re-read those artifacts explicitly.
+**Session context on resume**: Handles required by an explicit `context: { resume: node-id }` selector are restored for completed nodes. The ambient sequential cursor is not reconstructed; a downstream node that relies on implicit inherited context should use an explicit selector or re-read durable artifacts.
 
 **Fresh start**: If zero nodes completed in the prior run, Archon starts fresh (no nodes to skip).
 
@@ -728,7 +767,7 @@ On resume, `fetch-data` re-runs regardless of prior success, so `process-data` r
 
 ## Persistent Sessions Across Re-Runs
 
-Different from resume: when you invoke the same workflow *again* with a follow-up prompt, every AI node normally starts fresh and pays to re-establish context. Set `persist_session: true` on a node to make its provider session ID stick across runs, so subsequent invocations continue the prior conversation for that role.
+Different from resuming a failed/paused run or selecting an upstream node with `context.resume`: when you invoke the same workflow *again* with a follow-up prompt, every AI node normally starts fresh and pays to re-establish context. Set `persist_session: true` on a node to make its provider session ID stick across runs, so subsequent invocations continue the prior conversation for that role.
 
 ```yaml
 name: feature-dev
@@ -784,6 +823,8 @@ When a workflow-level `persist_sessions: true` is combined with any of these nod
 ### `context: fresh` overrides
 
 A node with `context: fresh` skips persistence (and in-run threading). The explicit "always fresh" intent wins over `persist_session`.
+
+`context: { resume: source }` also wins over the consumer's saved cross-run session for that invocation. After the exact named fork succeeds, its new branch is saved normally when `persist_session` applies.
 
 ### Clearing memory
 

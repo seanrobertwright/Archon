@@ -2,6 +2,7 @@ import type { ProviderCapabilities } from '../types';
 
 export const CODEX_CAPABILITIES: ProviderCapabilities = {
   sessionResume: true,
+  sessionFork: false,
   mcp: true,
   hooks: false,
   // Codex has native filesystem skills, but does not implement Archon's per-node

@@ -441,7 +441,10 @@ export interface AgentRequestOptions {
   env?: Record<string, string>;
   maxBudgetUsd?: number;
   fallbackModel?: string;
-  /** Session fork flag — when true, copies prior session history before appending. */
+  /**
+   * Request an immutable fork of `resumeSessionId`. Callers must first verify
+   * that the provider advertises `sessionFork === true`.
+   */
   forkSession?: boolean;
   /** When false, skip writing session transcript to disk. */
   persistSession?: boolean;
@@ -579,6 +582,11 @@ export interface SendQueryOptions extends AgentRequestOptions {
  */
 export interface ProviderCapabilities {
   sessionResume: boolean;
+  /**
+   * Given a session ID, create a new session containing the source history
+   * while leaving the source unchanged. Omission means unsupported.
+   */
+  sessionFork?: boolean;
   mcp: boolean;
   hooks: boolean;
   skills: boolean;

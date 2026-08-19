@@ -51,6 +51,7 @@ import {
   isScriptNode,
   isWorkflowNode,
   isPersistableNode,
+  isNodeContextResume,
   INPUT_NAME_SOURCE,
 } from './schemas';
 import { createLogger } from '@archon/paths';
@@ -385,6 +386,9 @@ function rewriteNodeOutputRefs(
   const whenExpr = (text: string): string => applyWhenRefRename(text, renameOutputRef);
 
   if (node.when !== undefined) node.when = whenExpr(node.when);
+  if (isNodeContextResume(node.context)) {
+    node.context.resume = renameOutputRef(node.context.resume);
+  }
 
   // The composed-input stamp holds caller-supplied VALUES, which are live code/expression
   // ref surfaces exactly like `workflow.with` above it — a value naming a node of the

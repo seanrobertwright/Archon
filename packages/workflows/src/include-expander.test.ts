@@ -94,6 +94,27 @@ describe('expandWorkflowIncludes — namespacing', () => {
     expect(nodeById(expanded, 'review__impl')?.depends_on).toEqual(['review__scope']);
   });
 
+  test('rewrites named session sources through nested include namespaces', () => {
+    const leaf = wf('leaf-lineage', [
+      { id: 'source', prompt: 'scope' },
+      {
+        id: 'consumer',
+        prompt: 'continue',
+        depends_on: ['source'],
+        context: { resume: 'source' },
+      },
+    ]);
+    const middle = wf('middle-lineage', [{ id: 'inner', include: 'leaf-lineage' }]);
+    const parent = wf('parent-lineage', [{ id: 'outer', include: 'middle-lineage' }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(leaf, middle, parent));
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get('parent-lineage')!;
+    const consumer = nodeById(expanded, 'outer__inner__consumer');
+    expect(consumer?.context).toEqual({ resume: 'outer__inner__source' });
+    expect(consumer?.depends_on).toEqual(['outer__inner__source']);
+  });
+
   test('entry node inherits the include node upstream deps; sinks feed downstream refs', () => {
     const parent = wf('parent', [
       { id: 'setup', bash: 'echo setup' },

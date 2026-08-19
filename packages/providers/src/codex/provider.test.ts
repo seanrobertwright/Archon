@@ -94,6 +94,7 @@ describe('CodexProvider', () => {
       const caps = client.getCapabilities();
       expect(caps).toEqual({
         sessionResume: true,
+        sessionFork: false,
         mcp: true,
         hooks: false,
         skills: false,

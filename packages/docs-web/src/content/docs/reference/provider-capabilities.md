@@ -36,6 +36,7 @@ per-node YAML field for that provider; a ❌ means the field is accepted but ign
 | Capability | `claude` | `codex` | `opencode` | `pi` | `copilot` |
 | --- | --- | --- | --- | --- | --- |
 | Session resume | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Immutable session fork (`context.resume`) | ✅ | ❌ | ❌ | ✅ | ❌ |
 | MCP servers (`mcp:`) | ✅ | ✅ | ❌ | ❌ | ✅ |
 | Hooks (`hooks:`) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Skills (`skills:`) | ✅ | ❌ | ❌ | ✅ | ✅ |

@@ -14,6 +14,7 @@ import {
   isIncludeNode,
   isWorkflowNode,
   isPersistableNode,
+  isNodeContextResume,
 } from './schemas';
 import { createLogger } from '@archon/paths';
 import {
@@ -473,6 +474,19 @@ export function validateDagStructure(
     return `Cycle detected among nodes: ${cycleNodes.join(', ')}`;
   }
 
+  const directDeps = new Map<string, string[]>(nodes.map(n => [n.id, n.depends_on ?? []]));
+  const transitiveDepsOf = (nodeId: string): Set<string> => {
+    const seen = new Set<string>();
+    const stack = [...(directDeps.get(nodeId) ?? [])];
+    while (stack.length > 0) {
+      const dep = stack.pop();
+      if (dep === undefined || seen.has(dep)) continue;
+      seen.add(dep);
+      stack.push(...(directDeps.get(dep) ?? []));
+    }
+    return seen;
+  };
+
   // Check $nodeId.output references across every public YAML field the executor substitutes at
   // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
   // (prompt, systemPrompt, agents.*.prompt/description, bash, script,
@@ -655,18 +669,24 @@ export function validateDagStructure(
   // (the ref resolves to nothing → the node fails closed at run time); catch it at
   // load time with an actionable message instead. A literal `items` with no `$…output`
   // ref is left to the runtime fail-closed check (it must still parse to an array).
-  const directDeps = new Map<string, string[]>(nodes.map(n => [n.id, n.depends_on ?? []]));
-  const transitiveDepsOf = (nodeId: string): Set<string> => {
-    const seen = new Set<string>();
-    const stack = [...(directDeps.get(nodeId) ?? [])];
-    while (stack.length > 0) {
-      const dep = stack.pop();
-      if (dep === undefined || seen.has(dep)) continue;
-      seen.add(dep);
-      stack.push(...(directDeps.get(dep) ?? []));
+  for (const node of nodes) {
+    if (!isNodeContextResume(node.context)) continue;
+    if (enclosingNodes !== undefined) {
+      return `Node '${node.id}' uses context.resume inside a loop_group body, which is not supported`;
     }
-    return seen;
-  };
+    const sourceId = node.context.resume;
+    const source = nodesById.get(sourceId);
+    if (source === undefined) {
+      return `Node '${node.id}' context.resume references unknown node '${sourceId}'`;
+    }
+    if (!isCommandNode(source) && !isPromptNode(source) && !isLoopNode(source)) {
+      return `Node '${node.id}' context.resume source '${sourceId}' is not a session-producing command, prompt, or loop node`;
+    }
+    if (!transitiveDepsOf(node.id).has(sourceId)) {
+      return `Node '${node.id}' context.resume source '${sourceId}' is not an upstream dependency`;
+    }
+  }
+
   for (const node of nodes) {
     if (!isWorkflowNode(node) || !node.fan_out) continue;
     const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);
@@ -846,6 +866,45 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
             errorType: 'validation_error',
           },
         };
+      }
+    }
+
+    for (const node of dagNodes) {
+      if (!isNodeContextResume(node.context)) continue;
+      const sourceNodeId = node.context.resume;
+      const source = dagNodes.find(candidate => candidate.id === sourceNodeId);
+      if (source === undefined) continue; // validateDagStructure already reports this case.
+
+      const consumerProvider = node.provider ?? provider;
+      const sourceProvider = source.provider ?? provider;
+      if (
+        consumerProvider !== undefined &&
+        sourceProvider !== undefined &&
+        consumerProvider !== sourceProvider
+      ) {
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error: `Node '${node.id}' context.resume source '${source.id}' uses provider '${sourceProvider}', but the consumer uses '${consumerProvider}'`,
+            errorType: 'validation_error',
+          },
+        };
+      }
+
+      const knownProvider = consumerProvider ?? sourceProvider;
+      if (knownProvider !== undefined && isRegisteredProvider(knownProvider)) {
+        const caps = getProviderCapabilities(knownProvider);
+        if (!caps.sessionResume || caps.sessionFork !== true) {
+          return {
+            workflow: null,
+            error: {
+              filename,
+              error: `Node '${node.id}' context.resume requires immutable session forks, but provider '${knownProvider}' does not support sessionFork`,
+              errorType: 'validation_error',
+            },
+          };
+        }
       }
     }
 

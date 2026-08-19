@@ -767,6 +767,40 @@ describe('SqliteAdapter', () => {
       expect(raw_pragma(currentDbPath, 'remote_agent_workflow_runs')).toContain('output_root');
       expect(getSchemaSQL()).toContain('output_root');
     });
+
+    test('run-scoped session handles cascade with their workflow run in both schema shapes', async () => {
+      db = createTestDb();
+      await insertCodebase(db, 'cb-session-cascade');
+      await db.query(
+        `INSERT INTO remote_agent_conversations
+           (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['conv-session-cascade', 'web', 'thread-session-cascade', 'cb-session-cascade']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_workflow_runs
+           (id, conversation_id, workflow_name, user_message)
+         VALUES ($1, $2, $3, $4)`,
+        ['run-session-cascade', 'conv-session-cascade', 'lineage', 'test']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_workflow_run_node_sessions
+           (workflow_run_id, node_id, provider, provider_session_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['run-session-cascade', 'scope', 'claude', 'session-secret']
+      );
+
+      await db.query('DELETE FROM remote_agent_workflow_runs WHERE id = $1', [
+        'run-session-cascade',
+      ]);
+      const rows = await db.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_workflow_run_node_sessions'
+      );
+      expect(Number(rows.rows[0]?.count)).toBe(0);
+      expect(getSchemaSQL()).toMatch(
+        /remote_agent_workflow_run_node_sessions[\s\S]*workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs\(id\) ON DELETE CASCADE/
+      );
+    });
   });
 
   /**
