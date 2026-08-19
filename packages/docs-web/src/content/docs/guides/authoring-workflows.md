@@ -19,7 +19,7 @@ A workflow is a **YAML file** that defines a directed acyclic graph (DAG) of com
 - **Parallel execution**: Independent nodes run concurrently
 - **Conditional branching**: Route to different paths based on node output
 - **Artifact passing**: Output from one node becomes input for downstream nodes
-- **Iterative loops**: Loop nodes repeat until a completion signal
+- **Iterative loops**: Loop nodes repeat until a declared completion condition is met
 
 ```yaml
 name: fix-github-issue
@@ -201,8 +201,8 @@ nodes:
 | `prompt` | string | Inline prompt string |
 | `bash` | string | Shell script (no AI). Stdout captured as `$nodeId.output`; successful stdout is also stored in `node_completed.data.node_output` as an audit preview capped at 32 KiB (UTF-8 bytes). Optional `timeout` (ms, default 120000) |
 | `script` | string | TypeScript/JavaScript (via `bun`) or Python (via `uv`) — inline code or named reference. Packaged workflows resolve named scripts only from their own `scripts/`; legacy workflows use shared script directories. Stdout captured as `$nodeId.output`. Requires `runtime: bun` or `runtime: uv`. Optional `deps` (uv only) and `timeout` (ms, default 120000). See [Script Nodes](/guides/script-nodes/) |
-| `loop` | object | Iterative AI prompt until completion signal. See [Loop Nodes](/guides/loop-nodes/) |
-| `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a completion signal. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
+| `loop` | object | Iterative AI prompt until a declared completion condition is met. See [Loop Nodes](/guides/loop-nodes/) |
+| `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a declared completion condition is met. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
 | `approval` | object | Pauses workflow for human review. See [Approval Nodes](/guides/approval-nodes/) |
 | `cancel` | string | Terminates the workflow run with a reason string. Uses existing cancellation plumbing — in-flight parallel nodes are stopped |
 | `include` | string | Name of another workflow whose nodes are inlined into this DAG at load time as a namespaced sub-DAG. See [Composing Another Workflow](#composing-another-workflow-with-include) |
@@ -2425,7 +2425,7 @@ Two primitives handle human-in-the-loop iteration. Use the right one for your pa
 | User input variable | `$LOOP_USER_INPUT` | `$REJECTION_REASON` |
 | How it works | Same prompt runs each iteration, user input injected as variable | Specific on_reject prompt runs only on rejection |
 | Best for | **Conversational iteration** — explore, refine, review cycles where the AI and human go back and forth | **Gate-then-fix** — approve to proceed, or reject to trigger a specific corrective action |
-| Approval signal | AI emits the completion signal (`<promise>DONE</promise>`); a gate that paused on a signaled iteration finalizes on a bare approve | User explicitly approves or rejects via button/command |
+| Completion condition | A declared `until`, `until_bash`, or `until_field` channel completes; a gate that paused on a completed iteration finalizes on a bare approve | User explicitly approves or rejects via button/command |
 | Example | PIV loop: explore → user feedback → explore again | Report generation: generate → user rejects → AI revises specific section |
 
 **Interactive loop** (`loop.interactive: true`):
@@ -2445,11 +2445,11 @@ Two primitives handle human-in-the-loop iteration. Use the right one for your pa
 The AI runs each iteration, pauses for user input, and the user's text feeds into the next
 iteration via `$LOOP_USER_INPUT`. What an approve does depends on the paused iteration:
 
-- If the iteration **emitted the completion signal** (the gate says "Completion signal
-  detected"), approving with **no feedback** accepts the result — the node finalizes from
-  the already-computed output with no extra iteration. Approving **with** feedback runs
-  another iteration instead.
-- If it did **not** signal, any approve runs another iteration with your feedback.
+- If any declared completion channel completed the iteration (the gate names the channel
+  after `✅ Completion condition met via`), approving with **no feedback** accepts the
+  result — the node finalizes from the already-computed output with no extra iteration.
+  Approving **with** feedback runs another iteration instead.
+- If no completion condition was met, any approve runs another iteration with your feedback.
 
 For a loop that should complete autonomously on the signal (no gate at all on success —
 e.g. a validation that only needs a human on failure), add `signal_completes: true`. See
@@ -2550,6 +2550,6 @@ Before deploying a workflow:
 16. **`systemPrompt`** — override the default system prompt per node (Claude only)
 17. **`sandbox`** — OS-level filesystem/network restrictions per node or workflow (Claude only)
 18. **`output_type`** — tag a node's output with a semantic type; the engine writes a typed sidecar (`$ARTIFACTS_DIR/nodes/<id>.md` + `.meta.json`) for cross-node/cross-run lookup by type (any node type)
-19. **Loop nodes** — use `loop:` within a DAG node for iterative execution until completion signal
+19. **Loop nodes** — use `loop:` within a DAG node for iterative execution until a declared completion condition is met
 20. **Defaults as templates** — browse `.archon/workflows/defaults/` for real examples to copy and modify
 21. **Test thoroughly** — each command, the artifact flow, and edge cases

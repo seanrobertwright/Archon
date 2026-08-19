@@ -330,7 +330,8 @@ describe('manage_run — destructive confirmation gate', () => {
     const out = await tool.handler({ action: 'approve', runId: 'r1abcdef', confirm: true });
     expect(mockApprove).toHaveBeenCalledWith('r1abcdef-1234', undefined);
     expect(out).toContain('no feedback');
-    expect(out).toContain('finalizes');
+    expect(out).toContain('completion condition was met');
+    expect(out).not.toContain('completion signal');
   });
 
   test('approve with accept:true finalizes even when a message is present (#2074 E)', async () => {
@@ -363,7 +364,7 @@ describe('manage_run — destructive confirmation gate', () => {
     expect(out).toContain('another iteration');
   });
 
-  test('approve preview on a signal-bearing gate states the finalize/iterate effect (#2074 E)', async () => {
+  test('approve preview on a completed-condition gate states the finalize/iterate effect (#2074 E)', async () => {
     mockFindByPrefix.mockResolvedValue([
       makeRun({
         status: 'paused',
@@ -382,9 +383,13 @@ describe('manage_run — destructive confirmation gate', () => {
     const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
     // No confirm → preview. Bare args would finalize.
     const bare = await tool.handler({ action: 'approve', runId: 'r1abcdef' });
+    expect(bare).toContain('completion condition was met');
+    expect(bare).not.toContain('completionSignaled');
     expect(bare).toContain('FINALIZE');
     // A message would iterate.
     const withMsg = await tool.handler({ action: 'approve', runId: 'r1abcdef', message: 'redo' });
+    expect(withMsg).toContain('completion condition was met');
+    expect(withMsg).not.toContain('completionSignaled');
     expect(withMsg).toContain('ANOTHER iteration');
     expect(mockApprove).not.toHaveBeenCalled();
   });
