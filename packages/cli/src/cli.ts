@@ -615,6 +615,13 @@ async function main(): Promise<number> {
           }
 
           case 'status':
+            if (positionals[2] !== undefined) {
+              console.error(
+                'Usage: archon workflow status [--json] [--verbose] [--events]\n' +
+                  'To show a single run, use: archon workflow get <run-id>'
+              );
+              return 1;
+            }
             await workflowStatusCommand(
               jsonFlag,
               values.verbose as boolean | undefined,
@@ -624,7 +631,7 @@ async function main(): Promise<number> {
 
           case 'get': {
             const getRunId = positionals[2];
-            if (!getRunId) {
+            if (!getRunId || positionals[3] !== undefined) {
               console.error('Usage: archon workflow get <run-id> [--json] [--verbose] [--events]');
               return 1;
             }
@@ -767,14 +774,14 @@ async function main(): Promise<number> {
             const eventType = values.type as string | undefined;
             if (!runId) {
               console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
               );
               console.error('Error: --run-id is required');
               return 1;
             }
             if (!eventType) {
               console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
               );
               console.error('Error: --type is required');
               return 1;
@@ -795,7 +802,7 @@ async function main(): Promise<number> {
                 );
               }
             }
-            await workflowEventEmitCommand(runId, eventType, eventData);
+            await workflowEventEmitCommand(runId, eventType, eventData, effectiveCwd);
             break;
           }
 
