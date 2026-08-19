@@ -1646,6 +1646,7 @@ describe('expandWorkflowIncludes — composed-node metadata survives nesting', (
         entryTriggerRules: ['all_success'],
         when: "$outer__local-gate.output == 'local'",
         isEntry: true,
+        entryTriggerRule: 'all_success',
       },
     ]);
   });

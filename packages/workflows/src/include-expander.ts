@@ -183,10 +183,16 @@ function markComposedNode(node: DagNode, patch: ComposedNodeMeta): void {
       ...(patch.inputs !== undefined ? { inputs: patch.inputs } : {}),
       ...(patch.boundaries !== undefined
         ? {
-            boundaries: patch.boundaries.map(boundary => ({
-              ...structuredClone(boundary),
-              isEntry: false,
-            })),
+            boundaries: patch.boundaries.map(boundary => {
+              const clone = structuredClone(boundary);
+              if (!clone.isEntry) return clone;
+              return {
+                dependsOn: clone.dependsOn,
+                entryTriggerRules: clone.entryTriggerRules,
+                ...(clone.when !== undefined ? { when: clone.when } : {}),
+                isEntry: false,
+              };
+            }),
           }
         : {}),
     };
@@ -646,6 +652,20 @@ function inlineInclude(
       cn.id
     );
     const wasEntry = (cn.depends_on ?? []).length === 0;
+    const boundary: ComposedBlockBoundary = wasEntry
+      ? {
+          dependsOn: [...parentDeps],
+          entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
+          ...(includeNode.when !== undefined ? { when: includeNode.when } : {}),
+          isEntry: true,
+          entryTriggerRule: cn.trigger_rule ?? includeNode.trigger_rule ?? 'all_success',
+        }
+      : {
+          dependsOn: [...parentDeps],
+          entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
+          ...(includeNode.when !== undefined ? { when: includeNode.when } : {}),
+          isEntry: false,
+        };
 
     // Rewrite child-internal refs before inserting caller values. This ordering is
     // load-bearing: a caller ref such as `$gather.output` must remain parent-scoped even
@@ -662,14 +682,7 @@ function inlineInclude(
       ...(wasEntry ? { blockEntry: true as const } : {}),
       ...(hasActivationBoundary
         ? {
-            boundaries: [
-              {
-                dependsOn: [...parentDeps],
-                entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
-                ...(includeNode.when !== undefined ? { when: includeNode.when } : {}),
-                isEntry: wasEntry,
-              },
-            ],
+            boundaries: [boundary],
           }
         : {}),
     });

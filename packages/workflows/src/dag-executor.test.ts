@@ -18677,6 +18677,36 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     return [...workflows.get('multi-sink-parent')!.nodes];
   }
 
+  function expandedMixedEntryTriggerNodes(): DagNode[] {
+    const upstream = buildWf('upstream', [
+      { id: 'start', bash: 'echo start' },
+      { id: 'good', bash: 'echo good', depends_on: ['start'] },
+      {
+        id: 'bad',
+        bash: 'echo bad',
+        depends_on: ['start'],
+        when: "$start.output == 'never'",
+      },
+    ]);
+    const downstream = buildWf('downstream', [
+      { id: 'strict', bash: 'echo strict', trigger_rule: 'all_success' },
+      { id: 'lenient', bash: 'echo lenient', trigger_rule: 'one_success' },
+    ]);
+    const parent = buildWf('mixed-entry-parent', [
+      { id: 'up', include: 'upstream' },
+      { id: 'down', include: 'downstream', depends_on: ['up'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['upstream', upstream],
+        ['downstream', downstream],
+        ['mixed-entry-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...workflows.get('mixed-entry-parent')!.nodes];
+  }
+
   function eventList(deps: WorkflowDeps): Array<{ event_type: string; step_name: string }> {
     return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
       (call: unknown[]) => call[0] as { event_type: string; step_name: string }
@@ -18865,6 +18895,30 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     ]);
     expect(completed).toEqual(['gate']);
     expect(reused.filter(stepName => stepName.startsWith('review__'))).toEqual([]);
+  });
+
+  it("resume evaluates each cached block entry with that entry's trigger rule", async () => {
+    const priorCompletedNodes = new Map<string, string>([
+      ['up__start', 'start'],
+      ['up__good', 'good'],
+      ['down__strict', 'old-strict'],
+      ['down__lenient', 'old-lenient'],
+    ]);
+    const { events } = await executeExpanded(
+      expandedMixedEntryTriggerNodes(),
+      'inc-resume-mixed-entry-rules',
+      priorCompletedNodes
+    );
+    const skipped = events
+      .filter(event => event.event_type === 'node_skipped')
+      .map(event => event.step_name);
+    const reused = events
+      .filter(event => event.event_type === 'node_skipped_prior_success')
+      .map(event => event.step_name);
+
+    expect(skipped).toContain('down__strict');
+    expect(reused).toContain('down__lenient');
+    expect(reused).not.toContain('down__strict');
   });
 
   it('emits namespaced step_names and resolves $inc.output to the child terminal node', async () => {

@@ -25,13 +25,25 @@ export const COMPOSED_NODE = Symbol('archon.composed-node');
  * The caller-level predicate that decides whether one include instance is active.
  * Every descendant carries a copy because load-time expansion removes the include node.
  */
-export interface ComposedBlockBoundary {
+interface ComposedBlockBoundaryBase {
   dependsOn: string[];
   entryTriggerRules: [TriggerRule, ...TriggerRule[]];
   when?: string;
-  /** The node's own trigger/when fields already enforce this boundary at the entry. */
-  isEntry: boolean;
 }
+
+export type ComposedBlockBoundary = ComposedBlockBoundaryBase &
+  (
+    | {
+        /** The node's own trigger/when fields normally enforce this boundary at the entry. */
+        isEntry: true;
+        /** Resume needs this entry's rule rather than the block-wide rule set. */
+        entryTriggerRule: TriggerRule;
+      }
+    | {
+        isEntry: false;
+        entryTriggerRule?: never;
+      }
+  );
 
 /**
  * Per-node record of the workflow a node was AUTHORED in, attached when that

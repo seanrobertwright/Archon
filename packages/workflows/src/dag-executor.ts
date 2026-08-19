@@ -1364,7 +1364,11 @@ export function checkComposedBlockBoundaries(
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
     if (boundary.isEntry && !evaluateEntryBoundary) continue;
 
-    const dependencyEligible = boundary.entryTriggerRules.some(
+    const triggerRules =
+      boundary.isEntry && evaluateEntryBoundary
+        ? [boundary.entryTriggerRule]
+        : boundary.entryTriggerRules;
+    const dependencyEligible = triggerRules.some(
       rule => checkTriggerRuleForDependencies(boundary.dependsOn, rule, nodeOutputs) === 'run'
     );
     if (!dependencyEligible) return 'skip';
