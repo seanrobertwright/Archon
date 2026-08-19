@@ -1218,7 +1218,7 @@ describe('WorktreeProvider', () => {
       );
     });
 
-    test('keeps a durable external Git directory anchor after removing its linked checkout', async () => {
+    test('keeps a durable external Git directory anchor when the linked checkout is supplied', async () => {
       const worktreePath = git.toWorktreePath('/workspace/external-linked');
       const branchName = git.toBranchName('external-linked');
       getCanonicalRepoPathSpy.mockRejectedValue(
@@ -1227,6 +1227,7 @@ describe('WorktreeProvider', () => {
 
       const result = await provider.destroy(worktreePath, {
         branchName,
+        canonicalRepoPath: git.toRepoPath(worktreePath),
         deleteRemoteBranch: true,
       });
 

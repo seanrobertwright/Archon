@@ -240,7 +240,7 @@ export class WorktreeProvider implements IIsolationProvider {
     // Get canonical repo path - use provided path or derive from worktree
     let repoPath: string;
     if (options?.canonicalRepoPath) {
-      repoPath = options.canonicalRepoPath;
+      repoPath = (await getGitCommandAnchors(options.canonicalRepoPath)).durable;
     } else if (pathExists) {
       repoPath = (await getGitCommandAnchors(worktreePath)).durable;
     } else {
