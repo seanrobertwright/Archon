@@ -616,7 +616,7 @@ describe('expandWorkflowIncludes — nested', () => {
 
     expect(errors).toHaveLength(0);
     const group = nodeById(workflows.get('parent')!, 'outer__inner__group');
-    const repeat = group && 'loop_group' in group ? group.loop_group.nodes[0] : undefined;
+    const repeat = group?.loop_group?.nodes[0];
     expect(compiledLoopPrompt(repeat)).toBe(
       'Use $outer__inner__seed.output with bound value and continue.'
     );
@@ -732,12 +732,8 @@ describe('expandWorkflowIncludes — refs in Markdown code spans', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const gate = nodeById(workflows.get('parent')!, 'inc__gate');
-    expect(gate && 'approval' in gate ? gate.approval.message : '').toBe(
-      'Approve $inc__plan.output'
-    );
-    expect(gate && 'approval' in gate ? gate.approval.on_reject?.prompt : '').toBe(
-      'Revise $inc__plan.output'
-    );
+    expect(gate?.approval?.message ?? '').toBe('Approve $inc__plan.output');
+    expect(gate?.approval?.on_reject?.prompt ?? '').toBe('Revise $inc__plan.output');
   });
 
   // #2121 Phase 2: a `workflow:` (sub-run) node inside an included block is a live
@@ -957,7 +953,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     expect(errors).toHaveLength(0);
     const repeat = nodeById(workflows.get('parent')!, 'inc__repeat');
     expect(compiledLoopPrompt(repeat)).toBe('Review prod.');
-    expect(repeat && 'loop' in repeat ? repeat.loop.command : undefined).toBe('loop-cmd');
+    expect(repeat?.loop?.command).toBe('loop-cmd');
   });
 
   test('binds a declared include input named output in a loop command', () => {
@@ -1020,7 +1016,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     );
     expect(errors).toHaveLength(0);
     const group = nodeById(workflows.get('parent')!, 'inc__group');
-    const repeat = group && 'loop_group' in group ? group.loop_group.nodes[0] : undefined;
+    const repeat = group?.loop_group?.nodes[0];
     expect(compiledLoopPrompt(repeat)).toBe('Read $inc__seed.output and continue.');
   });
 
@@ -1053,8 +1049,8 @@ describe('expandWorkflowIncludes — included command compilation', () => {
 
     expect(errors).toHaveLength(0);
     const outer = nodeById(workflows.get('parent')!, 'inc__outer');
-    const inner = outer && 'loop_group' in outer ? outer.loop_group.nodes[0] : undefined;
-    const review = inner && 'loop_group' in inner ? inner.loop_group.nodes[0] : undefined;
+    const inner = outer?.loop_group?.nodes[0];
+    const review = inner?.loop_group?.nodes[0];
     expect(review && 'prompt' in review ? review.prompt : '').toBe(
       'Read $inc__seed.output and continue.'
     );
@@ -1086,7 +1082,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     );
     expect(errors).toHaveLength(0);
     const group = nodeById(workflows.get('parent')!, 'inc__group');
-    const repeat = group && 'loop_group' in group ? group.loop_group.nodes[0] : undefined;
+    const repeat = group?.loop_group?.nodes[0];
     expect(compiledLoopPrompt(repeat)).toBe('Review prod.');
   });
 
@@ -1341,7 +1337,7 @@ describe('expandWorkflowIncludes — determinism', () => {
     // provider does NOT inherit the other provider's model string, matching what the
     // executor does with a workflow-level model today.
     expect(nodeById(expanded, 'b')).toMatchObject({ provider: 'codex' });
-    expect((nodeById(expanded, 'b') as Record<string, unknown>).model).toBeUndefined();
+    expect(nodeById(expanded, 'b')?.model).toBeUndefined();
     // The input is never mutated — discovery hands the same object to display surfaces.
     expect(plain.provider).toBe('pi');
   });
@@ -1669,7 +1665,8 @@ describe('expandWorkflowIncludes — where a workflow-level model: travels (#176
       provider: 'codex',
       model: 'gpt-5.6-sol',
     });
-    expect((nodes[0] as Record<string, unknown>).model).toBeUndefined();
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].model).toBeUndefined();
   });
 
   test('does NOT travel when the workflow declares a model but no provider — the known divergence', () => {
@@ -1681,8 +1678,8 @@ describe('expandWorkflowIncludes — where a workflow-level model: travels (#176
       ...wf('w', [{ id: 'n', prompt: 'p', provider: 'codex' }]),
       model: 'large',
     });
-    expect((nodes[0] as Record<string, unknown>).model).toBeUndefined();
-    expect((nodes[0] as Record<string, unknown>).provider).toBe('codex');
+    expect(nodes[0]?.model).toBeUndefined();
+    expect(nodes[0]?.provider).toBe('codex');
   });
 
   test('every other node-affecting field travels regardless of the node provider', () => {
