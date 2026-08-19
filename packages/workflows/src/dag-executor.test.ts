@@ -16269,8 +16269,10 @@ describe('executeDagWorkflow -- loop_group node', () => {
                   until_bash:
                     `test $LOOP_PREV.pass__check.output = "inner's ready" && ` +
                     `test $pass.output = "inner's ready" && ` +
-                    `{ test -z $LOOP_PREV.seed.output || ` +
-                    `test $LOOP_PREV.seed.output = "outer's first"; }`,
+                    `{ { test $seed.output = "outer's first" && ` +
+                    `test -z $LOOP_PREV.seed.output; } || ` +
+                    `{ test $seed.output = "outer's second" && ` +
+                    `test $LOOP_PREV.seed.output = "outer's first"; }; }`,
                   nodes: [{ id: 'pass', include: 'nested-check-block' }],
                 },
                 depends_on: ['seed'],
