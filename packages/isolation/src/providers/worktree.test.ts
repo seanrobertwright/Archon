@@ -1218,6 +1218,21 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('uses an external-git-dir linked checkout as its own removal anchor', async () => {
+      const worktreePath = git.toWorktreePath('/workspace/external-linked');
+      getCanonicalRepoPathSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(worktreePath, '/metadata/repository')
+      );
+
+      await provider.destroy(worktreePath);
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining(['-C', worktreePath, 'worktree', 'remove', worktreePath]),
+        expect.any(Object)
+      );
+    });
+
     test('uses force flag when specified', async () => {
       const worktreePath = git.toWorktreePath('/workspace/worktrees/repo/issue-42');
 
@@ -1627,6 +1642,22 @@ describe('WorktreeProvider', () => {
       expect(result?.branchName).toBe(git.toBranchName('issue-42'));
     });
 
+    test('queries an external-git-dir linked checkout from its exact path', async () => {
+      const worktreePath = git.toWorktreePath('/workspace/external-linked');
+      worktreeExistsSpy.mockResolvedValue(true);
+      getCanonicalRepoPathSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(worktreePath, '/metadata/repository')
+      );
+      listWorktreesSpy.mockResolvedValue([
+        { path: worktreePath, branch: git.toBranchName('external-linked') },
+      ]);
+
+      const result = await provider.get(worktreePath);
+
+      expect(result?.workingPath).toBe(worktreePath);
+      expect(listWorktreesSpy).toHaveBeenCalledWith(worktreePath);
+    });
+
     test('re-throws errors from getCanonicalRepoPath with logging', async () => {
       worktreeExistsSpy.mockResolvedValue(true);
       getCanonicalRepoPathSpy.mockRejectedValue(new Error('Permission denied'));
@@ -1726,6 +1757,23 @@ describe('WorktreeProvider', () => {
       expect(result?.provider).toBe('worktree');
       expect(result?.branchName).toBe(git.toBranchName('feature/auth'));
       expect(result?.metadata).toHaveProperty('adopted', true);
+    });
+
+    test('adopts an external-git-dir linked checkout from its exact path', async () => {
+      const worktreePath = git.toWorktreePath('/workspace/external-linked');
+      worktreeExistsSpy.mockResolvedValue(true);
+      getCanonicalRepoPathSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(worktreePath, '/metadata/repository')
+      );
+      listWorktreesSpy.mockResolvedValue([
+        { path: worktreePath, branch: git.toBranchName('external-linked') },
+      ]);
+
+      const result = await provider.adopt(worktreePath);
+
+      expect(result?.workingPath).toBe(worktreePath);
+      expect(result?.metadata).toHaveProperty('adopted', true);
+      expect(listWorktreesSpy).toHaveBeenCalledWith(worktreePath);
     });
 
     test('returns null for non-existent path', async () => {

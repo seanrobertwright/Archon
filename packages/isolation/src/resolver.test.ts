@@ -1162,6 +1162,39 @@ describe('IsolationResolver', () => {
   // become a `blocked` result; unknown errors propagate as crashes.
   // -------------------------------------------------------------------------
   describe('canonical path resolution failure handling', () => {
+    test('uses an exact registered external-git-dir checkout as the worktree anchor', async () => {
+      const defaultCwd = '/workspace/external-linked';
+      getCanonicalSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(defaultCwd, '/metadata/repository')
+      );
+      const createSpy = mock(
+        async (_request: IsolationRequest): Promise<IsolatedEnvironment> => ({
+          id: '/worktrees/new-branch',
+          provider: 'worktree',
+          workingPath: '/worktrees/new-branch',
+          branchName: git.toBranchName('new-branch'),
+          status: 'active',
+          createdAt: new Date(),
+          metadata: { adopted: false },
+        })
+      );
+      const resolver = createResolver({
+        provider: { ...makeMockProvider(), create: createSpy },
+      });
+
+      const result = await resolver.resolve({
+        existingEnvId: null,
+        codebase: { ...defaultCodebase, defaultCwd },
+        hints: { workflowType: 'issue', workflowId: '42' },
+        platformType: 'web',
+      });
+
+      expect(result.status).toBe('resolved');
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ canonicalRepoPath: defaultCwd })
+      );
+    });
+
     test('known infrastructure error returns blocked with classified user message', async () => {
       const eaccesError = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
       eaccesError.code = 'EACCES';
