@@ -3373,31 +3373,46 @@ async function executeScriptNode(
  *  tool-input truncation used for progress events). */
 const GATE_EXCERPT_MAX = 500;
 
+type LoopCompletionCheck =
+  | { channel: 'until'; signal: string; completed: boolean }
+  | { channel: 'until_bash'; completed: boolean }
+  | { channel: 'until_field'; field: string; completed: boolean };
+
+function describeLoopCompletionCheck(check: LoopCompletionCheck): string {
+  switch (check.channel) {
+    case 'until':
+      return `\`until\` signal (\`${check.signal}\`)`;
+    case 'until_bash':
+      return '`until_bash`';
+    case 'until_field':
+      return `\`until_field\` (\`${check.field}\`)`;
+  }
+  const unreachable: never = check;
+  return unreachable;
+}
+
 /**
  * Build the honest interactive-gate message (#2074, change D): an engine-generated
- * status line (was the completion signal detected?) plus a bounded excerpt of the
- * final iteration output, prepended to the author's static `gate_message`. Shared
- * by executeLoopNode and executeLoopGroupNode so both gates tell the truth about
- * the iteration they paused on.
+ * status line naming the completion channels that fired (or every declared channel
+ * when none fired), plus a bounded excerpt of the final iteration output, prepended
+ * to the author's static `gate_message`. Shared by executeLoopNode and
+ * executeLoopGroupNode so both gates tell the truth about the iteration they paused on.
  */
 function buildHonestGateMessage(
-  completionDetected: boolean,
-  untilSignal: string | undefined,
+  completionChecks: LoopCompletionCheck[],
   lastIterationOutput: string,
   gateMessage: string
 ): string {
   const trimmed = lastIterationOutput.trim();
   const excerpt = trimmed.slice(0, GATE_EXCERPT_MAX);
-  // A loop that declared only `until_bash` (#2563) has no signal to name — say what
-  // was actually evaluated rather than printing `undefined` back at the reviewer.
+  const completedChecks = completionChecks.filter(check => check.completed);
+  const describedChecks = (completedChecks.length > 0 ? completedChecks : completionChecks).map(
+    describeLoopCompletionCheck
+  );
   const statusLine =
-    untilSignal === undefined
-      ? completionDetected
-        ? '✅ Completion condition met.'
-        : '⚠️ Completion condition not met in this iteration.'
-      : completionDetected
-        ? `✅ Completion signal detected (\`${untilSignal}\`).`
-        : `⚠️ No completion signal (\`${untilSignal}\`) in this iteration.`;
+    completedChecks.length > 0
+      ? `✅ Completion condition${completedChecks.length === 1 ? '' : 's'} met via ${describedChecks.join(' and ')}.`
+      : `⚠️ No completion condition met in this iteration (${describedChecks.join(', ')}).`;
   const excerptBlock = excerpt
     ? `\n\n> ${excerpt}${trimmed.length > GATE_EXCERPT_MAX ? '…' : ''}`
     : '';
@@ -3435,7 +3450,7 @@ function readSignaledTokens(
 
 /**
  * Finalize-on-approve (#2074), shared by executeLoopNode and executeLoopGroupNode:
- * a gate that paused on a signal-bearing iteration, resumed WITHOUT feedback,
+ * a gate that paused on a completion-bearing iteration, resumed WITHOUT feedback,
  * completes the node from the persisted `signaledOutput` instead of re-running
  * the (expensive) iteration. Sends the user notice and writes/emits the
  * node_completed pair; the caller builds its own return value (the single-node
@@ -3474,7 +3489,7 @@ async function finalizeLoopFromSignal(
   await safeSendMessage(
     platform,
     conversationId,
-    `${nodeLabel} '${nodeId}' accepted at the completion signal (no re-run)`,
+    `${nodeLabel} '${nodeId}' accepted after a completion condition was met (no re-run)`,
     { workflowId: workflowRun.id, nodeName: nodeId }
   );
   await deps.store
@@ -3588,7 +3603,7 @@ async function executeLoopGroupNode(
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLoopResume ? (loopGateRunMeta.loop_user_input ?? '') : '';
 
-  // Finalize-on-approve (#2074): mirrors executeLoopNode — a signal-bearing gate
+  // Finalize-on-approve (#2074): mirrors executeLoopNode — a completion-bearing gate
   // resumed WITHOUT feedback completes the group from the persisted output instead
   // of re-running the body.
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
@@ -3927,8 +3942,16 @@ async function executeLoopGroupNode(
       }
     }
 
+    const completionChecks: LoopCompletionCheck[] = [];
+    if (group.until !== undefined) {
+      completionChecks.push({ channel: 'until', signal: group.until, completed: signalDetected });
+    }
+    if (group.until_bash !== undefined) {
+      completionChecks.push({ channel: 'until_bash', completed: bashComplete });
+    }
+
     const duration = Date.now() - iterationStart;
-    const completionDetected = signalDetected || bashComplete;
+    const completionDetected = completionChecks.some(check => check.completed);
 
     getWorkflowEventEmitter().emit({
       type: 'loop_iteration_completed',
@@ -3949,7 +3972,7 @@ async function executeLoopGroupNode(
         logEventStoreError(err, i);
       });
 
-    // Completion: honor the signal only when the AI had input to evaluate (interactive
+    // Completion: honor the completed iteration only when the AI had input to evaluate (interactive
     // first run always gates first — mirrors executeLoopNode's interactiveFirstRun),
     // UNLESS the author opted into autonomous completion via signal_completes (#2074).
     const interactiveFirstRun = group.interactive && !isLoopResume;
@@ -4017,12 +4040,11 @@ async function executeLoopGroupNode(
     }
 
     // Interactive gate — pause after an iteration that did not complete (or, when
-    // interactiveFirstRun && !signalCompletes, an iteration that DID signal — the honest
-    // status line + persisted signal state (#2074) let a bare approve finalize it).
+    // interactiveFirstRun && !signalCompletes, an iteration that DID complete — the honest
+    // status line + persisted completion state (#2074) let a bare approve finalize it).
     if (group.interactive && group.gate_message) {
       const honestMessage = buildHonestGateMessage(
-        completionDetected,
-        group.until,
+        completionChecks,
         lastIterationOutput,
         group.gate_message
       );
@@ -4227,7 +4249,8 @@ export function applyLoopPrevToBodyNode(
 }
 
 /**
- * Execute a loop node — runs prompt repeatedly until completion signal or max iterations.
+ * Execute a loop node — runs the prompt until a declared completion channel fires or the
+ * maximum iteration count is reached.
  *
  * Key behaviors:
  * - Returns NodeExecutionResult (not void) — DAG executor owns workflow lifecycle
@@ -4373,10 +4396,10 @@ async function executeLoopNode(
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLoopResume ? (loopGateRunMeta.loop_user_input ?? '') : '';
 
-  // Finalize-on-approve (#2074): a gate that paused on a signal-bearing iteration,
+  // Finalize-on-approve (#2074): a gate that paused on a completion-bearing iteration,
   // resumed WITHOUT feedback, completes the node from the persisted output instead of
   // re-running the (expensive) iteration. Feedback (loop_feedback_given) OR a
-  // non-signaled gate falls through to a normal resumed iteration below. Runs
+  // non-completing gate falls through to a normal resumed iteration below. Runs
   // BEFORE prompt-source resolution: a bare approve never needs the prompt, so a
   // command file deleted while the run sat paused cannot fail the finalize.
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
@@ -5414,8 +5437,23 @@ async function executeLoopNode(
       }
     }
 
+    const completionChecks: LoopCompletionCheck[] = [];
+    if (loop.until_field !== undefined) {
+      completionChecks.push({
+        channel: 'until_field',
+        field: loop.until_field,
+        completed: fieldComplete,
+      });
+    }
+    if (loop.until !== undefined) {
+      completionChecks.push({ channel: 'until', signal: loop.until, completed: signalDetected });
+    }
+    if (loop.until_bash !== undefined) {
+      completionChecks.push({ channel: 'until_bash', completed: bashComplete });
+    }
+
     const duration = Date.now() - iterationStart;
-    const completionDetected = fieldComplete || signalDetected || bashComplete;
+    const completionDetected = completionChecks.some(check => check.completed);
 
     // Emit iteration completed
     getWorkflowEventEmitter().emit({
@@ -5441,12 +5479,12 @@ async function executeLoopNode(
       durationMs: duration,
     });
 
-    // Completion signal detected — exit the loop.
-    // For interactive loops: only honor the signal when the AI had user input to evaluate
+    // A completion channel fired — exit the loop.
+    // For interactive loops: only honor completion when the AI had user input to evaluate
     // (i.e., this is a resume iteration with loopUserInput). On the first iteration of a
     // fresh interactive loop, the user hasn't seen anything yet — always gate first,
     // UNLESS the author opted into autonomous completion via signal_completes (#2074).
-    // For non-interactive loops: the AI signals task completion at any point.
+    // For non-interactive loops: any declared channel can complete the iteration.
     const interactiveFirstRun = loop.interactive && !isLoopResume;
     const signalCompletes = loop.signal_completes === true;
     if (completionDetected && (!interactiveFirstRun || signalCompletes)) {
@@ -5520,14 +5558,13 @@ async function executeLoopNode(
     }
 
     // Interactive loop gate — pause after an iteration that did not complete (or, when
-    // interactiveFirstRun && !signalCompletes, an iteration that DID signal — the honest
-    // status line + persisted signal state (#2074) let a bare approve finalize it).
-    // On a non-signaled gate, the user's feedback feeds the next iteration, which exits
-    // above once the AI emits the signal.
+    // interactiveFirstRun && !signalCompletes, an iteration that DID complete — the honest
+    // status line + persisted completion state (#2074) let a bare approve finalize it).
+    // On a non-completing gate, the user's feedback feeds the next iteration, which exits
+    // above once any declared completion channel fires.
     if (loop.interactive && loop.gate_message) {
       const honestMessage = buildHonestGateMessage(
-        completionDetected,
-        loop.until,
+        completionChecks,
         lastIterationOutput,
         loop.gate_message
       );

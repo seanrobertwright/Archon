@@ -348,6 +348,31 @@ function makeWorkflowRun(id = 'dag-test-run-id', overrides?: Partial<WorkflowRun
   };
 }
 
+function expectLoopGateEvidence(
+  store: MockWorkflowStore,
+  platform: MockWorkflowPlatform,
+  statusLine: string,
+  completionSignaled: boolean
+): void {
+  const pauseCalls = store.pauseWorkflowRun.mock.calls;
+  expect(pauseCalls.length).toBe(1);
+  const approval = pauseCalls[0][1];
+  expect(approval).toMatchObject({ completionSignaled });
+  expect(approval.message.startsWith(statusLine)).toBe(true);
+
+  const approvalRequested = store.createWorkflowEvent.mock.calls
+    .map(([event]) => event)
+    .filter(event => event.event_type === 'approval_requested');
+  expect(approvalRequested.length).toBe(1);
+  expect(approvalRequested[0].data).toMatchObject({
+    message: approval.message,
+    completionSignaled,
+  });
+
+  const sentMessages = platform.sendMessage.mock.calls.map(([, message]) => message);
+  expect(sentMessages.some(message => message.includes(approval.message))).toBe(true);
+}
+
 function loaderBypassingWorkflow(
   workflow: Parameters<typeof executeDagWorkflow>[4] & { modelReasoningEffort: string }
 ): Parameters<typeof executeDagWorkflow>[4] {
@@ -8348,8 +8373,171 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         signaledOutput: null,
       });
       const pausedMessage = (pauseCalls[0][1] as { message: string }).message;
-      expect(pausedMessage).toContain('No completion signal');
+      expect(pausedMessage).toContain('No completion condition met');
       expect(pausedMessage).toContain('Review the plan and provide feedback.');
+    });
+
+    it('interactive loop gate attributes completion to until_bash instead of an absent signal', async () => {
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'Checks pass, but no prose sentinel.' };
+        yield { type: 'result', sessionId: 'loop-bash-gate' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'interactive-loop-bash-gate',
+          nodes: [
+            {
+              id: 'refine',
+              loop: {
+                fresh_context: false,
+                prompt: 'Validate.',
+                until: 'UNTIL_DONE',
+                until_bash: 'exit 0',
+                max_iterations: 3,
+                interactive: true,
+                gate_message: 'Review the checks.',
+              },
+            },
+          ],
+        },
+        makeWorkflowRun('loop-bash-gate'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expectLoopGateEvidence(
+        mockDeps.store,
+        platform,
+        '✅ Completion condition met via `until_bash`.',
+        true
+      );
+      const pausedMessage = mockDeps.store.pauseWorkflowRun.mock.calls[0][1].message;
+      expect(pausedMessage).not.toContain('`until` signal (`UNTIL_DONE`)');
+    });
+
+    it('interactive loop gate attributes completion to until_field instead of an absent signal', async () => {
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield {
+          type: 'result',
+          sessionId: 'loop-field-gate',
+          structuredOutput: { done: true, note: 'validated' },
+        };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'interactive-loop-field-gate',
+          nodes: [
+            {
+              id: 'refine',
+              output_format: untilFieldSchema,
+              loop: {
+                fresh_context: false,
+                prompt: 'Judge completion.',
+                until: 'UNTIL_DONE',
+                until_field: 'done',
+                max_iterations: 3,
+                interactive: true,
+                gate_message: 'Review the judgment.',
+              },
+            },
+          ],
+        },
+        makeWorkflowRun('loop-field-gate'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expectLoopGateEvidence(
+        mockDeps.store,
+        platform,
+        '✅ Completion condition met via `until_field` (`done`).',
+        true
+      );
+      const pausedMessage = mockDeps.store.pauseWorkflowRun.mock.calls[0][1].message;
+      expect(pausedMessage).not.toContain('`until` signal (`UNTIL_DONE`)');
+    });
+
+    it('interactive loop gate names every declared condition when none completes', async () => {
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield {
+          type: 'result',
+          sessionId: 'loop-unmet-gate',
+          structuredOutput: { done: false, note: 'not ready' },
+        };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'interactive-loop-unmet-gate',
+          nodes: [
+            {
+              id: 'refine',
+              output_format: untilFieldSchema,
+              loop: {
+                fresh_context: false,
+                prompt: 'Judge completion.',
+                until: 'UNTIL_DONE',
+                until_bash: 'exit 1',
+                until_field: 'done',
+                max_iterations: 3,
+                interactive: true,
+                gate_message: 'Keep working.',
+              },
+            },
+          ],
+        },
+        makeWorkflowRun('loop-unmet-gate'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expectLoopGateEvidence(
+        mockDeps.store,
+        platform,
+        '⚠️ No completion condition met in this iteration (`until_field` (`done`), `until` signal (`UNTIL_DONE`), `until_bash`).',
+        false
+      );
     });
 
     it('interactive loop first iteration always gates even if AI emits signal', async () => {
@@ -8418,7 +8606,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       const signaledOutput = (pauseCalls[0][1] as { signaledOutput: string }).signaledOutput;
       expect(signaledOutput).toContain('Plan approved');
       const gateMessage = (pauseCalls[0][1] as { message: string }).message;
-      expect(gateMessage).toContain('Completion signal detected');
+      expect(gateMessage).toContain('Completion condition met via `until` signal (`APPROVED`)');
       expect(gateMessage).toContain('Review and provide feedback.');
     });
 
@@ -17334,8 +17522,61 @@ describe('executeDagWorkflow -- loop_group node', () => {
       signaledOutput: null,
     });
     const pausedGroupMessage = (pauseCalls[0][1] as { message: string }).message;
-    expect(pausedGroupMessage).toContain('No completion signal');
+    expect(pausedGroupMessage).toContain('No completion condition met');
     expect(pausedGroupMessage).toContain('Review the result.');
+  });
+
+  it('INTERACTIVE: loop_group gate attributes completion to until_bash instead of an absent signal', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'Checks pass, but no prose sentinel.' };
+      yield { type: 'result', sessionId: 'lg-bash-gate' };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-lg',
+      testDir,
+      {
+        name: 'lg-bash-gate',
+        nodes: [
+          {
+            id: 'refine',
+            loop_group: {
+              until: 'UNTIL_DONE',
+              until_bash: 'exit 0',
+              max_iterations: 3,
+              fresh_context: false,
+              interactive: true,
+              gate_message: 'Review the checks.',
+              nodes: [{ id: 'work', prompt: 'validate', depends_on: [] }],
+            },
+            depends_on: [],
+          },
+        ],
+      },
+      makeWorkflowRun('lg-bash-gate'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expectLoopGateEvidence(
+      mockDeps.store,
+      platform,
+      '✅ Completion condition met via `until_bash`.',
+      true
+    );
+    const pausedMessage = mockDeps.store.pauseWorkflowRun.mock.calls[0][1].message;
+    expect(pausedMessage).not.toContain('`until` signal (`UNTIL_DONE`)');
   });
 
   it('INTERACTIVE: loop_group gate persists signal state when iteration 1 signals (#2074)', async () => {
@@ -17393,7 +17634,9 @@ describe('executeDagWorkflow -- loop_group node', () => {
       completionSignaled: true,
     });
     expect(String(pauseCalls[0][1].signaledOutput)).toContain('validation PASS');
-    expect(String(pauseCalls[0][1].message)).toContain('Completion signal detected');
+    expect(String(pauseCalls[0][1].message)).toContain(
+      'Completion condition met via `until` signal (`APPROVED`)'
+    );
     // No `signaledTokens` (unlike the plain-loop gate): the group's finalize path has
     // no consumer for it, because the body's own rows already persisted this
     // iteration's usage before the pause (#2333).

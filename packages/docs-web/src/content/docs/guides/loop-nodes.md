@@ -483,10 +483,11 @@ Set `interactive: true` to pause the loop between iterations and wait for human 
 After each iteration the executor:
 
 1. Sends the gate message to the user along with the run ID and a `/workflow approve` command.
-   The gate text is engine-generated: a status line — whether the iteration emitted the
-   completion signal, plus a bounded excerpt of the iteration output — followed by your
-   `gate_message`, so the gate always reports the real iteration outcome. The status line
-   **leads the persisted gate message** (`metadata.approval.message`, also the
+   The gate text is engine-generated: a status line naming the completion channel or channels
+   that ended the iteration, or every declared channel when none did, plus a bounded excerpt of
+   the iteration output — followed by your `gate_message`, so the gate always reports the real
+   iteration outcome. The status line **leads the persisted gate message**
+   (`metadata.approval.message`, also the
    `approval_requested` event data — what `workflow get --json` and `manage_run` read);
    the chat-delivered message wraps the same text in a `⏸ Input required (loop ..., iteration N):`
    prefix, so in chat the status line appears right after that prefix.
@@ -495,16 +496,16 @@ After each iteration the executor:
 
 The user's feedback is injected into the next iteration's prompt via `$LOOP_USER_INPUT`.
 
-**Approve semantics (finalize vs iterate).** What an approve does depends on whether the
-paused iteration emitted the completion signal:
+**Approve semantics (finalize vs iterate).** What an approve does depends on whether any declared
+completion channel ended the paused iteration:
 
-- **Gate paused on a signal-bearing iteration** (the status line says "Completion signal
-  detected"): `/workflow approve <id>` with **no feedback** *accepts the completion* — the
-  node finalizes from the already-computed output and the workflow proceeds, with **no
-  re-run**. Approving **with feedback** discards the signal and runs another iteration with
-  your feedback as `$LOOP_USER_INPUT`.
-- **Gate paused without the signal:** both forms run another iteration (there is nothing
-  to finalize).
+- **Gate paused on a completed iteration** (the status line starts "Completion condition met
+  via"): `/workflow approve <id>` with **no feedback** *accepts the completion* — the node
+  finalizes from the already-computed output and the workflow proceeds, with **no re-run**.
+  Approving **with feedback** discards that completion and runs another iteration with your
+  feedback as `$LOOP_USER_INPUT`.
+- **Gate paused without a completed condition** (the status line starts "No completion condition
+  met"): both forms run another iteration (there is nothing to finalize).
 
 The same rule applies on every approve surface: chat `/workflow approve`, the CLI
 (`archon workflow approve <id> [--json]` — omit the comment to finalize), the HTTP
@@ -520,9 +521,9 @@ surfaces above, `manage_run` with `accept: true`, or `signal_completes`.
 
 ### `signal_completes` — autonomous completion
 
-By default an interactive loop **always gates first**, even when the very first iteration
-emits the completion signal — the human confirms before the node completes. If you want
-the signal itself to complete the node (no gate, no approve), set `signal_completes: true`:
+By default an interactive loop **always gates first**, even when the very first iteration reaches
+a completion condition — the human confirms before the node completes. If you want a completed
+iteration to finish the node immediately (no gate, no approve), set `signal_completes: true`:
 
 ```yaml
   - id: validate
@@ -537,10 +538,10 @@ the signal itself to complete the node (no gate, no approve), set `signal_comple
       signal_completes: true   # signal ⇒ node completes immediately, no gate
 ```
 
-With `signal_completes: true` the gate only appears on iterations that did **not** signal —
-the pattern for "pass through on success, pause for a human on failure". The flag has no
-effect on non-interactive loops (the signal already completes them); setting it without
-`interactive: true` emits a loader warning.
+With `signal_completes: true` the gate only appears on iterations where no declared completion
+channel fired — the pattern for "pass through on success, pause for a human on failure". The flag
+has no effect on non-interactive loops (a completed iteration already finishes them); setting it
+without `interactive: true` emits a loader warning.
 
 **AI approvers / relay steering.** An orchestrating agent can steer another run's gate:
 read the structured gate state first (`archon workflow get <id> --json` →
