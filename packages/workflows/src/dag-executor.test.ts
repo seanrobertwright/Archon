@@ -16231,6 +16231,97 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(bodyCompletions.map(event => event.data?.iteration)).toEqual([1, 2]);
   });
 
+  it('resolves an included inner body previous output in nested loop_group until_bash (#2623)', async () => {
+    // This runs the authored include through real load-time expansion before executing the
+    // nested groups. The inner gate combines three scopes: its included body's previous
+    // iteration, that body's current output, and the enclosing group's previous iteration.
+    // Apostrophes in every carried value make unsafe shell interpolation fail visibly.
+    const outerCounter = join(testDir, 'nested-until-outer-counter');
+    const outerCounterRef = `"${outerCounter.replace(/\\/g, '/')}"`;
+
+    const block = workflowDefinitionSchema.parse({
+      name: 'nested-check-block',
+      description: 'Reusable nested loop check',
+      returns: 'check',
+      nodes: [{ id: 'check', bash: `echo "inner's ready"` }],
+    });
+    const parent = workflowDefinitionSchema.parse({
+      name: 'nested-included-loop-group',
+      description: 'Repeats an included block inside nested groups',
+      nodes: [
+        {
+          id: 'outer',
+          loop_group: {
+            max_iterations: 2,
+            until_bash:
+              `test $seed.output = "outer's second" && ` + `test $inner.output = "inner's ready"`,
+            nodes: [
+              {
+                id: 'seed',
+                bash:
+                  `if [ -f ${outerCounterRef} ]; then echo "outer's second"; ` +
+                  `else touch ${outerCounterRef}; echo "outer's first"; fi`,
+              },
+              {
+                id: 'inner',
+                loop_group: {
+                  max_iterations: 2,
+                  until_bash:
+                    `test $LOOP_PREV.pass__check.output = "inner's ready" && ` +
+                    `test $pass.output = "inner's ready" && ` +
+                    `{ test -z $LOOP_PREV.seed.output || ` +
+                    `test $LOOP_PREV.seed.output = "outer's first"; }`,
+                  nodes: [{ id: 'pass', include: 'nested-check-block' }],
+                },
+                depends_on: ['seed'],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        [block.name, block],
+        [parent.name, parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get(parent.name);
+    expect(expanded).toBeDefined();
+    if (!expanded) throw new Error('expected expanded workflow');
+
+    const store = createMockStore();
+    const result = await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      expanded,
+      makeWorkflowRun('dag-nested-loopgroup-included-prev'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Each outer iteration runs two inner iterations: inner iteration 1 sees an empty
+    // previous snapshot, while iteration 2 sees the prior included-node output. The outer
+    // repeats once, proving its own previous `seed` output remains outer-scoped.
+    expect(result).toContain("inner's ready");
+    const includedCompletions = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .filter(
+        event =>
+          event.event_type === 'node_completed' && event.step_name === 'outer.inner.pass__check'
+      );
+    expect(includedCompletions.map(event => event.data?.iteration)).toEqual([1, 2, 1, 2]);
+  });
+
   it('runs a command-backed loop node inside a loop_group body with namespaced lifecycle events', async () => {
     // A `loop:` body node may use `loop.command` like any top-level loop. The
     // command body must reach the AI, and the loop's persisted lifecycle events

@@ -3872,8 +3872,22 @@ async function executeLoopGroupNode(
       // to the caller instead of being swallowed by the per-iteration catch.
       const groupBashPath = resolveBashPath();
       try {
-        const { prompt: bashPrompt } = substituteWorkflowVariables(
+        // Resolve this group's own cross-iteration refs against the snapshot captured
+        // before its body ran. `loopPrevOutputs` now contains the CURRENT iteration, so
+        // using it here would collapse `$LOOP_PREV` into `$node.output` semantics. Only
+        // direct body ids belong to this scope; refs owned by an enclosing group were
+        // already resolved while preparing this nested group, and descendant ids are not
+        // present in this group's per-iteration output map.
+        const prevResolvedBash = substituteLoopPrevRefs(
           group.until_bash,
+          prevSnapshot,
+          true,
+          logDir,
+          directBodyIds,
+          directBodyIds
+        );
+        const { prompt: bashPrompt } = substituteWorkflowVariables(
+          prevResolvedBash,
           workflowRun.id,
           workflowRun.user_message,
           artifactsDir,
@@ -4249,10 +4263,9 @@ export function applyLoopPrevToBodyNode(
     // (in knownBodyIds but not directBodyIds) is left intact (return match) for the inner
     // group's own pass, while a ref to an OUTER-direct id resolves here at the outer
     // granularity and a true typo still throws. The inner group's own executeLoopGroupNode
-    // computes fresh sets when it runs, so inner-owned refs resolve at the inner iteration
-    // granularity. The inner group's until_bash is shell-bound and only ever substituted
-    // here for OUTER-loop refs (a nested group's own until_bash cannot reference its own body
-    // via $LOOP_PREV — executeLoopGroupNode does not re-run this pass on the group's until_bash).
+    // computes fresh sets when it runs, so inner-owned refs in both body nodes and its
+    // completion script resolve at the inner iteration granularity. This outer pass still
+    // resolves enclosing-group refs in the nested until_bash before that inner execution.
     return {
       ...substitutedNode,
       loop_group: {
