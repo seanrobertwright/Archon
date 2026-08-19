@@ -1218,19 +1218,35 @@ describe('WorktreeProvider', () => {
       );
     });
 
-    test('uses an external-git-dir linked checkout as its own removal anchor', async () => {
+    test('keeps a durable external Git directory anchor after removing its linked checkout', async () => {
       const worktreePath = git.toWorktreePath('/workspace/external-linked');
+      const branchName = git.toBranchName('external-linked');
       getCanonicalRepoPathSpy.mockRejectedValue(
         new git.CanonicalRepoPathUnavailableError(worktreePath, '/metadata/repository')
       );
 
-      await provider.destroy(worktreePath);
+      const result = await provider.destroy(worktreePath, {
+        branchName,
+        deleteRemoteBranch: true,
+      });
 
       expect(execSpy).toHaveBeenCalledWith(
         'git',
-        expect.arrayContaining(['-C', worktreePath, 'worktree', 'remove', worktreePath]),
+        expect.arrayContaining(['-C', '/metadata/repository', 'worktree', 'remove', worktreePath]),
         expect.any(Object)
       );
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/metadata/repository', 'branch', '-D', branchName],
+        expect.any(Object)
+      );
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/metadata/repository', 'push', 'origin', '--delete', branchName],
+        expect.any(Object)
+      );
+      expect(result.branchDeleted).toBe(true);
+      expect(result.remoteBranchDeleted).toBe(true);
     });
 
     test('uses force flag when specified', async () => {

@@ -51,18 +51,29 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
- * Resolve the checkout from which Git worktree commands should run.
+ * Resolve the anchors from which Git worktree commands should run.
  *
  * External `--separate-git-dir` repositories do not record a reverse path to
- * their primary checkout. Their linked checkouts are still valid command
- * anchors, so retain the exact path only for that typed Git limitation.
+ * their primary checkout. The exact linked checkout is valid while it exists;
+ * its common Git directory remains usable after that checkout is removed.
  */
-async function getGitCommandAnchor(path: string): Promise<RepoPath> {
+interface GitCommandAnchors {
+  active: RepoPath;
+  durable: RepoPath;
+}
+
+async function getGitCommandAnchors(path: string): Promise<GitCommandAnchors> {
   try {
-    return await getCanonicalRepoPath(path);
+    const canonicalPath = await getCanonicalRepoPath(path);
+    return { active: canonicalPath, durable: canonicalPath };
   } catch (error) {
     if (error instanceof CanonicalRepoPathUnavailableError) {
-      return toRepoPath(path);
+      return {
+        active: toRepoPath(path),
+        // The exact checkout may be removed by destroy(), while Git's common
+        // directory remains a valid anchor for prune and branch cleanup.
+        durable: toRepoPath(error.commonGitDir),
+      };
     }
     throw error;
   }
@@ -231,7 +242,7 @@ export class WorktreeProvider implements IIsolationProvider {
     if (options?.canonicalRepoPath) {
       repoPath = options.canonicalRepoPath;
     } else if (pathExists) {
-      repoPath = await getGitCommandAnchor(worktreePath);
+      repoPath = (await getGitCommandAnchors(worktreePath)).durable;
     } else {
       // Path doesn't exist and no canonicalRepoPath provided - can't clean up branch
       // This is expected when worktree was already fully cleaned up externally
@@ -451,7 +462,7 @@ export class WorktreeProvider implements IIsolationProvider {
     let repoPath: RepoPath;
     let worktrees: WorktreeInfo[];
     try {
-      repoPath = await getGitCommandAnchor(worktreePath);
+      repoPath = (await getGitCommandAnchors(worktreePath)).active;
       worktrees = await listWorktrees(repoPath);
     } catch (error) {
       getLog().error({ err: error, worktreePath }, 'worktree_query_failed');
@@ -517,7 +528,7 @@ export class WorktreeProvider implements IIsolationProvider {
     let repoPath: RepoPath;
     let worktrees: WorktreeInfo[];
     try {
-      repoPath = await getGitCommandAnchor(path);
+      repoPath = (await getGitCommandAnchors(path)).active;
       worktrees = await listWorktrees(repoPath);
     } catch (error) {
       const err = error as Error;
