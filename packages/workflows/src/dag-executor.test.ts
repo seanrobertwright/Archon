@@ -20103,7 +20103,7 @@ describe('executeDagWorkflow -- addressable session resume', () => {
   });
 
   it('fails a required loop source before completion when its session checkpoint cannot be saved', async () => {
-    mockSendQueryDag.mockImplementation(async function* () {
+    mockSendQueryDag.mockImplementation(async function* (): ReturnType<typeof mockSendQueryDag> {
       yield { type: 'assistant', content: '<promise>DONE</promise>' };
       yield { type: 'result', sessionId: 'loop-session' };
     });
