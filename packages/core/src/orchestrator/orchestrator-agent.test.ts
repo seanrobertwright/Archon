@@ -2416,6 +2416,7 @@ describe('paused approval gate routing', () => {
   }
 
   let capsMock: ReturnType<typeof mock>;
+  let prevExistsSyncImpl: ((...args: unknown[]) => unknown) | undefined;
 
   beforeEach(async () => {
     mockGetPausedWorkflowRun.mockReset();
@@ -2458,15 +2459,25 @@ describe('paused approval gate routing', () => {
     // tests need rather than inheriting whatever ran last — a false here would
     // short-circuit the turn before the gate context is ever built.
     const fs = await import('fs');
-    (fs.existsSync as unknown as ReturnType<typeof mock>).mockImplementation(() => true);
+    const existsSyncMock = fs.existsSync as unknown as ReturnType<typeof mock>;
+    prevExistsSyncImpl = existsSyncMock.getMockImplementation();
+    existsSyncMock.mockImplementation(() => true);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     // Restore the shared baseline, not a hand-written subset. A subset here
     // silently drops every other flag for the REST OF THE FILE — that is how
     // `effortControl` went missing for `resolveTitleRequest` once already
     // (#2556), and this block reintroduced it on merge.
     capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+    // Undo the forced `true` above so this describe block doesn't leak its own
+    // override forward onto whatever suite runs next in the same file — the
+    // same class of cross-suite fs.existsSync bleed #2551 fixed in the other
+    // direction.
+    const fs = await import('fs');
+    (fs.existsSync as unknown as ReturnType<typeof mock>).mockImplementation(
+      prevExistsSyncImpl ?? (() => true)
+    );
   });
 
   // ── The removed behaviour: prose no longer decides the gate ────────────────
