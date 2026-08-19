@@ -16288,10 +16288,11 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(receivedPrompts[1]).toContain('iter-1-draft');
   });
 
-  it('INSTANCE 3: until_bash deterministic gate completes on exit 0', async () => {
+  it('until_bash reads the current iteration body output and completes', async () => {
     // No `until` signal from AI; completion is decided solely by until_bash exit code.
-    // The body is a pure bash node that increments a counter file each iteration;
-    // until_bash exits 0 once the counter reaches 2. No AI node → sendQuery unused.
+    // The body is a pure bash node that increments a counter file each iteration and
+    // emits the count; until_bash exits 0 once that current body output reaches iter 2.
+    // No AI node → sendQuery unused.
     const counterFile = join(testDir, 'iter-counter');
     // The path is interpolated into REAL bash scripts: on Windows, join() yields
     // backslashes that bash strips as escapes. Use forward slashes + quoting so
@@ -16311,7 +16312,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
           // channel that could never fire.
           max_iterations: 5,
           fresh_context: false,
-          until_bash: `test "$(cat ${counterRef} 2>/dev/null || echo 0)" -ge 2`,
+          until_bash: "test $bump.output = 'iter 2'",
           nodes: [
             {
               id: 'bump',
@@ -16341,7 +16342,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
       minimalConfig
     );
 
-    // until_bash exits 0 once the counter reaches 2 → completes after 2 iterations.
+    // until_bash sees `bump` from the current scoped output map and exits 0 once it
+    // reaches iter 2 → completes after 2 iterations.
     // The counter file holds the final iteration count (2).
     const { readFile } = await import('fs/promises');
     const finalCount = parseInt((await readFile(counterFile, 'utf8')).trim(), 10);
