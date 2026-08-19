@@ -204,13 +204,17 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
         { id: 'second', loop_group: body() },
       ],
     });
+    const directory = mkdtempSync(join(tmpdir(), 'archon-dry-run-scaffold-keys-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'stubs.yaml');
 
-    const scaffold = createDryRunStubScaffold(workflow);
+    const scaffold = await writeDryRunStubScaffold(workflow, path);
+    const loaded = await loadDryRunStubs(path);
     const strict = await dryRunWorkflow({
       workflow,
       userMessage: '',
       cwd: process.cwd(),
-      stubs: scaffold,
+      stubs: loaded,
     });
     const sparse = await dryRunWorkflow({
       workflow,
@@ -222,11 +226,51 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
     expect(Object.keys(scaffold).sort()).toEqual(['__proto__', 'constructor', 'shared']);
     expect(scaffold.__proto__).toBe('TODO');
     expect(Object.getOwnPropertyDescriptor(scaffold, 'constructor')?.value).toBe('TODO');
+    expect(Object.hasOwn(loaded, '__proto__')).toBe(true);
+    expect(loaded.__proto__).toBe('TODO');
     expect(strict.outcome).toBe('completed');
     expect(strict.unusedStubs).toEqual([]);
     expect(sparse.outcome).toBe('completed');
     expect(sparse.trace.find(entry => entry.nodeId === '__proto__')?.output).toBe('TODO');
     expect(sparse.trace.filter(entry => entry.nodeId === 'shared')).toHaveLength(2);
+  });
+
+  test('selects a retained candidate after collecting every shared-key consumer', async () => {
+    const body = (values: string[]) => ({
+      until_bash: 'true',
+      max_iterations: 1,
+      nodes: [
+        {
+          id: 'shared',
+          prompt: 'work',
+          output_format: {
+            type: 'object',
+            properties: { kind: { type: 'string', enum: values } },
+            required: ['kind'],
+          },
+        },
+      ],
+    });
+    const workflow = makeTestWorkflow({
+      name: 'retained-shared-candidate',
+      nodes: [
+        { id: 'first', loop_group: body(['A', 'B']) },
+        { id: 'second', loop_group: body(['B', 'A', 'C']) },
+        { id: 'third', loop_group: body(['C', 'B']) },
+      ],
+    });
+
+    const scaffold = createDryRunStubScaffold(workflow);
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: scaffold,
+    });
+
+    expect(scaffold.shared).toEqual({ kind: 'B' });
+    expect(result.outcome).toBe('completed');
+    expect(result.unusedStubs).toEqual([]);
   });
 
   test('rejects only genuinely incompatible nodes sharing one raw stub key', () => {

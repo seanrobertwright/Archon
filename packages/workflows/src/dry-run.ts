@@ -57,8 +57,35 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 export const dryRunStubValueSchema = z.union([z.string(), z.record(z.string(), z.unknown())]);
-export const dryRunStubsSchema = z.record(z.string(), dryRunStubValueSchema);
 export type DryRunStubValue = z.infer<typeof dryRunStubValueSchema>;
+export const dryRunStubsSchema = z.unknown().transform((value, ctx) => {
+  if (!isRecord(value)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'expected a mapping of node ids to outputs',
+    });
+    return z.NEVER;
+  }
+
+  const entries: [string, DryRunStubValue][] = [];
+  let invalid = false;
+  for (const [id, candidate] of Object.entries(value)) {
+    const result = dryRunStubValueSchema.safeParse(candidate);
+    if (!result.success) {
+      invalid = true;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [id],
+        message: result.error.issues.map(issue => issue.message).join('; '),
+      });
+      continue;
+    }
+    // Validation establishes the union; retaining the raw value preserves own keys
+    // such as `__proto__` across the YAML → Zod boundary.
+    entries.push([id, candidate as DryRunStubValue]);
+  }
+  return invalid ? z.NEVER : Object.fromEntries(entries);
+});
 export type DryRunStubs = z.infer<typeof dryRunStubsSchema>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -170,32 +197,36 @@ function collectsStub(node: DagNode): boolean {
 
 /** Build the complete static stub map for an already-expanded workflow definition. */
 export function createDryRunStubScaffold(workflow: WorkflowDefinition): DryRunStubs {
-  const stubs = new Map<string, { value: DryRunStubValue; consumers: DagNode[] }>();
+  const stubs = new Map<string, { candidates: DryRunStubValue[]; consumers: DagNode[] }>();
   const visit = (nodes: readonly DagNode[]): void => {
     for (const node of nodes) {
       if (collectsStub(node)) {
         const generated = generatedStubFor(node);
         const existing = stubs.get(node.id);
         if (existing === undefined) {
-          stubs.set(node.id, { value: generated, consumers: [node] });
+          stubs.set(node.id, { candidates: [generated], consumers: [node] });
         } else {
-          const consumers = [...existing.consumers, node];
-          const value = [existing.value, generated].find(candidate =>
-            consumers.every(consumer => stubSatisfiesNode(consumer, candidate))
-          );
-          if (value === undefined) {
-            throw new Error(
-              `Cannot generate dry-run scaffold: nodes sharing stub key '${node.id}' require incompatible values`
-            );
-          }
-          stubs.set(node.id, { value, consumers });
+          existing.candidates.push(generated);
+          existing.consumers.push(node);
         }
       }
       if (isLoopGroupNode(node)) visit(node.loop_group.nodes);
     }
   };
   visit(workflow.nodes);
-  return Object.fromEntries([...stubs].map(([id, entry]) => [id, entry.value]));
+  return Object.fromEntries(
+    [...stubs].map(([id, entry]) => {
+      const value = entry.candidates.find(candidate =>
+        entry.consumers.every(consumer => stubSatisfiesNode(consumer, candidate))
+      );
+      if (value === undefined) {
+        throw new Error(
+          `Cannot generate dry-run scaffold: nodes sharing stub key '${id}' require incompatible values`
+        );
+      }
+      return [id, value];
+    })
+  );
 }
 
 /** Write a scaffold without ever overwriting an existing fixture. */
