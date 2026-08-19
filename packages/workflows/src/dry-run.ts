@@ -113,6 +113,11 @@ function generatedStubFor(node: DagNode): DryRunStubValue {
   if (node.output_format === undefined) {
     return isLoopNode(node) && node.loop.until !== undefined ? node.loop.until : 'TODO';
   }
+  if (node.output_format.$async === true) {
+    throw new Error(
+      `Cannot generate dry-run stub for node '${node.id}': asynchronous output_format schemas are unsupported`
+    );
+  }
 
   const value = schemaPlaceholder(node.output_format);
   if (!isRecord(value)) {
@@ -141,6 +146,18 @@ function generatedStubFor(node: DagNode): DryRunStubValue {
   return value;
 }
 
+function stubSatisfiesNode(node: DagNode, stub: DryRunStubValue): boolean {
+  if (node.output_format !== undefined) {
+    if (!isRecord(stub)) return false;
+    const validation = validateStructuredOutput(stub, node.output_format);
+    if (!validation.valid) return false;
+  }
+  if (isLoopNode(node)) {
+    return loopIterationCompletes(node.loop, completedOutput(node, stub)).kind !== 'incomplete';
+  }
+  return true;
+}
+
 function collectsStub(node: DagNode): boolean {
   return !(
     isApprovalNode(node) ||
@@ -153,22 +170,32 @@ function collectsStub(node: DagNode): boolean {
 
 /** Build the complete static stub map for an already-expanded workflow definition. */
 export function createDryRunStubScaffold(workflow: WorkflowDefinition): DryRunStubs {
-  const stubs: DryRunStubs = {};
+  const stubs = new Map<string, { value: DryRunStubValue; consumers: DagNode[] }>();
   const visit = (nodes: readonly DagNode[]): void => {
     for (const node of nodes) {
       if (collectsStub(node)) {
-        if (stubs[node.id] !== undefined) {
-          throw new Error(
-            `Cannot generate dry-run scaffold: multiple nodes use stub key '${node.id}'`
+        const generated = generatedStubFor(node);
+        const existing = stubs.get(node.id);
+        if (existing === undefined) {
+          stubs.set(node.id, { value: generated, consumers: [node] });
+        } else {
+          const consumers = [...existing.consumers, node];
+          const value = [existing.value, generated].find(candidate =>
+            consumers.every(consumer => stubSatisfiesNode(consumer, candidate))
           );
+          if (value === undefined) {
+            throw new Error(
+              `Cannot generate dry-run scaffold: nodes sharing stub key '${node.id}' require incompatible values`
+            );
+          }
+          stubs.set(node.id, { value, consumers });
         }
-        stubs[node.id] = generatedStubFor(node);
       }
       if (isLoopGroupNode(node)) visit(node.loop_group.nodes);
     }
   };
   visit(workflow.nodes);
-  return stubs;
+  return Object.fromEntries([...stubs].map(([id, entry]) => [id, entry.value]));
 }
 
 /** Write a scaffold without ever overwriting an existing fixture. */
@@ -560,10 +587,9 @@ async function executeCodeNode(
 }
 
 function stubFor(node: DagNode, ctx: DryRunContext): DryRunStubValue | undefined {
-  const stub = ctx.stubs[node.id];
-  if (stub !== undefined) {
+  if (Object.hasOwn(ctx.stubs, node.id)) {
     ctx.consumedStubs.add(node.id);
-    return stub;
+    return ctx.stubs[node.id];
   }
   if (ctx.defaultStubs && !((isBashNode(node) || isScriptNode(node)) && ctx.execCode)) {
     return generatedStubFor(node);

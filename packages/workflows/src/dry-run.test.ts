@@ -189,6 +189,114 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
     expect(existsSync(path)).toBe(false);
   });
 
+  test('owns prototype-named keys and coalesces compatible loop-body keys', async () => {
+    const body = () => ({
+      until: 'TODO',
+      max_iterations: 1,
+      nodes: [{ id: 'shared', prompt: 'work' }],
+    });
+    const workflow = makeTestWorkflow({
+      name: 'shared-stub-keys',
+      nodes: [
+        { id: '__proto__', prompt: 'prototype' },
+        { id: 'constructor', prompt: 'constructor' },
+        { id: 'first', loop_group: body() },
+        { id: 'second', loop_group: body() },
+      ],
+    });
+
+    const scaffold = createDryRunStubScaffold(workflow);
+    const strict = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: scaffold,
+    });
+    const sparse = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      defaultStubs: true,
+    });
+
+    expect(Object.keys(scaffold).sort()).toEqual(['__proto__', 'constructor', 'shared']);
+    expect(scaffold.__proto__).toBe('TODO');
+    expect(Object.getOwnPropertyDescriptor(scaffold, 'constructor')?.value).toBe('TODO');
+    expect(strict.outcome).toBe('completed');
+    expect(strict.unusedStubs).toEqual([]);
+    expect(sparse.outcome).toBe('completed');
+    expect(sparse.trace.find(entry => entry.nodeId === '__proto__')?.output).toBe('TODO');
+    expect(sparse.trace.filter(entry => entry.nodeId === 'shared')).toHaveLength(2);
+  });
+
+  test('rejects only genuinely incompatible nodes sharing one raw stub key', () => {
+    const body = (only: string) => ({
+      until: 'TODO',
+      max_iterations: 1,
+      nodes: [
+        {
+          id: 'shared',
+          prompt: 'work',
+          output_format: {
+            type: 'object',
+            properties: { kind: { type: 'string', enum: [only] } },
+            required: ['kind'],
+          },
+        },
+      ],
+    });
+    const workflow = makeTestWorkflow({
+      name: 'incompatible-stub-keys',
+      nodes: [
+        { id: 'first', loop_group: body('first') },
+        { id: 'second', loop_group: body('second') },
+      ],
+    });
+
+    expect(() => createDryRunStubScaffold(workflow)).toThrow(
+      "nodes sharing stub key 'shared' require incompatible values"
+    );
+  });
+
+  test('fails closed on asynchronous output schemas without an unhandled rejection', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'async-schema',
+      nodes: [
+        {
+          id: 'strict',
+          prompt: 'strict',
+          output_format: {
+            $async: true,
+            type: 'object',
+            properties: { code: { type: 'string' } },
+            required: ['code'],
+          },
+        },
+      ],
+    });
+    const directory = mkdtempSync(join(tmpdir(), 'archon-dry-run-scaffold-async-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'stubs.yaml');
+
+    await expect(writeDryRunStubScaffold(workflow, path)).rejects.toThrow(
+      'asynchronous output_format schemas are unsupported'
+    );
+    const sparse = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      defaultStubs: true,
+    });
+
+    expect(existsSync(path)).toBe(false);
+    expect(sparse.outcome).toBe('failed');
+    expect(sparse.trace[0]).toMatchObject({
+      nodeId: 'strict',
+      state: 'failed',
+      reason: expect.stringContaining('asynchronous output_format schemas are unsupported'),
+    });
+  });
+
   test('completes a 36-node composition with only three load-bearing overrides', async () => {
     const blockNodes = [
       {
