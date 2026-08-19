@@ -91,6 +91,7 @@ describe('WorktreeProvider', () => {
   let listWorktreesSpy: Mock<typeof git.listWorktrees>;
   let findWorktreeByBranchSpy: Mock<typeof git.findWorktreeByBranch>;
   let getCanonicalRepoPathSpy: Mock<typeof git.getCanonicalRepoPath>;
+  let verifyWorktreeOwnershipSpy: Mock<typeof git.verifyWorktreeOwnership>;
 
   beforeEach(() => {
     mockConfigLoader = async (): Promise<{ baseBranch: git.BranchName }> => ({
@@ -103,6 +104,7 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy = spyOn(git, 'listWorktrees');
     findWorktreeByBranchSpy = spyOn(git, 'findWorktreeByBranch');
     getCanonicalRepoPathSpy = spyOn(git, 'getCanonicalRepoPath');
+    verifyWorktreeOwnershipSpy = spyOn(git, 'verifyWorktreeOwnership');
     getDefaultBranchSpy = spyOn(git, 'getDefaultBranch');
     getDefaultRemoteSpy = spyOn(git, 'getDefaultRemote');
     syncWorkspaceSpy = spyOn(git, 'syncWorkspace');
@@ -114,6 +116,7 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy.mockResolvedValue([]);
     findWorktreeByBranchSpy.mockResolvedValue(null);
     getCanonicalRepoPathSpy.mockImplementation(async path => git.toRepoPath(path));
+    verifyWorktreeOwnershipSpy.mockResolvedValue(undefined);
     // Most paths exist by default (directoryExists checks for destroy etc.),
     // but .gitmodules is absent by default — most repos don't use submodules,
     // and default-on submodule init must skip cleanly in that case.
@@ -149,6 +152,7 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy.mockRestore();
     findWorktreeByBranchSpy.mockRestore();
     getCanonicalRepoPathSpy.mockRestore();
+    verifyWorktreeOwnershipSpy.mockRestore();
     getDefaultBranchSpy.mockRestore();
     getDefaultRemoteSpy.mockRestore();
     syncWorkspaceSpy.mockRestore();
@@ -586,6 +590,9 @@ describe('WorktreeProvider', () => {
     test('throws when worktree belongs to different repo root (cross-checkout)', async () => {
       worktreeExistsSpy.mockResolvedValue(true);
       mockReadFile.mockResolvedValue('gitdir: /different/repo/.git/worktrees/archon/issue-42\n');
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('Worktree belongs to a different clone (/different/repo/.git).')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(/belongs to a different clone/);
     });
@@ -595,6 +602,9 @@ describe('WorktreeProvider', () => {
       const eisdirError = new Error('EISDIR') as NodeJS.ErrnoException;
       eisdirError.code = 'EISDIR';
       mockReadFile.mockRejectedValue(eisdirError);
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('path contains a full git checkout')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(
         /path contains a full git checkout/
@@ -606,6 +616,9 @@ describe('WorktreeProvider', () => {
       const eaccesError = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
       eaccesError.code = 'EACCES';
       mockReadFile.mockRejectedValue(eaccesError);
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('Cannot verify worktree ownership: permission denied')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(
         /Cannot verify worktree ownership/
@@ -619,6 +632,9 @@ describe('WorktreeProvider', () => {
       mockReadFile
         .mockResolvedValueOnce('gitdir: /workspace/repo/.git/modules/submodule-name\n')
         .mockRejectedValueOnce(enoentError);
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('.git pointer is not a git-worktree reference')
+      );
 
       await expect(provider.create(baseRequest)).rejects.toThrow(/not a git-worktree reference/);
     });
@@ -689,6 +705,9 @@ describe('WorktreeProvider', () => {
       );
       // .git points to a different clone
       mockReadFile.mockResolvedValue('gitdir: /other/clone/.git/worktrees/feature-auth\n');
+      verifyWorktreeOwnershipSpy.mockRejectedValueOnce(
+        new Error('Worktree belongs to a different clone (/other/clone/.git).')
+      );
 
       await expect(provider.create(request)).rejects.toThrow(/belongs to a different clone/);
     });

@@ -40,6 +40,7 @@ import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
+import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
@@ -2484,17 +2485,6 @@ function readParseWarningEvents(events: readonly WorkflowEventRow[]): string[] {
  * status. `--all` drops the project scope (lists across all projects);
  * `--status` filters to one status; `--limit` caps the count (default 20).
  */
-async function findCodebaseForCheckoutPath(
-  cwd: string
-): Promise<Awaited<ReturnType<typeof codebaseDb.findCodebaseByDefaultCwd>>> {
-  const exact = await codebaseDb.findCodebaseByDefaultCwd(cwd);
-  if (exact) return exact;
-
-  const canonicalCwd = await git.getCanonicalRepoPath(cwd);
-  if (canonicalCwd === cwd) return null;
-  return codebaseDb.findCodebaseByDefaultCwd(canonicalCwd);
-}
-
 export async function workflowRunsCommand(
   cwd: string,
   opts: { json?: boolean; all?: boolean; status?: string; limit?: number } = {}

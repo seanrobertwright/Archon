@@ -6,7 +6,8 @@ import { access, rm, stat, realpath } from 'fs/promises';
 import { join, basename, resolve } from 'path';
 import * as codebaseDb from '../db/codebases';
 import { sanitizeError } from '../utils/credential-sanitizer';
-import { execFileAsync, getCanonicalRepoPath } from '@archon/git';
+import { execFileAsync } from '@archon/git';
+import { findCodebaseForCheckoutPath } from '../services/codebase-checkout-resolver';
 import {
   expandTilde,
   getCommandFolderSearchPaths,
@@ -411,16 +412,9 @@ export async function registerRepository(localPath: string): Promise<RegisterRes
     throw new Error(`Path is not a git repository: ${localPath} (${(error as Error).message})`);
   }
 
-  // A linked worktree is another checkout of the same local repository, so its
-  // registered identity is owned by the primary checkout from its .git pointer.
-  // Ordinary clones return their own path unchanged and remain distinct (#1192).
-  let existing = await codebaseDb.findCodebaseByDefaultCwd(localPath);
-  if (!existing) {
-    const canonicalPath = await getCanonicalRepoPath(localPath);
-    if (canonicalPath !== localPath) {
-      existing = await codebaseDb.findCodebaseByDefaultCwd(canonicalPath);
-    }
-  }
+  // Git's physical common directory proves linked-checkout ownership without
+  // conflating separate clones, remotes, names, or branches (#1192).
+  const existing = await findCodebaseForCheckoutPath(localPath);
   if (existing) {
     return {
       codebaseId: existing.id,

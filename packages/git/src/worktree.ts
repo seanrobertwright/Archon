@@ -294,68 +294,90 @@ export async function removeWorktree(
   });
 }
 
-type GitDirPointer =
-  | { kind: 'linked-worktree'; primaryCheckout: RepoPath }
-  | { kind: 'submodule' }
-  | { kind: 'invalid' };
+export interface GitCheckoutIdentity {
+  gitDir: string;
+  commonGitDir: string;
+  linkedWorktree: boolean;
+}
 
-// A submodule path may itself contain `worktrees/<name>`. Git's commondir
-// metadata, rather than that path shape, proves whether it is a linked worktree.
-async function decodeGitDirPointer(path: string, content: string): Promise<GitDirPointer> {
-  if (!content.startsWith('gitdir:')) return { kind: 'invalid' };
+export class CanonicalRepoPathUnavailableError extends Error {
+  constructor(
+    readonly checkoutPath: string,
+    readonly commonGitDir: string
+  ) {
+    super(
+      `Cannot determine the primary checkout for linked worktree at ${checkoutPath}. ` +
+        `Git uses external directory ${commonGitDir}, which does not record the primary checkout path.`
+    );
+    this.name = 'CanonicalRepoPathUnavailableError';
+  }
+}
 
-  const pointer = content.slice('gitdir:'.length).trim();
-  const gitDir = isAbsolute(pointer) ? pointer : resolve(path, pointer);
-  const worktreeMatch = /^(.*)[\\/]\.git[\\/]worktrees[\\/]/.exec(gitDir);
-  if (worktreeMatch) {
-    return { kind: 'linked-worktree', primaryCheckout: toRepoPath(worktreeMatch[1]) };
+/**
+ * Return Git's physical repository identity for a checkout.
+ *
+ * `--git-dir` and `--git-common-dir` are equal for independent checkouts and
+ * differ for linked worktrees. This avoids rebuilding valid Git layouts from
+ * pathname conventions (`.git/modules`, linked-superproject modules, or an
+ * external `--separate-git-dir`).
+ */
+export async function getGitCheckoutIdentity(path: string): Promise<GitCheckoutIdentity> {
+  const { stdout } = await execFileAsync('git', [
+    '-C',
+    path,
+    'rev-parse',
+    '--path-format=absolute',
+    '--git-dir',
+    '--git-common-dir',
+  ]);
+  const [gitDir, commonGitDir] = stdout.split(/\r?\n/).filter(line => line.length > 0);
+  if (!gitDir || !commonGitDir) {
+    throw new Error(`Git returned incomplete repository identity for ${path}`);
+  }
+  return {
+    gitDir,
+    commonGitDir,
+    linkedWorktree: resolve(gitDir) !== resolve(commonGitDir),
+  };
+}
+
+async function resolvePrimaryCheckout(
+  path: string,
+  identity: GitCheckoutIdentity
+): Promise<RepoPath> {
+  const { stdout: worktreeList } = await execFileAsync('git', [
+    '--git-dir',
+    identity.commonGitDir,
+    'worktree',
+    'list',
+    '--porcelain',
+  ]);
+  const firstWorktree = /^worktree (.+)$/m.exec(worktreeList)?.[1];
+  if (firstWorktree && resolve(firstWorktree) !== resolve(identity.commonGitDir)) {
+    return toRepoPath(firstWorktree);
   }
 
-  if (!/(?:^|[\\/])\.git[\\/]modules[\\/]/.test(gitDir)) {
-    return { kind: 'invalid' };
-  }
-
-  let commonDirPointer: string;
-  try {
-    commonDirPointer = (await readFile(join(gitDir, 'commondir'), 'utf-8')).trim();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { kind: 'submodule' };
-    }
-    throw error;
-  }
-
-  if (!commonDirPointer) {
-    throw new Error(`Git returned an empty commondir for linked submodule worktree at ${path}`);
-  }
-
-  const commonGitDir = isAbsolute(commonDirPointer)
-    ? commonDirPointer
-    : resolve(gitDir, commonDirPointer);
   try {
     const { stdout } = await execFileAsync('git', [
       '--git-dir',
-      commonGitDir,
+      identity.commonGitDir,
       'config',
       '--get',
       'core.worktree',
     ]);
     const primaryCheckout = stdout.trim();
     if (primaryCheckout) {
-      return {
-        kind: 'linked-worktree',
-        primaryCheckout: toRepoPath(
-          isAbsolute(primaryCheckout) ? primaryCheckout : resolve(commonGitDir, primaryCheckout)
-        ),
-      };
+      return toRepoPath(
+        isAbsolute(primaryCheckout)
+          ? primaryCheckout
+          : resolve(identity.commonGitDir, primaryCheckout)
+      );
     }
-  } catch (error) {
-    getLog().error({ path, commonGitDir, err: error as Error }, 'submodule_worktree_path_failed');
-    throw new Error(
-      `Cannot determine primary checkout for linked submodule worktree at ${path}: ${(error as Error).message}`
-    );
+  } catch {
+    // External Git directories do not record a reverse pointer to their primary
+    // checkout. Registered-codebase lookup can still match their common Git dir.
   }
-  throw new Error(`Git returned an empty core.worktree for linked submodule worktree at ${path}`);
+  throw new CanonicalRepoPathUnavailableError(path, identity.commonGitDir);
 }
 
 /**
@@ -364,21 +386,18 @@ async function decodeGitDirPointer(path: string, content: string): Promise<GitDi
  */
 export async function getCanonicalRepoPath(path: string): Promise<RepoPath> {
   if (await isWorktreePath(path)) {
-    // Read .git file to find main repo
-    const gitPath = join(path, '.git');
-    const content = await readFile(gitPath, 'utf-8');
-    const pointer = await decodeGitDirPointer(path, content);
-    if (pointer.kind === 'linked-worktree') return pointer.primaryCheckout;
-    if (pointer.kind === 'submodule') return toRepoPath(path);
-    // A gitdir file that identifies neither a worktree nor a submodule is malformed here.
-    getLog().error(
-      { path, gitContentPrefix: content.substring(0, 120) },
-      'canonical_path_regex_failed'
-    );
-    throw new Error(
-      `Cannot determine canonical repo path from worktree at ${path}. ` +
-        `Unexpected .git file format: ${content.substring(0, 80)}`
-    );
+    try {
+      const identity = await getGitCheckoutIdentity(path);
+      if (!identity.linkedWorktree) return toRepoPath(path);
+      return await resolvePrimaryCheckout(path, identity);
+    } catch (error) {
+      if (error instanceof CanonicalRepoPathUnavailableError) throw error;
+      getLog().error({ path, err: error as Error }, 'canonical_path_resolution_failed');
+      throw new Error(
+        `Cannot determine canonical repo path from worktree at ${path}: ${(error as Error).message}`,
+        { cause: error }
+      );
+    }
   }
   return toRepoPath(path);
 }
@@ -392,10 +411,8 @@ export async function getCanonicalRepoPath(path: string): Promise<RepoPath> {
  * worktree. This is intentionally strict — a permissive fallback here
  * would re-introduce the cross-checkout bug this guard exists to prevent.
  *
- * Paths are normalized with `resolve()` before comparison to handle trailing
- * slashes and relative components. Symlinked paths (where canonical vs
- * registered paths differ by symlink resolution) are not equated — callers
- * should register codebases with consistent path forms.
+ * Git's common-directory paths are normalized with `resolve()` before
+ * comparison to handle trailing slashes and relative components.
  *
  * Error classification (surfaced via `classifyIsolationError` in
  * `@archon/isolation/errors.ts`):
@@ -437,21 +454,36 @@ export async function verifyWorktreeOwnership(
     throw wrap(`Cannot verify worktree ownership at ${worktreePath}: ${err.message}`);
   }
 
-  const pointer = await decodeGitDirPointer(worktreePath, gitContent);
-  if (pointer.kind !== 'linked-worktree') {
+  if (!gitContent.startsWith('gitdir:')) {
+    throw new Error(`Cannot adopt ${worktreePath}: .git pointer is not a git-worktree reference.`);
+  }
+
+  let worktreeIdentity: GitCheckoutIdentity;
+  let expectedIdentity: GitCheckoutIdentity;
+  try {
+    [worktreeIdentity, expectedIdentity] = await Promise.all([
+      getGitCheckoutIdentity(worktreePath),
+      getGitCheckoutIdentity(expectedRepo),
+    ]);
+  } catch (error) {
+    throw new Error(
+      `Cannot verify worktree ownership at ${worktreePath}: ${(error as Error).message}`,
+      {
+        cause: error,
+      }
+    );
+  }
+  if (!worktreeIdentity.linkedWorktree) {
     // Not a git-worktree pointer (e.g., submodule pointer, or malformed).
     // We cannot confirm this is our worktree, so refuse adoption.
     throw new Error(`Cannot adopt ${worktreePath}: .git pointer is not a git-worktree reference.`);
   }
 
-  // Compare on resolved paths (normalizes trailing slashes and relative
-  // components) but display the decoded path without applying `resolve()`.
-  // On Windows, resolving a POSIX-style gitdir would prepend a drive letter
-  // and make the error message misleading.
-  const existingRepo = pointer.primaryCheckout;
-  if (resolve(existingRepo) !== resolve(expectedRepo)) {
+  // Compare resolved common-directory paths: the primary checkout and every
+  // linked worktree share this Git identity, while separate clones differ.
+  if (resolve(worktreeIdentity.commonGitDir) !== resolve(expectedIdentity.commonGitDir)) {
     throw new Error(
-      `Worktree at ${worktreePath} belongs to a different clone (${existingRepo}). ` +
+      `Worktree at ${worktreePath} belongs to a different clone (${worktreeIdentity.commonGitDir}). ` +
         'Remove it from that clone or use a different codebase registration.'
     );
   }

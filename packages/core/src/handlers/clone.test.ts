@@ -11,6 +11,11 @@ import { describe, test, expect, mock, beforeEach, afterAll, afterEach, spyOn } 
 import { resolve } from 'path';
 import * as fsPromises from 'fs/promises';
 import * as gitUtils from '@archon/git';
+import type { Codebase } from '../types';
+import {
+  findCodebaseForCheckoutPath,
+  type CodebaseCheckoutResolverDeps,
+} from '../services/codebase-checkout-resolver';
 import { createMockLogger } from '../test/mocks/logger';
 
 // ── DB mocks ────────────────────────────────────────────────────────────────
@@ -30,6 +35,7 @@ const mockGetCodebaseCommands = mock(() => Promise.resolve({}));
 const mockUpdateCodebaseCommands = mock(() => Promise.resolve());
 const mockFindCodebaseByRepoUrl = mock(() => Promise.resolve(null));
 const mockFindCodebaseByDefaultCwd = mock(() => Promise.resolve(null));
+const mockListCodebases = mock(() => Promise.resolve([]));
 const mockFindCodebaseByName = mock(() => Promise.resolve(null));
 const mockUpdateCodebase = mock(() => Promise.resolve());
 const mockCreateProjectSourceSymlink = mock((): Promise<void> => Promise.resolve());
@@ -40,6 +46,7 @@ mock.module('../db/codebases', () => ({
   updateCodebaseCommands: mockUpdateCodebaseCommands,
   findCodebaseByRepoUrl: mockFindCodebaseByRepoUrl,
   findCodebaseByDefaultCwd: mockFindCodebaseByDefaultCwd,
+  listCodebases: mockListCodebases,
   findCodebaseByName: mockFindCodebaseByName,
   updateCodebase: mockUpdateCodebase,
 }));
@@ -183,12 +190,97 @@ function makeCodebase(
     default_cwd: '/home/test/.archon/workspaces/owner/repo/source',
     default_branch: null,
     ai_assistant_type: 'claude',
+    kind: 'repo',
     commands: {},
     created_at: new Date(),
     updated_at: new Date(),
     ...overrides,
   };
 }
+
+function makeResolverDeps(
+  overrides: Partial<CodebaseCheckoutResolverDeps> = {}
+): CodebaseCheckoutResolverDeps {
+  return {
+    findCodebaseByDefaultCwd: async () => null,
+    listCodebases: async () => [],
+    getCanonicalRepoPath: async path => path,
+    getGitCheckoutIdentity: async path => ({
+      gitDir: `${path}/.git`,
+      commonGitDir: `${path}/.git`,
+      linkedWorktree: false,
+    }),
+    ...overrides,
+  };
+}
+
+describe('findCodebaseForCheckoutPath', () => {
+  const cwd = '/workspace/external-linked';
+  const commonGitDir = '/metadata/repository';
+
+  function externalLinkedError(): gitUtils.CanonicalRepoPathUnavailableError {
+    return new gitUtils.CanonicalRepoPathUnavailableError(cwd, commonGitDir);
+  }
+
+  test('matches an external linked worktree to its uniquely registered Git repository', async () => {
+    const registered = makeCodebase({ default_cwd: '/workspace/primary' }) as Codebase;
+    const separateClone = makeCodebase({
+      id: 'separate-clone',
+      default_cwd: '/workspace/separate-clone',
+    }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [registered, separateClone],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : `${path}/.git`,
+        commonGitDir:
+          path === separateClone.default_cwd ? '/metadata/separate-clone' : commonGitDir,
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).resolves.toBe(registered);
+  });
+
+  test('does not conflate a separate clone with the registered repository', async () => {
+    const registered = makeCodebase({ default_cwd: '/workspace/primary' }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [registered],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : '/other/clone/.git',
+        commonGitDir: path === cwd ? commonGitDir : '/other/clone/.git',
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).resolves.toBeNull();
+  });
+
+  test('rejects ambiguous registrations sharing one external Git directory', async () => {
+    const first = makeCodebase({ id: 'first', default_cwd: '/workspace/first' }) as Codebase;
+    const second = makeCodebase({ id: 'second', default_cwd: '/workspace/second' }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [first, second],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : commonGitDir,
+        commonGitDir,
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).rejects.toThrow(
+      'matches multiple registered codebases'
+    );
+  });
+});
 
 // ────────────────────────────────────────────────────────────────────────────
 describe('cloneRepository', () => {

@@ -158,9 +158,27 @@ mock.module('@archon/workflows/event-emitter', () => ({
   })),
 }));
 
+class MockCanonicalRepoPathUnavailableError extends Error {
+  constructor(
+    readonly checkoutPath: string,
+    readonly commonGitDir: string
+  ) {
+    super(`Cannot determine the primary checkout for ${checkoutPath}`);
+    this.name = 'CanonicalRepoPathUnavailableError';
+  }
+}
+
 mock.module('@archon/git', () => ({
   findRepoRoot: mock(() => Promise.resolve(null)),
   getCanonicalRepoPath: mock((path: string) => Promise.resolve(path)),
+  getGitCheckoutIdentity: mock((path: string) =>
+    Promise.resolve({
+      gitDir: `${path}/.git`,
+      commonGitDir: `${path}/.git`,
+      linkedWorktree: false,
+    })
+  ),
+  CanonicalRepoPathUnavailableError: MockCanonicalRepoPathUnavailableError,
   getRemoteUrl: mock(() => Promise.resolve(null)),
   checkout: mock(() => Promise.resolve()),
   toRepoPath: mock((path: string) => path),
@@ -180,6 +198,7 @@ mock.module('@archon/core/db/conversations', () => ({
 
 mock.module('@archon/core/db/codebases', () => ({
   findCodebaseByDefaultCwd: mock(() => Promise.resolve(null)),
+  listCodebases: mock(() => Promise.resolve([])),
   findCodebaseByPathPrefix: mock(() => Promise.resolve(null)),
   getCodebase: mock(() => Promise.resolve(null)),
 }));
@@ -4148,6 +4167,44 @@ describe('workflowRunsCommand', () => {
     expect(canonicalSpy).not.toHaveBeenCalled();
     expect(listSpy).toHaveBeenCalledWith(
       expect.objectContaining({ codebaseId: 'cb-worktree', limit: 20 })
+    );
+  });
+
+  it('scopes an external-git-dir worktree through its registered Git identity', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const cwd = '/workspace/external-linked';
+    const commonGitDir = '/metadata/repository';
+    const registered = {
+      id: 'cb-external',
+      name: 'owner/repo',
+      default_cwd: '/workspace/primary',
+      kind: 'repo',
+    };
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new git.CanonicalRepoPathUnavailableError(cwd, commonGitDir)
+    );
+    (git.getGitCheckoutIdentity as ReturnType<typeof mock>)
+      .mockResolvedValueOnce({
+        gitDir: `${commonGitDir}/worktrees/linked`,
+        commonGitDir,
+        linkedWorktree: true,
+      })
+      .mockResolvedValueOnce({
+        gitDir: commonGitDir,
+        commonGitDir,
+        linkedWorktree: false,
+      });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (codebaseDb.listCodebases as ReturnType<typeof mock>).mockResolvedValueOnce([registered]);
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand(cwd, {});
+
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-external', limit: 20 })
     );
   });
 

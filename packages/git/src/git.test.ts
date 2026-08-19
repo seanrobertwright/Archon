@@ -157,8 +157,21 @@ describe('git utilities', () => {
 
     test('extracts main repo path from worktree', async () => {
       await writeFile(join(testDir, '.git'), 'gitdir: /workspace/my-repo/.git/worktrees/issue-42');
-      const result = await git.getCanonicalRepoPath(testDir);
-      expect(result).toBe(repo('/workspace/my-repo'));
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout: '/workspace/my-repo/.git/worktrees/issue-42\n/workspace/my-repo/.git\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: 'worktree /workspace/my-repo\nHEAD abc123\nbranch refs/heads/main\n',
+          stderr: '',
+        });
+      try {
+        const result = await git.getCanonicalRepoPath(testDir);
+        expect(result).toBe(repo('/workspace/my-repo'));
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('handles worktree path with nested directories', async () => {
@@ -166,20 +179,54 @@ describe('git utilities', () => {
         join(testDir, '.git'),
         'gitdir: /home/user/projects/my-app/.git/worktrees/feature-branch'
       );
-      const result = await git.getCanonicalRepoPath(testDir);
-      expect(result).toBe(repo('/home/user/projects/my-app'));
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout:
+            '/home/user/projects/my-app/.git/worktrees/feature-branch\n/home/user/projects/my-app/.git\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: 'worktree /home/user/projects/my-app\nHEAD abc123\n',
+          stderr: '',
+        });
+      try {
+        const result = await git.getCanonicalRepoPath(testDir);
+        expect(result).toBe(repo('/home/user/projects/my-app'));
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('resolves a relative worktree pointer from the worktree root', async () => {
       await writeFile(join(testDir, '.git'), 'gitdir: ../primary/.git/worktrees/linked');
-      const result = await git.getCanonicalRepoPath(testDir);
-      expect(result).toBe(repo(resolve(testDir, '../primary')));
+      const primary = resolve(testDir, '../primary');
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout: `${primary}/.git/worktrees/linked\n${primary}/.git\n`,
+          stderr: '',
+        })
+        .mockResolvedValueOnce({ stdout: `worktree ${primary}\nHEAD abc123\n`, stderr: '' });
+      try {
+        const result = await git.getCanonicalRepoPath(testDir);
+        expect(result).toBe(repo(primary));
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('keeps a submodule checkout as its own canonical repository', async () => {
       await writeFile(join(testDir, '.git'), 'gitdir: ../primary/.git/modules/vendor/module');
-      const result = await git.getCanonicalRepoPath(testDir);
-      expect(result).toBe(testDir);
+      const gitDir = resolve(testDir, '../primary/.git/modules/vendor/module');
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
+        stdout: `${gitDir}\n${gitDir}\n`,
+        stderr: '',
+      });
+      try {
+        const result = await git.getCanonicalRepoPath(testDir);
+        expect(result).toBe(testDir);
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('keeps a submodule named under worktrees as its own canonical repository', async () => {
@@ -187,9 +234,39 @@ describe('git utilities', () => {
       await realMkdir(gitDir, { recursive: true });
       await writeFile(join(testDir, '.git'), `gitdir: ${gitDir}`);
 
-      const result = await git.getCanonicalRepoPath(testDir);
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
+        stdout: `${gitDir}\n${gitDir}\n`,
+        stderr: '',
+      });
+      try {
+        const result = await git.getCanonicalRepoPath(testDir);
+        expect(result).toBe(testDir);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
 
-      expect(result).toBe(testDir);
+    test('keeps a submodule inside a linked superproject as its own repository', async () => {
+      const commonGitDir = join(
+        testDir,
+        'super',
+        '.git',
+        'worktrees',
+        'linked-super',
+        'modules',
+        'vendor',
+        'module'
+      );
+      await writeFile(join(testDir, '.git'), `gitdir: ${commonGitDir}`);
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
+        stdout: `${commonGitDir}\n${commonGitDir}\n`,
+        stderr: '',
+      });
+      try {
+        await expect(git.getCanonicalRepoPath(testDir)).resolves.toBe(testDir);
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('resolves a linked submodule worktree to the primary submodule checkout', async () => {
@@ -198,10 +275,14 @@ describe('git utilities', () => {
       await realMkdir(linkedGitDir, { recursive: true });
       await writeFile(join(linkedGitDir, 'commondir'), '../..\n');
       await writeFile(join(testDir, '.git'), `gitdir: ${linkedGitDir}`);
-      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
-        stdout: '../../../../vendor/module\n',
-        stderr: '',
-      });
+      const primaryCheckout = resolve(commonGitDir, '../../../../vendor/module');
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout: `${linkedGitDir}\n${commonGitDir}\n`,
+          stderr: '',
+        })
+        .mockResolvedValueOnce({ stdout: `worktree ${commonGitDir}\nHEAD abc123\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: '../../../../vendor/module\n', stderr: '' });
 
       try {
         const result = await git.getCanonicalRepoPath(testDir);
@@ -213,7 +294,63 @@ describe('git utilities', () => {
           '--get',
           'core.worktree',
         ]);
-        expect(result).toBe(repo(resolve(commonGitDir, '../../../../vendor/module')));
+        expect(result).toBe(repo(primaryCheckout));
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    test('resolves a linked submodule worktree inside a linked superproject', async () => {
+      const commonGitDir = join(
+        testDir,
+        'super',
+        '.git',
+        'worktrees',
+        'linked-super',
+        'modules',
+        'vendor',
+        'module'
+      );
+      const linkedGitDir = join(commonGitDir, 'worktrees', 'linked-module');
+      const primaryCheckout = join(testDir, 'linked-super', 'vendor', 'module');
+      await writeFile(join(testDir, '.git'), `gitdir: ${linkedGitDir}`);
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({ stdout: `${linkedGitDir}\n${commonGitDir}\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: `worktree ${commonGitDir}\nHEAD abc123\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: `${primaryCheckout}\n`, stderr: '' });
+      try {
+        await expect(git.getCanonicalRepoPath(testDir)).resolves.toBe(repo(primaryCheckout));
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    test('keeps a primary checkout with an external Git directory', async () => {
+      const externalGitDir = join(testDir, 'metadata');
+      await writeFile(join(testDir, '.git'), `gitdir: ${externalGitDir}`);
+      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
+        stdout: `${externalGitDir}\n${externalGitDir}\n`,
+        stderr: '',
+      });
+      try {
+        await expect(git.getCanonicalRepoPath(testDir)).resolves.toBe(testDir);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    test('reports when an external Git directory cannot reveal the primary checkout', async () => {
+      const commonGitDir = join(testDir, 'metadata');
+      const linkedGitDir = join(commonGitDir, 'worktrees', 'linked');
+      await writeFile(join(testDir, '.git'), `gitdir: ${linkedGitDir}`);
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({ stdout: `${linkedGitDir}\n${commonGitDir}\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: `worktree ${commonGitDir}\nHEAD abc123\n`, stderr: '' })
+        .mockRejectedValueOnce(new Error('core.worktree is unset'));
+      try {
+        await expect(git.getCanonicalRepoPath(testDir)).rejects.toBeInstanceOf(
+          git.CanonicalRepoPathUnavailableError
+        );
       } finally {
         execSpy.mockRestore();
       }
@@ -2821,14 +2958,19 @@ branch refs/heads/feature/auth
         'gitdir: /some/unusual/path/without/expected/structure'
       );
       mockLogger.error.mockClear();
+      const execSpy = spyOn(git, 'execFileAsync').mockRejectedValue(new Error('invalid gitdir'));
 
-      await expect(git.getCanonicalRepoPath(testDir)).rejects.toThrow(
-        'Cannot determine canonical repo path from worktree'
-      );
-      expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ path: testDir }),
-        'canonical_path_regex_failed'
-      );
+      try {
+        await expect(git.getCanonicalRepoPath(testDir)).rejects.toThrow(
+          'Cannot determine canonical repo path from worktree'
+        );
+        expect(mockLogger.error).toHaveBeenCalledWith(
+          expect.objectContaining({ path: testDir }),
+          'canonical_path_resolution_failed'
+        );
+      } finally {
+        execSpy.mockRestore();
+      }
     });
   });
 
@@ -2838,24 +2980,50 @@ branch refs/heads/feature/auth
         join(testDir, '.git'),
         'gitdir: /workspace/my-repo/.git/worktrees/issue-42\n'
       );
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout: '/workspace/my-repo/.git/worktrees/issue-42\n/workspace/my-repo/.git\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: '/workspace/my-repo/.git\n/workspace/my-repo/.git\n',
+          stderr: '',
+        });
 
-      await expect(
-        git.verifyWorktreeOwnership(
-          git.toWorktreePath(testDir),
-          git.toRepoPath('/workspace/my-repo')
-        )
-      ).resolves.toBeUndefined();
+      try {
+        await expect(
+          git.verifyWorktreeOwnership(
+            git.toWorktreePath(testDir),
+            git.toRepoPath('/workspace/my-repo')
+          )
+        ).resolves.toBeUndefined();
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('throws with "belongs to a different clone" when gitdir points elsewhere', async () => {
       await writeFile(join(testDir, '.git'), 'gitdir: /other/clone/.git/worktrees/issue-42\n');
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout: '/other/clone/.git/worktrees/issue-42\n/other/clone/.git\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: '/workspace/my-repo/.git\n/workspace/my-repo/.git\n',
+          stderr: '',
+        });
 
-      await expect(
-        git.verifyWorktreeOwnership(
-          git.toWorktreePath(testDir),
-          git.toRepoPath('/workspace/my-repo')
-        )
-      ).rejects.toThrow(/belongs to a different clone \(\/other\/clone\)/);
+      try {
+        await expect(
+          git.verifyWorktreeOwnership(
+            git.toWorktreePath(testDir),
+            git.toRepoPath('/workspace/my-repo')
+          )
+        ).rejects.toThrow(/belongs to a different clone \(\/other\/clone\/\.git\)/);
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('normalizes trailing slashes in both paths', async () => {
@@ -2863,13 +3031,26 @@ branch refs/heads/feature/auth
         join(testDir, '.git'),
         'gitdir: /workspace/my-repo/.git/worktrees/issue-42\n'
       );
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout: '/workspace/my-repo/.git/worktrees/issue-42/\n/workspace/my-repo/.git/\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: '/workspace/my-repo/.git\n/workspace/my-repo/.git\n',
+          stderr: '',
+        });
 
-      await expect(
-        git.verifyWorktreeOwnership(
-          git.toWorktreePath(testDir),
-          git.toRepoPath('/workspace/my-repo/')
-        )
-      ).resolves.toBeUndefined();
+      try {
+        await expect(
+          git.verifyWorktreeOwnership(
+            git.toWorktreePath(testDir),
+            git.toRepoPath('/workspace/my-repo/')
+          )
+        ).resolves.toBeUndefined();
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('throws EISDIR when .git is a directory (full checkout at path)', async () => {
@@ -2914,13 +3095,27 @@ branch refs/heads/feature/auth
         join(testDir, '.git'),
         'gitdir: /workspace/my-repo/.git/modules/vendor/submodule\n'
       );
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({
+          stdout:
+            '/workspace/my-repo/.git/modules/vendor/submodule\n/workspace/my-repo/.git/modules/vendor/submodule\n',
+          stderr: '',
+        })
+        .mockResolvedValueOnce({
+          stdout: '/workspace/my-repo/.git\n/workspace/my-repo/.git\n',
+          stderr: '',
+        });
 
-      await expect(
-        git.verifyWorktreeOwnership(
-          git.toWorktreePath(testDir),
-          git.toRepoPath('/workspace/my-repo')
-        )
-      ).rejects.toThrow(/not a git-worktree reference/);
+      try {
+        await expect(
+          git.verifyWorktreeOwnership(
+            git.toWorktreePath(testDir),
+            git.toRepoPath('/workspace/my-repo')
+          )
+        ).rejects.toThrow(/not a git-worktree reference/);
+      } finally {
+        execSpy.mockRestore();
+      }
     });
 
     test('resolves for a matching linked submodule worktree pointer', async () => {
@@ -2930,14 +3125,32 @@ branch refs/heads/feature/auth
       await realMkdir(linkedGitDir, { recursive: true });
       await writeFile(join(linkedGitDir, 'commondir'), '../..\n');
       await writeFile(join(testDir, '.git'), `gitdir: ${linkedGitDir}\n`);
-      const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
-        stdout: '../../../../vendor/module\n',
-        stderr: '',
-      });
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({ stdout: `${linkedGitDir}\n${commonGitDir}\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: `${commonGitDir}\n${commonGitDir}\n`, stderr: '' });
 
       try {
         await expect(
           git.verifyWorktreeOwnership(git.toWorktreePath(testDir), git.toRepoPath(primaryCheckout))
+        ).resolves.toBeUndefined();
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    test('resolves for a linked worktree backed by an external Git directory', async () => {
+      const commonGitDir = join(testDir, 'metadata');
+      const linkedGitDir = join(commonGitDir, 'worktrees', 'linked');
+      await writeFile(join(testDir, '.git'), `gitdir: ${linkedGitDir}\n`);
+      const execSpy = spyOn(git, 'execFileAsync')
+        .mockResolvedValueOnce({ stdout: `${linkedGitDir}\n${commonGitDir}\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: `${commonGitDir}\n${commonGitDir}\n`, stderr: '' });
+      try {
+        await expect(
+          git.verifyWorktreeOwnership(
+            git.toWorktreePath(testDir),
+            git.toRepoPath(join(testDir, 'primary'))
+          )
         ).resolves.toBeUndefined();
       } finally {
         execSpy.mockRestore();
