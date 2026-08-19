@@ -207,6 +207,40 @@ describe('artifacts-index', () => {
     expect(await readNodeArtifacts(dir)).toHaveLength(2);
   });
 
+  test('loop owner digests distinguish body node ids that sanitize alike', async () => {
+    const [first, second] = await Promise.all([
+      writeNodeArtifact(
+        dir,
+        {
+          nodeId: 'a.b',
+          outputType: 'findings',
+          loopGroupPath: [{ groupId: 'group', iteration: 1 }],
+          runId: 'r',
+          producedAt: '2026-06-03T00:00:00.000Z',
+        },
+        'first'
+      ),
+      writeNodeArtifact(
+        dir,
+        {
+          nodeId: 'a_b',
+          outputType: 'findings',
+          loopGroupPath: [{ groupId: 'group', iteration: 1 }],
+          runId: 'r',
+          producedAt: '2026-06-03T00:01:00.000Z',
+        },
+        'second'
+      ),
+    ]);
+
+    expect(first.path).not.toBe(second.path);
+    expect(await readFile(join(dir, first.path), 'utf8')).toBe('first');
+    expect(await readFile(join(dir, second.path), 'utf8')).toBe('second');
+    expect(new Set((await readNodeArtifacts(dir)).map(entry => entry.nodeId))).toEqual(
+      new Set(['a.b', 'a_b'])
+    );
+  });
+
   test('loop owner namespace cannot alias valid top-level or delimiter-shaped loop ids', async () => {
     const topLevel = await writeNodeArtifact(
       dir,
