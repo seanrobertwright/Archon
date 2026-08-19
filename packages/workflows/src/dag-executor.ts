@@ -1655,7 +1655,8 @@ async function executeNodeInternal(
 
   // Create per-node abort controller for idle timeout cleanup
   const nodeAbortController = new AbortController();
-  // Fork when resuming — leaves the source session untouched so retries are safe.
+  // Request a fork when resuming. Exact-fork callers gate on sessionFork first;
+  // legacy resume-only providers may continue the source session in place.
   const shouldForkSession = resumeSessionId !== undefined;
   const nodeOptionsWithAbort: SendQueryOptions | undefined = {
     ...nodeOptions,
@@ -8087,9 +8088,9 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 baseBranch,
                 docsDir,
                 ctx.nodeOutputs,
-                // Always pass the prior session ID — forkSession:true in
-                // executeNodeInternal ensures the source is never mutated, so
-                // retries can safely resume from it.
+                // Always pass the prior session ID. executeNodeInternal requests a fork,
+                // but legacy resume-only providers may continue in place; named resume
+                // separately capability-gates and verifies an exact fork.
                 resumeSessionId,
                 configuredCommandFolder,
                 issueContext,
