@@ -6405,6 +6405,173 @@ nodes:
 });
 
 // ---------------------------------------------------------------------------
+// Authored workflow outcome (#2618)
+// ---------------------------------------------------------------------------
+
+describe('workflow authored outcome declaration (#2618)', () => {
+  const parseOutcomeWorkflow = (
+    declaration: string,
+    outputFormat = `
+    output_format:
+      type: object
+      properties:
+        green:
+          type: boolean
+      required: [green]`
+  ): ReturnType<typeof parseWorkflow> =>
+    parseWorkflow(
+      `
+name: authored-outcome
+description: independently reports the authored verdict
+${declaration}
+nodes:
+  - id: result
+    prompt: report the verdict${outputFormat}
+`,
+      'authored-outcome.yaml'
+    );
+
+  it('accepts a trimmed field naming a required boolean on the selected return node', () => {
+    const { workflow, error } = parseOutcomeWorkflow('returns: result\noutcome_field: "  green  "');
+
+    expect(error).toBeNull();
+    expect(workflow?.returns).toBe('result');
+    expect(workflow?.outcome_field).toBe('green');
+  });
+
+  it('rejects outcome_field without an explicit returns node', () => {
+    const { workflow, error } = parseOutcomeWorkflow('outcome_field: green');
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('without returns:');
+  });
+
+  it.each([
+    ['blank', 'returns: result\noutcome_field: "   "'],
+    ['non-string', 'returns: result\noutcome_field: { field: green }'],
+  ])('rejects a %s outcome_field instead of silently dropping it', (_label, declaration) => {
+    const { workflow, error } = parseOutcomeWorkflow(declaration);
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain("Invalid 'outcome_field'");
+  });
+
+  it.each([
+    ['no output_format', ''],
+    [
+      'undeclared property',
+      `
+    output_format:
+      type: object
+      properties:
+        ready: { type: boolean }
+      required: [ready]`,
+    ],
+    [
+      'optional property',
+      `
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }`,
+    ],
+    [
+      'non-boolean property',
+      `
+    output_format:
+      type: object
+      properties:
+        green: { type: string }
+      required: [green]`,
+    ],
+    [
+      'non-object root schema',
+      `
+    output_format:
+      type: string
+      properties:
+        green: { type: boolean }
+      required: [green]`,
+    ],
+  ])('rejects an outcome field with %s', (_label, outputFormat) => {
+    const { workflow, error } = parseOutcomeWorkflow(
+      'returns: result\noutcome_field: green',
+      outputFormat
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toContain('outcome_field');
+  });
+
+  it('rejects a fan-out workflow node because its runtime output is an aggregate array', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: fan-out-outcome
+description: invalid direct outcome over child aggregates
+returns: work
+outcome_field: green
+nodes:
+  - id: plan
+    prompt: emit tasks
+    output_format:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items: { type: string }
+      required: [tasks]
+  - id: work
+    workflow: child-workflow
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output.tasks"
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`,
+      'fan-out-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('fan-out workflow node');
+    expect(error?.error).toContain('collector node');
+  });
+
+  it('rejects a loop_group because its declared output format is ignored at runtime', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: loop-group-outcome
+description: invalid outcome over a raw loop group result
+returns: group
+outcome_field: green
+nodes:
+  - id: group
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: author
+          prompt: author a result
+`,
+      'loop-group-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('loop_group');
+    expect(error?.error).toContain('raw text');
+    expect(error?.error).toContain('collector node');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Workflow-level field parity (#2457)
 // ---------------------------------------------------------------------------
 
@@ -6496,6 +6663,10 @@ describe('workflow-level field parity (#2457)', () => {
     },
     // `returns` must name a real top-level node id — the fixture's single node is `only`.
     returns: { yaml: 'returns: only', present: w => w.returns === 'only' },
+    outcome_field: {
+      yaml: 'returns: only\noutcome_field: green',
+      present: w => w.outcome_field === 'green',
+    },
   };
 
   const schemaKeys = Object.keys(workflowDefinitionSchema.shape);
@@ -6528,6 +6699,11 @@ describe('workflow-level field parity (#2457)', () => {
         'nodes:',
         '  - id: only',
         '    prompt: hello',
+        '    output_format:',
+        '      type: object',
+        '      properties:',
+        '        green: { type: boolean }',
+        '      required: [green]',
       ]
         .filter(line => line !== '')
         .join('\n');

@@ -369,6 +369,11 @@ export class SqliteAdapter implements IDatabase {
       if (!wfColNames.has('output_root')) {
         this.db.run('ALTER TABLE remote_agent_workflow_runs ADD COLUMN output_root TEXT');
       }
+      if (!wfColNames.has('outcome')) {
+        this.db.run(
+          "ALTER TABLE remote_agent_workflow_runs ADD COLUMN outcome TEXT CHECK (outcome IN ('succeeded', 'failed'))"
+        );
+      }
       // Same rationale as idx_conversations_user_id above.
       this.db.run(
         'CREATE INDEX IF NOT EXISTS idx_workflow_runs_user_id ON remote_agent_workflow_runs(user_id) WHERE user_id IS NOT NULL'
@@ -713,6 +718,7 @@ export class SqliteAdapter implements IDatabase {
         workflow_name TEXT NOT NULL,
         user_message TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',
+        outcome TEXT CHECK (outcome IN ('succeeded', 'failed')),
         current_step_index INTEGER,
         metadata TEXT DEFAULT '{}',
         parent_conversation_id TEXT REFERENCES remote_agent_conversations(id) ON DELETE SET NULL,

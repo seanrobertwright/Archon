@@ -1590,7 +1590,11 @@ describe('expandWorkflowIncludes — loop_group body composition (#2623)', () =>
 /** Add workflow-level signature fields to a block. */
 function withSignature(
   base: WorkflowDefinition,
-  sig: { returns?: string; inputs?: WorkflowDefinition['inputs'] }
+  sig: {
+    returns?: string;
+    outcome_field?: string;
+    inputs?: WorkflowDefinition['inputs'];
+  }
 ): WorkflowDefinition {
   return { ...base, ...sig };
 }
@@ -1643,6 +1647,92 @@ describe('expandWorkflowIncludes — returns drives primarySink (#2470)', () => 
     // A caller including that outer workflow observes the same return selection.
     const consume = nodeById(workflows.get('parent')!, 'consume')!;
     expect('prompt' in consume ? consume.prompt : '').toBe('value: $outer__blk__result.output');
+  });
+
+  test('validates an outer outcome_field against the rebound flattened return node', () => {
+    const resultNode: DagNode = {
+      id: 'result',
+      prompt: 'result',
+      output_format: {
+        type: 'object',
+        properties: { green: { type: 'boolean' } },
+        required: ['green'],
+      },
+    };
+    const inner = withSignature(wf('inner', [resultNode]), { returns: 'result' });
+    const outer = withSignature(wf('outer', [{ id: 'blk', include: 'inner' }]), {
+      returns: 'blk',
+      outcome_field: 'green',
+    });
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(inner, outer));
+
+    expect(errors).toHaveLength(0);
+    expect(workflows.get('outer')).toMatchObject({
+      returns: 'blk__result',
+      outcome_field: 'green',
+    });
+  });
+
+  test('rejects an outer outcome_field after return rebinding when the child contract is invalid', () => {
+    const inner = withSignature(
+      wf('inner', [
+        {
+          id: 'result',
+          prompt: 'result',
+          output_format: {
+            type: 'object',
+            properties: { green: { type: 'string' } },
+            required: ['green'],
+          },
+        },
+      ]),
+      { returns: 'result' }
+    );
+    const outer = withSignature(wf('outer', [{ id: 'blk', include: 'inner' }]), {
+      returns: 'blk',
+      outcome_field: 'green',
+    });
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(inner, outer));
+
+    expect(workflows.has('outer')).toBe(false);
+    expect(errors.find(error => error.filename === 'outer')?.error).toContain(
+      'must explicitly declare type: boolean'
+    );
+  });
+
+  test('keeps a nested outer declaration but never propagates an included workflow outcome', () => {
+    const leaf = withSignature(
+      wf('leaf', [
+        {
+          id: 'result',
+          prompt: 'result',
+          output_format: {
+            type: 'object',
+            properties: { green: { type: 'boolean' } },
+            required: ['green'],
+          },
+        },
+      ]),
+      { returns: 'result', outcome_field: 'green' }
+    );
+    const middle = withSignature(wf('middle', [{ id: 'leaf-block', include: 'leaf' }]), {
+      returns: 'leaf-block',
+    });
+    const outer = withSignature(wf('outer', [{ id: 'middle-block', include: 'middle' }]), {
+      returns: 'middle-block',
+      outcome_field: 'green',
+    });
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(leaf, middle, outer));
+
+    expect(errors).toHaveLength(0);
+    expect(workflows.get('middle')?.outcome_field).toBeUndefined();
+    expect(workflows.get('outer')).toMatchObject({
+      returns: 'middle-block__leaf-block__result',
+      outcome_field: 'green',
+    });
   });
 });
 

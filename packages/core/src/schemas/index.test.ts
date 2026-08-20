@@ -23,6 +23,7 @@ const validDashboardWorkflowRun = {
   parent_conversation_id: null,
   codebase_id: null,
   status: 'running',
+  outcome: null,
   user_message: 'deploy please',
   metadata: {},
   started_at: new Date(),
@@ -263,6 +264,27 @@ describe('core schemas', () => {
     if (!result.success) {
       expect(result.error.issues.map(issue => issue.path)).toEqual([['status']]);
     }
+  });
+
+  test('dashboardWorkflowRunSchema preserves nullable authored outcomes and rejects unknown values', () => {
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'succeeded',
+      }).success
+    ).toBe(true);
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'failed',
+      }).success
+    ).toBe(true);
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'unknown',
+      }).success
+    ).toBe(false);
   });
 
   // -----------------------------------------------------------------------

@@ -31,6 +31,7 @@ import {
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
 import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
+import { validateWorkflowOutcomeDeclaration } from './loader';
 import { maybeWarnLegacyStatePath, maybeWarnLegacyArtifactsPath } from './state-migration';
 import { resolveWorkflowName } from './router';
 import { resolveDeclaredInputs, defaultRunInputs } from './workflow-inputs';
@@ -1160,6 +1161,11 @@ export async function executeWorkflow(
   conversationDbId: string,
   opts: ExecuteWorkflowOptions = {}
 ): Promise<WorkflowExecutionResult> {
+  const outcomeDeclarationError = validateWorkflowOutcomeDeclaration(workflow);
+  if (outcomeDeclarationError !== null) {
+    throw new Error(`Invalid workflow '${workflow.name}': ${outcomeDeclarationError}`);
+  }
+
   const {
     codebaseId,
     issueContext,

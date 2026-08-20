@@ -59,6 +59,7 @@ import type {
   LoopGateRunMetadata,
   ApprovalContext,
   WorkflowEvidencePolicy,
+  WorkflowRunOutcome,
   NodeArtifactLoopFrame,
   WorkflowRunNodeSession,
 } from './schemas';
@@ -7299,6 +7300,12 @@ interface RunLayersContext {
   layers: DagNode[][];
   /** Shared node-output map (caller owns; runLayers writes node results here). */
   nodeOutputs: Map<string, NodeOutput>;
+  /**
+   * Awaited after a complete layer has been aggregated and before lifecycle status is
+   * observed. The top-level DAG uses this to durably capture authored run state at
+   * the first point it exists; loop_group bodies have no run-level hook.
+   */
+  afterLayer?: () => Promise<void>;
   /** Resume cache: node ids that completed in a prior run (top-level only; undefined for body). */
   priorCompletedNodes?: Map<string, string>;
   /**
@@ -8353,6 +8360,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
       getLog().warn({ layerIdx, nodeCount: layer.length }, 'dag_layer_had_failures');
     }
 
+    await ctx.afterLayer?.();
+
     // Check for non-running status between DAG layers (cancellation, deletion, pause)
     try {
       const dagStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
@@ -8842,6 +8851,8 @@ export async function executeDagWorkflow(
     evidence_policy?: WorkflowEvidencePolicy;
     /** Declared `returns:` node id (#2470) — rebinds a CHILD run's terminal output. */
     returns?: string;
+    /** Required boolean property on `returns:` that authors the durable run outcome. */
+    outcome_field?: string;
   } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
@@ -9038,6 +9049,33 @@ export async function executeDagWorkflow(
     }
   }
 
+  // Persist the authored verdict as soon as the selected result is available,
+  // independently from every lifecycle branch below (#2618). The initial call
+  // covers a selected node rehydrated from node_completed events on resume; the
+  // awaited per-layer hook captures a fresh result before later work can pause or
+  // fail; and the unwind backstop covers a fatal throw while aggregating that layer.
+  // A same-value write is skipped, but a genuine re-execution may replace the
+  // prior verdict.
+  let persistedOutcome: WorkflowRunOutcome | null = workflowRun.outcome;
+  const persistAuthoredOutcome = async (): Promise<void> => {
+    const field = workflow.outcome_field;
+    const returns = workflow.returns;
+    if (field === undefined || returns === undefined) return;
+    const selectedOutput = nodeOutputs.get(returns);
+    if (selectedOutput?.state !== 'completed') return;
+
+    const resolution = resolveNodeOutputField(selectedOutput, returns, field);
+    if (resolution.kind !== 'value' || typeof resolution.value !== 'boolean') {
+      throw new Error(
+        `Workflow outcome_field '${field}' on returns node '${returns}' did not resolve to a boolean`
+      );
+    }
+    const outcome: WorkflowRunOutcome = resolution.value ? 'succeeded' : 'failed';
+    if (outcome === persistedOutcome) return;
+    await deps.store.updateWorkflowRun(workflowRun.id, { outcome });
+    persistedOutcome = outcome;
+  };
+
   // Run the topological layers. runLayers mutates the context's mutable fields in place
   // (nodeOutputs, lastSequentialSession, usage accumulators); we read them back below
   // for the terminal tally. stepNamePrefix is '' for the top-level DAG so node event
@@ -9071,6 +9109,7 @@ export async function executeDagWorkflow(
     scopeArtifactsDir: persistScopeKey !== undefined ? scopeArtifactsDir : undefined,
     layers,
     nodeOutputs,
+    afterLayer: persistAuthoredOutcome,
     priorCompletedNodes,
     nodeSessionHandles,
     namedResumeSourceIds,
@@ -9124,20 +9163,32 @@ export async function executeDagWorkflow(
       });
   };
 
+  await persistAuthoredOutcome();
   try {
     await runLayers(runCtx);
-  } finally {
-    // `finally`, not a plain call. runLayers guards almost everything — every store
-    // call inside the per-node try, the between-layer status check, the artifact
-    // writes — but `safeSendMessage` deliberately RETHROWS a FATAL-classified platform
-    // error (executor-shared.ts, 'unauthorized'/'forbidden'/'401'…) rather than
-    // swallowing it, and the allSettled `rejected` branch calls it outside any try. So a
-    // platform whose auth dies mid-run throws clean out of runLayers, past every
-    // disposition below, to executeWorkflow's catch-all — which marks the run FAILED, a
-    // terminal outcome the invariant has to cover. persistRunUsage swallows its own
-    // errors, so it can never displace the in-flight exception.
+  } catch (error) {
+    // runLayers guards almost everything, but a FATAL platform error can escape its
+    // allSettled rejection branch. Persist both durable facts before rethrowing that
+    // exact value (including an exotic `throw undefined`). Usage is best-effort. An
+    // outcome write failure is secondary here: record it, but never let it mask the
+    // execution error already in flight.
     await persistRunUsage();
+    try {
+      await persistAuthoredOutcome();
+    } catch (outcomeError) {
+      getLog().error(
+        { err: outcomeError as Error, workflowRunId: workflowRun.id },
+        'dag.authored_outcome_persist_failed_during_unwind'
+      );
+    }
+    throw error;
   }
+
+  // Normal return has no primary error to preserve, so a verdict persistence failure
+  // remains visible to the caller. These two small calls intentionally mirror the
+  // unwind path above; extracting a policy flag would hide which error owns the throw.
+  await persistRunUsage();
+  await persistAuthoredOutcome();
   // Pull the mutated accumulators back into local scope for the terminal tally below.
   const totalCostUsd = runCtx.totalCostUsd;
   const totalTokensIn = runCtx.totalTokensIn;

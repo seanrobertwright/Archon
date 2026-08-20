@@ -55,7 +55,7 @@ import {
   INPUT_NAME_SOURCE,
 } from './schemas';
 import { createLogger } from '@archon/paths';
-import { validateDagStructure } from './loader';
+import { validateDagStructure, validateWorkflowOutcomeDeclaration } from './loader';
 import { resolveDeclaredInputs } from './workflow-inputs';
 import { parseWhenAtom, whenAtoms } from './when-atom';
 import {
@@ -797,6 +797,10 @@ const NON_DROPPED_WORKFLOW_KEYS: ReadonlySet<string> = new Set([
   // primarySink and `inputs` validates the caller's `with:`. Warning "dropped" would be
   // misleading.
   'returns',
+  // Run-owned like `returns`: an included file's authored outcome is not
+  // propagated to its composer, while the top-level workflow keeps its own
+  // declaration through flattening.
+  'outcome_field',
   'inputs',
   // #1764: unioned into the composing workflow's own requirement set, not dropped.
   'requires',
@@ -1137,6 +1141,10 @@ export function expandWorkflowIncludes(
         : {}),
       ...(dedupedRequires.length > 0 ? { requires: dedupedRequires } : {}),
     };
+    const outcomeDeclarationError = validateWorkflowOutcomeDeclaration(result);
+    if (outcomeDeclarationError !== null) {
+      throw new IncludeExpansionError(outcomeDeclarationError);
+    }
     memo.set(name, result);
     return result;
   }

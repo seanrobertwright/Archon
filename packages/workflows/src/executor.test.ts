@@ -162,6 +162,7 @@ import { keepAwake } from './utils/keep-awake';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './schemas';
+import { workflowDefinitionSchema } from './schemas';
 
 // --- Helpers ---
 
@@ -245,6 +246,7 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     parent_conversation_id: null,
     codebase_id: null,
     status: 'running',
+    outcome: null,
     user_message: 'test message',
     metadata: {},
     started_at: new Date(),
@@ -268,6 +270,25 @@ describe('executeWorkflow', () => {
     mockGetDefaultBranch.mockClear();
     mockGetDefaultBranch.mockImplementation(async () => 'main');
     mockExecuteDagWorkflow.mockImplementation(async () => undefined);
+  });
+
+  it('rejects a structurally valid but semantically invalid outcome declaration before side effects', async () => {
+    const workflow = workflowDefinitionSchema.parse({
+      name: 'invalid-authored-outcome',
+      description: 'missing selected return node',
+      outcome_field: 'green',
+      nodes: [{ id: 'node1', prompt: 'Do something' }],
+    });
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await expect(
+      executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp/ops', workflow, 'msg', 'db-conv-1')
+    ).rejects.toThrow('without returns:');
+
+    expect(store.createWorkflowRun).not.toHaveBeenCalled();
+    expect(deps.loadConfig).not.toHaveBeenCalled();
+    expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
   });
 
   // -------------------------------------------------------------------------
