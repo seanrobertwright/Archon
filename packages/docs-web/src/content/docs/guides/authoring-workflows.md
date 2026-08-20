@@ -220,7 +220,7 @@ nodes:
 | `idle_timeout` | number | — | Kill node if idle for this many milliseconds |
 | `retry` | object | — | Per-node retry configuration. See [Retry Configuration](#retry-configuration) |
 | `always_run` | boolean | `false` | Opt out of resume caching: re-run this node on resume even if a prior run completed it. See [Opting Out of Resume Caching](#opting-out-of-resume-caching) |
-| `output_type` | string | — | Semantic label for this node's output (e.g. `'plan'`, `'findings'`, `'code'`). When set, the executor writes `$ARTIFACTS_DIR/nodes/<id>.md` + `<id>.meta.json` after the node completes (best-effort) so later nodes and runs can locate output by type instead of guessing filenames. See [The Artifact Chain](#the-artifact-chain) |
+| `output_type` | string | — | Semantic label for this node's output (e.g. `'plan'`, `'findings'`, `'code'`). When set, the executor writes a typed output + metadata pair after the node completes (best-effort). Top-level nodes use `$ARTIFACTS_DIR/nodes/<id>.md` + `<id>.meta.json`; loop-body executions use [iteration-specific paths](#the-artifact-chain). |
 
 **AI node options** — apply to `command` and `prompt` nodes:
 
@@ -886,6 +886,14 @@ When a node sets `output_type`, the executor writes a typed sidecar after the no
 
 - `$ARTIFACTS_DIR/nodes/<id>.md` — the node's output text
 - `$ARTIFACTS_DIR/nodes/<id>.meta.json` — metadata (`outputType`, `runId`, `producedAt`, `size`, and `sessionId` when available)
+
+That exact layout remains the contract for top-level nodes. A typed node inside a `loop_group`
+writes one pair per successful body execution instead: `nodes/loop.<owner-digest>__<body>.md` and
+the matching `.meta.json`. The stable digest is derived from the complete original body ID and
+outermost-to-innermost loop lineage, so delimiter-shaped IDs and repeated inner iteration numbers
+cannot alias another execution. Metadata keeps the readable provenance as
+`loopGroupPath: [{ groupId, iteration }, ...]`. A body node expanded from an `include:` retains its
+load-time `<include>__<node>` ID in metadata and as the sanitized body suffix.
 
 This works on **every** node type (`bash`/`script` produce typed outputs too, just without a `sessionId`). The write is **best-effort** — if it fails, the node still succeeds and a warning is logged; the typed sidecar may simply be absent. `output_type` is an open set of labels (`plan`, `findings`, `code`, `summary`, …) — pick a convention and keep casing consistent, since lookup is case-sensitive.
 
@@ -2557,7 +2565,7 @@ Before deploying a workflow:
 15. **`maxBudgetUsd`** — set a USD cost cap per node; fails with error if exceeded (Claude only)
 16. **`systemPrompt`** — override the default system prompt per node (Claude only)
 17. **`sandbox`** — OS-level filesystem/network restrictions per node or workflow (Claude only)
-18. **`output_type`** — tag a node's output with a semantic type; the engine writes a typed sidecar (`$ARTIFACTS_DIR/nodes/<id>.md` + `.meta.json`) for cross-node/cross-run lookup by type (any node type)
+18. **`output_type`** — tag a node's output with a semantic type; the engine writes a typed sidecar for cross-node/cross-run lookup by type (any node type). Top-level nodes use `$ARTIFACTS_DIR/nodes/<id>.md` + `.meta.json`; loop-body executions use [iteration-specific paths](#the-artifact-chain)
 19. **Loop nodes** — use `loop:` within a DAG node for iterative execution until a declared completion condition is met
 20. **Defaults as templates** — browse `.archon/workflows/defaults/` for real examples to copy and modify
 21. **Test thoroughly** — each command, the artifact flow, and edge cases

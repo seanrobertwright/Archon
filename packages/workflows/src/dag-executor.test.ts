@@ -81,7 +81,7 @@ import {
   containerCommandName,
   buildSubprocessDockerArgs,
 } from './dag-executor';
-import { writeNodeArtifact } from './artifacts-index';
+import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emitter';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
 import type {
@@ -16350,6 +16350,272 @@ describe('executeDagWorkflow -- loop_group node', () => {
         event => event.event_type === 'node_completed' && event.step_name === 'group.pass__review'
       );
     expect(bodyCompletions.map(event => event.data?.iteration)).toEqual([1, 2]);
+  });
+
+  it('preserves typed loop body artifacts across three included iterations (#2480)', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      yield {
+        type: 'assistant',
+        content:
+          callCount === 3 ? 'review iteration 3 DONE' : `review iteration ${String(callCount)}`,
+      };
+      yield { type: 'result', sessionId: `typed-body-${String(callCount)}` };
+    });
+
+    const block = workflowDefinitionSchema.parse({
+      name: 'typed-review-block',
+      description: 'Reusable typed loop body',
+      returns: 'review',
+      nodes: [{ id: 'review', prompt: 'review this iteration', output_type: 'findings' }],
+    });
+    const parent = workflowDefinitionSchema.parse({
+      name: 'typed-included-loop-group',
+      description: 'Repeats a typed composed block',
+      nodes: [
+        {
+          id: 'group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 3,
+            nodes: [{ id: 'pass', include: 'typed-review-block' }],
+          },
+        },
+      ],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        [block.name, block],
+        [parent.name, parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get(parent.name);
+    expect(expanded).toBeDefined();
+    if (!expanded) throw new Error('expected expanded workflow');
+
+    const artifactsDir = join(testDir, 'artifacts');
+    await executeDagWorkflow(
+      createMockDeps(createMockStore()),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      expanded,
+      makeWorkflowRun('dag-loopgroup-typed-included'),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(3);
+    const artifacts = (await readNodeArtifacts(artifactsDir)).sort(
+      (left, right) =>
+        (left.loopGroupPath?.[0]?.iteration ?? 0) - (right.loopGroupPath?.[0]?.iteration ?? 0)
+    );
+    expect(artifacts).toHaveLength(3);
+    expect(new Set(artifacts.map(entry => entry.path)).size).toBe(3);
+    expect(artifacts.map(entry => entry.nodeId)).toEqual([
+      'pass__review',
+      'pass__review',
+      'pass__review',
+    ]);
+    expect(artifacts.map(entry => entry.loopGroupPath)).toEqual([
+      [{ groupId: 'group', iteration: 1 }],
+      [{ groupId: 'group', iteration: 2 }],
+      [{ groupId: 'group', iteration: 3 }],
+    ]);
+    const contents = await Promise.all(
+      artifacts.map(entry => readFile(join(artifactsDir, entry.path), 'utf8'))
+    );
+    expect(contents).toEqual([
+      'review iteration 1',
+      'review iteration 2',
+      'review iteration 3 DONE',
+    ]);
+  });
+
+  it('preserves complete nested loop_group lineage when inner iterations repeat (#2480)', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      yield {
+        type: 'assistant',
+        content:
+          callCount === 1 ? 'inner result 1 INNER_DONE' : 'inner result 2 INNER_DONE OUTER_DONE',
+      };
+      yield { type: 'result', sessionId: `nested-artifact-${String(callCount)}` };
+    });
+
+    const artifactsDir = join(testDir, 'artifacts');
+    await executeDagWorkflow(
+      createMockDeps(createMockStore()),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      {
+        name: 'nested-typed-loop-group',
+        nodes: [
+          {
+            id: 'outer',
+            loop_group: {
+              until: 'OUTER_DONE',
+              max_iterations: 2,
+              fresh_context: false,
+              nodes: [
+                {
+                  id: 'inner',
+                  loop_group: {
+                    until: 'INNER_DONE',
+                    max_iterations: 1,
+                    fresh_context: false,
+                    nodes: [
+                      {
+                        id: 'leaf',
+                        prompt: 'produce nested result',
+                        output_type: 'findings',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+      makeWorkflowRun('dag-nested-loopgroup-typed'),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(callCount).toBe(2);
+    const artifacts = (await readNodeArtifacts(artifactsDir)).sort(
+      (left, right) =>
+        (left.loopGroupPath?.[0]?.iteration ?? 0) - (right.loopGroupPath?.[0]?.iteration ?? 0)
+    );
+    expect(artifacts.map(entry => entry.loopGroupPath)).toEqual([
+      [
+        { groupId: 'outer', iteration: 1 },
+        { groupId: 'inner', iteration: 1 },
+      ],
+      [
+        { groupId: 'outer', iteration: 2 },
+        { groupId: 'inner', iteration: 1 },
+      ],
+    ]);
+    expect(new Set(artifacts.map(entry => entry.path)).size).toBe(2);
+  });
+
+  it('preserves a completed body artifact when an interactive loop_group resumes (#2480)', async () => {
+    const artifactsDir = join(testDir, 'artifacts');
+    const workflow = {
+      name: 'resumed-typed-loop-group',
+      nodes: [
+        {
+          id: 'refine',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 3,
+            interactive: true,
+            gate_message: 'Review the typed result.',
+            nodes: [
+              {
+                id: 'work',
+                prompt: 'produce a typed result',
+                output_type: 'findings',
+              },
+            ],
+          },
+        },
+      ] as DagNode[],
+    };
+
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield { type: 'assistant', content: 'iteration 1 draft' };
+      yield { type: 'result', sessionId: 'typed-resume-1' };
+    });
+    const firstDeps = createMockDeps(createMockStore());
+    await executeDagWorkflow(
+      firstDeps,
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      workflow,
+      makeWorkflowRun('dag-loopgroup-typed-resume'),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const beforeResume = await readNodeArtifacts(artifactsDir);
+    expect(beforeResume).toHaveLength(1);
+    expect(beforeResume[0]?.loopGroupPath).toEqual([{ groupId: 'refine', iteration: 1 }]);
+    const firstPath = beforeResume[0]?.path;
+    if (firstPath === undefined) throw new Error('expected first-iteration artifact');
+    expect(await readFile(join(artifactsDir, firstPath), 'utf8')).toBe('iteration 1 draft');
+
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield { type: 'assistant', content: 'iteration 2 final DONE' };
+      yield { type: 'result', sessionId: 'typed-resume-2' };
+    });
+    await executeDagWorkflow(
+      createMockDeps(createMockStore()),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      workflow,
+      makeWorkflowRun('dag-loopgroup-typed-resume', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            sessionId: 'typed-resume-1',
+            sessionProvider: 'claude',
+            message: 'Review the typed result.',
+          },
+          loop_user_input: 'continue',
+        },
+      }),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const afterResume = (await readNodeArtifacts(artifactsDir)).sort(
+      (left, right) =>
+        (left.loopGroupPath?.[0]?.iteration ?? 0) - (right.loopGroupPath?.[0]?.iteration ?? 0)
+    );
+    expect(afterResume.map(entry => entry.loopGroupPath)).toEqual([
+      [{ groupId: 'refine', iteration: 1 }],
+      [{ groupId: 'refine', iteration: 2 }],
+    ]);
+    expect(afterResume[0]?.path).toBe(firstPath);
+    expect(await readFile(join(artifactsDir, firstPath), 'utf8')).toBe('iteration 1 draft');
+    const secondPath = afterResume[1]?.path;
+    if (secondPath === undefined) throw new Error('expected resumed iteration artifact');
+    expect(await readFile(join(artifactsDir, secondPath), 'utf8')).toBe('iteration 2 final DONE');
   });
 
   it('resolves an included inner body previous output in nested loop_group until_bash (#2623)', async () => {

@@ -59,6 +59,7 @@ import type {
   LoopGateRunMetadata,
   ApprovalContext,
   WorkflowEvidencePolicy,
+  NodeArtifactLoopFrame,
 } from './schemas';
 import {
   isBashNode,
@@ -3572,6 +3573,9 @@ async function executeLoopGroupNode(
    *  could be omitted, silently handing the body an isolated Set and quietly undoing the
    *  de-duplication, with no compiler signal. */
   warnedProviderConflicts: Set<string>,
+  /** Ordered enclosing loop_group frames. Required so nested artifact identity cannot
+   *  silently fall back to only the immediate group. */
+  enclosingLoopGroupPath: NodeArtifactLoopFrame[],
   issueContext?: string,
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
@@ -3775,7 +3779,7 @@ async function executeLoopGroupNode(
       totalTokensOut: 0,
       totalLoopIterations: 0,
       stepNamePrefix: bodyStepNamePrefix,
-      iteration: i,
+      loopGroupPath: [...enclosingLoopGroupPath, { groupId: node.id, iteration: i }],
       // Deliver this iteration's approval-gate free-text to body script: nodes via env
       // (never spliced into source — #2115); matches applyLoopPrevToBodyNode's skip.
       bodyLoopUserInput: userInputForIter,
@@ -7253,12 +7257,8 @@ interface RunLayersContext {
   totalLoopIterations: number;
   /** Prefix prepended to every persisted `step_name` ('' for top-level, '{groupId}.' for a loop_group body). */
   stepNamePrefix: string;
-  /**
-   * The enclosing loop_group iteration (1-based) when these layers are a group body,
-   * else undefined for the top-level DAG. Tagged into body node lifecycle event `data`
-   * so multi-iteration runs are disaggregatable in the persisted event log (#2090).
-   */
-  iteration?: number;
+  /** Complete runtime loop_group lineage for typed body artifacts; empty at top level. */
+  loopGroupPath: NodeArtifactLoopFrame[];
   /**
    * Per-iteration `$LOOP_USER_INPUT` free-text for loop_group body `script:` nodes,
    * delivered into the subprocess as an env var (never spliced into TS/Python source —
@@ -7306,8 +7306,11 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
     layers,
     priorCompletedNodes,
     stepNamePrefix,
-    iteration,
+    loopGroupPath,
   } = ctx;
+  // Lifecycle events expose only the immediate enclosing iteration; artifact
+  // identity retains the complete outermost-to-innermost lineage.
+  const iteration = loopGroupPath.at(-1)?.iteration;
   // nodeOutputs + accumulators + lastSequentialSession are mutated in place on `ctx`.
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
@@ -7688,6 +7691,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               ctx.nodeOutputs,
               config,
               ctx.warnedProviderConflicts,
+              ctx.loopGroupPath,
               issueContext,
               stepNamePrefix,
               execContext,
@@ -8139,9 +8143,10 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
         if (output.loopIterations !== undefined) ctx.totalLoopIterations += output.loopIterations;
         ctx.nodeOutputs.set(nodeId, output);
         // Typed artifact: when a node declares `output_type`, persist its output
-        // as a typed sidecar (nodes/<id>.md + .meta.json) so other nodes and
-        // later runs can locate it by type. Best-effort — a metadata write must
-        // never fail an otherwise-successful node.
+        // as a typed sidecar so other nodes and later runs can locate it by type.
+        // The writer keeps top-level node paths stable and qualifies loop body
+        // paths with ctx.loopGroupPath. Best-effort — a metadata write must never
+        // fail an otherwise-successful node.
         const completedNode = nodeById.get(nodeId);
         if (output.state === 'completed' && completedNode?.output_type) {
           const meta = {
@@ -8149,6 +8154,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             outputType: completedNode.output_type,
             runId: workflowRun.id,
             producedAt: new Date().toISOString(),
+            ...(loopGroupPath.length > 0 ? { loopGroupPath } : {}),
             // `sessionId` may be undefined (e.g. bash/script nodes have no
             // session); writeNodeArtifact omits it from the metadata when so.
             sessionId: output.sessionId,
@@ -8913,6 +8919,7 @@ export async function executeDagWorkflow(
     totalTokensOut: priorUsage?.tokens.output ?? 0,
     totalLoopIterations: 0,
     stepNamePrefix: '',
+    loopGroupPath: [],
   };
 
   /**
