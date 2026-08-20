@@ -5337,6 +5337,63 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(resumedGroup?.data?.node_output).toBe(freshGroup?.data?.node_output);
   });
 
+  it('keeps a structured loop declared-field contract on resume', async () => {
+    const store = createMockStore();
+    let capturedPrompt = '';
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      capturedPrompt = prompt;
+      yield { type: 'assistant', content: 'consumer completed' };
+      yield { type: 'result', sessionId: 'structured-loop-resume-session' };
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-resume',
+      testDir,
+      {
+        name: 'structured-loop-resume',
+        nodes: [
+          {
+            id: 'iterate',
+            output_format: {
+              type: 'object',
+              properties: { done: { type: 'boolean' }, note: { type: 'string' } },
+              required: ['done'],
+            },
+            loop: {
+              prompt: 'iterate',
+              until_field: 'done',
+              max_iterations: 1,
+              fresh_context: false,
+            },
+          },
+          {
+            id: 'consumer',
+            prompt: 'note=[$iterate.output.note]',
+            depends_on: ['iterate'],
+          },
+        ],
+      },
+      makeWorkflowRun('structured-loop-resume'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map([['iterate', '{"done":true}']])
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(capturedPrompt).toBe('note=[]');
+  });
+
   // #2091: on resume, prior completed nodes are rehydrated from text only, so the
   // producer's output_format field set must be re-derived from the loaded definition —
   // otherwise the strict `$node.output.field` contract downgrades to the schemaless
