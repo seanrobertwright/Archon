@@ -1235,6 +1235,9 @@ async function resolveNodeProviderAndModel(
   if (config.envVars && Object.keys(config.envVars).length > 0) {
     baseOptions.env = config.envVars;
   }
+  if (config.userCredentialEnvKeys && config.userCredentialEnvKeys.length > 0) {
+    baseOptions.userCredentialEnvKeys = config.userCredentialEnvKeys;
+  }
   // Resolved, never mutated in place: the node object is the shared definition and a loop
   // or a resume would otherwise substitute into an already-substituted string.
   const systemPrompt =

@@ -439,6 +439,11 @@ export interface AgentRequestOptions {
   systemPrompt?: SystemPromptInput;
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   env?: Record<string, string>;
+  /**
+   * Names in `env` whose values came from the acting user's provider credential
+   * store. Custom provider configuration must not be allowed to select them.
+   */
+  userCredentialEnvKeys?: readonly string[];
   maxBudgetUsd?: number;
   fallbackModel?: string;
   /**

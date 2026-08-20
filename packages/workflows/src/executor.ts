@@ -1685,6 +1685,10 @@ export async function executeWorkflow(
   // returns {} when the feature is disabled or no userId is present).
   const userProviderEnv = await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
   config.envVars = { ...config.envVars, ...userProviderEnv };
+  const userCredentialEnvKeys = Object.keys(userProviderEnv);
+  if (userCredentialEnvKeys.length > 0) {
+    config.userCredentialEnvKeys = userCredentialEnvKeys;
+  }
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error.
   //

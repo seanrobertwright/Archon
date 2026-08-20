@@ -76,6 +76,8 @@ export interface WorkflowConfig {
   baseBranch?: string;
   docsPath?: string;
   envVars?: Record<string, string>;
+  /** Acting-user provider credential entries within envVars. */
+  userCredentialEnvKeys?: readonly string[];
   aliases?: RawAliasesConfig;
   tiers?: RawTiersConfig;
   commands: { folder?: string };

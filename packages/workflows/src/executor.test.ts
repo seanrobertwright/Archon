@@ -1582,6 +1582,7 @@ describe('executeWorkflow', () => {
         SHARED_KEY: 'user_wins',
         USER_KEY: 'u_val',
       });
+      expect(configArg?.userCredentialEnvKeys).toEqual(['SHARED_KEY', 'USER_KEY']);
     });
 
     it('returns {} and does not throw when getUserProviderEnv rejects', async () => {

@@ -19,6 +19,7 @@ import type {
 import { PI_CAPABILITIES } from './capabilities';
 import { parsePiConfig, resolvePiExtensionSettings } from './config';
 import { parsePiModelRef } from './model-ref';
+import { withCustomProviderRequestEnv } from './request-auth';
 import { withResumedOutcome, resumedOutcome } from '../../shared/resumed';
 
 // IMPORTANT: Do NOT add static `import { ... } from '@earendil-works/*'` here,
@@ -378,6 +379,8 @@ export class PiProvider implements IAgentProvider {
     //    user edits to auth.json or models.json take effect without restart.
     //    ModelRegistry.create() is mutable: extension providers can call registerProvider()
     //    on it during bindExtensions() to add their models (phase 2 resolution).
+    const envVarName = PI_PROVIDER_ENV_VARS[parsed.provider];
+    const oauthVarName = PI_OAUTH_ENV_VARS[parsed.provider];
     let authStorage: ReturnType<typeof piCodingAgent.AuthStorage.create>;
     let modelRegistry: ReturnType<typeof piCodingAgent.ModelRegistry.create>;
     try {
@@ -392,6 +395,14 @@ export class PiProvider implements IAgentProvider {
         (requestOptions?.env?.ARCHON_PI_AUTH_PATH ?? process.env.ARCHON_PI_AUTH_PATH)?.trim() ||
         undefined;
       authStorage = piCodingAgent.AuthStorage.create(archonAuthPath);
+      if (!envVarName) {
+        authStorage = withCustomProviderRequestEnv(
+          authStorage,
+          parsed.provider,
+          requestOptions?.env,
+          requestOptions?.userCredentialEnvKeys
+        );
+      }
       modelRegistry = piCodingAgent.ModelRegistry.create(authStorage);
     } catch (err) {
       const e = err as Error;
@@ -430,8 +441,6 @@ export class PiProvider implements IAgentProvider {
     //    createClient discriminates OAuth vs api-key by token content (sk-ant-oat*),
     //    so one runtime channel serves both — and setRuntimeApiKey stays runtime-only
     //    (no auth.json disk write, unlike AuthStorage.set) (#1984).
-    const envVarName = PI_PROVIDER_ENV_VARS[parsed.provider];
-    const oauthVarName = PI_OAUTH_ENV_VARS[parsed.provider];
     const readEnvOverride = (name: string | undefined): string | undefined =>
       name ? (requestOptions?.env?.[name] ?? process.env[name]) : undefined;
     const envOverride = readEnvOverride(oauthVarName) ?? readEnvOverride(envVarName);
@@ -447,11 +456,19 @@ export class PiProvider implements IAgentProvider {
     // deferred to extensions (AuthStorage reads are cheap and side-effect-free)
     // so a catalog miss can never skip the OAuth-safe default prompt.
     let resolvedKey: Awaited<ReturnType<typeof authStorage.getApiKey>> | undefined;
-    if (model || parsed.provider === 'anthropic') {
+    let hasResolvedAuth = false;
+    if (model && !envVarName) {
+      const resolved = await modelRegistry.getApiKeyAndHeaders(model);
+      if (resolved.ok) {
+        resolvedKey = resolved.apiKey;
+        hasResolvedAuth = Boolean(resolved.apiKey || resolved.headers);
+      }
+    } else if (model || parsed.provider === 'anthropic') {
       resolvedKey = await authStorage.getApiKey(parsed.provider);
+      hasResolvedAuth = Boolean(resolvedKey);
     }
     if (model) {
-      if (!resolvedKey) {
+      if (!hasResolvedAuth) {
         if (envVarName) {
           // Name the OAuth var first when the backend has one — a subscription
           // user who hits this miss must be told the var the resolver actually
