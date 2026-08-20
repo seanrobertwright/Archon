@@ -44,7 +44,11 @@ import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor
 import {
   assertWorkflowRequirementsMet,
   WorkflowRequirementError,
+  ComposedApprovalGateError,
+  resolveTopLevelInputs,
+  WorkflowMissingInputsError,
 } from '@archon/workflows/utils/workflow-requirements';
+import { WorkflowInputContractError } from '@archon/workflows/workflow-inputs';
 import type {
   WorkflowDefinition,
   WorkflowWithSource,
@@ -68,6 +72,7 @@ import { IsolationBlockedError } from '@archon/isolation';
 import {
   buildOrchestratorSystemAppend,
   buildRunManagementSection,
+  formatPausedGateSection,
   formatWorkflowContextSection,
 } from './prompt-builder';
 import type { WorkflowResultContext } from './prompt-builder';
@@ -75,16 +80,14 @@ import { reportUnpushedWorkInSource } from './post-message-reminder';
 import * as messageDb from '../db/messages';
 import * as workflowDb from '../db/workflows';
 import { getCodebaseEnvVars } from '../db/env-vars';
-import { approveWorkflow } from '../operations/workflow-operations';
-import { isApprovalContext, isGateResolved } from '@archon/workflows/schemas/workflow-run';
-import type { ApprovalContext } from '@archon/workflows/schemas/workflow-run';
+import { isContainerRun } from '@archon/workflows/schemas/workflow-run';
 import {
   buildAiProfile,
   isLiteralSpec,
   isTierName,
   resolveModelSpec,
   resolveTierWithFallback,
-  routePresetEffort,
+  resolvePresetEffort,
   type ModelAliasPreset,
   type TierName,
 } from '@archon/workflows/model-validation';
@@ -113,20 +116,24 @@ function applyPresetToRequestOptions(
 
   if (preset.effort === undefined) return;
 
-  const routed = routePresetEffort(provider, preset.effort);
-  if (!routed) {
-    // Cross-provider effort mismatch — warn instead of silently dropping.
-    getLog().warn({ provider, effort: preset.effort }, 'orchestrator.preset_effort_unsupported');
+  // One effort channel for every provider (#2556): the preset's rung goes on
+  // nodeConfig and the provider clamps it into its own SDK vocabulary. The gate
+  // is shared with `applyPresetOptions` in the DAG executor rather than
+  // restated, so the same tier cannot mean different depths in chat and in a
+  // workflow.
+  const decision = resolvePresetEffort(provider, preset.effort);
+  if (!decision.ok) {
+    // `unsupported` = the provider has no reasoning control at all. Warn instead
+    // of silently dropping.
+    getLog().warn(
+      { provider, effort: preset.effort, valid: decision.valid },
+      decision.reason === 'unsupported'
+        ? 'orchestrator.preset_effort_unsupported'
+        : 'orchestrator.preset_effort_unknown'
+    );
     return;
   }
-  if (routed.field === 'effort') {
-    options.nodeConfig = { ...(options.nodeConfig ?? {}), effort: routed.value };
-  } else {
-    options.assistantConfig = {
-      ...(options.assistantConfig ?? {}),
-      modelReasoningEffort: routed.value,
-    };
-  }
+  options.nodeConfig = { ...(options.nodeConfig ?? {}), effort: preset.effort };
 }
 
 interface ResolvedModelRequest {
@@ -627,6 +634,13 @@ interface WorkflowDispatchOptions {
    * picker.
    */
   parseWarnings?: readonly string[];
+  /**
+   * Declared inputs supplied by the caller (#2554), already carried this far by
+   * `HandleMessageContext.workflowInputs`. Populated only by the run route; chat
+   * platforms have no channel and leave it unset, so their behaviour is unchanged.
+   * Validated at the dispatch gate before any worktree/clone/AI cost.
+   */
+  inputs?: Readonly<Record<string, string>>;
 }
 
 const FAILED_RUN_PROMPT_PREVIEW_MAX = 160;
@@ -737,6 +751,87 @@ async function dispatchOrchestratorWorkflow(
         })
       : undefined;
 
+  // Resume detection, hoisted above the signature gate ON PURPOSE (#2554).
+  //
+  // This function continues an existing run in TWO ways: an explicit
+  // `/workflow resume <id>` (which arrives as `resumeRunId`/`resumeRun`), and an
+  // IMPLICIT auto-detection that fires for a plain `/workflow run <name>` on every
+  // platform — the lookup that used to live further down, next to the dispatch. The
+  // gate below has to know about both: gating only against the explicit form wrongly
+  // refused a required-input workflow that was merely being continued (the run row
+  // already holds its validated inputs, and the caller supplies nothing when they
+  // just say "run it" again).
+  //
+  // It has to be hoisted rather than the gate pushed down: `validateAndResolveIsolation`
+  // sits between here and the old lookup site and CREATES WORKTREES, so gating after it
+  // would forfeit the pre-cost refusal. This lookup is a single indexed DB read — no
+  // worktree, no clone, no AI — so it is safe to do before gating. Its inputs
+  // (`conversation.id`, `codebase.id`) are parameters and nothing below mutates them.
+  const resumableRun = options?.force
+    ? null
+    : (options?.resumeRun ??
+      (await workflowDb.findResumableRunByParentConversation(
+        workflow.name,
+        conversation.id,
+        codebase.id
+      )));
+  // Whether this dispatch will CONTINUE existing work rather than create a fresh run
+  // row. Deliberately the exact negation of the resume/abandon/force menu's condition
+  // below: a candidate that is neither paused nor the explicitly-targeted run does not
+  // continue — it shows that menu and returns. Only a genuine continuation may defer the
+  // signature gate, so an invocation that was never going to continue is still refused
+  // immediately, with the specific input error rather than a generic menu, and before
+  // isolation resolution can create a worktree.
+  //
+  // It does NOT mirror the other refusal exit below — an explicit resume naming a run
+  // with no `working_path` is now preempted by the gate instead of reaching that check.
+  // That is a behaviour change and it is deliberate. Every row-creation site records a
+  // real `working_path`, so a NULL one means a row predating the column; reaching the
+  // gate with a violation to defer additionally needs that ancient run's workflow to
+  // have since gained a required input, and someone to resume it explicitly. (The gate
+  // judges the CURRENT YAML, not the row's vintage, so that combination is improbable
+  // rather than impossible.) Both exits refuse at zero cost, so which message wins is a
+  // wording question, not a correctness one.
+  const willContinueExistingRun =
+    Boolean(resumableRun?.working_path) &&
+    (resumableRun?.status === 'paused' || resumableRun?.id === options?.resumeRunId);
+
+  // Signature gate (#2470, #2554): resolve this invocation's declared inputs from the
+  // values its channel supplied — the run route's `inputs` map today; chat platforms
+  // supply nothing and so still refuse a required-input workflow here, before any
+  // worktree/clone/AI cost. The workflow still lists/loads normally either way.
+  let resolvedInputs: Record<string, string> | undefined;
+  // A contract violation held back because a resume may make it moot. Only the one
+  // branch below that falls through to a FRESH run row (hydration found nothing worth
+  // resuming) still needs it; every other continuation path never reads inputs from
+  // this invocation at all.
+  let deferredInputError: Error | undefined;
+  try {
+    resolvedInputs = resolveTopLevelInputs(workflow, options?.inputs);
+  } catch (err) {
+    // Both are user-facing contract violations: a missing required input, and — now
+    // that a caller can supply values — a key the workflow does not declare.
+    if (err instanceof WorkflowMissingInputsError || err instanceof WorkflowInputContractError) {
+      getLog().info(
+        {
+          workflowName: workflow.name,
+          // Names only, never values — a supplied value is user content (logging rules).
+          missing: err instanceof WorkflowMissingInputsError ? err.missing : undefined,
+          suppliedKeys: options?.inputs ? Object.keys(options.inputs) : [],
+          deferred: willContinueExistingRun,
+        },
+        'workflow.required_inputs_unsatisfiable'
+      );
+      if (!willContinueExistingRun) {
+        await platform.sendMessage(conversationId, err.message);
+        return;
+      }
+      deferredInputError = err;
+    } else {
+      throw err;
+    }
+  }
+
   // Capability gate: hard-fail before any worktree/clone/AI cost if the
   // workflow declares `requires: [github]` and the originating user hasn't
   // connected. No-op when per-user GitHub is disabled (solo PAT installs).
@@ -824,19 +919,12 @@ async function dispatchOrchestratorWorkflow(
   }
 
   // Dispatch workflow.
-  // Resume detection runs for ALL platforms: check if a prior run for this workflow
-  // is in a resumable state (paused — including approved-awaiting-resume — or failed)
-  // in this conversation+codebase
-  // before dispatching fresh. This ensures chat platforms (slack, telegram, discord,
-  // github) resume after approval gates just like web does.
-  const resumableRun = options?.force
-    ? null
-    : (options?.resumeRun ??
-      (await workflowDb.findResumableRunByParentConversation(
-        workflow.name,
-        conversation.id,
-        codebase.id
-      )));
+  // `resumableRun` was resolved above the signature gate (see the comment there):
+  // resume detection runs for ALL platforms, so a prior run for this workflow in a
+  // resumable state (paused — including approved-awaiting-resume — or failed) in this
+  // conversation+codebase is continued rather than dispatched fresh. This ensures chat
+  // platforms (slack, telegram, discord, github) resume after approval gates just like
+  // web does.
   if (options?.resumeRun && !options.resumeRun.working_path) {
     getLog().warn(
       {
@@ -900,13 +988,36 @@ async function dispatchOrchestratorWorkflow(
         await platform.sendMessage(
           conversationId,
           `⚠️ **${workflow.name}** is already being resumed (status: ${err.currentStatus}). ` +
-            'No action taken — follow the existing run for progress.'
+            'No action taken — follow the existing run for progress.' +
+            // The gate deferred a contract violation because this looked like a
+            // continuation; losing the race means it never got surfaced anywhere else.
+            // Say it here rather than let an already-computed, actionable error die.
+            (deferredInputError && options?.inputs && Object.keys(options.inputs).length > 0
+              ? `\n\nAlso note: ${deferredInputError.message}`
+              : '')
         );
         return;
       }
       throw err;
     }
     if (prepared) {
+      // A resume replays the inputs stamped on its own row; values supplied on THIS
+      // call cannot reach it (the row already exists, so the executor's stamp never
+      // fires). Say so rather than accepting them and quietly running something else.
+      if (options?.inputs && Object.keys(options.inputs).length > 0) {
+        const ignored = Object.keys(options.inputs).sort().join(', ');
+        getLog().info(
+          { workflowName: workflow.name, resumableRunId: resumableRun.id, ignoredKeys: ignored },
+          'orchestrator.resume_ignored_supplied_inputs'
+        );
+        await platform.sendMessage(
+          conversationId,
+          `▶️ Resuming the paused run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
+            `keeps the inputs it started with — the values you supplied now (${ignored}) were ` +
+            'not applied. To run fresh with them instead, abandon that run first ' +
+            `(\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
+        );
+      }
       await executeWorkflow(
         deps,
         platform,
@@ -927,6 +1038,13 @@ async function dispatchOrchestratorWorkflow(
         }
       );
     } else {
+      // Hydration found nothing worth resuming, so this is the ONE continuation path
+      // that creates a fresh run row — which means a contract violation deferred at the
+      // gate is live again and must be surfaced before any AI cost.
+      if (deferredInputError) {
+        await platform.sendMessage(conversationId, deferredInputError.message);
+        return;
+      }
       await platform.sendMessage(
         conversationId,
         `⚠️ Prior run for **${workflow.name}** had no completed nodes; starting fresh in the same worktree.`
@@ -947,27 +1065,48 @@ async function dispatchOrchestratorWorkflow(
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
+          // This branch creates a FRESH run row (the prior run had nothing to resume),
+          // so the supplied inputs still need stamping.
+          inputs: resolvedInputs,
         }
       );
     }
   } else if (platform.getPlatformType() === 'web' && !workflow.interactive) {
-    // Background dispatch: web-only, non-interactive workflows with no resumable run
-    await dispatchBackgroundWorkflow(
-      {
-        platform,
-        conversationId,
-        cwd,
-        originalMessage: userMessage,
-        conversationDbId: conversation.id,
-        codebaseId: codebase.id,
-        availableWorkflows: [workflow],
-        isolationHints,
-        userId,
-        source,
-        parseWarnings: options?.parseWarnings,
-      },
-      workflow
-    );
+    // Background dispatch: web-only, non-interactive workflows with no resumable run.
+    // This is the console's default path, so it is exactly where a console-supplied
+    // input map must not be dropped.
+    //
+    // `dispatchBackgroundWorkflow` refuses a composed approval gate a background run
+    // cannot present (#1764); turn that into a message rather than an unhandled throw.
+    try {
+      await dispatchBackgroundWorkflow(
+        {
+          platform,
+          conversationId,
+          cwd,
+          originalMessage: userMessage,
+          conversationDbId: conversation.id,
+          codebaseId: codebase.id,
+          availableWorkflows: [workflow],
+          isolationHints,
+          userId,
+          source,
+          parseWarnings: options?.parseWarnings,
+          inputs: resolvedInputs,
+        },
+        workflow
+      );
+    } catch (err) {
+      if (err instanceof ComposedApprovalGateError) {
+        getLog().info(
+          { workflowName: workflow.name, conversationId, gate: err.gate },
+          'workflow.composed_gate_undriveable'
+        );
+        await platform.sendMessage(conversationId, err.message);
+        return;
+      }
+      throw err;
+    }
   } else {
     // Fresh foreground execution: web interactive workflows + all chat platforms
     await executeWorkflow(
@@ -986,7 +1125,121 @@ async function dispatchOrchestratorWorkflow(
         parseWarnings: options?.parseWarnings,
         baseBranch: codebaseBaseBranch,
         resolveChildIsolation,
+        inputs: resolvedInputs,
       }
+    );
+  }
+}
+
+/** A human gate the chat agent resolved during a turn, awaiting continuation. */
+interface ResolvedGate {
+  run: WorkflowRun;
+  action: 'approve' | 'reject';
+}
+
+/**
+ * Continue a run whose human gate the chat agent just resolved (#2565).
+ *
+ * A resolution leaves the run `paused` on purpose — `approveWorkflow` and
+ * `rejectWorkflow` record the decision and let the caller decide when to move
+ * (`workflow-operations.ts`). This is chat's "when": the same resume dispatch the
+ * removed natural-language branch performed, now triggered by the agent's
+ * explicit approve/reject verb instead of by "the message did not start with /".
+ * Resolution without continuation would strand the run on every chat surface.
+ *
+ * Never throws — the gate decision is already committed, so a failure here costs
+ * the user a manual `/workflow resume`, not the decision. The whole body is
+ * guarded so that guarantee holds for the `finally` this runs from, where a
+ * throw would replace the error the user actually needs to see.
+ */
+async function continueResolvedGateRun(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  conversation: Conversation,
+  codebase: Codebase | null,
+  workflowsWithSource: readonly WorkflowWithSource[],
+  run: WorkflowRun,
+  action: 'approve' | 'reject',
+  isolationHints?: HandleMessageContext['isolationHints'],
+  userId?: string
+): Promise<void> {
+  const decision = action === 'approve' ? 'Approved' : 'Rejected';
+  const notify = async (text: string): Promise<void> => {
+    await platform.sendMessage(conversationId, text).catch((sendErr: unknown) => {
+      getLog().warn(
+        { err: toError(sendErr), conversationId, workflowRunId: run.id },
+        'orchestrator.gate_continuation_notice_failed'
+      );
+    });
+  };
+
+  try {
+    const workflow = findWorkflow(
+      run.workflow_name,
+      workflowsWithSource.map(w => w.workflow)
+    );
+    if (!workflow) {
+      getLog().warn(
+        { conversationId, workflowRunId: run.id, workflowName: run.workflow_name },
+        'orchestrator.gate_continuation_workflow_not_found'
+      );
+      await notify(
+        `${decision}, but workflow \`${run.workflow_name}\` was not found, so the run could not ` +
+          'continue. The decision is recorded — use `/workflow list` to check available workflows.'
+      );
+      return;
+    }
+    if (!codebase) {
+      getLog().warn(
+        { conversationId, workflowRunId: run.id },
+        'orchestrator.gate_continuation_no_codebase'
+      );
+      await notify(
+        `${decision}, but no project is attached to this conversation, so the run could not ` +
+          `continue. The decision is recorded — use \`/workflow resume ${run.id}\` from the project.`
+      );
+      return;
+    }
+
+    const source = workflowsWithSource.find(w => w.workflow === workflow)?.source;
+    getLog().info(
+      { conversationId, workflowRunId: run.id, workflowName: workflow.name, action },
+      'orchestrator.gate_continuation_started'
+    );
+    try {
+      await notify(`▶️ Resuming **${workflow.name}**...`);
+      await dispatchOrchestratorWorkflow(
+        platform,
+        conversationId,
+        conversation,
+        codebase,
+        workflow,
+        run.user_message,
+        isolationHints,
+        userId,
+        source,
+        { resumeRunId: run.id, resumeRun: run }
+      );
+      getLog().info(
+        { conversationId, workflowRunId: run.id, workflowName: workflow.name, action },
+        'orchestrator.gate_continuation_completed'
+      );
+    } catch (error) {
+      const err = toError(error);
+      getLog().error(
+        { err, errorType: err.constructor.name, conversationId, workflowRunId: run.id, action },
+        'orchestrator.gate_continuation_failed'
+      );
+      await notify(
+        `${decision}, but resuming **${workflow.name}** failed: ${err.message}. ` +
+          `The decision is recorded — retry with \`/workflow resume ${run.id}\`.`
+      );
+    }
+  } catch (error) {
+    // Belt and braces for the "never throws" contract the finally relies on.
+    getLog().error(
+      { err: toError(error), conversationId, workflowRunId: run.id, action },
+      'orchestrator.gate_continuation_failed'
     );
   }
 }
@@ -1143,7 +1396,8 @@ function buildFullPrompt(
   issueContext: string | undefined,
   threadContext: string | undefined,
   attachedFiles?: AttachedFile[],
-  workflowContext?: string
+  workflowContext?: string,
+  pausedGateContext?: string
 ): string {
   const contextSuffix = issueContext ? '\n\n---\n\n## Additional Context\n\n' + issueContext : '';
 
@@ -1156,12 +1410,16 @@ function buildFullPrompt(
       : '';
 
   const workflowContextSuffix = workflowContext ? '\n\n---\n\n' + workflowContext : '';
+  // Placed LAST of the context blocks, immediately before the user's message —
+  // the gate is the thing the message is most likely answering (#2565).
+  const gateSuffix = pausedGateContext ? '\n\n---\n\n' + pausedGateContext : '';
 
   if (threadContext) {
     return (
       '## Thread Context (previous messages)\n\n' +
       threadContext +
       workflowContextSuffix +
+      gateSuffix +
       '\n\n---\n\n## Current Request\n\n' +
       message +
       contextSuffix +
@@ -1170,7 +1428,12 @@ function buildFullPrompt(
   }
 
   return (
-    workflowContextSuffix + '\n\n---\n\n## User Message\n\n' + message + contextSuffix + fileSuffix
+    workflowContextSuffix +
+    gateSuffix +
+    '\n\n---\n\n## User Message\n\n' +
+    message +
+    contextSuffix +
+    fileSuffix
   );
 }
 
@@ -1196,6 +1459,11 @@ export async function handleMessage(
     attachedFiles,
     userId,
   } = context ?? {};
+  // Anchor "is this a slash command" at the true start of the message —
+  // leading whitespace (e.g. from a platform that doesn't pre-trim after
+  // stripping a bot mention) must not let a command masquerade as a plain
+  // AI turn. Mirrors the trim already done inside commandHandler.parseCommand.
+  const trimmedMessage = message.trim();
   try {
     getLog().debug({ conversationId, userId }, 'orchestrator_message_received');
 
@@ -1219,115 +1487,8 @@ export async function handleMessage(
       conversationId
     );
 
-    // Natural-language approval routing — if a workflow is paused in this
-    // conversation awaiting a human gate, treat any non-slash message as the
-    // approval response. A paused run whose gate is already resolved
-    // (metadata.approval.resolved set — approved/rejected and awaiting
-    // auto-resume, #2075) is skipped so the message falls through to normal
-    // routing, matching the pre-#2075 behavior where a staged run no longer
-    // matched the 'paused' query.
-    if (!message.startsWith('/')) {
-      const pausedRun = await workflowDb.getPausedWorkflowRun(conversation.id);
-      const pausedApprovalRaw = pausedRun?.metadata.approval;
-      const gateAlreadyResolved =
-        pausedApprovalRaw !== undefined &&
-        isApprovalContext(pausedApprovalRaw) &&
-        isGateResolved(pausedApprovalRaw);
-      if (pausedRun && !gateAlreadyResolved) {
-        const approvalRaw = pausedRun.metadata.approval;
-        const hasValidApproval =
-          approvalRaw != null &&
-          typeof approvalRaw === 'object' &&
-          'nodeId' in approvalRaw &&
-          typeof (approvalRaw as Record<string, unknown>).nodeId === 'string';
-
-        if (!hasValidApproval) {
-          // Paused run exists but approval context is missing or corrupt —
-          // tell the user so they can use explicit commands instead.
-          await platform.sendMessage(
-            conversationId,
-            'A workflow is paused but its approval context is missing. ' +
-              `Use \`/workflow approve ${pausedRun.id}\` or \`/workflow reject ${pausedRun.id}\`.`
-          );
-          return;
-        }
-
-        const approval = approvalRaw as ApprovalContext;
-        getLog().info(
-          {
-            conversationId,
-            workflowRunId: pausedRun.id,
-            nodeId: approval.nodeId,
-            workflowName: pausedRun.workflow_name,
-          },
-          'orchestrator.natural_language_approval_started'
-        );
-
-        try {
-          // Shared gate logic (events, telemetry, metadata staging) — the run
-          // stays 'paused' with metadata.approval.resolved = 'approved'.
-          await approveWorkflow(pausedRun.id, message);
-
-          // Discover workflow and resume
-          const { workflows: discoveredWorkflows } = await discoverAllWorkflows(conversation);
-          const allWorkflows: WorkflowDefinition[] = discoveredWorkflows.map(w => w.workflow);
-          const workflow = findWorkflow(pausedRun.workflow_name, allWorkflows);
-          const workflowSource = workflow
-            ? discoveredWorkflows.find(w => w.workflow === workflow)?.source
-            : undefined;
-          if (!workflow) {
-            await platform.sendMessage(
-              conversationId,
-              `Approved, but workflow \`${pausedRun.workflow_name}\` not found. ` +
-                'The approval was recorded — use `/workflow list` to check available workflows.'
-            );
-            return;
-          }
-          const codebase = conversation.codebase_id
-            ? await codebaseDb.getCodebase(conversation.codebase_id)
-            : null;
-          if (!codebase) {
-            await platform.sendMessage(
-              conversationId,
-              'Approved, but no project is attached to this conversation. ' +
-                'The approval was recorded — re-run the workflow to resume.'
-            );
-            return;
-          }
-          await platform.sendMessage(conversationId, `▶️ Resuming **${workflow.name}**...`);
-          await dispatchOrchestratorWorkflow(
-            platform,
-            conversationId,
-            conversation,
-            codebase,
-            workflow,
-            pausedRun.user_message,
-            isolationHints,
-            userId,
-            workflowSource,
-            { resumeRunId: pausedRun.id, resumeRun: pausedRun }
-          );
-          getLog().info(
-            { conversationId, workflowRunId: pausedRun.id, workflowName: pausedRun.workflow_name },
-            'orchestrator.natural_language_approval_completed'
-          );
-        } catch (error) {
-          getLog().error(
-            { err: error as Error, workflowRunId: pausedRun.id, conversationId },
-            'orchestrator.natural_language_approval_failed'
-          );
-          await platform.sendMessage(
-            conversationId,
-            `Approval failed: ${(error as Error).message}. ` +
-              `Try again or use \`/workflow approve ${pausedRun.id}\` explicitly.`
-          );
-        }
-        return;
-      }
-    }
-
     // 2. Check for deterministic commands
-    if (message.startsWith('/')) {
+    if (trimmedMessage.startsWith('/')) {
       const { command } = commandHandler.parseCommand(message);
       const deterministicCommands = [
         'help',
@@ -1393,6 +1554,9 @@ export async function handleMessage(
               resumeRunId: result.workflow.resumeRunId,
               resumeRun: result.workflow.resumeRun,
               parseWarnings: result.workflow.parseWarnings,
+              // Declared inputs (#2554) arrive on the request context, not in the
+              // command text — the run route is the only caller that sets them.
+              inputs: context?.workflowInputs,
             }
           );
         }
@@ -1499,12 +1663,45 @@ export async function handleMessage(
       // Non-critical — continue without context
     }
 
+    // A human gate paused in this conversation is CONTEXT for the agent, not a
+    // branch in the router (#2565). Before #2565 any non-slash message here was
+    // recorded as an approval — including an objection — so an interpretation
+    // step never existed. Now the agent reads the gate alongside the message and
+    // resolves it (or doesn't) through the explicit approve/reject verbs it
+    // already has. Best-effort: getPausedWorkflowRun swallows DB errors and
+    // returns null, and a missing section only means the agent isn't told.
+    const pausedGateRun = await workflowDb.getPausedWorkflowRun(conversation.id);
+    const pausedGateContext = pausedGateRun
+      ? formatPausedGateSection({
+          runId: pausedGateRun.id,
+          workflowName: pausedGateRun.workflow_name,
+          approval: pausedGateRun.metadata.approval,
+          // Chat cannot rewire a container, so it cannot continue such a run.
+          containerRun: isContainerRun(pausedGateRun),
+          // Both resolution routes — the `manage_run` tool and the CLI-pointer
+          // section — are gated on a scoped project; without one the section
+          // must not instruct the agent to use verbs it does not have.
+          agentCanResolve: conversation.codebase_id !== null,
+        }) || undefined
+      : undefined;
+    if (pausedGateContext !== undefined) {
+      getLog().info(
+        {
+          conversationId,
+          workflowRunId: pausedGateRun?.id,
+          workflowName: pausedGateRun?.workflow_name,
+        },
+        'orchestrator.paused_gate_context_injected'
+      );
+    }
+
     const fullPrompt = buildFullPrompt(
       message,
       issueContext,
       threadContext,
       attachedFiles,
-      workflowContext
+      workflowContext,
+      pausedGateContext
     );
     const scopedCodebase =
       conversation.codebase_id !== null
@@ -1689,7 +1886,7 @@ export async function handleMessage(
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
     }
 
-    if (!conversation.title && !message.startsWith('/')) {
+    if (!conversation.title && !trimmedMessage.startsWith('/')) {
       const titleRequest = resolveModelRequest(aiProfile, 'small', configuredProviderKey);
       const titleOptions: SendQueryOptions = {
         model: titleRequest.model,
@@ -1721,6 +1918,14 @@ export async function handleMessage(
       'sending_to_ai'
     );
 
+    // Written by the `manage_run` tool when the agent resolves a human gate
+    // during this turn, and acted on once the turn ends (#2565). Resolving a
+    // gate and continuing the run are two halves of one action — the tool
+    // records the intent so its call returns immediately, and the resume runs
+    // here rather than blocking the agent loop on a whole workflow. Held in an
+    // object because a `let` assigned only from a callback narrows to `null`.
+    const gateResolution: { resolved: ResolvedGate | null } = { resolved: null };
+
     // Project-scoped chats get the `manage_run` tool so the agent can see and
     // launch this project's workflow runs. Only when a codebase is scoped and
     // the provider supports in-process native tools (Claude, Pi). The explicit
@@ -1731,6 +1936,14 @@ export async function handleMessage(
       requestOptions.nativeTools = [
         buildManageRunTool({
           codebaseId: scopedCodebaseId,
+          // One continuation per turn: the resume runs in this conversation and
+          // to completion, so a second gate resolved in the same turn is
+          // declined rather than silently dropped (the tool tells the agent).
+          onGateResolved: (run, action) => {
+            if (gateResolution.resolved !== null) return false;
+            gateResolution.resolved = { run, action };
+            return true;
+          },
           startWorkflow: async (workflowName, msg): Promise<string> => {
             let wf: WorkflowDefinition | undefined;
             try {
@@ -1771,40 +1984,63 @@ export async function handleMessage(
     }
 
     const mode = platform.getStreamingMode();
-    if (mode === 'stream') {
-      await handleStreamMode(
-        platform,
-        conversationId,
-        message,
-        codebases,
-        workflowsWithSource,
-        aiClient,
-        fullPrompt,
-        cwd,
-        session,
-        isolationHints,
-        conversation,
-        issueContext,
-        requestOptions,
-        userId
-      );
-    } else {
-      await handleBatchMode(
-        platform,
-        conversationId,
-        message,
-        codebases,
-        workflowsWithSource,
-        aiClient,
-        fullPrompt,
-        cwd,
-        session,
-        isolationHints,
-        conversation,
-        issueContext,
-        requestOptions,
-        userId
-      );
+    // `finally`, not straight-line code: the gate resolution is committed to the
+    // DB the moment the tool call returns, so once the agent has resolved a gate
+    // the continuation must run even if the rest of the turn throws — a provider
+    // subprocess crash after a successful tool call would otherwise leave the run
+    // resolved and parked with only a generic error to show for it. The outer
+    // catch cannot cover this: it does not know about the resolution.
+    // continueResolvedGateRun never throws, so this cannot mask the real error.
+    try {
+      if (mode === 'stream') {
+        await handleStreamMode(
+          platform,
+          conversationId,
+          message,
+          codebases,
+          workflowsWithSource,
+          aiClient,
+          fullPrompt,
+          cwd,
+          session,
+          isolationHints,
+          conversation,
+          issueContext,
+          requestOptions,
+          userId
+        );
+      } else {
+        await handleBatchMode(
+          platform,
+          conversationId,
+          message,
+          codebases,
+          workflowsWithSource,
+          aiClient,
+          fullPrompt,
+          cwd,
+          session,
+          isolationHints,
+          conversation,
+          issueContext,
+          requestOptions,
+          userId
+        );
+      }
+    } finally {
+      if (gateResolution.resolved !== null) {
+        await continueResolvedGateRun(
+          platform,
+          conversationId,
+          conversation,
+          discoveredCodebase ?? null,
+          workflowsWithSource,
+          gateResolution.resolved.run,
+          gateResolution.resolved.action,
+          isolationHints,
+          userId
+        );
+      }
     }
 
     // Direct-chat turns may have written to source/. If there is local-only state

@@ -65,6 +65,7 @@ type MockWorkflowRun = {
   parent_conversation_id: string | null;
   codebase_id: string | null;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+  outcome: 'succeeded' | 'failed' | null;
   user_message: string;
   started_at: string;
   completed_at: string | null;
@@ -324,6 +325,7 @@ const MOCK_RUNNING_RUN: MockWorkflowRun = {
   parent_conversation_id: null,
   codebase_id: 'cb-uuid-1',
   status: 'running',
+  outcome: null,
   user_message: 'Deploy to staging',
   started_at: NOW,
   completed_at: null,
@@ -336,6 +338,7 @@ const MOCK_COMPLETED_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-2',
   status: 'completed',
+  outcome: 'failed',
   completed_at: NOW,
 };
 
@@ -343,6 +346,7 @@ const MOCK_FAILED_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-4',
   status: 'failed',
+  outcome: 'succeeded',
   completed_at: NOW,
 };
 
@@ -645,6 +649,155 @@ describe('POST /api/workflows/:name/run', () => {
     });
     expect(response.status).toBe(400);
   });
+
+  // -------------------------------------------------------------------------
+  // Declared inputs (#2554)
+  // -------------------------------------------------------------------------
+
+  test('forwards a JSON `inputs` map on the context, never in the message text', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Review it',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/review-block/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Review it',
+        inputs: { diff: 'D1', style: 'terse' },
+      }),
+    });
+    expect(response.status).toBe(200);
+
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      // The command text is untouched — a supplied value must never be confusable
+      // with $ARGUMENTS, and this route must not invent a chat grammar.
+      '/workflow run review-block Review it',
+      expect.objectContaining({ workflowInputs: { diff: 'D1', style: 'terse' } })
+    );
+  });
+
+  test('omits workflowInputs entirely when no inputs are supplied', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Go',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go' }),
+    });
+
+    const ctx = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    expect(ctx).not.toHaveProperty('workflowInputs');
+  });
+
+  test('returns 400 when `inputs` is not an object of strings', async () => {
+    const { app } = makeApp();
+    for (const inputs of [['a'], 'nope', { diff: 5 }, { diff: null }]) {
+      const response = await app.request('/api/workflows/deploy/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go', inputs }),
+      });
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toContain('inputs');
+    }
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+  });
+
+  test('treats an explicit empty `inputs` object as nothing supplied', async () => {
+    // `{}` is valid, not an error — it means "take every declared default", so the
+    // context must carry no workflowInputs rather than an empty map.
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Go',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go', inputs: {} }),
+    });
+    expect(response.status).toBe(200);
+
+    const ctx = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    expect(ctx).not.toHaveProperty('workflowInputs');
+  });
+
+  test('accepts a multipart `inputs` field carrying the map JSON-encoded', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Review it',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const form = new FormData();
+    form.append('conversationId', 'web-test-abc');
+    form.append('message', 'Review it');
+    form.append('inputs', JSON.stringify({ diff: 'D1' }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/review-block/run', {
+      method: 'POST',
+      body: form,
+    });
+    expect(response.status).toBe(200);
+
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      '/workflow run review-block Review it',
+      expect.objectContaining({ workflowInputs: { diff: 'D1' } })
+    );
+  });
+
+  test('returns 400 for a malformed multipart `inputs` field rather than dropping it', async () => {
+    const form = new FormData();
+    form.append('conversationId', 'web-test-abc');
+    form.append('message', 'Review it');
+    form.append('inputs', 'not json {{{');
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/review-block/run', {
+      method: 'POST',
+      body: form,
+    });
+    expect(response.status).toBe(400);
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -804,9 +957,12 @@ describe('GET /api/workflows/runs', () => {
     const response = await app.request('/api/workflows/runs');
     expect(response.status).toBe(200);
 
-    const body = (await response.json()) as { runs: Array<{ id: string }> };
+    const body = (await response.json()) as {
+      runs: Array<{ id: string; outcome: 'succeeded' | 'failed' | null }>;
+    };
     expect(body.runs.length).toBe(2);
     expect(body.runs[0]?.id).toBe('run-uuid-1');
+    expect(body.runs.map(run => run.outcome)).toEqual([null, 'failed']);
   });
 
   test('converts Date objects to ISO strings in response', async () => {
@@ -956,6 +1112,24 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(body.error).toContain('not found');
   });
 
+  test('returns authored outcome independently from failed lifecycle status', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_FAILED_RUN);
+    mockListWorkflowEvents.mockImplementationOnce(async () => []);
+    mockGetConversationById.mockImplementationOnce(async () => ({
+      id: 'conv-uuid-1',
+      platform_conversation_id: 'web-conv-abc',
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-4');
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      run: { status: string; outcome: string | null };
+    };
+    expect(body.run).toMatchObject({ status: 'failed', outcome: 'succeeded' });
+  });
+
   test('includes conversation_platform_id for CLI runs (no parent_conversation_id)', async () => {
     // CLI run: conversation_id set, no parent_conversation_id
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
@@ -1069,12 +1243,13 @@ describe('GET /api/dashboard/runs', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
-      runs: unknown[];
+      runs: Array<{ status: string; outcome: string | null }>;
       total: number;
       counts: { all: number };
     };
     expect(Array.isArray(body.runs)).toBe(true);
     expect(body.runs.length).toBe(2);
+    expect(body.runs[1]).toMatchObject({ status: 'completed', outcome: 'failed' });
     expect(body.total).toBe(2);
     expect(body.counts.all).toBe(5);
   });
@@ -1214,12 +1389,14 @@ describe('GET /api/workflows/runs/by-worker/:platformId', () => {
   });
 
   test('returns run when found', async () => {
-    mockGetWorkflowRunByWorkerPlatformId.mockResolvedValueOnce(MOCK_RUNNING_RUN);
+    mockGetWorkflowRunByWorkerPlatformId.mockResolvedValueOnce(MOCK_COMPLETED_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/by-worker/some-platform-id');
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { run: unknown };
-    expect(body.run).toBeDefined();
+    const body = (await response.json()) as {
+      run: { status: string; outcome: string | null };
+    };
+    expect(body.run).toMatchObject({ status: 'completed', outcome: 'failed' });
   });
 
   test('returns 404 when not found', async () => {

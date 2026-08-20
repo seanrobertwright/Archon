@@ -6,6 +6,7 @@ import { insertWorkflowEvent } from './workflow-events';
 import type { IDatabase, SqlDialect } from './adapters/types';
 import type {
   WorkflowRun,
+  WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
 } from '@archon/workflows/schemas/workflow-run';
@@ -428,7 +429,8 @@ export async function getActiveWorkflowRun(conversationId: string): Promise<Work
 
 /**
  * Find a paused workflow run for a conversation (or its parent).
- * Used by the message handler to detect approval gates awaiting a natural-language response.
+ * Used by the message handler to give the chat agent the open approval gate as
+ * context for the turn (#2565).
  * Non-throwing: returns null on DB error so the caller can fall through to normal routing.
  */
 export async function getPausedWorkflowRun(conversationId: string): Promise<WorkflowRun | null> {
@@ -868,7 +870,9 @@ export async function getWorkflowRunByWorkerPlatformId(
  */
 export async function updateWorkflowRun(
   id: string,
-  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>>
+  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+    outcome?: WorkflowRunOutcome;
+  }
 ): Promise<void> {
   const dialect = getDialect();
   const setClauses: string[] = [];
@@ -894,6 +898,10 @@ export async function updateWorkflowRun(
     const paramIndex = values.length + 1;
     values.push(JSON.stringify(updates.metadata));
     setClauses.push(`metadata = ${dialect.jsonMerge('metadata', paramIndex)}`);
+  }
+  if (updates.outcome !== undefined) {
+    values.push(updates.outcome);
+    setClauses.push(`outcome = $${values.length}`);
   }
   if (updates.output_root !== undefined) {
     values.push(updates.output_root);

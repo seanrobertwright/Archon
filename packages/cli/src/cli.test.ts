@@ -5,15 +5,19 @@
  * Full integration tests would require mocking the database and commands.
  */
 import { describe, it, expect } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { parseArgs } from 'util';
 import * as git from '@archon/git';
 import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+const CLI_ENTRY = join(import.meta.dir, 'cli.ts');
+
 describe('CLI help output', () => {
   it('lists the workflow resume command', () => {
-    const result = spawnSync(process.execPath, [join(import.meta.dir, 'cli.ts'), '--help'], {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
       encoding: 'utf8',
     });
 
@@ -22,6 +26,142 @@ describe('CLI help output', () => {
       'workflow resume <run-id>   Resume a failed or paused run from completed nodes'
     );
   });
+
+  it('documents workflow dry-run flags', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('--dry-run');
+    expect(result.stdout).toContain('--stubs <path>');
+    expect(result.stdout).toContain('--stubs-init <path>');
+    expect(result.stdout).toContain('--default-stubs');
+    expect(result.stdout).toContain('--exec-code');
+    expect(result.stdout).toContain('--pause-at-gates');
+  });
+});
+
+describe('workflow status arguments', () => {
+  it('rejects a run id and points to workflow get', () => {
+    const result = spawnSync(
+      process.execPath,
+      [join(import.meta.dir, 'cli.ts'), 'workflow', 'status', 'abc123'],
+      { encoding: 'utf8' }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      'Usage: archon workflow status [--json] [--verbose] [--events]'
+    );
+    expect(result.stderr).toContain('archon workflow get <run-id>');
+    expect(result.stdout).toBe('');
+  });
+});
+
+describe('workflow get arguments', () => {
+  it('rejects extra positional arguments', () => {
+    const result = spawnSync(
+      process.execPath,
+      [join(import.meta.dir, 'cli.ts'), 'workflow', 'get', 'abc123', 'accidental-extra'],
+      { encoding: 'utf8' }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      'Usage: archon workflow get <run-id> [--json] [--verbose] [--events]'
+    );
+    expect(result.stdout).toBe('');
+  });
+});
+
+describe('CLI workflow event dispatch', () => {
+  it('resolves a run prefix using the registered effective cwd', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'archon-cli-event-'));
+    const archonHome = join(scratch, 'home');
+    const repoDir = join(scratch, 'repo');
+    mkdirSync(archonHome, { recursive: true });
+    mkdirSync(repoDir, { recursive: true });
+
+    try {
+      expect(spawnSync('git', ['init', '-q', '.'], { cwd: repoDir }).status).toBe(0);
+      const repoRoot = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: repoDir,
+        encoding: 'utf8',
+      });
+      expect(repoRoot.status).toBe(0);
+
+      const env = {
+        ...process.env,
+        ARCHON_HOME: archonHome,
+        ARCHON_TELEMETRY_DISABLED: '1',
+      };
+      const initialize = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--cwd', repoDir],
+        { env, encoding: 'utf8' }
+      );
+      expect({ status: initialize.status, stderr: initialize.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+
+      const fullRunId = '0b1ee8da-1111-2222-3333-444455556666';
+      const database = new Database(join(archonHome, 'archon.db'));
+      try {
+        database.run(
+          'INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES (?, ?, ?)',
+          ['codebase-1', 'fixture', repoRoot.stdout.trim()]
+        );
+        database.run(
+          'INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, codebase_id) VALUES (?, ?, ?, ?)',
+          ['conversation-1', 'cli', 'cli-fixture', 'codebase-1']
+        );
+        database.run(
+          'INSERT INTO remote_agent_workflow_runs (id, conversation_id, codebase_id, workflow_name, user_message) VALUES (?, ?, ?, ?, ?)',
+          [fullRunId, 'conversation-1', 'codebase-1', 'fixture', 'test']
+        );
+      } finally {
+        database.close();
+      }
+
+      const emitted = spawnSync(
+        process.execPath,
+        [
+          CLI_ENTRY,
+          'workflow',
+          'event',
+          'emit',
+          '--run-id',
+          fullRunId.slice(0, 8),
+          '--type',
+          'workflow_started',
+          '--cwd',
+          repoDir,
+        ],
+        { env, encoding: 'utf8' }
+      );
+      expect({ status: emitted.status, stderr: emitted.stderr }).toEqual({ status: 0, stderr: '' });
+
+      const verify = new Database(join(archonHome, 'archon.db'), { readonly: true });
+      try {
+        const event = verify
+          .query<
+            { workflow_run_id: string; event_type: string },
+            []
+          >('SELECT workflow_run_id, event_type FROM remote_agent_workflow_events')
+          .get();
+        expect(event).toEqual({
+          workflow_run_id: fullRunId,
+          event_type: 'workflow_started',
+        });
+      } finally {
+        verify.close();
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 // Test the argument parsing logic used in cli.ts
@@ -45,6 +185,12 @@ describe('CLI argument parsing', () => {
         verbose: { type: 'boolean', short: 'v' },
         scope: { type: 'string' },
         force: { type: 'boolean' },
+        'dry-run': { type: 'boolean' },
+        stubs: { type: 'string' },
+        'stubs-init': { type: 'string' },
+        'default-stubs': { type: 'boolean' },
+        'exec-code': { type: 'boolean' },
+        'pause-at-gates': { type: 'boolean' },
       },
       allowPositionals: true,
       strict: false,
@@ -172,6 +318,29 @@ describe('CLI argument parsing', () => {
     it('should parse --base flag for workflow run', () => {
       const result = parseCliArgs(['workflow', 'run', 'assist', '--base', 'epic/foo']);
       expect(result.values.base).toBe('epic/foo');
+    });
+
+    it('parses workflow dry-run flags', () => {
+      const result = parseCliArgs([
+        'workflow',
+        'run',
+        'assist',
+        '--dry-run',
+        '--stubs',
+        'fixtures.yaml',
+        '--stubs-init',
+        'generated.yaml',
+        '--default-stubs',
+        '--exec-code',
+        '--pause-at-gates',
+      ]);
+
+      expect(result.values['dry-run']).toBe(true);
+      expect(result.values.stubs).toBe('fixtures.yaml');
+      expect(result.values['stubs-init']).toBe('generated.yaml');
+      expect(result.values['default-stubs']).toBe(true);
+      expect(result.values['exec-code']).toBe(true);
+      expect(result.values['pause-at-gates']).toBe(true);
     });
   });
 

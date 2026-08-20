@@ -13,11 +13,14 @@ import {
 import type {
   IAgentProvider,
   SendQueryOptions,
+  NodeConfig,
   MessageChunk,
   TokenUsage,
   ProviderCapabilities,
+  CodexProviderDefaults,
 } from '../types';
-import { parseCodexConfig } from './config';
+import { clampEffort } from '../shared/effort';
+import { CODEX_EFFORTS, parseCodexConfig } from './config';
 import { CODEX_CAPABILITIES } from './capabilities';
 import { resolveCodexBinaryPath } from './binary-resolver';
 import { createLogger } from '@archon/paths';
@@ -74,12 +77,43 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 }
 
 /**
+ * Resolve Codex's `modelReasoningEffort` from Archon's inputs.
+ *
+ * Precedence: `nodeConfig.effort` > `assistants.codex.modelReasoningEffort`
+ * from config.yaml — mirroring Copilot's `resolveCopilotReasoning`, so a workflow's
+ * declared depth beats the install default on both providers alike.
+ *
+ * Codex has no `max` rung, so `effort: max` clamps to `xhigh` (see
+ * `clampEffort`). A value that is not on the ladder at all falls back to the
+ * config default rather than being invented; the workflow loader rejects such
+ * values at parse time, so this only guards programmatic callers.
+ */
+function resolveModelReasoningEffort(
+  nodeConfig: NodeConfig | undefined,
+  configured: CodexProviderDefaults['modelReasoningEffort']
+): CodexProviderDefaults['modelReasoningEffort'] {
+  const declared = nodeConfig?.effort;
+  if (declared === undefined) return configured;
+
+  const clamped = clampEffort(declared, CODEX_EFFORTS);
+  if (clamped === undefined) {
+    getLog().warn({ effort: declared }, 'codex.effort_unrecognized');
+    return configured;
+  }
+  if (clamped !== declared) {
+    getLog().debug({ declared, applied: clamped }, 'codex.effort_clamped');
+  }
+  return clamped;
+}
+
+/**
  * Build thread options for Codex SDK
  */
 function buildThreadOptions(
   cwd: string,
   model?: string,
-  assistantConfig?: Record<string, unknown>
+  assistantConfig?: Record<string, unknown>,
+  nodeConfig?: NodeConfig
 ): ThreadOptions {
   const config = parseCodexConfig(assistantConfig ?? {});
   return {
@@ -89,7 +123,7 @@ function buildThreadOptions(
     networkAccessEnabled: true,
     approvalPolicy: 'never',
     model: model ?? config.model,
-    modelReasoningEffort: config.modelReasoningEffort,
+    modelReasoningEffort: resolveModelReasoningEffort(nodeConfig, config.modelReasoningEffort),
     webSearchMode: config.webSearchMode,
     additionalDirectories: config.additionalDirectories,
   };
@@ -208,6 +242,32 @@ function buildCodexMcpConfigOverrides(
 
   if (Object.keys(mcpServers).length === 0) return undefined;
   return { mcp_servers: mcpServers };
+}
+
+function isWorkflowNode(requestOptions?: SendQueryOptions): boolean {
+  const nodeId = requestOptions?.nodeConfig?.nodeId;
+  return typeof nodeId === 'string' && nodeId.trim().length > 0;
+}
+
+function withWorkflowSkillCatalogDisabled(config?: CodexConfigOverrides): CodexConfigOverrides {
+  return {
+    ...(config ?? {}),
+    skills: { include_instructions: false },
+  };
+}
+
+function isWorkflowSkillCatalogConfigUnsupported(errorMessage: string): boolean {
+  const normalized = errorMessage.toLowerCase();
+  const namesCatalogSetting =
+    normalized.includes('skills.include_instructions') ||
+    normalized.includes('include_instructions');
+  const isConfigRejection =
+    normalized.includes('config') ||
+    normalized.includes('unknown field') ||
+    normalized.includes('unknown key') ||
+    normalized.includes('unrecognized') ||
+    normalized.includes('failed to parse');
+  return namesCatalogSetting && isConfigRejection;
 }
 
 // Maps slugs that ChatGPT-plan accounts now reject (previously shipped as Archon
@@ -855,7 +915,7 @@ export class CodexProvider implements IAgentProvider {
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const codexConfig = parseCodexConfig(assistantConfig);
     const providerWarnings: ProviderWarning[] = [];
-    let codexConfigOverrides: CodexConfigOverrides | undefined;
+    let declaredMcpConfigOverrides: CodexConfigOverrides | undefined;
 
     if (requestOptions?.nodeConfig?.mcp) {
       const mcpPath = requestOptions.nodeConfig.mcp;
@@ -864,7 +924,7 @@ export class CodexProvider implements IAgentProvider {
         cwd,
         buildMcpEnvSource(requestOptions.env)
       );
-      codexConfigOverrides = buildCodexMcpConfigOverrides(servers);
+      declaredMcpConfigOverrides = buildCodexMcpConfigOverrides(servers);
       getLog().info({ serverNames, mcpPath }, 'codex.mcp_config_loaded');
       if (missingVars.length > 0) {
         const uniqueVars = [...new Set(missingVars)];
@@ -876,17 +936,27 @@ export class CodexProvider implements IAgentProvider {
       }
     }
 
+    const suppressWorkflowSkillCatalog = isWorkflowNode(requestOptions);
+    const initialConfigOverrides = suppressWorkflowSkillCatalog
+      ? withWorkflowSkillCatalogDisabled(declaredMcpConfigOverrides)
+      : declaredMcpConfigOverrides;
+
     for (const warning of providerWarnings) {
       yield { type: 'system', content: `⚠️ ${warning.message}` };
     }
 
     // 1. Initialize SDK and build thread options
-    const codex = await this.createCodexClient(
+    let codex = await this.createCodexClient(
       codexConfig.codexBinaryPath,
       requestOptions?.env,
-      codexConfigOverrides
+      initialConfigOverrides
     );
-    const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    const threadOptions = buildThreadOptions(
+      cwd,
+      requestOptions?.model,
+      assistantConfig,
+      requestOptions?.nodeConfig
+    );
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');
@@ -938,6 +1008,7 @@ export class CodexProvider implements IAgentProvider {
     const { turnOptions, hasOutputFormat } = buildTurnOptions(requestOptions);
     const effectivePrompt = buildEffectivePrompt(prompt, requestOptions);
     let lastError: Error | undefined;
+    let skillCatalogCompatibilityFallbackUsed = false;
 
     for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
       if (requestOptions?.abortSignal?.aborted) {
@@ -978,24 +1049,77 @@ export class CodexProvider implements IAgentProvider {
         }
 
         try {
-          // 4. Run streamed turn
-          const result = await thread.runStreamed(effectivePrompt, turnOptions);
+          // 4. Run and consume the streamed turn. Codex starts its subprocess
+          // lazily while events are iterated, so compatibility errors must be
+          // caught around both runStreamed() and event consumption.
+          let providerEventEmitted = false;
+          while (true) {
+            try {
+              const result = await thread.runStreamed(effectivePrompt, turnOptions);
+              for await (const chunk of withResumedOutcome(
+                streamCodexEvents(
+                  result.events as AsyncIterable<Record<string, unknown>>,
+                  hasOutputFormat,
+                  thread.id,
+                  attemptController.signal,
+                  Boolean(requestOptions?.nodeConfig?.mcp)
+                ),
+                // Stamp from the attempt that produced the result: any retry
+                // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
+                // session context is lost even when the initial resumeThread succeeded.
+                resumedOutcome(resumeSessionId, !sessionResumeFailed && attempt === 0)
+              )) {
+                providerEventEmitted = true;
+                yield chunk;
+              }
+              return;
+            } catch (error) {
+              const err = error as Error;
+              if (
+                providerEventEmitted ||
+                !suppressWorkflowSkillCatalog ||
+                skillCatalogCompatibilityFallbackUsed ||
+                !isWorkflowSkillCatalogConfigUnsupported(err.message)
+              ) {
+                throw error;
+              }
 
-          // 5. Stream normalized events (fresh state per attempt to avoid dedup leaks)
-          yield* withResumedOutcome(
-            streamCodexEvents(
-              result.events as AsyncIterable<Record<string, unknown>>,
-              hasOutputFormat,
-              thread.id,
-              attemptController.signal,
-              Boolean(requestOptions?.nodeConfig?.mcp)
-            ),
-            // Stamp from the attempt that produced the result: any retry
-            // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
-            // session context is lost even when the initial resumeThread succeeded.
-            resumedOutcome(resumeSessionId, !sessionResumeFailed && attempt === 0)
-          );
-          return;
+              skillCatalogCompatibilityFallbackUsed = true;
+              getLog().warn(
+                { err, nodeId: requestOptions?.nodeConfig?.nodeId },
+                'codex.workflow_skill_catalog_suppression_unsupported'
+              );
+              yield {
+                type: 'system',
+                content:
+                  '⚠️ This Codex binary does not support suppressing the automatic skill catalog. Continuing with native skill discovery enabled.',
+              };
+
+              codex = await this.createCodexClient(
+                codexConfig.codexBinaryPath,
+                requestOptions?.env,
+                declaredMcpConfigOverrides
+              );
+              if (resumeSessionId) {
+                try {
+                  thread = codex.resumeThread(resumeSessionId, threadOptions);
+                } catch (resumeError) {
+                  getLog().error(
+                    { err: resumeError, sessionId: resumeSessionId },
+                    'resume_thread_failed'
+                  );
+                  thread = codex.startThread(threadOptions);
+                  sessionResumeFailed = true;
+                  yield {
+                    type: 'system',
+                    content: '⚠️ Could not resume previous session. Starting fresh conversation.',
+                  };
+                }
+              } else {
+                thread = codex.startThread(threadOptions);
+              }
+            }
+          }
         } catch (error) {
           const err = error as Error;
 

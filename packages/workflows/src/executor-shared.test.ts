@@ -24,6 +24,7 @@ import {
   buildPromptWithContext,
   detectCreditExhaustion,
   detectCompletionSignal,
+  describeUnmetCompletion,
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
@@ -115,6 +116,58 @@ describe('substituteWorkflowVariables', () => {
       'docs/'
     );
     expect(prompt).toBe('No state reference here');
+  });
+
+  it('substitutes a known $INPUTS.<name> from options.inputs (#2470)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Plan: $INPUTS.plan and mode $INPUTS.mode',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { inputs: { plan: 'do the thing', mode: 'fast' } }
+    );
+    expect(prompt).toBe('Plan: do the thing and mode fast');
+  });
+
+  it('throws with a did-you-mean hint on an unknown $INPUTS name (#2470)', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Use $INPUTS.pln',
+        'run-1',
+        'msg',
+        '/tmp/artifacts',
+        'main',
+        'docs/',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { inputs: { plan: 'x' } }
+      )
+    ).toThrow('$INPUTS.plan');
+  });
+
+  it('does NOT substitute $INPUTS under shellSafe — env delivery is the shell path (#2470/#2115)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'echo "$INPUTS.plan"',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { shellSafe: true, inputs: { plan: 'x' } }
+    );
+    expect(prompt).toBe('echo "$INPUTS.plan"');
   });
 
   it('replaces $BASE_BRANCH with config value', () => {
@@ -955,5 +1008,36 @@ describe('safeSendMessage', () => {
       );
       expect(result).toBe(false);
     }
+  });
+});
+
+describe('describeUnmetCompletion', () => {
+  // The max-iterations failure message for both loop variants. `loop.until` is
+  // optional (#2563), so this exists to stop the two executors describing the same
+  // loop differently — and to stop either printing `undefined` at the author.
+  it('names the signal when only until is declared', () => {
+    expect(describeUnmetCompletion({ until: 'COMPLETE' })).toBe(
+      "without completion signal 'COMPLETE'"
+    );
+  });
+
+  it('names the check when only until_bash is declared', () => {
+    expect(describeUnmetCompletion({ until_bash: 'bun run test' })).toBe(
+      "without a passing 'until_bash' check"
+    );
+  });
+
+  it('names both when both are declared', () => {
+    expect(describeUnmetCompletion({ until: 'DONE', until_bash: 'test -f x' })).toBe(
+      "without completion signal 'DONE' or a passing 'until_bash' check"
+    );
+  });
+
+  it('never emits the literal "undefined" for a channel-less control', () => {
+    // Unreachable through the schema (it requires at least one channel), but this is
+    // an error message: degrade to something readable rather than assert.
+    const described = describeUnmetCompletion({});
+    expect(described).toBe('without a completion channel');
+    expect(described).not.toContain('undefined');
   });
 });

@@ -30,6 +30,7 @@ export {
   triggerRuleSchema,
   TRIGGER_RULES,
   dagNodeBaseSchema,
+  nodeContextSchema,
   commandNodeSchema,
   promptNodeSchema,
   bashNodeSchema,
@@ -45,7 +46,9 @@ export {
   fanOutConfigSchema,
   dagNodeSchema,
   INPUT_NAME_SOURCE,
+  inputEnvKey,
   isCommandNode,
+  isPromptNode,
   isBashNode,
   isLoopNode,
   isLoopGroupNode,
@@ -55,6 +58,7 @@ export {
   isIncludeNode,
   isWorkflowNode,
   isPersistableNode,
+  isNodeContextResume,
   isTriggerRule,
   BASH_NODE_AI_FIELDS,
   SCRIPT_NODE_AI_FIELDS,
@@ -75,6 +79,7 @@ export {
 export type {
   TriggerRule,
   DagNodeBase,
+  NodeContext,
   CommandNode,
   PromptNode,
   BashNode,
@@ -103,6 +108,7 @@ export {
   webSearchModeSchema,
   workflowRequirementSchema,
   workflowEvidencePolicySchema,
+  workflowInputSpecSchema,
   workflowBaseSchema,
   workflowDefinitionSchema,
   KNOWN_WORKFLOW_KEYS,
@@ -114,6 +120,7 @@ export type {
   WebSearchMode,
   WorkflowRequirement,
   WorkflowEvidencePolicy,
+  WorkflowInputSpec,
   WorkflowBase,
   WorkflowDefinition,
 } from './workflow';
@@ -121,6 +128,7 @@ export type {
 // Workflow run state
 export {
   workflowRunStatusSchema,
+  workflowRunOutcomeSchema,
   workflowStepStatusSchema,
   nodeStateSchema,
   nodeOutputSchema,
@@ -135,6 +143,7 @@ export {
 } from './workflow-run';
 export type {
   WorkflowRunStatus,
+  WorkflowRunOutcome,
   WorkflowStepStatus,
   NodeState,
   NodeOutput,
@@ -148,9 +157,13 @@ export type {
 export { workflowNodeSessionSchema } from './workflow-node-session';
 export type { WorkflowNodeSession } from './workflow-node-session';
 
+// Private provider session handles scoped to one workflow run
+export { workflowRunNodeSessionSchema } from './workflow-run-node-session';
+export type { WorkflowRunNodeSession } from './workflow-run-node-session';
+
 // Node typed-output artifacts (output_type metadata)
-export { nodeArtifactSchema } from './node-artifact';
-export type { NodeArtifact } from './node-artifact';
+export { nodeArtifactSchema, nodeArtifactLoopFrameSchema } from './node-artifact';
+export type { NodeArtifact, NodeArtifactLoopFrame } from './node-artifact';
 
 // Result types (non-schema hand-written types)
 export type {
@@ -160,6 +173,7 @@ export type {
   WorkflowLoadResult,
   WorkflowSource,
   WorkflowWithSource,
+  DeclaredWorkflowConfig,
 } from './workflow';
 
 // DagWorkflow — alias kept for backward compatibility

@@ -96,6 +96,7 @@ class InMemoryStore implements IWorkflowStore {
       parent_conversation_id: data.parent_conversation_id ?? null,
       codebase_id: data.codebase_id ?? null,
       status: 'pending',
+      outcome: null,
       user_message: data.user_message,
       metadata: data.metadata ?? {},
       started_at: new Date(),
@@ -104,6 +105,7 @@ class InMemoryStore implements IWorkflowStore {
       working_path: data.working_path ?? null,
       user_id: data.user_id ?? null,
       parent_run_id: data.parent_run_id ?? null,
+      output_root: null,
     };
     this.runs.set(id, row);
     return Promise.resolve(this.clone(row));
@@ -160,6 +162,7 @@ class InMemoryStore implements IWorkflowStore {
     const r = this.runs.get(id);
     if (r) {
       if (updates.status) r.status = updates.status;
+      if (updates.outcome) r.outcome = updates.outcome;
       if (updates.metadata) r.metadata = { ...r.metadata, ...updates.metadata };
     }
     return Promise.resolve();
@@ -227,6 +230,7 @@ class InMemoryStore implements IWorkflowStore {
   getDagResumeSnapshot: IWorkflowStore['getDagResumeSnapshot'] = workflowRunId => {
     const completedNodeOutputs = new Map<string, string>();
     const tokens = { input: 0, output: 0 };
+    let costUsd = 0;
     for (const e of this.events) {
       if (
         e.workflow_run_id === workflowRunId &&
@@ -234,6 +238,9 @@ class InMemoryStore implements IWorkflowStore {
         typeof e.step_name === 'string'
       ) {
         completedNodeOutputs.set(e.step_name, String(e.data?.node_output ?? ''));
+        // Mirrors the real store: a derived row (loop_group roll-up) restates usage
+        // other rows already carry, so it contributes output but never usage (#2469).
+        if (e.data?.aggregate === true) continue;
         const eventTokens = e.data?.tokens;
         if (
           e.event_type === 'node_completed' &&
@@ -249,14 +256,26 @@ class InMemoryStore implements IWorkflowStore {
           tokens.input += eventTokens.input;
           tokens.output += eventTokens.output;
         }
+        const eventCost = e.data?.cost_usd;
+        if (
+          e.event_type === 'node_completed' &&
+          typeof eventCost === 'number' &&
+          Number.isFinite(eventCost)
+        ) {
+          costUsd += eventCost;
+        }
       }
     }
-    return Promise.resolve({ completedNodeOutputs, tokens });
+    return Promise.resolve({ completedNodeOutputs, tokens, costUsd });
   };
 
   getCodebase = (): Promise<null> => Promise.resolve(null);
   getCodebaseEnvVars = (): Promise<Record<string, string>> => Promise.resolve({});
   getWorkflowNodeSession = (): Promise<null> => Promise.resolve(null);
+  listWorkflowRunNodeSessions: IWorkflowStore['listWorkflowRunNodeSessions'] = () =>
+    Promise.resolve([]);
+  upsertWorkflowRunNodeSession: IWorkflowStore['upsertWorkflowRunNodeSession'] = () =>
+    Promise.resolve();
   upsertWorkflowNodeSession = (): Promise<void> => Promise.resolve();
   deleteWorkflowNodeSessions = (): Promise<{ deleted: number }> => Promise.resolve({ deleted: 0 });
   findResumableRun = (): Promise<null> => Promise.resolve(null);
@@ -1002,8 +1021,9 @@ nodes:
     expect(result.success).toBe(false);
     const child = [...store.runs.values()].find(r => r.workflow_name === 'child-plain');
     expect(child).toBeDefined();
+    if (!child) throw new Error('Expected child run');
     // The child must be TERMINAL — not a 'pending'/'running' zombie holding the lock.
-    expect(['cancelled', 'failed']).toContain(child?.status);
+    expect(['cancelled', 'failed']).toContain(child.status);
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'parent-plain');
     expect(parentRun?.status).toBe('failed');
   });
@@ -1196,9 +1216,11 @@ nodes:
     expect(result.success).toBe(true);
     // The resolver was invoked once, for the `sub` node, carrying the parent run.
     expect(calls).toHaveLength(1);
+    if (!calls[0]) throw new Error('Expected resolver call');
     expect(calls[0].nodeId).toBe('sub');
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'parent-iso');
-    expect(calls[0].parentRun.id).toBe(parentRun?.id);
+    if (!parentRun) throw new Error('Expected parent run');
+    expect(calls[0].parentRun.id).toBe(parentRun.id);
     // The child ran in the resolver's worktree cwd — NOT the parent's checkout.
     const child = [...store.runs.values()].find(r => r.workflow_name === 'child-iso');
     expect(child?.status).toBe('completed');
@@ -1802,8 +1824,9 @@ nodes:
     // each in its OWN worktree (distinct working paths, none the parent's checkout).
     const children = [...store.runs.values()].filter(r => r.workflow_name === 'fan-child');
     expect(children).toHaveLength(3);
+    if (!parentRun) throw new Error('Expected parent run');
     for (const c of children) {
-      expect(c.parent_run_id).toBe(parentRun?.id);
+      expect(c.parent_run_id).toBe(parentRun.id);
       expect((c.metadata as Record<string, unknown>).parent_node_id).toBe('work');
       expect(c.status).toBe('completed');
       expect(c.working_path).not.toBe(cwd);
@@ -2608,15 +2631,139 @@ nodes:
     // 3 children × 0.01 each = 0.03 rolled up to the parent (plan is bash → 0 cost).
     expect((parentRun?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.03, 5);
 
-    // Tokens must be PERSISTED on the node_completed event, not merely computed. This is
-    // the axis getDagResumeSnapshot sums to rebuild usage across resume passes — it never
-    // reads cost_usd — so dropping it here under-reports every resumed run by exactly the
-    // children's tokens, silently, and on Codex (which reports no cost) loses everything.
+    // Usage must be PERSISTED on the node_completed event, not merely computed. These
+    // are the axes getDagResumeSnapshot sums to rebuild a run's usage across resume
+    // passes, so dropping either here under-reports every resumed run by exactly the
+    // children's usage — silently, since an absent key is skipped without warning.
     const workCompleted = store.events.find(
       e => e.event_type === 'node_completed' && e.step_name === 'work'
     );
     expect(workCompleted?.data?.cost_usd).toBeCloseTo(0.03, 5);
     expect(workCompleted?.data?.tokens).toBeDefined();
+  });
+
+  // #2469 (R1) — the 1:1 topology, not just fan-out. The fan-out `failResult` has
+  // carried a failed child's usage since #2224; the single-child one dropped it, so a
+  // parent with one ordinary `workflow:` node still reported zero for a child that
+  // burned tokens and then failed. That is the more common shape of the two.
+  it("rolls up a failed 1:1 child's spend into the parent (no fan_out)", async () => {
+    await writeWorkflow(
+      'solo-child-doomed',
+      `
+name: solo-child-doomed
+description: one AI turn (canned cost 0.01 / 7 in / 3 out), then fails
+mutates_checkout: false
+nodes:
+  - id: think
+    prompt: "work on $ARGUMENTS"
+  - id: fail
+    depends_on: [think]
+    bash: |
+      exit 1
+`
+    );
+    await writeWorkflow(
+      'solo-parent',
+      `
+name: solo-parent
+description: a single non-fan-out sub-run node whose child fails after spending
+nodes:
+  - id: work
+    workflow: solo-child-doomed
+    input: "the task"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('solo-parent');
+    await executeWorkflow(deps, makePlatform(), 'conv-plat', cwd, parent, 'goal', 'conv-db');
+
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'solo-child-doomed');
+    expect(child?.status).toBe('failed');
+    // The child's own row records the spend (the run-tail write).
+    expect((child?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);
+
+    // ...and so does the parent's, via the node result the failed branch now carries.
+    // The node failed, so the parent run failed too — which is exactly the case that
+    // used to report nothing at all.
+    const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'solo-parent');
+    expect(parentRun?.status).toBe('failed');
+    expect((parentRun?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);
+    expect((parentRun?.metadata as Record<string, unknown>).total_tokens_in).toBe(7);
+    expect((parentRun?.metadata as Record<string, unknown>).total_tokens_out).toBe(3);
+  });
+
+  // #2469 — the regression proof. `all_done` is the DEFAULT join and a failing child
+  // explicitly must not discard its siblings, so partial failure is a designed, routine
+  // outcome. Before this fix a child that burned tokens and then failed recorded no
+  // spend at all, and the fan-out reported Σ of *completed* children: plausible, lower
+  // than reality, and with no warning to prompt investigation.
+  it('rolls up the spend of EVERY child, including ones that failed after burning tokens', async () => {
+    await writeWorkflow(
+      'fan-child-partial',
+      `
+name: fan-child-partial
+description: one AI turn (canned cost 0.01 / 7 in / 3 out), then the "doomed" item fails
+mutates_checkout: false
+nodes:
+  - id: think
+    prompt: "work on $ARGUMENTS"
+  - id: check
+    depends_on: [think]
+    bash: |
+      test "$ARGUMENTS" != "doomed"
+`
+    );
+    await writeWorkflow(
+      'fan-partial',
+      `
+name: fan-partial
+description: three children, one fails AFTER its AI node already spent tokens
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["a","doomed","c"]'
+  - id: work
+    workflow: fan-child-partial
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('fan-partial');
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db'
+    );
+
+    // all_done: the failed child is represented in the aggregate, not fatal to the node.
+    expect(result.success).toBe(true);
+    const children = [...store.runs.values()].filter(r => r.workflow_name === 'fan-child-partial');
+    expect(children).toHaveLength(3);
+    const failedChild = children.find(r => r.status === 'failed');
+    expect(failedChild).toBeDefined();
+
+    // The failed child's OWN row carries what it spent. This is the assertion that
+    // fails on the pre-fix engine: failWorkflowRun wrote only { error }.
+    const failedMeta = failedChild?.metadata as Record<string, unknown>;
+    expect(failedMeta.total_cost_usd).toBeCloseTo(0.01, 5);
+    expect(failedMeta.total_tokens_in).toBe(7);
+    expect(failedMeta.total_tokens_out).toBe(3);
+
+    // 3 children × 0.01 = 0.03 — Σ of ALL three, not the 0.02 of the two that completed.
+    const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'fan-partial');
+    expect((parentRun?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.03, 5);
+    expect((parentRun?.metadata as Record<string, unknown>).total_tokens_in).toBe(21);
+    expect((parentRun?.metadata as Record<string, unknown>).total_tokens_out).toBe(9);
   });
 
   it('parent resume re-drives only the failed instance, skipping completed ones (1:N re-entry)', async () => {
@@ -3355,7 +3502,7 @@ nodes:
 
     const wf = await discover('parent-forward-ref');
     const issues = await validateWorkflowResources(wf, cwd);
-    const errors = issues.filter(i => i.severity === 'error');
+    const errors = issues.filter(i => i.level === 'error');
     expect(errors).toHaveLength(0);
   });
 
@@ -3736,5 +3883,868 @@ nodes:
     expect(approval).toBeDefined();
     const paused = children.find(c => c.status === 'paused');
     expect(String(approval?.childRunId ?? '')).toBe(paused?.id ?? '');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime declared-input contract on `workflow:` nodes (#2470)
+//
+// `include:` enforces the callee's `inputs:` block at LOAD time; these lock the
+// RUN-time twin so the same `with:` map is accepted or rejected identically no
+// matter which surface calls the block.
+// ---------------------------------------------------------------------------
+
+describe('workflow: declared input contract at runtime (#2470)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  /** A child that declares `inputs:` and echoes them, so delivery is observable. */
+  async function writeDeclaringChild(inputsYaml: string): Promise<void> {
+    await writeWorkflow(
+      'child-declares',
+      `
+name: child-declares
+description: child with a declared input contract
+inputs:
+${inputsYaml}
+nodes:
+  - id: emit
+    bash: echo "style=$INPUTS_STYLE tone=$INPUTS_TONE"
+`
+    );
+  }
+
+  /** The child run row spawned by `sub`, or undefined if none was created. */
+  function childRun(store: InMemoryStore): WorkflowRun | undefined {
+    return [...store.runs.values()].find(r => r.workflow_name === 'child-declares');
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subin-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true }).catch(() => {});
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  it('applies the child declared default for an omitted with: key', async () => {
+    await writeDeclaringChild('  style:\n    default: strict\n  tone:\n    default: dry');
+    await writeWorkflow(
+      'parent-defaults',
+      `
+name: parent-defaults
+description: supplies only one of two declared inputs
+nodes:
+  - id: sub
+    workflow: child-declares
+    with:
+      style: loud
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-defaults'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    // The caller's value wins; the omitted one is filled from the child's default —
+    // and the RESOLVED map (not the raw caller map) is what gets persisted, so it
+    // survives a cold resume that never re-reads the parent.
+    const child = childRun(store);
+    expect(child?.metadata?.inputs).toEqual({ style: 'loud', tone: 'dry' });
+    // Delivered to the child's shell surface as INPUTS_<UPPER_SNAKE>.
+    const emitted = store.events.find(
+      e => e.workflow_run_id === child?.id && e.event_type === 'node_completed'
+    );
+    expect(String(emitted?.data?.node_output)).toContain('style=loud tone=dry');
+  });
+
+  it('fails the node when a required child input is not supplied', async () => {
+    await writeDeclaringChild('  style:\n    required: true');
+    await writeWorkflow(
+      'parent-missing',
+      `
+name: parent-missing
+description: omits a required child input
+nodes:
+  - id: sub
+    workflow: child-declares
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-missing'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(false);
+    const failed = store.events.find(e => e.event_type === 'node_failed');
+    expect(String(failed?.data?.error)).toContain("requires input 'style'");
+    // Rejected BEFORE the child row exists — no doomed run left to clean up.
+    expect(childRun(store)).toBeUndefined();
+  });
+
+  it('fails the node on a with: key the child does not declare', async () => {
+    await writeDeclaringChild('  style:\n    default: strict');
+    await writeWorkflow(
+      'parent-undeclared',
+      `
+name: parent-undeclared
+description: passes a key the child never declared
+nodes:
+  - id: sub
+    workflow: child-declares
+    with:
+      stlye: typo
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-undeclared'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(false);
+    const failed = store.events.find(e => e.event_type === 'node_failed');
+    expect(String(failed?.data?.error)).toContain("does not declare input 'stlye'");
+    expect(childRun(store)).toBeUndefined();
+  });
+
+  it('keeps Phase-1 passthrough for a child that declares no inputs', async () => {
+    await writeWorkflow(
+      'child-undeclared',
+      `
+name: child-undeclared
+description: no inputs block at all
+nodes:
+  - id: emit
+    bash: echo "v=$INPUTS_V"
+`
+    );
+    await writeWorkflow(
+      'parent-passthrough',
+      `
+name: parent-passthrough
+description: passes anything to an undeclared child
+nodes:
+  - id: sub
+    workflow: child-undeclared
+    with:
+      v: hello
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-passthrough'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-undeclared');
+    expect(child?.metadata?.inputs).toEqual({ v: 'hello' });
+  });
+
+  it('resolves declared defaults on a bare top-level run (no parent to stamp metadata)', async () => {
+    // Runtime `$INPUTS` otherwise comes only from sub-run metadata, so a workflow
+    // started directly would throw on its own `$INPUTS.<name>` while the identical
+    // workflow invoked as a child resolved it.
+    await writeWorkflow(
+      'top-level-defaults',
+      `
+name: top-level-defaults
+description: declares a defaulted input and reads it
+inputs:
+  style:
+    default: strict
+nodes:
+  - id: emit
+    bash: echo "style=$INPUTS_STYLE"
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('top-level-defaults'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const emitted = store.events.find(e => e.event_type === 'node_completed');
+    expect(String(emitted?.data?.node_output)).toContain('style=strict');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime `$INPUTS` delivery into AI surfaces + cold-resume reconstitution (#2470)
+// ---------------------------------------------------------------------------
+
+describe('workflow: runtime $INPUTS delivery and cold resume (#2470)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  /** Deps whose provider records every prompt it is handed, so AI-surface delivery is observable. */
+  function makeRecordingDeps(store: IWorkflowStore): { deps: WorkflowDeps; prompts: string[] } {
+    const prompts: string[] = [];
+    const provider = {
+      ...makeProvider(),
+      sendQuery: mock(function* (prompt: string) {
+        prompts.push(prompt);
+        yield { type: 'assistant', content: 'ai-output' };
+        yield { type: 'result', sessionId: 'sess', cost: 0.01, tokens: { input: 7, output: 3 } };
+      }),
+    };
+    return {
+      deps: {
+        ...makeDeps(store),
+        getAgentProvider: mock(() => provider) as unknown as WorkflowDeps['getAgentProvider'],
+      },
+      prompts,
+    };
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subdel-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true }).catch(() => {});
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  it("substitutes the child's $INPUTS.<name> into an AI prompt surface", async () => {
+    await writeWorkflow(
+      'child-ai-inputs',
+      `
+name: child-ai-inputs
+description: reads a declared input from a prompt
+inputs:
+  style:
+    default: strict
+nodes:
+  - id: work
+    prompt: "write it in $INPUTS.style style"
+`
+    );
+    await writeWorkflow(
+      'parent-ai-inputs',
+      `
+name: parent-ai-inputs
+description: supplies the child input
+nodes:
+  - id: sub
+    workflow: child-ai-inputs
+    with:
+      style: terse
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps, prompts } = makeRecordingDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-ai-inputs'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    // The caller's value reached the model; the literal token never did.
+    expect(prompts.some(p => p.includes('write it in terse style'))).toBe(true);
+    expect(prompts.some(p => p.includes('$INPUTS.style'))).toBe(false);
+  });
+
+  it("BRANCHES on the child's $INPUTS.<name> in a when: condition (#2453 defect 1)", async () => {
+    // Reading an input in a prompt already worked; branching on one did not — the
+    // ref parsed as a node called `INPUTS` and failed the node.
+    await writeWorkflow(
+      'child-when-inputs',
+      `
+name: child-when-inputs
+description: branches on a declared input
+inputs:
+  mode:
+    default: slow
+nodes:
+  - id: fast-path
+    prompt: "ran the FAST path"
+    when: "$INPUTS.mode == 'fast'"
+  - id: slow-path
+    prompt: "ran the SLOW path"
+    when: "$INPUTS.mode != 'fast'"
+`
+    );
+    await writeWorkflow(
+      'parent-when-inputs',
+      `
+name: parent-when-inputs
+description: supplies the branch selector
+nodes:
+  - id: sub
+    workflow: child-when-inputs
+    with:
+      mode: fast
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps, prompts } = makeRecordingDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-when-inputs'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    expect(prompts.some(p => p.includes('ran the FAST path'))).toBe(true);
+    expect(prompts.some(p => p.includes('ran the SLOW path'))).toBe(false);
+  });
+
+  it('FAILS the node when a when: references an input the run does not carry', async () => {
+    await writeWorkflow(
+      'child-when-unknown-input',
+      `
+name: child-when-unknown-input
+description: branches on a misspelled input
+inputs:
+  mode:
+    default: slow
+nodes:
+  - id: gated
+    prompt: "should never run"
+    when: "$INPUTS.mdoe == 'fast'"
+`
+    );
+    await writeWorkflow(
+      'parent-when-unknown-input',
+      `
+name: parent-when-unknown-input
+description: supplies the declared input
+nodes:
+  - id: sub
+    workflow: child-when-unknown-input
+    with:
+      mode: fast
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps, prompts } = makeRecordingDeps(store);
+    const platform = makePlatform();
+    const result = await executeWorkflow(
+      deps,
+      platform,
+      'conv-plat',
+      cwd,
+      await discover('parent-when-unknown-input'),
+      'goal',
+      'conv-db'
+    );
+
+    // Loud, not a silent skip: the typo fails the node rather than resolving to ''.
+    expect(result.success).toBe(false);
+    expect(prompts.some(p => p.includes('should never run'))).toBe(false);
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls
+      .map(call => String(call[1]))
+      .join('\n');
+    expect(sent).toContain("Unknown input '$INPUTS.mdoe'");
+    expect(sent).toContain('Did you mean $INPUTS.mode?');
+  });
+
+  it('reconstitutes $INPUTS from the child run row on a COLD resume (no parent in the loop)', async () => {
+    // The child is resumed directly from its own persisted row — the parent never
+    // re-resolves `with:` (its refs may be long out of scope), so a post-gate node
+    // can only see `$INPUTS` if the resolved map survived on `metadata.inputs`.
+    await writeWorkflow(
+      'child-cold',
+      `
+name: child-cold
+description: gated child that reads an input AFTER the gate
+interactive: true
+inputs:
+  style:
+    default: strict
+nodes:
+  - id: gate
+    approval:
+      message: "hold"
+  - id: after-gate
+    prompt: "resumed in $INPUTS.style style"
+    depends_on: [gate]
+`
+    );
+    await writeWorkflow(
+      'parent-cold',
+      `
+name: parent-cold
+description: spawns the gated child
+interactive: true
+nodes:
+  - id: sub
+    workflow: child-cold
+    with:
+      style: terse
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps, prompts } = makeRecordingDeps(store);
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-cold'),
+      'goal',
+      'conv-db'
+    );
+
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-cold');
+    expect(child?.status).toBe('paused');
+    expect(child?.metadata?.inputs).toEqual({ style: 'terse' });
+
+    // Cold path: approve, hydrate from the persisted row alone, re-drive the child.
+    store.approveGate(child!.id);
+    const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(child!.id))!);
+    expect(hydrated).not.toBeNull();
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('child-cold'),
+      child!.user_message,
+      'conv-db',
+      { ...hydrated! }
+    );
+
+    expect((await store.getWorkflowRun(child!.id))?.status).toBe('completed');
+    expect(prompts.some(p => p.includes('resumed in terse style'))).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Direct top-level invocation supplying its own inputs (#2554)
+  // -------------------------------------------------------------------------
+
+  it('delivers directly-supplied inputs to BOTH the AI and shell surfaces of a top-level run', async () => {
+    // No parent anywhere: the values come from `opts.inputs` (the CLI's --input / the
+    // run route's `inputs` map) and must reach the same two surfaces a child's do.
+    await writeWorkflow(
+      'direct-inputs',
+      `
+name: direct-inputs
+description: runs on its own with a required input
+inputs:
+  diff:
+    required: true
+  style:
+    default: strict
+nodes:
+  - id: shell
+    bash: echo "diff=$INPUTS_DIFF style=$INPUTS_STYLE"
+  - id: ai
+    prompt: "review $INPUTS.diff in $INPUTS.style style"
+    depends_on: [shell]
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps, prompts } = makeRecordingDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('direct-inputs'),
+      'goal',
+      'conv-db',
+      { inputs: { diff: 'D1', style: 'terse' } }
+    );
+
+    expect(result.success).toBe(true);
+    // Shell surface: env vars, never $INPUTS text spliced into shell source.
+    const shellOut = store.events.find(
+      e => e.event_type === 'node_completed' && e.step_name === 'shell'
+    );
+    expect(String(shellOut?.data?.node_output)).toContain('diff=D1 style=terse');
+    // AI surface: substituted text, literal token never reaches the model.
+    expect(prompts.some(p => p.includes('review D1 in terse style'))).toBe(true);
+    expect(prompts.some(p => p.includes('$INPUTS.diff'))).toBe(false);
+  });
+
+  it('persists ONLY the supplied values on a top-level run, letting defaults stay derived', async () => {
+    await writeWorkflow(
+      'direct-persist',
+      `
+name: direct-persist
+description: one supplied input, one defaulted
+inputs:
+  diff:
+    required: true
+  style:
+    default: strict
+nodes:
+  - id: emit
+    bash: echo "style=$INPUTS_STYLE"
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('direct-persist'),
+      'goal',
+      'conv-db',
+      { inputs: { diff: 'D1' } }
+    );
+
+    expect(result.success).toBe(true);
+    const run = [...store.runs.values()].find(r => r.workflow_name === 'direct-persist');
+    // `style` is NOT on the row — freezing a derived default would make the row lie
+    // about what the invocation supplied, and pin a stale default across a resume.
+    expect(run?.metadata?.inputs).toEqual({ diff: 'D1' });
+    // …yet the default still reaches the node, layered under the persisted map.
+    const emitted = store.events.find(e => e.event_type === 'node_completed');
+    expect(String(emitted?.data?.node_output)).toContain('style=strict');
+  });
+
+  it('a supplied value overrides the declared default on a top-level run', async () => {
+    await writeWorkflow(
+      'direct-override',
+      `
+name: direct-override
+description: supplied value beats the declared default
+inputs:
+  style:
+    default: strict
+nodes:
+  - id: emit
+    bash: echo "style=$INPUTS_STYLE"
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('direct-override'),
+      'goal',
+      'conv-db',
+      { inputs: { style: 'terse' } }
+    );
+
+    expect(result.success).toBe(true);
+    const emitted = store.events.find(e => e.event_type === 'node_completed');
+    expect(String(emitted?.data?.node_output)).toContain('style=terse');
+  });
+
+  it('writes no inputs key for a bare top-level run, preserving pre-#2554 behaviour', async () => {
+    await writeWorkflow(
+      'direct-bare',
+      `
+name: direct-bare
+description: defaulted input, nothing supplied
+inputs:
+  style:
+    default: strict
+nodes:
+  - id: emit
+    bash: echo "style=$INPUTS_STYLE"
+`
+    );
+
+    const store = new InMemoryStore();
+    await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('direct-bare'),
+      'goal',
+      'conv-db'
+    );
+
+    const run = [...store.runs.values()].find(r => r.workflow_name === 'direct-bare');
+    expect(run?.metadata?.inputs).toBeUndefined();
+  });
+
+  it('reconstitutes directly-supplied inputs on a COLD resume of a top-level run', async () => {
+    // The invocation channel is gone by resume time — the CLI process exited, the HTTP
+    // request completed. Only the run row can carry the values forward.
+    await writeWorkflow(
+      'direct-cold',
+      `
+name: direct-cold
+description: gated top-level run reading an input AFTER the gate
+interactive: true
+inputs:
+  style:
+    default: strict
+nodes:
+  - id: gate
+    approval:
+      message: "hold"
+  - id: after-gate
+    prompt: "resumed in $INPUTS.style style"
+    depends_on: [gate]
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps, prompts } = makeRecordingDeps(store);
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('direct-cold'),
+      'goal',
+      'conv-db',
+      { inputs: { style: 'terse' } }
+    );
+
+    const run = [...store.runs.values()].find(r => r.workflow_name === 'direct-cold');
+    expect(run?.status).toBe('paused');
+    expect(run?.metadata?.inputs).toEqual({ style: 'terse' });
+
+    // Cold path: approve, hydrate from the persisted row alone, re-drive — and pass NO
+    // `inputs` this time, exactly as a resume does.
+    store.approveGate(run!.id);
+    const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(run!.id))!);
+    expect(hydrated).not.toBeNull();
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('direct-cold'),
+      run!.user_message,
+      'conv-db',
+      { ...hydrated! }
+    );
+
+    expect((await store.getWorkflowRun(run!.id))?.status).toBe('completed');
+    expect(prompts.some(p => p.includes('resumed in terse style'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runtime `returns:` rebinding on a `workflow:` sub-run (#2470)
+// ---------------------------------------------------------------------------
+
+describe('workflow: returns rebinds the child terminal output (#2470)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subret-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true }).catch(() => {});
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  it('threads the declared returns node output, not the last sink', async () => {
+    // `summary` is the declared return; `cleanup` is the positional sink that would
+    // otherwise supply the terminal output.
+    await writeWorkflow(
+      'child-returns',
+      `
+name: child-returns
+description: declares a non-sink return node
+returns: summary
+nodes:
+  - id: summary
+    bash: echo "THE-SUMMARY"
+  - id: cleanup
+    bash: echo "THE-CLEANUP"
+    depends_on: [summary]
+`
+    );
+    await writeWorkflow(
+      'parent-returns',
+      `
+name: parent-returns
+description: consumes the child's declared return
+nodes:
+  - id: sub
+    workflow: child-returns
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-returns'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'parent-returns');
+    const subCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parentRun?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'sub'
+    );
+    expect(String(subCompleted?.data?.node_output)).toContain('THE-SUMMARY');
+    expect(String(subCompleted?.data?.node_output)).not.toContain('THE-CLEANUP');
+  });
+
+  it('keeps a child authored outcome on the child run without propagating it to the parent', async () => {
+    await writeWorkflow(
+      'child-outcome',
+      `
+name: child-outcome
+description: child authors a failed work verdict
+returns: result
+outcome_field: green
+nodes:
+  - id: result
+    prompt: report the child verdict
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`
+    );
+    await writeWorkflow(
+      'parent-outcome',
+      `
+name: parent-outcome
+description: parent consumes the governed child
+nodes:
+  - id: sub
+    workflow: child-outcome
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    deps.getAgentProvider = mock(() => ({
+      ...makeProvider(),
+      sendQuery: mock(function* () {
+        yield { type: 'assistant', content: '{"green":false}' };
+        yield {
+          type: 'result',
+          sessionId: 'sess-outcome',
+          structuredOutput: { green: false },
+        };
+      }),
+    })) as unknown as WorkflowDeps['getAgentProvider'];
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-outcome'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(run => run.workflow_name === 'child-outcome');
+    const parent = [...store.runs.values()].find(run => run.workflow_name === 'parent-outcome');
+    expect(child).toMatchObject({ status: 'completed', outcome: 'failed' });
+    expect(parent).toMatchObject({ status: 'completed', outcome: null });
+    expect(
+      store.events.some(
+        event =>
+          event.workflow_run_id === parent?.id &&
+          event.event_type === 'node_completed' &&
+          event.step_name === 'sub'
+      )
+    ).toBe(true);
   });
 });

@@ -7,6 +7,7 @@ import type { IsolationEnvironmentRow } from '@archon/isolation';
 // (or the workflow engine) before the mock.module() calls below take effect.
 import type { WorkflowRoutingContext } from './orchestrator';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import { makeTestComposedWorkflow, makeTestWorkflow } from '@archon/workflows/test-utils';
 
 // ─── Mock setup (BEFORE importing module under test) ─────────────────────────
 
@@ -330,7 +331,7 @@ describe('dispatchBackgroundWorkflow', () => {
     } as WorkflowDefinition;
   }
 
-  function makeRoutingCtx(): WorkflowRoutingContext {
+  function makeRoutingCtx(overrides?: Partial<WorkflowRoutingContext>): WorkflowRoutingContext {
     return {
       platform,
       conversationId: 'parent-conv',
@@ -339,6 +340,7 @@ describe('dispatchBackgroundWorkflow', () => {
       conversationDbId: 'parent-db-id',
       codebaseId: 'cb-1',
       availableWorkflows: [],
+      ...overrides,
     };
   }
 
@@ -359,6 +361,42 @@ describe('dispatchBackgroundWorkflow', () => {
     mockGetCodebase.mockResolvedValue(makeCodebase());
   });
 
+  test('refuses a composed approval gate before creating anything (#1764)', async () => {
+    // Enforced HERE rather than at the callers, because there are two entrypoints that
+    // background a run — the console's default dispatch and the `manage_run` tool's
+    // startWorkflow, which reaches every platform with native tools. A rule enforced per
+    // caller fails open the moment a third appears.
+    const block = makeTestWorkflow({
+      name: 'gate-blk',
+      nodes: [{ id: 'gate', approval: { message: 'Approve?' } }],
+    });
+    const parent = makeTestComposedWorkflow(
+      [block, makeTestWorkflow({ name: 'bg-parent', nodes: [{ id: 'inc', include: 'gate-blk' }] })],
+      'bg-parent'
+    );
+
+    await expect(dispatchBackgroundWorkflow(makeRoutingCtx(), parent)).rejects.toThrow(
+      /composes 'gate-blk'.*approval gate/s
+    );
+
+    // Refused before any side effect — no worker conversation, no run row.
+    expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  test('a workflow with only its OWN approval gate still dispatches', async () => {
+    // The rule is about a gate written in another file, not about gates.
+    const own = makeTestWorkflow({
+      name: 'own-gate',
+      nodes: [{ id: 'gate', approval: { message: 'Approve?' } }],
+      worktree: { enabled: false },
+    });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), makeTestComposedWorkflow([own], 'own-gate'));
+    expect(mockGetOrCreateConversation).toHaveBeenCalled();
+    await flushBackgroundExecution();
+  });
+
   test('worktree.enabled: false skips isolation and runs in the parent cwd', async () => {
     const workflow = makeWorkflow({ worktree: { enabled: false } });
 
@@ -377,6 +415,40 @@ describe('dispatchBackgroundWorkflow', () => {
       { workflowName: 'bg-workflow', conversationId: 'parent-conv', codebaseId: 'cb-1' },
       'workflow.worktree_disabled_by_policy'
     );
+
+    await flushBackgroundExecution();
+  });
+
+  // This path PRE-CREATES the run row (so the console can fetch it immediately), which
+  // means the executor's own `if (!workflowRun)` stamp never fires here — the values
+  // have to be written onto the row below. It is also the console's default path for
+  // non-interactive workflows, so losing the stamp would silently start every
+  // console-supplied run with its inputs missing rather than failing (#2554).
+  test('stamps caller-supplied declared inputs onto the pre-created run row', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx({ inputs: { diff: 'D1' } }), workflow);
+
+    expect(mockCreateWorkflowRun).toHaveBeenCalledTimes(1);
+    const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0] as unknown as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(runRow.metadata?.inputs).toEqual({ diff: 'D1' });
+
+    await flushBackgroundExecution();
+  });
+
+  test('writes no inputs key on the pre-created row when none are supplied', async () => {
+    // Bare-run parity with the executor-level row: a run that supplied nothing must
+    // look exactly as it did before #2554.
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+
+    const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0] as unknown as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(runRow.metadata).not.toHaveProperty('inputs');
 
     await flushBackgroundExecution();
   });

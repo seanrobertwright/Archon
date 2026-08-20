@@ -15,9 +15,10 @@ import {
   BASH_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
+  inputEnvKey,
+  readSubrunMetadata,
 } from './schemas';
 import type {
-  WorkflowDefinition,
   DagNode,
   CommandNode,
   PromptNode,
@@ -37,11 +38,33 @@ const promptNode: PromptNode = { id: 'n2', prompt: 'Do this inline.' };
 const bashNode: BashNode = { id: 'n3', bash: 'echo hello' };
 const cancelNode: CancelNode = { id: 'n5', cancel: 'Precondition failed' };
 
-const dagWorkflow: WorkflowDefinition = {
-  name: 'dag-workflow',
-  description: 'DAG execution',
-  nodes: [commandNode, promptNode, bashNode],
-};
+describe('dagNodeSchema — context', () => {
+  test('parses scalar and named resume contexts on AI consumers', () => {
+    expect(dagNodeSchema.parse({ id: 'fresh', prompt: 'work', context: 'fresh' }).context).toBe(
+      'fresh'
+    );
+    expect(dagNodeSchema.parse({ id: 'shared', command: 'work', context: 'shared' }).context).toBe(
+      'shared'
+    );
+    expect(
+      dagNodeSchema.parse({ id: 'named', prompt: 'work', context: { resume: 'source' } }).context
+    ).toEqual({ resume: 'source' });
+  });
+
+  test('rejects named resume on a deterministic node instead of stripping it', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'shell',
+      bash: 'echo work',
+      context: { resume: 'source' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain(
+        "'context.resume' is only supported on command and prompt nodes"
+      );
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // isBashNode
@@ -787,9 +810,10 @@ describe('LOOP_NODE_AI_FIELDS', () => {
   });
 
   test('contains all other AI-specific fields from BASH_NODE_AI_FIELDS', () => {
+    // `output_format` is deliberately absent since #2563 — a loop: node makes its
+    // own sendQuery, so the schema is honoured rather than warned-and-dropped.
     const expectedFields = [
       'context',
-      'output_format',
       'allowed_tools',
       'denied_tools',
       'hooks',
@@ -878,12 +902,32 @@ describe('dagNodeSchema — loop_group', () => {
     }
   });
 
-  test('loop_group requires until (completion signal)', () => {
+  test('loop_group rejects a body with no completion channel', () => {
     const result = dagNodeSchema.safeParse({
       id: 'grp',
       loop_group: { max_iterations: 3, nodes: [{ id: 'x', prompt: 'x' }] },
     });
     expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes('completion channel'))).toBe(true);
+    }
+  });
+
+  test('loop_group accepts until_bash alone (no prose signal) — #2563', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'grp',
+      loop_group: {
+        max_iterations: 3,
+        until_bash: 'test -f ./done',
+        nodes: [{ id: 'x', bash: 'echo hi' }],
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const grp = result.data as { loop_group?: { until?: string; until_bash?: string } };
+      expect(grp.loop_group?.until).toBeUndefined();
+      expect(grp.loop_group?.until_bash).toBe('test -f ./done');
+    }
   });
 
   test('nested loop_group body parses (loop_group inside loop_group)', () => {
@@ -917,19 +961,340 @@ describe('dagNodeSchema — loop_group', () => {
   });
 });
 
+describe('dagNodeSchema — loop completion channel (#2563)', () => {
+  test('a loop declaring only until_bash parses, with no prose signal', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'deterministic',
+      loop: {
+        prompt: 'fix the failing tests',
+        max_iterations: 5,
+        until_bash: 'bun run test',
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { loop?: { until?: string; until_bash?: string } };
+      expect(node.loop?.until).toBeUndefined();
+      expect(node.loop?.until_bash).toBe('bun run test');
+    }
+  });
+
+  test('a loop declaring only until still parses (unchanged)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'prose',
+      loop: { prompt: 'iterate', until: 'COMPLETE', max_iterations: 5 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { loop?: { until?: string } };
+      expect(node.loop?.until).toBe('COMPLETE');
+    }
+  });
+
+  test('a loop with no channel is rejected, naming every channel it could declare', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'no-channel',
+      loop: { prompt: 'iterate', max_iterations: 5 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find(i => i.message.includes('completion channel'));
+      expect(issue).toBeDefined();
+      expect(issue?.message).toContain('loop.until');
+      expect(issue?.message).toContain('loop.until_bash');
+      // A `loop:` has three channels, so the message must offer all three — an
+      // author told about two would not learn the one this PR added exists.
+      expect(issue?.message).toContain('loop.until_field');
+      expect(issue?.path).toEqual(['loop', 'until']);
+    }
+  });
+
+  test('an empty-string until is rejected rather than treated as absent', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'blank',
+      loop: { prompt: 'iterate', until: '', max_iterations: 5 },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // Channel-verdict matrix — this package's half. The cross-package guard that
+  // actually ENFORCES agreement is `scripts/node-ref-parity.test.ts`, which runs both
+  // encodings over one corpus and compares verdicts in CI; this matrix stays as the
+  // engine's own regression coverage. `structural.test.ts` in @archon/web mirrors
+  // these case names. Change one, change both — the guard will say so if you don't.
+  describe('channel verdict matrix (twin: builder structural.test.ts)', () => {
+    const cases: Array<[string, Record<string, string>, boolean]> = [
+      ['neither declared', {}, false],
+      ['until only, real', { until: 'COMPLETE' }, true],
+      ['until_bash only, real', { until_bash: 'bun run test' }, true],
+      ['both real', { until: 'COMPLETE', until_bash: 'bun run test' }, true],
+      ['until blank, no bash', { until: '  ' }, false],
+      ['until blank + real bash', { until: ' ', until_bash: 'bun run test' }, false],
+      ['real until + blank bash', { until: 'COMPLETE', until_bash: '   ' }, false],
+      ['both blank', { until: ' ', until_bash: '\t' }, false],
+      ['until empty string', { until: '' }, false],
+      ['until_bash empty string', { until_bash: '' }, false],
+      ['padded until (legit)', { until: ' COMPLETE ' }, true],
+      ['multiline until_bash (legit)', { until_bash: '  set -e\n  test -f x\n' }, true],
+      // Third channel (#2563 Part B) — same case names as the builder's twin.
+      ['until_field only, real', { until_field: 'done' }, true],
+      ['until_field blank', { until_field: '  ' }, false],
+    ];
+
+    // `until_field` cases need an `output_format` on the node or they would be
+    // rejected for a DIFFERENT reason ("declares no 'output_format'") — which would
+    // make the matrix agree with the builder by accident rather than on the channel
+    // rule it exists to compare. The builder mirrors only the channel rules, so the
+    // schema is supplied here to isolate the same question.
+    const untilFieldSchema = {
+      type: 'object',
+      properties: { done: { type: 'boolean' } },
+      required: ['done'],
+    };
+
+    for (const [name, channels, shouldParse] of cases) {
+      test(`${name} -> ${shouldParse ? 'accepted' : 'rejected'}`, () => {
+        const needsSchema = 'until_field' in channels;
+        const result = dagNodeSchema.safeParse({
+          id: 'l',
+          ...(needsSchema ? { output_format: untilFieldSchema } : {}),
+          loop: { prompt: 'iterate', max_iterations: 5, ...channels },
+        });
+        expect(result.success).toBe(shouldParse);
+      });
+    }
+  });
+
+  test('a blank channel is rejected even when its sibling is valid', () => {
+    // The aggregate at-least-one rule only fires when BOTH are blank, so the
+    // per-field checks are what catch these two. Both are broken at runtime, not
+    // merely untidy: `bash -c "   "` exits 0 (completing on iteration 1), and a blank
+    // signal reaches detectCompletionSignal, whose own-line pattern matches any
+    // whitespace-only line the model emits.
+    const blankSignal = dagNodeSchema.safeParse({
+      id: 'a',
+      loop: { prompt: 'p', until: ' ', until_bash: 'bun run test', max_iterations: 5 },
+    });
+    expect(blankSignal.success).toBe(false);
+    if (!blankSignal.success) {
+      expect(blankSignal.error.issues.some(i => i.message.includes("'loop.until' must be"))).toBe(
+        true
+      );
+    }
+
+    const blankCheck = dagNodeSchema.safeParse({
+      id: 'b',
+      loop: { prompt: 'p', until: 'COMPLETE', until_bash: '   ', max_iterations: 5 },
+    });
+    expect(blankCheck.success).toBe(false);
+    if (!blankCheck.success) {
+      expect(
+        blankCheck.error.issues.some(i => i.message.includes("'loop.until_bash' must be"))
+      ).toBe(true);
+    }
+  });
+
+  test('a declared channel is validated but never rewritten', () => {
+    // Trimming for validation is not trimming for storage: `until` is matched
+    // verbatim by detectCompletionSignal and `until_bash` is executed verbatim, so
+    // rewriting either here would silently change what an existing workflow does.
+    const result = dagNodeSchema.safeParse({
+      id: 'verbatim',
+      loop: {
+        prompt: 'p',
+        until: ' COMPLETE ',
+        until_bash: '  set -e\n  test -f x\n',
+        max_iterations: 5,
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { loop?: { until?: string; until_bash?: string } };
+      expect(node.loop?.until).toBe(' COMPLETE ');
+      expect(node.loop?.until_bash).toBe('  set -e\n  test -f x\n');
+    }
+  });
+});
+
+describe('dagNodeSchema — loop.until_field (#2563)', () => {
+  const schema = {
+    type: 'object',
+    properties: { done: { type: 'boolean' }, note: { type: 'string' } },
+    required: ['done'],
+  };
+  const loopWith = (loop: Record<string, unknown>, output_format?: unknown) =>
+    dagNodeSchema.safeParse({
+      id: 'l',
+      ...(output_format !== undefined ? { output_format } : {}),
+      loop: { prompt: 'p', max_iterations: 5, ...loop },
+    });
+
+  test('a valid until_field parses and keeps output_format on the node', () => {
+    const result = loopWith({ until_field: 'done' }, schema);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as { output_format?: unknown; loop?: { until_field?: string } };
+      // Before #2563 the transform dropped output_format for loop nodes entirely.
+      expect(node.output_format).toEqual(schema);
+      expect(node.loop?.until_field).toBe('done');
+    }
+  });
+
+  test('until_field alone satisfies the completion-channel rule', () => {
+    // No `until`, no `until_bash` — the structured channel is a channel.
+    expect(loopWith({ until_field: 'done' }, schema).success).toBe(true);
+  });
+
+  test('until_field without output_format is rejected', () => {
+    const result = loopWith({ until_field: 'done' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes("declares no 'output_format'"))).toBe(
+        true
+      );
+    }
+  });
+
+  test('until_field naming an undeclared property is rejected, listing what is declared', () => {
+    const result = loopWith({ until_field: 'finished' }, schema);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find(i => i.message.includes('not declared'));
+      expect(issue).toBeDefined();
+      expect(issue?.message).toContain('done, note');
+    }
+  });
+
+  test('until_field must be listed in output_format.required', () => {
+    // Otherwise a schema-valid payload may omit it, "absent" reads as "not
+    // complete", and the loop burns max_iterations reporting the wrong cause.
+    const optional = {
+      type: 'object',
+      properties: { done: { type: 'boolean' } },
+    };
+    const result = loopWith({ until_field: 'done' }, optional);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes('output_format.required'))).toBe(
+        true
+      );
+    }
+  });
+
+  test('until_field declared as a non-boolean type is rejected', () => {
+    const stringy = {
+      type: 'object',
+      properties: { done: { type: 'string' } },
+      required: ['done'],
+    };
+    const result = loopWith({ until_field: 'done' }, stringy);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(i => i.message.includes("must be 'boolean'"))).toBe(true);
+    }
+  });
+
+  test('a property with no declared type is accepted', () => {
+    // JSON Schema does not require `type`; only a WRONG type is a violation.
+    const untyped = { type: 'object', properties: { done: {} }, required: ['done'] };
+    expect(loopWith({ until_field: 'done' }, untyped).success).toBe(true);
+  });
+
+  test('output_format without until_field is fine (structured output, prose termination)', () => {
+    expect(loopWith({ until: 'DONE' }, schema).success).toBe(true);
+  });
+
+  test('until_field on a loop_group is an unknown key, leaving it channel-less', () => {
+    // Declined by design: a loop_group body node can declare output_format and be
+    // read by `until_bash: '[ "$decide.output.done" = "true" ]'`, so the existing
+    // wiring already expresses it there. The key is stripped and the group is left
+    // with no channel at all, which is the error the author sees.
+    const result = dagNodeSchema.safeParse({
+      id: 'g',
+      loop_group: { max_iterations: 3, until_field: 'done', nodes: [{ id: 'x', bash: 'echo' }] },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find(i => i.message.includes('completion channel'));
+      expect(issue).toBeDefined();
+      // The group's message names only the two channels a group has.
+      expect(issue?.message).not.toContain('until_field');
+    }
+  });
+});
+
 describe('LOOP_GROUP_NODE_AI_FIELDS', () => {
   test('excludes model/provider (forwarded to body AI nodes)', () => {
     expect(LOOP_GROUP_NODE_AI_FIELDS).not.toContain('model');
     expect(LOOP_GROUP_NODE_AI_FIELDS).not.toContain('provider');
   });
 
-  test('differs from LOOP_NODE_AI_FIELDS only on pi (#2133)', () => {
-    // A plain loop: node calls sendQuery itself, so pi IS honored there (not warned).
-    // A loop_group node never calls sendQuery — body nodes carry their own pi — so
-    // pi is warned-ignored on the group. That single-key difference is intentional.
+  test('differs from LOOP_NODE_AI_FIELDS on pi (#2133) and output_format (#2563)', () => {
+    // Both differences have the same cause: a plain loop: node calls sendQuery
+    // itself, so its per-node Pi posture AND its output_format schema both reach
+    // that call. A loop_group never calls sendQuery — its body nodes carry their
+    // own — so both stay warned-ignored on the group.
     expect(LOOP_NODE_AI_FIELDS).not.toContain('pi');
+    expect(LOOP_NODE_AI_FIELDS).not.toContain('output_format');
     expect(LOOP_GROUP_NODE_AI_FIELDS).toContain('pi');
-    expect(LOOP_GROUP_NODE_AI_FIELDS.filter(f => f !== 'pi')).toEqual([...LOOP_NODE_AI_FIELDS]);
+    expect(LOOP_GROUP_NODE_AI_FIELDS).toContain('output_format');
+    expect(LOOP_GROUP_NODE_AI_FIELDS.filter(f => f !== 'pi' && f !== 'output_format')).toEqual([
+      ...LOOP_NODE_AI_FIELDS,
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// output_format survival through the transform (#2566)
+// ---------------------------------------------------------------------------
+
+describe('dagNodeSchema — output_format survival by node type', () => {
+  /**
+   * The lists above are the loader's WARN sets; this is what the transform actually
+   * emits, which is a different fact and the one the `when:` whole-output rejection
+   * (#2566) reasons from. `output_format` is in the schema's `aiOnly` group, which the
+   * `loop_group` branch spreads and the `loop` branch does not.
+   *
+   * Pinned here because the loader's three rejection messages, the authoring guide and
+   * the constitution's case-law row all ASSERT this asymmetry in prose. Those assertions
+   * are unverifiable by the type checker (they are string literals) and the loader tests
+   * pin only the message wording, not the claim inside it — so before this test the fact
+   * was stated in five places and derived from none. Its history earned it: the claim was
+   * written three times across #2579 and was wrong or imprecise twice.
+   *
+   * #2563 is the change this tripwire was written to catch, and it fired: a `loop:`
+   * node now KEEPS `output_format` (it makes its own sendQuery, so the schema reaches
+   * the provider and the node's output becomes the validated JSON). The loader message
+   * telling authors that declaring one on a loop "would change nothing" was removed
+   * with it — a `loop:` is now classified `schema-capable` and gets the same remedy as
+   * a prompt node. The asymmetry that remains is `loop_group:`, which never calls the
+   * provider itself.
+   */
+  const outputFormat = { type: 'object', properties: { done: { type: 'boolean' } } };
+
+  function parsedNode(extra: Record<string, unknown>) {
+    const result = dagNodeSchema.safeParse({ id: 'n1', ...extra, output_format: outputFormat });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error('unreachable: asserted above');
+    return result.data as { output_format?: unknown };
+  }
+
+  test('a loop node KEEPS output_format (#2563 — it runs its own sendQuery)', () => {
+    expect(
+      parsedNode({ loop: { until: 'DONE', max_iterations: 3, prompt: 'go' } }).output_format
+    ).toEqual(outputFormat);
+  });
+
+  test('a loop_group node KEEPS output_format (aiOnly is spread)', () => {
+    const node = parsedNode({
+      loop_group: { until: 'DONE', max_iterations: 3, nodes: [{ id: 'body', prompt: 'x' }] },
+    });
+    expect(node.output_format).toEqual(outputFormat);
+  });
+
+  test('prompt and command nodes KEEP output_format', () => {
+    expect(parsedNode({ prompt: 'go' }).output_format).toEqual(outputFormat);
+    expect(parsedNode({ command: 'some-command' }).output_format).toEqual(outputFormat);
   });
 });
 
@@ -1039,6 +1404,29 @@ describe('dagNodeSchema — include', () => {
   });
 });
 
+describe('dagNodeSchema — launch-only options on an include node (#1764)', () => {
+  test.each([
+    ['isolation', { isolation: 'worktree' }],
+    ['fan_out', { fan_out: { items: '$list.output' } }],
+    ['input', { input: 'do the thing' }],
+  ])('rejects %s, naming the option and pointing at workflow:', (field, extra) => {
+    const result = dagNodeSchema.safeParse({ id: 'review', include: 'blk', ...extra });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const message = result.error.issues.map(i => i.message).join(' | ');
+      expect(message).toContain(`'${field}' is not supported on an include node`);
+      expect(message).toContain("'workflow:' node");
+    }
+  });
+
+  test('a merely-meaningless AI field on an include node still only warns', () => {
+    // The distinction the rejection above rests on: `model:` says nothing composition
+    // has to refuse, it is simply unread. INCLUDE_NODE_IGNORED_FIELDS keeps warning.
+    const result = dagNodeSchema.safeParse({ id: 'review', include: 'blk', model: 'opus' });
+    expect(result.success).toBe(true);
+  });
+});
+
 describe('INCLUDE_NODE_IGNORED_FIELDS', () => {
   test('is a superset of BASH_NODE_AI_FIELDS plus exec-only fields', () => {
     for (const f of BASH_NODE_AI_FIELDS) {
@@ -1051,5 +1439,29 @@ describe('INCLUDE_NODE_IGNORED_FIELDS', () => {
     for (const f of ['id', 'depends_on', 'when', 'trigger_rule', 'include', 'description']) {
       expect(INCLUDE_NODE_IGNORED_FIELDS).not.toContain(f);
     }
+  });
+});
+
+describe('inputEnvKey (#2470)', () => {
+  test('mangles an input name to INPUTS_<UPPER_SNAKE>', () => {
+    expect(inputEnvKey('plan')).toBe('INPUTS_PLAN');
+    expect(inputEnvKey('base-branch')).toBe('INPUTS_BASE_BRANCH');
+    expect(inputEnvKey('foo_bar')).toBe('INPUTS_FOO_BAR');
+    // hyphen and underscore fold to the same key — the loader rejects such a pair.
+    expect(inputEnvKey('foo-bar')).toBe(inputEnvKey('foo_bar'));
+  });
+});
+
+describe('readSubrunMetadata — inputs (#2470)', () => {
+  test('reads a well-formed inputs map', () => {
+    const md = readSubrunMetadata({ inputs: { plan: 'do it', mode: 'fast' } });
+    expect(md.inputs).toEqual({ plan: 'do it', mode: 'fast' });
+  });
+
+  test('treats a non-string-valued or non-object inputs as unset', () => {
+    expect(readSubrunMetadata({ inputs: { plan: 5 } }).inputs).toBeUndefined();
+    expect(readSubrunMetadata({ inputs: ['a'] }).inputs).toBeUndefined();
+    expect(readSubrunMetadata({}).inputs).toBeUndefined();
+    expect(readSubrunMetadata(undefined).inputs).toBeUndefined();
   });
 });

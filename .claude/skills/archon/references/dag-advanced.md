@@ -1,6 +1,6 @@
 # Advanced Features: Hooks, MCP, Skills, Retry, Sessions, Typed Artifacts
 
-Hooks, MCP, skills, tool restrictions, `output_format`, `agents`, and Claude SDK options apply to **command and prompt nodes** (including loop_group *body* nodes of those types). `retry` applies to command/prompt by default and to bash/script with an explicit block (see §Retry). Loop/loop_group nodes support none of these directly (`retry` there is a hard error; the rest are silently ignored) — except `model`/`provider`, which they forward to iterations. Bash and script nodes ignore AI-specific fields with a loader warning.
+Hooks, MCP, skills, tool restrictions, `output_format`, `agents`, and Claude SDK options apply to **command and prompt nodes** (including loop_group *body* nodes of those types). `retry` applies to command/prompt by default and to bash/script with an explicit block (see §Retry). Loop/loop_group nodes support none of these directly (`retry` there is a hard error; the rest are silently ignored) — with two exceptions: `model`/`provider`, which they forward to iterations, and **`output_format` on a `loop:` node, which IS honored** (#2563 — a `loop:` runs its own provider call, so the schema reaches it, each iteration's payload is validated, and `loop.until_field` can terminate on a declared boolean). `output_format` remains ignored on `loop_group`, which never calls the provider itself. Bash and script nodes ignore AI-specific fields with a loader warning.
 
 ## Provider Compatibility
 
@@ -13,10 +13,10 @@ Hooks, MCP, skills, tool restrictions, `output_format`, `agents`, and Claude SDK
 | `output_format` | Enforced | Enforced | Best-effort (validated + up to 3 re-asks) | — |
 | `retry` | Supported | Supported | Supported | — |
 | `model` / `provider` per-node | Supported | Supported | Supported | — |
-| `effort` / `thinking` | Supported | Use `modelReasoningEffort` | Supported (maps to thinking level) | — |
+| `effort` / `thinking` | Supported | `effort` supported (translated to `modelReasoningEffort`); no `thinking` | Supported (maps to thinking level) | — |
 | `agents` / `sandbox` / `maxBudgetUsd` / `fallbackModel` | Supported | No | No | — |
 
-Community providers beyond Pi: **OpenCode** supports per-node `mcp`, `skills`, `agents` (configured-agent selection by name — NOT Claude-style inline definitions), and tool restrictions (no `hooks` — Archon's Claude-shaped hook field has no OpenCode translation site; effort/thinking via `opencode.json`, not per-node); **Copilot** supports per-node `mcp`, `skills`, `agents`, tool restrictions, and effort/thinking (no hooks). Hooks are Claude-only. See the five-provider matrix in `parameter-matrix.md` §Providers at a Glance. `sandbox`/`maxBudgetUsd`/`fallbackModel` remain Claude-only.
+Community providers beyond Pi: **OpenCode** supports per-node `mcp`, `skills`, `agents` (configured-agent selection by name — NOT Claude-style inline definitions), and tool restrictions (no `hooks` — Archon's Claude-shaped hook field has no OpenCode translation site; effort/thinking via `opencode.json`, not per-node); **Copilot** supports per-node `mcp`, `skills`, `agents`, tool restrictions, and effort/thinking (no hooks). `effort:` is the one reasoning-depth spelling and reaches Claude, Codex, Pi and Copilot alike. Hooks are Claude-only. See the five-provider matrix in `parameter-matrix.md` §Providers at a Glance. `sandbox`/`maxBudgetUsd`/`fallbackModel` remain Claude-only.
 
 ### Claude vs Codex: How Each Gets MCP and Skills
 

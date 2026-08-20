@@ -19,7 +19,7 @@ A workflow is a **YAML file** that defines a directed acyclic graph (DAG) of com
 - **Parallel execution**: Independent nodes run concurrently
 - **Conditional branching**: Route to different paths based on node output
 - **Artifact passing**: Output from one node becomes input for downstream nodes
-- **Iterative loops**: Loop nodes repeat until a completion signal
+- **Iterative loops**: Loop nodes repeat until a declared completion condition is met
 
 ```yaml
 name: fix-github-issue
@@ -41,7 +41,7 @@ nodes:
 > ```
 > Same-named files in `.archon/workflows/` override the bundled defaults.
 
-> **`defaults/` is maintainer-territory:** `.archon/workflows/defaults/` and `.archon/commands/defaults/` are reserved for workflows/commands shipped with Archon itself — they are embedded into the binary at build time and every file there must be committed in git. For your own drafts use `.archon/workflows/` (project-scoped, committed to your repo) or `~/.archon/workflows/` (home-scoped, personal). Running `bun run generate:bundled` (or `bun run validate`) will exit with an error if it finds any untracked files in `defaults/`.
+> **Legacy bundled defaults:** The flat `.archon/workflows/defaults/` and `.archon/commands/defaults/` directories contain Archon's existing bundled files. `defaults` is not a reserved pack name in the packaged layout below; authors may choose any safe pack and workflow directory names.
 
 ---
 
@@ -52,14 +52,18 @@ Workflows live in `.archon/workflows/` relative to the working directory:
 ```
 .archon/
 ├── workflows/
-│   ├── my-workflow.yaml
-│   └── review/
-│       └── full-review.yaml    # Subdirectories work
-└── commands/
-    └── [commands used by workflows]
+│   └── my-pack/                 # Author-chosen pack name
+│       └── release/             # Author-chosen workflow folder
+│           ├── release.yaml
+│           ├── commands/
+│           │   └── prepare.md
+│           └── scripts/
+│               └── publish.ts
 ```
 
-Archon discovers workflows recursively - subdirectories are fine. If a workflow file fails to load (syntax error, validation failure), it's skipped and the error is reported via `/workflow list`.
+The two directories form a fixed package boundary: `.archon/workflows/<pack>/<workflow>/`. A packaged workflow contains exactly one YAML definition; bare `command:` and named `script:` references resolve only from its own `commands/` and `scripts/` directories, with no shared or cross-scope fallback. Included workflows retain their own resource folder, so two workflows may reuse names such as `review.md` without collisions.
+
+The same tree works under `~/.archon/workflows/` for home-scoped workflows. Existing flat `.archon/workflows/foo.yaml`, one-level grouped YAML, shared `.archon/commands/`, and shared `.archon/scripts/` remain supported for compatibility.
 
 > **Global workflows:** For workflows that apply to every project, place them in `~/.archon/workflows/`. Global workflows are overridden by same-named repo workflows. See [Global Workflows](/guides/global-workflows/).
 
@@ -119,8 +123,8 @@ description: |
 # Optional workflow-level configuration
 provider: claude
 model: sonnet
-modelReasoningEffort: medium     # Codex only
-webSearchMode: live              # Codex only
+effort: medium                   # Reasoning depth on any provider that has one
+webSearchMode: live              # Codex only, workflow level only (no per-node form)
 interactive: true                # Web only: run in foreground instead of background
 requires: [github]               # Optional: hard-block invocation unless the triggering
                                  #   user has connected their GitHub identity. Enforced only
@@ -144,11 +148,17 @@ tags: [GitLab, Review]           # Optional: explicit Web UI filter tags. Overri
                                  #   keyword-based tag inference. An empty list (`tags: []`)
                                  #   suppresses inference and shows no tags. Omit to fall
                                  #   back to inferred tags (the default).
+inputs:                          # Optional: declared signature — what this block takes.
+  diff: { required: true }       #   A caller supplies values via `with:`; the block reads
+  style: { default: strict }     #   them as `$INPUTS.<name>`. See "Workflow Signature".
+returns: synthesize              # Optional: the node id whose output IS this block's result.
+# outcome_field: ready           # Optional: a required boolean property on `returns:` whose
+                                 #   exact value is persisted as the authored run outcome.
 
 # Required for DAG-based
 nodes:
   - id: classify                 # Unique node ID (used for dependency refs and $id.output)
-    command: classify-issue      # Loads from .archon/commands/classify-issue.md
+    command: classify-issue      # Package-local in packaged workflows; shared lookup otherwise
     output_format:               # Optional: structured JSON output. SDK-enforced on Claude/Codex/OpenCode; best-effort (prompt + JSON extraction + repair) on Pi/Copilot. Parsed output is validated against the schema; a node that declares output_format but returns no schema-valid output FAILS.
       type: object
       properties:
@@ -179,8 +189,8 @@ nodes:
     provider: claude             # Per-node provider override
     model: haiku                 # Per-node model override
     # hooks:                     # Optional: per-node SDK hook callbacks (Claude only) — see hooks guide
-    # mcp: .archon/mcp/servers.json  # Optional: per-node MCP servers (all providers except Pi)
-    # skills: [remotion-best-practices]  # Optional: per-node skills (Claude/Pi/OpenCode/Copilot; Codex auto-discovers) — see skills guide
+    # mcp: .archon/mcp/servers.json  # Optional: per-node MCP servers (Claude/Codex/Copilot; Codex is additive)
+    # skills: [remotion-best-practices]  # Optional: per-node skills (Claude/Pi/Copilot); Codex uses explicit $skill-name
 ```
 
 ### Node Fields
@@ -189,16 +199,16 @@ nodes:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `command` | string | Command name to load from `.archon/commands/` |
+| `command` | string | Command name. Packaged workflows resolve it only from their own `commands/`; legacy workflows use shared repo → home → bundled lookup. |
 | `prompt` | string | Inline prompt string |
 | `bash` | string | Shell script (no AI). Stdout captured as `$nodeId.output`; successful stdout is also stored in `node_completed.data.node_output` as an audit preview capped at 32 KiB (UTF-8 bytes). Optional `timeout` (ms, default 120000) |
-| `script` | string | TypeScript/JavaScript (via `bun`) or Python (via `uv`) — inline code or named reference to `.archon/scripts/`. Stdout captured as `$nodeId.output`. Requires `runtime: bun` or `runtime: uv`. Optional `deps` (uv only) and `timeout` (ms, default 120000). See [Script Nodes](/guides/script-nodes/) |
-| `loop` | object | Iterative AI prompt until completion signal. See [Loop Nodes](/guides/loop-nodes/) |
-| `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a completion signal. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
+| `script` | string | TypeScript/JavaScript (via `bun`) or Python (via `uv`) — inline code or named reference. Packaged workflows resolve named scripts only from their own `scripts/`; legacy workflows use shared script directories. Stdout captured as `$nodeId.output`. Requires `runtime: bun` or `runtime: uv`. Optional `deps` (uv only) and `timeout` (ms, default 120000). See [Script Nodes](/guides/script-nodes/) |
+| `loop` | object | Iterative AI prompt until a declared completion condition is met. See [Loop Nodes](/guides/loop-nodes/) |
+| `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a declared completion condition is met. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
 | `approval` | object | Pauses workflow for human review. See [Approval Nodes](/guides/approval-nodes/) |
 | `cancel` | string | Terminates the workflow run with a reason string. Uses existing cancellation plumbing — in-flight parallel nodes are stopped |
-| `include` | string | Name of another workflow whose nodes are inlined into this DAG at load time as a namespaced sub-DAG. See [Reusing a Shared Sub-DAG](#reusing-a-shared-sub-dag-with-include) |
-| `workflow` | string | Name of another workflow to run as a governed **child sub-run** at execution time — its own run record, gates, artifacts, and cost. Optional `input` (data string), `isolation` (`'inherit'` \| `'worktree'`), and `fan_out` (one child per item of a runtime list). See [Composing a Governed Sub-Run](#composing-a-governed-sub-run-with-workflow) |
+| `include` | string | Name of another workflow whose nodes are inlined into this DAG at load time as a namespaced sub-DAG. See [Composing Another Workflow](#composing-another-workflow-with-include) |
+| `workflow` | string | Name of another workflow to run as a governed **child sub-run** at execution time — its own run record, gates, artifacts, and cost. Optional `input` (untyped data string → child's `$ARGUMENTS`) **or** `with:` (named inputs → child's `$INPUTS.<name>`; mutually exclusive with `input`), `isolation` (`'inherit'` \| `'worktree'`), and `fan_out` (one child per item of a runtime list; optional `as:` names the per-item `$INPUTS` channel). See [Launching a Separate Governed Run](#launching-a-separate-governed-run-with-workflow) and [Workflow Signature](#workflow-signature-inputs-returns-and-inputs) |
 
 **Common fields** — apply to all node types:
 
@@ -208,11 +218,11 @@ nodes:
 | `depends_on` | string[] | `[]` | Node IDs that must complete before this node runs |
 | `when` | string | — | Condition expression. Node is skipped if false. See [Condition Syntax](#when-condition-syntax) |
 | `trigger_rule` | string | `all_success` | Join semantics when multiple upstreams exist. Distinct from a fan-out node's [`fan_out.join`](#the-four-fields), which reduces one node's N children and defaults to `all_done` |
-| `context` | `'fresh'` \| `'shared'` | — | `fresh` = new session; `shared` = inherit from prior node. Defaults to `fresh` for parallel layers, inherited for sequential |
+| `context` | `'fresh'` \| `'shared'` \| `{ resume: node-id }` | — | `fresh` = new session; `shared` = inherit from the ambient prior node; `resume` = fork the exact completed upstream node's session. Defaults to `fresh` for parallel layers, inherited for sequential |
 | `idle_timeout` | number | — | Kill node if idle for this many milliseconds |
 | `retry` | object | — | Per-node retry configuration. See [Retry Configuration](#retry-configuration) |
 | `always_run` | boolean | `false` | Opt out of resume caching: re-run this node on resume even if a prior run completed it. See [Opting Out of Resume Caching](#opting-out-of-resume-caching) |
-| `output_type` | string | — | Semantic label for this node's output (e.g. `'plan'`, `'findings'`, `'code'`). When set, the executor writes `$ARTIFACTS_DIR/nodes/<id>.md` + `<id>.meta.json` after the node completes (best-effort) so later nodes and runs can locate output by type instead of guessing filenames. See [The Artifact Chain](#the-artifact-chain) |
+| `output_type` | string | — | Semantic label for this node's output (e.g. `'plan'`, `'findings'`, `'code'`). When set, the executor writes a typed output + metadata pair after the node completes (best-effort). Top-level nodes use `$ARTIFACTS_DIR/nodes/<id>.md` + `<id>.meta.json`; loop-body executions use [iteration-specific paths](#the-artifact-chain). |
 
 **AI node options** — apply to `command` and `prompt` nodes:
 
@@ -224,29 +234,74 @@ nodes:
 | `allowed_tools` | string[] | — | Whitelist of built-in tools. `[]` = no tools. All providers except Codex |
 | `denied_tools` | string[] | — | Tools to remove. Applied after `allowed_tools`. All providers except Codex |
 | `hooks` | object | — | Per-node SDK hook callbacks. Claude only. See [Hooks](/guides/hooks/) |
-| `mcp` | string | — | Path to MCP server config JSON file. All providers except Pi. See [MCP Servers](/guides/mcp-servers/) |
-| `skills` | string[] | — | Skills to preload. Per-node injection on Claude/Pi/OpenCode/Copilot; Codex auto-discovers from `.agents/skills/`. See [Skills](/guides/skills/) |
+| `mcp` | string | — | Path to MCP server config JSON file. Claude/Codex/Copilot; Codex adds servers to ambient config rather than replacing it. See [MCP Servers](/guides/mcp-servers/) |
+| `skills` | string[] | — | Exact Claude-native skill selection (omission/`[]` selects none); skill declarations for Pi/Copilot. Codex workflow commands/prompts invoke installed skills explicitly with `$skill-name`; OpenCode does not implement this field. See [Skills](/guides/skills/) |
 | `agents` | object | — | Inline sub-agent definitions keyed by kebab-case ID. Claude only. See [Inline sub-agents](#inline-sub-agents) |
-| `effort` | `'low'`\|`'medium'`\|`'high'`\|`'max'` | — | Reasoning depth. Claude/Pi/Copilot. Also settable at workflow level |
+| `effort` | `'minimal'`\|`'low'`\|`'medium'`\|`'high'`\|`'xhigh'`\|`'max'` | — | Reasoning depth. Every provider with a reasoning control — Claude/Codex/Pi/Copilot. Pi accepts all six; the others clamp a rung their model lacks to the nearest one it has. OpenCode configures reasoning in `opencode.json`. Also settable at workflow level |
 | `thinking` | string \| object | — | Thinking mode: `'adaptive'`, `'disabled'`, or `{type:'enabled', budgetTokens:N}`. Claude/Pi/Copilot. Also settable at workflow level |
 | `maxBudgetUsd` | number | — | USD cost cap; node fails if exceeded. Claude only. Per-node only |
 | `systemPrompt` | string | — | Override the default `claude_code` system prompt for this node. Claude only. Per-node only |
 | `fallbackModel` | string | — | Model to use if primary model fails. Claude only. Also settable at workflow level |
 | `betas` | string[] | — | SDK beta feature flags (e.g., `'context-1m-2025-08-07'`). Claude only. Also settable at workflow level |
 | `sandbox` | object | — | OS-level filesystem/network restrictions for the Claude subprocess. Claude only. Also settable at workflow level |
-| `settingSources` | (`'project'`\|`'user'`)[] | inherited | Which filesystem setting sources Claude loads (CLAUDE.md, skills, commands, agents). Overrides the assistant-level default; unset everywhere = `['project', 'user']`. `[]` loads none. Claude only. Per-node only |
+| `settingSources` | (`'project'`\|`'user'`)[] | inherited | Which filesystem setting sources Claude discovers (CLAUDE.md, skills, commands, agents). Workflow `skills:` remains the exact active skill set. Overrides the assistant-level default; unset everywhere = `['project', 'user']`. `[]` loads none. Claude only. Per-node only |
+
+### Addressable session ancestry
+
+Dependency edges determine execution and `$node.output` carries data. When a later command or prompt must continue one particular AI conversation instead of the latest ambient session, name that completed upstream node:
+
+```yaml
+provider: claude
+nodes:
+  - id: scope
+    prompt: Scope the work
+
+  - id: lens-a
+    prompt: Review one aspect of $scope.output
+    context: fresh
+    depends_on: [scope]
+
+  - id: lens-b
+    prompt: Review another aspect of $scope.output
+    context: fresh
+    depends_on: [scope]
+
+  - id: synthesize
+    prompt: Synthesize $lens-a.output and $lens-b.output
+    context:
+      resume: scope
+    depends_on: [lens-a, lens-b]
+```
+
+`synthesize` forks the exact provider session produced by `scope`; the parallel lenses do not change that ancestry. The source must be a transitively upstream command, prompt, or plain `loop:` node, and the consumer must be a command or prompt node. Addressable resume is not supported inside `loop_group` bodies.
+
+This is an exact, immutable fork contract:
+
+- Source and consumer must resolve to the same provider.
+- Claude and Pi support immutable forks. Codex explicitly does not; an omitted fork capability is also unsupported.
+- A missing source handle, unavailable prior context, missing branch handle, or provider that reuses the source session fails the node. Named resume never falls back to a fresh session.
+- Two parallel consumers may name the same source; each receives its own branch while the source remains unchanged.
+- Run resume restores these private handles for completed nodes, so a pause or process restart does not lose declared ancestry. Session IDs remain outside workflow events and API payloads.
+
+This is separate from `persist_session`: `{ resume: source }` selects ancestry within one governed run, while `persist_session` continues the same node across separate workflow invocations. If both apply to a consumer, the named source wins for the current invocation and the resulting branch is still saved for its next invocation.
 
 ### Claude SDK Advanced Options
 
-These fields map directly to Claude Agent SDK options. `maxBudgetUsd`, `systemPrompt`, `fallbackModel`, `betas`, `sandbox`, and `settingSources` are Claude-only — Codex and other providers emit a warning and ignore them. `effort` and `thinking` also apply to Pi and Copilot, which map them to their own reasoning controls (Codex uses `modelReasoningEffort` instead; OpenCode configures reasoning via `opencode.json`). They can be set **per-node** or at the **workflow level** as defaults (per-node takes precedence). `maxBudgetUsd`, `systemPrompt`, and `settingSources` are per-node only (`settingSources` also has an assistant-level default in `.archon/config.yaml`).
+Most of these fields map directly to Claude Agent SDK options. `maxBudgetUsd`, `systemPrompt`, `fallbackModel`, `betas`, `sandbox`, and `settingSources` are Claude-only — Codex and other providers emit a warning and ignore them. `effort` is the exception: it is the one reasoning-depth spelling and applies on **every** provider that has a reasoning control (Claude, Codex, Pi, Copilot), each translating it to its own SDK control. OpenCode has no request-level control — it configures reasoning in `opencode.json` — so `effort:` there warns and is ignored. `thinking` applies to Claude, Pi, and Copilot. They can be set **per-node** or at the **workflow level** as defaults (per-node takes precedence). `maxBudgetUsd`, `systemPrompt`, and `settingSources` are per-node only (`settingSources` also has an assistant-level default in `.archon/config.yaml`).
 
 **effort** — reasoning depth:
 
 ```yaml
 - id: thorough-review
   command: review
-  effort: high   # 'low' | 'medium' | 'high' | 'max'
+  effort: high   # 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 ```
+
+The ladder is the union of every provider's vocabulary. Pi accepts all six rungs;
+the others clamp a rung their model does not offer to the nearest one it does —
+`max` becomes `xhigh` on Codex and Copilot, `minimal` becomes `low` on Claude and
+Copilot. So `effort: max` always means "as deep as this model goes", whichever
+provider the node resolves to.
 
 **thinking** — extended thinking mode (string shorthand or object form):
 
@@ -304,12 +359,12 @@ These fields map directly to Claude Agent SDK options. `maxBudgetUsd`, `systemPr
       denyWrite: ['/etc', '/usr']
 ```
 
-**settingSources** — control which filesystem setting sources the Claude SDK loads (project `CLAUDE.md`/`.claude/` skills, commands, agents vs the user-level `~/.claude/`). Loading fewer sources gives a leaner context and a faster node start — a lean reviewer node can skip project context entirely while a writer node in the same workflow keeps it:
+**settingSources** — control which filesystem setting sources the Claude SDK discovers (project `CLAUDE.md`/`.claude/` skills, commands, agents vs the user-level `~/.claude/`). For workflow skills, this controls eligibility rather than activation: `skills:` selects the exact active set, and a declaration must exist under an enabled source. Loading fewer sources gives a leaner context and a faster node start — a lean reviewer node can skip project context entirely while a writer node in the same workflow keeps it:
 
 ```yaml
 - id: lean-review
   command: review
-  settingSources: []              # load no CLAUDE.md / skills / commands / agents
+  settingSources: []              # no setting sources; skills must be omitted or []
 
 - id: implement
   command: implement
@@ -390,12 +445,70 @@ when: "$score.output > '80' && $flag.output == 'true'"
 when: "$a.output == 'X' && $b.output == 'Y' || $c.output == 'Z'"
 ```
 
+**Declared inputs** (see [Workflow Signature](#workflow-signature-inputs-returns-and-inputs)):
+```yaml
+when: "$INPUTS.mode == 'fast'"              # branch on a caller's `with:` value
+when: "$INPUTS.mode == 'fast' && $check.output.ok == 'true'"
+```
+
 - `$nodeId.output` references the full output string of a completed node
 - `$nodeId.output.field` accesses a JSON field (for `output_format` nodes)
+- `$INPUTS.<name>` references a declared input supplied by a caller's `with:` (or a direct
+  run's `--input`). A name this run does not carry **fails the node** — it never quietly
+  becomes an empty string. `INPUTS` is a reserved scope: a node cannot be given that id
+  (the loader rejects it), so `$INPUTS.x` always means an input.
 - Invalid or unparseable expressions default to `false` (fail-closed — node is skipped with a warning)
 - Numeric operators fail-closed if either side is not a finite number
 - Parentheses are not supported — use standard AND/OR precedence to structure conditions
 - Skipped nodes propagate their skipped state to dependants
+
+:::danger[You cannot compare a whole AI output to a literal]
+A `when:` that compares the **entire output** of a `prompt:` or `command:` node with no
+`output_format` — or of any `loop:`/`loop_group:` node — against a literal is
+**rejected at load time**:
+
+```yaml
+# REJECTED — $analyze is an AI node with no output_format
+- id: analyze
+  prompt: "Is this a bug or a feature?"
+- id: decide
+  depends_on: [analyze]
+  when: "$analyze.output == 'BUG'"
+```
+
+The model writes `This is a BUG.` and the byte-for-byte comparison is false, so the node
+is skipped with no error and the run finishes looking successful having quietly done less
+than you asked. Declare the shape you are branching on instead:
+
+```yaml
+- id: analyze
+  prompt: "Is this a bug or a feature?"
+  output_format:
+    type: object
+    properties:
+      status: { type: string, enum: [BUG, FEATURE] }
+    required: [status]
+- id: decide
+  depends_on: [analyze]
+  when: "$analyze.output.status == 'BUG'"
+```
+
+Unaffected: `bash:` and `script:` producers keep whole-output comparison
+(`when: "$check.output == 'true'"`) because their stdout is author-controlled and exact by
+construction, and so do `approval:` captures (a human typed them) and `workflow:` sub-run
+results (the callee owns that contract). A field access (`$analyze.output.status`) is
+always allowed.
+
+**A `loop:` opts out the same way a `prompt:` node does** — declare `output_format` on it
+and the loop's output becomes the validated JSON document, so `$loop.output.field` is
+available to gate on. (Before #2563 the field was dropped at parse and this was a no-op.)
+
+**A `loop_group:` still has no opt-out.** It keeps the field, but the group's output is the
+*last iteration's raw text* and a schema never replaces it with the JSON document the way it
+does on a `prompt:` or `loop:` node — the group never calls the provider itself. Compute the
+decision in a `bash:`/`script:` node — or an `until_bash` check — and gate on that node's
+output instead.
+:::
 
 ### `$node_id.output` Substitution
 
@@ -417,7 +530,7 @@ Variable substitution order:
 2. Node output references (`$nodeId.output`, `$nodeId.output.field`)
 
 :::caution[Double-quoting `$node.output` in `bash:` nodes is a silent footgun]
-In `bash:` nodes, `$nodeId.output` and `$nodeId.output.field` are injected pre-quoted by Archon. For small outputs, values are **single-quoted inline** — the quoting is already provided by the substitution. For outputs exceeding 32 KB, Archon spills to a temp file and substitutes `$(cat '/tmp/path')` instead. Wrapping the substitution in double quotes breaks the **small (inline) case**: `var="$n.output"` becomes `var="'value'"`, embedding the literal single-quotes as part of the value. (For the large `$(cat ...)` case, double-quoting is harmless — `var="$(cat ...)"` is correct bash — but you can't know the output's size at author time, so the rule is unconditional: never double-quote.)
+In `bash:` nodes, `$nodeId.output` and `$nodeId.output.field` are injected pre-quoted by Archon. For small outputs, values are **single-quoted inline** — the quoting is already provided by the substitution. For outputs exceeding 32 KB, Archon spills to the run-owned `$ARTIFACTS_DIR/.archon/node-output-spills/<node>[.<field>].nodeoutput` file and substitutes `$(cat '<path>')` instead. These files follow the [run-artifact retention lifecycle](/reference/archon-directories/#user-level-archon). Wrapping the substitution in double quotes breaks the **small (inline) case**: `var="$n.output"` becomes `var="'value'"`, embedding the literal single-quotes as part of the value. (For the large `$(cat ...)` case, double-quoting is harmless — `var="$(cat ...)"` is correct bash — but you can't know the output's size at author time, so the rule is unconditional: never double-quote.)
 
 ```bash
 # WRONG — produces status="'ok'" (single quotes become part of the value)
@@ -510,7 +623,7 @@ Keys:
 
 - Agent IDs must be **kebab-case** (`^[a-z0-9]+(-[a-z0-9]+)*$`)
 - Each definition requires `description` and `prompt`; `model`, `tools`, `disallowedTools`, `skills`, and `maxTurns` are optional
-- Map is merged with any SDK-level agents and with the internal `dag-node-skills` wrapper created by `skills:` — user-defined agents win on ID collision (a warning is logged when this happens)
+- Map is merged with any SDK-level agents and composes independently with native Claude `skills:` selection
 - Claude only. Codex and community providers that don't support inline agents emit a warning and ignore the field
 
 **When to use `agents:` vs `.claude/agents/*.md` files:**
@@ -607,12 +720,12 @@ When a `nodes:` (DAG) workflow fails, the prior run stays in the database as a c
 **How to resume:**
 
 - **CLI**: `archon workflow run <name> --resume` resumes the most recent failed run for `(workflow_name, cwd)`. Or `archon workflow resume <run-id>` to target a specific run.
-- **Chat**: Approving or rejecting a _paused_ workflow auto-resumes from where it left off (the platform already knows the run id). For a prior **failed** (or stale `running`) run, `/workflow run <name>` does **not** silently resume — it shows a prompt offering three choices: resume it, abandon it and run fresh, or start fresh anyway. Pass `--force` to skip the prompt: `/workflow run <name> --force <args>` always starts a fresh run.
+- **Chat**: Approving or rejecting a _paused_ workflow continues it from where it left off (the platform already knows the run id). For a prior **failed** (or stale `running`) run, `/workflow run <name>` does **not** silently resume — it shows a prompt offering three choices: resume it, abandon it and run fresh, or start fresh anyway. Pass `--force` to skip the prompt: `/workflow run <name> --force <args>` always starts a fresh run.
 - **Web UI**: Resume button on the workflow card.
 
 **What happens on resume:**
 
-1. The CLI / orchestrator looks up the resumable run, loads its `node_completed` events to determine which nodes finished successfully, and transitions the row back to `running`.
+1. The CLI / orchestrator looks up the resumable run, loads its `node_completed` events and private addressable-session handles, then transitions the row back to `running`.
 2. Completed nodes are skipped; only failed and not-yet-run nodes are executed.
 3. You receive a platform message like: `Resuming workflow — skipping 3 already-completed node(s).`
 
@@ -627,7 +740,7 @@ Once the row reaches a terminal status, you can resume it explicitly via the pat
 
 > Not to be confused with `archon workflow cleanup [days]`, which **deletes** old terminal runs (`completed`/`failed`/`cancelled`) from the database for disk hygiene. It does not transition `running` rows.
 
-**Known limitation**: AI session context from prior nodes is not restored. If a downstream node relies on in-context knowledge from a prior run's session (rather than artifacts), it may need to re-read those artifacts explicitly.
+**Session context on resume**: Handles required by an explicit `context: { resume: node-id }` selector are restored for completed nodes. The ambient sequential cursor is not reconstructed; a downstream node that relies on implicit inherited context should use an explicit selector or re-read durable artifacts.
 
 **Fresh start**: If zero nodes completed in the prior run, Archon starts fresh (no nodes to skip).
 
@@ -656,7 +769,7 @@ On resume, `fetch-data` re-runs regardless of prior success, so `process-data` r
 
 ## Persistent Sessions Across Re-Runs
 
-Different from resume: when you invoke the same workflow *again* with a follow-up prompt, every AI node normally starts fresh and pays to re-establish context. Set `persist_session: true` on a node to make its provider session ID stick across runs, so subsequent invocations continue the prior conversation for that role.
+Different from resuming a failed/paused run or selecting an upstream node with `context.resume`: when you invoke the same workflow *again* with a follow-up prompt, every AI node normally starts fresh and pays to re-establish context. Set `persist_session: true` on a node to make its provider session ID stick across runs, so subsequent invocations continue the prior conversation for that role.
 
 ```yaml
 name: feature-dev
@@ -712,6 +825,8 @@ When a workflow-level `persist_sessions: true` is combined with any of these nod
 ### `context: fresh` overrides
 
 A node with `context: fresh` skips persistence (and in-run threading). The explicit "always fresh" intent wins over `persist_session`.
+
+`context: { resume: source }` also wins over the consumer's saved cross-run session for that invocation. After the exact named fork succeeds, its new branch is saved normally when `persist_session` applies.
 
 ### Clearing memory
 
@@ -815,6 +930,14 @@ When a node sets `output_type`, the executor writes a typed sidecar after the no
 - `$ARTIFACTS_DIR/nodes/<id>.md` — the node's output text
 - `$ARTIFACTS_DIR/nodes/<id>.meta.json` — metadata (`outputType`, `runId`, `producedAt`, `size`, and `sessionId` when available)
 
+That exact layout remains the contract for top-level nodes. A typed node inside a `loop_group`
+writes one pair per successful body execution instead: `nodes/loop.<owner-digest>__<body>.md` and
+the matching `.meta.json`. The stable digest is derived from the complete original body ID and
+outermost-to-innermost loop lineage, so delimiter-shaped IDs and repeated inner iteration numbers
+cannot alias another execution. Metadata keeps the readable provenance as
+`loopGroupPath: [{ groupId, iteration }, ...]`. A body node expanded from an `include:` retains its
+load-time `<include>__<node>` ID in metadata and as the sanitized body suffix.
+
 This works on **every** node type (`bash`/`script` produce typed outputs too, just without a `sessionId`). The write is **best-effort** — if it fails, the node still succeeds and a warning is logged; the typed sidecar may simply be absent. `output_type` is an open set of labels (`plan`, `findings`, `code`, `summary`, …) — pick a convention and keep casing consistent, since lookup is case-sensitive.
 
 Successful bash stdout is retained by default on the completed run as a bounded audit preview in `node_completed.data.node_output`. Output over 32 KiB (32,768 UTF-8 bytes) ends with a truncation marker, and the event also includes `node_output_truncated: true` plus `node_output_original_bytes`. Because stdout is persisted, never print secrets or credentials from bash nodes. This preview is separate from `output_type`: declaring `output_type` opts into a best-effort file sidecar that may contain the full output and is not required for ordinary bash audit retention.
@@ -899,12 +1022,19 @@ worktree is destroyed at cleanup. Three sanctioned ways to get content into git 
    it in the repo at all: the artifact routes (`GET /api/runs/:runId/artifacts`) and
    `output_type` sidecars address a run's output by run id and by type.
 
-## Reusing a Shared Sub-DAG with `include:`
+## Composing Another Workflow with `include:`
 
-An `include:` node inlines another workflow's nodes into the current DAG. This lets you
-factor a shared block of nodes (for example a multi-step review flow) into its own workflow
-file and reference it from many workflows, instead of copy-pasting the nodes and letting the
-copies drift apart.
+An `include:` node runs another workflow's nodes as part of this one. This lets you factor a
+shared block of nodes (for example a multi-step review flow) into its own workflow file and
+reference it from many workflows, instead of copy-pasting the nodes and letting the copies
+drift apart.
+
+**A node runs with the configuration its own workflow file declares; the run owns isolation,
+interactivity and evidence policy.** That one sentence is the whole rule. A composed workflow
+that declares `provider: codex` / `model: large` / `effort: high` runs on exactly those,
+whichever workflow composed it — and a composed workflow that declares nothing resolves from
+your config, tier presets and personal AI preferences at run time, exactly as it would on its
+own. The composing workflow contributes ordering and gates; it does not reach inside.
 
 ```yaml
 nodes:
@@ -923,27 +1053,64 @@ nodes:
 
 The include target (`archon-review-block` here) is an ordinary workflow file discovered by
 name, honoring the usual precedence (`bundled` < `~/.archon/workflows/` < repo
-`.archon/workflows/`). Only its `nodes:` are inlined — the included file's workflow-level
-fields (`provider`, `model`, `worktree`, `persist_sessions`, `requires`, …) are ignored; the
-including workflow's defaults govern the inlined nodes. If an included node needs a specific
-provider or model, set it **per-node** — per-node fields survive inlining verbatim.
+`.archon/workflows/`).
+
+### What travels, and what belongs to the run
+
+At load time each workflow's **node-affecting** configuration is written onto its own nodes
+and then removed from the definition, so nothing can fall back to an outer file's values:
+
+| Field | Composed behaviour |
+|---|---|
+| `provider`, `model`, `effort`, `thinking`, `fallbackModel`, `betas`, `sandbox`, `persist_sessions` | **Travel** with the workflow, onto its own nodes. A node's own value always wins. |
+| `requires` | **Unions** into the composing workflow, so a missing capability refuses the run at invocation instead of failing mid-block. |
+| `inputs`, `returns` | **Consumed** by composition — `inputs:` validates the caller's `with:`, `returns:` selects `$includeId.output`. |
+| `outcome_field` | **Owned by the workflow being run.** An included workflow's declaration does not propagate to its composer. A top-level composer may declare its own field relative to its own `returns:`; an include alias is rebound before that contract is validated. |
+| `interactive`, `worktree`, `container`, `evidence_policy`, `mutates_checkout` | **Run-owned.** Whoever starts the run decides these; a composed file's values are dropped with a load-time warning. Declare them on the top-level workflow. |
+| `webSearchMode` | **Dropped, and this one is a real gap.** It is the only workflow-level field with no per-node counterpart, so there is nowhere for it to travel. Set it on the top-level workflow — where it then applies to every node in the run. |
+
+Two consequences worth knowing:
+
+- **A composition can span providers.** Parent on Claude, one composed block on Pi, another
+  on Codex, all in one run — each resolves independently. `archon workflow run <name>
+  --dry-run` prints each node's effective provider and model and where the value came from.
+- **A composed workflow's entry node starts a fresh session**, exactly as it would if you
+  ran that file on its own, even when the preceding node used the same provider. Set
+  `context: shared` on the entry node if you deliberately want the caller's thread to
+  continue into the block.
+
+One safety rule has teeth: if a composed workflow contains an `approval:` node, the workflow
+you **run** must declare `interactive: true` — otherwise the web console refuses to start it
+in the background, naming the block and the gate. A background run cannot present that gate
+inline, and the author who wrote it is looking at a different file. The check applies only
+where it matters: on the CLI and chat platforms the gate is presented normally, and an
+intermediate building block that merely composes a gate-bearing block is never asked — only
+the workflow that owns the run is.
 
 ### How expansion works
 
 Expansion happens at **load time (discovery)**, before the workflow ever runs. By the time
 the executor sees the DAG there are no include nodes left — the inlined nodes are ordinary
-top-level nodes, so runs, events, resume, and approvals all behave exactly as if you had
-written the nodes by hand. There is no separate child run.
+executable nodes in the include's containing scope, so runs, events, resume, and approvals all
+behave exactly as if you had written the nodes by hand. A top-level include produces top-level
+nodes; an include in a `loop_group` body produces body-local nodes. There is no separate child run.
 
-- **Namespacing.** Each included node `n` becomes a top-level node with id
-  `<includeId>__<n.id>` (double underscore). Including `archon-review-block` under
-  `id: review` yields `review__verify-pr-base`, `review__sync`, `review__implement-fixes`,
-  and so on. These namespaced ids are what appear in the event stream and in
-  `archon workflow get <id>`.
-- **Edges.** Internal `depends_on` edges and `$id.output` references inside the block are
-  rewired to the namespaced ids automatically. The include node's own `depends_on` /
-  `when` / `trigger_rule` attach to the block's **entry** nodes (those with no upstream
-  inside the block).
+- **Namespacing.** Each included node `n` receives id `<includeId>__<n.id>` (double
+  underscore) within that scope. Including `archon-review-block` under `id: review` yields
+  `review__verify-pr-base`, `review__sync`, `review__implement-fixes`, and so on. These
+  namespaced ids are what appear in the event stream and in `archon workflow get <id>`;
+  body-local events additionally carry their enclosing group prefix.
+- **Edges and command bodies.** Internal `depends_on` edges and `$id.output` references are
+  rewired to the namespaced ids automatically. This includes named `command:` and
+  `loop.command` files: discovery resolves their bodies and compiles them into the flat DAG
+  before namespacing. Compilation recurses through nested `loop_group` bodies. An unresolved
+  included command cannot start a fresh execution because its references cannot be proven safe.
+  Command nodes fail composition immediately; loop commands retain a private compilation error
+  so a paused loop can still resume from its persisted, validated prompt snapshot.
+  The include node's own `depends_on` / `when` / `trigger_rule` attach to the block's
+  **entry** nodes (those with no upstream inside the block). If both the include and an entry
+  define `when:` and either condition contains `||`, loading fails because the grammar cannot
+  group them without changing precedence; put the gate only on the include or inside the block.
 - **Sink asymmetry (a downstream node depending on the include).** A `depends_on:
   [<includeId>]` on a downstream node fans out to **all** of the block's sink nodes (every
   node with no dependents inside the block), so it waits for the whole block to finish.
@@ -953,6 +1120,13 @@ written the nodes by hand. There is no separate child run.
   has multiple leaf nodes.
 - **Output.** `$<includeId>.output` in another node resolves to the block's primary sink.
   In the example, `$review.output` is the output of the block's `implement-fixes` node.
+- **Inside a `loop_group` body.** An include expands inside that sealed body at load time.
+  Its nodes keep the usual `<includeId>__<nodeId>` names, then the loop runtime prefixes
+  persisted step names with the group id (for example `fix-loop.review__synthesize`). Every
+  iteration re-runs the expanded nodes exactly like equivalent inline body nodes. The group's
+  `until_bash` can read `$<includeId>.output` and expansion binds it to the block's declared
+  `returns:` node. A `workflow:` node is different — it creates a child run at runtime and
+  remains unsupported inside a loop-group body.
 
 ### Passing values into an included block
 
@@ -985,25 +1159,53 @@ underscores, or hyphens. Values must be strings and are inserted verbatim during
 expansion — they are **never expressions**: nothing is evaluated, computed, or interpreted,
 and the value is spliced in as text exactly as written. An inserted `$node.output` reference
 remains a reference and resolves through the normal runtime output substitution. A missing
-input is a load error; extra caller keys are ignored until workflow input declarations ship.
+input referenced by the block is a load error. Whether **extra** caller keys are allowed
+depends on whether the block declares `inputs:` (see
+[Workflow Signature](#workflow-signature-inputs-returns-and-inputs)): a block with no
+`inputs:` ignores unrecognized keys; a block that declares `inputs:` rejects an undeclared
+key at load.
 
 Substitution applies everywhere the value could reach the model or the shell, including
 inside Markdown code fences and inline code spans — `$INPUTS.<name>` has no
 documentation-only meaning, so a fenced occurrence is still a live parameter.
 
-#### Command bodies cannot use include inputs
+#### Command bodies use the same explicit interface
 
-Phase 1 cannot parameterize a `command:` file or `loop.command` file used by an included
-block. Command bodies are read at execution time, after load-time include expansion has
-finished. When such a file can be read at load time and contains `$INPUTS.<name>` anywhere —
-including inside a code fence — workflow loading fails with a message directing you to inline
-the prompt text. Use an inline `prompt:` when the block needs include inputs.
+Named `command:` and `loop.command` files are the preferred home for substantial prompts and
+can use both workflow-local `$node.output` references and declared `$INPUTS.<name>` values.
+For an `include:`, Archon resolves and snapshots the command body during load-time composition,
+then applies the same input binding and node-id namespacing as an inline prompt. The authored
+workflow stays command-first; the executor receives a deterministic flat DAG.
 
-This check is best-effort, so a clean load is not a guarantee. It covers the block's
-top-level `command:`/`loop.command` nodes only, so a command nested inside a `loop_group`
-body is not scanned; and a command file that cannot be resolved at load time is logged as a
-warning and skipped rather than failing the workflow. This restriction applies to `include:`;
-named `with:` mappings for `workflow:` sub-runs have not shipped.
+Every live reference in the command body must belong to the included workflow's lexical node
+scope. A direct `$caller.output` reference is rejected whether or not the parent happens to
+have a node called `caller`; declare an input and pass it with `with:` instead. Failure to
+resolve or read an included command is never a warning or best-effort bypass: a fresh execution
+fails before an AI turn. A paused loop remains resumable from its saved prompt snapshot even if
+the command is later deleted or made invalid.
+Canonical references are live even inside Markdown code fences and inline code because runtime
+substitution is syntax-agnostic.
+
+Named `script:` files are different: they are opaque programs, not prompt templates. Archon
+does not scan or rewrite their source, so it delivers a composed workflow's declared inputs to
+them the same way it delivers everything else user-controlled — as environment variables.
+Every `bash:` and `script:` node in a composed workflow receives that workflow's resolved
+inputs as `INPUTS_<UPPER_SNAKE>` (hyphens fold to underscores, so `base-branch` arrives as
+`INPUTS_BASE_BRANCH`), whether the body is inline or a named file:
+
+```bash
+# inside the composed workflow's own script, named or inline
+echo "reviewing $INPUTS_PLAN against $INPUTS_BASE_BRANCH"
+```
+
+The names are the ones the node's **own** workflow declared, at any nesting depth: a block
+three files deep still reads its own input names, not the caller's. Values are delivered
+through the environment and never spliced into the source, so a value containing shell
+metacharacters is data, not syntax. The load-time `$INPUTS.<name>` macro still substitutes
+into inline `bash:`/`script:` bodies as before — both channels work.
+
+`workflow:` sub-runs deliver the same `INPUTS_<UPPER_SNAKE>` variables, from inputs persisted
+in the child's run metadata.
 
 ### Non-goals (Phase 1)
 
@@ -1012,8 +1214,9 @@ named `with:` mappings for `workflow:` sub-runs have not shipped.
   implementation detail.
 - **Literal targets only.** `include:` takes a literal workflow name — no
   `include: $something` and no cross-repo includes.
-- **Not inside a `loop_group` body.** An include node nested in a `loop_group` body is
-  rejected at load time.
+- **No child runs inside a `loop_group` body.** A `workflow:` node remains unsupported there;
+  use `include:` when the reusable nodes should participate in the same run and repeat as
+  part of the group's static body.
 - **Depth-capped and cycle-checked.** Includes may nest up to 3 levels deep; cycles
   (`A` includes `B` includes `A`) and over-deep chains are load errors that drop only the
   offending workflow — other workflows still load.
@@ -1024,12 +1227,230 @@ for a standalone run.
 
 ---
 
-## Composing a Governed Sub-Run with `workflow:`
+## Workflow Signature: `inputs:`, `returns:`, and `$INPUTS`
+
+A workflow can declare a **structural signature** — what it takes and what it returns — so a
+reusable block has an explicit, caller-facing contract instead of relying on positional
+accidents. Two workflow-level fields:
+
+```yaml
+name: review-block
+description: Reviews a diff — composes into a parent, and runs on its own
+inputs:
+  diff:
+    required: true
+    description: the diff to review
+  style:
+    default: strict
+returns: synthesize          # the node whose output IS this block's result
+outcome_field: green         # required boolean field that authors this run's verdict
+nodes:
+  - id: gather
+    prompt: Gather context for $INPUTS.diff (style $INPUTS.style).
+  - id: synthesize
+    prompt: Synthesize a review from $gather.output and report whether it is green.
+    depends_on: [gather]
+    output_format:
+      type: object
+      properties:
+        review: { type: string }
+        green: { type: boolean }
+      required: [review, green]
+  - id: implement-fixes
+    prompt: Apply the fixes.
+    depends_on: [synthesize]
+```
+
+- **`inputs:`** — a map of input name → `{ required?, default?, description? }`. `required: true`
+  and `default:` are mutually exclusive (a required input has no default; declaring both drops
+  the key at load with a warning). Values come from `with:` on the `include:`/`workflow:` node
+  that references this workflow, or — for a direct run — from `--input name=value` on the CLI or
+  the run form in the web console (see [Running a workflow that declares
+  inputs](#running-a-workflow-that-declares-inputs)). Whichever channel supplies them, the same
+  contract applies: a missing **required** input and an **undeclared** key are both rejected, and
+  a declared `default:` fills an omitted input. A workflow with **no** `inputs:` keeps the old
+  lenient behavior: supplied keys **pass through unvalidated** — they are recorded on the run
+  and still resolve as `$INPUTS.<name>` / `INPUTS_<UPPER_SNAKE>`, they are simply never checked
+  against a declaration, because there isn't one.
+- **`returns:`** — the **node id** whose output IS the workflow's result. It selects by id, so
+  it works for any node type and even a **non-sink** node (a node other nodes depend on). For an
+  `include:` block, `$blk.output` resolves to the `returns:` node; `depends_on: [blk]` still
+  waits on every terminal node. For a `workflow:` sub-run child, the child's terminal output
+  (threaded back as `$node.output`) becomes the `returns:` node's output.
+- **`outcome_field:`** — an optional, explicit authored verdict relative to `returns:`. The
+  selected node must declare an object `output_format` (`type: object`) whose `properties`
+  declares the field, whose `required` lists it, and whose field schema sets `type: boolean`;
+  otherwise the workflow fails to load.
+  It cannot select a `loop_group` (which returns raw text) or a fan-out `workflow:` node
+  (which returns an aggregate array); add a structured collector node after either one.
+  Exact `true` is persisted as `outcome: succeeded`, exact `false` as `outcome: failed`.
+  This is independent from engine lifecycle `status`: a run may be `completed / failed-outcome`,
+  `failed / succeeded-outcome`, or `paused / succeeded-outcome`. Status still controls terminality,
+  resume, cancellation, filtering, automation, and CLI exit codes. A workflow with no declaration,
+  a selected node that has not completed, and historical runs read as `outcome: null` — never as
+  failure. Resume preserves an authored outcome until the selected node actually re-executes and
+  authors a replacement.
+
+An included workflow's outcome declaration never becomes the composer's outcome, and a
+`workflow:` child owns its outcome on its own run row; neither propagates implicitly to a parent.
+The REST run list, detail, by-worker, and dashboard JSON expose nullable `outcome` beside `status`.
+Coherent presentation across CLI, web, console, and adapters is tracked in
+[#2651](https://github.com/coleam00/Archon/issues/2651); dry-run terminology and compatibility are
+tracked separately in [#2650](https://github.com/coleam00/Archon/issues/2650).
+
+### Binding time: includes resolve at load, runs at runtime
+
+`$INPUTS.<name>` is delivered by **two deliberately separate paths**, and the difference decides
+which surfaces can read it:
+
+| Caller | When `$INPUTS` resolves | Reaches `prompt:`/`bash:`/`script:` | Reaches `command:` file bodies |
+|--------|-------------------------|-------------------------------------|--------------------------------|
+| `include:` | **Load time** (the block and command bodies are compiled into the flat DAG) | Yes | **Yes** — resolved command bodies receive the same input binding before execution |
+| `workflow:` sub-run | **Runtime** (values become `$INPUTS` variables on the child run) | Yes | **Yes** — every child node flows through runtime substitution |
+| direct run (`--input` / console form) | **Runtime** — the same path as a sub-run; supplied values are persisted to the run's own metadata, so `$INPUTS` reconstitutes on a cold resume | Yes | **Yes** — every node flows through runtime substitution |
+
+Both composition paths support command-backed prompts; their binding time differs. Includes
+snapshot and bind the resolved command body at load time, while sub-runs resolve inputs at
+runtime. Sub-run inputs are persisted to the child run's metadata at spawn, so `$INPUTS`
+reconstitutes on a cold resume.
+
+### `$INPUTS` in `bash:`/`script:` nodes uses env vars
+
+`$INPUTS.<name>` text is substituted only into non-shell (AI/prompt) surfaces — a sub-run's
+input value can derive from AI output, exactly the user-controlled class kept out of shell
+source. A `bash:`/`script:` node instead reads each input as an **environment variable** named
+`INPUTS_<UPPER_SNAKE>`: hyphens become underscores and the name is upper-cased, so `plan` →
+`$INPUTS_PLAN` and `base-branch` → `$INPUTS_BASE_BRANCH`. (Because `-` and `_` both fold to `_`,
+two input names that collide on one env key — e.g. `foo-bar` and `foo_bar` — are a load error.)
+
+```yaml
+# in a workflow: sub-run child
+nodes:
+  - id: check
+    bash: |
+      echo "planning: $INPUTS_PLAN"     # NOT $INPUTS.plan — bash reads the env var
+```
+
+### `$INPUTS` in `when:` conditions
+
+A node in a `workflow:` sub-run child — or in a workflow started directly with `--input` —
+can **branch** on a declared input, not just read one:
+
+```yaml
+inputs:
+  mode: { default: thorough }
+nodes:
+  - id: quick-pass
+    prompt: "Do the quick pass"
+    when: "$INPUTS.mode == 'fast'"
+  - id: full-pass
+    prompt: "Do the full pass"
+    when: "$INPUTS.mode != 'fast'"
+```
+
+The condition resolves the name against the run's inputs at evaluation time; the value is
+never spliced into the expression, so an input containing a quote or an operator is
+compared as data and can never be re-read as syntax. An `$INPUTS.<name>` the run does not
+carry **fails the node**, with the same message the prompt surface gives
+(`Unknown input '$INPUTS.mdoe'. Did you mean $INPUTS.mode?`) — it never resolves to an
+empty string, because a condition that quietly compares nothing is the silent-branch
+failure the [`when:` section](#when-condition-syntax) warns about.
+
+:::caution[Inside an `include:` block, put `$INPUTS` on the RIGHT of the comparison]
+An include is a **verbatim text** splice at load time, and a `when:` is one of the
+surfaces it rewrites. That makes the right-hand form work and the left-hand form break:
+
+```yaml
+when: "$probe.output == '$INPUTS.mode'"   # ✅ becomes  $probe.output == 'fast'
+when: "$INPUTS.mode == 'fast'"            # ❌ would become  fast == 'fast'
+```
+
+The second would no longer be a condition, so include expansion rejects it at load time and
+shows both the authored and rewritten expressions instead of allowing a runtime skip. The
+left-hand form is a `workflow:`/direct-run feature: those callers resolve `$INPUTS` at
+evaluation time, while an included block is inlined into the caller's own run and has no
+input scope left to resolve against.
+:::
+
+### Running a workflow that declares inputs
+
+Declaring `inputs:` does not make a workflow callable-only. The same file runs on its own **and**
+composes into any number of parents — supply the values at invocation:
+
+```bash
+# one flag per input; repeat it
+archon workflow run review-block --input diff="$(git diff)" --input style=terse
+
+# the trailing message is still $ARGUMENTS, independent of --input
+archon workflow run review-block --input diff=... "focus on the auth changes"
+```
+
+In the **web console**, a workflow that declares `inputs:` renders a field per input in the run
+card — description as help text, `default:` as the placeholder, `*` on the required ones. The
+Start button stays disabled, and says which input it is waiting for, until every required field
+has a value. A field left blank is **omitted**, so it falls back to its declared `default:`;
+the console therefore cannot send a deliberate empty string, where `--input name=` can.
+
+The grammar is deliberately small:
+
+- `--input name=value` splits on the **first** `=`, so `--input msg=a=b` gives `a=b`.
+- Values are plain strings. `--input name=` supplies a deliberate empty string.
+- Repeat the flag per input; supplying the same name twice is an error, not last-wins.
+- Omit an input to take its `default:`. Omitting one with no default and no `required: true`
+  leaves it unset, and a body referencing it fails at the reference site.
+
+Whatever supplies the values, they go through **one contract** — the same code a caller's `with:`
+map goes through — so a map accepted when composing is accepted here:
+
+- a **required** input with no value is refused, naming it;
+- an **undeclared** key is refused, naming it and listing what the workflow does declare;
+- both refusals happen **before any worktree, clone, or AI cost**;
+- supplied values are recorded on the run, so a resume replays exactly what the run started with.
+
+One consequence worth knowing on **chat, the run route, and the console** — the surfaces that reuse a
+conversation. Invoking a workflow there when a resumable run of it already exists in that
+conversation *continues that run* rather than starting a new one, without any resume vocabulary
+(see [DAG Resume on Failure](#dag-resume-on-failure)). New `inputs` values passed on such a call are
+**not applied** — the continued run keeps what it started with, and Archon says so, naming the
+values it ignored. To run fresh with different values, abandon the existing run first
+(`/workflow abandon <id>`) and invoke again. The CLI has no such implicit continuation: a plain
+`archon workflow run` always starts fresh, and `--input` with `--resume` is rejected outright.
+
+Chat platforms (Slack, Telegram, Discord, GitHub) have **no** channel for inputs yet: they carry
+only a trigger message, so a required-input workflow invoked there still refuses up front and
+points at the CLI and console. That gap is tracked in
+[#2555](https://github.com/coleam00/Archon/issues/2555).
+
+---
+
+## Launching a Separate Governed Run with `workflow:`
 
 A `workflow:` node runs another workflow as a **child sub-run** — a genuinely separate
 `workflow_runs` record with its own artifacts directory, its own approval gates, its own
 cost line, and its own audit trail. The child's terminal output threads back into the
 parent as `$<nodeId>.output`, exactly like any other node.
+
+### Choosing between `include:` and `workflow:`
+
+Both run another workflow as authored. They differ in how many *governance objects* exist,
+and three differences are the ones an author actually feels:
+
+| | `include:` — composition | `workflow:` — a separate launch |
+|---|---|---|
+| **The gate** | One run, one id. A human approves the run that composed the block. | Two runs. The human approves the **child** by its own run id; the parent stays paused and auto-resumes when the child finishes. |
+| **Command-body freshness** | The block's `command:` bodies are snapshotted at discovery, so a resumed run survives the file being deleted or edited. | The child re-reads its command bodies live when it starts. |
+| **`interactive:`** | One posture for the whole run — the top-level workflow's. A composed `approval:` node therefore requires `interactive: true` there. | The child has its own posture, independent of the parent's. |
+
+Reach for `include:` when you want one run made of reusable parts — the common case. Reach
+for `workflow:` when a human needs to approve, inspect or abandon one delegated unit
+**independently of its siblings and of its caller**, or when you want N runtime copies of
+one workflow (`fan_out:`). That independence is the one thing a single flat DAG cannot
+express, which is why both keywords exist.
+
+Because a composed block has no run of its own, the launch-only options are load errors on
+an `include:` node rather than silent no-ops: `isolation:`, `fan_out:`, `input:`, and
+`mutates_checkout:` each fail with a message naming the option and pointing here. A merely
+unread field (an AI option on an include node, say) still only warns.
 
 ```yaml
 nodes:
@@ -1049,6 +1470,21 @@ nodes:
     prompt: "Summarize the sub-run result:\n\n$implement-qa.output"
     depends_on: [implement-qa]
     context: fresh
+```
+
+A `workflow:` node has **one** input channel per invocation: either the untyped `input:` string
+(delivered as the child's `$ARGUMENTS`) **or** the named `with:` map (delivered as the child's
+`$INPUTS.<name>` — see [Workflow Signature](#workflow-signature-inputs-returns-and-inputs)).
+Setting both on one node is a load error. Use `with:` when the child declares named `inputs:` or
+when its `command:` bodies need named values:
+
+```yaml
+  - id: implement-qa
+    workflow: qa-block
+    with:
+      plan: "$plan.output"
+      mode: fast
+    depends_on: [plan]
 ```
 
 ### `include:` vs `workflow:` — which to use
@@ -1084,7 +1520,10 @@ sub-pipeline.**
   hard subprocess kill yet).
 - **Cost roll-up.** The child's total cost rolls up into the `workflow:` node's cost and
   the parent's aggregate, and `parent_run_id` on the child row makes the run tree visible
-  in `archon workflow runs` and the console.
+  in `archon workflow runs` and the console. A run records what it spent whatever its
+  outcome, so a child that burned tokens and then failed or was cancelled still counts —
+  a partly-failed fan-out reports the spend of every child, not just the ones that
+  finished.
 
 ### Choosing the child's checkout with `isolation:`
 
@@ -1215,7 +1654,7 @@ The way to avoid it is to declare what the child does, on the child workflow its
 ```yaml
 # review-block.yaml — reads the repo, writes only to $ARTIFACTS_DIR
 name: review-block
-description: Reviews the diff and writes findings. Building block — not for standalone runs.
+description: Reviews the diff and writes findings. Composes into a parent; also runs on its own.
 mutates_checkout: false      # skips the path lock: N of these coexist in one checkout
 nodes:
   - id: review
@@ -1280,7 +1719,7 @@ can line results up against the input list positionally.
 | Field | Default | What it does |
 |-------|---------|--------------|
 | `items` | required | A `$node.output` (or `$node.output.field`) reference that must resolve to a **JSON array** at run time. Anything else — an object, a bare string, malformed JSON, a dangling ref — fails the node before any child is created. It never fans out over the characters of a string, and never silently degrades to zero items. An empty array is legal: the node completes immediately with `[]`. |
-| `as` | — | Reserved for a future `$INPUTS.<as>` channel ([#2214](https://github.com/coleam00/Archon/issues/2214)) and **rejected at load** until then, rather than accepted and ignored — writing `as: task` and then `$INPUTS.task` in the child would otherwise deliver the literal string to the model. The item reaches the child as `$ARGUMENTS`. |
+| `as` | — | Names the current item as `$INPUTS.<as>` in each child. It must not collide with a `with:` key. The item also reaches the child as `$ARGUMENTS`. |
 | `max_parallel` | `5` | How many children may be **in flight at once**. |
 | `join` | `all_done` | How N child outcomes reduce to one node outcome (below). |
 
@@ -1493,8 +1932,8 @@ re-deriving it.
 
 ### Non-goals (this slice)
 
-- **No `with:` named-parameter mapping** — use `input:` (a single data string). A
-  `workflow:` node with a `with:` key is rejected with a clear error.
+- **Choose one input form** — `input:` sends a single data string as `$ARGUMENTS`;
+  `with:` supplies named `$INPUTS` values. The two forms are mutually exclusive.
 - **No racing** (`join: first_success`) — rejected outright, not deferred (see [Why there is no racing join](#why-there-is-no-racing-join)).
 - **Not inside a `loop_group` body** — a `workflow:` node, fanned out or not, is rejected
   there at load time ([#2439](https://github.com/coleam00/Archon/issues/2439)).
@@ -1553,19 +1992,34 @@ If the SDK rejects a literal string at request time, the node fails loudly with 
 name: my-workflow
 provider: codex
 model: gpt-5.6-sol
-modelReasoningEffort: medium    # 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+effort: medium                  # Reasoning depth — the one spelling, any provider
 webSearchMode: live             # 'disabled' | 'cached' | 'live'
 ```
 
-**Model reasoning effort:**
-- `minimal`, `low` - Fast, cheaper
-- `medium` - Balanced (default)
-- `high`, `xhigh` - More thorough, expensive
+**Web search mode:** controls Codex's built-in web-search tool. It is not a network
+switch — Codex nodes always run with network access enabled, so `disabled` stops Codex
+from searching, not from reaching the network.
 
-**Web search mode:**
-- `disabled` - No web access (default)
+- `disabled` - No built-in web search (default)
 - `cached` - Use cached search results
 - `live` - Real-time web search
+
+`webSearchMode:` is **workflow-level only** — there is no per-node form, and no other
+provider reads it. Declaring it on a workflow whose node resolves to a provider other
+than Codex logs a warning and applies nothing, the same way any other unsupported option
+does.
+
+:::caution[`modelReasoningEffort:` is deprecated]
+Workflow-level `modelReasoningEffort:` was a second, Codex-only spelling of reasoning
+depth. Use [`effort:`](#claude-sdk-advanced-options) instead — it reaches Codex too, and
+it can be set per node. The old field is still accepted: the loader **translates** it into
+`effort:` and warns, naming the value it became — so nothing stops working, and no engine
+code has to reason about a second spelling. If a workflow declares both, `effort:` wins and
+the old field is dropped (the loader cannot know which nodes resolve to Codex, so the old
+field's Codex-only precedence is not expressible at load time); the warning says so. The
+field will be removed. `assistants.codex.modelReasoningEffort` in `.archon/config.yaml` is
+a different setting and is **not** deprecated.
+:::
 
 ### Web Execution Mode
 
@@ -2014,13 +2468,13 @@ nodes:
 
 When the workflow reaches `review-gate`, it pauses and notifies you. Approve or reject via:
 
-- **Natural language** (recommended): Just type your response in the conversation — the system detects the paused workflow and auto-resumes
-- **CLI**: `bun run cli workflow approve <run-id>` or `bun run cli workflow reject <run-id>` — auto-resumes
-- **Explicit command**: `/workflow approve <run-id>` or `/workflow reject <run-id>` — auto-resumes when issued in the originating conversation
+- **Explicit command**: `/workflow approve <run-id>` or `/workflow reject <run-id>` — deterministic; resolves and continues the run
+- **CLI**: `bun run cli workflow approve <run-id>` or `bun run cli workflow reject <run-id>` — resolves and continues (`--json` records the decision only)
+- **Chat**: tell the agent what you want ("looks good, ship it" / "no, stop") — it resolves the gate and the run continues. An ambiguous message resolves nothing and the agent asks; a plain message is **not** an automatic approval
 - **Web UI**: Click the Approve/Reject buttons on the dashboard card — auto-resumes for Web-UI-dispatched runs; the Reject dialog includes an optional reason field that flows to `$REJECTION_REASON`
 - **API**: `POST /api/workflows/runs/<run-id>/approve` or `/reject`
 
-All four paths auto-resume the workflow from the next node. The user's approval comment is available as `$review-gate.output` in downstream nodes only when `capture_response: true` is set on the approval node. Cross-platform caveat: Web-UI approvals on Slack / Telegram / GitHub-dispatched runs record the decision but do not auto-resume — re-run from the originating platform to continue.
+Every path continues the workflow from the next node. The user's approval comment is available as `$review-gate.output` in downstream nodes only when `capture_response: true` is set on the approval node. Cross-platform caveat: Web-UI approvals on Slack / Telegram / GitHub-dispatched runs record the decision but do not auto-resume — re-run from the originating platform to continue.
 
 Without `on_reject`: rejecting cancels the workflow.
 With `on_reject`: rejecting triggers an AI rework prompt and re-pauses for re-review.
@@ -2058,7 +2512,7 @@ Two primitives handle human-in-the-loop iteration. Use the right one for your pa
 | User input variable | `$LOOP_USER_INPUT` | `$REJECTION_REASON` |
 | How it works | Same prompt runs each iteration, user input injected as variable | Specific on_reject prompt runs only on rejection |
 | Best for | **Conversational iteration** — explore, refine, review cycles where the AI and human go back and forth | **Gate-then-fix** — approve to proceed, or reject to trigger a specific corrective action |
-| Approval signal | AI emits the completion signal (`<promise>DONE</promise>`); a gate that paused on a signaled iteration finalizes on a bare approve | User explicitly approves or rejects via button/command |
+| Completion condition | A declared `until`, `until_bash`, or `until_field` channel completes; a gate that paused on a completed iteration finalizes on a bare approve | User explicitly approves or rejects via button/command |
 | Example | PIV loop: explore → user feedback → explore again | Report generation: generate → user rejects → AI revises specific section |
 
 **Interactive loop** (`loop.interactive: true`):
@@ -2078,11 +2532,11 @@ Two primitives handle human-in-the-loop iteration. Use the right one for your pa
 The AI runs each iteration, pauses for user input, and the user's text feeds into the next
 iteration via `$LOOP_USER_INPUT`. What an approve does depends on the paused iteration:
 
-- If the iteration **emitted the completion signal** (the gate says "Completion signal
-  detected"), approving with **no feedback** accepts the result — the node finalizes from
-  the already-computed output with no extra iteration. Approving **with** feedback runs
-  another iteration instead.
-- If it did **not** signal, any approve runs another iteration with your feedback.
+- If any declared completion channel completed the iteration (the gate names the channel
+  after `✅ Completion condition met via`), approving with **no feedback** accepts the
+  result — the node finalizes from the already-computed output with no extra iteration.
+  Approving **with** feedback runs another iteration instead.
+- If no completion condition was met, any approve runs another iteration with your feedback.
 
 For a loop that should complete autonomously on the signal (no gate at all on success —
 e.g. a validation that only needs a human on failure), add `signal_completes: true`. See
@@ -2175,14 +2629,14 @@ Before deploying a workflow:
 8. **`allowed_tools` / `denied_tools`** — restrict tools per node (all providers except Codex)
 9. **`retry:`** — AI nodes auto-retry transient errors (default: 2 retries / 3 total attempts, 3 s backoff); `bash:`/`script:` retry only with an explicit `retry:` block
 10. **`hooks`** — attach SDK hook callbacks to Claude nodes for tool control and context injection
-11. **`mcp:`** — attach per-node MCP servers via JSON config (all providers except Pi)
-12. **`skills:`** — preload skills per node (Claude/Pi/OpenCode/Copilot; Codex auto-discovers from `.agents/skills/`)
+11. **`mcp:`** — attach per-node MCP servers via JSON config (Claude/Codex/Copilot; Codex configuration is additive)
+12. **`skills:`** — select exact active skills on Claude and declare skills for Pi/Copilot; Codex workflow bodies use explicit `$skill-name`
 13. **`agents:`** — inline Claude sub-agent definitions invokable via the `Task` tool
-14. **`effort` / `thinking`** — control reasoning depth and thinking mode per node or workflow (Claude/Pi/Copilot)
+14. **`effort`** — reasoning depth per node or workflow, on every provider that has one (Claude/Codex/Pi/Copilot); **`thinking`** — thinking mode (Claude/Pi/Copilot)
 15. **`maxBudgetUsd`** — set a USD cost cap per node; fails with error if exceeded (Claude only)
 16. **`systemPrompt`** — override the default system prompt per node (Claude only)
 17. **`sandbox`** — OS-level filesystem/network restrictions per node or workflow (Claude only)
-18. **`output_type`** — tag a node's output with a semantic type; the engine writes a typed sidecar (`$ARTIFACTS_DIR/nodes/<id>.md` + `.meta.json`) for cross-node/cross-run lookup by type (any node type)
-19. **Loop nodes** — use `loop:` within a DAG node for iterative execution until completion signal
+18. **`output_type`** — tag a node's output with a semantic type; the engine writes a typed sidecar for cross-node/cross-run lookup by type (any node type). Top-level nodes use `$ARTIFACTS_DIR/nodes/<id>.md` + `.meta.json`; loop-body executions use [iteration-specific paths](#the-artifact-chain)
+19. **Loop nodes** — use `loop:` within a DAG node for iterative execution until a declared completion condition is met
 20. **Defaults as templates** — browse `.archon/workflows/defaults/` for real examples to copy and modify
 21. **Test thoroughly** — each command, the artifact flow, and edge cases

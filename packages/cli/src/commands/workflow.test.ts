@@ -6,7 +6,11 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
-import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
+import {
+  makeTestComposedWorkflow,
+  makeTestWorkflow,
+  makeTestWorkflowWithSource,
+} from '@archon/workflows/test-utils';
 import type { WorkflowEventRow } from '@archon/core/schemas/workflow-event';
 import {
   workflowListCommand,
@@ -18,6 +22,7 @@ import {
   workflowAbandonCommand,
   workflowApproveCommand,
   workflowRejectCommand,
+  workflowEventEmitCommand,
   workflowCleanupCommand,
   workflowResetSessionsCommand,
   buildDetachedRunCmd,
@@ -36,6 +41,8 @@ const mockLogger = {
   trace: mock(() => undefined),
   child: mock(() => mockLogger),
 };
+
+const mockCreateWorkflowEvent = mock(() => Promise.resolve());
 
 // Mock @archon/paths (createLogger moved here from @archon/core)
 mock.module('@archon/paths', () => ({
@@ -94,9 +101,7 @@ mock.module('@archon/core', () => ({
   generateAndSetTitle: mock(() => Promise.resolve()),
   loadRepoConfig: mock(() => Promise.resolve(null)),
   getUserAiPrefs: mock(() => Promise.resolve({})),
-  createWorkflowStore: mock(() => ({
-    createWorkflowEvent: mock(() => Promise.resolve()),
-  })),
+  createWorkflowStore: mock(() => ({ createWorkflowEvent: mockCreateWorkflowEvent })),
   // requires: [github] gate. Default to a solo-install posture (disabled) so the
   // gate is a no-op for every existing test; the gate-specific tests below flip
   // isPerUserGitHubEnabled on per-invocation.
@@ -115,6 +120,29 @@ mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mock(() => Promise.resolve({ success: true, workflowRunId: 'test-run-id' })),
   hydrateResumableRun: mock(() => Promise.resolve(null)),
 }));
+mock.module('@archon/workflows/dry-run', () => ({
+  loadDryRunStubs: mock(() => Promise.resolve({ node: 'stubbed output' })),
+  writeDryRunStubScaffold: mock(() => Promise.resolve({ first: 'TODO', second: 'TODO' })),
+  dryRunWorkflow: mock(() =>
+    Promise.resolve({
+      workflow: 'plan',
+      outcome: 'completed',
+      trace: [
+        {
+          nodeId: 'node',
+          nodeType: 'command',
+          state: 'stubbed',
+          resolvedText: 'command:test-command',
+          output: 'stubbed output',
+        },
+      ],
+      missingStubs: [],
+      unusedStubs: [],
+      summary: 'stubbed output',
+    })
+  ),
+  formatDryRunTrace: mock(() => 'DRY RUN TRACE'),
+}));
 
 // Capture the subscription handler so tests can trigger events
 let capturedSubscribeHandler: ((event: WorkflowEmitterEvent) => void) | null = null;
@@ -131,8 +159,27 @@ mock.module('@archon/workflows/event-emitter', () => ({
   })),
 }));
 
+class MockCanonicalRepoPathUnavailableError extends Error {
+  constructor(
+    readonly checkoutPath: string,
+    readonly commonGitDir: string
+  ) {
+    super(`Cannot determine the primary checkout for ${checkoutPath}`);
+    this.name = 'CanonicalRepoPathUnavailableError';
+  }
+}
+
 mock.module('@archon/git', () => ({
   findRepoRoot: mock(() => Promise.resolve(null)),
+  getCanonicalRepoPath: mock((path: string) => Promise.resolve(path)),
+  getGitCheckoutIdentity: mock((path: string) =>
+    Promise.resolve({
+      gitDir: `${path}/.git`,
+      commonGitDir: `${path}/.git`,
+      linkedWorktree: false,
+    })
+  ),
+  CanonicalRepoPathUnavailableError: MockCanonicalRepoPathUnavailableError,
   getRemoteUrl: mock(() => Promise.resolve(null)),
   checkout: mock(() => Promise.resolve()),
   toRepoPath: mock((path: string) => path),
@@ -152,6 +199,7 @@ mock.module('@archon/core/db/conversations', () => ({
 
 mock.module('@archon/core/db/codebases', () => ({
   findCodebaseByDefaultCwd: mock(() => Promise.resolve(null)),
+  listCodebases: mock(() => Promise.resolve([])),
   findCodebaseByPathPrefix: mock(() => Promise.resolve(null)),
   getCodebase: mock(() => Promise.resolve(null)),
 }));
@@ -359,7 +407,7 @@ describe('workflowListCommand', () => {
     expect(() => JSON.parse(output)).not.toThrow();
   });
 
-  it('should include modelReasoningEffort and webSearchMode in JSON output when present', async () => {
+  it('should include effort and webSearchMode in JSON output when present', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
       workflows: [
@@ -368,7 +416,9 @@ describe('workflowListCommand', () => {
           description: 'Planning workflow',
           provider: 'codex',
           model: 'gpt-5.6-sol',
-          modelReasoningEffort: 'high',
+          // #2556: `effort:` is the one spelling. The deprecated field is
+          // translated into it at load, so it can never reach this surface.
+          effort: 'xhigh',
           webSearchMode: 'live',
         }),
       ],
@@ -387,7 +437,7 @@ describe('workflowListCommand', () => {
       description: 'Planning workflow',
       provider: 'codex',
       model: 'gpt-5.6-sol',
-      modelReasoningEffort: 'high',
+      effort: 'xhigh',
       webSearchMode: 'live',
     });
   });
@@ -476,6 +526,194 @@ describe('workflowListCommand', () => {
   });
 });
 
+describe('workflowRunCommand — dry-run', () => {
+  let stdoutSpy: ReturnType<typeof spyOn>;
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    stdoutSpy = spyOnJsonStdout();
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const dryRun = await import('@archon/workflows/dry-run');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+    (dryRun.loadDryRunStubs as ReturnType<typeof mock>).mockClear();
+    (dryRun.writeDryRunStubScaffold as ReturnType<typeof mock>).mockClear();
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockClear();
+    (dryRun.formatDryRunTrace as ReturnType<typeof mock>).mockClear();
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValue({
+      workflow: 'plan',
+      outcome: 'completed',
+      trace: [],
+      missingStubs: [],
+      unusedStubs: [],
+      summary: 'done',
+    });
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+  });
+
+  afterEach(() => {
+    stdoutSpy.mockRestore();
+    consoleSpy.mockRestore();
+  });
+
+  it('runs the simulator before real-run setup and writes one JSON document', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const dryRun = await import('@archon/workflows/dry-run');
+
+    await workflowRunCommand('/test/path', 'plan', 'hello', {
+      dryRun: true,
+      stubsPath: 'fixtures.yaml',
+      defaultStubs: true,
+      execCode: true,
+      pauseAtGates: true,
+      json: true,
+    });
+
+    expect(dryRun.loadDryRunStubs).toHaveBeenCalledWith(join('/test/path', 'fixtures.yaml'));
+    expect(dryRun.dryRunWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userMessage: 'hello',
+        cwd: '/test/path',
+        defaultStubs: true,
+        execCode: true,
+        pauseAtGates: true,
+      })
+    );
+    expect(executeWorkflow).not.toHaveBeenCalled();
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      workflow: 'plan',
+      outcome: 'completed',
+    });
+    expect(consoleSpy).not.toHaveBeenCalled();
+  });
+
+  it('writes a scaffold from the discovered workflow and exits before simulation', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const dryRun = await import('@archon/workflows/dry-run');
+
+    await workflowRunCommand('/test/path', 'plan', '', {
+      dryRun: true,
+      stubsInitPath: 'fixtures/generated.yaml',
+      json: true,
+    });
+
+    expect(dryRun.writeDryRunStubScaffold).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'plan' }),
+      join('/test/path', 'fixtures/generated.yaml')
+    );
+    expect(dryRun.loadDryRunStubs).not.toHaveBeenCalled();
+    expect(dryRun.dryRunWorkflow).not.toHaveBeenCalled();
+    expect(executeWorkflow).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
+      workflow: 'plan',
+      stubsPath: join('/test/path', 'fixtures/generated.yaml'),
+      nodeCount: 2,
+    });
+  });
+
+  it('writes the human trace through guaranteed stdout delivery', async () => {
+    const dryRun = await import('@archon/workflows/dry-run');
+
+    await workflowRunCommand('/test/path', 'plan', '', { dryRun: true });
+
+    expect(dryRun.formatDryRunTrace).toHaveBeenCalled();
+    expect(firstJsonPayload(stdoutSpy)).toBe('DRY RUN TRACE');
+  });
+
+  it('fails the dry run when the config is unreadable instead of reporting against defaults', async () => {
+    // `loadConfig` returns defaults when there is no config file, so a throw means a
+    // MALFORMED one. Swallowing it would print a clean-looking trace claiming every node
+    // resolves to the default assistant — a plausible report of a run that cannot happen.
+    const core = await import('@archon/core');
+    const dryRun = await import('@archon/workflows/dry-run');
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockClear();
+    (core.loadConfig as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('bad yaml at .archon/config.yaml:7')
+    );
+
+    await expect(workflowRunCommand('/test/path', 'plan', 'go', { dryRun: true })).rejects.toThrow(
+      /bad yaml/
+    );
+
+    expect(dryRun.dryRunWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('rejects dry-run-only and incompatible lifecycle flags', async () => {
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', { stubsPath: 'fixtures.yaml' })
+    ).rejects.toThrow('--stubs requires --dry-run');
+
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', { stubsInitPath: 'fixtures.yaml' })
+    ).rejects.toThrow('--stubs-init requires --dry-run');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', { defaultStubs: true })
+    ).rejects.toThrow('--default-stubs requires --dry-run');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', { dryRun: true, detach: true })
+    ).rejects.toThrow('--dry-run cannot be combined with --detach');
+  });
+
+  it('rejects scaffold mode combined with simulation stub options', async () => {
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', {
+        dryRun: true,
+        stubsInitPath: 'generated.yaml',
+        stubsPath: 'overrides.yaml',
+      })
+    ).rejects.toThrow('--stubs-init cannot be combined with --stubs');
+
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [],
+    });
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', {
+        dryRun: true,
+        stubsInitPath: 'generated.yaml',
+        defaultStubs: true,
+      })
+    ).rejects.toThrow('--stubs-init cannot be combined with --default-stubs');
+  });
+
+  it('emits failure JSON before returning a nonzero-worthy error', async () => {
+    const dryRun = await import('@archon/workflows/dry-run');
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflow: 'plan',
+      outcome: 'failed',
+      trace: [],
+      missingStubs: ['node'],
+      unusedStubs: [],
+    });
+
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', { dryRun: true, json: true })
+    ).rejects.toThrow('missing stubs: node');
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({ outcome: 'failed' });
+  });
+});
+
 describe('workflowRunCommand — requires: [github] gate', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let priorArchonUserId: string | undefined;
@@ -517,6 +755,40 @@ describe('workflowRunCommand — requires: [github] gate', () => {
     ).rejects.toThrow(/connected github identity/i);
 
     // Hard-blocked before any worktree/AI cost — executeWorkflow never ran.
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('blocks a parent whose requirement came only from a COMPOSED block', async () => {
+    // The parent declares no `requires:` of its own — the requirement unions upward from
+    // the block during expansion (#1764). Without that union this refusal never happens
+    // and the run fails mid-block instead, inside a file the parent cannot inspect.
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { isPerUserGitHubEnabled, getDecryptedAccessToken } = await import('@archon/core');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const composed = makeTestComposedWorkflow(
+      [
+        makeTestWorkflow({
+          name: 'gh-block',
+          requires: ['github'],
+          nodes: [{ id: 'work', prompt: 'work' }],
+        }),
+        makeTestWorkflow({ name: 'composes-gh', nodes: [{ id: 'sub', include: 'gh-block' }] }),
+      ],
+      'composes-gh'
+    );
+    // The union is what the gate reads — assert it before relying on it.
+    expect(composed.requires).toEqual(['github']);
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [{ workflow: composed, source: 'project' }],
+      errors: [],
+    });
+    (isPerUserGitHubEnabled as ReturnType<typeof mock>).mockReturnValueOnce(true);
+    (getDecryptedAccessToken as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+
+    await expect(
+      workflowRunCommand('/repo/root', 'composes-gh', 'go', { noWorktree: true })
+    ).rejects.toThrow(/connected github identity/i);
     expect(executeWorkflow).not.toHaveBeenCalled();
   });
 
@@ -632,6 +904,225 @@ describe('workflowRunCommand — requires: [github] gate', () => {
     await expect(
       workflowRunCommand('/repo/root', 'ship', 'go', { noWorktree: true })
     ).rejects.toThrow(/connected github identity/i);
+
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+describe('workflowRunCommand — --input declared inputs (#2554)', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  /** Stub discovery with one workflow declaring a required + a defaulted input. */
+  async function stubInputWorkflow(): Promise<void> {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource(
+          {
+            name: 'review-block',
+            inputs: { diff: { required: true }, style: { default: 'strict' } },
+          },
+          'project'
+        ),
+      ],
+      errors: [],
+    });
+  }
+
+  it('runs a required-input workflow when --input supplies the value', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    await stubInputWorkflow();
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-ok',
+    });
+
+    await workflowRunCommand('/repo/root', 'review-block', 'go', {
+      noWorktree: true,
+      inputs: ['diff=D1'],
+    });
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+    // Only the supplied value is threaded through; `style` stays a derived default.
+    const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][7] as {
+      inputs?: Record<string, string>;
+    };
+    expect(opts.inputs).toEqual({ diff: 'D1' });
+  });
+
+  it('still refuses a required-input workflow when nothing is supplied, before any cost', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    await stubInputWorkflow();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'review-block', 'go', { noWorktree: true })
+    ).rejects.toThrow(/requires input 'diff'/);
+
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('rejects an undeclared --input name before any cost', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    await stubInputWorkflow();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'review-block', 'go', {
+        noWorktree: true,
+        inputs: ['diff=D1', 'stlye=terse'],
+      })
+    ).rejects.toThrow(/does not declare input 'stlye'/);
+
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed --input assignment before any cost', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    await stubInputWorkflow();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'review-block', 'go', {
+        noWorktree: true,
+        inputs: ['diff'],
+      })
+    ).rejects.toThrow(/expected 'name=value'/);
+
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('passes gate-resolved inputs to dryRunWorkflow (#2610)', async () => {
+    // Only the SUPPLIED entries travel: the simulator derives declared defaults
+    // itself, mirroring the executor's `defaultRunInputs` merge at run start.
+    const dryRun = await import('@archon/workflows/dry-run');
+    await stubInputWorkflow();
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockClear();
+
+    await workflowRunCommand('/repo/root', 'review-block', 'go', {
+      dryRun: true,
+      inputs: ['diff=D1'],
+    });
+
+    expect(dryRun.dryRunWorkflow).toHaveBeenCalledTimes(1);
+    const opts = (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mock.calls[0][0] as {
+      inputs?: Record<string, string>;
+    };
+    expect(opts.inputs).toEqual({ diff: 'D1' });
+  });
+
+  it('fails a dry run of a required-input workflow at the gate, like a real run', async () => {
+    const dryRun = await import('@archon/workflows/dry-run');
+    await stubInputWorkflow();
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockClear();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'review-block', 'go', { dryRun: true })
+    ).rejects.toThrow(/requires input 'diff'/);
+
+    expect(dryRun.dryRunWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('reports the incompatible flag, not an input error, for --dry-run --resume --input', async () => {
+    // The incompatible-flags check must stay ahead of the input gate: with --input no
+    // longer in that list, only ordering keeps the triple reporting the flag conflict.
+    const dryRun = await import('@archon/workflows/dry-run');
+    await stubInputWorkflow();
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockClear();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'review-block', 'go', {
+        dryRun: true,
+        resume: true,
+        inputs: ['diff=D1'],
+      })
+    ).rejects.toThrow(/--dry-run cannot be combined with --resume/);
+
+    expect(dryRun.dryRunWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('rejects an undeclared --input name on a dry run at the gate', async () => {
+    const dryRun = await import('@archon/workflows/dry-run');
+    await stubInputWorkflow();
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockClear();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'review-block', 'go', {
+        dryRun: true,
+        inputs: ['diff=D1', 'stlye=terse'],
+      })
+    ).rejects.toThrow(/does not declare input 'stlye'/);
+
+    expect(dryRun.dryRunWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('does not re-gate a --resume of a required-input workflow', async () => {
+    // The gate is deliberately skipped on resume: the run row already carries inputs
+    // validated at creation, and a resume supplies nothing. A refactor that hoists
+    // `resolveTopLevelInputs` out of the `if (!options.resume)` guard would make every
+    // CLI resume of a required-input workflow throw instead — this is what catches it.
+    // (The `--input` + `--resume` test below cannot: it fails on the mutual-exclusion
+    // check before ever reaching the gate.)
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    await stubInputWorkflow();
+
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { id: 'run-prior', workflow_name: 'review-block' },
+      priorCompletedNodes: new Map([['node-a', 'done']]),
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-resume',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-resume',
+      default_cwd: '/repo/root',
+      default_branch: 'develop',
+    });
+    // working_path null keeps the resume on the caller cwd, skipping the existsSync probe.
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-prior',
+      working_path: null,
+      workflow_name: 'review-block',
+    });
+    (conversationDb.updateConversation as ReturnType<typeof mock>).mockResolvedValueOnce(undefined);
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-prior',
+    });
+
+    // No --input, and the workflow declares a required one: this must NOT throw.
+    await workflowRunCommand('/repo/root', 'review-block', 'go', { resume: true });
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+    // The resume branch carries the row's own inputs; it never re-stamps from a flag.
+    const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][7] as {
+      inputs?: Record<string, string>;
+    };
+    expect(opts.inputs).toBeUndefined();
+  });
+
+  it('rejects --input combined with --resume rather than silently ignoring it', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    // Flag validation runs after name resolution (as every other flag check does),
+    // so discovery still has to resolve for the conflict to be reached.
+    await stubInputWorkflow();
+
+    await expect(
+      workflowRunCommand('/repo/root', 'review-block', 'go', {
+        resume: true,
+        inputs: ['diff=D1'],
+      })
+    ).rejects.toThrow(/--resume and --input are mutually exclusive/);
 
     expect(executeWorkflow).not.toHaveBeenCalled();
   });
@@ -3177,7 +3668,7 @@ describe('workflowGetCommand', () => {
     expect(code).toBe(0);
   });
 
-  it('prints a Gate line (human) for a paused interactive_loop run (#2074 E)', async () => {
+  it('prints aggregate completion-condition state for a paused interactive_loop run (#2074 E)', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-gate-human',
@@ -3200,7 +3691,7 @@ describe('workflowGetCommand', () => {
     await workflowGetCommand('run-gate-human');
 
     expect(consoleSpy).toHaveBeenCalledWith(
-      '  Gate:   awaiting approval — signal detected: yes (iteration 2)'
+      '  Gate:   awaiting approval — completion condition met: yes (iteration 2)'
     );
   });
 
@@ -3293,6 +3784,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockClear();
     (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockClear();
+    mockCreateWorkflowEvent.mockClear();
   });
 
   afterEach(() => {
@@ -3378,7 +3870,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     ]);
 
     await expect(workflowResumeCommand('0b1ee8da', undefined, '/repo')).rejects.toThrow(
-      'matches more than one run'
+      '0b1ee8da-1111-2222-3333-444455556666\n  0b1ee8da-9999-8888-7777-666655554444'
     );
   });
 
@@ -3526,6 +4018,124 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
     });
   });
 
+  it('emits an event using the resolved full run id', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
+      CODEBASE
+    );
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: FULL_ID },
+    ]);
+
+    await workflowEventEmitCommand('0b1ee8da', 'workflow_started', undefined, '/repo');
+
+    expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+      workflow_run_id: FULL_ID,
+      event_type: 'workflow_started',
+      data: undefined,
+    });
+    expect(consoleSpy).toHaveBeenCalledWith(
+      `Event submitted (best-effort): workflow_started for run ${FULL_ID}`
+    );
+  });
+
+  it('resolves an event prefix from a workspace-scoped worktree', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce('/canonical/repo');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(CODEBASE);
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: FULL_ID },
+    ]);
+
+    await workflowEventEmitCommand(
+      '0b1ee8da',
+      'workflow_started',
+      undefined,
+      '/home/test/.archon/workspaces/owner/proj/worktrees/archon/task-2611'
+    );
+
+    expect(codebaseDb.findCodebaseByDefaultCwd).toHaveBeenCalledWith('/canonical/repo');
+    expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+      workflow_run_id: FULL_ID,
+      event_type: 'workflow_started',
+      data: undefined,
+    });
+  });
+
+  it('resolves an event prefix from an exact registered linked worktree', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
+      CODEBASE
+    );
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: FULL_ID },
+    ]);
+
+    await workflowEventEmitCommand(
+      '0b1ee8da',
+      'workflow_started',
+      undefined,
+      '/workspace/registered-worktree'
+    );
+
+    expect(canonicalSpy).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+      workflow_run_id: FULL_ID,
+      event_type: 'workflow_started',
+      data: undefined,
+    });
+  });
+
+  it('rejects an unmatched event prefix before creating an event', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
+      CODEBASE
+    );
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([]);
+
+    await expect(
+      workflowEventEmitCommand('deadbeef', 'workflow_started', undefined, '/repo')
+    ).rejects.toThrow("No workflow run matches prefix 'deadbeef' in this project.");
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects an event prefix outside a registered project before creating an event', async () => {
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+
+    await expect(
+      workflowEventEmitCommand('deadbeef', 'workflow_started', undefined, '/unregistered')
+    ).rejects.toThrow("Cannot resolve run id prefix 'deadbeef' outside a registered project.");
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+  });
+
+  it('rejects an ambiguous event prefix before creating an event', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(
+      CODEBASE
+    );
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: '0b1ee8da-1111-2222-3333-444455556666' },
+      { id: '0b1ee8da-9999-8888-7777-666655554444' },
+    ]);
+
+    await expect(
+      workflowEventEmitCommand('0b1ee8da', 'workflow_started', undefined, '/repo')
+    ).rejects.toThrow('matches more than one run');
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+  });
+
   it('skips resolution when no cwd is provided (exact lookup only)', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
@@ -3554,8 +4164,11 @@ describe('workflowRunsCommand', () => {
   });
 
   it('scopes to the cwd-resolved codebase id', async () => {
+    const git = await import('@archon/git');
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
     (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'cb-proj',
       name: 'owner/repo',
@@ -3569,6 +4182,96 @@ describe('workflowRunsCommand', () => {
 
     expect(listSpy).toHaveBeenCalledWith(
       expect.objectContaining({ codebaseId: 'cb-proj', limit: 20 })
+    );
+    expect(canonicalSpy).not.toHaveBeenCalled();
+  });
+
+  it('scopes a linked worktree to its registered primary checkout', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce(
+      '/registered/primary'
+    );
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'cb-primary',
+        name: 'owner/repo',
+        default_cwd: '/registered/primary',
+      });
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand('/workspace/sibling-worktree', {});
+
+    expect(git.getCanonicalRepoPath).toHaveBeenCalledWith('/workspace/sibling-worktree');
+    expect(codebaseDb.findCodebaseByDefaultCwd).toHaveBeenCalledWith('/registered/primary');
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-primary', limit: 20 })
+    );
+    expect(consoleSpy).not.toHaveBeenCalledWith('(not a registered project — showing all runs)');
+  });
+
+  it('preserves a codebase registered at the exact linked-worktree path', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    canonicalSpy.mockClear();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-worktree',
+      name: 'owner/repo-worktree',
+      default_cwd: '/workspace/registered-worktree',
+    });
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand('/workspace/registered-worktree', {});
+
+    expect(canonicalSpy).not.toHaveBeenCalled();
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-worktree', limit: 20 })
+    );
+  });
+
+  it('scopes an external-git-dir worktree through its registered Git identity', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const cwd = '/workspace/external-linked';
+    const commonGitDir = '/metadata/repository';
+    const registered = {
+      id: 'cb-external',
+      name: 'owner/repo',
+      default_cwd: '/workspace/primary',
+      kind: 'repo',
+    };
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new git.CanonicalRepoPathUnavailableError(cwd, commonGitDir)
+    );
+    (git.getGitCheckoutIdentity as ReturnType<typeof mock>)
+      .mockResolvedValueOnce({
+        gitDir: `${commonGitDir}/worktrees/linked`,
+        commonGitDir,
+        linkedWorktree: true,
+      })
+      .mockResolvedValueOnce({
+        gitDir: commonGitDir,
+        commonGitDir,
+        linkedWorktree: false,
+      });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (codebaseDb.listCodebases as ReturnType<typeof mock>).mockResolvedValueOnce([registered]);
+    const listSpy = workflowDb.listDashboardRuns as ReturnType<typeof mock>;
+    listSpy.mockResolvedValueOnce({ runs: [], total: 0, counts: EMPTY_COUNTS });
+
+    await workflowRunsCommand(cwd, {});
+
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-external', limit: 20 })
     );
   });
 
@@ -4236,6 +4939,36 @@ describe('buildDetachedRunCmd', () => {
   // fixture modelled a compiled argv with no argv[1] at all, which is why
   // #2248 (detached child dies with `Unknown command: B:/~BUN/root/...`)
   // shipped green.
+  // `--input` is the first repeatable flag in the tree (#2554). Nothing here handles
+  // repetition specially — argv is forwarded verbatim — so this pins the property a
+  // future change to the argv rebuild could silently break, turning a detached run into
+  // one that starts with its inputs missing instead of failing.
+  it('forwards every repeated --input to the detached child', () => {
+    const cmd = buildDetachedRunCmd(
+      false,
+      '/path/to/bun',
+      [
+        '/path/to/bun',
+        '/abs/cli.ts',
+        'workflow',
+        'run',
+        'review-block',
+        '--input',
+        'diff=D1',
+        '--input',
+        'style=terse',
+        '--detach',
+      ],
+      '/abs/cwd',
+      []
+    );
+
+    expect(cmd.filter(arg => arg === '--input')).toHaveLength(2);
+    expect(cmd).toContain('diff=D1');
+    expect(cmd).toContain('style=terse');
+    expect(cmd).not.toContain('--detach');
+  });
+
   it('binary mode: uses [execPath] only (no duplicated entry arg), drops the Bun SFE virtual argv[1]', () => {
     const cmd = buildDetachedRunCmd(
       true,

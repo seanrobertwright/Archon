@@ -18,6 +18,19 @@ export const workflowRunStatusSchema = z.enum([
 
 export type WorkflowRunStatus = z.infer<typeof workflowRunStatusSchema>;
 
+// ---------------------------------------------------------------------------
+// WorkflowRunOutcome
+// ---------------------------------------------------------------------------
+
+/**
+ * Workflow-authored verdict, independent from engine-owned lifecycle status.
+ * Null on a run means no declared result has been authored yet (or the
+ * workflow does not declare one); it never means failure.
+ */
+export const workflowRunOutcomeSchema = z.enum(['succeeded', 'failed']);
+
+export type WorkflowRunOutcome = z.infer<typeof workflowRunOutcomeSchema>;
+
 /** Statuses that indicate a run has finished and cannot transition further. */
 export const TERMINAL_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
   'completed',
@@ -114,6 +127,7 @@ export const workflowRunSchema = z.object({
   parent_conversation_id: z.string().nullable(),
   codebase_id: z.string().nullable(),
   status: workflowRunStatusSchema,
+  outcome: workflowRunOutcomeSchema.nullable(),
   user_message: z.string(),
   metadata: z.record(z.string(), z.unknown()),
   started_at: z.date(),
@@ -156,11 +170,15 @@ export type WorkflowRun = z.infer<typeof workflowRunSchema>;
  *                    child, which is what distinguishes the two on re-entry.
  * `fan_out_item_hash` — hash of the item the child was spawned with, so a resume can warn
  *                    when a non-deterministic producer changed it under the same index.
+ * `inputs`         — the resolved `with:` map (name → string) the parent supplied (#2470),
+ *                    persisted at spawn so the child's `$INPUTS.<name>` reconstitutes on a
+ *                    cold resume without re-resolving parent refs that may be out of scope.
  */
 export const SUBRUN_METADATA_KEYS = {
   parentNodeId: 'parent_node_id',
   childIndex: 'child_index',
   fanOutItemHash: 'fan_out_item_hash',
+  inputs: 'inputs',
 } as const;
 
 /** Typed view of the sub-run keys on a run's metadata; each is undefined when unset. */
@@ -168,14 +186,29 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
   parentNodeId: string | undefined;
   childIndex: number | undefined;
   fanOutItemHash: string | undefined;
+  inputs: Record<string, string> | undefined;
 } {
   const parentNodeId = metadata?.[SUBRUN_METADATA_KEYS.parentNodeId];
   const childIndex = metadata?.[SUBRUN_METADATA_KEYS.childIndex];
   const fanOutItemHash = metadata?.[SUBRUN_METADATA_KEYS.fanOutItemHash];
+  const rawInputs = metadata?.[SUBRUN_METADATA_KEYS.inputs];
+  // Accept only a plain object of string values; anything else reads as unset. The
+  // writer always stores a Record<string,string>, so a non-conforming value is
+  // corrupt/foreign metadata, not a shape this reader should try to coerce.
+  let inputs: Record<string, string> | undefined;
+  if (
+    typeof rawInputs === 'object' &&
+    rawInputs !== null &&
+    !Array.isArray(rawInputs) &&
+    Object.values(rawInputs as Record<string, unknown>).every(v => typeof v === 'string')
+  ) {
+    inputs = rawInputs as Record<string, string>;
+  }
   return {
     parentNodeId: typeof parentNodeId === 'string' ? parentNodeId : undefined,
     childIndex: typeof childIndex === 'number' ? childIndex : undefined,
     fanOutItemHash: typeof fanOutItemHash === 'string' ? fanOutItemHash : undefined,
+    inputs,
   };
 }
 
@@ -272,24 +305,28 @@ export interface ApprovalContext {
    *
    * Scope note: this is the PAUSING invocation's total, matching what the normal
    * (re-run) completion path reports — a loop that gates more than once attributes each
-   * invocation's usage to that invocation, and EARLIER invocations' usage is reported
-   * nowhere: a pausing invocation never reaches completeWorkflowRun (the status is
-   * `paused`, so the pre-complete status check bails), and `total_tokens_*` are written
-   * only there. So on a twice-gated loop the surviving node row and the run row both
-   * report only the final invocation. That under-report predates this field (before
+   * invocation's usage to that invocation, so on a twice-gated loop the surviving NODE
+   * row reports only the final invocation. That under-report predates this field (before
    * #2333 nothing was persisted at all) and belongs to the "preserve terminal provider
    * stats across a gate" fix tracked by #2345, which also covers the `cost_usd` and
    * resolved-model loss at the same gate.
+   *
+   * The RUN row has the SAME per-invocation attribution, for the same root cause. Since
+   * #2469 the run-tail write is no longer skipped on pause, so a paused run's row does
+   * carry what that invocation spent — but the baseline it adds to (`priorUsage`) is
+   * rebuilt from `node_completed` rows, and a gate pause deliberately writes none. The
+   * metadata merge replaces each key it names rather than adding to it, so a loop that
+   * gates twice leaves the run row reporting only the final invocation. Same fix
+   * boundary as the node row: #2345.
    */
   signaledTokens?: { input: number; output: number } | null;
   /**
-   * Interactive-loop only. Read-once snapshot of a command-backed loop's
-   * (`loop.command`) loaded prompt body, persisted at gate pause so the resumed
-   * invocation reuses the exact text the run started with — a command file
-   * edited or deleted while the run sat paused cannot change or break the
-   * running loop's prompt. Null for prompt-based loops (explicit-null pause
-   * convention, same as `sessionId`). Absent on runs paused by builds that
-   * predate this field — the resume path then falls back to re-reading the file.
+   * Interactive-loop only. Read-once snapshot of the resolved loop prompt
+   * template, whether authored as `loop.prompt` or loaded from `loop.command`,
+   * persisted at gate pause so the resumed invocation reuses the exact text the
+   * run started with. This also takes precedence over an included loop command's
+   * load-time compiled prompt/error after rediscovery. Absent on runs paused by builds
+   * that predate this field; those resume from the current prompt or command source.
    */
   commandSnapshot?: string | null;
 }
@@ -314,8 +351,9 @@ export interface LoopGateRunMetadata {
 /**
  * True when the run's current approval gate has already been resolved
  * (approved, or rejected with a staged on_reject rework) and the run is
- * paused only while awaiting resume. Guards double-approve/reject and the
- * natural-language approval routing.
+ * paused only while awaiting resume. Guards double-approve/reject, and keeps a
+ * resolved gate out of the chat agent's prompt context (#2565) — it is waiting
+ * on the machine, not on a human.
  */
 export function isGateResolved(approval: ApprovalContext): boolean {
   return approval.resolved === 'approved' || approval.resolved === 'rejected';
@@ -356,6 +394,20 @@ export function isRunBlockedOnChild(
     approval.type === 'child_workflow' &&
     approval.childRunId === childRunId
   );
+}
+
+/**
+ * True when `run` executed inside an isolation container.
+ *
+ * Such a run can only be resumed where the docker backend is reachable and the
+ * container can be rewired — the CLI. `executeWorkflow` enforces this: a resume
+ * without a container context fails the run with a CLI pointer rather than
+ * silently running host-side and dropping the write-back. Callers that offer to
+ * continue a run consult this FIRST so they never promise a continuation the
+ * executor will refuse (#2565). Reads defensively from possibly-absent metadata.
+ */
+export function isContainerRun(run: { metadata?: Record<string, unknown> }): boolean {
+  return run.metadata?.isolation === 'container';
 }
 
 // ---------------------------------------------------------------------------

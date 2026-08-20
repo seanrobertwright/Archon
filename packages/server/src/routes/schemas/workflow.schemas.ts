@@ -3,7 +3,10 @@
  */
 import { z } from '@hono/zod-openapi';
 import { workflowDefinitionSchema as engineWorkflowDefinitionSchema } from '@archon/workflows/schemas/workflow';
-import { workflowRunSchema as engineWorkflowRunSchema } from '@archon/workflows/schemas/workflow-run';
+import {
+  workflowRunSchema as engineWorkflowRunSchema,
+  workflowRunOutcomeSchema as engineWorkflowRunOutcomeSchema,
+} from '@archon/workflows/schemas/workflow-run';
 import { workflowEventRowSchema } from '@archon/core/schemas/workflow-event';
 import { dashboardWorkflowRunSchema as coreDashboardWorkflowRunSchema } from '@archon/core/schemas/workflow-run';
 
@@ -109,9 +112,15 @@ export const workflowRunStatusSchema = z
   .enum(['pending', 'running', 'completed', 'failed', 'cancelled', 'paused'])
   .openapi('WorkflowRunStatus');
 
+/** Workflow-authored verdict, independent from lifecycle status. */
+export const workflowRunOutcomeSchema = engineWorkflowRunOutcomeSchema
+  .nullable()
+  .openapi('WorkflowRunOutcome');
+
 /** A workflow run record (wire shape with ISO string dates). */
 export const workflowRunSchema = engineWorkflowRunSchema
   .extend({
+    outcome: workflowRunOutcomeSchema,
     started_at: z.string(),
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),
@@ -221,11 +230,34 @@ export const dashboardRunsResponseSchema = z
   })
   .openapi('DashboardRunsResponse');
 
-/** POST /api/workflows/:name/run request body. */
+/**
+ * POST /api/workflows/:name/run request body.
+ *
+ * NOT WIRED, and deliberately so: `runWorkflowRoute` omits `request.body` because this
+ * route also accepts `multipart/form-data`, which Zod would reject against a JSON schema
+ * (the documented multipart-or-JSON exception in AGENTS.md). Nothing references this
+ * schema, so it contributes nothing to `/api/openapi.json` — `RunWorkflowBody` does not
+ * appear in the generated spec or in `api.generated.d.ts`. The route's real contract is
+ * the hand-written validation in the handler plus the route `description` string; those
+ * are what a caller and the generated client actually see.
+ *
+ * It is kept as the declared shape of the JSON body for a reader, and must be updated
+ * alongside the handler — but do not add a field here believing that publishes it.
+ */
 export const runWorkflowBodySchema = z
   .object({
     conversationId: z.string(),
     message: z.string(),
+    /**
+     * Values for the workflow's declared `inputs:` (#2554), keyed by input name.
+     * Validated against the declaration before any worktree, clone, or AI cost; a
+     * missing required input or an undeclared key is refused. Omit for a workflow that
+     * declares no inputs, or to take every declared default.
+     *
+     * In a `multipart/form-data` request the same map travels as a single `inputs` form
+     * field holding this object JSON-encoded (form fields can only be strings).
+     */
+    inputs: z.record(z.string(), z.string()).optional(),
   })
   .openapi('RunWorkflowBody');
 

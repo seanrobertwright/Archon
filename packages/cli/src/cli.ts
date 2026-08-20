@@ -158,7 +158,14 @@ Options:
   --base <branch>            Per-dispatch base override for epic slices (worktree cut-from + PR target)
   --no-worktree              Run on branch directly without worktree isolation
   --folder                   Register the current non-git directory as a folder project and run in place
+  --input <name>=<value>     Supply a declared workflow input; repeat per input (mutually exclusive with --resume)
   --resume                   Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)
+  --dry-run                  Simulate workflow DAG control flow without creating a run or contacting a provider
+  --stubs <path>             YAML node-output map for --dry-run
+  --stubs-init <path>        Write a complete dry-run stub scaffold and exit
+  --default-stubs            Fill missing reached nodes with validated placeholders during --dry-run
+  --exec-code                Execute trusted bash/script nodes during --dry-run (default: require stubs)
+  --pause-at-gates           Stop a dry-run at approval gates instead of auto-approving
   --spawn                    Open setup wizard in a new terminal window (for setup command)
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
@@ -185,6 +192,7 @@ Examples:
   archon workflow run quick-fix --no-worktree "Fix typo"
   archon workflow run assist --folder "List every repo under this multi-repo root"
   archon workflow run archon-assist --detach "Investigate the flaky test"
+  archon workflow run assist --dry-run --stubs ./stubs.yaml --json
   archon workflow runs --json
   archon workflow get <run-id> --json
   archon workflow resume <run-id>
@@ -310,6 +318,14 @@ async function main(): Promise<number> {
         limit: { type: 'string' },
         effort: { type: 'string' },
         full: { type: 'boolean' },
+        'dry-run': { type: 'boolean' },
+        stubs: { type: 'string' },
+        'stubs-init': { type: 'string' },
+        'default-stubs': { type: 'boolean' },
+        'exec-code': { type: 'boolean' },
+        'pause-at-gates': { type: 'boolean' },
+        // Repeatable: `--input a=1 --input b=2` yields ['a=1', 'b=2'] (#2554).
+        input: { type: 'string', multiple: true },
       },
       allowPositionals: true,
       strict: false, // Allow unknown flags to pass through
@@ -336,6 +352,12 @@ async function main(): Promise<number> {
   const spawnFlag = values.spawn as boolean | undefined;
   const jsonFlag = values.json as boolean | undefined;
   const detachFlag = values.detach as boolean | undefined;
+  const dryRunFlag = values['dry-run'] as boolean | undefined;
+  const stubsPath = values.stubs as string | undefined;
+  const stubsInitPath = values['stubs-init'] as string | undefined;
+  const defaultStubsFlag = values['default-stubs'] as boolean | undefined;
+  const execCodeFlag = values['exec-code'] as boolean | undefined;
+  const pauseAtGatesFlag = values['pause-at-gates'] as boolean | undefined;
   // Handle help flag
   if (values.help) {
     printUsage();
@@ -412,6 +434,10 @@ async function main(): Promise<number> {
       if (repoRoot) {
         // Use repo root as working directory (handles subdirectory case)
         effectiveCwd = repoRoot;
+      } else if (dryRunFlag && command === 'workflow' && subcommand === 'run') {
+        // Dry-run only discovers workflow files and simulates in memory. It does
+        // not need project registration, a database lookup, or a git worktree.
+        effectiveCwd = cwd;
       } else {
         // Not a git repo. It may still be a registered FOLDER project (a
         // multi-repo root or plain ops folder). Consult the DB before rejecting.
@@ -583,12 +609,27 @@ async function main(): Promise<number> {
               conversationId: values['conversation-id'] as string | undefined,
               detach: detachFlag,
               json: jsonFlag,
+              dryRun: dryRunFlag,
+              stubsPath,
+              stubsInitPath,
+              defaultStubs: defaultStubsFlag,
+              execCode: execCodeFlag,
+              pauseAtGates: pauseAtGatesFlag,
+              // Raw `name=value` assignments; parsed at the invocation gate (#2554).
+              inputs: values.input as string[] | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;
           }
 
           case 'status':
+            if (positionals[2] !== undefined) {
+              console.error(
+                'Usage: archon workflow status [--json] [--verbose] [--events]\n' +
+                  'To show a single run, use: archon workflow get <run-id>'
+              );
+              return 1;
+            }
             await workflowStatusCommand(
               jsonFlag,
               values.verbose as boolean | undefined,
@@ -598,7 +639,7 @@ async function main(): Promise<number> {
 
           case 'get': {
             const getRunId = positionals[2];
-            if (!getRunId) {
+            if (!getRunId || positionals[3] !== undefined) {
               console.error('Usage: archon workflow get <run-id> [--json] [--verbose] [--events]');
               return 1;
             }
@@ -741,14 +782,14 @@ async function main(): Promise<number> {
             const eventType = values.type as string | undefined;
             if (!runId) {
               console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
               );
               console.error('Error: --run-id is required');
               return 1;
             }
             if (!eventType) {
               console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
               );
               console.error('Error: --type is required');
               return 1;
@@ -769,7 +810,7 @@ async function main(): Promise<number> {
                 );
               }
             }
-            await workflowEventEmitCommand(runId, eventType, eventData);
+            await workflowEventEmitCommand(runId, eventType, eventData, effectiveCwd);
             break;
           }
 

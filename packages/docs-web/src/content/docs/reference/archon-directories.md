@@ -34,12 +34,15 @@ Archon provides a unified directory and configuration system with:
 │       ├── worktrees/              # Git worktrees for this project (repo kinds only)
 │       ├── artifacts/              # Workflow artifacts — NEVER in git
 │       │   ├── runs/<run-id>/      #   $ARTIFACTS_DIR for one run
+│       │   │   ├── .archon/node-output-spills/  # engine-owned oversized shell handoffs
+│       │   │   │   └── *.nodeoutput
 │       │   │   └── nodes/          #     typed output sidecars (<id>.md + <id>.meta.json)
 │       │   ├── scopes/<workflow>/<scope>/   # cross-invocation artifacts (persist_session)
 │       │   └── uploads/<conv-id>/  #   Web UI file uploads (ephemeral)
 │       ├── logs/<run-id>.jsonl     # Workflow execution logs
 │       └── state/                  # $STATE_DIR — cross-run state, shared per project
 ├── workflows/  commands/  scripts/ # Home-scoped ("global") definitions
+├── temp/                           # Ephemeral scratch (per-simulation dry-run dirs; removed when the run ends)
 ├── worktrees/                      # Legacy global worktrees (repos not in workspaces/)
 ├── vendor/codex/                   # Codex native binary (binary builds, user-placed)
 ├── web-dist/<version>/             # Cached web UI dist (archon serve, binary only)
@@ -57,7 +60,11 @@ Archon provides a unified directory and configuration system with:
   project, and `_cwd/<basename>` when a run has no registered codebase at all. Folder
   projects and `_cwd` projects have no `source/` or `worktrees/` — they run in place.
 - `workspaces/<project>/artifacts/` - Run output. `$ARTIFACTS_DIR` is
-  `artifacts/runs/<run-id>/`.
+  `artifacts/runs/<run-id>/`. Oversized values passed to shell nodes are retained in the
+  engine-owned `.archon/node-output-spills/` child so concurrent runs never share the deferred
+  read and workflow-authored root files remain untouched. Archon currently retains filesystem
+  run artifacts until the operator removes them; `archon workflow cleanup` deletes old database
+  run records, not these directories.
 - `workspaces/<project>/logs/` - One JSONL execution log per run.
 - `workspaces/<project>/state/` - `$STATE_DIR`. Cross-run workflow state, shared by every
   workflow in the project. Survives worktree teardown; never visible to git.
@@ -82,7 +89,7 @@ any-repo/.archon/
 
 **Purpose:**
 - `commands/` - Slash commands (auto-loaded on clone)
-- `workflows/` - YAML workflow definitions, discovered recursively at runtime
+- `workflows/` - YAML workflow definitions in flat, one-level grouped, or exact `<pack>/<workflow>/` packaged layouts
 - `scripts/` - Named scripts referenced by `script:` nodes
 - `config.yaml` - Project-specific settings
 

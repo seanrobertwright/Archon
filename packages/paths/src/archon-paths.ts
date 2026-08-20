@@ -13,6 +13,7 @@
  * │   ├── artifacts/runs/{workflow-id}/  # Workflow artifacts (NEVER in git)
  * │   ├── logs/{workflow-id}.jsonl       # Workflow execution logs
  * │   └── state/                         # $STATE_DIR — cross-run state, shared per project
+ * ├── temp/                              # Ephemeral scratch (per-simulation dry-run dirs)
  * ├── worktrees/                         # Legacy global worktrees (for repos not in workspaces/)
  * └── config.yaml                        # Global config
  *
@@ -147,6 +148,15 @@ export async function ensureArchonWorkspacesPath(): Promise<string> {
  */
 export function getArchonWorktreesPath(): string {
   return join(getArchonHome(), 'worktrees');
+}
+
+/**
+ * Get the ephemeral scratch area (~/.archon/temp/).
+ * Contents are per-process throwaway — each consumer creates a uniquely named
+ * subdirectory and removes it when done (currently: dry-run simulations).
+ */
+export function getArchonTempPath(): string {
+  return join(getArchonHome(), 'temp');
 }
 
 /**

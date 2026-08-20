@@ -15,6 +15,7 @@ import type {
   WorkflowRun,
   WorkflowExecutionResult,
   WorkflowSource,
+  WorkflowRunNodeSession,
 } from './schemas';
 import {
   isLoopNode,
@@ -25,12 +26,15 @@ import {
   isApprovalContext,
   isRunBlockedOnChild,
   SUBRUN_METADATA_KEYS,
+  readSubrunMetadata,
 } from './schemas';
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
-import type { RunChildWorkflowArgs, ChildWorkflowOutcome } from './dag-executor';
+import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
+import { validateWorkflowOutcomeDeclaration } from './loader';
 import { maybeWarnLegacyStatePath, maybeWarnLegacyArtifactsPath } from './state-migration';
 import { resolveWorkflowName } from './router';
+import { resolveDeclaredInputs, defaultRunInputs } from './workflow-inputs';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { keepAwake } from './utils/keep-awake';
@@ -52,8 +56,9 @@ import {
   type SendMessageContext,
 } from './executor-shared';
 import { resolveGithubTokenOverrides } from './utils/github-token-policy';
-import { buildAiProfile, isLiteralSpec, resolveModelSpec } from './model-validation';
-import type { ModelAliasPreset, ResolvedAiProfile } from './model-validation';
+import { buildAiProfile } from './model-validation';
+import type { ResolvedAiProfile } from './model-validation';
+import { assistantModelDefaults, resolveWorkflowModelScope } from './node-model-resolution';
 
 /** The per-user prefs layer as returned by `WorkflowDeps.getUserAiPrefs`. */
 type UserAiPrefsLayer = Awaited<ReturnType<NonNullable<WorkflowDeps['getUserAiPrefs']>>>;
@@ -434,12 +439,14 @@ type ResumePayload =
   | {
       preCreatedRun: WorkflowRun;
       priorCompletedNodes?: Map<string, string>;
-      priorTokenUsage?: { input: number; output: number };
+      priorUsage?: PriorRunUsage;
+      priorNodeSessions?: readonly WorkflowRunNodeSession[];
     }
   | {
       preCreatedRun?: undefined;
       priorCompletedNodes?: undefined;
-      priorTokenUsage?: undefined;
+      priorUsage?: undefined;
+      priorNodeSessions?: undefined;
     };
 
 /**
@@ -537,6 +544,23 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * fallback). Threaded into the child-spawn closure.
    */
   resolveChildIsolation?: ChildIsolationResolver;
+  /**
+   * Declared inputs supplied by a DIRECT top-level invocation (#2554) — the CLI's
+   * `--input name=value`, the run route's `inputs` map, or the console's run form.
+   * Stamped onto the fresh run row's `metadata.inputs`, the same key a `workflow:`
+   * parent writes for its child, so every existing delivery path (`$INPUTS.<name>` on
+   * AI/prompt surfaces, `INPUTS_<UPPER_SNAKE>` for bash/script) works unchanged and the
+   * values survive a cold resume.
+   *
+   * ALREADY RESOLVED by the invocation gate (`resolveTopLevelInputs`), which validates
+   * against the workflow's declared `inputs:` before any worktree, clone, or AI cost —
+   * like `baseOverride` and `parseWarnings`, this is a caller-resolved value. The
+   * executor does not re-validate: it would run after the cost the gate exists to
+   * prevent, and its message would be shaped for the wrong surface.
+   *
+   * Ignored on a resume: the row already carries the inputs validated at creation.
+   */
+  inputs?: Readonly<Record<string, string>>;
 };
 
 /**
@@ -558,7 +582,8 @@ export async function hydrateResumableRun(
 ): Promise<{
   preCreatedRun: WorkflowRun;
   priorCompletedNodes: Map<string, string>;
-  priorTokenUsage: { input: number; output: number };
+  priorUsage: PriorRunUsage;
+  priorNodeSessions: WorkflowRunNodeSession[];
 } | null> {
   const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
   const priorCompletedNodes = snapshot.completedNodeOutputs;
@@ -578,12 +603,21 @@ export async function hydrateResumableRun(
     );
     return null;
   }
+  const completedNodeIds = new Set(priorCompletedNodes.keys());
+  const priorNodeSessions = (await deps.store.listWorkflowRunNodeSessions(candidate.id)).filter(
+    row => completedNodeIds.has(row.node_id)
+  );
   const preCreatedRun = await deps.store.resumeWorkflowRun(candidate.id);
   getLog().info(
     { workflowRunId: preCreatedRun.id, priorCompletedCount: priorCompletedNodes.size },
     'workflow.dag_resuming'
   );
-  return { preCreatedRun, priorCompletedNodes, priorTokenUsage: snapshot.tokens };
+  return {
+    preCreatedRun,
+    priorCompletedNodes,
+    priorUsage: { tokens: snapshot.tokens, costUsd: snapshot.costUsd },
+    priorNodeSessions,
+  };
 }
 
 /** Depth cap on the `workflow:` sub-run tree (D9). A node nested deeper fails fast. */
@@ -653,6 +687,7 @@ async function runChildWorkflow(
     childIndex,
     itemHash,
     resumeFailedChild,
+    inputs,
   } = args;
 
   // Every failure below returns a `{ status: 'failed' }` outcome (never throws);
@@ -712,6 +747,26 @@ async function runChildWorkflow(
     return failOutcome(
       `Sub-run depth cap (${String(CHILD_WORKFLOW_DEPTH_CAP)}) exceeded nesting '${childWorkflow.name}'.`
     );
+  }
+
+  // 2b. Enforce the RESOLVED child's declared `inputs:` contract (#2470) — the exact
+  //     same resolution `include:` performs at load time, through the same shared
+  //     implementation, so a `with:` map accepted by one surface is accepted by the
+  //     other. It can only run here (not at load time) because the target is resolved
+  //     late by design, so it sits before isolation/worktree creation and before the
+  //     child run row exists: a contract violation must never leave an orphan worktree
+  //     or a doomed child row behind.
+  let childInputs: Record<string, string> | undefined;
+  try {
+    const resolved = resolveDeclaredInputs(
+      inputs ?? {},
+      childWorkflow.inputs,
+      `Node '${nodeId}'`,
+      `sub-run workflow '${childWorkflow.name}'`
+    );
+    childInputs = Object.keys(resolved).length > 0 ? resolved : undefined;
+  } catch (err) {
+    return failOutcome((err as Error).message);
   }
 
   // 3. Resolve the child's execution cwd (slice 2, PR-A). `isolation: 'worktree'`
@@ -829,6 +884,14 @@ async function runChildWorkflow(
           // alongside so resume can WARN on a non-deterministic producer (same index, new item).
           ...(childIndex !== undefined ? { [SUBRUN_METADATA_KEYS.childIndex]: childIndex } : {}),
           ...(itemHash !== undefined ? { [SUBRUN_METADATA_KEYS.fanOutItemHash]: itemHash } : {}),
+          // Named inputs (#2470) — persisted at spawn so the child's `$INPUTS.<name>`
+          // resolves from `metadata.inputs` at runtime (resolveRunInputs) and survives a
+          // COLD resume: both resume paths (hydrateResumableRun and the zero-completed-node
+          // resumeWorkflowRun fallback) reload THIS run row, so the map is intact without
+          // re-resolving parent refs that may be out of scope. Stamped only when non-empty.
+          // This is the CONTRACT-RESOLVED map (declared defaults applied), not the raw
+          // caller map — the child must see exactly what its `inputs:` block promises.
+          ...(childInputs !== undefined ? { [SUBRUN_METADATA_KEYS.inputs]: childInputs } : {}),
           // Record the child's own worktree env + branch (mirrors the container path's
           // isolation_env_id) so `isolation list` correlation + PR-E console grouping
           // can find it. Absent for `inherit`/shared-checkout children.
@@ -1098,6 +1161,11 @@ export async function executeWorkflow(
   conversationDbId: string,
   opts: ExecuteWorkflowOptions = {}
 ): Promise<WorkflowExecutionResult> {
+  const outcomeDeclarationError = validateWorkflowOutcomeDeclaration(workflow);
+  if (outcomeDeclarationError !== null) {
+    throw new Error(`Invalid workflow '${workflow.name}': ${outcomeDeclarationError}`);
+  }
+
   const {
     codebaseId,
     issueContext,
@@ -1105,7 +1173,8 @@ export async function executeWorkflow(
     parentConversationId,
     preCreatedRun,
     priorCompletedNodes,
-    priorTokenUsage,
+    priorUsage,
+    priorNodeSessions,
     userId,
     source,
     parseWarnings,
@@ -1114,7 +1183,19 @@ export async function executeWorkflow(
     execContext = { kind: 'host' },
     container: containerCtx,
     resolveChildIsolation,
+    inputs: suppliedInputs,
   } = opts;
+
+  if (preCreatedRun !== undefined) {
+    const foreignPriorNodeSession = priorNodeSessions?.find(
+      row => row.workflow_run_id !== preCreatedRun.id
+    );
+    if (foreignPriorNodeSession !== undefined) {
+      throw new Error(
+        `Cannot resume workflow run '${preCreatedRun.id}' with session state from run '${foreignPriorNodeSession.workflow_run_id}' (node '${foreignPriorNodeSession.node_id}')`
+      );
+    }
+  }
 
   // Guard: a container run MUST be resumed with its container rewired (the CLI does
   // this via backend.resumeEnv, threading a `container` context). A resume that
@@ -1240,44 +1321,52 @@ export async function executeWorkflow(
     });
   }
 
-  // Resolve provider and model once (used by all nodes). Literal model strings
-  // keep the existing workflow/provider/config chain; tier and @alias refs use
-  // the resolved preset provider/model so bundled workflows are portable.
-  let resolvedProvider: string = workflow.provider ?? config.assistant;
-  let resolvedModel: string | undefined;
-  let workflowPreset: ModelAliasPreset | undefined;
-  let providerSource = workflow.provider ? 'workflow definition' : 'config';
-  if (workflow.model) {
-    const workflowModelSpec = resolveModelSpec(aiProfile, workflow.model);
-    if (isLiteralSpec(workflowModelSpec)) {
-      resolvedModel = workflowModelSpec.literal;
-    } else {
-      workflowPreset = workflowModelSpec;
-      if (workflow.provider && workflow.provider !== workflowModelSpec.provider) {
-        getLog().warn(
-          {
-            workflowName: workflow.name,
-            configuredProvider: workflow.provider,
-            resolvedProvider: workflowModelSpec.provider,
-            modelRef: workflow.model,
-          },
-          'workflow.model_provider_conflict'
-        );
-        const delivered = await safeSendMessage(
-          platform,
-          conversationId,
-          `Warning: Workflow '${workflow.name}' sets provider '${workflow.provider}' but model '${workflow.model}' resolves to provider '${workflowModelSpec.provider}' — using '${workflowModelSpec.provider}'.`
-        );
-        if (!delivered) {
-          getLog().error(
-            { workflowName: workflow.name, conversationId },
-            'workflow.model_provider_conflict_warning_delivery_failed'
-          );
-        }
-      }
-      resolvedProvider = workflowModelSpec.provider;
-      resolvedModel = workflowModelSpec.model;
-      providerSource = `model preset '${workflow.model}'`;
+  // Resolve the workflow-level provider/model fallbacks once (used by all nodes) through
+  // the SAME pure function the dry run reports from, so `--dry-run` cannot disagree with
+  // what the run does. Everything the pure function must not do — warn the user, throw —
+  // stays here, mirroring how `resolveNodeProviderAndModel` wraps `resolveNodeModel` one
+  // level down.
+  //
+  // Note that a workflow which came through discovery carries NO workflow-level provider
+  // or model: composition collapses them onto its own nodes and removes the layer (#1764),
+  // so this normally resolves to `config.assistant`. It still has to behave correctly for
+  // a programmatic caller that hands over an unexpanded definition.
+  const scope = resolveWorkflowModelScope(
+    workflow,
+    config.assistant,
+    assistantModelDefaults(config),
+    aiProfile
+  );
+  const resolvedProvider = scope.provider;
+  const resolvedModel = scope.model;
+  const workflowPreset = scope.preset;
+  const providerSource =
+    scope.providerOrigin === 'model ref'
+      ? `model preset '${workflow.model ?? ''}'`
+      : scope.providerOrigin === 'workflow'
+        ? 'workflow definition'
+        : 'config';
+
+  if (workflow.provider && workflowPreset && workflow.provider !== workflowPreset.provider) {
+    getLog().warn(
+      {
+        workflowName: workflow.name,
+        configuredProvider: workflow.provider,
+        resolvedProvider: workflowPreset.provider,
+        modelRef: workflow.model,
+      },
+      'workflow.model_provider_conflict'
+    );
+    const delivered = await safeSendMessage(
+      platform,
+      conversationId,
+      `Warning: Workflow '${workflow.name}' sets provider '${workflow.provider}' but model '${workflow.model ?? ''}' resolves to provider '${workflowPreset.provider}' — using '${workflowPreset.provider}'.`
+    );
+    if (!delivered) {
+      getLog().error(
+        { workflowName: workflow.name, conversationId },
+        'workflow.model_provider_conflict_warning_delivery_failed'
+      );
     }
   }
 
@@ -1289,8 +1378,6 @@ export async function executeWorkflow(
           .join(', ')}`
     );
   }
-  const assistantDefaults = config.assistants[resolvedProvider];
-  resolvedModel ??= assistantDefaults?.model as string | undefined;
 
   getLog().info(
     {
@@ -1310,13 +1397,13 @@ export async function executeWorkflow(
   // preCreatedRun (from hydrateResumableRun) + priorCompletedNodes via opts.
   // When both are absent the executor creates a fresh row below.
   const dagPriorCompletedNodes = priorCompletedNodes;
-  const dagPriorTokenUsage = priorTokenUsage;
+  const dagPriorUsage = priorUsage;
   let workflowRun: WorkflowRun | undefined = preCreatedRun;
 
   if (preCreatedRun && priorCompletedNodes !== undefined) {
     const resumeMsg =
       priorCompletedNodes.size > 0
-        ? `▶️ **Resuming** workflow \`${workflow.name}\` — skipping ${String(priorCompletedNodes.size)} already-completed node(s).\n\nNote: AI session context from prior nodes is not restored. Nodes that depend on prior context may need to re-read artifacts.`
+        ? `▶️ **Resuming** workflow \`${workflow.name}\` — skipping ${String(priorCompletedNodes.size)} already-completed node(s).`
         : `▶️ **Resuming** workflow \`${workflow.name}\` — continuing interactive loop.`;
     await safeSendMessage(platform, conversationId, resumeMsg);
   }
@@ -1338,6 +1425,13 @@ export async function executeWorkflow(
           ...(issueContext ? { github_context: issueContext } : {}),
           ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),
           ...(containerCtx ? { isolation_env_id: containerCtx.envId } : {}),
+          // Declared inputs supplied by a direct top-level invocation (#2554), already
+          // validated by the invocation gate. Written here — inside `if (!workflowRun)` —
+          // so a resume, which arrives with `preCreatedRun` set and never enters this
+          // branch, can never re-stamp or clobber what the original invocation supplied.
+          ...(suppliedInputs && Object.keys(suppliedInputs).length > 0
+            ? { [SUBRUN_METADATA_KEYS.inputs]: { ...suppliedInputs } }
+            : {}),
         },
         parent_conversation_id: parentConversationId,
         user_id: userId,
@@ -1795,6 +1889,28 @@ export async function executeWorkflow(
       // Continue anyway - workflow is already recorded in database
     }
 
+    // Declared-input defaults for a run with no caller (#2470). Runtime `$INPUTS`
+    // otherwise comes only from `metadata.inputs`, which a parent stamps at spawn — so a
+    // workflow started directly (CLI / chat / web) would throw on its own
+    // `$INPUTS.<name>` while the identical workflow invoked as a `workflow:` child
+    // resolved it. Derived from the definition rather than persisted, so it stays
+    // correct across a cold resume and when the defaults are later edited. Any caller-
+    // supplied value already on the row wins; only defaults are filled in.
+    const declaredDefaults = defaultRunInputs(workflow.inputs);
+    const runForDag: WorkflowRun = declaredDefaults
+      ? {
+          ...workflowRun,
+          metadata: {
+            ...(workflowRun.metadata as Record<string, unknown> | undefined),
+            [SUBRUN_METADATA_KEYS.inputs]: {
+              ...declaredDefaults,
+              ...(readSubrunMetadata(workflowRun.metadata as Record<string, unknown> | undefined)
+                .inputs ?? {}),
+            },
+          },
+        }
+      : workflowRun;
+
     // Execute the DAG workflow
     const dagSummary = await executeDagWorkflow(
       deps,
@@ -1802,7 +1918,7 @@ export async function executeWorkflow(
       conversationId,
       cwd,
       workflow,
-      workflowRun,
+      runForDag,
       resolvedProvider,
       resolvedModel,
       artifactsDir,
@@ -1826,7 +1942,8 @@ export async function executeWorkflow(
       // `isolation: 'worktree'` child gets its own worktree cwd.
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
         runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
-      dagPriorTokenUsage
+      dagPriorUsage,
+      priorNodeSessions
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

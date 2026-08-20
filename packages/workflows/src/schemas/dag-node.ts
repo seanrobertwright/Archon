@@ -11,8 +11,21 @@
  * so a flat schema with superRefine is cleaner than a z.union() with implicit discriminants.
  */
 import { z } from '@hono/zod-openapi';
+import { EFFORT_LADDER } from '@archon/providers/effort';
 import { stepRetryConfigSchema } from './retry';
-import { loopNodeConfigSchema, loopControlSchema, type LoopControl } from './loop';
+// Runtime import, but cycle-free: output-ref's only edge back into schemas is a
+// type-only `NodeOutput`, which is erased. Reused rather than reimplemented so
+// `loop.until_field` and the strict `$node.output.field` access agree on what
+// counts as a declared property — a second definition could drift into accepting
+// a name that consumers then reject.
+import { declaredFieldsFromSchema } from '../output-ref';
+import {
+  BASE_COMPLETION_CHANNELS,
+  addMissingChannelIssue,
+  loopNodeConfigSchema,
+  loopControlSchema,
+  type LoopControl,
+} from './loop';
 import { workflowNodeHooksSchema } from './hooks';
 import { isValidCommandName } from '../command-validation';
 
@@ -36,10 +49,20 @@ export const TRIGGER_RULES: readonly TriggerRule[] = triggerRuleSchema.options;
 // Claude SDK option schemas
 // ---------------------------------------------------------------------------
 
-/** Claude Agent SDK effort level — controls reasoning depth. Different from Codex modelReasoningEffort. */
-export const effortLevelSchema = z.enum(['low', 'medium', 'high', 'max']);
+/**
+ * Reasoning depth — the one spelling, on every provider that has the control
+ * (#2556). The vocabulary is the union of the effort-capable SDKs' enums, and
+ * a provider clamps a rung it doesn't offer to the nearest one it does
+ * (`clampEffort` in @archon/providers): Pi takes all six, while `max` → `xhigh`
+ * on Codex/Copilot and `minimal` → `low` on Claude/Copilot. Derived from `EFFORT_LADDER` rather than
+ * restated, so the YAML enum and the clamp cannot disagree.
+ */
+export const effortLevelSchema = z.enum(EFFORT_LADDER);
 
 export type EffortLevel = z.infer<typeof effortLevelSchema>;
+
+/** Canonical list of effort levels — derived from schema, do not duplicate. */
+export const EFFORT_LEVELS: readonly EffortLevel[] = effortLevelSchema.options;
 
 /**
  * Claude Agent SDK beta header list. Non-empty array of non-empty strings —
@@ -137,8 +160,11 @@ export type AgentDefinition = z.infer<typeof agentDefinitionSchema>;
  * machine's `config.yaml`. Highest-precedence layer: node YAML `pi:` > config
  * `nodes.<id>` > assistant-level `assistants.pi.*`. Structurally identical to the
  * providers-side `PiNodeOverride` (@archon/providers/pi/config) — hand-mirrored
- * because @archon/workflows cannot import runtime values from @archon/providers
- * (only the contract subpath @archon/providers/types).
+ * because that module is not reachable from here. The constraint is SDK-free,
+ * not type-only: @archon/workflows may import runtime values from a leaf subpath
+ * with no SDK dependencies (@archon/providers/types, @archon/providers/effort —
+ * see EFFORT_LADDER at the top of this file), but `pi/config` pulls in the Pi
+ * SDK, so this shape stays mirrored.
  *
  * Pi-only, like Claude's `hooks`/`mcp`/`skills`/`agents`. Other providers ignore
  * it; non-AI node types warn it's ignored (see BASH_NODE_AI_FIELDS).
@@ -158,6 +184,20 @@ export const piNodeConfigSchema = z.object({
 
 export type PiNodeConfig = z.infer<typeof piNodeConfigSchema>;
 
+export const nodeContextResumeSchema = z.object({
+  resume: z.string().trim().min(1, "'context.resume' must name a node"),
+});
+
+export const nodeContextSchema = z.union([z.enum(['fresh', 'shared']), nodeContextResumeSchema]);
+
+export type NodeContext = z.infer<typeof nodeContextSchema>;
+
+export function isNodeContextResume(
+  context: NodeContext | undefined
+): context is { resume: string } {
+  return typeof context === 'object' && context !== null && 'resume' in context;
+}
+
 // Kebab-case: no leading/trailing/double hyphens (e.g. `brief-gen`, not `-brief`, `brief-`, `brief--gen`).
 const AGENT_ID_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
@@ -176,7 +216,7 @@ export const dagNodeBaseSchema = z.object({
   trigger_rule: triggerRuleSchema.optional(),
   model: z.string().optional(),
   provider: z.string().trim().min(1).optional(),
-  context: z.enum(['fresh', 'shared']).optional(),
+  context: nodeContextSchema.optional(),
   output_format: z.record(z.string(), z.unknown()).optional(),
   allowed_tools: z.array(z.string()).optional(),
   denied_tools: z.array(z.string()).optional(),
@@ -184,10 +224,7 @@ export const dagNodeBaseSchema = z.object({
   retry: stepRetryConfigSchema.optional(),
   hooks: workflowNodeHooksSchema.optional(),
   mcp: z.string().min(1, "'mcp' must be a non-empty string path").optional(),
-  skills: z
-    .array(z.string().min(1, 'each skill must be a non-empty string'))
-    .nonempty("'skills' must be a non-empty array")
-    .optional(),
+  skills: z.array(z.string().min(1, 'each skill must be a non-empty string')).optional(),
   agents: z
     .record(z.string(), agentDefinitionSchema)
     // Validate agent-id keys in a superRefine rather than via a regex on the
@@ -362,12 +399,24 @@ export type LoopGroupNodeConfig = LoopControl & {
   /** Sub-DAG body re-executed in full each iteration. At least one node required. */
   nodes: DagNode[];
 };
-export const loopGroupNodeConfigSchema: z.ZodType<LoopGroupNodeConfig> = loopControlSchema.extend({
-  /** Sub-DAG body re-executed in full each iteration. At least one node required. */
-  get nodes(): z.ZodArray<typeof dagNodeSchema> {
-    return z.array(dagNodeSchema).min(1, "'loop_group.nodes' must have at least one node");
-  },
-});
+export const loopGroupNodeConfigSchema: z.ZodType<LoopGroupNodeConfig> = loopControlSchema
+  .extend({
+    /** Sub-DAG body re-executed in full each iteration. At least one node required. */
+    get nodes(): z.ZodArray<typeof dagNodeSchema> {
+      return z.array(dagNodeSchema).min(1, "'loop_group.nodes' must have at least one node");
+    },
+  })
+  // A group has TWO completion channels; `loop:` has three (`until_field` is
+  // loop-only — see its field docs). The rule therefore lives on each variant
+  // rather than on the shared control schema. Adding `.superRefine` keeps `.shape`
+  // readable in zod v4, which `loopGroupShape` below depends on.
+  .superRefine((data, ctx) => {
+    addMissingChannelIssue(
+      ctx,
+      [data.until, data.until_bash].filter(v => v !== undefined),
+      BASE_COMPLETION_CHANNELS
+    );
+  });
 
 /**
  * Loop-group node schema — extends base with `loop_group` config (iteration control + body).
@@ -459,7 +508,19 @@ export type CancelNode = z.infer<typeof cancelNodeSchema> & {
  * grammar elsewhere in the tree encodes a different concept and stays separate.
  */
 export const INPUT_NAME_SOURCE = String.raw`[a-zA-Z_][a-zA-Z0-9_-]*`;
-const INPUT_NAME_PATTERN = new RegExp(`^${INPUT_NAME_SOURCE}$`);
+export const INPUT_NAME_PATTERN = new RegExp(`^${INPUT_NAME_SOURCE}$`);
+
+/**
+ * Env-var key an input name is delivered under to bash/script sub-run nodes (#2470):
+ * `INPUTS_` + UPPER_SNAKE(name) (hyphens → underscores, uppercased). Because `-` and
+ * `_` both fold to `_`, two distinct names (`foo-bar`, `foo_bar`) can collide on one
+ * env key — the loader rejects that at load time (all names for one workflow are
+ * visible there). Bash/script bodies read `$INPUTS_<UPPER_SNAKE>`; `$INPUTS.<name>`
+ * text is only substituted into non-shell (AI/prompt) surfaces.
+ */
+export function inputEnvKey(name: string): string {
+  return `INPUTS_${name.replace(/-/g, '_').toUpperCase()}`;
+}
 
 /**
  * Include node schema — a load-time directive that inlines another workflow's
@@ -518,11 +579,10 @@ export type IncludeNode = z.infer<typeof includeNodeSchema> & {
  *      forbids, and racing cannot be reshaped without it. The enum value is retained only
  *      so existing YAML gets a message explaining the rejection.
  *
- * `as` is a forward seam reserved for PR-B (#2214, `with:`/`$INPUTS`): it will name the
- * per-item value as `$INPUTS.<as>` inside the child. The key is accepted here so PR-B
- * needs no schema migration, but until PR-B lands the superRefine REJECTS it at load —
- * it has no runtime effect, and silently ignoring it would deliver a literal
- * `$INPUTS.<as>` to the model. The item travels as the child's `$ARGUMENTS` today.
+ * `as` names the per-item value as `$INPUTS.<as>` inside each child (#2470 lifted the
+ * PR-B/#2214 placeholder now that #2224 merged). It is generally accepted; the superRefine
+ * rejects it only when it collides with a `with:` key of the same name (both would populate
+ * the same `$INPUTS.<name>` slot). When `as` is unset the item still travels as `$ARGUMENTS`.
  */
 export const fanOutConfigSchema = z.object({
   items: z
@@ -556,6 +616,9 @@ export type FanOutConfig = z.infer<typeof fanOutConfigSchema>;
 export const workflowNodeSchema = dagNodeBaseSchema.extend({
   workflow: z.string().min(1, "'workflow' must be a non-empty workflow name"),
   input: z.string().optional(),
+  // Named inputs passed to the child sub-run as `$INPUTS.<name>` (#2470). Mutually
+  // exclusive with `input:`. Same identifier-keyed string-map shape as `include.with`.
+  with: z.record(z.string(), z.string()).optional(),
   isolation: z.enum(['inherit', 'worktree']).optional(),
   fan_out: fanOutConfigSchema.optional(),
 });
@@ -622,10 +685,14 @@ export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
  * the workflow level. `pi` is excluded because the portable per-node Pi posture
  * (#2133) IS threaded into each iteration's sendQuery — the loop is the very
  * node whose extension posture users need to scope (plannotator planning-mode
- * leak, #2073).
+ * leak, #2073). `output_format` is excluded for the same class of reason (#2563):
+ * a `loop:` node makes its own sendQuery, so the schema reaches the provider, each
+ * iteration's payload is validated against it, and `loop.until_field` can terminate
+ * on a declared boolean. It stays listed for `loop_group`, which never calls
+ * sendQuery — its body nodes carry their own.
  */
 export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
-  f => f !== 'model' && f !== 'provider' && f !== 'pi'
+  f => f !== 'model' && f !== 'provider' && f !== 'pi' && f !== 'output_format'
 );
 
 /**
@@ -698,15 +765,10 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   // over a data-driven item list. Only meaningful on a `workflow:` node (guarded in
   // superRefine).
   fan_out: fanOutConfigSchema.optional(),
-  // Raw (not `z.record(z.string(), z.string())`) because the shape is only settled for
-  // ONE of the two modes that care. Include mode validates it in superRefine below and
-  // retains it on the parsed node; workflow mode rejects it outright as unsupported
-  // (phase 2, #2470) and never retains it in any form. Typing the shared flat field to
-  // the include shape now would commit `workflow.with` to a mapping whose phase-2 shape
-  // is still undecided, making a later widening a breaking change. (Note this is NOT the
-  // same situation as `isolation`/`fan_out`, which are typed at the flat level and
-  // rejected per-mode — their shape is settled.) Other node modes strip it with the rest
-  // of their unsupported surface.
+  // Raw (not `z.record(z.string(), z.string())`) so each relevant node mode validates it
+  // contextually. Include and workflow nodes both accept the same identifier-keyed string
+  // map, validate it in superRefine, and retain it in their transform. Other node modes
+  // strip it with the rest of their unsupported surface.
   with: z.unknown().optional(),
   // Script-only
   script: z.string().optional(),
@@ -803,9 +865,19 @@ export const dagNodeSchema = dagNodeFlatSchema
       return z.NEVER;
     }
 
-    // `include.with` is a load-time, identifier-keyed string map. Keep the flat
-    // field raw so other node variants can still strip it contextually.
-    if (hasInclude && data.with !== undefined) {
+    if (isNodeContextResume(data.context) && !hasCommand && !hasPrompt) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'context.resume' is only supported on command and prompt nodes",
+        path: ['context'],
+      });
+    }
+
+    // `with:` is an identifier-keyed string map on BOTH include and workflow nodes
+    // (#2470). For includes it inlines at load time (applyInputsMacro); for sub-runs it
+    // becomes `$INPUTS.<name>` runtime variables on the child. Same shape validation for
+    // both; the flat field stays `z.unknown()` so other node variants strip it contextually.
+    const validateWithShape = (kind: 'include' | 'workflow'): void => {
       const prototype =
         typeof data.with === 'object' && data.with !== null
           ? Object.getPrototypeOf(data.with)
@@ -818,33 +890,39 @@ export const dagNodeSchema = dagNodeFlatSchema
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: "'with' on include nodes must be an object mapping input names to strings",
+          message: `'with' on ${kind} nodes must be an object mapping input names to strings`,
           path: ['with'],
         });
-      } else {
-        for (const [key, value] of Object.entries(data.with)) {
-          if (!INPUT_NAME_PATTERN.test(key)) {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              message: `invalid include input name '${key}'; use letters, numbers, underscores, or hyphens and start with a letter or underscore`,
-              path: ['with'],
-            });
-          }
-          if (typeof value !== 'string') {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              message: `include input '${key}' must be a string`,
-              path: ['with'],
-            });
-          }
+        return;
+      }
+      for (const [key, value] of Object.entries(data.with)) {
+        if (!INPUT_NAME_PATTERN.test(key)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `invalid ${kind} input name '${key}'; use letters, numbers, underscores, or hyphens and start with a letter or underscore`,
+            path: ['with'],
+          });
+        }
+        if (typeof value !== 'string') {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `${kind} input '${key}' must be a string`,
+            path: ['with'],
+          });
         }
       }
-    }
-    if (hasWorkflow && data.with !== undefined) {
+    };
+    if (hasInclude && data.with !== undefined) validateWithShape('include');
+    if (hasWorkflow && data.with !== undefined) validateWithShape('workflow');
+    // A `workflow:` node has ONE input channel per invocation: either the untyped
+    // `input:` string ($ARGUMENTS) or the named `with:` map ($INPUTS.<name>). Accepting
+    // both would require a precedence rule between two overlapping channels — the exact
+    // ambiguity the constitution's smell #5 warns against — so reject them together.
+    if (hasWorkflow && data.with !== undefined && data.input !== undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "'with:' named-parameter mapping is not yet supported on workflow nodes (slice 2). Use 'input:' instead.",
+          "'with:' and 'input:' cannot both be set on a workflow node — 'with:' supplies named $INPUTS, 'input:' supplies the child's $ARGUMENTS. Use one.",
         path: ['with'],
       });
     }
@@ -863,22 +941,53 @@ export const dagNodeSchema = dagNodeFlatSchema
     // injected — never a silent shared-checkout fallback. On every OTHER node type
     // `isolation:` is meaningless (only a `workflow:` node spawns a child run) and
     // would be silently dropped — reject it fail-fast, mirroring the `with:` guard.
-    if (!hasWorkflow && data.isolation !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'isolation' is only supported on workflow (sub-run) nodes.",
-        path: ['isolation'],
-      });
-    }
-    // Dynamic fan-out (slice 2, PR-C) is meaningful ONLY on a `workflow:` node — it
-    // multiplies a child sub-run. On any other node type it would be silently dropped,
-    // so reject it fail-fast (mirrors the `isolation` guard above).
-    if (!hasWorkflow && data.fan_out !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'fan_out' is only supported on workflow (sub-run) nodes.",
-        path: ['fan_out'],
-      });
+    //
+    // On an `include:` node specifically these options are not merely meaningless, they
+    // express a LAUNCH intent composition cannot honour (#1764): an author who writes
+    // `isolation: worktree` on an include believes the block got its own checkout, and it
+    // did not. So the message names the option, why composition cannot honour it, and the
+    // keyword that can — rather than the generic "only on workflow nodes" line.
+    const LAUNCH_ONLY_ON_INCLUDE: readonly (readonly [keyof typeof data, string])[] = [
+      [
+        'isolation',
+        'a composed block runs inside the run that composed it, so it has no checkout of its own to isolate',
+      ],
+      [
+        'fan_out',
+        'composition inlines a fixed set of nodes at load time, so there is nothing to multiply per item',
+      ],
+      [
+        'input',
+        "a composed block reads named values as $INPUTS.<name>, supplied through 'with:' — there is no separate $ARGUMENTS for it",
+      ],
+    ];
+    if (hasInclude) {
+      for (const [field, why] of LAUNCH_ONLY_ON_INCLUDE) {
+        if (data[field] === undefined) continue;
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `'${field}' is not supported on an include node: ${why}. Use a 'workflow:' node instead when you want a separate governed run.`,
+          path: [field],
+        });
+      }
+    } else if (!hasWorkflow) {
+      if (data.isolation !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'isolation' is only supported on workflow (sub-run) nodes.",
+          path: ['isolation'],
+        });
+      }
+      // Dynamic fan-out (slice 2, PR-C) is meaningful ONLY on a `workflow:` node — it
+      // multiplies a child sub-run. On any other node type it would be silently dropped,
+      // so reject it fail-fast (mirrors the `isolation` guard above).
+      if (data.fan_out !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'fan_out' is only supported on workflow (sub-run) nodes.",
+          path: ['fan_out'],
+        });
+      }
     }
     // `first_success` racing is REJECTED, not deferred — the earlier deferral is dead. A
     // winner aborting and cancelling its losers is one child's outcome ending its siblings',
@@ -901,18 +1010,22 @@ export const dagNodeSchema = dagNodeFlatSchema
         path: ['fan_out', 'join'],
       });
     }
-    // `as` names the per-item value for the `$INPUTS.<as>` channel that PR-B (#2214) will
-    // add. Accept the key in the schema (so PR-B lifts a guard rather than migrating YAML)
-    // but reject it fail-fast now, exactly as `first_success` above. `$INPUTS` exists
-    // nowhere in the engine today, so an author writing `as: task` and `$INPUTS.task` in
-    // the child gets the literal string delivered to the model — silently wrong output
-    // with no error. A field that quietly does nothing reads as a working feature.
-    if (hasWorkflow && data.fan_out?.as !== undefined) {
+    // `fan_out.as` names the per-item value as `$INPUTS.<as>` inside each child (#2470
+    // lifts the PR-B/#2214 placeholder — #2224 merged). It is now generally accepted; the
+    // only rejection is a COLLISION with a `with:` key, since both would populate the same
+    // `$INPUTS.<name>` slot on the child with a precedence rule between them — the same
+    // two-channels-one-name ambiguity the `with:`+`input:` guard rejects above.
+    if (
+      hasWorkflow &&
+      data.fan_out?.as !== undefined &&
+      typeof data.with === 'object' &&
+      data.with !== null &&
+      !Array.isArray(data.with) &&
+      Object.prototype.hasOwnProperty.call(data.with, data.fan_out.as)
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message:
-          "'fan_out.as' (the $INPUTS channel) is not yet supported (PR-B, #2214). Remove it — " +
-          "each item is delivered to the child as $ARGUMENTS, which the child's prompts can use today.",
+        message: `'fan_out.as: ${data.fan_out.as}' collides with a 'with:' key of the same name — both would populate $INPUTS.${data.fan_out.as}. Rename one.`,
         path: ['fan_out', 'as'],
       });
     }
@@ -985,6 +1098,65 @@ export const dagNodeSchema = dagNodeFlatSchema
           message: "'timeout' must be a positive number (ms)",
           path: ['timeout'],
         });
+      }
+    }
+
+    // `loop.until_field` <-> `output_format` (#2563). These live here rather than on
+    // loopNodeConfigSchema because only this level can see BOTH the loop config and
+    // the node's `output_format`.
+    //
+    // All four rules are load-time reads of data the author already wrote, and each
+    // converts a silent non-termination into a load error. Without `required`, a
+    // schema-valid payload may omit the property, and "absent" would mean "not
+    // complete" — a model that never emits it would burn max_iterations and then
+    // fail reporting the wrong cause. Without the boolean constraint,
+    // `until_field: status` over a string invites truthiness semantics the engine
+    // deliberately does not have (it terminates on `=== true`, nothing else).
+    const untilField = data.loop?.until_field;
+    if (hasLoop && untilField !== undefined) {
+      const schema = data.output_format;
+      if (schema === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `'loop.until_field' names '${untilField}' but this node declares no 'output_format' — the field must be a declared property of the node's schema`,
+          path: ['loop', 'until_field'],
+        });
+      } else {
+        const declared = declaredFieldsFromSchema(schema);
+        if (!declared?.includes(untilField)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `'loop.until_field' names '${untilField}', which is not declared in this node's output_format properties${declared && declared.length > 0 ? ` (declared: ${declared.join(', ')})` : ''}`,
+            path: ['loop', 'until_field'],
+          });
+        } else {
+          const required = schema.required;
+          if (!Array.isArray(required) || !required.includes(untilField)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `'loop.until_field' names '${untilField}', which must also be listed in output_format.required — an optional field the model omits would silently read as "not complete" and burn max_iterations`,
+              path: ['loop', 'until_field'],
+            });
+          }
+          // `output_format` is free-form JSON Schema (`z.record`), so `type` is
+          // genuinely unknown here — it may be a string, an array of strings
+          // (`type: [boolean, 'null']`), or absent. Only a declared STRING type
+          // other than 'boolean' is a violation; anything else is left to ajv.
+          const properties = schema.properties as Record<string, unknown> | undefined;
+          const property = properties?.[untilField];
+          const rawType =
+            property !== null && typeof property === 'object'
+              ? (property as { type?: unknown }).type
+              : undefined;
+          const declaredType = typeof rawType === 'string' ? rawType : undefined;
+          if (declaredType !== undefined && declaredType !== 'boolean') {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `'loop.until_field' names '${untilField}', declared as type '${declaredType}' — it must be 'boolean'; the loop terminates on the value being exactly true`,
+              path: ['loop', 'until_field'],
+            });
+          }
+        }
       }
     }
 
@@ -1131,6 +1303,10 @@ export const dagNodeSchema = dagNodeFlatSchema
         ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
         workflow: data.workflow.trim(),
         ...(data.input !== undefined ? { input: data.input } : {}),
+        // `with:` supplies named $INPUTS to the child sub-run (#2470), validated in shape
+        // by the superRefine above and mutually exclusive with `input:`. Mirrors the
+        // include transform's `with` assembly.
+        ...(data.with !== undefined ? { with: data.with as Record<string, string> } : {}),
         // Isolation is EXPLICIT-ONLY — never inferred, including from `fan_out`. How many
         // children a node spawns says nothing about whether they write; N review or
         // research children over the shared checkout is the common case. A shared-checkout
@@ -1159,6 +1335,11 @@ export const dagNodeSchema = dagNodeFlatSchema
     return {
       ...base,
       ...(data.pi !== undefined ? { pi: data.pi } : {}),
+      // Kept for the same reason as `pi`: a loop: node runs its own sendQuery, so
+      // the schema reaches the provider and each iteration's payload is validated
+      // against it (#2563). `loop.until_field` then terminates on a declared
+      // boolean, and the node's output becomes the validated JSON.
+      ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
       loop: data.loop,
     } as LoopNode;
   })
@@ -1171,6 +1352,17 @@ export const dagNodeSchema = dagNodeFlatSchema
 /** Type guard: check if a DAG node is a command (named command file) node */
 export function isCommandNode(node: DagNode): node is CommandNode {
   return 'command' in node && typeof node.command === 'string';
+}
+
+/**
+ * Type guard: check if a DAG node is an inline-prompt node.
+ *
+ * Every other member of the union declares `prompt?: never`, so the presence of a
+ * string `prompt` identifies this variant on its own (a loop's prompt lives at
+ * `loop.prompt`, not here).
+ */
+export function isPromptNode(node: DagNode): node is PromptNode {
+  return 'prompt' in node && typeof node.prompt === 'string';
 }
 
 /** Type guard: check if a DAG node is a bash (shell script) node */
@@ -1328,6 +1520,7 @@ export const KNOWN_NODE_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = new Ma
     },
   ],
   ['retry', { kind: 'object', keys: new Set(Object.keys(stepRetryConfigSchema.shape)) }],
+  ['context', { kind: 'object', keys: new Set(Object.keys(nodeContextResumeSchema.shape)) }],
   ['loop', { kind: 'object', keys: new Set(Object.keys(loopNodeConfigSchema.shape)) }],
   ['loop_group', { kind: 'object', keys: new Set(Object.keys(loopGroupShape)) }],
   ['pi', { kind: 'object', keys: new Set(Object.keys(piNodeConfigSchema.shape)) }],

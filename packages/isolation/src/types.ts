@@ -41,15 +41,17 @@ interface IsolationRequestBase {
   codebaseName?: string;
 
   /**
-   * Absolute, resolved filesystem path to the main repository checkout.
+   * Absolute, resolved filesystem path to a registered repository checkout.
    *
    * "Canonical" means the real path with symlinks resolved and `~` expanded
    * (e.g., `/home/user/.archon/workspaces/owner/repo/source`). This must
-   * point to the primary git checkout, not a worktree, because git worktree
-   * operations (add, remove, list) must be executed from the main repo.
+   * This normally points to the primary checkout. A repository created with
+   * `--separate-git-dir` does not record a reverse primary-checkout path, so an
+   * exactly registered linked checkout is also a valid Git worktree-operation
+   * anchor.
    *
-   * Use `getCanonicalRepoPath()` to resolve any path (including worktree
-   * paths) back to the canonical repo path.
+   * Use `getCanonicalRepoPath()` when Git can resolve a primary checkout; keep
+   * an exact registered checkout when it returns its typed unavailable result.
    */
   canonicalRepoPath: RepoPath;
 

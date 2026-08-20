@@ -144,7 +144,7 @@ assistants:
     # claudeBinaryPath: /absolute/path/to/claude
 ```
 
-The `settingSources` option controls which `CLAUDE.md`, skill, command, and agent files the Claude Code SDK loads. The default is `['project', 'user']`, which loads both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. Set it to `['project']` if you want to scope a workflow to project-only resources. Individual workflow nodes can override this with a per-node `settingSources:` field (e.g. `settingSources: []` for a lean node that loads no setting sources at all) — see [Claude SDK Advanced Options](/guides/authoring-workflows/#claude-sdk-advanced-options).
+The `settingSources` option controls where the Claude Code SDK discovers `CLAUDE.md`, skill, command, and agent files. The default is `['project', 'user']`, which includes both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. For workflow skills, discovery is only eligibility: the node's `skills:` list remains the exact active selection, and omission/`[]` activates none. Set `settingSources` to `['project']` to exclude user-level resources, or `[]` for a lean node with no setting sources; a declared skill must live under a source the node enables. See [Claude SDK Advanced Options](/guides/authoring-workflows/#claude-sdk-advanced-options).
 
 ### Set as Default (Optional)
 
@@ -234,6 +234,7 @@ assistants:
   codex:
     model: gpt-5.6-sol
     modelReasoningEffort: medium  # 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+                                  # (install default; a workflow's `effort:` overrides it)
     webSearchMode: live           # 'disabled' | 'cached' | 'live'
     additionalDirectories:
       - /absolute/path/to/other/repo
@@ -249,7 +250,11 @@ DEFAULT_AI_ASSISTANT=codex
 
 ### Skills
 
-Codex supports skills via filesystem auto-discovery from `.agents/skills/`. Run `archon skill install` (or `archon setup`) to install the bundled `archon` and `manage-run` skills for both Claude Code and Codex.
+Codex supports installed skills from `.agents/skills/`. In workflow nodes Archon
+turns the automatic skill catalog off, so commands and prompts invoke a skill
+explicitly with `$skill-name`. Direct Codex chat keeps native discovery behavior.
+Run `archon skill install` (or `archon setup`) to install the bundled `archon`
+and `manage-run` skills for both Claude Code and Codex.
 
 See [Per-Node Skills](/guides/skills/#codex-compatibility) for behavior details and limitations.
 
@@ -542,7 +547,7 @@ nodes:
 | Extensions (community + local) | ✅ (default on) | `enableExtensions: false` to disable; `interactive: false` to load without UI bridge; `extensionFlags: { <name>: true }` per extension. Scope per node with a `pi:` block (`pi: { interactive, enableExtensions, extensionFlags }`) — see [Scoping extension posture per node](#scoping-extension-posture-per-node) |
 | Session resume | ✅ | automatic (Archon persists `sessionId`) |
 | Tool restrictions | ✅ | `allowed_tools` / `denied_tools` (read, bash, edit, write, grep, find, ls) |
-| Thinking level | ✅ | `effort: low\|medium\|high\|max` (max → xhigh) |
+| Thinking level | ✅ | `effort: minimal\|low\|medium\|high\|xhigh\|max` (every rung is Pi-native; nothing is clamped) |
 | Skills | ✅ | `skills: [name]` (searches `.agents/skills`, `.claude/skills`, user-global) |
 | Inline sub-agents | ❌ | `agents:` is Claude-only; ignored with a warning on Pi |
 | System prompt override | ✅ | `systemPrompt:` |
@@ -613,7 +618,7 @@ You can configure Copilot's behavior in `.archon/config.yaml`:
 assistants:
   copilot:
     model: gpt-5-mini             # 'gpt-5', 'gpt-5-mini', 'claude-sonnet-4.5', 'auto', etc.
-    modelReasoningEffort: medium  # 'low' | 'medium' | 'high' | 'xhigh' | 'max' (alias for xhigh)
+    modelReasoningEffort: medium  # 'minimal'..'max' — clamped to the SDK's 'low'..'xhigh'
     # configDir: /absolute/path/to/copilot-config
     # enableConfigDiscovery: false  # only enable for trusted repos — bypasses Archon's workflow MCP/skill validation
     # useLoggedInUser: false        # opt into env-token auth (GH_TOKEN / GITHUB_TOKEN); default uses `copilot login`

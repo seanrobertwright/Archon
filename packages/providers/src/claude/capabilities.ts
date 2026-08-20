@@ -49,6 +49,7 @@ const CLAUDE_RENAMED_TOOLS = {
 
 export const CLAUDE_CAPABILITIES: ProviderCapabilities = {
   sessionResume: true,
+  sessionFork: true,
   mcp: true,
   hooks: true,
   skills: true,

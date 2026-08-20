@@ -1515,7 +1515,7 @@ export interface paths {
     put?: never;
     /**
      * Run a workflow via the orchestrator (JSON or multipart with file uploads)
-     * @description Accepts `application/json` with `{ conversationId, message }` or `multipart/form-data` with `conversationId`, `message`, and optional file attachments (max 5 files, 10 MB each).
+     * @description Accepts `application/json` with `{ conversationId, message, inputs? }` or `multipart/form-data` with `conversationId`, `message`, an optional `inputs` field holding the same map JSON-encoded, and optional file attachments (max 5 files, 10 MB each). `inputs` supplies values for the workflow's declared `inputs:` (#2554); it is validated against the declaration before any worktree, clone, or AI cost, so a missing required input or an undeclared key is refused up front.
      */
     post: {
       parameters: {
@@ -3294,7 +3294,7 @@ export interface components {
       webSearchMode?: 'disabled' | 'cached' | 'live';
       interactive?: boolean;
       /** @enum {string} */
-      effort?: 'low' | 'medium' | 'high' | 'max';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       thinking?:
         | {
             /** @enum {string} */
@@ -3357,6 +3357,15 @@ export interface components {
       persist_sessions?: boolean;
       tags?: string[];
       requires?: 'github'[];
+      inputs?: {
+        [key: string]: {
+          required?: boolean;
+          default?: string;
+          description?: string;
+        };
+      };
+      returns?: string;
+      outcome_field?: string;
       nodes: components['schemas']['DagNode'][];
     };
     DagNode: {
@@ -3368,8 +3377,11 @@ export interface components {
       trigger_rule?: 'all_success' | 'one_success' | 'none_failed_min_one_success' | 'all_done';
       model?: string;
       provider?: string;
-      /** @enum {string} */
-      context?: 'fresh' | 'shared';
+      context?:
+        | ('fresh' | 'shared')
+        | {
+            resume: string;
+          };
       output_format?: {
         [key: string]: unknown;
       };
@@ -3552,7 +3564,7 @@ export interface components {
         };
       };
       /** @enum {string} */
-      effort?: 'low' | 'medium' | 'high' | 'max';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       thinking?:
         | {
             /** @enum {string} */
@@ -3610,7 +3622,7 @@ export interface components {
       prompt?: string;
       bash?: string;
       loop?: {
-        until: string;
+        until?: string;
         max_iterations: number;
         /** @default false */
         fresh_context: boolean;
@@ -3620,9 +3632,10 @@ export interface components {
         signal_completes?: boolean;
         prompt?: string;
         command?: string;
+        until_field?: string;
       };
       loop_group?: {
-        until: string;
+        until?: string;
         max_iterations: number;
         /** @default false */
         fresh_context: boolean;
@@ -3693,6 +3706,8 @@ export interface components {
       codebase_id: string | null;
       /** @enum {string} */
       status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+      /** @enum {string|null} */
+      outcome: 'succeeded' | 'failed' | null;
       user_message: string;
       metadata: {
         [key: string]: unknown;
@@ -3745,6 +3760,7 @@ export interface components {
       codebase_id: string | null;
       /** @enum {string} */
       status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+      outcome: components['schemas']['WorkflowRunOutcome'];
       user_message: string;
       metadata: {
         [key: string]: unknown;
@@ -3757,6 +3773,8 @@ export interface components {
       parent_run_id: string | null;
       output_root: string | null;
     };
+    /** @enum {string|null} */
+    WorkflowRunOutcome: 'succeeded' | 'failed' | null;
     WorkflowRunByWorkerResponse: {
       run: components['schemas']['WorkflowRun'];
     };
@@ -3888,6 +3906,7 @@ export interface components {
     };
     ProviderCapabilities: {
       sessionResume: boolean;
+      sessionFork?: boolean;
       mcp: boolean;
       hooks: boolean;
       skills: boolean;

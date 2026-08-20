@@ -35,20 +35,32 @@ import {
   readTierNoticeState,
   markTierNoticeShown,
 } from '@archon/paths';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
+import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
-import { assertWorkflowRequirementsMet } from '@archon/workflows/utils/workflow-requirements';
+import {
+  assertWorkflowRequirementsMet,
+  resolveTopLevelInputs,
+} from '@archon/workflows/utils/workflow-requirements';
+import { parseInputAssignments } from '@archon/workflows/workflow-inputs';
+import {
+  dryRunWorkflow,
+  formatDryRunTrace,
+  loadDryRunStubs,
+  writeDryRunStubScaffold,
+} from '@archon/workflows/dry-run';
 import {
   getWorkflowEventEmitter,
   type WorkflowEmitterEvent,
 } from '@archon/workflows/event-emitter';
 import type {
+  DeclaredWorkflowConfig,
   WorkflowDefinition,
   WorkflowLoadResult,
   WorkflowSource,
@@ -210,6 +222,26 @@ export interface WorkflowRunOptions {
    * `--json` alone still suppresses CLI logs but does not change the output).
    */
   json?: boolean;
+  /** Simulate deterministic DAG control flow without creating run state or contacting a provider. */
+  dryRun?: boolean;
+  /** YAML mapping of node ids to scalar or structured simulated outputs. */
+  stubsPath?: string;
+  /** Write a complete YAML stub scaffold for the discovered workflow and exit. */
+  stubsInitPath?: string;
+  /** Fill reached nodes missing from the supplied stub map with validated placeholders. */
+  defaultStubs?: boolean;
+  /** Execute reachable bash/script nodes locally instead of requiring stubs. */
+  execCode?: boolean;
+  /** Stop at the first approval gate instead of auto-approving it. */
+  pauseAtGates?: boolean;
+  /**
+   * Raw `--input name=value` assignments (#2554), one per occurrence of the flag.
+   * Parsed and validated against the workflow's declared `inputs:` at the invocation
+   * gate — before the `--detach` fork and before any worktree, clone, or AI cost.
+   * Kept as raw strings here so the grammar has exactly one parser
+   * (`parseInputAssignments` in `@archon/workflows`).
+   */
+  inputs?: string[];
 }
 
 /**
@@ -573,17 +605,20 @@ async function assertCliWorkflowRequirementsMet(workflow: WorkflowDefinition): P
  * of falling back to a stale conversation default.
  */
 function resolveTitleAssistantType(
-  workflow: WorkflowDefinition,
+  declared: DeclaredWorkflowConfig | undefined,
   defaultAssistant: string | undefined,
   conversationAssistant: string | undefined
 ): string {
-  // Per CLAUDE.md, provider is resolved via an explicit chain:
-  // node.provider ?? workflow.provider ?? config.assistant. Model never
-  // influences provider selection — vendor SDKs add new model names faster
-  // than we can keep a mapping in sync.
+  // Reads what the AUTHOR declared, not the expanded definition: expansion collapses
+  // workflow-level config onto the nodes and removes it (#1764), so the expanded object
+  // has no `provider` and every Codex workflow would be labelled with the fallback.
+  //
+  // The top-level file's own `provider:` is the right answer even though a composition
+  // can span providers — no single label is fully true then, and the file the user
+  // invoked is the honest one. Model never influences provider selection: vendor SDKs
+  // add model names faster than a mapping could track.
   const fallbackAssistant = defaultAssistant ?? conversationAssistant ?? 'claude';
-  if (workflow.provider) return workflow.provider;
-  return fallbackAssistant;
+  return declared?.provider ?? fallbackAssistant;
 }
 
 /**
@@ -790,7 +825,10 @@ interface WorkflowJsonEntry {
   description: string;
   provider?: string;
   model?: string;
-  modelReasoningEffort?: string;
+  /** Reasoning depth — the one spelling, on every provider that has one (#2556).
+   *  A workflow written with the deprecated `modelReasoningEffort:` reports its
+   *  value here, since the loader translates the two into one field. */
+  effort?: string;
   webSearchMode?: string;
   /** Keys the workflow's YAML declares that the engine drops (#2213). */
   parseWarnings?: string[];
@@ -804,19 +842,24 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 
   if (json) {
     const output = {
-      workflows: workflowEntries.map(({ workflow: w, parseWarnings }) => {
-        const entry: WorkflowJsonEntry = {
-          name: w.name,
-          description: w.description,
-        };
-        if (w.provider !== undefined) entry.provider = w.provider;
-        if (w.model !== undefined) entry.model = w.model;
-        if (w.modelReasoningEffort !== undefined)
-          entry.modelReasoningEffort = w.modelReasoningEffort;
-        if (w.webSearchMode !== undefined) entry.webSearchMode = w.webSearchMode;
-        if (parseWarnings && parseWarnings.length > 0) entry.parseWarnings = [...parseWarnings];
-        return entry;
-      }),
+      // `declared` rather than the expanded workflow: composition collapses these fields
+      // onto the nodes and removes them (#1764), so the listing reports what the author
+      // wrote. `webSearchMode` is the one that stays on the definition — it has no
+      // per-node form to collapse onto.
+      workflows: workflowEntries.map(
+        ({ workflow: w, parseWarnings, declared }): WorkflowJsonEntry => {
+          const entry: WorkflowJsonEntry = {
+            name: w.name,
+            description: w.description,
+          };
+          if (declared?.provider !== undefined) entry.provider = declared.provider;
+          if (declared?.model !== undefined) entry.model = declared.model;
+          if (declared?.effort !== undefined) entry.effort = declared.effort;
+          if (w.webSearchMode !== undefined) entry.webSearchMode = w.webSearchMode;
+          if (parseWarnings && parseWarnings.length > 0) entry.parseWarnings = [...parseWarnings];
+          return entry;
+        }
+      ),
       errors: errors.map(e => ({
         filename: e.filename,
         error: e.error,
@@ -838,11 +881,11 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
   if (workflowEntries.length > 0) {
     console.log(`\nFound ${workflowEntries.length} workflow(s):\n`);
 
-    for (const { workflow, parseWarnings } of workflowEntries) {
+    for (const { workflow, parseWarnings, declared } of workflowEntries) {
       console.log(`  ${workflow.name}`);
       console.log(`    ${workflow.description}`);
-      if (workflow.provider) {
-        console.log(`    Provider: ${workflow.provider}`);
+      if (declared?.provider) {
+        console.log(`    Provider: ${declared.provider}`);
       }
       for (const warning of parseWarnings ?? []) {
         console.log(`    Warning: ${warning}`);
@@ -920,6 +963,112 @@ export async function workflowRunCommand(
   // dropped key can be a gate the author believes is protecting the run.
   emitParseWarnings(workflowEntry?.parseWarnings, workflow.name);
 
+  const dryRunOnlyOptions = [
+    ['--stubs', options.stubsPath !== undefined],
+    ['--stubs-init', options.stubsInitPath !== undefined],
+    ['--default-stubs', options.defaultStubs === true],
+    ['--exec-code', options.execCode === true],
+    ['--pause-at-gates', options.pauseAtGates === true],
+  ] as const;
+  const optionWithoutDryRun = dryRunOnlyOptions.find(([, present]) => present)?.[0];
+  if (!options.dryRun && optionWithoutDryRun) {
+    throw new Error(`${optionWithoutDryRun} requires --dry-run.`);
+  }
+
+  if (options.dryRun) {
+    const incompatible = [
+      ['--branch', options.branchName !== undefined],
+      ['--from/--from-branch', options.fromBranch !== undefined],
+      ['--base', options.baseBranch !== undefined],
+      ['--no-worktree', options.noWorktree === true],
+      ['--folder', options.folder === true],
+      ['--container', options.container === true],
+      ['--resume', options.resume === true],
+      ['--detach', options.detach === true],
+    ] as const;
+    const incompatibleFlag = incompatible.find(([, present]) => present)?.[0];
+    if (incompatibleFlag) {
+      throw new Error(`--dry-run cannot be combined with ${incompatibleFlag}.`);
+    }
+    if (options.stubsInitPath !== undefined && options.stubsPath !== undefined) {
+      throw new Error('--stubs-init cannot be combined with --stubs.');
+    }
+    if (options.stubsInitPath !== undefined && options.defaultStubs) {
+      throw new Error('--stubs-init cannot be combined with --default-stubs.');
+    }
+
+    // The IDENTICAL invocation gate a real run passes through below (#2610): parse
+    // `--input name=value`, validate against the declared `inputs:` contract, and fail
+    // with the same errors (undeclared key, missing required) before any trace output.
+    // Only the supplied entries travel; the simulator derives declared defaults itself,
+    // mirroring the executor's `defaultRunInputs` merge at run start.
+    const dryRunInputs = resolveTopLevelInputs(
+      workflow,
+      options.inputs ? parseInputAssignments(options.inputs) : undefined
+    );
+
+    const stubsPath = options.stubsPath
+      ? isAbsolute(options.stubsPath)
+        ? options.stubsPath
+        : join(effectiveDiscoveryCwd, options.stubsPath)
+      : undefined;
+    const stubsInitPath = options.stubsInitPath
+      ? isAbsolute(options.stubsInitPath)
+        ? options.stubsInitPath
+        : join(effectiveDiscoveryCwd, options.stubsInitPath)
+      : undefined;
+    if (stubsInitPath !== undefined) {
+      const scaffold = await writeDryRunStubScaffold(workflow, stubsInitPath);
+      const nodeCount = Object.keys(scaffold).length;
+      if (options.json) {
+        await writeJsonLine({ workflow: workflow.name, stubsPath: stubsInitPath, nodeCount });
+      } else {
+        await writeStdout(
+          `Created dry-run stub scaffold for ${workflow.name}: ${stubsInitPath} (${String(nodeCount)} nodes)\n`
+        );
+      }
+      return;
+    }
+    const stubs = await loadDryRunStubs(stubsPath);
+    // The install's config + AI profile are what make the per-node provider/model report
+    // match a real run — tier keywords and `@alias` refs resolve through the same profile
+    // the executor builds.
+    //
+    // NOT wrapped in a catch: `loadConfig` returns defaults when there is no config file,
+    // so a throw means a malformed or unreadable one. Reporting against fabricated
+    // defaults would hand the user a clean-looking trace of a run that cannot happen —
+    // the same fail-fast reasoning the container-policy load below spells out.
+    const dryRunConfig = await loadConfig(effectiveDiscoveryCwd);
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage,
+      cwd: effectiveDiscoveryCwd,
+      stubs,
+      ...(dryRunInputs ? { inputs: dryRunInputs } : {}),
+      execCode: options.execCode,
+      defaultStubs: options.defaultStubs,
+      pauseAtGates: options.pauseAtGates,
+      config: dryRunConfig,
+      aiProfile: buildAiProfile(dryRunConfig.assistant, {
+        repoTiers: dryRunConfig.tiers,
+        repoAliases: dryRunConfig.aliases,
+      }),
+    });
+    if (options.json) {
+      await writeJsonLine(result);
+    } else {
+      await writeStdout(`${formatDryRunTrace(result)}\n`);
+    }
+    if (result.outcome === 'failed') {
+      throw new Error(
+        result.missingStubs.length > 0
+          ? `Dry-run failed; missing stubs: ${result.missingStubs.join(', ')}`
+          : 'Dry-run failed. See the trace for details.'
+      );
+    }
+    return;
+  }
+
   // Validate mutually exclusive flags (defensive — cli.ts checks these for UX, but
   // workflowRunCommand is the authoritative boundary for programmatic callers)
   if (options.branchName !== undefined && options.noWorktree) {
@@ -946,6 +1095,13 @@ export async function workflowRunCommand(
       '--resume and --branch are mutually exclusive.\n' +
         '  --resume reuses the existing worktree from the failed run.\n' +
         '  Remove --branch when using --resume.'
+    );
+  }
+  if (options.resume && options.inputs !== undefined && options.inputs.length > 0) {
+    throw new Error(
+      '--resume and --input are mutually exclusive.\n' +
+        "  A resume replays the original invocation's inputs, recorded on the run.\n" +
+        '  Drop --input to resume, or start a fresh run to supply different values.'
     );
   }
 
@@ -1013,6 +1169,22 @@ export async function workflowRunCommand(
   // codebase lookup below. Fail fast — never silently ignore the flags.
   assertNoWorktreeOptionsForFolder(options.folder === true, options);
   assertWorkflowNotWorktreePinnedForFolder(options.folder === true, pinnedEnabled, workflow.name);
+
+  // Signature gate (#2470, #2554): resolve this invocation's declared inputs from the
+  // `--input name=value` flags against the workflow's `inputs:` block, here — before the
+  // --detach fork and any worktree/clone/AI cost — so a bad name, a missing required
+  // input, or a malformed assignment costs nothing.
+  //
+  // Skipped on --resume: the resumable run is not resolved until later in this function,
+  // and its inputs were validated when its row was created. Re-gating with nothing
+  // supplied would make every resume of a required-input run impossible.
+  let resolvedInputs: Record<string, string> | undefined;
+  if (!options.resume) {
+    resolvedInputs = resolveTopLevelInputs(
+      workflow,
+      options.inputs ? parseInputAssignments(options.inputs) : undefined
+    );
+  }
 
   // Capability gate: hard-fail before the --detach fork and any worktree/clone/
   // AI cost if the workflow declares `requires: [github]` and the acting CLI
@@ -1613,7 +1785,7 @@ export async function workflowRunCommand(
 
     try {
       const titleAssistantType = resolveTitleAssistantType(
-        workflow,
+        workflowEntry?.declared,
         workflowConfig?.assistant,
         conversation.ai_assistant_type
       );
@@ -1840,6 +2012,8 @@ export async function workflowRunCommand(
           execContext,
           container: containerRunCtx,
           resolveChildIsolation,
+          // Fresh run only: a resume (`prepared`) replays the inputs already on its row.
+          inputs: resolvedInputs,
         };
     result = await executeWorkflow(
       deps,
@@ -2290,17 +2464,17 @@ export async function workflowGetCommand(
   console.log(`  Status: ${run.status}`);
   console.log(`  Age:    ${formatAge(run.started_at)}`);
   // Paused interactive-loop gate: one honest line so a human (or an agent parsing
-  // the plain output) sees whether the paused iteration emitted its completion
-  // signal (#2074). --json already carries the full metadata.approval.
+  // the plain output) sees whether any declared completion condition completed
+  // the paused iteration (#2074). --json already carries the full metadata.approval.
   const gateMeta = run.metadata.approval;
   if (
     run.status === 'paused' &&
     isApprovalContext(gateMeta) &&
     gateMeta.type === 'interactive_loop'
   ) {
-    const signal = gateMeta.completionSignaled === true ? 'yes' : 'no';
+    const completionMet = gateMeta.completionSignaled === true ? 'yes' : 'no';
     console.log(
-      `  Gate:   awaiting approval — signal detected: ${signal} (iteration ${String(gateMeta.iteration ?? '?')})`
+      `  Gate:   awaiting approval — completion condition met: ${completionMet} (iteration ${String(gateMeta.iteration ?? '?')})`
     );
   }
   const runError = typeof run.metadata.error === 'string' ? run.metadata.error : undefined;
@@ -2365,14 +2539,17 @@ export async function workflowRunsCommand(
     statusFilter = parsed.data;
   }
 
-  // Scope to this project by resolving the codebase from cwd (mirror
-  // workflowRunCommand). --all opts out of scoping. A lookup failure or an
-  // unregistered cwd both fall back to the global list — never a silent
-  // wrong-scope (the human path prints an explicit note below).
+  // Scope to this project by exact registration first, then through the
+  // checkout's canonical repository path. This preserves an explicitly
+  // registered linked worktree while allowing another linked worktree to share
+  // its registered primary checkout. Ordinary clones remain unchanged (#2613).
+  // --all opts out of scoping. A lookup failure or an unregistered cwd both
+  // fall back to the global list — never a silent wrong-scope (the human path
+  // prints an explicit note below).
   let codebase = null;
   if (!opts.all) {
     try {
-      codebase = await codebaseDb.findCodebaseByDefaultCwd(cwd);
+      codebase = await findCodebaseForCheckoutPath(cwd);
     } catch (error) {
       getLog().warn({ err: error as Error, cwd }, 'cli.workflow_runs_codebase_lookup_failed');
     }
@@ -2455,23 +2632,45 @@ const FULL_RUN_ID_RE =
  * codebase, a unique match resolves, and an ambiguous prefix errors.
  *
  * Full UUIDs skip resolution entirely — exact lookup is global, so full ids
- * keep working from any directory. When `cwd` is omitted, the cwd is not a
- * registered project, or the prefix matches nothing in this project, the
- * argument passes through unchanged so the downstream exact lookup keeps its
- * existing error surface (intentional fallback: it preserves behavior for
- * runs of other projects and non-UUID ids rather than guessing).
+ * keep working from any directory. Project lookup preserves an exact checkout
+ * registration, then falls back to a linked worktree's canonical checkout. By
+ * default, an omitted or unregistered cwd and an unmatched prefix pass through
+ * unchanged so the downstream exact lookup keeps its existing error surface.
+ * Callers without a downstream lookup can require a match instead.
  */
-async function resolveRunIdArg(runId: string, cwd?: string): Promise<string> {
-  if (cwd === undefined || FULL_RUN_ID_RE.test(runId)) return runId;
-  const codebase = await codebaseDb.findCodebaseByDefaultCwd(cwd);
-  if (!codebase) return runId;
+async function resolveRunIdArg(
+  runId: string,
+  cwd?: string,
+  requirePrefixMatch = false
+): Promise<string> {
+  if (FULL_RUN_ID_RE.test(runId)) return runId;
+  if (cwd === undefined) {
+    if (requirePrefixMatch) {
+      throw new Error(`Cannot resolve run id prefix '${runId}' without a project directory.`);
+    }
+    return runId;
+  }
+  const codebase = await findCodebaseForCheckoutPath(cwd);
+  if (!codebase) {
+    if (requirePrefixMatch) {
+      throw new Error(`Cannot resolve run id prefix '${runId}' outside a registered project.`);
+    }
+    return runId;
+  }
   const matches = await workflowDb.findWorkflowRunsByIdPrefix(runId, codebase.id);
   if (matches.length > 1) {
+    const candidates = matches.map(match => `  ${match.id}`).join('\n');
     throw new Error(
-      `Run id '${runId}' matches more than one run in this project — use more characters or the full id (from 'archon workflow runs --json').`
+      `Run id '${runId}' matches more than one run in this project:\n${candidates}\nUse more characters or the full id.`
     );
   }
-  return matches[0]?.id ?? runId;
+  if (matches.length === 0) {
+    if (requirePrefixMatch) {
+      throw new Error(`No workflow run matches prefix '${runId}' in this project.`);
+    }
+    return runId;
+  }
+  return matches[0].id;
 }
 
 async function resolveDiscoveryCwdForCodebase(
@@ -2680,7 +2879,8 @@ export async function workflowApproveCommand(
   const resolvedId = await resolveRunIdArg(runId, cwd);
   const result = await approveWorkflow(resolvedId, comment);
 
-  // CLI auto-resumes after approval (unlike chat, which defers to next user message)
+  // CLI auto-resumes after approval, as chat does since #2565. `--json` (handled
+  // above) is the one surface that records the decision without continuing.
   if (!result.workingPath) {
     throw new Error(
       `Workflow run '${resolvedId}' has no working path recorded.\n` +
@@ -2916,7 +3116,8 @@ export async function workflowCleanupCommand(days: number): Promise<void> {
 
 /**
  * Emit a workflow event directly to the database.
- * Non-throwing: mirrors the fire-and-forget contract of createWorkflowEvent.
+ * Event persistence mirrors createWorkflowEvent's fire-and-forget contract;
+ * run-id resolution can still fail before the event reaches the store.
  */
 export function isValidEventType(value: string): value is WorkflowEventType {
   return (WORKFLOW_EVENT_TYPES as readonly string[]).includes(value);
@@ -2925,17 +3126,19 @@ export function isValidEventType(value: string): value is WorkflowEventType {
 export async function workflowEventEmitCommand(
   runId: string,
   eventType: WorkflowEventType,
-  data?: Record<string, unknown>
+  data?: Record<string, unknown>,
+  cwd?: string
 ): Promise<void> {
+  const resolvedId = await resolveRunIdArg(runId, cwd, true);
   const store = createWorkflowStore();
   await store.createWorkflowEvent({
-    workflow_run_id: runId,
+    workflow_run_id: resolvedId,
     event_type: eventType,
     data,
   });
   // createWorkflowEvent is non-throwing (fire-and-forget) — the event may not
   // have been persisted if the DB was unavailable. Check server logs if missing.
-  console.log(`Event submitted (best-effort): ${eventType} for run ${runId}`);
+  console.log(`Event submitted (best-effort): ${eventType} for run ${resolvedId}`);
 }
 
 // ─── Marketplace commands ────────────────────────────────────────────────────

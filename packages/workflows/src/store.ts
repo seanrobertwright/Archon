@@ -7,12 +7,14 @@
  */
 import type {
   WorkflowRun,
+  WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
   WorkflowNodeSession,
+  WorkflowRunNodeSession,
 } from './schemas';
 
-export type { WorkflowNodeSession } from './schemas';
+export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 
 export interface DagResumeSnapshot {
   completedNodeOutputs: Map<string, string>;
@@ -20,6 +22,8 @@ export interface DagResumeSnapshot {
     input: number;
     output: number;
   };
+  /** Cumulative USD cost of the run's already-completed nodes across prior passes. */
+  costUsd: number;
 }
 
 /** Composite primary key identifying a single persisted node session row. */
@@ -112,7 +116,17 @@ export interface IRunTreeStore {
   getRunAncestry(runId: string): Promise<WorkflowRun[]>;
 }
 
-export interface IWorkflowStore extends IRunTreeStore {
+export interface IWorkflowRunNodeSessionStore {
+  listWorkflowRunNodeSessions(workflowRunId: string): Promise<readonly WorkflowRunNodeSession[]>;
+  upsertWorkflowRunNodeSession(params: {
+    workflow_run_id: string;
+    node_id: string;
+    provider: string;
+    provider_session_id: string;
+  }): Promise<void>;
+}
+
+export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionStore {
   // Run lifecycle
   createWorkflowRun(data: {
     workflow_name: string;
@@ -167,7 +181,9 @@ export interface IWorkflowStore extends IRunTreeStore {
    */
   updateWorkflowRun(
     id: string,
-    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>>
+    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+      outcome?: WorkflowRunOutcome;
+    }
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;

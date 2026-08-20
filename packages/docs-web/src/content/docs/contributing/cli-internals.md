@@ -193,7 +193,7 @@ packages/cli/
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ archon workflow event emit --run-id <uuid> --type <type> [...]   │
+│ archon workflow event emit --run-id <run-id> --type <type> [...] │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
@@ -205,9 +205,11 @@ packages/cli/
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ workflow.ts  workflowEventEmitCommand(runId, eventType, data?)   │
+│ workflow.ts  workflowEventEmitCommand(..., cwd)                   │
+│              Resolve an unambiguous run-id prefix                 │
 │              createWorkflowStore().createWorkflowEvent(...)       │
-│              Non-throwing (fire-and-forget)                       │
+│              Persistence is non-throwing (fire-and-forget)        │
+│              Run-ID resolution may fail                           │
 └──────────────────────────────────────────────────────────────────┘
 ```
 

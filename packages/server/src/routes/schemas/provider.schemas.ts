@@ -7,6 +7,7 @@ import { z } from '@hono/zod-openapi';
 const providerCapabilitiesSchema = z
   .object({
     sessionResume: z.boolean(),
+    sessionFork: z.boolean().optional(),
     mcp: z.boolean(),
     hooks: z.boolean(),
     skills: z.boolean(),
