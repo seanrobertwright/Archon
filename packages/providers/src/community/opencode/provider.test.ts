@@ -415,7 +415,7 @@ describe('OpencodeProvider', () => {
           output: 7,
           cacheRead: 5,
           cacheWrite: 0,
-          total: 21,
+          total: 26,
           cost: 0.42,
         },
         cost: 0.42,

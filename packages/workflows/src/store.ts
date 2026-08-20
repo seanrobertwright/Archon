@@ -19,7 +19,7 @@ export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 export interface DagResumeSnapshot {
   completedNodeOutputs: Map<string, string>;
   tokens?: TokenUsage;
-  /** Cumulative USD cost of the run's already-completed nodes across prior passes. */
+  /** Cumulative USD cost persisted by completed and failed node attempts across prior passes. */
   costUsd: number;
 }
 

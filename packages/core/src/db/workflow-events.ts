@@ -219,8 +219,10 @@ export async function listWorkflowEventsSince(
  * run. Used by the DAG executor to restore state when resuming a failed run.
  * Throws on DB error — caller owns the degradation policy.
  *
- * Both usage axes are summed from `node_completed` rows only, and only from rows that are
- * not marked `data.aggregate`. Two distinct duplication hazards:
+ * Both usage axes are summed from `node_completed` and `node_failed` rows, and only
+ * from rows that are not marked `data.aggregate`. Failed rows contribute spend but
+ * never completed outputs, so their nodes remain eligible for resume. Two distinct
+ * duplication hazards:
  *
  * - `node_skipped_prior_success` rows replay a node an earlier pass already counted, so
  *   counting them would multiply that node's usage by the number of resume passes.
@@ -240,11 +242,11 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
 }> {
   const result = await pool.query<{
     step_name: string | null;
-    event_type: 'node_completed' | 'node_skipped_prior_success';
+    event_type: 'node_completed' | 'node_failed' | 'node_skipped_prior_success';
     data: string | Record<string, unknown>;
   }>(
     `SELECT step_name, event_type, data FROM remote_agent_workflow_events
-     WHERE workflow_run_id = $1 AND event_type IN ('node_completed', 'node_skipped_prior_success')
+     WHERE workflow_run_id = $1 AND event_type IN ('node_completed', 'node_failed', 'node_skipped_prior_success')
      ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
     [workflowRunId]
   );
@@ -263,12 +265,12 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       );
       continue;
     }
-    if (typeof data.node_output === 'string') {
+    if (row.event_type !== 'node_failed' && typeof data.node_output === 'string') {
       completedNodeOutputs.set(row.step_name, data.node_output);
     }
     // A derived row restates usage that other rows in this same log already carry.
     if (data.aggregate === true) continue;
-    if (row.event_type === 'node_completed' && data.tokens !== undefined) {
+    if (row.event_type !== 'node_skipped_prior_success' && data.tokens !== undefined) {
       const eventTokens = data.tokens;
       if (
         typeof eventTokens === 'object' &&
@@ -318,7 +320,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         );
       }
     }
-    if (row.event_type === 'node_completed' && data.cost_usd !== undefined) {
+    if (row.event_type !== 'node_skipped_prior_success' && data.cost_usd !== undefined) {
       const eventCost = data.cost_usd;
       // Same guard shape as tokens: a non-finite value from a provider must not
       // silently poison the total (NaN > 0 is false, which would drop the run's

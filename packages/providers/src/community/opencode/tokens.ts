@@ -14,10 +14,11 @@ export function normalizeTokens(info: Record<string, unknown> | undefined): Toke
   const cache = isRecord(tokens.cache) ? tokens.cache : undefined;
   const cacheRead = typeof cache?.read === 'number' ? cache.read : undefined;
   const cacheWrite = typeof cache?.write === 'number' ? cache.write : undefined;
-  const total = input + output + reasoning;
+  const grossInput = input + (cacheRead ?? 0) + (cacheWrite ?? 0);
+  const total = grossInput + output + reasoning;
 
   return {
-    input: input + (cacheRead ?? 0) + (cacheWrite ?? 0),
+    input: grossInput,
     output,
     ...(cacheRead !== undefined ? { cacheRead } : {}),
     ...(cacheWrite !== undefined ? { cacheWrite } : {}),

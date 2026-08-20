@@ -254,6 +254,43 @@ describe('workflow-events', () => {
       expect(result.tokens).toEqual({ input: 100, output: 10 });
     });
 
+    test('includes failed-node usage without treating the failed node as completed', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'done',
+            event_type: 'node_completed',
+            data: {
+              node_output: 'kept',
+              cost_usd: 0.01,
+              tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0 },
+            },
+          },
+          {
+            step_name: 'retry-me',
+            event_type: 'node_failed',
+            data: {
+              error: 'provider failed after reporting usage',
+              cost_usd: 0.02,
+              tokens: { input: 20, output: 2 },
+            },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-failed-usage');
+
+      expect(result.completedNodeOutputs).toEqual(new Map([['done', 'kept']]));
+      expect(result.costUsd).toBeCloseTo(0.03, 10);
+      expect(result.tokens).toEqual({
+        input: 30,
+        output: 3,
+      });
+      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining("'node_failed'"), [
+        'run-failed-usage',
+      ]);
+    });
+
     test('returns outputs from node_skipped_prior_success events (multi-resume)', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([

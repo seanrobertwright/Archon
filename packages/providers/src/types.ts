@@ -174,6 +174,7 @@ export interface TokenUsage {
   cacheRead?: number;
   /** Provider-reported cache-creation input. Absent means unsupported or unknown; zero is known. */
   cacheWrite?: number;
+  /** Total of gross input, output, and any provider-reported reasoning tokens. */
   total?: number;
   cost?: number;
 }

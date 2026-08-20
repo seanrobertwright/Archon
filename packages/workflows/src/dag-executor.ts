@@ -486,9 +486,10 @@ function sumTokenUsage(
 
 /**
  * Usage a resumed run already consumed in earlier passes, rebuilt from its persisted
- * `node_completed` events by `getDagResumeSnapshot`. Both axes travel together because
- * they are one concept — what this run has spent so far — and seeding only one of them
- * is how cost came to under-report every resumed run while tokens did not (#2469).
+ * node completion and failure events by `getDagResumeSnapshot`. Both axes travel
+ * together because they are one concept — what this run has spent so far — and seeding
+ * only one of them is how cost came to under-report every resumed run while tokens did
+ * not (#2469).
  */
 export interface PriorRunUsage {
   tokens?: TokenUsage;
@@ -794,21 +795,32 @@ function shouldRetryNodeFailure(
  * never retried, and a platform notification before each retry. Used by both the
  * AI-node path in {@link runLayers} and {@link runDeterministicNodeWithRetry} so
  * the backoff math and user-facing wording are defined once and can't drift.
- * `initialOutput` seeds `output` for the (unreachable) zero-iteration case and is
- * generic in `T` so callers keep their richer result type (e.g. NodeExecutionResult).
+ * `initialOutput` seeds `output` for the unreachable zero-iteration case. Usage is
+ * accumulated across failed attempts so a later success still reports all paid work.
  */
-async function runNodeRetryLoop<T extends NodeOutput>(
+async function runNodeRetryLoop(
   node: DagNode,
   platform: IWorkflowPlatform,
   conversationId: string,
   workflowRun: WorkflowRun,
   retryConfig: { maxRetries: number; delayMs: number; onError: 'transient' | 'all' },
-  run: () => Promise<T>,
-  initialOutput: T
-): Promise<T> {
+  run: () => Promise<NodeExecutionResult>,
+  initialOutput: NodeExecutionResult
+): Promise<NodeExecutionResult> {
   let output = initialOutput;
+  let accumulatedCostUsd: number | undefined;
+  let accumulatedTokens: TokenUsage | undefined;
   for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
     output = await run();
+    if (output.costUsd !== undefined) {
+      accumulatedCostUsd = (accumulatedCostUsd ?? 0) + output.costUsd;
+    }
+    if (output.tokens !== undefined) {
+      accumulatedTokens = sumTokenUsage(
+        [...(accumulatedTokens !== undefined ? [accumulatedTokens] : []), output.tokens],
+        { nodeId: node.id }
+      );
+    }
     if (output.state !== 'failed') break;
 
     const { shouldRetry, isTransient } = shouldRetryNodeFailure(output, retryConfig.onError);
@@ -836,6 +848,8 @@ async function runNodeRetryLoop<T extends NodeOutput>(
 
     await new Promise(resolve => setTimeout(resolve, delayMs));
   }
+  output.costUsd = accumulatedCostUsd;
+  output.tokens = accumulatedTokens;
   return output;
 }
 
@@ -853,8 +867,8 @@ async function runDeterministicNodeWithRetry(
   platform: IWorkflowPlatform,
   conversationId: string,
   workflowRun: WorkflowRun,
-  run: () => Promise<NodeOutput>
-): Promise<NodeOutput> {
+  run: () => Promise<NodeExecutionResult>
+): Promise<NodeExecutionResult> {
   const retryConfig = getExplicitNodeRetryConfig(node);
   // No explicit retry: preserve the single-attempt deterministic-node default.
   if (!retryConfig) {
@@ -1716,6 +1730,11 @@ async function executeNodeInternal(
   let nodeResolvedModel: ResolvedModel | undefined;
   const batchMessages: string[] = [];
 
+  const nodeUsageEventData = (): Record<string, unknown> => ({
+    ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+    ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
+  });
+
   // Create per-node abort controller for idle timeout cleanup
   const nodeAbortController = new AbortController();
   // Request a fork when resuming. Exact-fork callers gate on sessionFork first;
@@ -1745,6 +1764,7 @@ async function executeNodeInternal(
       ? STRUCTURED_OUTPUT_MAX_REASKS
       : 0;
   let accumulatedCostUsd: number | undefined;
+  let accumulatedTokens: TokenUsage | undefined;
 
   // One sendQuery stream pass. Resets the per-attempt accumulators it mutates
   // (output text, structured output, the batched-message buffer, per-pass cost,
@@ -1761,6 +1781,7 @@ async function executeNodeInternal(
     nodeResumed = undefined;
     batchMessages.length = 0; // else a failed attempt's prose flushes during reask
     nodeCostUsd = undefined;
+    nodeTokens = undefined;
     nodeIdleTimedOut = false;
     backgroundTasksIncomplete = [];
     const backgroundTasks = createBackgroundTaskTracker();
@@ -2380,14 +2401,22 @@ async function executeNodeInternal(
       // the declared source rather than inheriting stale attestation from an earlier pass.
       const reaskResumeSessionId =
         namedResumeSourceNodeId !== undefined || reaskAttempt === 0 ? resumeSessionId : undefined;
-      await runStreamPass(reaskPrompt, reaskResumeSessionId);
-      if (nodeCostUsd !== undefined) {
-        accumulatedCostUsd = (accumulatedCostUsd ?? 0) + nodeCostUsd;
+      try {
+        await runStreamPass(reaskPrompt, reaskResumeSessionId);
+      } finally {
+        if (nodeCostUsd !== undefined) {
+          accumulatedCostUsd = (accumulatedCostUsd ?? 0) + nodeCostUsd;
+        }
+        if (nodeTokens !== undefined) {
+          accumulatedTokens = sumTokenUsage(
+            [...(accumulatedTokens !== undefined ? [accumulatedTokens] : []), nodeTokens],
+            { nodeId: node.id }
+          );
+        }
+        // Keep cumulative usage on the node result even when this pass throws.
+        nodeCostUsd = accumulatedCostUsd;
+        nodeTokens = accumulatedTokens;
       }
-      // Carry the running total onto nodeCostUsd every pass so the exhaustion throw
-      // paths (which jump straight to the outer catch) report cost across ALL reask
-      // attempts, not just the last pass. runStreamPass clears it next iteration.
-      nodeCostUsd = accumulatedCostUsd;
 
       // When output_format is set and the provider returned structured_output, use
       // it instead of the concatenated assistant text. Each provider normalizes its
@@ -2504,6 +2533,7 @@ async function executeNodeInternal(
           data: {
             error: 'Cancelled by user',
             duration_ms: duration,
+            ...nodeUsageEventData(),
             ...namedSessionAuditData,
           },
         })
@@ -2526,7 +2556,13 @@ async function executeNodeInternal(
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: nodeOutputText, error: 'Cancelled by user' };
+      return {
+        state: 'failed',
+        output: nodeOutputText,
+        error: 'Cancelled by user',
+        costUsd: nodeCostUsd,
+        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      };
     }
 
     if (streamingMode === 'batch' && batchMessages.length > 0) {
@@ -2550,7 +2586,7 @@ async function executeNodeInternal(
           workflow_run_id: workflowRun.id,
           event_type: 'node_failed',
           step_name: stepName,
-          data: { error: creditError, ...namedSessionAuditData },
+          data: { error: creditError, ...nodeUsageEventData(), ...namedSessionAuditData },
         })
         .catch((err: Error) => {
           getLog().error(
@@ -2570,7 +2606,13 @@ async function executeNodeInternal(
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: nodeOutputText, error: creditError };
+      return {
+        state: 'failed',
+        output: nodeOutputText,
+        error: creditError,
+        costUsd: nodeCostUsd,
+        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      };
     }
 
     // Fail for zero output: covers both silent non-timeout exits AND idle-timeout before first token (time-to-first-token exceeded the window).
@@ -2587,7 +2629,12 @@ async function executeNodeInternal(
           workflow_run_id: workflowRun.id,
           event_type: 'node_failed',
           step_name: stepName,
-          data: { error: emptyError, duration_ms: duration, ...namedSessionAuditData },
+          data: {
+            error: emptyError,
+            duration_ms: duration,
+            ...nodeUsageEventData(),
+            ...namedSessionAuditData,
+          },
         })
         .catch((err: Error) => {
           getLog().error(
@@ -2607,7 +2654,13 @@ async function executeNodeInternal(
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: '', error: emptyError };
+      return {
+        state: 'failed',
+        output: '',
+        error: emptyError,
+        costUsd: nodeCostUsd,
+        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      };
     }
 
     if (namedResumeSourceNodeId !== undefined) {
@@ -2712,27 +2765,21 @@ async function executeNodeInternal(
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-    // If the abort was triggered by user cancel (not idle timeout), classify as cancel
-    if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
+    const cancelled = nodeAbortController.signal.aborted && !nodeIdleTimedOut;
+    const failureMessage = cancelled ? 'Cancelled by user' : err.message;
+    if (cancelled) {
       getLog().info({ nodeId: node.id }, 'dag_node_cancelled_via_abort');
-      return {
-        state: 'failed',
-        output: nodeOutputText,
-        error: 'Cancelled by user',
-        costUsd: nodeCostUsd,
-        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
-      };
+    } else {
+      getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
+      await logNodeError(logDir, workflowRun.id, node.id, failureMessage);
     }
-
-    getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
-    await logNodeError(logDir, workflowRun.id, node.id, err.message);
 
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_failed',
         step_name: stepName,
-        data: { error: err.message, ...namedSessionAuditData },
+        data: { error: failureMessage, ...nodeUsageEventData(), ...namedSessionAuditData },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -2746,13 +2793,13 @@ async function executeNodeInternal(
       runId: workflowRun.id,
       nodeId: node.id,
       nodeName: node.command ?? node.id,
-      error: err.message,
+      error: failureMessage,
     });
 
     return {
       state: 'failed',
       output: '',
-      error: err.message,
+      error: failureMessage,
       costUsd: nodeCostUsd,
       ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
     };
@@ -3572,6 +3619,17 @@ function readSignaledTokens(
   return undefined;
 }
 
+/** Narrow the cumulative cost stored beside signaledTokens in a loop gate. */
+function readSignaledCostUsd(
+  raw: unknown,
+  context: { workflowRunId: string; nodeId: string }
+): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  getLog().warn({ ...context, costUsd: raw }, 'dag_loop.signaled_cost_invalid_ignored');
+  return undefined;
+}
+
 /**
  * Finalize-on-approve (#2074), shared by executeLoopNode and executeLoopGroupNode:
  * a gate that paused on a completion-bearing iteration, resumed WITHOUT feedback,
@@ -3580,15 +3638,13 @@ function readSignaledTokens(
  * node_completed pair; the caller builds its own return value (the single-node
  * loop also threads the restored sessionId).
  *
- * `finalizeTokens` is the usage the pausing invocation actually consumed, carried
+ * `finalizeUsage` is the usage the pausing invocation consumed, carried
  * across the gate in the approval context (#2333) — without it this path persists a
  * node_completed reporting no usage for iterations that really ran. Passed by the
  * single-node loop ONLY: its per-iteration rows carry no tokens, so this row is the
  * only record. A loop_group omits it — its body nodes persisted their own namespaced
  * rows (with tokens) before the pause, and those rows survive it, so repeating the
- * total here would double-count in the one event stream. `cost_usd` and the resolved
- * model are lost across the same gate; both are part of the single "preserve terminal
- * provider stats across a gate" fix in #2345.
+ * total here would double-count in the one event stream.
  */
 async function finalizeLoopFromSignal(
   deps: WorkflowDeps,
@@ -3599,7 +3655,7 @@ async function finalizeLoopFromSignal(
   stepName: string,
   nodeLabel: string,
   finalizeOutput: string,
-  finalizeTokens?: TokenUsage
+  finalizeUsage?: { costUsd?: number; tokens?: TokenUsage }
 ): Promise<void> {
   // Impossible by construction today (the gate writes signaledOutput whenever
   // completionSignaled is true) — this warn guards a future decoupling so a
@@ -3624,7 +3680,8 @@ async function finalizeLoopFromSignal(
       data: {
         duration_ms: 0,
         node_output: finalizeOutput,
-        ...(finalizeTokens !== undefined ? { tokens: finalizeTokens } : {}),
+        ...(finalizeUsage?.costUsd !== undefined ? { cost_usd: finalizeUsage.costUsd } : {}),
+        ...(finalizeUsage?.tokens !== undefined ? { tokens: finalizeUsage.tokens } : {}),
       },
     })
     .catch((err: Error) => {
@@ -3639,6 +3696,7 @@ async function finalizeLoopFromSignal(
     nodeId,
     nodeName: nodeId,
     duration: 0,
+    ...(finalizeUsage?.costUsd !== undefined ? { costUsd: finalizeUsage.costUsd } : {}),
   });
 }
 
@@ -3745,14 +3803,14 @@ async function executeLoopGroupNode(
       stepName,
       'Loop-group node',
       finalizeOutput
-      // NO finalizeTokens, deliberately — same double-count reasoning as the
+      // NO usage, deliberately — same double-count reasoning as the
       // natural-completion group row below. A loop_group's body nodes wrote their own
       // `<groupId>.<nodeId>` node_completed rows (with tokens) BEFORE the gate paused,
       // and those rows survive the pause: they are already in the event stream this
       // finalize row is appended to. Reporting the group total here would make a
-      // consumer summing `data.tokens` count the pausing iteration twice. The plain
-      // `loop` DOES pass it — its per-iteration rows carry no tokens, so its finalize
-      // row is the only record of the usage.
+      // consumer summing usage count the pausing iteration twice. The plain `loop`
+      // DOES pass it — its per-iteration rows carry no usage, so its finalize row is
+      // the only record.
     );
     return { state: 'completed', output: finalizeOutput };
   }
@@ -4558,7 +4616,12 @@ async function executeLoopNode(
         workflow_run_id: workflowRun.id,
         event_type: 'node_failed',
         step_name: stepName,
-        data: { error, ...(extras.data ?? {}) },
+        data: {
+          error,
+          ...(extras.costUsd !== undefined ? { cost_usd: extras.costUsd } : {}),
+          ...(extras.tokens !== undefined ? { tokens: extras.tokens } : {}),
+          ...(extras.data ?? {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -4593,6 +4656,13 @@ async function executeLoopNode(
     : undefined;
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLoopResume ? (loopGateRunMeta.loop_user_input ?? '') : '';
+  const persistedUsageContext = { workflowRunId: workflowRun.id, nodeId: node.id };
+  const persistedLoopCostUsd = isLoopResume
+    ? readSignaledCostUsd(loopGateMeta.signaledCostUsd, persistedUsageContext)
+    : undefined;
+  const persistedLoopTokens = isLoopResume
+    ? readSignaledTokens(loopGateMeta.signaledTokens, persistedUsageContext)
+    : undefined;
 
   // Finalize-on-approve (#2074): a gate that paused on a completion-bearing iteration,
   // resumed WITHOUT feedback, completes the node from the persisted output instead of
@@ -4615,10 +4685,10 @@ async function executeLoopNode(
       stepName,
       'Loop node',
       finalizeOutput,
-      readSignaledTokens(loopGateMeta.signaledTokens, {
-        workflowRunId: workflowRun.id,
-        nodeId: node.id,
-      })
+      {
+        ...(persistedLoopCostUsd !== undefined ? { costUsd: persistedLoopCostUsd } : {}),
+        ...(persistedLoopTokens !== undefined ? { tokens: persistedLoopTokens } : {}),
+      }
     );
     // Same declared-field capture as the normal completion return below and as the
     // resume-hydration path (#2091). This is a COMPLETION exit, so a consumer's
@@ -4631,6 +4701,8 @@ async function executeLoopNode(
       state: 'completed',
       output: finalizeOutput,
       sessionId: currentSessionId,
+      ...(persistedLoopCostUsd !== undefined ? { costUsd: persistedLoopCostUsd } : {}),
+      ...(persistedLoopTokens !== undefined ? { tokens: persistedLoopTokens } : {}),
       ...(finalizeDeclaredFields !== undefined ? { declaredFields: finalizeDeclaredFields } : {}),
     };
   }
@@ -4705,10 +4777,10 @@ async function executeLoopNode(
 
   let lastIterationOutput = '';
   let lastIterationStructuredOutput: unknown;
-  let loopTotalCostUsd: number | undefined;
+  let loopTotalCostUsd: number | undefined = persistedLoopCostUsd;
   let loopFinalStopReason: string | undefined;
   let loopTotalNumTurns: number | undefined;
-  let loopTotalTokens: TokenUsage | undefined;
+  let loopTotalTokens: TokenUsage | undefined = persistedLoopTokens;
   // Concrete model the provider resolved to (#2314). Last-seen wins, like
   // loopFinalStopReason: every iteration runs on the same resolved provider and
   // model, so the final iteration's report is the node's report.
@@ -5815,9 +5887,11 @@ async function executeLoopNode(
         // for honesty; pauseWorkflowRun nulls both on every fresh pause.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
-        // Usage consumed up to this gate, so a bare approve (finalize, no re-run)
-        // can persist it on node_completed instead of reporting nothing (#2333).
-        signaledTokens: completionDetected ? (loopTotalTokens ?? null) : null,
+        // Cumulative usage consumed through this gate. A resumed loop seeds its
+        // totals from these values so later gates and terminal metadata preserve
+        // every pre-gate iteration; bare approval uses the same values directly.
+        signaledTokens: loopTotalTokens ?? null,
+        signaledCostUsd: loopTotalCostUsd ?? null,
         // Read-once resolved template for both prompt- and command-backed loops.
         // Included command-backed loops use their load-time compiled body here, so
         // snapshotting both forms preserves resume determinism after source deletion.
@@ -6147,7 +6221,12 @@ async function executeWorkflowNode(
         workflow_run_id: parentRun.id,
         event_type: 'node_failed',
         step_name: ctx.stepNamePrefix + node.id,
-        data: { error, type: 'workflow' },
+        data: {
+          error,
+          type: 'workflow',
+          ...(costUsd !== undefined ? { cost_usd: costUsd } : {}),
+          ...(tokens !== undefined ? { tokens } : {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -6692,7 +6771,12 @@ async function executeFanOutWorkflowNode(
         workflow_run_id: parentRun.id,
         event_type: 'node_failed',
         step_name: stepName,
-        data: { error, type: 'workflow' },
+        data: {
+          error,
+          type: 'workflow',
+          ...(costUsd !== undefined ? { cost_usd: costUsd } : {}),
+          ...(tokens !== undefined ? { tokens } : {}),
+        },
       })
       .catch((err: Error) => {
         getLog().error(

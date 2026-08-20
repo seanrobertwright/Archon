@@ -3337,10 +3337,24 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     mockSendQueryDag.mockImplementation(async function* () {
       callCount++;
       if (callCount === 1) {
-        throw new Error('Claude Code crash: process exited with code 1');
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'error_during_execution',
+          errors: ['Claude Code crash: process exited with code 1'],
+          sessionId: 'failed-retry-sess',
+          cost: 0.01,
+          tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0 },
+        };
+        return;
       }
       yield { type: 'assistant', content: 'Recovered' };
-      yield { type: 'result', sessionId: 'retry-sess' };
+      yield {
+        type: 'result',
+        sessionId: 'retry-sess',
+        cost: 0.02,
+        tokens: { input: 20, output: 2, cacheRead: 10, cacheWrite: 0 },
+      };
     });
 
     const mockDeps = createMockDeps();
@@ -3371,6 +3385,15 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     // Node was called at least twice (first fails transiently, second succeeds)
     expect(callCount).toBeGreaterThanOrEqual(2);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
+    expect(runUsageWrites(mockDeps.store)).toEqual([
+      {
+        total_cost_usd: 0.03,
+        total_tokens_in: 30,
+        total_tokens_out: 3,
+        total_cache_read_tokens: 15,
+        total_cache_write_tokens: 0,
+      },
+    ]);
   }, 5_000);
 
   it('workflow fails after exhausting all node retries', async () => {
@@ -8647,7 +8670,12 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     it('interactive loop with gate_message pauses after first iteration', async () => {
       mockSendQueryDag.mockImplementation(async function* () {
         yield { type: 'assistant', content: 'Here is the plan. Please review.' };
-        yield { type: 'result', sessionId: 'loop-session-1' };
+        yield {
+          type: 'result',
+          sessionId: 'loop-session-1',
+          cost: 0.02,
+          tokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
+        };
       });
 
       const mockDeps = createMockDeps();
@@ -8701,6 +8729,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         // and the author's gate text is preserved at the end.
         completionSignaled: false,
         signaledOutput: null,
+        signaledCostUsd: 0.02,
+        signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
       });
       const pausedMessage = (pauseCalls[0][1] as { message: string }).message;
       expect(pausedMessage).toContain('No completion condition met');
@@ -9153,7 +9183,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             message: 'gate',
             completionSignaled: true,
             signaledOutput: 'REPORT',
-            signaledTokens: { input: 40, output: 4 },
+            signaledCostUsd: 0.02,
+            signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
           },
           loop_user_input: 'Approved',
           loop_feedback_given: false,
@@ -9211,7 +9242,22 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       // The finalize row reports the usage the pausing invocation consumed (#2333).
       // Without this it persists duration_ms: 0 and no tokens for iterations that
       // really ran — a silent zero, not an absence.
-      expect(completed[0][0].data.tokens).toEqual({ input: 40, output: 4 });
+      expect(completed[0][0].data.cost_usd).toBe(0.02);
+      expect(completed[0][0].data.tokens).toEqual({
+        input: 40,
+        output: 4,
+        cacheRead: 20,
+        cacheWrite: 0,
+      });
+      expect(runUsageWrites(mockDeps.store)).toEqual([
+        {
+          total_cost_usd: 0.02,
+          total_tokens_in: 40,
+          total_tokens_out: 4,
+          total_cache_read_tokens: 20,
+          total_cache_write_tokens: 0,
+        },
+      ]);
     });
 
     it('finalize omits tokens when the gate persisted none (legacy pause / no usage) (#2333)', async () => {
@@ -9360,7 +9406,12 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     it('iterates at resume when feedback was given, even on a signal-bearing gate (#2074 C)', async () => {
       mockSendQueryDag.mockImplementation(async function* () {
         yield { type: 'assistant', content: 'Re-checked X. <promise>APPROVED</promise>' };
-        yield { type: 'result', sessionId: 'iter-session-2' };
+        yield {
+          type: 'result',
+          sessionId: 'iter-session-2',
+          cost: 0.03,
+          tokens: { input: 60, output: 6, cacheRead: 30, cacheWrite: 0 },
+        };
       });
 
       const mockDeps = createMockDeps();
@@ -9375,6 +9426,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             message: 'gate',
             completionSignaled: true,
             signaledOutput: 'REPORT',
+            signaledCostUsd: 0.02,
+            signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
           },
           loop_user_input: 'actually re-check X',
           loop_feedback_given: true,
@@ -9417,6 +9470,25 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(mockSendQueryDag.mock.calls.length).toBe(1);
       const promptArg = mockSendQueryDag.mock.calls[0][0] as string;
       expect(promptArg).toContain('actually re-check X');
+      const completed = mockDeps.store.createWorkflowEvent.mock.calls.find(
+        ([event]) => event.event_type === 'node_completed' && event.step_name === 'refine'
+      );
+      expect(completed?.[0].data?.cost_usd).toBeCloseTo(0.05, 5);
+      expect(completed?.[0].data?.tokens).toEqual({
+        input: 100,
+        output: 10,
+        cacheRead: 50,
+        cacheWrite: 0,
+      });
+      expect(runUsageWrites(mockDeps.store)).toEqual([
+        {
+          total_cost_usd: 0.05,
+          total_tokens_in: 100,
+          total_tokens_out: 10,
+          total_cache_read_tokens: 50,
+          total_cache_write_tokens: 0,
+        },
+      ]);
     });
 
     it('iterates at resume on a non-signaled gate even without feedback (#2074 C)', async () => {
@@ -9552,6 +9624,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           errorSubtype: 'error_during_execution',
           errors: ['Subprocess crashed mid-turn'],
           sessionId: 'bad-session',
+          cost: 0.04,
+          tokens: { input: 70, output: 7, cacheRead: 30, cacheWrite: 0 },
         };
       });
 
@@ -9605,6 +9679,18 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       >;
       expect(failedData.error).toContain('error_during_execution');
       expect(failedData.error).toContain('Subprocess crashed mid-turn');
+      const nodeFailed = eventCalls.find(
+        (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+      );
+      const nodeFailedData = (nodeFailed?.[0] as { data?: Record<string, unknown> } | undefined)
+        ?.data;
+      expect(nodeFailedData?.cost_usd).toBe(0.04);
+      expect(nodeFailedData?.tokens).toEqual({
+        input: 70,
+        output: 7,
+        cacheRead: 30,
+        cacheWrite: 0,
+      });
     });
 
     it('loop iteration does NOT fail on isError: true + errorSubtype: success', async () => {
@@ -10898,7 +10984,12 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     // didn't yield a result.isError chunk. Treat it as a node failure
     // rather than a successful empty completion.
     mockSendQueryDag.mockImplementation(async function* () {
-      yield { type: 'result', sessionId: 'sess-empty' };
+      yield {
+        type: 'result',
+        sessionId: 'sess-empty',
+        cost: 0.02,
+        tokens: { input: 30, output: 3, cacheRead: 20, cacheWrite: 0 },
+      };
     });
 
     const store = createMockStore();
@@ -10933,6 +11024,22 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       unknown
     >;
     expect(failedData.error).toContain('produced no assistant output');
+    expect(failedData.cost_usd).toBe(0.02);
+    expect(failedData.tokens).toEqual({
+      input: 30,
+      output: 3,
+      cacheRead: 20,
+      cacheWrite: 0,
+    });
+    expect(runUsageWrites(store)).toEqual([
+      {
+        total_cost_usd: 0.02,
+        total_tokens_in: 30,
+        total_tokens_out: 3,
+        total_cache_read_tokens: 20,
+        total_cache_write_tokens: 0,
+      },
+    ]);
     // Workflow-level failure must propagate, not just the node event.
     expect(store.failWorkflowRun).toHaveBeenCalled();
   });
@@ -11235,9 +11342,15 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
   it('best-effort provider: malformed-then-fixed structured output recovers within reasks', async () => {
     // Attempt 1 returns structured output missing the required `verdict`; the reask
     // loop re-runs and attempt 2 returns valid output → node COMPLETES (not failed).
-    // Costs accumulate across both attempts.
+    // Cost and token usage accumulate across both attempts.
     mockSendQueryDag.mockImplementationOnce(async function* () {
-      yield { type: 'result', sessionId: 's1', structuredOutput: { other: 'x' }, cost: 0.01 };
+      yield {
+        type: 'result',
+        sessionId: 's1',
+        structuredOutput: { other: 'x' },
+        cost: 0.01,
+        tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0 },
+      };
     });
     mockSendQueryDag.mockImplementation(async function* () {
       yield {
@@ -11245,6 +11358,7 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         sessionId: 's2',
         structuredOutput: { verdict: 'review' },
         cost: 0.02,
+        tokens: { input: 20, output: 2, cacheRead: 10, cacheWrite: 0 },
       };
     });
 
@@ -11302,6 +11416,14 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     const cost = ((completed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
       .cost_usd as number;
     expect(cost).toBeCloseTo(0.03, 5);
+    const tokens = ((completed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
+      .tokens;
+    expect(tokens).toEqual({
+      input: 30,
+      output: 3,
+      cacheRead: 15,
+      cacheWrite: 0,
+    });
   });
 
   it('best-effort provider: a non-finite reask cost does not erase prior valid cost', async () => {
@@ -12681,6 +12803,8 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
         errorSubtype: 'error_during_execution',
         errors: ['Tool call failed: permission denied'],
         sessionId: 'sid-err',
+        cost: 0.04,
+        tokens: { input: 70, output: 7, cacheRead: 30, cacheWrite: 0 },
       };
     });
 
@@ -12721,6 +12845,22 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     >;
     expect(failedData.error).toContain('error_during_execution');
     expect(failedData.error).toContain('permission denied');
+    expect(failedData.cost_usd).toBe(0.04);
+    expect(failedData.tokens).toEqual({
+      input: 70,
+      output: 7,
+      cacheRead: 30,
+      cacheWrite: 0,
+    });
+    expect(runUsageWrites(store)).toEqual([
+      {
+        total_cost_usd: 0.04,
+        total_tokens_in: 70,
+        total_tokens_out: 7,
+        total_cache_read_tokens: 30,
+        total_cache_write_tokens: 0,
+      },
+    ]);
   });
 
   it('does NOT fail node when SDK returns isError: true + errorSubtype: success', async () => {
