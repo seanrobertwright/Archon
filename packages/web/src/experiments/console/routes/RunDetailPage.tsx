@@ -221,16 +221,13 @@ export function RunDetailPage(): ReactElement {
   const lastBottomRef = useRef(true);
   const [atBottom, setAtBottom] = useState(true);
   const pendingNodeIdRef = useRef<string | null>(null);
-  const observerRef = useRef<ResizeObserver | null>(null);
 
   // Bind the observer to the conditional content node so it survives loading and
   // Log remounts. A Graph-selected node takes precedence over the mount's normal
   // tail position and keeps follow disabled until the user reaches the tail again.
   const contentRef = useCallback(
-    (node: HTMLDivElement | null): void => {
-      observerRef.current?.disconnect();
-      observerRef.current = null;
-      if (node === null) return;
+    (node: HTMLDivElement | null): (() => void) | undefined => {
+      if (node === null) return undefined;
 
       const pendingNodeId = pendingNodeIdRef.current;
       const followTail = pendingNodeId === null;
@@ -243,20 +240,23 @@ export function RunDetailPage(): ReactElement {
         if (el !== null) el.scrollTop = el.scrollHeight;
       });
       observer.observe(node);
-      observerRef.current = observer;
 
       if (pendingNodeId !== null) {
         requestAnimationFrame(() => {
           if (pendingNodeIdRef.current !== pendingNodeId) return;
-          pendingNodeIdRef.current = null;
           scrollToNode(pendingNodeId);
         });
       }
+
+      return () => {
+        observer.disconnect();
+      };
     },
     [scrollToNode]
   );
 
   const handleScroll = useCallback((): void => {
+    if (pendingNodeIdRef.current !== null) return;
     const el = scrollRef.current;
     if (el === null) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
@@ -264,9 +264,17 @@ export function RunDetailPage(): ReactElement {
     setAtBottom(nearBottom);
   }, []);
 
+  const handleScrollEnd = useCallback((): void => {
+    if (pendingNodeIdRef.current === null) return;
+    pendingNodeIdRef.current = null;
+    lastBottomRef.current = false;
+    setAtBottom(false);
+  }, []);
+
   const scrollToBottom = useCallback((): void => {
     const el = scrollRef.current;
     if (el === null) return;
+    pendingNodeIdRef.current = null;
     lastBottomRef.current = true;
     setAtBottom(true);
     el.scrollTop = el.scrollHeight;
@@ -426,7 +434,12 @@ export function RunDetailPage(): ReactElement {
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {view === 'log' ? (
             <div className="relative min-h-0 flex-1">
-              <div ref={scrollRef} onScroll={handleScroll} className="h-full overflow-y-auto">
+              <div
+                ref={scrollRef}
+                onScroll={handleScroll}
+                onScrollEnd={handleScrollEnd}
+                className="h-full overflow-y-auto"
+              >
                 <div ref={contentRef} className="w-full px-6">
                   <div className="sticky top-0 z-10 -mx-6 bg-surface px-6">{toolbar}</div>
 
