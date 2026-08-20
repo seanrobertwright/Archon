@@ -157,6 +157,9 @@ export function validateWorkflowOutcomeDeclaration(
     return `Workflow declares returns: '${workflow.returns}' but no top-level node has that id`;
   }
   if (isIncludeNode(selectedNode)) return null;
+  if (isLoopGroupNode(selectedNode)) {
+    return `Workflow outcome_field: '${field}' cannot select loop_group node '${workflow.returns}' because loop_group output_format is ignored and its runtime output is raw text; select a schema-enforced collector node instead`;
+  }
   if (isWorkflowNode(selectedNode) && selectedNode.fan_out !== undefined) {
     return `Workflow outcome_field: '${field}' cannot select fan-out workflow node '${workflow.returns}' because its runtime output is an aggregate array; select a collector node with a required boolean output instead`;
   }
@@ -164,6 +167,9 @@ export function validateWorkflowOutcomeDeclaration(
   const schema = selectedNode.output_format;
   if (schema === undefined) {
     return `Workflow outcome_field: '${field}' selects node '${workflow.returns}', but that node declares no output_format`;
+  }
+  if (schema.type !== 'object') {
+    return `Workflow outcome_field: '${field}' requires node '${workflow.returns}' output_format to declare type: object`;
   }
   const declared = declaredFieldsFromSchema(schema);
   if (!declared?.includes(field)) {

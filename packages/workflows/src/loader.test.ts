@@ -6418,7 +6418,7 @@ describe('workflow authored outcome declaration (#2618)', () => {
         green:
           type: boolean
       required: [green]`
-  ) =>
+  ): ReturnType<typeof parseWorkflow> =>
     parseWorkflow(
       `
 name: authored-outcome
@@ -6484,6 +6484,15 @@ nodes:
         green: { type: string }
       required: [green]`,
     ],
+    [
+      'non-object root schema',
+      `
+    output_format:
+      type: string
+      properties:
+        green: { type: boolean }
+      required: [green]`,
+    ],
   ])('rejects an outcome field with %s', (_label, outputFormat) => {
     const { workflow, error } = parseOutcomeWorkflow(
       'returns: result\noutcome_field: green',
@@ -6528,6 +6537,36 @@ nodes:
 
     expect(workflow).toBeNull();
     expect(error?.error).toContain('fan-out workflow node');
+    expect(error?.error).toContain('collector node');
+  });
+
+  it('rejects a loop_group because its declared output format is ignored at runtime', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: loop-group-outcome
+description: invalid outcome over a raw loop group result
+returns: group
+outcome_field: green
+nodes:
+  - id: group
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: author
+          prompt: author a result
+`,
+      'loop-group-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('loop_group');
+    expect(error?.error).toContain('raw text');
     expect(error?.error).toContain('collector node');
   });
 });

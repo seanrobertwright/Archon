@@ -9164,8 +9164,16 @@ export async function executeDagWorkflow(
   };
 
   await persistAuthoredOutcome();
+  let runLayersErrorInFlight = false;
+  let outcomePersistenceErrorCaptured = false;
+  let outcomePersistenceError: unknown;
   try {
     await runLayers(runCtx);
+  } catch (error) {
+    // Preserve even an exotic `throw undefined`: the boolean records control flow,
+    // while inspecting the caught value would confuse that throw with no failure.
+    runLayersErrorInFlight = true;
+    throw error;
   } finally {
     // `finally`, not a plain call. runLayers guards almost everything — every store
     // call inside the per-node try, the between-layer status check, the artifact
@@ -9177,8 +9185,21 @@ export async function executeDagWorkflow(
     // terminal outcome the invariant has to cover. persistRunUsage swallows its own
     // errors, so it can never displace the in-flight exception.
     await persistRunUsage();
-    await persistAuthoredOutcome();
+    try {
+      await persistAuthoredOutcome();
+    } catch (outcomeError) {
+      if (runLayersErrorInFlight) {
+        getLog().error(
+          { err: outcomeError as Error, workflowRunId: workflowRun.id },
+          'dag.authored_outcome_persist_failed_during_unwind'
+        );
+      } else {
+        outcomePersistenceErrorCaptured = true;
+        outcomePersistenceError = outcomeError;
+      }
+    }
   }
+  if (outcomePersistenceErrorCaptured) throw outcomePersistenceError;
   // Pull the mutated accumulators back into local scope for the terminal tally below.
   const totalCostUsd = runCtx.totalCostUsd;
   const totalTokensIn = runCtx.totalTokensIn;

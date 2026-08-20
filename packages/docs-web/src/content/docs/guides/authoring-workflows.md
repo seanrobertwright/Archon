@@ -1280,6 +1280,8 @@ nodes:
 - **`outcome_field:`** — an optional, explicit authored verdict relative to `returns:`. The
   selected node must declare the property in `output_format.properties`, list it in
   `output_format.required`, and set `type: boolean`; otherwise the workflow fails to load.
+  It cannot select a `loop_group` (which returns raw text) or a fan-out `workflow:` node
+  (which returns an aggregate array); add a structured collector node after either one.
   Exact `true` is persisted as `outcome: succeeded`, exact `false` as `outcome: failed`.
   This is independent from engine lifecycle `status`: a run may be `completed / failed-outcome`,
   `failed / succeeded-outcome`, or `paused / succeeded-outcome`. Status still controls terminality,

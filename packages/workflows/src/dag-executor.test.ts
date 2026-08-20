@@ -13760,7 +13760,10 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     ).toBe(true);
   });
 
-  it('records usage and an earlier authored outcome when a FATAL platform error escapes', async () => {
+  it.each([
+    ['records usage and an earlier authored outcome when a FATAL platform error escapes', false],
+    ['preserves the FATAL platform error when the outcome backstop also fails', true],
+  ])('%s', async (_label, outcomeWriteFails) => {
     // The `finally` around runLayers exists for exactly this: a throw that skips every
     // disposition below and unwinds to executeWorkflow's catch-all, which marks the run
     // FAILED. Without this case the other three would pass with a plain call, so the
@@ -13785,9 +13788,16 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
 
     const store = createMockStore();
     let nodeFinished = false;
+    let announceNodeFinished: (() => void) | undefined;
+    const nodeFinishedSignal = new Promise<void>(resolve => {
+      announceNodeFinished = resolve;
+    });
     const realCreateEvent = store.createWorkflowEvent;
     store.createWorkflowEvent = mock<IWorkflowStore['createWorkflowEvent']>(data => {
-      if (data.event_type === 'node_completed') nodeFinished = true;
+      if (data.event_type === 'node_completed') {
+        nodeFinished = true;
+        announceNodeFinished?.();
+      }
       return realCreateEvent(data);
     });
 
@@ -13797,19 +13807,27 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     // recording BEFORE the send — and would not need the finally at all.
     const order: string[] = [];
     const realUpdateRun = store.updateWorkflowRun;
-    store.updateWorkflowRun = mock(
-      (id: string, updates: { metadata?: Record<string, unknown> }): Promise<void> => {
-        if (updates.metadata && 'total_cost_usd' in updates.metadata) order.push('usage-write');
-        return realUpdateRun(id, updates);
+    store.updateWorkflowRun = mock<IWorkflowStore['updateWorkflowRun']>((id, updates) => {
+      if (updates.outcome !== undefined) {
+        order.push('outcome-write');
+        if (outcomeWriteFails) return Promise.reject(new Error('outcome database unavailable'));
       }
-    );
+      if (updates.metadata && 'total_cost_usd' in updates.metadata) order.push('usage-write');
+      return realUpdateRun(id, updates);
+    });
 
-    // Auth dies only once the AI node has completed, so its usage is accumulated first.
+    // The cancel sibling starts concurrently but waits for the selected result to finish.
+    // From that point every platform send is fatal: the cancel send rejects inside the
+    // node try, its failure notification rejects the catch, and the allSettled rejection
+    // notification rejects before the per-layer hook. The only remaining outcome write
+    // is therefore the `finally` backstop.
     const platform = createMockPlatform();
-    platform.sendMessage = mock((): Promise<void> => {
-      if (!nodeFinished) return Promise.resolve();
-      order.push('fatal-send');
-      return Promise.reject(new Error('unauthorized'));
+    platform.sendMessage = mock(async (_conversationId, message): Promise<void> => {
+      if (message.includes('Workflow cancelled')) await nodeFinishedSignal;
+      if (nodeFinished) {
+        order.push('fatal-send');
+        throw new Error('unauthorized');
+      }
     });
 
     await expect(
@@ -13832,7 +13850,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
                 required: ['green'],
               },
             },
-            { id: 'stop', cancel: 'platform is gone', depends_on: ['spend'] },
+            { id: 'stop', cancel: 'platform is gone' },
           ],
         },
         makeWorkflowRun(),
@@ -13854,9 +13872,15 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       { total_cost_usd: 0.01, total_tokens_in: 20, total_tokens_out: 2 },
     ]);
     expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
-    // The usage write is the LAST thing that happens, after the send that killed the run.
+    // Both durable backstops run only after the send that killed layer aggregation.
     expect(order[0]).toBe('fatal-send');
-    expect(order[order.length - 1]).toBe('usage-write');
+    expect(order.lastIndexOf('fatal-send')).toBeLessThan(order.indexOf('usage-write'));
+    expect(order.lastIndexOf('fatal-send')).toBeLessThan(order.indexOf('outcome-write'));
+    expect(
+      (mockLogFn as unknown as Mock<(obj: unknown, msg?: string) => void>).mock.calls.some(
+        call => call[1] === 'dag.authored_outcome_persist_failed_during_unwind'
+      )
+    ).toBe(outcomeWriteFails);
   });
 });
 
