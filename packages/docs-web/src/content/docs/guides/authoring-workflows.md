@@ -1278,8 +1278,9 @@ nodes:
   waits on every terminal node. For a `workflow:` sub-run child, the child's terminal output
   (threaded back as `$node.output`) becomes the `returns:` node's output.
 - **`outcome_field:`** — an optional, explicit authored verdict relative to `returns:`. The
-  selected node must declare the property in `output_format.properties`, list it in
-  `output_format.required`, and set `type: boolean`; otherwise the workflow fails to load.
+  selected node must declare an object `output_format` (`type: object`) whose `properties`
+  declares the field, whose `required` lists it, and whose field schema sets `type: boolean`;
+  otherwise the workflow fails to load.
   It cannot select a `loop_group` (which returns raw text) or a fan-out `workflow:` node
   (which returns an aggregate array); add a structured collector node after either one.
   Exact `true` is persisted as `outcome: succeeded`, exact `false` as `outcome: failed`.

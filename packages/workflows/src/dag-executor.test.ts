@@ -13710,8 +13710,8 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
   it('a failed usage write is logged and never fails the run', async () => {
     // persistRunUsage is documented best-effort: a bookkeeping write must not turn an
     // otherwise-fine run into a failed one. Documented, but never watched failing — and
-    // the `finally` makes it the last thing standing between the run and its own
-    // completion, so a throw here would be maximally disruptive.
+    // the durability tail stands between the run and its own completion, so a throw here
+    // would be maximally disruptive.
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'done' };
       yield {
@@ -13764,10 +13764,10 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     ['records usage and an earlier authored outcome when a FATAL platform error escapes', false],
     ['preserves the FATAL platform error when the outcome backstop also fails', true],
   ])('%s', async (_label, outcomeWriteFails) => {
-    // The `finally` around runLayers exists for exactly this: a throw that skips every
-    // disposition below and unwinds to executeWorkflow's catch-all, which marks the run
-    // FAILED. Without this case the other three would pass with a plain call, so the
-    // guard would never be seen firing and a refactor could drop it silently.
+    // The unwind backstop exists for exactly this: a throw that skips every disposition
+    // below and unwinds to executeWorkflow's catch-all, which marks the run FAILED.
+    // Without this case the other three would pass with a plain success-tail call, so a
+    // refactor could drop the backstop silently.
     //
     // The reachable path is a platform whose auth dies mid-run: safeSendMessage rethrows
     // FATAL-classified errors instead of swallowing them (`executor-shared.ts:830-832`,
@@ -13801,10 +13801,10 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       return realCreateEvent(data);
     });
 
-    // Ordering is the real discriminator. The `finally` runs AFTER runLayers throws, so
+    // Ordering is the real discriminator. The unwind catch runs AFTER runLayers throws, so
     // the usage write must land after the fatal send. A write placed inside runLayers
     // (per-node or per-layer) would satisfy a bare "usage was persisted" assertion while
-    // recording BEFORE the send — and would not need the finally at all.
+    // recording BEFORE the send — and would not need the unwind backstop at all.
     const order: string[] = [];
     const realUpdateRun = store.updateWorkflowRun;
     store.updateWorkflowRun = mock<IWorkflowStore['updateWorkflowRun']>((id, updates) => {
@@ -13820,7 +13820,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     // From that point every platform send is fatal: the cancel send rejects inside the
     // node try, its failure notification rejects the catch, and the allSettled rejection
     // notification rejects before the per-layer hook. The only remaining outcome write
-    // is therefore the `finally` backstop.
+    // is therefore the unwind backstop.
     const platform = createMockPlatform();
     platform.sendMessage = mock(async (_conversationId, message): Promise<void> => {
       if (message.includes('Workflow cancelled')) await nodeFinishedSignal;

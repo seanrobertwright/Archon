@@ -9053,7 +9053,7 @@ export async function executeDagWorkflow(
   // independently from every lifecycle branch below (#2618). The initial call
   // covers a selected node rehydrated from node_completed events on resume; the
   // awaited per-layer hook captures a fresh result before later work can pause or
-  // fail; and the finally call covers a fatal throw while aggregating that layer.
+  // fail; and the unwind backstop covers a fatal throw while aggregating that layer.
   // A same-value write is skipped, but a genuine re-execution may replace the
   // prior verdict.
   let persistedOutcome: WorkflowRunOutcome | null = workflowRun.outcome;
@@ -9164,42 +9164,31 @@ export async function executeDagWorkflow(
   };
 
   await persistAuthoredOutcome();
-  let runLayersErrorInFlight = false;
-  let outcomePersistenceErrorCaptured = false;
-  let outcomePersistenceError: unknown;
   try {
     await runLayers(runCtx);
   } catch (error) {
-    // Preserve even an exotic `throw undefined`: the boolean records control flow,
-    // while inspecting the caught value would confuse that throw with no failure.
-    runLayersErrorInFlight = true;
-    throw error;
-  } finally {
-    // `finally`, not a plain call. runLayers guards almost everything — every store
-    // call inside the per-node try, the between-layer status check, the artifact
-    // writes — but `safeSendMessage` deliberately RETHROWS a FATAL-classified platform
-    // error (executor-shared.ts, 'unauthorized'/'forbidden'/'401'…) rather than
-    // swallowing it, and the allSettled `rejected` branch calls it outside any try. So a
-    // platform whose auth dies mid-run throws clean out of runLayers, past every
-    // disposition below, to executeWorkflow's catch-all — which marks the run FAILED, a
-    // terminal outcome the invariant has to cover. persistRunUsage swallows its own
-    // errors, so it can never displace the in-flight exception.
+    // runLayers guards almost everything, but a FATAL platform error can escape its
+    // allSettled rejection branch. Persist both durable facts before rethrowing that
+    // exact value (including an exotic `throw undefined`). Usage is best-effort. An
+    // outcome write failure is secondary here: record it, but never let it mask the
+    // execution error already in flight.
     await persistRunUsage();
     try {
       await persistAuthoredOutcome();
     } catch (outcomeError) {
-      if (runLayersErrorInFlight) {
-        getLog().error(
-          { err: outcomeError as Error, workflowRunId: workflowRun.id },
-          'dag.authored_outcome_persist_failed_during_unwind'
-        );
-      } else {
-        outcomePersistenceErrorCaptured = true;
-        outcomePersistenceError = outcomeError;
-      }
+      getLog().error(
+        { err: outcomeError as Error, workflowRunId: workflowRun.id },
+        'dag.authored_outcome_persist_failed_during_unwind'
+      );
     }
+    throw error;
   }
-  if (outcomePersistenceErrorCaptured) throw outcomePersistenceError;
+
+  // Normal return has no primary error to preserve, so a verdict persistence failure
+  // remains visible to the caller. These two small calls intentionally mirror the
+  // unwind path above; extracting a policy flag would hide which error owns the throw.
+  await persistRunUsage();
+  await persistAuthoredOutcome();
   // Pull the mutated accumulators back into local scope for the terminal tally below.
   const totalCostUsd = runCtx.totalCostUsd;
   const totalTokensIn = runCtx.totalTokensIn;
