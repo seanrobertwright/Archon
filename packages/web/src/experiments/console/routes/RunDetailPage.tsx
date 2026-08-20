@@ -123,11 +123,26 @@ export function RunDetailPage(): ReactElement {
   const [selectedNodeId, setSelectedNodeId] = useState<string>(() => readNodeFilter());
 
   // Hoisted above any early returns so the hook order stays stable.
-  const scrollToNode = useCallback((nodeId: string): void => {
-    const el = document.getElementById(`node-transition-${nodeId}`);
-    if (el !== null) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+  const scrollToNode = useCallback((nodeId: string): boolean => {
+    const scroller = scrollRef.current;
+    const target = document.getElementById(`node-transition-${nodeId}`);
+    if (scroller === null || target === null) return false;
+
+    const scrollerRect = scroller.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const centeredTop =
+      scroller.scrollTop +
+      targetRect.top +
+      targetRect.height / 2 -
+      (scrollerRect.top + scroller.clientHeight / 2);
+    const destination = Math.min(
+      scroller.scrollHeight - scroller.clientHeight,
+      Math.max(0, centeredTop)
+    );
+    const willMove = Math.abs(destination - scroller.scrollTop) > 1;
+
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return willMove;
   }, []);
 
   // `Project | null` / `RunDetailView | null` rather than the `as unknown as T`
@@ -222,9 +237,16 @@ export function RunDetailPage(): ReactElement {
   const [atBottom, setAtBottom] = useState(true);
   const pendingNodeIdRef = useRef<string | null>(null);
 
+  const finishNodeReveal = useCallback((nodeId: string): void => {
+    if (pendingNodeIdRef.current !== nodeId) return;
+    pendingNodeIdRef.current = null;
+    lastBottomRef.current = false;
+    setAtBottom(false);
+  }, []);
+
   // Bind the observer to the conditional content node so it survives loading and
   // Log remounts. A Graph-selected node takes precedence over the mount's normal
-  // tail position and keeps follow disabled until the user reaches the tail again.
+  // tail position and keeps follow disabled until its reveal settles.
   const contentRef = useCallback(
     (node: HTMLDivElement | null): (() => void) | undefined => {
       if (node === null) return undefined;
@@ -244,7 +266,7 @@ export function RunDetailPage(): ReactElement {
       if (pendingNodeId !== null) {
         requestAnimationFrame(() => {
           if (pendingNodeIdRef.current !== pendingNodeId) return;
-          scrollToNode(pendingNodeId);
+          if (!scrollToNode(pendingNodeId)) finishNodeReveal(pendingNodeId);
         });
       }
 
@@ -252,7 +274,7 @@ export function RunDetailPage(): ReactElement {
         observer.disconnect();
       };
     },
-    [scrollToNode]
+    [finishNodeReveal, scrollToNode]
   );
 
   const handleScroll = useCallback((): void => {
@@ -265,11 +287,9 @@ export function RunDetailPage(): ReactElement {
   }, []);
 
   const handleScrollEnd = useCallback((): void => {
-    if (pendingNodeIdRef.current === null) return;
-    pendingNodeIdRef.current = null;
-    lastBottomRef.current = false;
-    setAtBottom(false);
-  }, []);
+    const pendingNodeId = pendingNodeIdRef.current;
+    if (pendingNodeId !== null) finishNodeReveal(pendingNodeId);
+  }, [finishNodeReveal]);
 
   const scrollToBottom = useCallback((): void => {
     const el = scrollRef.current;
