@@ -6,6 +6,7 @@ import { insertWorkflowEvent } from './workflow-events';
 import type { IDatabase, SqlDialect } from './adapters/types';
 import type {
   WorkflowRun,
+  WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
 } from '@archon/workflows/schemas/workflow-run';
@@ -869,7 +870,9 @@ export async function getWorkflowRunByWorkerPlatformId(
  */
 export async function updateWorkflowRun(
   id: string,
-  updates: Partial<Pick<WorkflowRun, 'status' | 'outcome' | 'metadata' | 'output_root'>>
+  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+    outcome?: WorkflowRunOutcome;
+  }
 ): Promise<void> {
   const dialect = getDialect();
   const setClauses: string[] = [];

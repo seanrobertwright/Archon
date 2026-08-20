@@ -157,6 +157,9 @@ export function validateWorkflowOutcomeDeclaration(
     return `Workflow declares returns: '${workflow.returns}' but no top-level node has that id`;
   }
   if (isIncludeNode(selectedNode)) return null;
+  if (isWorkflowNode(selectedNode) && selectedNode.fan_out !== undefined) {
+    return `Workflow outcome_field: '${field}' cannot select fan-out workflow node '${workflow.returns}' because its runtime output is an aggregate array; select a collector node with a required boolean output instead`;
+  }
 
   const schema = selectedNode.output_format;
   if (schema === undefined) {

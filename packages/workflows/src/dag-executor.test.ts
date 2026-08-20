@@ -13760,7 +13760,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     ).toBe(true);
   });
 
-  it('records usage when a FATAL platform error throws out of runLayers', async () => {
+  it('records usage and an earlier authored outcome when a FATAL platform error escapes', async () => {
     // The `finally` around runLayers exists for exactly this: a throw that skips every
     // disposition below and unwinds to executeWorkflow's catch-all, which marks the run
     // FAILED. Without this case the other three would pass with a plain call, so the
@@ -13779,6 +13779,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
         sessionId: 'sid-throw',
         cost: 0.01,
         tokens: { input: 20, output: 2 },
+        structuredOutput: { green: true },
       };
     });
 
@@ -13819,8 +13820,18 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
         testDir,
         {
           name: 'usage-on-throw',
+          returns: 'spend',
+          outcome_field: 'green',
           nodes: [
-            { id: 'spend', prompt: 'Burn some tokens.' },
+            {
+              id: 'spend',
+              prompt: 'Burn some tokens.',
+              output_format: {
+                type: 'object',
+                properties: { green: { type: 'boolean' } },
+                required: ['green'],
+              },
+            },
             { id: 'stop', cancel: 'platform is gone', depends_on: ['spend'] },
           ],
         },
@@ -13842,6 +13853,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     expect(runUsageWrites(store)).toEqual([
       { total_cost_usd: 0.01, total_tokens_in: 20, total_tokens_out: 2 },
     ]);
+    expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
     // The usage write is the LAST thing that happens, after the send that killed the run.
     expect(order[0]).toBe('fatal-send');
     expect(order[order.length - 1]).toBe('usage-write');
@@ -14840,6 +14852,43 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
     expect(authoredOutcomeWrites(store)).toEqual(['failed']);
     expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
     expect(store.failWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('persists the verdict before a later layer finishes', async () => {
+    let releaseLater: (() => void) | undefined;
+    const laterReleased = new Promise<void>(resolve => {
+      releaseLater = resolve;
+    });
+    let announceLaterStarted: (() => void) | undefined;
+    const laterStarted = new Promise<void>(resolve => {
+      announceLaterStarted = resolve;
+    });
+    mockSendQueryDag.mockImplementation(async function* (prompt) {
+      if (prompt.includes('author the result')) {
+        yield { type: 'assistant', content: JSON.stringify({ green: true }) };
+        yield {
+          type: 'result',
+          sessionId: 'outcome-session',
+          structuredOutput: { green: true },
+        };
+        return;
+      }
+      announceLaterStarted?.();
+      await laterReleased;
+      yield { type: 'assistant', content: 'later finished' };
+      yield { type: 'result', sessionId: 'later-session' };
+    });
+    const store = createMockStore();
+
+    const runPromise = run(store, [
+      resultNode(),
+      { id: 'later', prompt: 'wait for release', depends_on: ['result'] },
+    ]);
+    await laterStarted;
+
+    expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
+    releaseLater?.();
+    await runPromise;
   });
 
   it('retains succeeded when a later node fails', async () => {

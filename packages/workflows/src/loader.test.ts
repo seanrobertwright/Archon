@@ -6494,6 +6494,42 @@ nodes:
     expect(error?.errorType).toBe('validation_error');
     expect(error?.error).toContain('outcome_field');
   });
+
+  it('rejects a fan-out workflow node because its runtime output is an aggregate array', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: fan-out-outcome
+description: invalid direct outcome over child aggregates
+returns: work
+outcome_field: green
+nodes:
+  - id: plan
+    prompt: emit tasks
+    output_format:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items: { type: string }
+      required: [tasks]
+  - id: work
+    workflow: child-workflow
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output.tasks"
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`,
+      'fan-out-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('fan-out workflow node');
+    expect(error?.error).toContain('collector node');
+  });
 });
 
 // ---------------------------------------------------------------------------
