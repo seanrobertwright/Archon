@@ -33,6 +33,12 @@ function getLog(): ReturnType<typeof createLogger> {
 /** Backing store for registered providers. */
 const registry = new Map<string, ProviderRegistration>();
 
+function assertValidCapabilities(entry: ProviderRegistration): void {
+  if (entry.capabilities.sessionFork === true && !entry.capabilities.sessionResume) {
+    throw new Error(`Provider '${entry.id}' cannot advertise sessionFork without sessionResume`);
+  }
+}
+
 /**
  * Register a provider. Throws on duplicate registration.
  */
@@ -40,6 +46,7 @@ export function registerProvider(entry: ProviderRegistration): void {
   if (registry.has(entry.id)) {
     throw new Error(`Provider '${entry.id}' is already registered`);
   }
+  assertValidCapabilities(entry);
   registry.set(entry.id, entry);
   getLog().debug({ provider: entry.id, builtIn: entry.builtIn }, 'provider.registered');
 }
@@ -149,6 +156,7 @@ export function registerBuiltinProviders(): void {
 
   for (const entry of builtins) {
     if (!registry.has(entry.id)) {
+      assertValidCapabilities(entry);
       registry.set(entry.id, entry);
       getLog().debug({ provider: entry.id }, 'builtin_provider.registered');
     }

@@ -270,6 +270,10 @@ class InMemoryStore implements IWorkflowStore {
   getCodebase = (): Promise<null> => Promise.resolve(null);
   getCodebaseEnvVars = (): Promise<Record<string, string>> => Promise.resolve({});
   getWorkflowNodeSession = (): Promise<null> => Promise.resolve(null);
+  listWorkflowRunNodeSessions: IWorkflowStore['listWorkflowRunNodeSessions'] = () =>
+    Promise.resolve([]);
+  upsertWorkflowRunNodeSession: IWorkflowStore['upsertWorkflowRunNodeSession'] = () =>
+    Promise.resolve();
   upsertWorkflowNodeSession = (): Promise<void> => Promise.resolve();
   deleteWorkflowNodeSessions = (): Promise<{ deleted: number }> => Promise.resolve({ deleted: 0 });
   findResumableRun = (): Promise<null> => Promise.resolve(null);

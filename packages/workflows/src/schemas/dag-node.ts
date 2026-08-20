@@ -184,6 +184,20 @@ export const piNodeConfigSchema = z.object({
 
 export type PiNodeConfig = z.infer<typeof piNodeConfigSchema>;
 
+export const nodeContextResumeSchema = z.object({
+  resume: z.string().trim().min(1, "'context.resume' must name a node"),
+});
+
+export const nodeContextSchema = z.union([z.enum(['fresh', 'shared']), nodeContextResumeSchema]);
+
+export type NodeContext = z.infer<typeof nodeContextSchema>;
+
+export function isNodeContextResume(
+  context: NodeContext | undefined
+): context is { resume: string } {
+  return typeof context === 'object' && context !== null && 'resume' in context;
+}
+
 // Kebab-case: no leading/trailing/double hyphens (e.g. `brief-gen`, not `-brief`, `brief-`, `brief--gen`).
 const AGENT_ID_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
@@ -202,7 +216,7 @@ export const dagNodeBaseSchema = z.object({
   trigger_rule: triggerRuleSchema.optional(),
   model: z.string().optional(),
   provider: z.string().trim().min(1).optional(),
-  context: z.enum(['fresh', 'shared']).optional(),
+  context: nodeContextSchema.optional(),
   output_format: z.record(z.string(), z.unknown()).optional(),
   allowed_tools: z.array(z.string()).optional(),
   denied_tools: z.array(z.string()).optional(),
@@ -849,6 +863,14 @@ export const dagNodeSchema = dagNodeFlatSchema
           "'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'script', 'include', and 'workflow' are mutually exclusive",
       });
       return z.NEVER;
+    }
+
+    if (isNodeContextResume(data.context) && !hasCommand && !hasPrompt) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'context.resume' is only supported on command and prompt nodes",
+        path: ['context'],
+      });
     }
 
     // `with:` is an identifier-keyed string map on BOTH include and workflow nodes
@@ -1498,6 +1520,7 @@ export const KNOWN_NODE_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = new Ma
     },
   ],
   ['retry', { kind: 'object', keys: new Set(Object.keys(stepRetryConfigSchema.shape)) }],
+  ['context', { kind: 'object', keys: new Set(Object.keys(nodeContextResumeSchema.shape)) }],
   ['loop', { kind: 'object', keys: new Set(Object.keys(loopNodeConfigSchema.shape)) }],
   ['loop_group', { kind: 'object', keys: new Set(Object.keys(loopGroupShape)) }],
   ['pi', { kind: 'object', keys: new Set(Object.keys(piNodeConfigSchema.shape)) }],

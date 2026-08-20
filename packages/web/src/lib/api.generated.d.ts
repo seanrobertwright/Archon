@@ -3376,8 +3376,11 @@ export interface components {
       trigger_rule?: 'all_success' | 'one_success' | 'none_failed_min_one_success' | 'all_done';
       model?: string;
       provider?: string;
-      /** @enum {string} */
-      context?: 'fresh' | 'shared';
+      context?:
+        | ('fresh' | 'shared')
+        | {
+            resume: string;
+          };
       output_format?: {
         [key: string]: unknown;
       };
@@ -3897,6 +3900,7 @@ export interface components {
     };
     ProviderCapabilities: {
       sessionResume: boolean;
+      sessionFork?: boolean;
       mcp: boolean;
       hooks: boolean;
       skills: boolean;

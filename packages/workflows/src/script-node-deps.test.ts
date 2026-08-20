@@ -118,6 +118,8 @@ function createMockStore(): IWorkflowStore {
     getCodebase: mock(() => Promise.resolve(null)),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
     getWorkflowNodeSession: mock(() => Promise.resolve(null)),
+    listWorkflowRunNodeSessions: mock(() => Promise.resolve([])),
+    upsertWorkflowRunNodeSession: mock(() => Promise.resolve()),
     upsertWorkflowNodeSession: mock(() => Promise.resolve()),
     deleteWorkflowNodeSessions: mock(() => Promise.resolve({ deleted: 0 })),
   };

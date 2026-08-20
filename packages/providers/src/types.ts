@@ -441,7 +441,12 @@ export interface AgentRequestOptions {
   env?: Record<string, string>;
   maxBudgetUsd?: number;
   fallbackModel?: string;
-  /** Session fork flag — when true, copies prior session history before appending. */
+  /**
+   * Request an immutable fork of `resumeSessionId`. Exact-fork callers such as
+   * named workflow resume must first verify `sessionFork === true`. Legacy session
+   * reuse may still send this flag to resume-only providers, where behavior is
+   * provider-specific and immutability is not guaranteed.
+   */
   forkSession?: boolean;
   /** When false, skip writing session transcript to disk. */
   persistSession?: boolean;
@@ -579,6 +584,11 @@ export interface SendQueryOptions extends AgentRequestOptions {
  */
 export interface ProviderCapabilities {
   sessionResume: boolean;
+  /**
+   * Given a session ID, create a new session containing the source history
+   * while leaving the source unchanged. Omission means unsupported.
+   */
+  sessionFork?: boolean;
   mcp: boolean;
   hooks: boolean;
   skills: boolean;

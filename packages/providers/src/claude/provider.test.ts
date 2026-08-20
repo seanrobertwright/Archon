@@ -127,6 +127,7 @@ describe('ClaudeProvider', () => {
       const caps = client.getCapabilities();
       expect(caps).toMatchObject({
         sessionResume: true,
+        sessionFork: true,
         mcp: true,
         hooks: true,
         skills: true,

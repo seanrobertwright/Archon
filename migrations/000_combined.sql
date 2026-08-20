@@ -220,6 +220,23 @@ COMMENT ON TABLE remote_agent_workflow_events IS
   'Lean UI-relevant workflow events for observability (step transitions, artifacts, errors)';
 
 -- ============================================================================
+-- Workflow run node sessions (private same-run session lineage)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS remote_agent_workflow_run_node_sessions (
+  workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  node_id VARCHAR(255) NOT NULL,
+  provider VARCHAR(50) NOT NULL,
+  provider_session_id TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  PRIMARY KEY (workflow_run_id, node_id)
+);
+
+COMMENT ON TABLE remote_agent_workflow_run_node_sessions IS
+  'Private provider session handles produced by top-level nodes within one workflow run. Cascades with the owning run and is never exposed through run or event APIs.';
+
+-- ============================================================================
 -- Workflow node sessions (persist_session opt-in across re-runs)
 -- ============================================================================
 

@@ -38,6 +38,34 @@ const promptNode: PromptNode = { id: 'n2', prompt: 'Do this inline.' };
 const bashNode: BashNode = { id: 'n3', bash: 'echo hello' };
 const cancelNode: CancelNode = { id: 'n5', cancel: 'Precondition failed' };
 
+describe('dagNodeSchema — context', () => {
+  test('parses scalar and named resume contexts on AI consumers', () => {
+    expect(dagNodeSchema.parse({ id: 'fresh', prompt: 'work', context: 'fresh' }).context).toBe(
+      'fresh'
+    );
+    expect(dagNodeSchema.parse({ id: 'shared', command: 'work', context: 'shared' }).context).toBe(
+      'shared'
+    );
+    expect(
+      dagNodeSchema.parse({ id: 'named', prompt: 'work', context: { resume: 'source' } }).context
+    ).toEqual({ resume: 'source' });
+  });
+
+  test('rejects named resume on a deterministic node instead of stripping it', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'shell',
+      bash: 'echo work',
+      context: { resume: 'source' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain(
+        "'context.resume' is only supported on command and prompt nodes"
+      );
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // isBashNode
 // ---------------------------------------------------------------------------

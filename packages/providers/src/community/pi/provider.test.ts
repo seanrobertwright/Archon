@@ -145,6 +145,9 @@ const mockModelRegistryCreate = mock<MockModelRegistryCreate>(
 // to a fresh one.
 const mockSessionCreate = mock((_cwd: string) => ({ __smKind: 'created' }));
 const mockSessionOpen = mock((_path: string) => ({ __smKind: 'opened' }));
+const mockSessionForkFrom = mock((_path: string, _cwd: string): { __smKind: string } => ({
+  __smKind: 'forked',
+}));
 const mockSessionList = mock(
   async (_cwd: string) => [] as { id: string; path: string; cwd: string }[]
 );
@@ -199,6 +202,7 @@ mock.module('@earendil-works/pi-coding-agent', () => ({
   SessionManager: {
     create: mockSessionCreate,
     open: mockSessionOpen,
+    forkFrom: mockSessionForkFrom,
     list: mockSessionList,
   },
   SettingsManager: {
@@ -292,6 +296,7 @@ describe('PiProvider', () => {
     mockCreateLsTool.mockClear();
     mockSessionCreate.mockClear();
     mockSessionOpen.mockClear();
+    mockSessionForkFrom.mockClear();
     mockSessionList.mockClear();
     mockSessionList.mockImplementation(async () => []);
     mockSettingsManagerInMemory.mockClear();
@@ -1000,6 +1005,7 @@ describe('PiProvider', () => {
     );
     expect(error).toBeUndefined();
     expect(mockSessionOpen).toHaveBeenCalledWith('/sessions/existing-id.jsonl');
+    expect(mockSessionForkFrom).not.toHaveBeenCalled();
     expect(mockSessionCreate).not.toHaveBeenCalled();
     // No resume_failed warning
     const systemChunks = chunks.filter(
@@ -1010,6 +1016,29 @@ describe('PiProvider', () => {
     // A warm resume reports resumed:true on the result chunk.
     expect(chunks.find(c => (c as { type?: string }).type === 'result')).toMatchObject({
       resumed: true,
+    });
+  });
+
+  test('forkSession resumes into a distinct branch without opening the source', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    mockSessionList.mockImplementationOnce(async () => [
+      { id: 'source-id', path: '/sessions/source-id.jsonl', cwd: '/tmp' },
+    ]);
+    resetScript(scriptedAgentEnd());
+
+    const { chunks, error } = await consume(
+      new PiProvider().sendQuery('hi', '/tmp', 'source-id', {
+        model: 'google/gemini-2.5-pro',
+        forkSession: true,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(mockSessionForkFrom).toHaveBeenCalledWith('/sessions/source-id.jsonl', '/tmp');
+    expect(mockSessionOpen).not.toHaveBeenCalled();
+    expect(chunks.find(c => (c as { type?: string }).type === 'result')).toMatchObject({
+      resumed: true,
+      sessionId: 'mock-session-uuid',
     });
   });
 

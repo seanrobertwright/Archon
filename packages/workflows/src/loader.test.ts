@@ -36,7 +36,7 @@ registerBuiltinProviders();
 
 import { discoverWorkflows, discoverWorkflowsWithConfig } from './workflow-discovery';
 import { isBashNode, isCancelNode, isLoopGroupNode, isLoopNode } from './schemas';
-import { parseWorkflow } from './loader';
+import { parseWorkflow, type ParseResult } from './loader';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import { workflowDefinitionSchema } from './schemas/workflow';
 import type { WorkflowDefinition } from './schemas/workflow';
@@ -5287,6 +5287,175 @@ nodes:
     });
   });
 
+  describe('addressable session resume', () => {
+    function parseAddressable(yaml: string): ParseResult {
+      return parseWorkflow(yaml, 'addressable.yaml');
+    }
+
+    it('accepts transitively upstream command, prompt, and plain loop sources', () => {
+      const result = parseAddressable(`
+name: addressable
+description: addressable sessions
+provider: claude
+nodes:
+  - id: command-source
+    command: scope
+  - id: prompt-source
+    prompt: review
+    depends_on: [command-source]
+  - id: loop-source
+    loop:
+      prompt: refine
+      until: DONE
+      max_iterations: 2
+    depends_on: [prompt-source]
+  - id: consumer
+    prompt: synthesize
+    depends_on: [loop-source]
+    context:
+      resume: command-source
+`);
+      expect(result.error).toBeNull();
+      expect(result.workflow?.nodes.at(-1)?.context).toEqual({ resume: 'command-source' });
+    });
+
+    for (const [label, sourceNode] of [
+      ['bash', '  - id: source\n    bash: echo scope'],
+      ['script', '  - id: source\n    script: console.log(1)\n    runtime: bun'],
+      ['approval', "  - id: source\n    approval:\n      message: 'Approve?'"],
+      ['workflow', '  - id: source\n    workflow: child'],
+    ] as const) {
+      it(`rejects a ${label} source`, () => {
+        const result = parseAddressable(`
+name: bad-source
+description: bad source
+provider: claude
+nodes:
+${sourceNode}
+  - id: consumer
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+`);
+        expect(result.error?.error).toContain('not a session-producing command, prompt, or loop');
+      });
+    }
+
+    it('rejects missing, self, downstream, and sibling sources', () => {
+      const missing = parseAddressable(`
+name: missing
+description: missing
+nodes:
+  - id: consumer
+    prompt: continue
+    context: { resume: ghost }
+`);
+      expect(missing.error?.error).toContain("references unknown node 'ghost'");
+
+      const self = parseAddressable(`
+name: self
+description: self
+nodes:
+  - id: consumer
+    prompt: continue
+    context: { resume: consumer }
+`);
+      expect(self.error?.error).toContain('not an upstream dependency');
+
+      const downstream = parseAddressable(`
+name: downstream
+description: downstream
+nodes:
+  - id: consumer
+    prompt: continue
+    context: { resume: later }
+  - id: later
+    prompt: later
+    depends_on: [consumer]
+`);
+      expect(downstream.error?.error).toContain('not an upstream dependency');
+
+      const sibling = parseAddressable(`
+name: sibling
+description: sibling
+nodes:
+  - id: source
+    prompt: source
+  - id: consumer
+    prompt: continue
+    context: { resume: source }
+`);
+      expect(sibling.error?.error).toContain('not an upstream dependency');
+    });
+
+    it('rejects named resume inside a loop_group body', () => {
+      const result = parseAddressable(`
+name: nested
+description: nested
+nodes:
+  - id: group
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: source
+          prompt: source
+        - id: consumer
+          prompt: continue
+          depends_on: [source]
+          context: { resume: source }
+`);
+      expect(result.error?.error).toContain('inside a loop_group body');
+    });
+
+    it('rejects statically mismatched and fork-incapable providers', () => {
+      const mismatch = parseAddressable(`
+name: mismatch
+description: mismatch
+nodes:
+  - id: source
+    prompt: source
+    provider: claude
+  - id: consumer
+    prompt: continue
+    provider: codex
+    depends_on: [source]
+    context: { resume: source }
+`);
+      expect(mismatch.error?.error).toContain("source 'source' uses provider 'claude'");
+      expect(mismatch.error?.error).toContain("consumer uses 'codex'");
+
+      const incapable = parseAddressable(`
+name: incapable
+description: incapable
+provider: codex
+nodes:
+  - id: source
+    prompt: source
+  - id: consumer
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+`);
+      expect(incapable.error?.error).toContain("provider 'codex' does not support sessionFork");
+    });
+
+    it('defers implicit provider resolution to runtime', () => {
+      const result = parseAddressable(`
+name: implicit
+description: implicit
+nodes:
+  - id: source
+    prompt: source
+  - id: consumer
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+`);
+      expect(result.error).toBeNull();
+    });
+  });
+
   describe('persist_session capability gating', () => {
     it('parses persist_session: true on a node', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
@@ -5677,6 +5846,24 @@ nodes:
       ]);
       expect(pw.length).toBe(1);
       expect(pw[0]).toContain("unknown key 'retry.backoff_ms'");
+    });
+
+    it('should warn on an unknown key inside context:', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: source',
+        '    prompt: source',
+        '  - id: consumer',
+        '    prompt: consumer',
+        '    depends_on: [source]',
+        '    context:',
+        '      resume: source',
+        '      fork: false',
+      ]);
+      expect(pw.length).toBe(1);
+      expect(pw[0]).toContain("unknown key 'context.fork'");
     });
 
     it('should warn on an unknown key inside an agents entry', async () => {
