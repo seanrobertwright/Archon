@@ -167,6 +167,7 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     parent_conversation_id: null,
     codebase_id: null,
     status: 'running',
+    outcome: null,
     user_message: 'test',
     metadata: {},
     started_at: new Date(),

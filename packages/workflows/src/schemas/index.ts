@@ -128,6 +128,7 @@ export type {
 // Workflow run state
 export {
   workflowRunStatusSchema,
+  workflowRunOutcomeSchema,
   workflowStepStatusSchema,
   nodeStateSchema,
   nodeOutputSchema,
@@ -142,6 +143,7 @@ export {
 } from './workflow-run';
 export type {
   WorkflowRunStatus,
+  WorkflowRunOutcome,
   WorkflowStepStatus,
   NodeState,
   NodeOutput,

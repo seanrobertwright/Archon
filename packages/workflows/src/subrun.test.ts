@@ -96,6 +96,7 @@ class InMemoryStore implements IWorkflowStore {
       parent_conversation_id: data.parent_conversation_id ?? null,
       codebase_id: data.codebase_id ?? null,
       status: 'pending',
+      outcome: null,
       user_message: data.user_message,
       metadata: data.metadata ?? {},
       started_at: new Date(),
@@ -161,6 +162,7 @@ class InMemoryStore implements IWorkflowStore {
     const r = this.runs.get(id);
     if (r) {
       if (updates.status) r.status = updates.status;
+      if (updates.outcome) r.outcome = updates.outcome;
       if (updates.metadata) r.metadata = { ...r.metadata, ...updates.metadata };
     }
     return Promise.resolve();
@@ -4676,5 +4678,73 @@ nodes:
     );
     expect(String(subCompleted?.data?.node_output)).toContain('THE-SUMMARY');
     expect(String(subCompleted?.data?.node_output)).not.toContain('THE-CLEANUP');
+  });
+
+  it('keeps a child authored outcome on the child run without propagating it to the parent', async () => {
+    await writeWorkflow(
+      'child-outcome',
+      `
+name: child-outcome
+description: child authors a failed work verdict
+returns: result
+outcome_field: green
+nodes:
+  - id: result
+    prompt: report the child verdict
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`
+    );
+    await writeWorkflow(
+      'parent-outcome',
+      `
+name: parent-outcome
+description: parent consumes the governed child
+nodes:
+  - id: sub
+    workflow: child-outcome
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    deps.getAgentProvider = mock(() => ({
+      ...makeProvider(),
+      sendQuery: mock(function* () {
+        yield { type: 'assistant', content: '{"green":false}' };
+        yield {
+          type: 'result',
+          sessionId: 'sess-outcome',
+          structuredOutput: { green: false },
+        };
+      }),
+    })) as unknown as WorkflowDeps['getAgentProvider'];
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-outcome'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(run => run.workflow_name === 'child-outcome');
+    const parent = [...store.runs.values()].find(run => run.workflow_name === 'parent-outcome');
+    expect(child).toMatchObject({ status: 'completed', outcome: 'failed' });
+    expect(parent).toMatchObject({ status: 'completed', outcome: null });
+    expect(
+      store.events.some(
+        event =>
+          event.workflow_run_id === parent?.id &&
+          event.event_type === 'node_completed' &&
+          event.step_name === 'sub'
+      )
+    ).toBe(true);
   });
 });

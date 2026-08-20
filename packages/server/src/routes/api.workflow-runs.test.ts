@@ -65,6 +65,7 @@ type MockWorkflowRun = {
   parent_conversation_id: string | null;
   codebase_id: string | null;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+  outcome: 'succeeded' | 'failed' | null;
   user_message: string;
   started_at: string;
   completed_at: string | null;
@@ -324,6 +325,7 @@ const MOCK_RUNNING_RUN: MockWorkflowRun = {
   parent_conversation_id: null,
   codebase_id: 'cb-uuid-1',
   status: 'running',
+  outcome: null,
   user_message: 'Deploy to staging',
   started_at: NOW,
   completed_at: null,
@@ -336,6 +338,7 @@ const MOCK_COMPLETED_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-2',
   status: 'completed',
+  outcome: 'failed',
   completed_at: NOW,
 };
 
@@ -343,6 +346,7 @@ const MOCK_FAILED_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-4',
   status: 'failed',
+  outcome: 'succeeded',
   completed_at: NOW,
 };
 
@@ -953,9 +957,12 @@ describe('GET /api/workflows/runs', () => {
     const response = await app.request('/api/workflows/runs');
     expect(response.status).toBe(200);
 
-    const body = (await response.json()) as { runs: Array<{ id: string }> };
+    const body = (await response.json()) as {
+      runs: Array<{ id: string; outcome: 'succeeded' | 'failed' | null }>;
+    };
     expect(body.runs.length).toBe(2);
     expect(body.runs[0]?.id).toBe('run-uuid-1');
+    expect(body.runs.map(run => run.outcome)).toEqual([null, 'failed']);
   });
 
   test('converts Date objects to ISO strings in response', async () => {
@@ -1105,6 +1112,24 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(body.error).toContain('not found');
   });
 
+  test('returns authored outcome independently from failed lifecycle status', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_FAILED_RUN);
+    mockListWorkflowEvents.mockImplementationOnce(async () => []);
+    mockGetConversationById.mockImplementationOnce(async () => ({
+      id: 'conv-uuid-1',
+      platform_conversation_id: 'web-conv-abc',
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-4');
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      run: { status: string; outcome: string | null };
+    };
+    expect(body.run).toMatchObject({ status: 'failed', outcome: 'succeeded' });
+  });
+
   test('includes conversation_platform_id for CLI runs (no parent_conversation_id)', async () => {
     // CLI run: conversation_id set, no parent_conversation_id
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
@@ -1218,12 +1243,13 @@ describe('GET /api/dashboard/runs', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
-      runs: unknown[];
+      runs: Array<{ status: string; outcome: string | null }>;
       total: number;
       counts: { all: number };
     };
     expect(Array.isArray(body.runs)).toBe(true);
     expect(body.runs.length).toBe(2);
+    expect(body.runs[1]).toMatchObject({ status: 'completed', outcome: 'failed' });
     expect(body.total).toBe(2);
     expect(body.counts.all).toBe(5);
   });
@@ -1363,12 +1389,14 @@ describe('GET /api/workflows/runs/by-worker/:platformId', () => {
   });
 
   test('returns run when found', async () => {
-    mockGetWorkflowRunByWorkerPlatformId.mockResolvedValueOnce(MOCK_RUNNING_RUN);
+    mockGetWorkflowRunByWorkerPlatformId.mockResolvedValueOnce(MOCK_COMPLETED_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/by-worker/some-platform-id');
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { run: unknown };
-    expect(body.run).toBeDefined();
+    const body = (await response.json()) as {
+      run: { status: string; outcome: string | null };
+    };
+    expect(body.run).toMatchObject({ status: 'completed', outcome: 'failed' });
   });
 
   test('returns 404 when not found', async () => {

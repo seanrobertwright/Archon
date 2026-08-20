@@ -6361,6 +6361,98 @@ nodes:
 });
 
 // ---------------------------------------------------------------------------
+// Authored workflow outcome (#2618)
+// ---------------------------------------------------------------------------
+
+describe('workflow authored outcome declaration (#2618)', () => {
+  const parseOutcomeWorkflow = (
+    declaration: string,
+    outputFormat = `
+    output_format:
+      type: object
+      properties:
+        green:
+          type: boolean
+      required: [green]`
+  ) =>
+    parseWorkflow(
+      `
+name: authored-outcome
+description: independently reports the authored verdict
+${declaration}
+nodes:
+  - id: result
+    prompt: report the verdict${outputFormat}
+`,
+      'authored-outcome.yaml'
+    );
+
+  it('accepts a trimmed field naming a required boolean on the selected return node', () => {
+    const { workflow, error } = parseOutcomeWorkflow('returns: result\noutcome_field: "  green  "');
+
+    expect(error).toBeNull();
+    expect(workflow?.returns).toBe('result');
+    expect(workflow?.outcome_field).toBe('green');
+  });
+
+  it('rejects outcome_field without an explicit returns node', () => {
+    const { workflow, error } = parseOutcomeWorkflow('outcome_field: green');
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('without returns:');
+  });
+
+  it.each([
+    ['blank', 'returns: result\noutcome_field: "   "'],
+    ['non-string', 'returns: result\noutcome_field: { field: green }'],
+  ])('rejects a %s outcome_field instead of silently dropping it', (_label, declaration) => {
+    const { workflow, error } = parseOutcomeWorkflow(declaration);
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain("Invalid 'outcome_field'");
+  });
+
+  it.each([
+    ['no output_format', ''],
+    [
+      'undeclared property',
+      `
+    output_format:
+      type: object
+      properties:
+        ready: { type: boolean }
+      required: [ready]`,
+    ],
+    [
+      'optional property',
+      `
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }`,
+    ],
+    [
+      'non-boolean property',
+      `
+    output_format:
+      type: object
+      properties:
+        green: { type: string }
+      required: [green]`,
+    ],
+  ])('rejects an outcome field with %s', (_label, outputFormat) => {
+    const { workflow, error } = parseOutcomeWorkflow(
+      'returns: result\noutcome_field: green',
+      outputFormat
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toContain('outcome_field');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Workflow-level field parity (#2457)
 // ---------------------------------------------------------------------------
 
@@ -6452,6 +6544,10 @@ describe('workflow-level field parity (#2457)', () => {
     },
     // `returns` must name a real top-level node id — the fixture's single node is `only`.
     returns: { yaml: 'returns: only', present: w => w.returns === 'only' },
+    outcome_field: {
+      yaml: 'returns: only\noutcome_field: green',
+      present: w => w.outcome_field === 'green',
+    },
   };
 
   const schemaKeys = Object.keys(workflowDefinitionSchema.shape);
@@ -6484,6 +6580,11 @@ describe('workflow-level field parity (#2457)', () => {
         'nodes:',
         '  - id: only',
         '    prompt: hello',
+        '    output_format:',
+        '      type: object',
+        '      properties:',
+        '        green: { type: boolean }',
+        '      required: [green]',
       ]
         .filter(line => line !== '')
         .join('\n');

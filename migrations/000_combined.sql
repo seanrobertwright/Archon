@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
   codebase_id UUID REFERENCES remote_agent_codebases(id) ON DELETE SET NULL,
   current_step_index INTEGER,
   status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending, running, completed, failed, cancelled, paused
+  outcome VARCHAR(20) CHECK (outcome IN ('succeeded', 'failed')),
   user_message TEXT NOT NULL,
   metadata JSONB DEFAULT '{}',
   parent_conversation_id UUID REFERENCES remote_agent_conversations(id) ON DELETE SET NULL,
@@ -369,6 +370,13 @@ ALTER TABLE remote_agent_workflow_runs
 -- across a codebase rename (#1192). Declared identically on SQLite (sqlite.ts).
 ALTER TABLE remote_agent_workflow_runs
   ADD COLUMN IF NOT EXISTS output_root TEXT;
+
+-- Authored workflow verdict (#2618), independent from lifecycle status. Nullable
+-- means undeclared or not yet authored; no default/backfill so historical rows
+-- remain unknown rather than being reinterpreted from current workflow YAML.
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)
+    CHECK (outcome IN ('succeeded', 'failed'));
 
 -- From PR-C: per-user GitHub user-to-server tokens (device flow), encrypted at rest.
 -- One row per Archon user; cascades on user deletion. github_user_id is the

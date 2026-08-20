@@ -59,6 +59,7 @@ import type {
   LoopGateRunMetadata,
   ApprovalContext,
   WorkflowEvidencePolicy,
+  WorkflowRunOutcome,
   NodeArtifactLoopFrame,
   WorkflowRunNodeSession,
 } from './schemas';
@@ -8842,6 +8843,8 @@ export async function executeDagWorkflow(
     evidence_policy?: WorkflowEvidencePolicy;
     /** Declared `returns:` node id (#2470) — rebinds a CHILD run's terminal output. */
     returns?: string;
+    /** Required boolean property on `returns:` that authors the durable run outcome. */
+    outcome_field?: string;
   } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
@@ -9123,6 +9126,33 @@ export async function executeDagWorkflow(
       });
   };
 
+  // Persist the authored verdict as soon as the selected result is available,
+  // independently from every lifecycle branch below (#2618). The initial call
+  // covers a selected node rehydrated from node_completed events on resume; the
+  // finally call covers fresh output even when the same/later layer pauses,
+  // cancels, fails, or throws. A same-value write is skipped, but a genuine
+  // re-execution may replace the prior verdict.
+  let persistedOutcome: WorkflowRunOutcome | null = workflowRun.outcome;
+  const persistAuthoredOutcome = async (): Promise<void> => {
+    const field = workflow.outcome_field;
+    const returns = workflow.returns;
+    if (field === undefined || returns === undefined) return;
+    const selectedOutput = nodeOutputs.get(returns);
+    if (selectedOutput?.state !== 'completed') return;
+
+    const resolution = resolveNodeOutputField(selectedOutput, returns, field);
+    if (resolution.kind !== 'value' || typeof resolution.value !== 'boolean') {
+      throw new Error(
+        `Workflow outcome_field '${field}' on returns node '${returns}' did not resolve to a boolean`
+      );
+    }
+    const outcome: WorkflowRunOutcome = resolution.value ? 'succeeded' : 'failed';
+    if (outcome === persistedOutcome) return;
+    await deps.store.updateWorkflowRun(workflowRun.id, { outcome });
+    persistedOutcome = outcome;
+  };
+
+  await persistAuthoredOutcome();
   try {
     await runLayers(runCtx);
   } finally {
@@ -9136,6 +9166,7 @@ export async function executeDagWorkflow(
     // terminal outcome the invariant has to cover. persistRunUsage swallows its own
     // errors, so it can never displace the in-flight exception.
     await persistRunUsage();
+    await persistAuthoredOutcome();
   }
   // Pull the mutated accumulators back into local scope for the terminal tally below.
   const totalCostUsd = runCtx.totalCostUsd;

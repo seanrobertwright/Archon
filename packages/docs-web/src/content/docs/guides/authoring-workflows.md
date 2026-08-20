@@ -152,6 +152,8 @@ inputs:                          # Optional: declared signature — what this bl
   diff: { required: true }       #   A caller supplies values via `with:`; the block reads
   style: { default: strict }     #   them as `$INPUTS.<name>`. See "Workflow Signature".
 returns: synthesize              # Optional: the node id whose output IS this block's result.
+# outcome_field: ready           # Optional: a required boolean property on `returns:` whose
+                                 #   exact value is persisted as the authored run outcome.
 
 # Required for DAG-based
 nodes:
@@ -1063,6 +1065,7 @@ and then removed from the definition, so nothing can fall back to an outer file'
 | `provider`, `model`, `effort`, `thinking`, `fallbackModel`, `betas`, `sandbox`, `persist_sessions` | **Travel** with the workflow, onto its own nodes. A node's own value always wins. |
 | `requires` | **Unions** into the composing workflow, so a missing capability refuses the run at invocation instead of failing mid-block. |
 | `inputs`, `returns` | **Consumed** by composition — `inputs:` validates the caller's `with:`, `returns:` selects `$includeId.output`. |
+| `outcome_field` | **Owned by the workflow being run.** An included workflow's declaration does not propagate to its composer. A top-level composer may declare its own field relative to its own `returns:`; an include alias is rebound before that contract is validated. |
 | `interactive`, `worktree`, `container`, `evidence_policy`, `mutates_checkout` | **Run-owned.** Whoever starts the run decides these; a composed file's values are dropped with a load-time warning. Declare them on the top-level workflow. |
 | `webSearchMode` | **Dropped, and this one is a real gap.** It is the only workflow-level field with no per-node counterpart, so there is nowhere for it to travel. Set it on the top-level workflow — where it then applies to every node in the run. |
 
@@ -1240,12 +1243,19 @@ inputs:
   style:
     default: strict
 returns: synthesize          # the node whose output IS this block's result
+outcome_field: green         # required boolean field that authors this run's verdict
 nodes:
   - id: gather
     prompt: Gather context for $INPUTS.diff (style $INPUTS.style).
   - id: synthesize
-    prompt: Synthesize a review from $gather.output.
+    prompt: Synthesize a review from $gather.output and report whether it is green.
     depends_on: [gather]
+    output_format:
+      type: object
+      properties:
+        review: { type: string }
+        green: { type: boolean }
+      required: [review, green]
   - id: implement-fixes
     prompt: Apply the fixes.
     depends_on: [synthesize]
@@ -1267,6 +1277,23 @@ nodes:
   `include:` block, `$blk.output` resolves to the `returns:` node; `depends_on: [blk]` still
   waits on every terminal node. For a `workflow:` sub-run child, the child's terminal output
   (threaded back as `$node.output`) becomes the `returns:` node's output.
+- **`outcome_field:`** — an optional, explicit authored verdict relative to `returns:`. The
+  selected node must declare the property in `output_format.properties`, list it in
+  `output_format.required`, and set `type: boolean`; otherwise the workflow fails to load.
+  Exact `true` is persisted as `outcome: succeeded`, exact `false` as `outcome: failed`.
+  This is independent from engine lifecycle `status`: a run may be `completed / failed-outcome`,
+  `failed / succeeded-outcome`, or `paused / succeeded-outcome`. Status still controls terminality,
+  resume, cancellation, filtering, automation, and CLI exit codes. A workflow with no declaration,
+  a selected node that has not completed, and historical runs read as `outcome: null` — never as
+  failure. Resume preserves an authored outcome until the selected node actually re-executes and
+  authors a replacement.
+
+An included workflow's outcome declaration never becomes the composer's outcome, and a
+`workflow:` child owns its outcome on its own run row; neither propagates implicitly to a parent.
+The REST run list, detail, by-worker, and dashboard JSON expose nullable `outcome` beside `status`.
+Coherent presentation across CLI, web, console, and adapters is tracked in
+[#2651](https://github.com/coleam00/Archon/issues/2651); dry-run terminology and compatibility are
+tracked separately in [#2650](https://github.com/coleam00/Archon/issues/2650).
 
 ### Binding time: includes resolve at load, runs at runtime
 

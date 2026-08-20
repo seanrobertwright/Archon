@@ -3365,6 +3365,7 @@ export interface components {
         };
       };
       returns?: string;
+      outcome_field?: string;
       nodes: components['schemas']['DagNode'][];
     };
     DagNode: {
@@ -3705,6 +3706,8 @@ export interface components {
       codebase_id: string | null;
       /** @enum {string} */
       status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+      /** @enum {string|null} */
+      outcome: 'succeeded' | 'failed' | null;
       user_message: string;
       metadata: {
         [key: string]: unknown;
@@ -3757,6 +3760,7 @@ export interface components {
       codebase_id: string | null;
       /** @enum {string} */
       status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+      outcome: components['schemas']['WorkflowRunOutcome'];
       user_message: string;
       metadata: {
         [key: string]: unknown;
@@ -3769,6 +3773,8 @@ export interface components {
       parent_run_id: string | null;
       output_root: string | null;
     };
+    /** @enum {string|null} */
+    WorkflowRunOutcome: 'succeeded' | 'failed' | null;
     WorkflowRunByWorkerResponse: {
       run: components['schemas']['WorkflowRun'];
     };

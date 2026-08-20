@@ -3,7 +3,10 @@
  */
 import { z } from '@hono/zod-openapi';
 import { workflowDefinitionSchema as engineWorkflowDefinitionSchema } from '@archon/workflows/schemas/workflow';
-import { workflowRunSchema as engineWorkflowRunSchema } from '@archon/workflows/schemas/workflow-run';
+import {
+  workflowRunSchema as engineWorkflowRunSchema,
+  workflowRunOutcomeSchema as engineWorkflowRunOutcomeSchema,
+} from '@archon/workflows/schemas/workflow-run';
 import { workflowEventRowSchema } from '@archon/core/schemas/workflow-event';
 import { dashboardWorkflowRunSchema as coreDashboardWorkflowRunSchema } from '@archon/core/schemas/workflow-run';
 
@@ -109,9 +112,15 @@ export const workflowRunStatusSchema = z
   .enum(['pending', 'running', 'completed', 'failed', 'cancelled', 'paused'])
   .openapi('WorkflowRunStatus');
 
+/** Workflow-authored verdict, independent from lifecycle status. */
+export const workflowRunOutcomeSchema = engineWorkflowRunOutcomeSchema
+  .nullable()
+  .openapi('WorkflowRunOutcome');
+
 /** A workflow run record (wire shape with ISO string dates). */
 export const workflowRunSchema = engineWorkflowRunSchema
   .extend({
+    outcome: workflowRunOutcomeSchema,
     started_at: z.string(),
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),

@@ -56,6 +56,7 @@ import type {
 import { INPUT_NAME_PATTERN, inputEnvKey } from './schemas/dag-node';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { parseWhenAtom, whenAtoms, WHEN_INPUTS_SCOPE } from './when-atom';
+import { declaredFieldsFromSchema } from './output-ref';
 import { z } from '@hono/zod-openapi';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -132,6 +133,52 @@ function nodeIdForMessages(raw: unknown, index: number): string {
       ? String((raw as Record<string, unknown>).id)
       : '';
   return rawId.trim() || `#${String(index + 1)}`;
+}
+
+/**
+ * Validate the run-level authored-outcome declaration against its selected node.
+ *
+ * Include aliases are deliberately deferred: `parseWorkflow` can only see the
+ * `include:` directive, while `expandWorkflowIncludes` owns rebinding that alias
+ * to the flattened child's declared return. The expander calls this same helper
+ * on the final flat workflow, where every selected node is executable.
+ */
+export function validateWorkflowOutcomeDeclaration(
+  workflow: Pick<WorkflowDefinition, 'returns' | 'outcome_field' | 'nodes'>
+): string | null {
+  const field = workflow.outcome_field;
+  if (field === undefined) return null;
+  if (workflow.returns === undefined) {
+    return `Workflow declares outcome_field: '${field}' without returns: — authored outcome must select a result node explicitly`;
+  }
+
+  const selectedNode = workflow.nodes.find(node => node.id === workflow.returns);
+  if (selectedNode === undefined) {
+    return `Workflow declares returns: '${workflow.returns}' but no top-level node has that id`;
+  }
+  if (isIncludeNode(selectedNode)) return null;
+
+  const schema = selectedNode.output_format;
+  if (schema === undefined) {
+    return `Workflow outcome_field: '${field}' selects node '${workflow.returns}', but that node declares no output_format`;
+  }
+  const declared = declaredFieldsFromSchema(schema);
+  if (!declared?.includes(field)) {
+    return `Workflow outcome_field: '${field}' is not declared in node '${workflow.returns}' output_format properties${declared && declared.length > 0 ? ` (declared: ${declared.join(', ')})` : ''}`;
+  }
+  if (!Array.isArray(schema.required) || !schema.required.includes(field)) {
+    return `Workflow outcome_field: '${field}' must be listed in node '${workflow.returns}' output_format.required`;
+  }
+  const properties = schema.properties as Record<string, unknown>;
+  const property = properties[field];
+  const propertyType =
+    property !== null && typeof property === 'object'
+      ? (property as { type?: unknown }).type
+      : undefined;
+  if (propertyType !== 'boolean') {
+    return `Workflow outcome_field: '${field}' on node '${workflow.returns}' must explicitly declare type: boolean`;
+  }
+  return null;
 }
 
 /**
@@ -1236,6 +1283,30 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       };
     }
 
+    // Authored run outcome (#2618). Unlike cosmetic or provider-default fields,
+    // a malformed selector cannot be dropped: doing so would silently turn a
+    // declared verdict into outcome=null. The node-schema relationship is
+    // validated below on the assembled workflow (and again after include
+    // expansion when `returns:` names an include alias).
+    let outcomeField: string | undefined;
+    if (typeof raw.outcome_field === 'string' && raw.outcome_field.trim().length > 0) {
+      outcomeField = raw.outcome_field.trim();
+    } else if (raw.outcome_field !== undefined) {
+      getLog().warn(
+        { filename, value: raw.outcome_field },
+        'invalid_workflow_outcome_field_value_rejected'
+      );
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error:
+            "Invalid 'outcome_field': expected a non-empty required boolean property name relative to 'returns'",
+          errorType: 'validation_error',
+        },
+      };
+    }
+
     // Parse workflow-level fallback fields. Same warn-and-drop pattern as
     // `modelReasoningEffort` / `webSearchMode` above. These are declared on
     // `workflowBaseSchema` and consumed by the DAG executor's
@@ -1363,32 +1434,46 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       }
     }
 
+    const workflow: WorkflowDefinition = {
+      name: raw.name,
+      description: raw.description,
+      provider,
+      model,
+      // `modelReasoningEffort` is deliberately absent — it was translated into
+      // `effort` above, so nothing downstream ever sees the deprecated field.
+      webSearchMode,
+      interactive,
+      ...(mutatesCheckout !== undefined ? { mutates_checkout: mutatesCheckout } : {}),
+      ...(effort !== undefined ? { effort } : {}),
+      ...(thinking !== undefined ? { thinking } : {}),
+      ...(fallbackModel !== undefined ? { fallbackModel } : {}),
+      ...(betas !== undefined ? { betas } : {}),
+      ...(sandbox !== undefined ? { sandbox } : {}),
+      ...(workflowPersistSessions ? { persist_sessions: true } : {}),
+      nodes: dagNodes,
+      ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
+      ...(containerPolicy ? { container: containerPolicy } : {}),
+      ...(evidencePolicy !== undefined ? { evidence_policy: evidencePolicy } : {}),
+      ...(tags !== undefined ? { tags } : {}),
+      ...(requires !== undefined ? { requires } : {}),
+      ...(inputs !== undefined ? { inputs } : {}),
+      ...(returns !== undefined ? { returns } : {}),
+      ...(outcomeField !== undefined ? { outcome_field: outcomeField } : {}),
+    };
+    const outcomeDeclarationError = validateWorkflowOutcomeDeclaration(workflow);
+    if (outcomeDeclarationError !== null) {
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error: outcomeDeclarationError,
+          errorType: 'validation_error',
+        },
+      };
+    }
+
     return {
-      workflow: {
-        name: raw.name,
-        description: raw.description,
-        provider,
-        model,
-        // `modelReasoningEffort` is deliberately absent — it was translated into
-        // `effort` above, so nothing downstream ever sees the deprecated field.
-        webSearchMode,
-        interactive,
-        ...(mutatesCheckout !== undefined ? { mutates_checkout: mutatesCheckout } : {}),
-        ...(effort !== undefined ? { effort } : {}),
-        ...(thinking !== undefined ? { thinking } : {}),
-        ...(fallbackModel !== undefined ? { fallbackModel } : {}),
-        ...(betas !== undefined ? { betas } : {}),
-        ...(sandbox !== undefined ? { sandbox } : {}),
-        ...(workflowPersistSessions ? { persist_sessions: true } : {}),
-        nodes: dagNodes,
-        ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
-        ...(containerPolicy ? { container: containerPolicy } : {}),
-        ...(evidencePolicy !== undefined ? { evidence_policy: evidencePolicy } : {}),
-        ...(tags !== undefined ? { tags } : {}),
-        ...(requires !== undefined ? { requires } : {}),
-        ...(inputs !== undefined ? { inputs } : {}),
-        ...(returns !== undefined ? { returns } : {}),
-      },
+      workflow,
       error: null,
       warnings: parseWarnings,
     };

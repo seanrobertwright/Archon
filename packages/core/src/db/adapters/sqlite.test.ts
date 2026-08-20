@@ -107,6 +107,30 @@ describe('SqliteAdapter upgrade path', () => {
       await seed.close();
     }
   });
+
+  test('adds the authored outcome column idempotently to an existing workflow-runs table', async () => {
+    const name = `archon-test-sqlite-outcome-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const uri = `file:${name}?mode=memory&cache=shared`;
+    const seed = new SqliteAdapter(uri);
+    try {
+      const raw = new Database(uri);
+      try {
+        raw.run('ALTER TABLE remote_agent_workflow_runs DROP COLUMN outcome');
+      } finally {
+        raw.close();
+      }
+      expect(columnsOf(uri, 'remote_agent_workflow_runs')).not.toContain('outcome');
+
+      const upgraded = new SqliteAdapter(uri);
+      await upgraded.close();
+      const reopened = new SqliteAdapter(uri);
+      await reopened.close();
+
+      expect(columnsOf(uri, 'remote_agent_workflow_runs')).toContain('outcome');
+    } finally {
+      await seed.close();
+    }
+  });
 });
 
 describe('SqliteAdapter', () => {
@@ -766,6 +790,37 @@ describe('SqliteAdapter', () => {
       db = createTestDb();
       expect(raw_pragma(currentDbPath, 'remote_agent_workflow_runs')).toContain('output_root');
       expect(getSchemaSQL()).toContain('output_root');
+    });
+
+    test('authored outcome is nullable and constrained identically in both schema sources', async () => {
+      db = createTestDb();
+      await insertCodebase(db, 'cb-outcome');
+      await db.query(
+        `INSERT INTO remote_agent_conversations
+           (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['conv-outcome', 'web', 'thread-outcome', 'cb-outcome']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_workflow_runs
+           (id, conversation_id, workflow_name, user_message, outcome)
+         VALUES ($1, $2, $3, $4, $5)`,
+        ['run-outcome', 'conv-outcome', 'verify', 'test', 'succeeded']
+      );
+      const rows = await db.query<{ outcome: string | null }>(
+        'SELECT outcome FROM remote_agent_workflow_runs WHERE id = $1',
+        ['run-outcome']
+      );
+      expect(rows.rows[0]?.outcome).toBe('succeeded');
+      await expect(
+        db.query(
+          `INSERT INTO remote_agent_workflow_runs
+             (id, conversation_id, workflow_name, user_message, outcome)
+           VALUES ($1, $2, $3, $4, $5)`,
+          ['run-bad-outcome', 'conv-outcome', 'verify', 'test', 'unknown']
+        )
+      ).rejects.toThrow();
+      expect(getSchemaSQL()).toContain("CHECK (outcome IN ('succeeded', 'failed'))");
     });
 
     test('run-scoped session handles cascade with their workflow run in both schema shapes', async (): Promise<void> => {

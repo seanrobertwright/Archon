@@ -869,7 +869,7 @@ export async function getWorkflowRunByWorkerPlatformId(
  */
 export async function updateWorkflowRun(
   id: string,
-  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>>
+  updates: Partial<Pick<WorkflowRun, 'status' | 'outcome' | 'metadata' | 'output_root'>>
 ): Promise<void> {
   const dialect = getDialect();
   const setClauses: string[] = [];
@@ -895,6 +895,10 @@ export async function updateWorkflowRun(
     const paramIndex = values.length + 1;
     values.push(JSON.stringify(updates.metadata));
     setClauses.push(`metadata = ${dialect.jsonMerge('metadata', paramIndex)}`);
+  }
+  if (updates.outcome !== undefined) {
+    values.push(updates.outcome);
+    setClauses.push(`outcome = $${values.length}`);
   }
   if (updates.output_root !== undefined) {
     values.push(updates.output_root);

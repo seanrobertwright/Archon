@@ -180,7 +180,7 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    */
   updateWorkflowRun(
     id: string,
-    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>>
+    updates: Partial<Pick<WorkflowRun, 'status' | 'outcome' | 'metadata' | 'output_root'>>
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;

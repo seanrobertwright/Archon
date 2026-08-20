@@ -208,6 +208,13 @@ export const workflowBaseSchema = z.object({
    * including a non-sink node.
    */
   returns: z.string().min(1).optional(),
+  /**
+   * Required boolean property on the declared `returns:` node that records the
+   * workflow author's verdict independently from the run lifecycle (#2618).
+   * The loader validates the selected node's `output_format` contract; the
+   * engine maps exact true/false values to succeeded/failed without inference.
+   */
+  outcome_field: z.string().trim().min(1).optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
@@ -279,7 +286,7 @@ export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = ne
   ],
   // First `record` entry in this map: `inputs` is a record of input-name → spec,
   // so unknown keys under an individual spec (e.g. `inputs.diff.typo`) warn.
-  // `returns` is a plain string and needs no nested registration.
+  // `returns` and `outcome_field` are plain strings and need no nested registration.
   [
     'inputs',
     {

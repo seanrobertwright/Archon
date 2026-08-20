@@ -18,6 +18,19 @@ export const workflowRunStatusSchema = z.enum([
 
 export type WorkflowRunStatus = z.infer<typeof workflowRunStatusSchema>;
 
+// ---------------------------------------------------------------------------
+// WorkflowRunOutcome
+// ---------------------------------------------------------------------------
+
+/**
+ * Workflow-authored verdict, independent from engine-owned lifecycle status.
+ * Null on a run means no declared result has been authored yet (or the
+ * workflow does not declare one); it never means failure.
+ */
+export const workflowRunOutcomeSchema = z.enum(['succeeded', 'failed']);
+
+export type WorkflowRunOutcome = z.infer<typeof workflowRunOutcomeSchema>;
+
 /** Statuses that indicate a run has finished and cannot transition further. */
 export const TERMINAL_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
   'completed',
@@ -114,6 +127,7 @@ export const workflowRunSchema = z.object({
   parent_conversation_id: z.string().nullable(),
   codebase_id: z.string().nullable(),
   status: workflowRunStatusSchema,
+  outcome: workflowRunOutcomeSchema.nullable(),
   user_message: z.string(),
   metadata: z.record(z.string(), z.unknown()),
   started_at: z.date(),
