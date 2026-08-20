@@ -2277,6 +2277,50 @@ nodes:
       }
     });
 
+    it('warns that output_format is ignored on a loop_group', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-group-structured.yaml'),
+        `
+name: loop-group-structured
+description: Group with an unsupported structured output declaration
+nodes:
+  - id: iterate
+    provider: claude
+    model: claude-opus-4-6
+    output_format:
+      type: object
+      properties:
+        done:
+          type: boolean
+      required: [done]
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 1
+      nodes:
+        - id: work
+          bash: echo done
+`
+      );
+
+      mockLogger.warn.mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(isLoopGroupNode(result.workflows[0].workflow.nodes[0])).toBe(true);
+
+      const aiFieldWarnings = mockLogger.warn.mock.calls.filter(
+        call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(1);
+      const warnedFields = (aiFieldWarnings[0][0] as { fields: string[] }).fields;
+      expect(warnedFields).toContain('output_format');
+      expect(warnedFields).not.toContain('model');
+      expect(warnedFields).not.toContain('provider');
+    });
+
     it('should NOT warn about pi: on loop nodes and should preserve it (#2133)', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });

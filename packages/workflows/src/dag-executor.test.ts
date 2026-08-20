@@ -4811,6 +4811,12 @@ nodes:
 describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
   let testDir: string;
 
+  type PersistedEvent = {
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  };
+
   beforeEach(async () => {
     testDir = join(
       tmpdir(),
@@ -4842,6 +4848,78 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       // ignore cleanup errors
     }
   });
+
+  function rawLoopGroupWorkflow(field: 'note' | 'status'): WorkflowDefinition {
+    return {
+      name: `raw-loop-group-${field}`,
+      description: 'Raw loop-group resume parity fixture',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'group',
+          output_format: {
+            type: 'object',
+            properties: { status: { type: 'string' } },
+            required: ['status'],
+          },
+          loop_group: {
+            until_bash: 'exit 0',
+            max_iterations: 1,
+            fresh_context: false,
+            nodes: [{ id: 'emit', bash: `printf '%s' '{"note":"hi"}'` }],
+          },
+        }),
+        dagNodeSchema.parse({
+          id: 'consumer',
+          prompt: `whole=[$group.output]\nfield=[$group.output.${field}]`,
+          depends_on: ['group'],
+        }),
+      ],
+    };
+  }
+
+  async function runRawLoopGroupWorkflow(
+    field: 'note' | 'status',
+    runId: string,
+    priorCompletedNodes?: Map<string, string>
+  ): Promise<{
+    prompt: string | undefined;
+    result: string | undefined;
+    events: PersistedEvent[];
+  }> {
+    let prompt: string | undefined;
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* (resolvedPrompt: string) {
+      prompt = resolvedPrompt;
+      yield { type: 'assistant', content: 'consumer completed' };
+      yield { type: 'result', sessionId: `${runId}-session` };
+    });
+
+    const store = createMockStore();
+    const result = await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-resume',
+      testDir,
+      rawLoopGroupWorkflow(field),
+      makeWorkflowRun(runId),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+    return { prompt, result, events };
+  }
 
   it('skips nodes that appear in priorCompletedNodes', async () => {
     const store = createMockStore();
@@ -5219,6 +5297,120 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       { input: 0, output: 0 }
     );
     expect(eventTokenTotal).toEqual({ input: 100, output: 10 });
+  });
+
+  it('keeps raw loop_group output schemaless on resume for a present undeclared field', async () => {
+    const rawOutput = '{"note":"hi"}';
+    const fresh = await runRawLoopGroupWorkflow('note', 'raw-group-present-fresh');
+    const resumed = await runRawLoopGroupWorkflow(
+      'note',
+      'raw-group-present-resumed',
+      new Map([['group', rawOutput]])
+    );
+
+    expect(fresh.prompt).toBe(`whole=[${rawOutput}]\nfield=[hi]`);
+    expect(resumed.prompt).toBe(fresh.prompt);
+    expect(fresh.result).toBe('consumer completed');
+    expect(resumed.result).toBe(fresh.result);
+
+    const freshGroup = fresh.events.find(
+      event => event.event_type === 'node_completed' && event.step_name === 'group'
+    );
+    const resumedGroup = resumed.events.find(
+      event => event.event_type === 'node_skipped_prior_success' && event.step_name === 'group'
+    );
+    expect(freshGroup?.data?.node_output).toBe(rawOutput);
+    expect(resumedGroup?.data?.node_output).toBe(freshGroup?.data?.node_output);
+  });
+
+  it('keeps an absent loop_group JSON field missing on fresh execution and resume', async () => {
+    const rawOutput = '{"note":"hi"}';
+    const fresh = await runRawLoopGroupWorkflow('status', 'raw-group-absent-fresh');
+    const resumed = await runRawLoopGroupWorkflow(
+      'status',
+      'raw-group-absent-resumed',
+      new Map([['group', rawOutput]])
+    );
+
+    expect(fresh.prompt).toBeUndefined();
+    expect(resumed.prompt).toBeUndefined();
+    expect(fresh.result).toBeUndefined();
+    expect(resumed.result).toBeUndefined();
+
+    const freshFailure = fresh.events.find(
+      event => event.event_type === 'node_failed' && event.step_name === 'consumer'
+    );
+    const resumedFailure = resumed.events.find(
+      event => event.event_type === 'node_failed' && event.step_name === 'consumer'
+    );
+    expect(freshFailure?.data?.error).toContain('JSON output has no such key');
+    expect(resumedFailure?.data?.error).toBe(freshFailure?.data?.error);
+
+    const freshGroup = fresh.events.find(
+      event => event.event_type === 'node_completed' && event.step_name === 'group'
+    );
+    const resumedGroup = resumed.events.find(
+      event => event.event_type === 'node_skipped_prior_success' && event.step_name === 'group'
+    );
+    expect(freshGroup?.data?.node_output).toBe(rawOutput);
+    expect(resumedGroup?.data?.node_output).toBe(freshGroup?.data?.node_output);
+  });
+
+  it('keeps a structured loop declared-field contract on resume', async () => {
+    const store = createMockStore();
+    let capturedPrompt = '';
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      capturedPrompt = prompt;
+      yield { type: 'assistant', content: 'consumer completed' };
+      yield { type: 'result', sessionId: 'structured-loop-resume-session' };
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-resume',
+      testDir,
+      {
+        name: 'structured-loop-resume',
+        nodes: [
+          {
+            id: 'iterate',
+            output_format: {
+              type: 'object',
+              properties: { done: { type: 'boolean' }, note: { type: 'string' } },
+              required: ['done'],
+            },
+            loop: {
+              prompt: 'iterate',
+              until_field: 'done',
+              max_iterations: 1,
+              fresh_context: false,
+            },
+          },
+          {
+            id: 'consumer',
+            prompt: 'note=[$iterate.output.note]',
+            depends_on: ['iterate'],
+          },
+        ],
+      },
+      makeWorkflowRun('structured-loop-resume'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map([['iterate', '{"done":true}']])
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(capturedPrompt).toBe('note=[]');
   });
 
   // #2091: on resume, prior completed nodes are rehydrated from text only, so the
