@@ -8979,13 +8979,14 @@ export async function executeDagWorkflow(
       const node = nodesById.get(nodeId);
       // Nodes flagged always_run re-execute on resume — leave them for fresh output.
       if (node?.always_run) continue;
-      // Re-derive the producer's declared field set from the loaded definition so the
-      // strict `$node.output.field` contract (output-ref.ts) is invariant across fresh
-      // vs resumed runs. The resume snapshot rehydrates text only, so without
-      // this a declared-optional-absent field would throw instead of resolving to ''
-      // and an undeclared key would resolve instead of throwing (#2091). Mirrors the
-      // fresh-completion capture above.
-      const declaredFields = declaredFieldsFromSchema(node?.output_format);
+      // Re-derive a schema-capable producer's declared field set from the loaded
+      // definition so its strict `$node.output.field` contract survives resume (#2091).
+      // A loop_group is the exception: its output_format is ignored and fresh completion
+      // exposes the final body output as raw text, so resumed output must stay raw too.
+      const declaredFields =
+        node !== undefined && !isLoopGroupNode(node)
+          ? declaredFieldsFromSchema(node.output_format)
+          : undefined;
       nodeOutputs.set(nodeId, {
         state: 'completed',
         output,
