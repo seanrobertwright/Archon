@@ -12512,7 +12512,7 @@ describe('executeDagWorkflow -- env var injection', () => {
       {
         ...minimalConfig,
         envVars: { MY_SECRET: 'abc123', ANTHROPIC_API_KEY: 'acting-user-secret' },
-        userCredentialEnvKeys: ['ANTHROPIC_API_KEY'],
+        protectedEnvKeys: ['ANTHROPIC_API_KEY'],
       }
     );
 
@@ -12522,7 +12522,7 @@ describe('executeDagWorkflow -- env var injection', () => {
       MY_SECRET: 'abc123',
       ANTHROPIC_API_KEY: 'acting-user-secret',
     });
-    expect(optionsArg?.userCredentialEnvKeys).toEqual(['ANTHROPIC_API_KEY']);
+    expect(optionsArg?.protectedEnvKeys).toEqual(['ANTHROPIC_API_KEY']);
   });
 
   it('does not set env on claudeOptions when config.envVars is empty', async () => {

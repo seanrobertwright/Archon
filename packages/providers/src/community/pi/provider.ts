@@ -400,7 +400,7 @@ export class PiProvider implements IAgentProvider {
           authStorage,
           parsed.provider,
           requestOptions?.env,
-          requestOptions?.userCredentialEnvKeys
+          requestOptions?.protectedEnvKeys
         );
       }
       modelRegistry = piCodingAgent.ModelRegistry.create(authStorage);
@@ -458,11 +458,9 @@ export class PiProvider implements IAgentProvider {
     let resolvedKey: Awaited<ReturnType<typeof authStorage.getApiKey>> | undefined;
     let hasResolvedAuth = false;
     if (model && !envVarName) {
-      const resolved = await modelRegistry.getApiKeyAndHeaders(model);
-      if (resolved.ok) {
-        resolvedKey = resolved.apiKey;
-        hasResolvedAuth = Boolean(resolved.apiKey || resolved.headers);
-      }
+      // This is deliberately status-only: Pi resolves models.json request auth
+      // when it sends, and command-backed values must execute only once there.
+      hasResolvedAuth = modelRegistry.hasConfiguredAuth(model);
     } else if (model || parsed.provider === 'anthropic') {
       resolvedKey = await authStorage.getApiKey(parsed.provider);
       hasResolvedAuth = Boolean(resolvedKey);

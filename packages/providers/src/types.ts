@@ -440,10 +440,11 @@ export interface AgentRequestOptions {
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   env?: Record<string, string>;
   /**
-   * Names in `env` whose values came from the acting user's provider credential
-   * store. Custom provider configuration must not be allowed to select them.
+   * Names in `env` whose values Archon injected as credentials rather than
+   * loading from project configuration. Custom provider configuration must not
+   * be allowed to select them.
    */
-  userCredentialEnvKeys?: readonly string[];
+  protectedEnvKeys?: readonly string[];
   maxBudgetUsd?: number;
   fallbackModel?: string;
   /**

@@ -3654,10 +3654,10 @@ describe('resolveUserProviderEnvForChat — chat env injection', () => {
     // The env passed to sendQuery should contain the provider's env var.
     const requestOptions = mockSendQuery.mock.calls[0]?.[3] as {
       env?: Record<string, string>;
-      userCredentialEnvKeys?: readonly string[];
+      protectedEnvKeys?: readonly string[];
     };
     expect(requestOptions?.env).toMatchObject({ OPENROUTER_API_KEY: 'or-key' });
-    expect(requestOptions?.userCredentialEnvKeys).toEqual(['OPENROUTER_API_KEY']);
+    expect(requestOptions?.protectedEnvKeys).toEqual(['OPENROUTER_API_KEY']);
   });
 
   test('anthropic OAuth subscription delivers ANTHROPIC_OAUTH_TOKEN into chat env (#1984)', async () => {
@@ -3695,10 +3695,10 @@ describe('resolveUserProviderEnvForChat — chat env injection', () => {
     await handleMessage(platform, 'conv-1', 'hello there');
     // generateAndSetTitle(convId, msg, provider, cwd, sessionId?, assistantConfig?, titleOptions)
     const titleOptions = mockGenerateAndSetTitle.mock.calls[0]?.[6] as
-      | { env?: Record<string, string>; userCredentialEnvKeys?: readonly string[] }
+      | { env?: Record<string, string>; protectedEnvKeys?: readonly string[] }
       | undefined;
     expect(titleOptions?.env).toMatchObject({ ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-x' });
-    expect([...(titleOptions?.userCredentialEnvKeys ?? [])].sort()).toEqual([
+    expect([...(titleOptions?.protectedEnvKeys ?? [])].sort()).toEqual([
       'ANTHROPIC_OAUTH_TOKEN',
       'CLAUDE_CODE_OAUTH_TOKEN',
     ]);

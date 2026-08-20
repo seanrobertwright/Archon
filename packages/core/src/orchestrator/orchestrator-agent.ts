@@ -1840,7 +1840,7 @@ export async function handleMessage(
       isPerUserProviderKeysEnabled() && executionUserId
         ? await resolveUserProviderEnvForChat(executionUserId)
         : {};
-    const userCredentialEnvKeys = Object.keys(userProviderEnv);
+    const protectedEnvKeys = Object.keys(userProviderEnv);
     const effectiveEnv = { ...(config.envVars ?? {}), ...dbEnvVars, ...userProviderEnv };
 
     // Warn if provider doesn't support env injection but env vars are configured
@@ -1880,7 +1880,7 @@ export async function handleMessage(
     const requestOptions: SendQueryOptions = {
       assistantConfig: { ...(config.assistants[providerKey] ?? {}) },
       env: Object.keys(effectiveEnv).length > 0 ? effectiveEnv : undefined,
-      userCredentialEnvKeys: userCredentialEnvKeys.length > 0 ? userCredentialEnvKeys : undefined,
+      protectedEnvKeys: protectedEnvKeys.length > 0 ? protectedEnvKeys : undefined,
       model: chatRequest.model,
       systemPrompt,
     };
@@ -1898,7 +1898,7 @@ export async function handleMessage(
         // subscription/key and fails on per-user-only installs (#1984; same family
         // as #1794/#1855). Same env-only bag as the main chat request above.
         env: Object.keys(effectiveEnv).length > 0 ? effectiveEnv : undefined,
-        userCredentialEnvKeys: userCredentialEnvKeys.length > 0 ? userCredentialEnvKeys : undefined,
+        protectedEnvKeys: protectedEnvKeys.length > 0 ? protectedEnvKeys : undefined,
       };
       if (titleRequest.preset) {
         applyPresetToRequestOptions(titleRequest.provider, titleRequest.preset, titleOptions);

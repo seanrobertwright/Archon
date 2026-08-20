@@ -11,6 +11,9 @@ const createdDirs: string[] = [];
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalAnthropicKey = process.env.ANTHROPIC_API_KEY;
 const originalOpenAiKey = process.env.OPENAI_API_KEY;
+const originalGhToken = process.env.GH_TOKEN;
+const originalGithubToken = process.env.GITHUB_TOKEN;
+const originalCopilotToken = process.env.COPILOT_GITHUB_TOKEN;
 
 function createAgentDir(apiKey?: string, headers?: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), 'archon-pi-models-'));
@@ -43,6 +46,9 @@ describe('withCustomProviderRequestEnv', () => {
     restoreEnv('PI_CODING_AGENT_DIR', originalAgentDir);
     restoreEnv('ANTHROPIC_API_KEY', originalAnthropicKey);
     restoreEnv('OPENAI_API_KEY', originalOpenAiKey);
+    restoreEnv('GH_TOKEN', originalGhToken);
+    restoreEnv('GITHUB_TOKEN', originalGithubToken);
+    restoreEnv('COPILOT_GITHUB_TOKEN', originalCopilotToken);
   });
 
   test('lets Pi resolve custom provider config from request/project env', async () => {
@@ -60,6 +66,7 @@ describe('withCustomProviderRequestEnv', () => {
     const registry = ModelRegistry.create(authStorage);
     const model = registry.find('mygw', 'demo');
     expect(model).toBeDefined();
+    expect(registry.hasConfiguredAuth(model!)).toBe(true);
     const resolved = await registry.getApiKeyAndHeaders(model!);
 
     expect(resolved).toEqual({
@@ -73,10 +80,16 @@ describe('withCustomProviderRequestEnv', () => {
     });
   });
 
-  test.each(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'])(
-    'does not expose acting-user %s to custom provider config',
+  test.each([
+    'ANTHROPIC_API_KEY',
+    'OPENAI_API_KEY',
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'COPILOT_GITHUB_TOKEN',
+  ])(
+    'does not expose protected %s to custom provider config or process fallback',
     async credentialEnvKey => {
-      delete process.env[credentialEnvKey];
+      process.env[credentialEnvKey] = 'process-secret';
       createAgentDir(`$${credentialEnvKey}`);
       const authStorage = withCustomProviderRequestEnv(
         AuthStorage.inMemory(),
@@ -90,7 +103,7 @@ describe('withCustomProviderRequestEnv', () => {
       expect(model).toBeDefined();
       expect(await registry.getApiKeyAndHeaders(model!)).toEqual({
         ok: false,
-        error: `Failed to resolve API key for provider "mygw" from environment variable: ${credentialEnvKey}`,
+        error: `Custom Pi provider 'mygw' cannot access protected environment variable '${credentialEnvKey}'`,
       });
     }
   );
@@ -115,6 +128,7 @@ describe('withCustomProviderRequestEnv', () => {
     const registry = ModelRegistry.create(authStorage);
     const model = registry.find('mygw', 'demo');
     expect(model).toBeDefined();
+    expect(registry.hasConfiguredAuth(model!)).toBe(true);
     expect(await registry.getApiKeyAndHeaders(model!)).toEqual({
       ok: true,
       apiKey: 'stored-secret',
@@ -134,6 +148,7 @@ describe('withCustomProviderRequestEnv', () => {
     const registry = ModelRegistry.create(authStorage);
     const model = registry.find('mygw', 'demo');
     expect(model).toBeDefined();
+    expect(registry.hasConfiguredAuth(model!)).toBe(true);
     expect(await registry.getApiKeyAndHeaders(model!)).toEqual({
       ok: true,
       apiKey: undefined,

@@ -110,11 +110,16 @@ const mockGetApiKey = mock(async (providerId: string): Promise<string | undefine
 });
 const mockGetCredential = mock((providerId: string) => fileCreds[providerId]);
 const mockGetProviderEnv = mock((providerId: string) => fileCreds[providerId]?.env);
+const mockHasAuth = mock(
+  (providerId: string) =>
+    runtimeOverrides[providerId] !== undefined || fileCreds[providerId] !== undefined
+);
 const mockAuthCreate = mock(() => ({
   setRuntimeApiKey: mockSetRuntimeApiKey,
   getApiKey: mockGetApiKey,
   get: mockGetCredential,
   getProviderEnv: mockGetProviderEnv,
+  hasAuth: mockHasAuth,
 }));
 
 function createMockModel(provider: string, modelId: string): Model<Api> {
@@ -137,13 +142,19 @@ const mockModelRegistryFind = mock<ModelRegistry['find']>((provider, modelId) =>
   return createMockModel(provider, modelId);
 });
 type MockModelRegistry = Pick<ModelRegistry, 'find'> &
-  Partial<Pick<ModelRegistry, 'getApiKeyAndHeaders' | 'getError' | 'registerProvider'>>;
+  Partial<
+    Pick<
+      ModelRegistry,
+      'getApiKeyAndHeaders' | 'getError' | 'hasConfiguredAuth' | 'registerProvider'
+    >
+  >;
 type MockModelRegistryCreate = (
   ...args: Parameters<typeof import('@earendil-works/pi-coding-agent').ModelRegistry.create>
 ) => MockModelRegistry;
 const mockModelRegistryCreate = mock<MockModelRegistryCreate>(
   (authStorage): MockModelRegistry => ({
     find: mockModelRegistryFind,
+    hasConfiguredAuth: mock(model => authStorage.hasAuth(model.provider)),
     getApiKeyAndHeaders: mock(async model => {
       const apiKey = await authStorage.getApiKey(model.provider, { includeFallback: false });
       return {
@@ -438,17 +449,22 @@ describe('PiProvider', () => {
           MYGW_API_KEY: 'request-secret',
           ANTHROPIC_API_KEY: 'acting-user-secret',
         },
-        userCredentialEnvKeys: ['ANTHROPIC_API_KEY'],
+        protectedEnvKeys: ['ANTHROPIC_API_KEY'],
       })
     );
 
-    const fileAuthStorage = mockAuthCreate.mock.results[0]?.value;
     const requestAuthStorage = mockModelRegistryCreate.mock.calls[0]?.[0];
-    expect(requestAuthStorage).not.toBe(fileAuthStorage);
+    const fileAuthStorage = mockAuthCreate.mock.results[0]?.value as typeof requestAuthStorage;
+    expect(requestAuthStorage).toBe(fileAuthStorage);
     expect(requestAuthStorage?.getProviderEnv('mygw')).toEqual({
       MYGW_API_KEY: 'request-secret',
     });
+    expect(requestAuthStorage?.hasAuth('mygw')).toBe(true);
     expect(requestAuthStorage?.getProviderEnv('anthropic')).toBeUndefined();
+    const requestRegistry = mockModelRegistryCreate.mock.results[0]?.value as
+      | MockModelRegistry
+      | undefined;
+    expect(requestRegistry?.getApiKeyAndHeaders).not.toHaveBeenCalled();
   });
 
   test('AuthStorage.create reads ARCHON_PI_AUTH_PATH from requestOptions.env (per-user channel)', async () => {
