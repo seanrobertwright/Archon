@@ -98,6 +98,8 @@ interface ContentBlock {
 function normalizeClaudeUsage(usage?: {
   input_tokens?: number;
   output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
   total_tokens?: number;
 }): TokenUsage | undefined {
   if (!usage) return undefined;
@@ -105,9 +107,16 @@ function normalizeClaudeUsage(usage?: {
   const output = usage.output_tokens;
   if (typeof input !== 'number' || typeof output !== 'number') return undefined;
   const total = usage.total_tokens;
+  const cacheRead = usage.cache_read_input_tokens;
+  const cacheWrite = usage.cache_creation_input_tokens;
   return {
-    input,
+    input:
+      input +
+      (typeof cacheRead === 'number' ? cacheRead : 0) +
+      (typeof cacheWrite === 'number' ? cacheWrite : 0),
     output,
+    ...(typeof cacheRead === 'number' ? { cacheRead } : {}),
+    ...(typeof cacheWrite === 'number' ? { cacheWrite } : {}),
     ...(typeof total === 'number' ? { total } : {}),
   };
 }

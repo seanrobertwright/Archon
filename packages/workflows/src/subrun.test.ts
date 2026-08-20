@@ -318,7 +318,12 @@ function makeProvider() {
     }),
     sendQuery: mock(function* () {
       yield { type: 'assistant', content: 'ai-output' };
-      yield { type: 'result', sessionId: 'sess', cost: 0.01, tokens: { input: 7, output: 3 } };
+      yield {
+        type: 'result',
+        sessionId: 'sess',
+        cost: 0.01,
+        tokens: { input: 7, output: 3, cacheRead: 5, cacheWrite: 0 },
+      };
     }),
   };
 }
@@ -504,6 +509,8 @@ nodes:
     expect((child?.metadata as Record<string, unknown>).summary).toBe('ai-output');
     expect((child?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);
     expect((child?.metadata as Record<string, unknown>).total_tokens_in).toBe(7);
+    expect((child?.metadata as Record<string, unknown>).total_cache_read_tokens).toBe(5);
+    expect((child?.metadata as Record<string, unknown>).total_cache_write_tokens).toBe(0);
     expect((child?.metadata as Record<string, unknown>).total_tokens_out).toBe(3);
     // The sub node wrote node_completed with the child's output (threaded to $sub.output).
     const subCompleted = store.events.find(
@@ -515,7 +522,12 @@ nodes:
     // own per-node rows are filed under a different workflow_run_id, so this cannot
     // double count within the parent's stream.
     expect(subCompleted?.data?.cost_usd).toBeCloseTo(0.01, 5);
-    expect(subCompleted?.data?.tokens).toEqual({ input: 7, output: 3 });
+    expect(subCompleted?.data?.tokens).toEqual({
+      input: 7,
+      output: 3,
+      cacheRead: 5,
+      cacheWrite: 0,
+    });
     // Child conversation is shared with the parent.
     expect(child?.conversation_id).toBe('conv-db');
   });
@@ -2689,6 +2701,8 @@ nodes:
     expect(parentRun?.status).toBe('failed');
     expect((parentRun?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);
     expect((parentRun?.metadata as Record<string, unknown>).total_tokens_in).toBe(7);
+    expect((parentRun?.metadata as Record<string, unknown>).total_cache_read_tokens).toBe(5);
+    expect((parentRun?.metadata as Record<string, unknown>).total_cache_write_tokens).toBe(0);
     expect((parentRun?.metadata as Record<string, unknown>).total_tokens_out).toBe(3);
   });
 
@@ -2761,6 +2775,8 @@ nodes:
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'fan-partial');
     expect((parentRun?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.03, 5);
     expect((parentRun?.metadata as Record<string, unknown>).total_tokens_in).toBe(21);
+    expect((parentRun?.metadata as Record<string, unknown>).total_cache_read_tokens).toBe(15);
+    expect((parentRun?.metadata as Record<string, unknown>).total_cache_write_tokens).toBe(0);
     expect((parentRun?.metadata as Record<string, unknown>).total_tokens_out).toBe(9);
   });
 

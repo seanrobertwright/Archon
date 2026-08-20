@@ -246,14 +246,29 @@ function findRunningTool(
  */
 function buildRunUsageProps(totals: {
   costUsd: number;
-  tokensIn: number;
-  tokensOut: number;
+  tokens?: TokenUsage;
   loopIterations: number;
-}): { costUsd?: number; tokensIn?: number; tokensOut?: number; loopIterations?: number } {
+}): {
+  costUsd?: number;
+  tokensIn?: number;
+  tokensOut?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  loopIterations?: number;
+} {
   return {
     ...(totals.costUsd > 0 ? { costUsd: totals.costUsd } : {}),
-    ...(totals.tokensIn > 0 || totals.tokensOut > 0
-      ? { tokensIn: totals.tokensIn, tokensOut: totals.tokensOut }
+    ...(totals.tokens !== undefined
+      ? {
+          tokensIn: totals.tokens.input,
+          tokensOut: totals.tokens.output,
+          ...(totals.tokens.cacheRead !== undefined
+            ? { cacheReadTokens: totals.tokens.cacheRead }
+            : {}),
+          ...(totals.tokens.cacheWrite !== undefined
+            ? { cacheWriteTokens: totals.tokens.cacheWrite }
+            : {}),
+        }
       : {}),
     ...(totals.loopIterations > 0 ? { loopIterations: totals.loopIterations } : {}),
   };
@@ -426,6 +441,45 @@ type NodeExecutionResult = NodeOutput & {
   loopIterations?: number;
 };
 
+/**
+ * Add provider usage without turning an unknown cache axis into a partial total.
+ * Required non-finite counters invalidate only that contribution; malformed optional
+ * counters are treated as unknown while valid gross input/output remain usable.
+ */
+function sumTokenUsage(
+  usages: readonly TokenUsage[],
+  context: Record<string, unknown> = {}
+): TokenUsage | undefined {
+  const valid: TokenUsage[] = [];
+  for (const usage of usages) {
+    if (!Number.isFinite(usage.input) || !Number.isFinite(usage.output)) {
+      getLog().warn({ ...context, tokens: usage }, 'dag.usage_tokens_non_finite_ignored');
+      continue;
+    }
+    const normalized: TokenUsage = { input: usage.input, output: usage.output };
+    for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+      const value = usage[axis];
+      if (value === undefined) continue;
+      if (Number.isFinite(value)) normalized[axis] = value;
+      else {
+        getLog().warn({ ...context, axis, value }, 'dag.usage_optional_tokens_non_finite_ignored');
+      }
+    }
+    valid.push(normalized);
+  }
+  if (valid.length === 0) return undefined;
+  const summed: TokenUsage = {
+    input: valid.reduce((total, usage) => total + usage.input, 0),
+    output: valid.reduce((total, usage) => total + usage.output, 0),
+  };
+  for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+    if (valid.every(usage => usage[axis] !== undefined)) {
+      summed[axis] = valid.reduce((total, usage) => total + (usage[axis] ?? 0), 0);
+    }
+  }
+  return summed;
+}
+
 // ---------------------------------------------------------------------------
 // workflow: (sub-run) node — cross-run composition (#2121 Phase 2)
 // ---------------------------------------------------------------------------
@@ -437,7 +491,7 @@ type NodeExecutionResult = NodeOutput & {
  * is how cost came to under-report every resumed run while tokens did not (#2469).
  */
 export interface PriorRunUsage {
-  tokens: { input: number; output: number };
+  tokens?: TokenUsage;
   costUsd: number;
 }
 
@@ -529,9 +583,18 @@ export function childOutcomeFromRun(run: WorkflowRun): ChildWorkflowOutcome {
   const md: Record<string, unknown> = run.metadata ?? {};
   const input = typeof md.total_tokens_in === 'number' ? md.total_tokens_in : undefined;
   const output = typeof md.total_tokens_out === 'number' ? md.total_tokens_out : undefined;
+  const cacheRead =
+    typeof md.total_cache_read_tokens === 'number' ? md.total_cache_read_tokens : undefined;
+  const cacheWrite =
+    typeof md.total_cache_write_tokens === 'number' ? md.total_cache_write_tokens : undefined;
   const tokens =
     input !== undefined || output !== undefined
-      ? { input: input ?? 0, output: output ?? 0 }
+      ? {
+          input: input ?? 0,
+          output: output ?? 0,
+          ...(cacheRead !== undefined ? { cacheRead } : {}),
+          ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+        }
       : undefined;
   return {
     childRunId: run.id,
@@ -1936,22 +1999,7 @@ async function executeNodeInternal(
         if (msg.sessionId) newSessionId = msg.sessionId;
         if (msg.resumed !== undefined) nodeResumed = msg.resumed;
         if (msg.tokens !== undefined) {
-          // Normalized to `{input, output}` — the ONLY two fields every provider
-          // reports the same way, and therefore the only shape a consumer can read
-          // without knowing which provider produced the row. `total` is
-          // provider-defined and is NOT input + output (Pi folds cacheRead/cacheWrite
-          // into it, OpenCode sums its own per-agent totals); `cost` duplicates the
-          // separately-persisted `cost_usd`. Same NaN guard rationale as the
-          // DAG-level accumulator: a non-finite value must be dropped loudly, not
-          // persisted as a wrong number that gets believed.
-          if (Number.isFinite(msg.tokens.input) && Number.isFinite(msg.tokens.output)) {
-            nodeTokens = { input: msg.tokens.input, output: msg.tokens.output };
-          } else {
-            getLog().warn(
-              { nodeId: node.id, tokens: msg.tokens },
-              'dag_node.usage_tokens_non_finite_ignored'
-            );
-          }
+          nodeTokens = sumTokenUsage([msg.tokens], { nodeId: node.id });
         }
         if (msg.cost !== undefined) {
           if (Number.isFinite(msg.cost)) {
@@ -3495,14 +3543,29 @@ function readSignaledTokens(
 ): TokenUsage | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw === 'object') {
-    const { input, output } = raw as { input?: unknown; output?: unknown };
+    const { input, output, cacheRead, cacheWrite } = raw as {
+      input?: unknown;
+      output?: unknown;
+      cacheRead?: unknown;
+      cacheWrite?: unknown;
+    };
     if (
       typeof input === 'number' &&
       typeof output === 'number' &&
       Number.isFinite(input) &&
       Number.isFinite(output)
     ) {
-      return { input, output };
+      return sumTokenUsage(
+        [
+          {
+            input,
+            output,
+            ...(cacheRead !== undefined ? { cacheRead: cacheRead as number } : {}),
+            ...(cacheWrite !== undefined ? { cacheWrite: cacheWrite as number } : {}),
+          },
+        ],
+        context
+      );
     }
   }
   getLog().warn({ ...context, tokens: raw }, 'dag_loop.signaled_tokens_invalid_ignored');
@@ -3830,8 +3893,7 @@ async function executeLoopGroupNode(
       lastSequentialSession: group.fresh_context || i === 1 ? undefined : loopLastSequentialSession,
       warnedProviderConflicts,
       totalCostUsd: 0,
-      totalTokensIn: 0,
-      totalTokensOut: 0,
+      totalTokens: undefined,
       totalLoopIterations: 0,
       stepNamePrefix: bodyStepNamePrefix,
       loopGroupPath: [...enclosingLoopGroupPath, { groupId: node.id, iteration: i }],
@@ -3857,11 +3919,11 @@ async function executeLoopGroupNode(
     }
     // Accumulate usage across iterations (charged on the failure path below too).
     loopTotalCostUsd = (loopTotalCostUsd ?? 0) + iterCtx.totalCostUsd;
-    if (iterCtx.totalTokensIn > 0 || iterCtx.totalTokensOut > 0) {
-      loopTotalTokens = {
-        input: (loopTotalTokens?.input ?? 0) + iterCtx.totalTokensIn,
-        output: (loopTotalTokens?.output ?? 0) + iterCtx.totalTokensOut,
-      };
+    if (iterCtx.totalTokens !== undefined) {
+      loopTotalTokens = sumTokenUsage(
+        [...(loopTotalTokens !== undefined ? [loopTotalTokens] : []), iterCtx.totalTokens],
+        { nodeId: node.id, iteration: i }
+      );
     }
 
     // A failed body node fails the group immediately — mirrors the top-level DAG
@@ -4770,10 +4832,10 @@ async function executeLoopNode(
         loopTotalCostUsd = (loopTotalCostUsd ?? 0) + iterationCost;
       }
       if (iterationTokens !== undefined) {
-        loopTotalTokens = {
-          input: (loopTotalTokens?.input ?? 0) + iterationTokens.input,
-          output: (loopTotalTokens?.output ?? 0) + iterationTokens.output,
-        };
+        loopTotalTokens = sumTokenUsage(
+          [...(loopTotalTokens !== undefined ? [loopTotalTokens] : []), iterationTokens],
+          { nodeId: node.id }
+        );
       }
       if (iterationNumTurns !== undefined) {
         loopTotalNumTurns = (loopTotalNumTurns ?? 0) + iterationNumTurns;
@@ -4975,16 +5037,10 @@ async function executeLoopNode(
               }
             }
             if (msg.tokens !== undefined) {
-              // Provider-supplied numbers — see the NaN guard rationale at the
-              // DAG-level accumulator.
-              if (Number.isFinite(msg.tokens.input) && Number.isFinite(msg.tokens.output)) {
-                iterationTokens = { input: msg.tokens.input, output: msg.tokens.output };
-              } else {
-                getLog().warn(
-                  { nodeId: node.id, tokens: msg.tokens },
-                  'loop_node.usage_tokens_non_finite_ignored'
-                );
-              }
+              iterationTokens = sumTokenUsage([msg.tokens], {
+                nodeId: node.id,
+                iteration: i,
+              });
             }
             if (msg.stopReason !== undefined) loopFinalStopReason = msg.stopReason;
             if (msg.numTurns !== undefined) {
@@ -6577,17 +6633,10 @@ function sumFanOutCost(outcomes: readonly ChildWorkflowOutcome[]): number | unde
  * {@link sumFanOutCost}, this covers every child regardless of outcome.
  */
 function sumFanOutTokens(outcomes: readonly ChildWorkflowOutcome[]): TokenUsage | undefined {
-  let input = 0;
-  let output = 0;
-  let any = false;
-  for (const o of outcomes) {
-    if (o.tokens !== undefined) {
-      if (Number.isFinite(o.tokens.input)) input += o.tokens.input;
-      if (Number.isFinite(o.tokens.output)) output += o.tokens.output;
-      any = true;
-    }
-  }
-  return any ? { input, output } : undefined;
+  return sumTokenUsage(
+    outcomes.flatMap(outcome => (outcome.tokens !== undefined ? [outcome.tokens] : [])),
+    { scope: 'fan_out' }
+  );
 }
 
 /**
@@ -7322,8 +7371,7 @@ interface RunLayersContext {
   warnedProviderConflicts: Set<string>;
   /** Run-level usage accumulators (mutated by runLayers; caller reads after). */
   totalCostUsd: number;
-  totalTokensIn: number;
-  totalTokensOut: number;
+  totalTokens: TokenUsage | undefined;
   totalLoopIterations: number;
   /** Prefix prepended to every persisted `step_name` ('' for top-level, '{groupId}.' for a loop_group body). */
   stepNamePrefix: string;
@@ -8260,15 +8308,10 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           }
         }
         if (output.tokens !== undefined) {
-          // Token values come from providers (incl. community ones) — guard so
-          // a NaN can't silently poison the totals (NaN > 0 is false, which
-          // would silently drop the fields from telemetry with no trace).
-          if (Number.isFinite(output.tokens.input) && Number.isFinite(output.tokens.output)) {
-            ctx.totalTokensIn += output.tokens.input;
-            ctx.totalTokensOut += output.tokens.output;
-          } else {
-            getLog().warn({ nodeId, tokens: output.tokens }, 'dag.usage_tokens_non_finite_ignored');
-          }
+          ctx.totalTokens = sumTokenUsage(
+            [...(ctx.totalTokens !== undefined ? [ctx.totalTokens] : []), output.tokens],
+            { nodeId }
+          );
         }
         if (output.loopIterations !== undefined) ctx.totalLoopIterations += output.loopIterations;
         ctx.nodeOutputs.set(nodeId, output);
@@ -9077,8 +9120,7 @@ export async function executeDagWorkflow(
     lastSequentialSession: undefined,
     warnedProviderConflicts: new Set<string>(),
     totalCostUsd: priorUsage?.costUsd ?? 0,
-    totalTokensIn: priorUsage?.tokens.input ?? 0,
-    totalTokensOut: priorUsage?.tokens.output ?? 0,
+    totalTokens: priorUsage?.tokens,
     totalLoopIterations: 0,
     stepNamePrefix: '',
     loopGroupPath: [],
@@ -9108,10 +9150,20 @@ export async function executeDagWorkflow(
    */
   const persistRunUsage = async (): Promise<void> => {
     const usage = {
-      // A zero stays absent: a bash-only workflow must not read as a free AI run.
+      // No usage stays absent: a bash-only workflow must not read as a free AI run.
       ...(runCtx.totalCostUsd > 0 ? { total_cost_usd: runCtx.totalCostUsd } : {}),
-      ...(runCtx.totalTokensIn > 0 ? { total_tokens_in: runCtx.totalTokensIn } : {}),
-      ...(runCtx.totalTokensOut > 0 ? { total_tokens_out: runCtx.totalTokensOut } : {}),
+      ...(runCtx.totalTokens !== undefined
+        ? {
+            total_tokens_in: runCtx.totalTokens.input,
+            total_tokens_out: runCtx.totalTokens.output,
+            ...(runCtx.totalTokens.cacheRead !== undefined
+              ? { total_cache_read_tokens: runCtx.totalTokens.cacheRead }
+              : {}),
+            ...(runCtx.totalTokens.cacheWrite !== undefined
+              ? { total_cache_write_tokens: runCtx.totalTokens.cacheWrite }
+              : {}),
+          }
+        : {}),
     };
     if (Object.keys(usage).length === 0) return;
     await deps.store
@@ -9140,8 +9192,7 @@ export async function executeDagWorkflow(
   }
   // Pull the mutated accumulators back into local scope for the terminal tally below.
   const totalCostUsd = runCtx.totalCostUsd;
-  const totalTokensIn = runCtx.totalTokensIn;
-  const totalTokensOut = runCtx.totalTokensOut;
+  const totalTokens = runCtx.totalTokens;
   const totalLoopIterations = runCtx.totalLoopIterations;
 
   // Container pause economics (Phase C): if a node paused the run (approval /
@@ -9203,8 +9254,7 @@ export async function executeDagWorkflow(
   const failureTaxonomy = firstFailedNodeTaxonomy(nodeOutputs, workflow.nodes);
   const runUsageProps = buildRunUsageProps({
     costUsd: totalCostUsd,
-    tokensIn: totalTokensIn,
-    tokensOut: totalTokensOut,
+    tokens: totalTokens,
     loopIterations: totalLoopIterations,
   });
 

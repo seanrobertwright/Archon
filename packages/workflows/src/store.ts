@@ -12,15 +12,13 @@ import type {
   WorkflowNodeSession,
   WorkflowRunNodeSession,
 } from './schemas';
+import type { TokenUsage } from '@archon/providers/types';
 
 export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 
 export interface DagResumeSnapshot {
   completedNodeOutputs: Map<string, string>;
-  tokens: {
-    input: number;
-    output: number;
-  };
+  tokens?: TokenUsage;
   /** Cumulative USD cost of the run's already-completed nodes across prior passes. */
   costUsd: number;
 }

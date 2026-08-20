@@ -334,6 +334,8 @@ function extractUsageFromCodexEvent(event: TurnCompletedEvent): TokenUsage {
   return {
     input: event.usage.input_tokens,
     output: event.usage.output_tokens,
+    cacheRead: event.usage.cached_input_tokens,
+    cacheWrite: event.usage.cache_write_input_tokens,
   };
 }
 

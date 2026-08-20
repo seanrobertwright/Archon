@@ -5767,7 +5767,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         type: 'result',
         sessionId: 'sid',
         resolvedModel: { id: 'claude-opus-5' },
-        tokens: { input: 100, output: 10 },
+        tokens: { input: 100, output: 10, cacheRead: 80, cacheWrite: 0 },
       };
     });
 
@@ -5806,8 +5806,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         .data.model_usage
     ).toEqual({ requested: 'requested-model', resolved: 'claude-opus-5' });
     expect(
-      (completedEvent![0] as { data: { tokens: { input: number; output: number } } }).data.tokens
-    ).toEqual({ input: 100, output: 10 });
+      (
+        completedEvent![0] as {
+          data: {
+            tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+          };
+        }
+      ).data.tokens
+    ).toEqual({ input: 100, output: 10, cacheRead: 80, cacheWrite: 0 });
   });
 
   it('omits tokens from a direct AI node_completed event when the provider reports no usage', async () => {
@@ -13488,7 +13494,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
           type: 'result',
           sessionId: 'sid-1',
           cost: 0.05,
-          tokens: { input: 900, output: 90 },
+          tokens: { input: 900, output: 90, cacheRead: 700, cacheWrite: 0 },
         };
         return;
       }
@@ -13525,7 +13531,13 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     expect(store.failWorkflowRun).toHaveBeenCalled();
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
     expect(runUsageWrites(store)).toEqual([
-      { total_cost_usd: 0.05, total_tokens_in: 900, total_tokens_out: 90 },
+      {
+        total_cost_usd: 0.05,
+        total_tokens_in: 900,
+        total_tokens_out: 90,
+        total_cache_read_tokens: 700,
+        total_cache_write_tokens: 0,
+      },
     ]);
   });
 
@@ -16307,7 +16319,7 @@ describe('executeDagWorkflow -- completion telemetry', () => {
         type: 'result',
         sessionId: 'sid-usage',
         cost: 0.25,
-        tokens: { input: 5000, output: 1200 },
+        tokens: { input: 5000, output: 1200, cacheRead: 4000, cacheWrite: 0 },
       };
     });
 
@@ -16320,6 +16332,8 @@ describe('executeDagWorkflow -- completion telemetry', () => {
         costUsd: 0.25,
         tokensIn: 5000,
         tokensOut: 1200,
+        cacheReadTokens: 4000,
+        cacheWriteTokens: 0,
       })
     );
   });
@@ -18959,7 +18973,10 @@ describe('executeDagWorkflow -- loop_group node', () => {
       yield {
         type: 'result',
         sessionId: `s-${calls}`,
-        tokens: calls === 1 ? { input: 100, output: 10 } : { input: 200, output: 20 },
+        tokens:
+          calls === 1
+            ? { input: 100, output: 10, cacheRead: 50, cacheWrite: 0 }
+            : { input: 200, output: 20, cacheRead: 125, cacheWrite: 5 },
       };
     });
 
@@ -19002,7 +19019,13 @@ describe('executeDagWorkflow -- loop_group node', () => {
     // The group sums tokens across iterations into its result; the outer runLayers
     // rolls them into the run totals reported via telemetry.
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
-      expect.objectContaining({ outcome: 'completed', tokensIn: 300, tokensOut: 30 })
+      expect.objectContaining({
+        outcome: 'completed',
+        tokensIn: 300,
+        tokensOut: 30,
+        cacheReadTokens: 175,
+        cacheWriteTokens: 5,
+      })
     );
     const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
       [{ event_type: string; step_name: string; data?: Record<string, unknown> }]
@@ -19012,8 +19035,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
       ([arg]) => arg.event_type === 'node_completed' && arg.step_name === 'paid.work'
     );
     expect(bodyEvents.map(([arg]) => arg.data?.tokens)).toEqual([
-      { input: 100, output: 10 },
-      { input: 200, output: 20 },
+      { input: 100, output: 10, cacheRead: 50, cacheWrite: 0 },
+      { input: 200, output: 20, cacheRead: 125, cacheWrite: 5 },
     ]);
     // The GROUP row must NOT repeat the same total under the same field name: body
     // rows and the aggregate live in one event stream, so a consumer summing

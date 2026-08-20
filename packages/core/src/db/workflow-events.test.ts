@@ -198,12 +198,18 @@ describe('workflow-events', () => {
           {
             step_name: 'node-a',
             event_type: 'node_completed',
-            data: { node_output: 'output A', tokens: { input: 40, output: 4 } },
+            data: {
+              node_output: 'output A',
+              tokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
+            },
           },
           {
             step_name: 'node-b',
             event_type: 'node_completed',
-            data: { node_output: 'output B', tokens: { input: 60, output: 6 } },
+            data: {
+              node_output: 'output B',
+              tokens: { input: 60, output: 6, cacheRead: 30, cacheWrite: 5 },
+            },
           },
         ])
       );
@@ -216,10 +222,36 @@ describe('workflow-events', () => {
           ['node-b', 'output B'],
         ])
       );
-      expect(result.tokens).toEqual({ input: 100, output: 10 });
+      expect(result.tokens).toEqual({
+        input: 100,
+        output: 10,
+        cacheRead: 50,
+        cacheWrite: 5,
+      });
       expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('node_completed'), [
         'run-123',
       ]);
+    });
+
+    test('omits cache totals when any token-bearing event has unknown cache usage', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'legacy',
+            event_type: 'node_completed',
+            data: { tokens: { input: 40, output: 4 } },
+          },
+          {
+            step_name: 'current',
+            event_type: 'node_completed',
+            data: { tokens: { input: 60, output: 6, cacheRead: 30, cacheWrite: 0 } },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-mixed-cache');
+
+      expect(result.tokens).toEqual({ input: 100, output: 10 });
     });
 
     test('returns outputs from node_skipped_prior_success events (multi-resume)', async () => {
@@ -275,7 +307,7 @@ describe('workflow-events', () => {
       expect(result.completedNodeOutputs.size).toBe(2);
       expect(result.completedNodeOutputs.get('node-x')).toBe('skipped output X');
       expect(result.completedNodeOutputs.get('node-y')).toBe('skipped output Y');
-      expect(result.tokens).toEqual({ input: 0, output: 0 });
+      expect(result.tokens).toBeUndefined();
     });
 
     test('parses JSON string data (SQLite path)', async () => {
@@ -372,7 +404,7 @@ describe('workflow-events', () => {
       const result = await getDagResumeSnapshot('run-without-tokens');
 
       expect(result.completedNodeOutputs).toEqual(new Map([['node-a', 'output without usage']]));
-      expect(result.tokens).toEqual({ input: 0, output: 0 });
+      expect(result.tokens).toBeUndefined();
       expect(mockLogger.warn).not.toHaveBeenCalled();
     });
 
@@ -532,7 +564,7 @@ describe('workflow-events', () => {
       const result = await getDagResumeSnapshot('run-empty');
 
       expect(result.completedNodeOutputs.size).toBe(0);
-      expect(result.tokens).toEqual({ input: 0, output: 0 });
+      expect(result.tokens).toBeUndefined();
       expect(result.costUsd).toBe(0);
     });
 

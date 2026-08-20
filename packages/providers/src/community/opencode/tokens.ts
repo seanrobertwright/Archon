@@ -11,11 +11,16 @@ export function normalizeTokens(info: Record<string, unknown> | undefined): Toke
   const input = typeof tokens.input === 'number' ? tokens.input : 0;
   const output = typeof tokens.output === 'number' ? tokens.output : 0;
   const reasoning = typeof tokens.reasoning === 'number' ? tokens.reasoning : 0;
+  const cache = isRecord(tokens.cache) ? tokens.cache : undefined;
+  const cacheRead = typeof cache?.read === 'number' ? cache.read : undefined;
+  const cacheWrite = typeof cache?.write === 'number' ? cache.write : undefined;
   const total = input + output + reasoning;
 
   return {
-    input,
+    input: input + (cacheRead ?? 0) + (cacheWrite ?? 0),
     output,
+    ...(cacheRead !== undefined ? { cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cacheWrite } : {}),
     ...(total > 0 ? { total } : {}),
     ...(typeof info?.cost === 'number' ? { cost: info.cost } : {}),
   };

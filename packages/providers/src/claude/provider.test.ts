@@ -210,6 +210,12 @@ describe('ClaudeProvider', () => {
         yield {
           type: 'result',
           session_id: 'session-123-abc',
+          usage: {
+            input_tokens: 20,
+            output_tokens: 5,
+            cache_read_input_tokens: 70,
+            cache_creation_input_tokens: 10,
+          },
         };
       });
 
@@ -219,7 +225,11 @@ describe('ClaudeProvider', () => {
       }
 
       expect(chunks).toHaveLength(1);
-      expect(chunks[0]).toEqual({ type: 'result', sessionId: 'session-123-abc' });
+      expect(chunks[0]).toEqual({
+        type: 'result',
+        sessionId: 'session-123-abc',
+        tokens: { input: 100, output: 5, cacheRead: 70, cacheWrite: 10 },
+      });
     });
 
     test('yields result with structuredOutput when SDK result has structured_output', async () => {

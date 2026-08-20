@@ -284,7 +284,10 @@ describe('CodexProvider', () => {
             type: 'item.completed',
             item: { type: 'agent_message', text: 'Hello from Codex!' },
           };
-          yield { type: 'turn.completed', usage: defaultUsage };
+          yield {
+            type: 'turn.completed',
+            usage: { ...defaultUsage, cached_input_tokens: 7, cache_write_input_tokens: 3 },
+          };
         })(),
       });
 
@@ -298,7 +301,7 @@ describe('CodexProvider', () => {
       expect(chunks[1]).toEqual({
         type: 'result',
         sessionId: 'new-thread-id',
-        tokens: { input: 10, output: 5 },
+        tokens: { input: 10, output: 5, cacheRead: 7, cacheWrite: 3 },
       });
     });
 
@@ -327,7 +330,7 @@ describe('CodexProvider', () => {
       expect(chunks[chunks.length - 1]).toEqual({
         type: 'result',
         sessionId: 'evt-thread-id',
-        tokens: { input: 10, output: 5 },
+        tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
       });
     });
 
@@ -971,7 +974,7 @@ describe('CodexProvider', () => {
       expect(chunks[2]).toEqual({
         type: 'result',
         sessionId: 'new-thread-id',
-        tokens: { input: 10, output: 5 },
+        tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
       });
     });
 
@@ -1066,7 +1069,7 @@ describe('CodexProvider', () => {
       expect(chunks[1]).toEqual({
         type: 'result',
         sessionId: 'fallback-thread',
-        tokens: { input: 10, output: 5 },
+        tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
         // A requested resume that fell back to a fresh thread is reported as cold.
         resumed: false,
       });
@@ -1760,7 +1763,7 @@ describe('CodexProvider', () => {
       expect(chunks[0]).toEqual({
         type: 'result',
         sessionId: 'new-thread-id',
-        tokens: { input: 10, output: 5 },
+        tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
       });
       expect(mockLogger.error).toHaveBeenCalledWith({ message: 'Transient blip' }, 'stream_error');
     });
@@ -1810,7 +1813,7 @@ describe('CodexProvider', () => {
       expect(chunks[0]).toEqual({
         type: 'result',
         sessionId: 'new-thread-id',
-        tokens: { input: 10, output: 5 },
+        tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
       });
       // Logged but not surfaced as failure
       expect(mockLogger.error).toHaveBeenCalledWith(
@@ -1874,7 +1877,7 @@ describe('CodexProvider', () => {
         expect(chunks[1]).toEqual({
           type: 'result',
           sessionId: 'new-thread-id',
-          tokens: { input: 10, output: 5 },
+          tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
         });
       } finally {
         await rm(testDir, { recursive: true, force: true });
@@ -2041,7 +2044,7 @@ describe('CodexProvider', () => {
       expect(chunks[0]).toEqual({
         type: 'result',
         sessionId: 'new-thread-id',
-        tokens: { input: 10, output: 5 },
+        tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
       });
     });
 

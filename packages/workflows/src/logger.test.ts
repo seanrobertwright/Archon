@@ -29,6 +29,7 @@ import {
   logTool,
   logWorkflowError,
   logWorkflowComplete,
+  logNodeComplete,
   type WorkflowEvent,
 } from './logger';
 
@@ -124,6 +125,22 @@ describe('Workflow Logger', () => {
       expect(events[0].type).toBe('workflow_start');
       expect(events[0].workflow_name).toBe('my-workflow');
       expect(events[0].content).toBe('User wants to build feature X');
+    });
+  });
+
+  describe('logNodeComplete', () => {
+    it('preserves gross input and reported cache counters', async () => {
+      await logNodeComplete(testDir, 'cache-test', 'step1', 'implement', {
+        tokens: { input: 120, output: 10, cacheRead: 80, cacheWrite: 0 },
+      });
+
+      const events = await readLogFile('cache-test');
+      expect(events[0].tokens).toEqual({
+        input: 120,
+        output: 10,
+        cacheRead: 80,
+        cacheWrite: 0,
+      });
     });
   });
 

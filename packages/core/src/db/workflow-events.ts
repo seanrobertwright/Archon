@@ -12,6 +12,7 @@ import { pool, getDialect, getDatabaseType } from './connection';
 import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
+import type { TokenUsage } from '@archon/providers/types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -234,7 +235,7 @@ export async function listWorkflowEventsSince(
  */
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   completedNodeOutputs: Map<string, string>;
-  tokens: { input: number; output: number };
+  tokens?: TokenUsage;
   costUsd: number;
 }> {
   const result = await pool.query<{
@@ -248,7 +249,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
     [workflowRunId]
   );
   const completedNodeOutputs = new Map<string, string>();
-  const tokens = { input: 0, output: 0 };
+  let tokens: TokenUsage | undefined;
   let costUsd = 0;
   for (const row of result.rows) {
     if (!row.step_name) continue;
@@ -279,8 +280,37 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         Number.isFinite(eventTokens.input) &&
         Number.isFinite(eventTokens.output)
       ) {
-        tokens.input += eventTokens.input;
-        tokens.output += eventTokens.output;
+        const normalized: TokenUsage = {
+          input: eventTokens.input,
+          output: eventTokens.output,
+        };
+        const optionalTokens = eventTokens as Record<string, unknown>;
+        for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+          const value = optionalTokens[axis];
+          if (value === undefined) continue;
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            normalized[axis] = value;
+          } else {
+            getLog().warn(
+              { runId: workflowRunId, stepName: row.step_name, axis, value },
+              'db.workflow_dag_node_optional_tokens_invalid_ignored'
+            );
+          }
+        }
+        if (tokens === undefined) {
+          tokens = normalized;
+        } else {
+          tokens = {
+            input: tokens.input + normalized.input,
+            output: tokens.output + normalized.output,
+            ...(tokens.cacheRead !== undefined && normalized.cacheRead !== undefined
+              ? { cacheRead: tokens.cacheRead + normalized.cacheRead }
+              : {}),
+            ...(tokens.cacheWrite !== undefined && normalized.cacheWrite !== undefined
+              ? { cacheWrite: tokens.cacheWrite + normalized.cacheWrite }
+              : {}),
+          };
+        }
       } else {
         getLog().warn(
           { runId: workflowRunId, stepName: row.step_name, tokens: eventTokens },
