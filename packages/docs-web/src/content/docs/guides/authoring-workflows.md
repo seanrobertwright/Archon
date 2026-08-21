@@ -1538,6 +1538,15 @@ cacheWrite` is exact when `cachePartial` is absent and an upper bound on full-pr
 when it is set. An axis no node reported stays absent, and cache usage in records created
 before this contract cannot be recovered.
 
+Read cost from `cost_usd`, not from the token counts. Because `input` is gross, pricing a
+node by hand means getting four axes and the cache rates right; `cost_usd` is the number the
+provider itself reported. JSONL `node_complete.cost_usd` and persisted
+`node_completed.data.cost_usd` carry it for a node, and JSONL `workflow_complete` carries the
+run totals as `cost_usd` and `tokens`, matching run metadata `total_cost_usd` and
+`total_tokens_*`. An absent `cost_usd` means the provider reported no cost — Codex reports
+none — while `0` means it reported zero. A run that spent nothing on AI, such as a bash-only
+workflow, carries no `cost_usd` rather than `0`.
+
 ### Choosing the child's checkout with `isolation:`
 
 `isolation:` decides which working directory the child run executes in. It is valid **only**

@@ -108,6 +108,7 @@ import {
   logTool,
   logWorkflowComplete,
   logWorkflowError,
+  type WorkflowUsage,
 } from './logger';
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
 import { mapWithLimit } from './utils/map-with-limit';
@@ -1739,7 +1740,9 @@ async function executeNodeInternal(
   let nodeResolvedModel: ResolvedModel | undefined;
   const batchMessages: string[] = [];
 
-  const nodeUsageEventData = (): Record<string, unknown> => ({
+  // What this node reported, built once and passed whole to every sink — the DB event
+  // on each outcome and the JSONL transcript row. See WorkflowUsage for why.
+  const nodeUsageEventData = (): WorkflowUsage => ({
     ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
     ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
   });
@@ -2698,7 +2701,7 @@ async function executeNodeInternal(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, node.command ?? '<inline>', {
       durationMs: duration,
-      tokens: nodeTokens,
+      ...nodeUsageEventData(),
     });
 
     deps.store
@@ -2709,8 +2712,7 @@ async function executeNodeInternal(
         data: {
           duration_ms: duration,
           node_output: nodeOutputText,
-          ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
-          ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
+          ...nodeUsageEventData(),
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
           ...(nodeResolvedModel
@@ -9680,7 +9682,13 @@ export async function executeDagWorkflow(
       { workflowId: workflowRun.id }
     );
   }
-  await logWorkflowComplete(logDir, workflowRun.id);
+  await logWorkflowComplete(logDir, workflowRun.id, {
+    // `> 0` rather than `!== undefined`, mirroring persistRunUsage above: the accumulator
+    // is a plain number seeded at 0, so zero is the only way it can say "no AI usage" —
+    // and a bash-only run must not read as a free AI run on the transcript either.
+    ...(totalCostUsd > 0 ? { cost_usd: totalCostUsd } : {}),
+    ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),
+  });
   const duration = Date.now() - dagStartTime;
   const emitter = getWorkflowEventEmitter();
   emitter.emit({
