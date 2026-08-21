@@ -1295,6 +1295,9 @@ nodes:
       For each item:
         - Skip PRs where `isDraft == true` — drafts are often WIP, nudging
           them is rude.
+        - Skip any item whose author ends with `[bot]`. A bot cannot act on
+          a nudge, and `renovate[bot]` dependency PRs are deliberately
+          long-lived until a human reviews them.
         - Skip any item with a label matching `wontfix`, `blocked`,
           `needs-maintainer`, `pinned`, `keep-open` (common "do not bother"
           signals). Check current labels via the fetched JSON.

@@ -7,11 +7,10 @@
     "bun.lock and fails with dependency_file_not_supported. No .github/dependabot.yml fixes that;",
     "there is no ecosystem entry that unlocks Dependabot security updates for Bun. Renovate has a",
     "dedicated bun manager instead, which reads the text bun.lock and the packages/* workspaces.",
-    "Operator coupling worth knowing before changing repository settings: leave Dependabot ALERTS",
-    "and the dependency graph ENABLED even though Dependabot SECURITY UPDATES are turned off.",
-    "vulnerabilityAlerts reads GitHub's alert feed, so turning alerts off costs that input. It is",
-    "not the only one - osvVulnerabilityAlerts below queries a local OSV database and never calls",
-    "GitHub - so the two are complementary rather than one being indispensable.",
+    "Leave Dependabot ALERTS and the dependency graph ENABLED even though Dependabot SECURITY",
+    "UPDATES are turned off: vulnerabilityAlerts reads that feed. osvVulnerabilityAlerts is a",
+    "second input that does not depend on this repository's alert setting - it queries a local OSV",
+    "database - so the two are complementary rather than one being indispensable.",
     "",
     "baseBranchPatterns is a product-history guard, not a style preference. Archon was rewritten",
     "(#957) and the Python-era product was archived rather than deleted. It still lives on",
@@ -24,14 +23,10 @@
   "baseBranchPatterns": ["dev"],
   "lockFileMaintenance": {
     "description": [
-      "Off by Renovate default, and the reason this file exists. Most of this repository's exposure",
-      "is not a declared range that is too old - it is a range that already permits a patched",
-      "version while the frozen bun.lock resolves to a stale one. That class produces no GitHub",
-      "alert at all, because the range *could* resolve to something patched, so no alert-driven",
-      "automation finds it however it is configured. Regenerating the lockfile does, and deleting",
-      "bun.lock then running bun install is exactly what Renovate's bun manager does here.",
-      "It also reaches the transitive packages: nothing declares them, so they can never be the",
-      "subject of a per-package PR - they move only when their parents move."
+      "Off by Renovate default, and the reason this file exists. 18 of this repository's 24",
+      "vulnerable packages are transitive - nothing declares them, so they can never be the subject",
+      "of a per-package PR however the alerting is configured. They move only when their parents",
+      "move, and regenerating the lockfile is what moves parents."
     ],
     "enabled": true
   },
@@ -40,14 +35,11 @@
     {
       "description": [
         "An override reaches the installed tree WITHOUT passing the range check that governs every",
-        "other route, so a major bump here can force a dependent onto a version its own declared",
-        "range forbids, and bun install --frozen-lockfile still succeeds. That bypass is live at",
-        "this commit: msw@2.12.10 declares path-to-regexp ^6.3.0 while the override resolves 8.4.2,",
-        "two majors outside it, with no error. Until now every line in this block was a deliberate",
-        "human act with an advisory behind it; Renovate now writes here too.",
-        "So majors in overrides are a human decision. Patch and minor still flow, which is the",
-        "whole class this file exists to automate - the axios, qs and @hono/node-server refreshes",
-        "landed in this PR were all in-range patch moves."
+        "other route, so a major bump here can force a dependent past its own declared range with",
+        "no error. Live at this commit: msw@2.12.10 declares path-to-regexp ^6.3.0 while the",
+        "override resolves 8.4.2. Patch and minor still flow - that is the class this file exists",
+        "to automate. Note this covers a major that is itself a security fix; those are rare",
+        "(vulnerabilityFixStrategy defaults to 'lowest') and become a human decision too."
       ],
       "matchDepTypes": ["overrides"],
       "matchUpdateTypes": ["major"],
