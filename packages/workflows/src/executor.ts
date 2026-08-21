@@ -631,8 +631,15 @@ const STAGED_SOURCE_TTL_MS = 6 * 60 * 60 * 1000;
  * capture is never touched.
  *
  * Hygiene only: it never mutates a run and cannot affect one in progress.
+ *
+ * Runs at most ONCE per process. It was on every capture, which put a directory scan on
+ * the spawn path of every fan-out child — N sweeps to reclaim the same nothing, on the one
+ * path where captures are most numerous and latency is most visible.
  */
+let stagedSourcesSwept = false;
 async function sweepStaleStagedSources(): Promise<void> {
+  if (stagedSourcesSwept) return;
+  stagedSourcesSwept = true;
   const stagingRoot = join(archonPaths.getArchonHome(), 'staged-source');
   try {
     const entries = await readdir(stagingRoot, { withFileTypes: true });
