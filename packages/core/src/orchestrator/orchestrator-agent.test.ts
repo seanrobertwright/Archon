@@ -373,9 +373,10 @@ function makeCodebase(name: string, id = `id-${name}`): Codebase {
 // handleUpdateProject. Today a leak is survivable only because the predicates
 // here reject one literal path — that is luck, not a guarantee, and it stops
 // being true the moment a test rejects something broader. Reset before every
+// test so no describe can poison another.
+//
 // Deliberately no count here: any number rots on the next test added, and the
 // mechanism is the argument.
-// test so no describe can poison another.
 beforeEach(() => {
   mockExistsSync.mockImplementation(() => true);
 });
@@ -1720,11 +1721,44 @@ describe('provider cwd resolution', () => {
       const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
       expect(sent).toContain('/worktrees/removed');
       expect(sent).toContain('working directory no longer exists');
+      // This guard's own message signature — nothing else emits that sentence, so
+      // it cannot false-alarm. Deliberately NOT also asserting the absence of
+      // `/update-project`: the guard above offers `/worktree remove` and
+      // `/setproject` and never that, so the two strings always co-occur and it
+      // would add no detection — while breaking this test if anyone ever adds
+      // `/update-project` to that message, an edit that has nothing to do with
+      // this guard.
       expect(sent).not.toContain('project directory no longer exists');
-      expect(sent).not.toContain('/update-project');
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.anything(),
         'orchestrator.conversation_cwd_missing'
+      );
+    });
+
+    test('runs the turn when the cwd override is healthy but default_cwd is gone', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({
+        codebase_id: 'codebase-1',
+        cwd: '/worktrees/healthy',
+      });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      // The project root is gone, but this conversation does not use it.
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      // This is the case that makes `&& conversation.cwd === null` load-bearing
+      // rather than decorative. Drop that clause while leaving the target as
+      // `default_cwd` and this guard refuses a perfectly healthy turn, telling the
+      // user their project directory is gone and offering to repoint a directory
+      // the turn never touches. Nothing else in the suite catches that mutation.
+      expect(getSendQueryCwd()).toBe('/worktrees/healthy');
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'orchestrator.codebase_cwd_missing'
       );
     });
 

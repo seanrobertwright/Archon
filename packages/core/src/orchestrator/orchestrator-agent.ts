@@ -1640,14 +1640,20 @@ export async function handleMessage(
     // the same field with no mutation between the reads, which is what lets them sit
     // side by side.
     //
-    // Keep the condition narrow rather than widening it to `conversation.cwd ??
-    // default_cwd`. Be aware that no test can hold you to this: the guard above
-    // already returns for every `cwd !== null` case, so a widened condition here is
-    // dead code rather than a behaviour change, and it is unobservable through
-    // handleMessage. The reason to keep it narrow is that it would silently become
-    // observable the moment the guard above is moved, narrowed, or removed — at
-    // which point this guard would answer for a stale worktree with the wrong
-    // message, one that says nothing about `isolation_env_id`.
+    // `&& conversation.cwd === null` is load-bearing. Dropping it while leaving the
+    // target as `default_cwd` refuses a healthy turn: a conversation working in a
+    // live worktree, whose project root happens to be gone, would be told its
+    // project directory no longer exists and offered `/update-project` for a
+    // directory that turn never touches. Covered by `runs the turn when the cwd
+    // override is healthy but default_cwd is gone`.
+    //
+    // Widening it the other way — to `conversation.cwd ?? default_cwd`, moving the
+    // target with the condition — is instead unobservable here, because the guard
+    // above already returns for every `cwd !== null` case. No test holds you to
+    // that one. Keep it narrow anyway: it becomes observable the moment the guard
+    // above is moved, narrowed, or removed, at which point this guard would answer
+    // for a stale worktree with the wrong message, one that says nothing about
+    // `isolation_env_id`.
     //
     // Refuses rather than falling back to the workspaces root the way the
     // `scopedCodebase === undefined` branch below does: relocating the agent into a
@@ -1684,11 +1690,12 @@ export async function handleMessage(
     // Persist the inbound user message for non-web platforms (Slack/Telegram/
     // GitHub/Discord/CLI) — the web adapter's route persists web turns itself.
     // Placed AFTER every early return that declines the turn — deterministic
-    // commands (including `/workflow approve|reject`) and the missing-project guard
-    // above — so only AI-bound turns get a user row (no orphaned user message
-    // without an assistant reply), and BEFORE the AI call so the user row's
-    // timestamp precedes the assistant row's. A plain message at a gate is NOT a
-    // refusal since #2577; it flows into the AI turn and earns its user row.
+    // commands (including `/workflow approve|reject`), the stale-worktree guard and
+    // the missing-project guard above — so only AI-bound turns get a user row (no
+    // orphaned user message without an assistant reply), and BEFORE the AI call so
+    // the user row's timestamp precedes the assistant row's. A plain message at a
+    // gate is NOT a refusal since #2577; it flows into the AI turn and earns its
+    // user row.
     //
     // A new refusal that needs nothing computed below belongs above this block. One
     // that needs data from further down (workflow discovery, gate lookup) has to
