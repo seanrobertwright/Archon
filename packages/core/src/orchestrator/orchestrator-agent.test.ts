@@ -1581,6 +1581,118 @@ describe('provider cwd resolution', () => {
     expect(mockSendQuery).toHaveBeenCalled();
   });
 
+  // ─── missing project directory (#2663) ──────────────────────────────────────
+
+  describe('missing project directory', () => {
+    test('refuses the turn and never reaches the provider when default_cwd is gone', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      // Handing a missing path to the provider is the whole defect: the spawn
+      // fails ENOENT against the BINARY, so the user is told the wrong thing.
+      expect(mockSendQuery).not.toHaveBeenCalled();
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      expect(sent).toContain('/repos/test-repo');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ codebaseId: 'codebase-1', cwd: '/repos/test-repo' }),
+        'orchestrator.codebase_cwd_missing'
+      );
+    });
+
+    test('offers recovery that actually works, and not the traps', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      // /update-project validates the new path and repairs the registration.
+      expect(sent).toContain('/update-project');
+      expect(sent).toContain('/setproject');
+      // /worktree remove answers "not using a worktree" when isolation_env_id is
+      // null, and otherwise repoints cwd at this same missing directory.
+      expect(sent).not.toContain('/worktree remove');
+      // /register-project creates a new registration rather than repairing this one.
+      expect(sent).not.toContain('/register-project');
+    });
+
+    test('writes no user row when it refuses, so none is left unpaired', async () => {
+      mockAddMessage.mockClear();
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      // Non-web only: the web adapter's route persists its own turns, so the
+      // orchestrator never writes a user row for it and this could not regress.
+      const platform = makePlatform();
+      platform.getPlatformType = mock(() => 'telegram') as typeof platform.getPlatformType;
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      expect(mockSendQuery).not.toHaveBeenCalled();
+      expect(mockAddMessage.mock.calls.filter(c => c[1] === 'user')).toHaveLength(0);
+    });
+
+    test('leaves a stale cwd override to the conversation-cwd guard', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({
+        codebase_id: 'codebase-1',
+        cwd: '/worktrees/removed',
+      });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/removed');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      // This guard is deliberately scoped to `cwd === null`. The override case is
+      // a different situation with different advice and belongs to #2551; if this
+      // ever starts firing here, the two guards have been collapsed into one.
+      expect(getSendQueryCwd()).toBe('/worktrees/removed');
+    });
+
+    test('does not fire when the project directory is present', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      expect(getSendQueryCwd()).toBe('/repos/test-repo');
+    });
+
+    test('leaves the unscoped path alone — the workspaces root is created on demand', async () => {
+      const conversation = makeConversation({ codebase_id: null });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([]));
+      mockExistsSync.mockImplementation(() => false);
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      expect(getSendQueryCwd()).toBe('/home/test/.archon/workspaces');
+    });
+  });
+
   test('unscoped chat uses ensureArchonWorkspacesPath result', async () => {
     const conversation = makeConversation({ codebase_id: null });
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
