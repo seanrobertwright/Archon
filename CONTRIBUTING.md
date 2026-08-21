@@ -52,7 +52,7 @@ bun run check:schema-upgrades   # PGHOST/PGUSER/… or DATABASE_URL
 1. Create a feature branch from `dev`
 2. Make your changes
 3. Ensure all checks pass
-4. Submit a PR using the template at [`.github/pull_request_template.md`](./.github/pull_request_template.md). GitHub fills it in automatically when you open a PR through the web UI. If you use `gh pr create`, copy the template into the body. Always keep Problem and outcome, Review guidance, Solution, and Validation; delete the conditional sections that do not apply rather than filling them with "N/A".
+4. Submit a PR using the template at [`.github/pull_request_template.md`](./.github/pull_request_template.md). GitHub fills it in automatically when you open a PR through the web UI. If you use `gh pr create`, copy the template into the body. Always keep Problem and outcome, Review guidance, Solution, and Validation; delete the conditional sections that do not apply rather than filling them with "N/A". Bot-authored dependency PRs (`renovate[bot]`) are exempt — they post a generated body naming the package, the version range and the advisory.
 5. Link the issue your PR addresses with `Closes #<number>` (or `Fixes #<number>` / `Resolves #<number>`) in the description so it auto-closes on merge.
 
 ## Code Style
