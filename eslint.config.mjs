@@ -14,7 +14,10 @@ export default tseslint.config(
       '.agents/examples/**',
       'packages/docs-web/**',
       'workspace/**',
+      // Nested git worktrees are separate checkouts that lint on their own branch.
+      // Their files are outside every tsconfig project here, so typed rules crash on them.
       'worktrees/**',
+      '.worktrees/**',
       '.claude/worktrees/**',
       '.claude/skills/**',
       '.archon/**', // User workflow/script/command content — not in any tsconfig project
