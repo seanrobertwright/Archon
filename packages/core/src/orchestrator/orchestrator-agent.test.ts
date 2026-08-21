@@ -1661,10 +1661,24 @@ describe('provider cwd resolution', () => {
       const platform = makePlatform();
       await handleMessage(platform, 'conv-1', 'hello');
 
-      // This guard is deliberately scoped to `cwd === null`. The override case is
-      // a different situation with different advice and belongs to #2551; if this
-      // ever starts firing here, the two guards have been collapsed into one.
-      expect(getSendQueryCwd()).toBe('/worktrees/removed');
+      // This guard is deliberately scoped to `cwd === null`; the override case is a
+      // different situation with different advice and belongs to #2551.
+      //
+      // Assert that THIS guard stays silent rather than asserting what the turn
+      // does next. What happens next is not stable across the two PRs: today the
+      // override reaches the provider, and once #2551's guard lands beside this
+      // one it refuses the turn instead. Either way the invariant that matters
+      // here is the same — this guard did not claim the case.
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'orchestrator.codebase_cwd_missing'
+      );
+      const sends = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c => c[1]);
+      expect(
+        sends.some(
+          (s: unknown) => typeof s === 'string' && s.includes('project directory no longer exists')
+        )
+      ).toBe(false);
     });
 
     test('does not fire when the project directory is present', async () => {
