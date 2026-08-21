@@ -330,7 +330,9 @@ export async function loadCommandPrompt(
           message: `Packaged command not found: ${packaged.name}.md`,
         };
       }
-      if (isBinaryBuild()) {
+      // A captured run reads the bundled bytes IT froze, even in a binary: the capture
+      // materialized the constants to files, and those are what its digest covers.
+      if (isBinaryBuild() && roots.kind === 'live') {
         const content = BUNDLED_COMMANDS[commandName];
         if (content === undefined) {
           return {
@@ -461,7 +463,8 @@ export async function loadCommandPrompt(
 
   // If not found in repo/home and app defaults enabled, search app defaults
   if (loadDefaultCommands) {
-    if (isBinaryBuild()) {
+    // A captured run reads the bundled command bytes IT froze; see the note above.
+    if (isBinaryBuild() && roots.kind === 'live') {
       // Binary: check bundled commands
       const bundledContent = BUNDLED_COMMANDS[commandName];
       if (bundledContent) {
@@ -470,8 +473,9 @@ export async function loadCommandPrompt(
       }
       getLog().debug({ commandName }, 'command_bundled_not_found');
     } else {
-      // Bun: load from filesystem (walk 1 level deep so `defaults/archon-*.md` resolves)
-      const appDefaultsPath = archonPaths.getDefaultCommandsPath();
+      // Bun (or any captured run): load from the bundled-commands root, walking 1 level
+      // deep so `defaults/archon-*.md` resolves.
+      const appDefaultsPath = roots.bundledCommands;
       const entries = await archonPaths.findMarkdownFilesRecursive(appDefaultsPath, '', {
         maxDepth: 1,
       });

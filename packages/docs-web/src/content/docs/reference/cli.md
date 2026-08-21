@@ -244,7 +244,7 @@ archon workflow run implement \
   "implement the plan"
 ```
 
-Every run freezes its workflow source when it starts, whether or not you pass this flag. That means the source directory's `.archon/workflows`, `.archon/commands`, and `.archon/scripts`, plus your home-scoped `~/.archon/` source and — when running from a source checkout rather than a compiled binary — the bundled defaults. Everything a static `include:` can reach is frozen together, so an included global or bundled workflow cannot change shape under a run either. That freeze is what makes the rest predictable:
+Every run freezes its workflow source when it starts, whether or not you pass this flag. That means the source directory's `.archon/workflows`, `.archon/commands`, and `.archon/scripts`, plus your home-scoped `~/.archon/` source and Archon's own bundled defaults. Everything a static `include:` can reach is frozen together, so an included global or bundled workflow cannot change shape under a run either. That freeze is what makes the rest predictable:
 
 - **The target stays clean.** Nothing from the source checkout is written into it, so its `git status` and its validators only ever see its own files.
 - **A run does not change shape while it is running.** Edit, move, or delete the source checkout after a run starts and a resume still executes what the run began with. Start a new run to pick up the edits.
@@ -254,7 +254,7 @@ The captured source lives under that run's artifacts (`~/.archon/workspaces/<pro
 
 The one exception is a run that started before Archon captured source at all. It has nothing recorded to honor, so it resumes against the current source on disk with a warning. A run whose source record exists but cannot be read is *not* treated that way — it fails, because a run that recorded its source must never quietly execute something else.
 
-**Compiled binaries and upgrades.** A binary embeds its bundled workflows, commands, and scripts as constants rather than files, so a capture cannot freeze them. That is harmless while the binary is the same one, and Archon records which version took the capture. If you upgrade Archon between pausing and resuming a run, that run fails closed rather than resuming with bundled content it cannot verify — start a fresh run. Source checkouts capture the bundled tree and are unaffected.
+**Compiled binaries.** A binary embeds its bundled workflows, commands, and scripts as constants rather than files. Those get written into the capture alongside everything else, so they are covered by the same digest — which means upgrading Archon between pausing and resuming a run is fine: the run keeps executing the bundled content it started with, and a change to those bytes would be caught like any other.
 
 `--container` runs get the same treatment: the capture is bind-mounted **read-only at the same absolute path** inside the container, so a named script resolves identically whether a node runs on the host or in the container, and a container recreated on resume gets the mount back. `--workflow-source` is refused with `--container` — a folder project runs in place, so its source and its target are the same directory by definition.
 

@@ -32,7 +32,6 @@ import {
   readWorkflowSourceState,
 } from './schemas';
 import {
-  assertBundledSourceStillTrustworthy,
   captureWorkflowSource,
   capturedSourceRoots,
   getRunSourceCapturePath,
@@ -1962,7 +1961,6 @@ export async function executeWorkflow(
     // directory exists, and not merely that the capture agrees with itself.
     try {
       const loaded = await loadWorkflowSource(recordedSource.root, recordedSource.digest);
-      assertBundledSourceStillTrustworthy(loaded.manifest);
       // The settings frozen WITH the capture, not the target's. Without this a resume
       // would re-read `commands.folder` and `defaults:` from the workspace it acts on and
       // reinterpret the frozen bytes through them.

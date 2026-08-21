@@ -421,7 +421,9 @@ async function resolveCommandContentForScan(
   if (packaged !== null) {
     if (packaged.owner.source === 'bundled') {
       if (config.loadDefaultCommands === false) return null;
-      if (isBinaryBuild()) return BUNDLED_COMMANDS[commandName] ?? null;
+      // A captured run reads the bundled bytes IT froze; the capture materialized a
+      // binary's embedded constants to files.
+      if (isBinaryBuild() && roots.kind === 'live') return BUNDLED_COMMANDS[commandName] ?? null;
     }
 
     let workflowsRoot: string;
@@ -481,10 +483,10 @@ async function resolveCommandContentForScan(
   // the workflow/command discovery opt-out so the scan doesn't resolve a command the repo
   // has disabled.
   if (config.loadDefaultCommands === false) return null;
-  if (isBinaryBuild()) {
+  if (isBinaryBuild() && roots.kind === 'live') {
     return BUNDLED_COMMANDS[commandName] ?? null;
   }
-  const defaultsDir = archonPaths.getDefaultCommandsPath();
+  const defaultsDir = roots.bundledCommands;
   let entries: Awaited<ReturnType<typeof archonPaths.findMarkdownFilesRecursive>>;
   try {
     entries = await archonPaths.findMarkdownFilesRecursive(defaultsDir, '', { maxDepth: 1 });
@@ -682,7 +684,10 @@ export async function discoverWorkflows(
   // 1. Load from app's bundled defaults (unless opted out)
   const loadDefaultWorkflows = options?.loadDefaults !== false;
   if (loadDefaultWorkflows) {
-    if (isBinaryBuild()) {
+    // A captured run loads the bundled workflows IT froze — including in a binary, where
+    // the capture wrote the embedded constants out as files. That is what lets a paused
+    // run resume across an upgrade instead of failing on unverifiable bundled bytes.
+    if (isBinaryBuild() && roots.kind === 'live') {
       // Binary: load from embedded bundled content
       getLog().debug('loading_bundled_default_workflows');
       const bundledResult = loadBundledWorkflows();

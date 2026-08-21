@@ -56,8 +56,15 @@ import { z } from '@hono/zod-openapi';
 import { createLogger } from '@archon/paths';
 import * as archonPaths from '@archon/paths';
 import { BUNDLED_VERSION } from '@archon/paths/bundled-build';
-import { isBinaryBuild } from './defaults/bundled-defaults';
+import {
+  BUNDLED_COMMANDS,
+  BUNDLED_SCRIPTS,
+  BUNDLED_WORKFLOWS,
+  BUNDLED_WORKFLOW_OWNERS,
+  isBinaryBuild,
+} from './defaults/bundled-defaults';
 import { readWorkflowSourceMetadata, readWorkflowSourceState } from './schemas/workflow-run';
+import { parsePackagedResourceReference } from './packaged-workflow';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -110,8 +117,19 @@ export interface WorkflowSourceRoots {
   globalWorkflows: string;
   globalCommands: string;
   globalScripts: string;
+  /**
+   * Whether these roots are a live checkout or a run's frozen capture.
+   *
+   * Load-bearing for one thing: a compiled binary normally reads its bundled workflows
+   * and commands from embedded constants rather than disk, short-circuiting before any
+   * root is consulted. A capture materializes those constants to files, so a captured
+   * run must take the filesystem path instead — this is how each of those branches knows.
+   */
+  kind: 'live' | 'captured';
   /** Directory holding packaged bundled workflows (the parent of the defaults folder). */
   bundledWorkflows: string;
+  /** Directory holding bundled default commands. */
+  bundledCommands: string;
   /**
    * The SOURCE's own settings for what those roots mean.
    *
@@ -150,6 +168,8 @@ export function liveSourceRoots(
     globalCommands: archonPaths.getHomeCommandsPath(),
     globalScripts: archonPaths.getHomeScriptsPath(),
     bundledWorkflows: dirname(archonPaths.getDefaultWorkflowsPath()),
+    bundledCommands: archonPaths.getDefaultCommandsPath(),
+    kind: 'live',
     config,
   };
 }
@@ -172,9 +192,12 @@ export function capturedSourceRoots(
     globalWorkflows: join(captureRoot, GLOBAL_SCOPE_DIR, 'workflows'),
     globalCommands: join(captureRoot, GLOBAL_SCOPE_DIR, 'commands'),
     globalScripts: join(captureRoot, GLOBAL_SCOPE_DIR, 'scripts'),
-    bundledWorkflows: isBinaryBuild()
-      ? dirname(archonPaths.getDefaultWorkflowsPath())
-      : join(captureRoot, BUNDLED_SCOPE_DIR),
+    // Always the capture, binary or not. A binary's bundled set is materialized into it
+    // at capture time, which is what lets a paused run resume across an Archon upgrade
+    // instead of failing because its bundled bytes could not be verified.
+    bundledWorkflows: join(captureRoot, BUNDLED_SCOPE_DIR, 'workflows'),
+    bundledCommands: join(captureRoot, BUNDLED_SCOPE_DIR, 'commands', 'defaults'),
+    kind: 'captured',
     config,
   };
 }
@@ -334,6 +357,68 @@ async function copyTree(
 }
 
 /**
+ * Write a binary's embedded bundled defaults into a capture, in the same layout a source
+ * build produces on disk.
+ *
+ * Mirroring the on-disk shape is the whole trick: every resolver already knows how to read
+ * bundled workflows, commands, and scripts from a directory, so once the constants are
+ * files under the capture's roots, the ordinary filesystem path serves a binary too and no
+ * resolver needs a second way to find them.
+ *
+ * Returns the number of files written.
+ */
+async function materializeBundledDefaults(bundledRoot: string): Promise<number> {
+  let written = 0;
+
+  const write = async (relative: string, content: string): Promise<void> => {
+    const target = join(bundledRoot, relative);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, content);
+    written += 1;
+  };
+
+  for (const [name, content] of Object.entries(BUNDLED_WORKFLOWS)) {
+    // A packaged bundled workflow lives under `<pack>/<workflow>/`; a bare one under
+    // `defaults/`. The owners map is what distinguishes them, exactly as on disk.
+    const owner = BUNDLED_WORKFLOW_OWNERS[name];
+    const relative = owner
+      ? join('workflows', owner.pack, owner.workflow, `${name}.yaml`)
+      : join('workflows', 'defaults', `${name}.yaml`);
+    await write(relative, content);
+  }
+
+  for (const [name, content] of Object.entries(BUNDLED_COMMANDS)) {
+    const packaged = parsePackagedResourceReference(name);
+    const relative = packaged
+      ? join(
+          'workflows',
+          packaged.owner.pack,
+          packaged.owner.workflow,
+          'commands',
+          `${packaged.name}.md`
+        )
+      : join('commands', 'defaults', `${name}.md`);
+    await write(relative, content);
+  }
+
+  for (const [name, script] of Object.entries(BUNDLED_SCRIPTS)) {
+    const packaged = parsePackagedResourceReference(name);
+    const relative = packaged
+      ? join(
+          'workflows',
+          packaged.owner.pack,
+          packaged.owner.workflow,
+          'scripts',
+          `${packaged.name}${script.extension}`
+        )
+      : join('scripts', `${name}${script.extension}`);
+    await write(relative, script.content);
+  }
+
+  return written;
+}
+
+/**
  * Content digest over every captured file.
  *
  * Path-and-bytes, sorted, so the value depends only on what was captured and never on
@@ -422,11 +507,17 @@ export async function captureWorkflowSource(opts: {
     if (await isDirectory(from))
       jobs.push({ dest: join(GLOBAL_SCOPE_DIR, name), from, scope: 'global' });
   }
-  // Source builds read bundled defaults off disk, so they are capturable and mutable.
-  // A binary embeds them as constants: nothing to copy, and nothing that can change.
+  // Bundled defaults, from wherever this build keeps them. A source build copies the two
+  // on-disk trees; a binary WRITES its embedded constants out below. Either way the run
+  // ends up with bundled bytes it owns, which is what lets it resume across an upgrade.
   if (!isBinaryBuild()) {
-    const from = dirname(archonPaths.getDefaultWorkflowsPath());
-    if (await isDirectory(from)) jobs.push({ dest: BUNDLED_SCOPE_DIR, from, scope: 'bundled' });
+    for (const [name, from] of [
+      ['workflows', dirname(archonPaths.getDefaultWorkflowsPath())],
+      ['commands', dirname(archonPaths.getDefaultCommandsPath())],
+    ] as const) {
+      if (await isDirectory(from))
+        jobs.push({ dest: join(BUNDLED_SCOPE_DIR, name), from, scope: 'bundled' });
+    }
   }
 
   const staging = `${captureRoot}.partial`;
@@ -434,6 +525,7 @@ export async function captureWorkflowSource(opts: {
 
   let fileCount = 0;
   let byteCount = 0;
+  const scopesCaptured = new Set(jobs.map(j => j.scope));
   try {
     await mkdir(staging, { recursive: true });
     for (const job of jobs) {
@@ -447,6 +539,19 @@ export async function captureWorkflowSource(opts: {
       byteCount += copied.bytes;
     }
 
+    // A compiled binary keeps its bundled set as constants rather than files, so there is
+    // nothing to copy — write them out instead. Without this a binary's capture cannot
+    // include the bundled scope at all, and a run that statically included a bundled
+    // workflow would have no way to prove, on resume, that it had not changed under an
+    // upgrade. Materializing turns that unprovable case into an ordinary digest check.
+    if (isBinaryBuild()) {
+      const written = await materializeBundledDefaults(join(staging, BUNDLED_SCOPE_DIR));
+      if (written > 0) {
+        fileCount += written;
+        scopesCaptured.add('bundled');
+      }
+    }
+
     const { digest } = await digestTree(staging);
     const manifest: WorkflowSourceManifest = {
       version: 1,
@@ -456,7 +561,7 @@ export async function captureWorkflowSource(opts: {
       digest,
       file_count: fileCount,
       byte_count: byteCount,
-      scopes: [...new Set(jobs.map(j => j.scope))],
+      scopes: [...scopesCaptured],
       source_config: sourceConfig,
     };
     await writeManifest(staging, manifest);
@@ -600,8 +705,7 @@ export async function resolveRunSourceRoot(
     );
   }
   if (state.kind === 'absent') return undefined;
-  const capture = await loadWorkflowSource(state.record.root, state.record.digest);
-  assertBundledSourceStillTrustworthy(capture.manifest);
+  await loadWorkflowSource(state.record.root, state.record.digest);
   return state.record.root;
 }
 
@@ -626,26 +730,4 @@ export async function resolveChildDiscoveryRoot(
   const recorded = readWorkflowSourceMetadata(metadata);
   if (!recorded) return undefined;
   return (await isDirectory(recorded.origin)) ? recorded.origin : undefined;
-}
-
-/**
- * Refuse to resume a binary-built run whose engine changed under it.
- *
- * A compiled binary embeds its bundled workflows, commands, and scripts as constants
- * rather than files, so a capture cannot freeze them — `scopes` omits `bundled`. That is
- * harmless while the binary is the same one: constants cannot move. It stops being
- * harmless across an upgrade, where a bundled workflow the run statically included may
- * have changed while project and global digests still verify perfectly.
- *
- * Source builds capture the bundled tree, so they are unaffected.
- */
-export function assertBundledSourceStillTrustworthy(manifest: WorkflowSourceManifest): void {
-  if (manifest.scopes.includes(BUNDLED_SCOPE_DIR)) return; // captured — verified by digest
-  if (manifest.engine_version === BUNDLED_VERSION) return; // same build — constants identical
-  throw new WorkflowSourceIntegrityError(
-    `This run was captured by Archon ${manifest.engine_version} and is resuming under ` +
-      `${BUNDLED_VERSION}. Its bundled workflows are compiled into the binary rather than ` +
-      'stored with the run, so they cannot be verified across an upgrade. Start a fresh ' +
-      'run to execute the current workflow.'
-  );
 }

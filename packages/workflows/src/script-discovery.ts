@@ -249,11 +249,13 @@ async function materializeBundledScripts(): Promise<Map<string, ScriptDefinition
 }
 
 async function discoverBundledPackagedScripts(
-  bundledWorkflowsRoot: string
+  roots: WorkflowSourceRoots
 ): Promise<Map<string, ScriptDefinition>> {
-  return isBinaryBuild()
+  // A captured run reads the bundled scripts IT froze — the capture materialized a
+  // binary's embedded ones to files, so the filesystem path serves both builds.
+  return isBinaryBuild() && roots.kind === 'live'
     ? await materializeBundledScripts()
-    : await discoverPackagedScripts(bundledWorkflowsRoot, 'bundled');
+    : await discoverPackagedScripts(roots.bundledWorkflows, 'bundled');
 }
 
 /**
@@ -278,7 +280,7 @@ export async function discoverScriptsForCwd(
   // from, not the workspace it acts on. Omitting `sourceRoots` reads live off `cwd`,
   // which is both the in-place case and the pre-capture behavior.
   const roots = sourceRoots ?? liveSourceRoots(cwd);
-  const bundledPackagedScripts = await discoverBundledPackagedScripts(roots.bundledWorkflows);
+  const bundledPackagedScripts = await discoverBundledPackagedScripts(roots);
   const homeScripts = await discoverScripts(roots.globalScripts);
   const homePackagedScripts = await discoverPackagedScripts(roots.globalWorkflows, 'global');
   const repoScripts = roots.project
