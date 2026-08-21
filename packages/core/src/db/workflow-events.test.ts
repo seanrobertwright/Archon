@@ -291,6 +291,38 @@ describe('workflow-events', () => {
       ]);
     });
 
+    test('sums cache axes reported by a failed node into the resumed total', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'done',
+            event_type: 'node_completed',
+            data: {
+              node_output: 'kept',
+              tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 2 },
+            },
+          },
+          {
+            step_name: 'retry-me',
+            event_type: 'node_failed',
+            data: {
+              error: 'provider failed after reporting usage',
+              tokens: { input: 20, output: 2, cacheRead: 8, cacheWrite: 3 },
+            },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-failed-cache');
+
+      expect(result.tokens).toEqual({
+        input: 30,
+        output: 3,
+        cacheRead: 13,
+        cacheWrite: 5,
+      });
+    });
+
     test('returns outputs from node_skipped_prior_success events (multi-resume)', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
