@@ -36,20 +36,31 @@ export function classifyAndFormatError(error: Error): string {
     return `⚠️ AI usage limit reached${reset ? ` (${reset})` : ''}. Please wait and try again.`;
   }
 
-  // Codex-specific auth errors — OAuth token refresh failures
-  // Codex wraps every provider error with `Codex query failed:` (see
-  // packages/providers/src/codex/provider.ts), so the wrapper prefix is a
-  // reliable Codex-side marker. This branch MUST precede the Claude-OAuth
-  // branch below — the refresh-token phrases are provider-agnostic and would
-  // otherwise be misattributed to Claude (GitHub #2509).
-  // Recovery: `codex login` in terminal.
+  // Codex-specific auth errors — OAuth token refresh failures and 401 retry
+  // exhaustion. The provider wraps streaming/lifecycle errors with several
+  // prefixes — `Codex auth error:`, `Codex unknown:`, `Codex query failed:`,
+  // and the generic `Codex ${errorClass}:` form (see
+  // packages/providers/src/codex/provider.ts: classifyAndEnrichCodexError and
+  // the SDK-lifecycle catches in createCodexClient / startThread /
+  // resumeThread), and the orchestrator's `isError` synthetic-error path
+  // emits `codex_turn_failed:` or `codex_stream_incomplete:` (see
+  // packages/core/src/orchestrator/orchestrator-agent.ts isError handling).
+  // Match any of those Codex-side prefixes so an auth-flavored inner message
+  // routes to Codex guidance (GitHub #2509) instead of falling through to the
+  // Claude-OAuth branch below. The rate-limit branch above has already had a
+  // chance to match, so `Codex rate_limit:` wraps route to usage-cap guidance
+  // first. Recovery: `codex login` in terminal.
   if (
-    message.includes('Codex query failed:') &&
+    (message.startsWith('Codex ') ||
+      message.startsWith('codex_turn_failed:') ||
+      message.startsWith('codex_stream_incomplete:')) &&
     (message.includes('refresh token') ||
       message.includes('could not be refreshed') ||
       message.includes('log out and sign in') ||
       message.includes('OAuth token has expired') ||
-      message.includes('sign-in has expired'))
+      message.includes('sign-in has expired') ||
+      message.includes('401') ||
+      message.includes('Unauthorized'))
   ) {
     return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
   }
@@ -78,16 +89,6 @@ export function classifyAndFormatError(error: Error): string {
   // instead of leaking the raw CLI string (#1983).
   if (message.includes('Not logged in') || message.includes('Please run /login')) {
     return '⚠️ Not logged in to the AI provider. Connect a subscription or API key in Settings → Agents, or set credentials in your environment (e.g. `claude /login` or `CLAUDE_API_KEY`).';
-  }
-
-  // Codex-specific auth errors — 401 retry exhaustion
-  // Codex surfaces auth failures as "exceeded retry limit, last status: 401 Unauthorized"
-  // Recovery: `codex login` in terminal.
-  if (
-    message.includes('Codex query failed:') &&
-    (message.includes('401') || message.includes('Unauthorized'))
-  ) {
-    return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
   }
 
   // General AI/SDK authentication errors

@@ -183,12 +183,25 @@ describe('classifyAndFormatError', () => {
   });
 
   describe('Codex auth errors', () => {
-    test('detects Codex 401 retry exhaustion', () => {
+    test('detects Codex 401 retry exhaustion via "Codex query failed:" wrapper', () => {
       const result = classifyAndFormatError(
         new Error('Codex query failed: exceeded retry limit, last status: 401 Unauthorized')
       );
       expect(result).toContain('Codex authentication error');
       expect(result).toContain('codex login');
+    });
+
+    test('detects Codex 401 retry exhaustion via "Codex auth error:" wrapper (provider-enriched shape)', () => {
+      // classifyAndEnrichCodexError wraps messages whose AUTH_PATTERNS match
+      // (here: "401" and "Unauthorized") as `Codex auth error: <inner>`. This
+      // is the shape the provider actually emits for a 401 retry exhaustion
+      // (#2509 R1), not the synthetic `Codex query failed:` shape.
+      const result = classifyAndFormatError(
+        new Error('Codex auth error: exceeded retry limit, last status: 401 Unauthorized')
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+      expect(result).not.toContain('Claude authentication');
     });
 
     test('detects Codex query failed with Unauthorized', () => {
@@ -201,9 +214,13 @@ describe('classifyAndFormatError', () => {
   describe('Codex OAuth refresh-token errors (#2509)', () => {
     // Regression for GitHub #2509: a Codex-wrapped OAuth refresh error used
     // to be routed to Claude `/login` guidance because the OAuth-refresh
-    // branch matched provider-agnostic refresh phrases. The new Codex
-    // OAuth-refresh branch above the Claude one catches it first.
-    test('routes Codex-wrapped refresh-token race to Codex auth guidance', () => {
+    // branch matched provider-agnostic refresh phrases without a Codex-side
+    // prefix check, so provider-wrapped shapes (Codex auth error: / Codex
+    // unknown: / codex_turn_failed: / codex_stream_incomplete:) fell through
+    // to the Claude branch. The Codex-side prefix check now catches every
+    // shape the provider/orchestrator actually emits.
+
+    test('routes "Codex query failed:" refresh-token race to Codex auth guidance', () => {
       const result = classifyAndFormatError(
         new Error(
           'Codex query failed: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.'
@@ -211,6 +228,70 @@ describe('classifyAndFormatError', () => {
       );
       expect(result).toContain('Codex authentication error');
       expect(result).toContain('codex login');
+      expect(result).not.toContain('Claude authentication');
+    });
+
+    test('routes "Codex auth error:" refresh-token race to Codex auth guidance (provider throw shape)', () => {
+      // The actual provider throw shape when AUTH_PATTERNS doesn't match
+      // (refresh-token messages don't match AUTH_PATTERNS, so this is the
+      // `Codex unknown:` path; using `Codex auth error:` here to also cover
+      // the case where a future AUTH_PATTERNS addition wraps it as auth).
+      const result = classifyAndFormatError(
+        new Error(
+          'Codex auth error: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.'
+        )
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+      expect(result).not.toContain('Claude authentication');
+    });
+
+    test('routes "Codex unknown:" refresh-token race to Codex auth guidance (provider throw shape)', () => {
+      // The actual provider throw shape when AUTH_PATTERNS doesn't match
+      // (none of "credit balance", "unauthorized", "authentication",
+      // "invalid token", "401", "403" appears in a refresh-token message),
+      // so classifyAndEnrichCodexError wraps it as `Codex unknown: <inner>`
+      // (provider.ts:854). This was the unreachable shape #2509 R1
+      // identified — it must now route to Codex auth guidance, not Claude.
+      const result = classifyAndFormatError(
+        new Error(
+          'Codex unknown: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.'
+        )
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+      expect(result).not.toContain('Claude authentication');
+    });
+
+    test('routes "codex_turn_failed:" synthetic shape to Codex auth guidance (orchestrator isError shape)', () => {
+      // The orchestrator's isError branch joins errorSubtype + errors[] into
+      // `codex_turn_failed: <inner>` (orchestrator-agent.ts:2522-2524). When
+      // the underlying provider turn.failed message is a refresh-token race,
+      // this is the shape the formatter sees.
+      const result = classifyAndFormatError(
+        new Error(
+          'codex_turn_failed: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.'
+        )
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+      expect(result).not.toContain('Claude authentication');
+    });
+
+    test('routes "codex_stream_incomplete:" synthetic shape to Codex auth guidance (orchestrator isError shape)', () => {
+      // The orchestrator's isError branch also emits `codex_stream_incomplete:
+      // <inner>` for the post-loop fail-stop path (orchestrator-agent.ts:
+      // 2756-2758). The provider's `streamCodexEvents` yields this chunk
+      // when the iterator closes without turn.completed / turn.failed (e.g.
+      // model rejected before the turn started).
+      const result = classifyAndFormatError(
+        new Error(
+          'codex_stream_incomplete: Your refresh token was already used. Please log out and sign in again.'
+        )
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+      expect(result).not.toContain('Claude authentication');
     });
 
     test('routes Codex-wrapped "refresh token" to Codex auth guidance', () => {
@@ -230,13 +311,24 @@ describe('classifyAndFormatError', () => {
     });
 
     test('routes Codex-wrapped "OAuth token has expired" to Codex auth guidance', () => {
-      // No "401" / "Unauthorized" present, so the existing Codex 401 branch
-      // cannot fire — the new OAuth-refresh branch must handle it instead.
+      // No "401" / "Unauthorized" present, so the auth-indicator half of
+      // the branch must still fire on the refresh-phrase half.
       const result = classifyAndFormatError(
         new Error('Codex query failed: OAuth token has expired')
       );
       expect(result).toContain('Codex authentication error');
       expect(result).toContain('codex login');
+    });
+
+    test('routes Codex-wrapped "sign-in has expired" to Codex auth guidance (#2509 R2 coverage)', () => {
+      // The "sign-in has expired" phrase is in the Codex-side branch's OR
+      // chain but had no Codex-wrapped test (#2509 R2). A future refactor
+      // that drops this phrase from the OR would otherwise let the next
+      // branch (Claude-OAuth) match and re-introduce #2509's misroute.
+      const result = classifyAndFormatError(new Error('Codex query failed: sign-in has expired'));
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+      expect(result).not.toContain('Claude authentication');
     });
   });
 
