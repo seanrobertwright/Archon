@@ -19,6 +19,7 @@ loadArchonEnv(process.cwd());
 import { parseArgs } from 'util';
 import { resolve } from 'path';
 import { existsSync, realpathSync } from 'fs';
+import { stat } from 'fs/promises';
 
 // Smart defaults for Claude auth
 // If no explicit tokens, default to global auth from `claude /login`
@@ -96,6 +97,15 @@ import {
 } from '@archon/paths';
 import * as git from '@archon/git';
 
+/** True when `path` exists and is a directory (used to validate `--workflow-source`). */
+async function isPathDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -156,6 +166,8 @@ Options:
   --branch, -b <name>        Create worktree for branch (or reuse existing)
   --from, --from-branch <name> Create new branch from specific start point
   --base <branch>            Per-dispatch base override for epic slices (worktree cut-from + PR target)
+  --workflow-source <path>   Read the workflow, its commands and scripts from this directory
+                             instead of --cwd (which stays the workspace the run acts on)
   --no-worktree              Run on branch directly without worktree isolation
   --folder                   Register the current non-git directory as a folder project and run in place
   --input <name>=<value>     Supply a declared workflow input; repeat per input (mutually exclusive with --resume)
@@ -289,6 +301,7 @@ async function main(): Promise<number> {
         from: { type: 'string' },
         'from-branch': { type: 'string' },
         base: { type: 'string' },
+        'workflow-source': { type: 'string' },
         'no-worktree': { type: 'boolean' },
         folder: { type: 'boolean' },
         container: { type: 'boolean' },
@@ -345,6 +358,7 @@ async function main(): Promise<number> {
   const fromBranch =
     (values.from as string | undefined) ?? (values['from-branch'] as string | undefined);
   const baseBranch = values.base as string | undefined;
+  const workflowSourceFlag = values['workflow-source'] as string | undefined;
   const noWorktree = values['no-worktree'] as boolean | undefined;
   const folderFlag = values.folder as boolean | undefined;
   const containerFlag = values.container as boolean | undefined;
@@ -592,10 +606,37 @@ async function main(): Promise<number> {
               );
               return 1;
             }
+            // `--workflow-source` picks the authoring directory. It is fresh-run only:
+            // a resume executes the source its run already captured, so accepting a
+            // different one here would promise a swap that cannot happen.
+            let workflowSource: string | undefined;
+            if (workflowSourceFlag !== undefined) {
+              if (resumeFlag) {
+                console.error(
+                  'Error: --workflow-source and --resume are mutually exclusive.\n' +
+                    '  A resumed run executes the source it captured when it started.\n' +
+                    '  Drop --workflow-source, or start a fresh run to pick up new source.'
+                );
+                return 1;
+              }
+              workflowSource = resolve(workflowSourceFlag);
+              if (!(await isPathDirectory(workflowSource))) {
+                console.error(
+                  `Error: --workflow-source is not a directory: ${workflowSource}\n` +
+                    '  Point it at the checkout holding .archon/workflows/.'
+                );
+                return 1;
+              }
+            }
             const options = {
               branchName,
               fromBranch,
               baseBranch,
+              // `--workflow-source` selects WHERE the workflow is read from; `--cwd`
+              // continues to select what it acts on. Reusing `discoveryCwd` keeps one
+              // internal concept: the directory discovery searches, which the run then
+              // freezes as its source.
+              discoveryCwd: workflowSource,
               noWorktree,
               folder: folderFlag,
               container: containerFlag,

@@ -138,7 +138,7 @@ commands:
 worktree:
   baseBranch: main  # Optional: auto-detected from git when not set
   copyFiles:  # Optional: Gitignored files/dirs to copy into new worktrees.
-              # `.archon/` is always copied automatically — don't list it.
+              # Nothing is copied unless you list it here.
     - .env
     - .vscode               # Copy entire directory
     - plans/                # Local plans not committed to the team repo
@@ -221,7 +221,23 @@ Set in `~/.archon/config.yaml` (global) or `.archon/config.yaml` (repo-specific)
 
 `git worktree add` only copies **tracked** files into a new worktree. Anything gitignored — secrets, local planning docs, agent reports, IDE settings, data fixtures — is absent by default. Archon's `worktree.copyFiles` closes that gap: after the worktree is created, each listed path is copied from the canonical repo into the worktree via raw filesystem copy (not git), so gitignored content comes along for the ride.
 
-**Defaults — no config needed for the common case.** `.archon/` is always copied automatically. If you gitignore `.archon/` (or it's just not committed), your custom commands, workflows, and scripts still reach every worktree. You do not need to list `.archon/` in `copyFiles` — it's merged in for you.
+**Nothing is copied unless you list it.** Archon used to copy `.archon/` into every worktree automatically, because that was the only way a workflow's own commands and scripts could be found from inside the worktree it was running against. Runs now carry their own source (see below), so the implicit copy is gone.
+
+If you relied on it — most often for a gitignored `.archon/config.yaml` holding local settings — add it explicitly:
+
+```yaml
+worktree:
+  copyFiles:
+    - .archon
+```
+
+You do **not** need this for workflows, commands, or scripts. Those are captured by the run itself, including uncommitted ones.
+
+**Workflow source no longer travels through the worktree.** When a run starts, Archon freezes the workflow's own `.archon/workflows`, `.archon/commands`, and `.archon/scripts` into that run's artifacts directory and resolves them from there for the run's whole life. Three consequences:
+
+- The worktree stays clean. Authoring files never appear in its `git status`, and repo validators no longer see packages that came from somewhere else.
+- Editing or deleting the authoring checkout mid-run does not change a run already in flight. A resumed run executes the source it started with; the next fresh run picks up your edits.
+- Uncommitted workflows work against any target, with no commit, push, or merge — see `--workflow-source` in the [CLI reference](/reference/cli/).
 
 **Common entries:**
 
@@ -244,7 +260,7 @@ worktree:
 - Per-entry failures are isolated — one bad entry won't abort the rest. Non-ENOENT failures (permissions, disk full) are surfaced as warnings on the environment.
 - Path-traversal attempts (entries resolving outside the repo root, or absolute paths on a different drive) are rejected — the entry is logged and skipped.
 
-**Interaction with `worktree.path`:** The copy step runs identically whether worktrees live under `~/.archon/workspaces/<owner>/<repo>/worktrees/` (default) or inside the repo at `<repoRoot>/<worktree.path>/` (repo-local). Both layouts get the same gitignored-file treatment.
+**Interaction with `worktree.path`:** The copy step runs identically (and is still a no-op with no `copyFiles`) whether worktrees live under `~/.archon/workspaces/<owner>/<repo>/worktrees/` (default) or inside the repo at `<repoRoot>/<worktree.path>/` (repo-local). Both layouts get the same gitignored-file treatment.
 
 **Defaults behavior:** The app's bundled default commands and workflows are loaded at runtime and merged with repo-specific ones. Repo commands/workflows override app defaults by name. Set `defaults.loadDefaultCommands: false` or `defaults.loadDefaultWorkflows: false` to disable runtime loading.
 

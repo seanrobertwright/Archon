@@ -202,9 +202,13 @@ export interface WorkflowRunOptions {
   resume?: boolean;
   codebaseId?: string; // Skips path-based codebase lookup when resume/approve/reject already resolved it
   /**
-   * Override the directory used for workflow YAML discovery.
+   * Override the directory used for workflow YAML discovery — and, for a fresh run,
+   * the source the run captures.
+   *
    * Pass `codebase.default_cwd` here so the source repo is searched even when
-   * `working_path` is a worktree or workspace clone that lacks the file.
+   * `working_path` is a worktree or workspace clone that lacks the file. The public
+   * `--workflow-source <path>` flag sets the same field, which is why one concept
+   * covers both the internal resume/approve lookups and the user-facing split.
    */
   discoveryCwd?: string;
   quiet?: boolean;
@@ -1237,6 +1241,13 @@ export async function workflowRunCommand(
     if (options.conversationId === undefined) {
       extraArgs.push('--conversation-id', childConversationId);
     }
+    // Re-pin the source as an ABSOLUTE path (parseArgs is last-wins, same as --cwd).
+    // The original argv may hold a relative `--workflow-source`, and the child is
+    // spawned with a different working directory, so passing it through unresolved
+    // would silently point the child at another directory — or at nothing.
+    if (options.discoveryCwd !== undefined) {
+      extraArgs.push('--workflow-source', options.discoveryCwd);
+    }
 
     const logPath = await spawnDetachedWorkflowRun(cwd, childConversationId, extraArgs);
 
@@ -2016,6 +2027,10 @@ export async function workflowRunCommand(
           resolveChildIsolation,
           // Fresh run only: a resume (`prepared`) replays the inputs already on its row.
           inputs: resolvedInputs,
+          // The directory the workflow was actually read from, which is NOT `workingCwd`
+          // once isolation has swapped in a worktree. A fresh run freezes this; a resume
+          // ignores it and uses the source already recorded on the run.
+          workflowSourceRoot: effectiveDiscoveryCwd,
         };
     result = await executeWorkflow(
       deps,

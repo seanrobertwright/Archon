@@ -277,8 +277,8 @@ mock.module('@archon/isolation', () => ({
   classifyIsolationError: (err: Error) => err.message,
 }));
 
-mock.module('../utils/worktree-sync', () => ({
-  syncArchonToWorktree: mock(() => Promise.resolve()),
+mock.module('../utils/workflow-source-root', () => ({
+  resolveWorkflowSourceRoot: mock(() => Promise.resolve(undefined)),
 }));
 
 mock.module('@archon/git', () => ({

@@ -28,7 +28,7 @@ import { safeDeactivateSession } from '../state/session-transitions';
 import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
 import { buildManageRunTool } from './manage-run-tool';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
-import { syncArchonToWorktree } from '../utils/worktree-sync';
+import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
   execFileAsync,
   findRepoRoot,
@@ -735,6 +735,16 @@ async function dispatchOrchestratorWorkflow(
   // executeWorkflow dispatch below (repo config worktree.baseBranch still wins).
   const codebaseBaseBranch = codebase.default_branch?.trim() || undefined;
 
+  // Where this run reads its workflow's own commands and scripts from. A conversation
+  // cwd is often a worktree, whose `.archon` belongs to whatever branch it is on rather
+  // than to the author. Resolving the canonical repo here means the run captures the
+  // authoring source and never needs anything copied into the worktree. Undefined for a
+  // non-worktree cwd, which reads the cwd exactly as before. Ignored on a resume — the
+  // run resolves the source it recorded when it started.
+  const workflowSourceRoot = await resolveWorkflowSourceRoot(
+    conversation.cwd ?? codebase.default_cwd
+  );
+
   // Per-child isolation resolver (#2121 slice 2, PR-A): a `workflow:` node with
   // `isolation: 'worktree'` gets its own worktree per child. Built for git-repo
   // codebases only — a folder project can't make worktrees, so the engine fails
@@ -1031,6 +1041,7 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
+          workflowSourceRoot,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
@@ -1062,6 +1073,7 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
+          workflowSourceRoot,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
@@ -1122,6 +1134,7 @@ async function dispatchOrchestratorWorkflow(
         parentConversationId: conversation.id,
         userId,
         source,
+        workflowSourceRoot,
         parseWarnings: options?.parseWarnings,
         baseBranch: codebaseBaseBranch,
         resolveChildIsolation,
@@ -1368,12 +1381,17 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
           }
         }
         const workflowCwd = conversation.cwd ?? codebase.default_cwd;
-        await syncArchonToWorktree(workflowCwd);
+        // Read workflows from the authoring repo rather than copying its `.archon` into
+        // this worktree first. Config still comes from `workflowCwd` — settings belong to
+        // the workspace being acted on.
+        const workflowSourceRoot = await resolveWorkflowSourceRoot(workflowCwd);
         // Load config once for this codebase path; reuse below to avoid a second disk read
         const loadedConfig = await loadConfig(workflowCwd);
         config = loadedConfig;
-        const repoResult = await discoverWorkflowsWithConfig(workflowCwd, () =>
-          Promise.resolve(loadedConfig)
+        const repoResult = await discoverWorkflowsWithConfig(
+          workflowCwd,
+          () => Promise.resolve(loadedConfig),
+          workflowSourceRoot
         );
         const workflowMap = new Map(workflows.map(w => [w.workflow.name, w]));
         for (const rw of repoResult.workflows) {
@@ -3061,18 +3079,13 @@ async function handleWorkflowRunCommand(
     // Auto-select the only project
     const codebase = codebases[0];
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
-    try {
-      await syncArchonToWorktree(workflowCwd);
-    } catch (error) {
-      getLog().debug(
-        { err: error as Error, workflowCwd },
-        'workflow_sync_before_validation_failed'
-      );
-    }
+    // Authoring root for discovery (the canonical repo when `workflowCwd` is a
+    // worktree). Never throws — an unresolvable root reads `workflowCwd`, as before.
+    const workflowSourceRoot = await resolveWorkflowSourceRoot(workflowCwd);
 
     let discovery;
     try {
-      discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
+      discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig, workflowSourceRoot);
     } catch (error) {
       const err = error as Error;
       getLog().error({ err, cwd: workflowCwd }, 'workflow_discovery_failed');

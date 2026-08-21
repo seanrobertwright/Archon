@@ -105,8 +105,8 @@ mock.module('../config/config-loader', () => ({
   loadRepoConfig: mock(() => Promise.resolve(null)),
 }));
 
-mock.module('../utils/worktree-sync', () => ({
-  syncArchonToWorktree: mock(() => Promise.resolve(false)),
+mock.module('../utils/workflow-source-root', () => ({
+  resolveWorkflowSourceRoot: mock(() => Promise.resolve(undefined)),
 }));
 
 mock.module('../services/cleanup-service', () => ({

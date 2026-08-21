@@ -11,6 +11,7 @@ import { isAbsolute, join as joinPath, resolve as resolvePath } from 'path';
 import { execFileAsync, resolveBashPath } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
+import { resolveChildDiscoveryRoot } from './workflow-source';
 import { resolveWorkflowName } from './router';
 import type {
   IWorkflowPlatform,
@@ -1569,7 +1570,9 @@ async function executeNodeInternal(
   resolvedEffort?: string,
   stepNamePrefix = '',
   iteration?: number,
-  checkpointSession?: SessionCheckpoint
+  checkpointSession?: SessionCheckpoint,
+  /** Root command files resolve under; see RunLayersContext. Undefined → `cwd`. */
+  workflowSourceRoot?: string
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1633,7 +1636,13 @@ async function executeNodeInternal(
   // Load prompt
   let rawPrompt: string;
   if (node.command !== undefined) {
-    const promptResult = await loadCommandPrompt(deps, cwd, node.command, configuredCommandFolder);
+    const promptResult = await loadCommandPrompt(
+      deps,
+      cwd,
+      node.command,
+      configuredCommandFolder,
+      workflowSourceRoot
+    );
     if (!promptResult.success) {
       const errMsg = promptResult.message;
       getLog().error({ nodeId: node.id, error: errMsg }, 'dag_node_command_load_failed');
@@ -3227,7 +3236,9 @@ async function executeScriptNode(
   // env (never spliced into source — #2115). '' for top-level scripts and non-first
   // iterations (mirrors executeBashNode, which delivers loop input via quoted splice).
   loopUserInput = '',
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  /** Root named scripts resolve under; see RunLayersContext. Undefined → `cwd`. */
+  workflowSourceRoot?: string
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3357,7 +3368,7 @@ async function executeScriptNode(
       // permissions)" branch — that branch is for execFileAsync EACCES.
       let scripts: Awaited<ReturnType<typeof discoverScriptsForCwd>>;
       try {
-        scripts = await discoverScriptsForCwd(cwd);
+        scripts = await discoverScriptsForCwd(cwd, workflowSourceRoot);
       } catch (discoveryErr) {
         const err = discoveryErr as Error;
         const errorMsg = `Script node '${node.id}': failed to discover scripts — ${err.message}`;
@@ -3759,7 +3770,9 @@ async function executeLoopGroupNode(
   issueContext?: string,
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
-  runChildWorkflow?: RunChildWorkflowFn
+  runChildWorkflow?: RunChildWorkflowFn,
+  /** Root body nodes read command files and named scripts from; see RunLayersContext. */
+  workflowSourceRoot?: string
 ): Promise<NodeExecutionResult> {
   const group = node.loop_group;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3918,6 +3931,9 @@ async function executeLoopGroupNode(
       runChildWorkflow,
       workflowRun,
       workflowName: node.id,
+      // A body node's commands and scripts come from the same frozen source as the
+      // enclosing run's — the group is part of one workflow, not a separate one.
+      workflowSourceRoot,
       config,
       workflowProvider,
       // Forward inherited workflow-level model/tier/options/profile so body AI nodes
@@ -4539,7 +4555,9 @@ async function executeLoopNode(
   resolvedModel?: string,
   resolvedTier?: TierName,
   resolvedEffort?: string,
-  checkpointSession?: SessionCheckpoint
+  checkpointSession?: SessionCheckpoint,
+  /** Root a `loop.command` file resolves under; see RunLayersContext. Undefined → `cwd`. */
+  workflowSourceRoot?: string
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -4745,7 +4763,8 @@ async function executeLoopNode(
         deps,
         cwd,
         loop.command,
-        configuredCommandFolder
+        configuredCommandFolder,
+        workflowSourceRoot
       );
       if (!promptResult.success) {
         getLog().error(
@@ -6008,7 +6027,9 @@ async function executeApprovalNode(
   workflowPreset?: ModelAliasPreset,
   stepNamePrefix = '',
   iteration?: number,
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  /** Forwarded to the synthetic `on_reject` node; see RunLayersContext. */
+  workflowSourceRoot?: string
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
   // Namespaced persisted step_name for loop_group bodies ('' → node.id at top level, #2090).
@@ -6141,7 +6162,9 @@ async function executeApprovalNode(
       resolvedTier,
       resolvedEffort,
       stepNamePrefix,
-      iteration
+      iteration,
+      undefined, // synthetic on_reject node never carries a session checkpoint
+      workflowSourceRoot
     );
 
     if (output.state === 'failed') {
@@ -6671,10 +6694,17 @@ function fanOutSharedCheckoutMessage(node: WorkflowNode, concurrency: number): s
 async function resolveFanOutChildDefinition(
   deps: WorkflowDeps,
   cwd: string,
-  targetName: string
+  targetName: string,
+  /** Parent run's AUTHORING directory; a fan-out target is a sibling workflow, so it
+   *  lives beside the parent there rather than in the target workspace. */
+  workflowSourceRoot?: string
 ): Promise<{ definition: WorkflowDefinition } | { unresolved: string }> {
   try {
-    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig);
+    const { workflows } = await discoverWorkflowsWithConfig(
+      cwd,
+      deps.loadConfig,
+      workflowSourceRoot
+    );
     const definition = resolveWorkflowName(
       targetName,
       workflows.map(w => w.workflow)
@@ -7083,7 +7113,15 @@ async function executeFanOutWorkflowNode(
   }, 0);
   const plannedConcurrency = Math.min(fanOut.max_parallel, pendingCount);
   if (node.isolation !== 'worktree' && plannedConcurrency > 1) {
-    const resolved = await resolveFanOutChildDefinition(deps, cwd, node.workflow);
+    // The fan-out target is a not-yet-started child, so it resolves from the parent's
+    // AUTHORING directory (live) rather than the parent's frozen copy — same rule as a
+    // 1:1 `workflow:` child. See resolveChildDiscoveryRoot.
+    const resolved = await resolveFanOutChildDefinition(
+      deps,
+      cwd,
+      node.workflow,
+      await resolveChildDiscoveryRoot(parentRun.metadata)
+    );
     if ('unresolved' in resolved) {
       // Fail CLOSED. Skipping the check here would let the path-lock cascade through
       // unguarded on the strength of a lookup that did not happen, and the spawn is about
@@ -7384,7 +7422,15 @@ interface RunLayersContext {
   deps: WorkflowDeps;
   platform: IWorkflowPlatform;
   conversationId: string;
+  /** The workspace nodes ACT on: provider turns, subprocesses, git, output files. */
   cwd: string;
+  /**
+   * The root nodes READ executable source from — command files and named scripts.
+   * Undefined means "same as `cwd`". These are different directories on every
+   * isolated run, and conflating them is what made a workflow's own commands
+   * invisible inside the worktree it was executing against.
+   */
+  workflowSourceRoot: string | undefined;
   /**
    * Injected closure that starts a child sub-run for a `workflow:` node (#2121
    * Phase 2). Undefined when the caller (e.g. a unit test) doesn't wire it — a
@@ -7869,7 +7915,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               resolvedLoopModel,
               resolvedLoopTier,
               resolvedLoopEffort,
-              checkpointSessionForProvider(loopProvider)
+              checkpointSessionForProvider(loopProvider),
+              ctx.workflowSourceRoot
             );
             // Loop nodes run every iteration on the same resolved provider, so the
             // result session (if any) is attributable to loopProvider — tag it so a
@@ -7925,7 +7972,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               issueContext,
               stepNamePrefix,
               execContext,
-              ctx.runChildWorkflow
+              ctx.runChildWorkflow,
+              ctx.workflowSourceRoot
             );
             return { nodeId: node.id, output };
           }
@@ -7955,7 +8003,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               workflowPreset,
               stepNamePrefix,
               iteration,
-              execContext
+              execContext,
+              ctx.workflowSourceRoot
             );
             return { nodeId: node.id, output };
           }
@@ -8020,7 +8069,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   stepNamePrefix,
                   iteration,
                   ctx.bodyLoopUserInput ?? '',
-                  execContext
+                  execContext,
+                  ctx.workflowSourceRoot
                 )
             );
             return { nodeId: node.id, output };
@@ -8241,7 +8291,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 resolvedEffort,
                 stepNamePrefix,
                 iteration,
-                checkpointSessionForProvider(provider)
+                checkpointSessionForProvider(provider),
+                ctx.workflowSourceRoot
               ),
             { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult
           );
@@ -9027,7 +9078,13 @@ export async function executeDagWorkflow(
   /** Cumulative usage restored from prior node_completed events on resume. */
   priorUsage?: PriorRunUsage,
   /** Private run-scoped handles restored before a cold resume transitions to running. */
-  priorNodeSessions?: readonly WorkflowRunNodeSession[]
+  priorNodeSessions?: readonly WorkflowRunNodeSession[],
+  /**
+   * Root this run's commands and scripts are read from, when that is not `cwd` — the
+   * run's frozen source capture. Undefined resolves them under `cwd`, which is both
+   * the in-place case and the pre-capture behavior.
+   */
+  workflowSourceRoot?: string
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
 
@@ -9219,6 +9276,7 @@ export async function executeDagWorkflow(
     runChildWorkflow,
     workflowRun,
     workflowName: workflow.name,
+    workflowSourceRoot,
     config,
     workflowProvider,
     workflowModel,

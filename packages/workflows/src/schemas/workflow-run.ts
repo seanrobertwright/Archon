@@ -213,6 +213,52 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
   };
 }
 
+/**
+ * Key under which a run records the executable SOURCE it was started from.
+ *
+ * A run reads its workflows, commands, and scripts from one directory and acts on
+ * another. Recording the first is what lets a resume reach the same source a month
+ * later, from a different process, after the authoring checkout has moved on. Absent
+ * on runs created before source capture existed, and on runs whose source could not
+ * be captured — both resolve live, which is exactly the pre-capture behavior.
+ */
+export const WORKFLOW_SOURCE_METADATA_KEY = 'workflow_source';
+
+/**
+ * A run's recorded executable source.
+ *
+ * `version` exists so a future capture layout can be recognized rather than
+ * misread. A reader that does not know a version treats the record as absent and
+ * falls back to live discovery with a warning — never as an error, because a paused
+ * run must stay resumable across an Archon upgrade.
+ */
+export const workflowSourceMetadataSchema = z.object({
+  version: z.literal(1),
+  /** Absolute path to the captured source; usable directly as a project root. */
+  root: z.string(),
+  /** The authoring directory it was captured from (provenance; never read for lookup). */
+  origin: z.string(),
+  captured_at: z.string(),
+  file_count: z.number(),
+  byte_count: z.number(),
+});
+
+export type WorkflowSourceMetadata = z.infer<typeof workflowSourceMetadataSchema>;
+
+/**
+ * Typed view of a run's recorded source, or `undefined` when it has none this reader
+ * understands. Validation is deliberately total: an unparseable record means "resolve
+ * live", not "fail the resume", so a shape change cannot strand paused work.
+ */
+export function readWorkflowSourceMetadata(
+  metadata: Record<string, unknown> | undefined
+): WorkflowSourceMetadata | undefined {
+  const raw = metadata?.[WORKFLOW_SOURCE_METADATA_KEY];
+  if (raw === undefined) return undefined;
+  const parsed = workflowSourceMetadataSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
+}
+
 /** Approval context stored in workflow run metadata when paused for human review. */
 export interface ApprovalContext {
   nodeId: string;

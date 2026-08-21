@@ -27,7 +27,16 @@ import {
   isRunBlockedOnChild,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
+  WORKFLOW_SOURCE_METADATA_KEY,
+  readWorkflowSourceMetadata,
 } from './schemas';
+import {
+  captureWorkflowSource,
+  getRunSourceCapturePath,
+  isCaptureUsable,
+  resolveRunSourceRoot,
+  resolveChildDiscoveryRoot,
+} from './workflow-source';
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
 import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
@@ -561,6 +570,19 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * Ignored on a resume: the row already carries the inputs validated at creation.
    */
   inputs?: Readonly<Record<string, string>>;
+  /**
+   * Directory the workflow, its commands, and its scripts were DISCOVERED from, when
+   * that is not `cwd`.
+   *
+   * The two diverge on every isolated run: the caller discovers from the authoring
+   * checkout and then executes against a fresh worktree. Passing the discovery root
+   * here is what lets the run freeze that source and keep resolving against it,
+   * instead of looking for the workflow's own files inside a workspace that never had
+   * them. Omitted means "same directory", which is correct for an in-place run.
+   *
+   * Ignored on a resume: the run resolves the source it recorded at start.
+   */
+  workflowSourceRoot?: string;
 };
 
 /**
@@ -701,6 +723,14 @@ async function runChildWorkflow(
     error,
   });
 
+  // Resolve the child against the parent's AUTHORING directory — live, not the parent's
+  // frozen copy of it. A sibling workflow lives next to the parent in that checkout,
+  // which the target workspace may never have contained; and reading it live is what
+  // lets an author fix a child workflow (removing a gate, say) and have a resumed parent
+  // pick the fix up. The child freezes its own source when its own run starts, which is
+  // also why this value is handed to it as `workflowSourceRoot`.
+  const parentSourceRoot = await resolveChildDiscoveryRoot(parentRun.metadata);
+
   // 1. Resolve the child workflow by NAME (static target — constitution guardrail).
   //    Resolution runs BEFORE the cycle check so a case-variant / suffix / substring
   //    reference to an ancestor (e.g. `workflow: SELFIE` naming its own run) is caught
@@ -715,7 +745,7 @@ async function runChildWorkflow(
     // table (reference/workflow-language-constitution.md) and locked by
     // `describe('workflow: late resolution is a deliberate affordance')` in
     // subrun.test.ts.
-    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig);
+    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, parentSourceRoot);
     childWorkflow = resolveWorkflowName(
       childWorkflowName,
       workflows.map(w => w.workflow)
@@ -857,13 +887,23 @@ async function runChildWorkflow(
     if (resumeFailedChild) {
       const hydrated = await hydrateResumableRun(deps, resumeFailedChild);
       if (hydrated) {
-        childOpts = { ...hydrated, codebaseId, resolveChildIsolation };
+        childOpts = {
+          ...hydrated,
+          codebaseId,
+          resolveChildIsolation,
+          workflowSourceRoot: parentSourceRoot,
+        };
         childRunId = hydrated.preCreatedRun.id;
       } else {
         // Failed child with no completed nodes — flip it back to running and re-run
         // from the top (nothing to skip).
         const preCreatedRun = await deps.store.resumeWorkflowRun(resumeFailedChild.id);
-        childOpts = { preCreatedRun, codebaseId, resolveChildIsolation };
+        childOpts = {
+          preCreatedRun,
+          codebaseId,
+          resolveChildIsolation,
+          workflowSourceRoot: parentSourceRoot,
+        };
         childRunId = preCreatedRun.id;
       }
     } else {
@@ -906,7 +946,12 @@ async function runChildWorkflow(
             : {}),
         },
       });
-      childOpts = { preCreatedRun: childRun, codebaseId, resolveChildIsolation };
+      childOpts = {
+        preCreatedRun: childRun,
+        codebaseId,
+        resolveChildIsolation,
+        workflowSourceRoot: parentSourceRoot,
+      };
       childRunId = childRun.id;
     }
   } catch (err) {
@@ -1058,7 +1103,15 @@ async function maybeResumeParentRun(
 
   let parentWorkflow: WorkflowDefinition | undefined;
   try {
-    const { workflows } = await discoverWorkflowsWithConfig(parentCwd, deps.loadConfig);
+    // Reload the parent's graph from the source IT started with. Rediscovering from
+    // `parentCwd` is how a mid-run authoring edit used to change an already-running
+    // parent's DAG, so stored node output could be reinterpreted by a different node.
+    const parentSourceRoot = await resolveRunSourceRoot(parent.metadata);
+    const { workflows } = await discoverWorkflowsWithConfig(
+      parentCwd,
+      deps.loadConfig,
+      parentSourceRoot
+    );
     parentWorkflow = resolveWorkflowName(
       parent.workflow_name,
       workflows.map(w => w.workflow)
@@ -1187,6 +1240,7 @@ export async function executeWorkflow(
     container: containerCtx,
     resolveChildIsolation,
     inputs: suppliedInputs,
+    workflowSourceRoot: discoveredSourceRoot,
   } = opts;
 
   if (preCreatedRun !== undefined) {
@@ -1684,6 +1738,99 @@ export async function executeWorkflow(
   }
   getLog().debug({ artifactsDir, logDir, stateDir, outputRoot }, 'workflow_paths_resolved');
 
+  // ── Executable source ──────────────────────────────────────────────────────
+  //
+  // Freeze the workflow's own commands and scripts into this run's artifacts, and
+  // resolve them from there for the rest of the run. Two things follow: the target
+  // workspace never receives authoring files (it used to get a whole `.archon` copy,
+  // `.env` and all), and the run stops changing shape when the authoring checkout is
+  // edited, moved, or deleted underneath it.
+  //
+  // Order matters. A run that already RECORDED a source uses it, always — that is what
+  // makes a resume deterministic. Only a run with no record captures, so a resume can
+  // never recapture and quietly pull in edits made since it paused.
+  const recordedSource = readWorkflowSourceMetadata(workflowRun.metadata);
+  const isResume = priorCompletedNodes !== undefined;
+  let workflowSourceRoot: string | undefined;
+
+  if (recordedSource) {
+    if (await isCaptureUsable(recordedSource.root)) {
+      workflowSourceRoot = recordedSource.root;
+      getLog().debug(
+        { workflowRunId: workflowRun.id, sourceRoot: workflowSourceRoot },
+        'workflow.source_restored'
+      );
+    } else {
+      // The capture is gone (artifact retention, a deleted run directory). Falling back
+      // to live source is better than failing every command lookup, but it is a real
+      // change in what this run executes, so it is never silent.
+      getLog().warn(
+        { workflowRunId: workflowRun.id, recordedRoot: recordedSource.root },
+        'workflow.source_capture_missing'
+      );
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `⚠️ This run's captured workflow source is no longer at \`${recordedSource.root}\`. ` +
+          'Continuing with the current source on disk, which may differ from what the run started with.'
+      );
+    }
+  } else if (isResume) {
+    // Started before source capture existed. Its original bytes were never recorded and
+    // cannot be reconstructed, so it resumes the way it always did — against live source.
+    getLog().warn({ workflowRunId: workflowRun.id }, 'workflow.source_legacy_live');
+  } else {
+    const captureFrom = discoveredSourceRoot ?? cwd;
+    try {
+      const capture = await captureWorkflowSource({
+        sourceRoot: captureFrom,
+        captureRoot: getRunSourceCapturePath(artifactsDir),
+        commandFolder: configuredCommandFolder,
+      });
+      if (capture) {
+        workflowSourceRoot = capture.captureRoot;
+        await deps.store
+          .updateWorkflowRun(workflowRun.id, {
+            metadata: {
+              [WORKFLOW_SOURCE_METADATA_KEY]: {
+                version: 1,
+                root: capture.captureRoot,
+                origin: capture.origin,
+                captured_at: new Date().toISOString(),
+                file_count: capture.fileCount,
+                byte_count: capture.byteCount,
+              },
+            },
+          })
+          .catch((err: Error) => {
+            // The capture is on disk and this run will use it; only a LATER resume
+            // loses the pointer and falls back to live source with the warning above.
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, captureRoot: capture.captureRoot },
+              'workflow.source_metadata_persist_failed'
+            );
+          });
+        getLog().info(
+          {
+            workflowRunId: workflowRun.id,
+            origin: capture.origin,
+            fileCount: capture.fileCount,
+            byteCount: capture.byteCount,
+          },
+          'workflow.source_captured'
+        );
+      }
+    } catch (error) {
+      // Capture is an optimization of WHERE source is read, not a precondition for
+      // running. A failure here degrades to live resolution — the pre-capture behavior —
+      // rather than failing a run that would otherwise work.
+      getLog().error(
+        { err: error as Error, sourceRoot: captureFrom, workflowRunId: workflowRun.id },
+        'workflow.source_capture_failed'
+      );
+    }
+  }
+
   // Per-user AI-provider credentials (Phase 2). Resolved AFTER artifactsDir is
   // created because file-based deliveries (Codex `CODEX_HOME/auth.json`) live
   // under it. Merged LAST into config.envVars so the originating user's keys
@@ -1956,7 +2103,8 @@ export async function executeWorkflow(
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
         runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
       dagPriorUsage,
-      priorNodeSessions
+      priorNodeSessions,
+      workflowSourceRoot
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

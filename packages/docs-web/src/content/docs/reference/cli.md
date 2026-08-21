@@ -213,6 +213,7 @@ Note that a real `run` emits a JSON payload **only** under `--detach`. Without i
 | Flag | Effect |
 |------|--------|
 | `--cwd <path>` | Target directory (required for most use cases) |
+| `--workflow-source <path>` | Read the workflow, its commands, and its scripts from this directory instead of `--cwd`. Lets an **uncommitted** workflow in one checkout run against a different checkout, repository, or folder project, with no commit, push, or merge. Fresh runs only -- rejected with `--resume`, because a resumed run executes the source it already captured. See [Running a workflow from another checkout](#running-a-workflow-from-another-checkout). |
 | `--branch <name>` | Explicit branch name for the worktree |
 | `--from <branch>`, `--from-branch <branch>` | Start-point for the new worktree only -- unlike `--base`, it does not change the PR target |
 | `--base <branch>` | Per-dispatch base override for a single run. Sets **both** the worktree cut-from **and** the PR target (`$BASE_BRANCH`), and outranks `worktree.baseBranch` in config plus the codebase default -- see [Base branch precedence](#base-branch-precedence) below. The branch **must already exist on the remote**; a missing one is a hard error, not a fallback. Combine with `--from` to drive the two separately. Rejected with `--no-worktree`, `--folder`, and workflows pinning `worktree.enabled: false`. |
@@ -230,6 +231,26 @@ Note that a real `run` emits a JSON payload **only** under `--detach`. Without i
 | `--default-stubs` | Fill reachable nodes omitted from `--stubs` with schema-valid placeholders. Explicit stubs still win; without this flag, missing reachable stubs remain an error. |
 | `--exec-code` | During `--dry-run`, execute trusted `bash:`/`script:` nodes locally instead of requiring stubs. Default is no code execution. |
 | `--pause-at-gates` | During `--dry-run`, stop at the first approval gate instead of auto-approving it. |
+
+#### Running a workflow from another checkout
+
+`--cwd` and `--workflow-source` answer two different questions: what the run acts on, and where the workflow itself is read from. They are the same directory unless you say otherwise.
+
+```bash
+# Author in ~/dev/archon (uncommitted), run against a clean checkout elsewhere
+archon workflow run implement \
+  --workflow-source ~/dev/archon \
+  --cwd ~/checkouts/archon-target \
+  "implement the plan"
+```
+
+Every run freezes its workflow source when it starts, whether or not you pass this flag. That freeze is what makes the rest predictable:
+
+- **The target stays clean.** Nothing from the source checkout is written into it, so its `git status` and its validators only ever see its own files.
+- **A run does not change shape while it is running.** Edit, move, or delete the source checkout after a run starts and a resume still executes what the run began with. Start a new run to pick up the edits.
+- **Resume needs no source path.** `archon workflow resume <run-id>`, `approve`, and `reject` all load the run's own captured source, which is why `--workflow-source` is refused alongside `--resume`.
+
+The captured source lives under that run's artifacts (`~/.archon/workspaces/<project>/artifacts/runs/<run-id>/workflow-source/`) and is removed with the rest of the run's artifacts. If it is ever missing when a run resumes, Archon says so and continues against the current source on disk rather than failing the run.
 
 #### Deterministic dry-run
 

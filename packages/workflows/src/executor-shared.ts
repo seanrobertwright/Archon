@@ -265,18 +265,29 @@ export function detectCreditExhaustion(text: string): string | null {
 /**
  * Load command prompt from file.
  *
+ * Two directories are in play and they are not interchangeable. `cwd` is the workspace
+ * the run acts on: it owns config, and it is where a `commands.folder` setting is read
+ * from. `sourceRoot` is where the command TEXT lives — the authoring checkout, or a
+ * run's frozen capture of it. They are the same directory for an ordinary in-place run
+ * and differ whenever a workflow authored in one checkout executes against another.
+ * Passing `cwd` for both is what made a workflow's own commands invisible inside its
+ * isolated worktree.
+ *
  * @param deps - Workflow dependencies (for config loading)
- * @param cwd - Working directory (repo root)
+ * @param cwd - Target workspace; owns config only
  * @param commandName - Name of the command (without .md extension)
  * @param configuredFolder - Optional additional folder from config to search
+ * @param sourceRoot - Root to resolve command files under; defaults to `cwd`
  * @returns On success: `{ success: true, content }`. On failure: `{ success: false, reason, message }`.
  */
 export async function loadCommandPrompt(
   deps: Pick<WorkflowDeps, 'loadConfig'>,
   cwd: string,
   commandName: string,
-  configuredFolder?: string
+  configuredFolder?: string,
+  sourceRoot?: string
 ): Promise<LoadCommandResult> {
+  const commandSourceRoot = sourceRoot ?? cwd;
   // Validate command name first
   if (!isValidCommandName(commandName)) {
     getLog().error({ commandName }, 'invalid_command_name');
@@ -336,7 +347,7 @@ export async function loadCommandPrompt(
 
     let workflowsRoot: string;
     if (packaged.owner.source === 'project') {
-      workflowsRoot = join(cwd, '.archon', 'workflows');
+      workflowsRoot = join(commandSourceRoot, '.archon', 'workflows');
     } else if (packaged.owner.source === 'global') {
       workflowsRoot = archonPaths.getHomeWorkflowsPath();
     } else {
@@ -386,7 +397,7 @@ export async function loadCommandPrompt(
   // precedence: repo > home (~/.archon/commands/) > bundled/app defaults.
   const searchPaths = archonPaths.getCommandFolderSearchPaths(configuredFolder);
   const resolvedSearchPaths: string[] = [
-    ...searchPaths.map(folder => join(cwd, folder)),
+    ...searchPaths.map(folder => join(commandSourceRoot, folder)),
     archonPaths.getHomeCommandsPath(),
   ];
 

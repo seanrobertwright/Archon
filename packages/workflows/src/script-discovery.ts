@@ -262,6 +262,9 @@ async function discoverBundledPackagedScripts(): Promise<Map<string, ScriptDefin
 /**
  * Discover scripts across all scopes for a given repo cwd.
  *
+ * `sourceRoot` overrides where PROJECT-scope scripts are read from; home and bundled
+ * scopes are unaffected because they resolve identically from any working directory.
+ *
  * Shared bare-name scripts use repo-over-home precedence. Packaged scripts
  * are owner-qualified and merge without participating in that override rule.
  * Sources are bundled packages, home shared/package scripts, then repo
@@ -270,13 +273,21 @@ async function discoverBundledPackagedScripts(): Promise<Map<string, ScriptDefin
  * Within a single shared scope, duplicate basenames across extensions still
  * throw (matches `discoverScripts` behavior).
  */
-export async function discoverScriptsForCwd(cwd: string): Promise<Map<string, ScriptDefinition>> {
+export async function discoverScriptsForCwd(
+  cwd: string,
+  sourceRoot?: string
+): Promise<Map<string, ScriptDefinition>> {
+  // Scripts are executable SOURCE, so they resolve under the root the workflow was
+  // read from, not the workspace it acts on. The two differ whenever a workflow runs
+  // against an isolated or foreign checkout; they are the same for an in-place run,
+  // which is why omitting `sourceRoot` keeps the original behavior exactly.
+  const scriptSourceRoot = sourceRoot ?? cwd;
   const bundledPackagedScripts = await discoverBundledPackagedScripts();
   const homeScripts = await discoverScripts(getHomeScriptsPath());
   const homePackagedScripts = await discoverPackagedScripts(getHomeWorkflowsPath(), 'global');
-  const repoScripts = await discoverScripts(join(cwd, '.archon', 'scripts'));
+  const repoScripts = await discoverScripts(join(scriptSourceRoot, '.archon', 'scripts'));
   const repoPackagedScripts = await discoverPackagedScripts(
-    join(cwd, '.archon', 'workflows'),
+    join(scriptSourceRoot, '.archon', 'workflows'),
     'project'
   );
 

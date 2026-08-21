@@ -140,6 +140,9 @@ export {
   isRunBlockedOnChild,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
+  WORKFLOW_SOURCE_METADATA_KEY,
+  workflowSourceMetadataSchema,
+  readWorkflowSourceMetadata,
 } from './workflow-run';
 export type {
   WorkflowRunStatus,
@@ -151,6 +154,7 @@ export type {
   ArtifactType,
   ApprovalContext,
   LoopGateRunMetadata,
+  WorkflowSourceMetadata,
 } from './workflow-run';
 
 // Per-node persisted provider sessions

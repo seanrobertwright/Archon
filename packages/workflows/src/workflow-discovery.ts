@@ -560,8 +560,22 @@ async function resolveIncludeBlockCommandContents(
  */
 export async function discoverWorkflows(
   cwd: string | null,
-  options?: { loadDefaults?: boolean; commandFolder?: string; loadDefaultCommands?: boolean }
+  options?: {
+    loadDefaults?: boolean;
+    commandFolder?: string;
+    loadDefaultCommands?: boolean;
+    /**
+     * Root to read PROJECT-scope workflows, commands, and scripts from, when that is
+     * not the working directory. Set by an executing run to its frozen source capture
+     * so the graph a resume reloads is the one the run started with. Defaults to
+     * `cwd`, which is correct for every listing and in-place caller.
+     */
+    sourceRoot?: string;
+  }
 ): Promise<WorkflowLoadResult> {
+  // Project-scope source root. Null only when there is no project context at all, in
+  // which case no project-scope read happens.
+  const projectRoot = cwd === null ? null : (options?.sourceRoot ?? cwd);
   // Map of filename -> workflow + source + parse warnings, for deduplication.
   // A later scope's `set()` replaces all three together, so a clean project file
   // can never inherit the bundled file's warnings (see ParsedWorkflowFile).
@@ -620,7 +634,7 @@ export async function discoverWorkflows(
     }
     // Pre-resolve command-file contents for include-target command nodes so the expander
     // can catch a block command file that references a sibling id namespacing renames.
-    const commandContents = await resolveIncludeBlockCommandContents(cwd, rawByName, {
+    const commandContents = await resolveIncludeBlockCommandContents(projectRoot, rawByName, {
       commandFolder: options?.commandFolder,
       loadDefaultCommands: options?.loadDefaultCommands,
     });
@@ -747,7 +761,7 @@ export async function discoverWorkflows(
   }
 
   const [workflowFolder] = archonPaths.getWorkflowFolderSearchPaths();
-  const workflowPath = join(cwd, workflowFolder);
+  const workflowPath = join(projectRoot ?? cwd, workflowFolder);
 
   getLog().debug({ workflowPath }, 'searching_repo_workflows');
 
@@ -783,7 +797,7 @@ export async function discoverWorkflows(
     allErrors.push(...repoResult.errors);
 
     // Warn about deprecated non-prefixed defaults in repo's defaults folder
-    const repoDefaultsPath = join(cwd, workflowFolder, 'defaults');
+    const repoDefaultsPath = join(projectRoot ?? cwd, workflowFolder, 'defaults');
     try {
       await access(repoDefaultsPath);
       const defaultEntries = await readdir(repoDefaultsPath);
@@ -837,7 +851,14 @@ export async function discoverWorkflowsWithConfig(
   loadConfig: (cwd: string) => Promise<{
     defaults?: { loadDefaultWorkflows?: boolean; loadDefaultCommands?: boolean };
     commands?: { folder?: string };
-  }>
+  }>,
+  /**
+   * Where PROJECT-scope source is read from, when that is not `cwd`. An executing run
+   * passes its frozen source capture; every listing caller omits it and keeps reading
+   * the working directory. Config is always read from `cwd` regardless — settings
+   * belong to the workspace being acted on, not to the source being executed.
+   */
+  sourceRoot?: string
 ): Promise<WorkflowLoadResult> {
   let loadDefaults = true;
   // Command-scan parity: pass the repo's configured command folder + loadDefaultCommands
@@ -858,5 +879,5 @@ export async function discoverWorkflowsWithConfig(
       );
     }
   }
-  return discoverWorkflows(cwd, { loadDefaults, commandFolder, loadDefaultCommands });
+  return discoverWorkflows(cwd, { loadDefaults, commandFolder, loadDefaultCommands, sourceRoot });
 }
