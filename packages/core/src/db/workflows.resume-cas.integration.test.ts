@@ -11,6 +11,7 @@
  * ./connection with a real adapter, conflicting with workflows.test.ts's fake.
  */
 import { describe, test, expect, mock } from 'bun:test';
+import type { TokenUsage } from '@archon/providers/types';
 
 mock.module('@archon/paths', () => ({
   createLogger: () => ({
@@ -220,11 +221,11 @@ describe('claimWriteback — real SQLite CAS', () => {
 // ---------------------------------------------------------------------------
 // Gate approve/reject staging (#2075) — the run stays 'paused' after a gate
 // resolution instead of masquerading as 'failed'. This exercises the REAL
-// SQLite json_patch path end-to-end: staging write, resumable pickup (both the
+// SQLite JSON write path end-to-end: staging write, resumable pickup (both the
 // parent-conversation query the orchestrator uses and the working-path query
 // the CLI uses), the resume CAS, the double-resolution guard, and — critically
-// — that a fresh pause clears the previous gate's `resolved` marker despite
-// json_patch's deep-merge semantics.
+// — that a fresh pause carries nothing from the previous gate, which only a
+// real engine can prove (the mock suite runs the Postgres dialect).
 // ---------------------------------------------------------------------------
 
 /**
@@ -292,12 +293,12 @@ describe('gate approve staging — real SQLite end-to-end (#2075)', () => {
     await expect(resumeWorkflowRun('gate-1')).rejects.toThrow(WorkflowNotResumableError);
   });
 
-  test('a fresh pause clears the previous resolution despite json_patch deep-merge', async () => {
+  test('a fresh pause replaces the previous gate context, clearing its resolution', async () => {
     // Continue the run from the previous test: it is 'running' with
     // approval.resolved = 'approved' still in metadata (never cleared on
-    // resume by design). The next gate's pause MUST reset it — on SQLite
-    // json_patch deep-merges the new approval context into the old one, so an
-    // omitted key would leak the stale 'approved' and falsely block this gate.
+    // resume by design). The next gate's pause MUST reset it — the write
+    // replaces the whole approval object, so a key this gate does not set
+    // cannot carry the stale 'approved' over and falsely block it.
     await pauseWorkflowRun('gate-1', {
       nodeId: 'second-gate',
       message: 'Approve step 2?',
@@ -308,7 +309,6 @@ describe('gate approve staging — real SQLite end-to-end (#2075)', () => {
     expect(repaused?.status).toBe('paused');
     const approval = repaused?.metadata.approval as Record<string, unknown>;
     expect(approval.nodeId).toBe('second-gate');
-    // json_patch removes keys patched with null — 'resolved' must be gone/null.
     expect(approval.resolved ?? null).toBeNull();
 
     // And the second gate is approvable again.
@@ -316,6 +316,140 @@ describe('gate approve staging — real SQLite end-to-end (#2075)', () => {
     const staged = await getWorkflowRun('gate-1');
     expect((staged?.metadata.approval as Record<string, unknown>).resolved).toBe('approved');
     expect(staged?.status).toBe('paused');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2673 — a later gate must not inherit an earlier gate's approval data. The
+// numeric half is the dangerous one: SQLite's json_patch is RFC 7396 and
+// recurses, so before the wholesale-replace write, interior keys of the nested
+// `signaledTokens` object survived from the previous gate and became real token
+// accounting on resume (readSignaledTokens in dag-executor). Only a real engine
+// can catch this; the mock suite runs the Postgres dialect, where `||` already
+// replaced the object.
+// ---------------------------------------------------------------------------
+describe('fresh gate usage is its own — real SQLite end-to-end (#2673)', () => {
+  /** Pause `runId` on a gate carrying `signaledTokens` and read the stored object back. */
+  async function pauseWithTokens(
+    runId: string,
+    nodeId: string,
+    signaledTokens: TokenUsage
+  ): Promise<Record<string, unknown> | undefined> {
+    await pauseWorkflowRun(runId, {
+      nodeId,
+      message: `gate ${nodeId}`,
+      type: 'interactive_loop',
+      iteration: 1,
+      signaledTokens,
+    });
+    const run = await getWorkflowRun(runId);
+    const approval = run?.metadata.approval as Record<string, unknown> | undefined;
+    return approval?.signaledTokens as Record<string, unknown> | undefined;
+  }
+
+  test('a second gate whose usage omits the cache axes does not inherit them', async () => {
+    await seedPausedRun('usage-cache', 'wf-usage-cache', { nodeId: 'seed', message: 'seed' });
+
+    // Gate 1: a provider that reports cache telemetry.
+    await resumeWorkflowRun('usage-cache');
+    const first = await pauseWithTokens('usage-cache', 'gate-1', {
+      input: 40,
+      output: 4,
+      cacheRead: 20,
+      cacheWrite: 3,
+    });
+    expect(first).toEqual({ input: 40, output: 4, cacheRead: 20, cacheWrite: 3 });
+
+    // Gate 2: a provider with no cache telemetry at all.
+    await resumeWorkflowRun('usage-cache');
+    const second = await pauseWithTokens('usage-cache', 'gate-2', { input: 90, output: 9 });
+
+    // Exactly the second gate's usage — no fabricated cache counts.
+    expect(second).toEqual({ input: 90, output: 9 });
+  });
+
+  test("a second gate's exact total is not flagged as a floor by the first gate", async () => {
+    await seedPausedRun('usage-partial', 'wf-usage-partial', { nodeId: 'seed', message: 'seed' });
+
+    // Gate 1 paused on a FLOOR (#2671): its cache totals are known-incomplete.
+    await resumeWorkflowRun('usage-partial');
+    await pauseWithTokens('usage-partial', 'gate-1', {
+      input: 10,
+      output: 1,
+      cacheRead: 50,
+      cacheWrite: 2,
+      cachePartial: true,
+    });
+
+    // Gate 2 knows its complete usage, so it declares no cachePartial.
+    await resumeWorkflowRun('usage-partial');
+    const second = await pauseWithTokens('usage-partial', 'gate-2', {
+      input: 90,
+      output: 9,
+      cacheRead: 5,
+      cacheWrite: 1,
+    });
+
+    expect(second).toEqual({ input: 90, output: 9, cacheRead: 5, cacheWrite: 1 });
+    expect(second?.cachePartial).toBeUndefined();
+  });
+
+  test('a gate that sets no optional fields stores none of them', async () => {
+    await seedPausedRun('usage-reset', 'wf-usage-reset', { nodeId: 'seed', message: 'seed' });
+
+    // A loop gate with the full optional payload.
+    await resumeWorkflowRun('usage-reset');
+    await pauseWorkflowRun('usage-reset', {
+      nodeId: 'loop-gate',
+      message: 'Review?',
+      type: 'interactive_loop',
+      iteration: 2,
+      sessionId: 'sess-1',
+      sessionProvider: 'claude',
+      completionSignaled: true,
+      signaledOutput: 'REPORT',
+      signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 3 },
+      signaledCostUsd: 0.02,
+      commandSnapshot: 'loop body',
+      onRejectPrompt: 'Fix: $REJECTION_REASON',
+      childRunId: 'child-1',
+    });
+
+    // A plain approval gate that declares none of them.
+    await resumeWorkflowRun('usage-reset');
+    await pauseWorkflowRun('usage-reset', {
+      nodeId: 'plain-gate',
+      message: 'Approve?',
+      type: 'approval',
+    });
+
+    const run = await getWorkflowRun('usage-reset');
+    expect(run?.metadata.approval).toEqual({
+      nodeId: 'plain-gate',
+      message: 'Approve?',
+      type: 'approval',
+    });
+  });
+
+  test('run-level metadata outside the approval object still merges', async () => {
+    await seedPausedRun(
+      'usage-extra',
+      'wf-usage-extra',
+      { nodeId: 'seed', message: 'seed' },
+      { rejection_count: 2 }
+    );
+
+    await resumeWorkflowRun('usage-extra');
+    await pauseWorkflowRun(
+      'usage-extra',
+      { nodeId: 'writeback', message: 'Apply changes?', type: 'writeback' },
+      { pending_writeback: true }
+    );
+
+    const run = await getWorkflowRun('usage-extra');
+    expect(run?.metadata.pending_writeback).toBe(true);
+    // Pre-existing top-level key untouched by the approval replace.
+    expect(run?.metadata.rejection_count).toBe(2);
   });
 });
 

@@ -21347,10 +21347,9 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
 
   it('interactive loop_group gate with no live cursor pauses with EXPLICIT null session fields', async () => {
     // Body tail is a PARALLEL layer (two sibling nodes, nothing downstream), which
-    // resets the sequential cursor before the gate. The pause payload must write
-    // sessionId/sessionProvider as explicit nulls — key omission would let SQLite's
-    // json_patch deep-merge keep a stale pair from a previous pause of this run
-    // (same convention as ApprovalContext.resolved).
+    // resets the sequential cursor before the gate. The pause payload must state
+    // sessionId/sessionProvider as explicit nulls rather than omitting them, so the
+    // resume path reads "this gate had no cursor" instead of "the gate said nothing".
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'checked, not done yet' };
       yield { type: 'result', sessionId: 'parallel-tail-sess' };

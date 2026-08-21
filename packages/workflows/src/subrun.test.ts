@@ -200,9 +200,11 @@ class InMemoryStore implements IWorkflowStore {
     const r = this.runs.get(id);
     if (r) {
       r.status = 'paused';
+      // Mirrors the real store: `approval` is REPLACED wholesale (so nothing from a
+      // prior gate survives) while run-level metadata merges at the top level.
       r.metadata = {
         ...r.metadata,
-        approval: { ...approvalContext, resolved: null },
+        approval: { ...approvalContext },
         ...(extraMetadata ?? {}),
       };
     }
