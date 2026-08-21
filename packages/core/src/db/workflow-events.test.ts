@@ -2,6 +2,11 @@ import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
+import {
+  AXIS_SPECIMEN,
+  RESUME_SNAPSHOT_AXIS_KEYS,
+  expectSeamCarriesAxes,
+} from '../test/token-usage-axes';
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = createMockLogger();
@@ -705,5 +710,43 @@ describe('workflow-events', () => {
 
       await expect(getDagResumeSnapshot('run-error')).rejects.toThrow('connection refused');
     });
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// TokenUsage axis seam guard (#2674) — the reader half
+//
+// `getDagResumeSnapshot` rebuilds a persisted `data.tokens` field by field, so
+// an axis it does not know about is dropped from every resumed run's total.
+// Its writer lives in @archon/workflows, which cannot be imported from here;
+// that half is guarded in that package's dag-executor tests, under the same
+// block name.
+//
+// The type-level anchors are in `src/test/token-usage-axes.ts`, NOT in this
+// file: `packages/core/tsconfig.json` excludes `**/*.test.ts` from type-check,
+// so an anchor placed here would never fail. That module explains the rest.
+// ───────────────────────────────────────────────────────────────────────────
+describe('TokenUsage axis seam guard', () => {
+  test('getDagResumeSnapshot carries every axis it claims', async () => {
+    // A single contributing row keeps the fold an identity, so each carried axis
+    // must come back at exactly the value the event stored.
+    mockQuery.mockResolvedValueOnce(
+      createQueryResult([
+        {
+          step_name: 'node-a',
+          event_type: 'node_completed',
+          data: { tokens: AXIS_SPECIMEN },
+        },
+      ])
+    );
+
+    const { tokens } = await getDagResumeSnapshot('run-axis-seam');
+
+    expectSeamCarriesAxes(
+      expect,
+      'getDagResumeSnapshot',
+      RESUME_SNAPSHOT_AXIS_KEYS,
+      tokens as unknown as Record<string, unknown> | undefined
+    );
   });
 });

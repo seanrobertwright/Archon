@@ -59,6 +59,7 @@ import {
   getProviderCapabilities,
 } from '@archon/providers';
 import type { SendQueryOptions } from '@archon/providers';
+import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
 clearRegistry();
 registerBuiltinProviders();
 // Pi is a community provider (best-effort structured output) — register it so the
@@ -23952,5 +23953,366 @@ describe('childOutcomeFromRun cache reporting', () => {
     // toEqual alone would still pass on `cachePartial: undefined`; the key must be absent,
     // because absence is what every reader treats as "this total is exact".
     expect(outcome.tokens).not.toHaveProperty('cachePartial');
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// TokenUsage axis seam guard (#2674)
+//
+// `TokenUsage` crosses boundaries where its fields are re-listed by hand on
+// both sides, with nothing tying writer to reader. #2662 added one optional
+// field, `cachePartial`, and three carrying sites dropped it while the full
+// suite stayed green.
+//
+// The guard is two TYPE-level anchors plus runtime proof of what they claim:
+//
+//   1. `Required<TokenUsage>` — adding an axis makes AXIS_SPECIMEN a compile
+//      error, so `bun run type-check` fails before a single test runs.
+//   2. `Record<keyof TokenUsage, string | null>` — each seam's key map is
+//      exhaustive, so a new axis must be dispositioned per seam: a key it is
+//      carried under, or `null` for "this seam deliberately does not carry it".
+//   3. Every non-null entry is then driven through the REAL production path,
+//      because a declared key spelling is only a claim until a run proves it.
+//
+// One seam is missing from this block: `getDagResumeSnapshot` is in
+// @archon/core, which this package cannot import. It is guarded there, under
+// the same block name — but with its anchors in `src/test/token-usage-axes.ts`
+// rather than the test file, because core's tsconfig excludes `**/*.test.ts`
+// from type-check. Anchors here can sit inline; this package type-checks tests.
+//
+// What this guard does NOT do: make a new *site* loud. No type can require an
+// author to register the hand-mapped seam they just wrote. The maps below are
+// the discoverable inventory a reviewer checks a new site against.
+// ───────────────────────────────────────────────────────────────────────────
+describe('TokenUsage axis seam guard', () => {
+  /**
+   * One value per axis, all distinct so a swapped key spelling fails instead of
+   * passing on a coincidence.
+   *
+   * `Required<TokenUsage>` is the anchor. Adding `foo?: number` to TokenUsage
+   * fails here with `TS2741: Property 'foo' is missing in type ... but required
+   * in type 'Required<TokenUsage>'`.
+   *
+   * A provider never sets `cachePartial` — it is aggregation-only (see the field
+   * docs in @archon/providers types). The specimen sets it anyway because this
+   * guard tests CARRIAGE, not the fold rule that normally produces the flag;
+   * `mergeTokenUsage` propagates an incoming `cachePartial`, so a one-node run
+   * is enough to observe the axis at every seam.
+   */
+  const AXIS_SPECIMEN: Required<TokenUsage> = {
+    input: 5000,
+    output: 1200,
+    cacheRead: 4000,
+    cacheWrite: 250,
+    cachePartial: true,
+    total: 6400,
+    cost: 0.25,
+  };
+
+  /**
+   * How one seam spells each axis on its wire. `null` = this seam deliberately
+   * does not carry the axis. Exhaustive over `keyof TokenUsage`, so a new axis
+   * is a compile error at every seam until someone decides which it is.
+   */
+  type SeamAxisKeys = Record<keyof TokenUsage, string | null>;
+
+  /**
+   * Seams that carry the `TokenUsage` object whole, so the axis names ARE the
+   * wire keys. They share one map because they share one decision: a new axis
+   * either rides the object or does not. Each still gets its own assertion —
+   * "carries it whole" is a claim about today's code, not a guarantee.
+   *
+   * `total` and `cost` cross NO seam below, and both `null`s are load-bearing:
+   *  - `cost` is lifted off the usage object at the PROVIDER boundary, onto the
+   *    result message's own `cost` field (Pi's event bridge does exactly that).
+   *    Every seam below carries that scalar — `total_cost_usd`, `cost_usd`,
+   *    `costUsd`, `signaledCostUsd` — and none reads `TokenUsage.cost`.
+   *  - `total` is set by Pi's event bridge and dropped by the first fold:
+   *    `mergeTokenUsage` documents that it does not aggregate it. So a Pi node's
+   *    reasoning-inclusive total reaches no seam. Recorded here, not fixed here.
+   */
+  const WHOLE_OBJECT_AXIS_KEYS: SeamAxisKeys = {
+    input: 'input',
+    output: 'output',
+    cacheRead: 'cacheRead',
+    cacheWrite: 'cacheWrite',
+    cachePartial: 'cachePartial',
+    total: null,
+    cost: null,
+  };
+
+  /** Run metadata written by persistRunUsage and read back by childOutcomeFromRun. */
+  const RUN_METADATA_AXIS_KEYS: SeamAxisKeys = {
+    input: 'total_tokens_in',
+    output: 'total_tokens_out',
+    cacheRead: 'total_cache_read_tokens',
+    cacheWrite: 'total_cache_write_tokens',
+    cachePartial: 'total_cache_partial',
+    total: null,
+    cost: null,
+  };
+
+  /** Terminal telemetry props — a third spelling, remapped again inside @archon/paths. */
+  const TELEMETRY_AXIS_KEYS: SeamAxisKeys = {
+    input: 'tokensIn',
+    output: 'tokensOut',
+    cacheRead: 'cacheReadTokens',
+    cacheWrite: 'cacheWriteTokens',
+    cachePartial: 'cachePartialTokens',
+    total: null,
+    cost: null,
+  };
+
+  /**
+   * Assert that every axis `keys` declares carried arrived under its declared key
+   * with the specimen's value.
+   *
+   * Seam and axis are folded into the compared object's KEY, not into a sibling
+   * field: bun's diff prints only a narrow window around the changed line, so a
+   * sibling `axis` field is elided from the failure and the report names the seam
+   * without saying which axis went missing.
+   */
+  function expectSeamCarriesAxes(
+    seam: string,
+    keys: SeamAxisKeys,
+    carried: Record<string, unknown> | undefined
+  ): void {
+    expect({ [`${seam} carried usage`]: carried !== undefined }).toEqual({
+      [`${seam} carried usage`]: true,
+    });
+    for (const [axis, key] of Object.entries(keys) as [keyof TokenUsage, string | null][]) {
+      if (key === null) continue;
+      const label = `${seam} → ${axis} (as '${key}')`;
+      expect({ [label]: carried?.[key] }).toEqual({ [label]: AXIS_SPECIMEN[axis] });
+    }
+  }
+
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-axis-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockCaptureWorkflowCompleted.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  /**
+   * One AI node whose provider reports the specimen. Four seams read off this
+   * single run: the node event, the run metadata, the telemetry props, and the
+   * JSONL transcript row.
+   */
+  async function runSpecimenDag(): Promise<{
+    store: MockWorkflowStore;
+    runId: string;
+    logDir: string;
+  }> {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'axis-sid', tokens: AXIS_SPECIMEN };
+    });
+    const store = createMockStore();
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('axis-seam-run');
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      { name: 'axis-seam', nodes: [{ id: 'step', prompt: 'Do thing.' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    return { store, runId: workflowRun.id, logDir };
+  }
+
+  function nodeCompletedTokens(store: MockWorkflowStore, stepName: string): unknown {
+    const completed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+      (call: unknown[]) => {
+        const event = call[0] as { event_type: string; step_name?: string };
+        return event.event_type === 'node_completed' && event.step_name === stepName;
+      }
+    );
+    expect(completed.length).toBe(1);
+    return (
+      (completed[0][0] as { data: Record<string, unknown> }).data as {
+        tokens?: Record<string, unknown>;
+      }
+    ).tokens;
+  }
+
+  it('aggregation fold (mergeTokenUsage) carries every axis it claims', () => {
+    // The chokepoint: every other seam's value passes through this fold first.
+    // It rebuilds `{input, output}` rather than spreading, which is why a new
+    // axis needs a deliberate merge rule here before any seam can carry it.
+    expectSeamCarriesAxes(
+      'mergeTokenUsage',
+      WHOLE_OBJECT_AXIS_KEYS,
+      mergeTokenUsage([AXIS_SPECIMEN]) as unknown as Record<string, unknown>
+    );
+  });
+
+  it('node_completed event carries every axis it claims', async () => {
+    const { store } = await runSpecimenDag();
+    expectSeamCarriesAxes(
+      'node_completed.data.tokens',
+      WHOLE_OBJECT_AXIS_KEYS,
+      nodeCompletedTokens(store, 'step') as Record<string, unknown>
+    );
+  });
+
+  it('run metadata round-trips every axis it claims, writer to reader', async () => {
+    const { store } = await runSpecimenDag();
+    const written = runUsageWrites(store);
+    expect(written.length).toBe(1);
+    // Writer: persistRunUsage's `total_*` key list.
+    expectSeamCarriesAxes('run metadata (write)', RUN_METADATA_AXIS_KEYS, written[0]);
+    // Reader: childOutcomeFromRun's SEPARATE, independently maintained key list.
+    // Nothing in production fails if the two disagree — this is the pair the
+    // issue calls the sharpest illustration of the seam.
+    expectSeamCarriesAxes(
+      'run metadata (read)',
+      WHOLE_OBJECT_AXIS_KEYS,
+      childOutcomeFromRun(
+        makeWorkflowRun('axis-child', { status: 'completed', metadata: written[0] })
+      ).tokens as unknown as Record<string, unknown>
+    );
+  });
+
+  it('terminal telemetry props carry every axis they claim', async () => {
+    await runSpecimenDag();
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
+    expectSeamCarriesAxes(
+      'telemetry props',
+      TELEMETRY_AXIS_KEYS,
+      mockCaptureWorkflowCompleted.mock.calls[0][0] as unknown as Record<string, unknown>
+    );
+  });
+
+  it('JSONL transcript node_complete row carries every axis it claims', async () => {
+    const { runId, logDir } = await runSpecimenDag();
+    const rows = (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const nodeComplete = rows.find(row => row.type === 'node_complete' && row.step === 'step');
+    expectSeamCarriesAxes(
+      'JSONL node_complete.tokens',
+      WHOLE_OBJECT_AXIS_KEYS,
+      nodeComplete?.tokens as Record<string, unknown>
+    );
+  });
+
+  it('loop gate round-trips every axis it claims, pause to resume', async () => {
+    // Writer: the gate persists the loop's cumulative usage whole.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'Pass one. <promise>APPROVED</promise>' };
+      yield { type: 'result', sessionId: 'axis-loop-sid', tokens: AXIS_SPECIMEN };
+    });
+    const loopNodes: DagNode[] = [
+      {
+        id: 'refine',
+        loop: {
+          fresh_context: false,
+          prompt: 'Refine.',
+          until: 'APPROVED',
+          max_iterations: 10,
+          interactive: true,
+          gate_message: 'Review.',
+        },
+      },
+    ];
+    const pausingDeps = createMockDeps();
+    await executeDagWorkflow(
+      pausingDeps,
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      { name: 'axis-loop-pause', nodes: loopNodes },
+      makeWorkflowRun('axis-loop-pause-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    const pauseCalls = (
+      pausingDeps.store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(1);
+    const signaledTokens = (pauseCalls[0][1] as { signaledTokens?: Record<string, unknown> })
+      .signaledTokens;
+    expectSeamCarriesAxes('loop gate (write)', WHOLE_OBJECT_AXIS_KEYS, signaledTokens);
+
+    // Reader: readSignaledTokens decodes it through a fixed key destructure.
+    // Resumed on a BARE approve so the finalize path (#2074) completes from the
+    // persisted usage without running another iteration — a new iteration would
+    // add its own usage and destroy the value identity this assertion needs.
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'should never run' };
+      yield { type: 'result', sessionId: 'never' };
+    });
+    const resumingDeps = createMockDeps();
+    await executeDagWorkflow(
+      resumingDeps,
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      { name: 'axis-loop-resume', nodes: loopNodes },
+      makeWorkflowRun('axis-loop-resume-run', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            sessionId: 'axis-loop-sid',
+            message: 'gate',
+            completionSignaled: true,
+            signaledOutput: 'REPORT',
+            signaledTokens,
+          },
+          loop_user_input: 'Approved',
+          loop_feedback_given: false,
+        },
+      }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+    expectSeamCarriesAxes(
+      'loop gate (read)',
+      WHOLE_OBJECT_AXIS_KEYS,
+      nodeCompletedTokens(resumingDeps.store, 'refine') as Record<string, unknown>
+    );
   });
 });
