@@ -42,11 +42,25 @@ export interface WorkflowEvent {
   tool_input?: Record<string, unknown>;
   duration_ms?: number;
   tokens?: WorkflowTokenUsage;
+  cost_usd?: number;
   check?: string;
   result?: 'pass' | 'fail' | 'warn' | 'unknown';
   error?: string;
   ts: string;
 }
+
+/**
+ * What a node or a whole run spent, in the transcript's own field names.
+ *
+ * One carrier, passed whole. The same payload used to be spelled out by hand at every
+ * sink, and cost was simply forgotten at the transcript one — an axis added here now
+ * reaches the JSONL row and the DB event together or not at all (#2674).
+ *
+ * Each axis is omitted when nothing was reported for it, so an absent `cost_usd` means
+ * the provider reported no cost (Codex reports none at all — #2334) and `0` means it
+ * reported zero. Build it with `!== undefined` tests, never truthiness.
+ */
+export type WorkflowUsage = Pick<WorkflowEvent, 'tokens' | 'cost_usd'>;
 
 /**
  * Get log file path for a workflow run.
@@ -153,11 +167,16 @@ export async function logWorkflowError(
 }
 
 /**
- * Log workflow completion
+ * Log workflow completion, with what the whole run spent.
  */
-export async function logWorkflowComplete(logDir: string, workflowRunId: string): Promise<void> {
+export async function logWorkflowComplete(
+  logDir: string,
+  workflowRunId: string,
+  usage?: WorkflowUsage
+): Promise<void> {
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'workflow_complete',
+    ...usage,
   });
 }
 
@@ -181,14 +200,17 @@ export async function logNodeComplete(
   workflowRunId: string,
   nodeId: string,
   commandName: string,
-  meta?: { durationMs?: number; tokens?: WorkflowTokenUsage }
+  meta?: { durationMs?: number } & WorkflowUsage
 ): Promise<void> {
+  const { durationMs, ...usage } = meta ?? {};
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'node_complete',
     step: nodeId,
     content: commandName,
-    ...(meta?.durationMs !== undefined ? { duration_ms: meta.durationMs } : {}),
-    ...(meta?.tokens ? { tokens: meta.tokens } : {}),
+    ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
+    // Spread whole: the caller already omitted every unreported axis, and a guard here
+    // would have to re-decide that per field — which is how `0` becomes absent.
+    ...usage,
   });
 }
 

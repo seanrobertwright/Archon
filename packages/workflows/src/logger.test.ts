@@ -142,6 +142,33 @@ describe('Workflow Logger', () => {
         cacheWrite: 0,
       });
     });
+
+    it('records the reported cost alongside the tokens', async () => {
+      await logNodeComplete(testDir, 'cost-test', 'step1', 'implement', {
+        durationMs: 1200,
+        tokens: { input: 120, output: 10 },
+        cost_usd: 0.0042,
+      });
+
+      const events = await readLogFile('cost-test');
+      expect(events[0].cost_usd).toBe(0.0042);
+      expect(events[0].duration_ms).toBe(1200);
+      expect(events[0].tokens).toEqual({ input: 120, output: 10 });
+    });
+
+    it('keeps a reported zero cost distinct from an unreported one', async () => {
+      // Codex reports no cost at all (#2334), so the absent key has to mean exactly
+      // that. A provider that reports 0 spent nothing, and must still say so.
+      await logNodeComplete(testDir, 'zero-cost', 'step1', 'implement', { cost_usd: 0 });
+      await logNodeComplete(testDir, 'no-cost', 'step1', 'implement', {
+        tokens: { input: 5, output: 1 },
+      });
+
+      const [zero] = await readLogFile('zero-cost');
+      const [absent] = await readLogFile('no-cost');
+      expect(zero.cost_usd).toBe(0);
+      expect('cost_usd' in absent).toBe(false);
+    });
   });
 
   describe('logAssistant', () => {
@@ -207,6 +234,20 @@ Line 3`;
       const events = await readLogFile('complete-test');
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe('workflow_complete');
+      // A run with no AI usage carries no usage keys at all.
+      expect('cost_usd' in events[0]).toBe(false);
+      expect('tokens' in events[0]).toBe(false);
+    });
+
+    it('records what the whole run spent', async () => {
+      await logWorkflowComplete(testDir, 'complete-usage-test', {
+        cost_usd: 0.19,
+        tokens: { input: 900, output: 120, cacheRead: 400 },
+      });
+
+      const events = await readLogFile('complete-usage-test');
+      expect(events[0].cost_usd).toBe(0.19);
+      expect(events[0].tokens).toEqual({ input: 900, output: 120, cacheRead: 400 });
     });
   });
 

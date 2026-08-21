@@ -5967,6 +5967,109 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(completedEvent?.[0].data).not.toHaveProperty('tokens');
   });
 
+  const readTranscript = async (
+    logDir: string,
+    runId: string
+  ): Promise<Array<Record<string, unknown>>> =>
+    (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+
+  it('writes node and run cost to the transcript, matching the persisted events', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'out' };
+      yield {
+        type: 'result',
+        sessionId: 'cost-sid',
+        cost: 0.3,
+        tokens: { input: 100, output: 10 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const logDir = join(testDir, 'logs');
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-transcript-cost',
+      testDir,
+      { name: 'transcript-cost', nodes: [{ id: 'step1', command: 'step1' }] },
+      makeWorkflowRun('transcript-cost-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const transcript = await readTranscript(logDir, 'transcript-cost-run');
+    const nodeRow = transcript.find(e => e.type === 'node_complete' && e.step === 'step1');
+    const runRow = transcript.find(e => e.type === 'workflow_complete');
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type: string; step_name: string; data?: Record<string, unknown> }]
+    >;
+    const completedEvent = eventCalls.find(
+      ([event]) => event.event_type === 'node_completed' && event.step_name === 'step1'
+    );
+
+    expect(nodeRow?.cost_usd).toBe(0.3);
+    expect(nodeRow?.tokens).toEqual({ input: 100, output: 10 });
+    // Both sinks read the one carrier, so the transcript can never disagree with the
+    // event the console and `workflow get` render.
+    expect(nodeRow?.cost_usd).toBe(completedEvent?.[0].data?.cost_usd);
+    expect(runRow?.cost_usd).toBe(0.3);
+    expect(runRow?.tokens).toEqual({ input: 100, output: 10 });
+  });
+
+  it('leaves cost off the transcript when the provider reports none', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'out' };
+      // Codex reports no cost at all (#2334). Writing 0 here would claim the node was
+      // free, and a reader summing the transcript would believe it.
+      yield { type: 'result', sessionId: 'no-cost-sid', tokens: { input: 100, output: 10 } };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const logDir = join(testDir, 'logs');
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-transcript-no-cost',
+      testDir,
+      { name: 'transcript-no-cost', nodes: [{ id: 'step1', command: 'step1' }] },
+      makeWorkflowRun('transcript-no-cost-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const transcript = await readTranscript(logDir, 'transcript-no-cost-run');
+    const nodeRow = transcript.find(e => e.type === 'node_complete' && e.step === 'step1');
+    const runRow = transcript.find(e => e.type === 'workflow_complete');
+
+    expect(nodeRow).toBeDefined();
+    expect(nodeRow).not.toHaveProperty('cost_usd');
+    expect(nodeRow?.tokens).toEqual({ input: 100, output: 10 });
+    expect(runRow).not.toHaveProperty('cost_usd');
+    // The two run-level axes are decided independently, so a missing cost must not
+    // suppress the tokens that were reported.
+    expect(runRow?.tokens).toEqual({ input: 100, output: 10 });
+  });
+
   // ─── Background Agent Task Gating (#2083) ───────────────────────────────
 
   describe('background task completion gating (#2083)', () => {
