@@ -24040,12 +24040,13 @@ describe('TokenUsage axis seam guard', () => {
    *    Pi's event bridge copies it there. `opencode/multi-agent.ts` does not, so
    *    on that path cost is stranded on the usage object. The fold seam carries
    *    no cost scalar at all.
-   *  - `total` is set by the Claude provider, Pi's event bridge and OpenCode's
-   *    token normalizer, then dropped by the first fold — `mergeTokenUsage`
-   *    documents that it does not aggregate it — so no seam below carries it.
-   *    It is NOT a dead axis: its live reader is `formatCostFooter` in
-   *    @archon/adapters, on the direct-chat path, which never folds. Recorded,
-   *    not fixed.
+   *  - `total` is set by several providers (Claude, Pi, and both OpenCode
+   *    paths — the multi-agent one re-synthesizes it after its own internal
+   *    fold) and then dropped by the engine's fold: `mergeTokenUsage` documents
+   *    that it does not aggregate it. So no seam below carries it. It is NOT a
+   *    dead axis: it is read by `formatCostFooter` in @archon/adapters on the
+   *    direct-chat path, which never folds, and by OpenCode's own multi-agent
+   *    sum. Recorded, not fixed.
    */
   const WHOLE_OBJECT_AXIS_KEYS: SeamAxisKeys = {
     input: 'input',
