@@ -32,14 +32,24 @@ function getLog(): ReturnType<typeof createLogger> {
  * conversation.
  */
 export async function resolveWorkflowSourceRoot(cwd: string): Promise<string | undefined> {
-  try {
-    if (!(await isWorktreePath(cwd))) return undefined;
-    const canonical = await getCanonicalRepoPath(cwd);
-    if (canonical === cwd) return undefined;
-    getLog().debug({ cwd, canonical }, 'workflow.source_root_resolved_canonical');
-    return canonical;
-  } catch (error) {
-    getLog().warn({ err: error as Error, cwd }, 'workflow.source_root_resolution_failed');
-    return undefined;
-  }
+  // A git failure is NOT the same as "this is not a worktree". Swallowing it returned
+  // `undefined`, which callers read as "the cwd is the authoring root" — and then froze
+  // the worktree, which is the very source/target confusion this exists to prevent. If we
+  // cannot tell, say so and let the caller refuse to start.
+  const isWorktree = await isWorktreePath(cwd).catch((error: Error) => {
+    throw new Error(
+      `Cannot determine whether ${cwd} is a worktree, so the run's authoring source is ` +
+        `unknown: ${error.message}`
+    );
+  });
+  if (!isWorktree) return undefined;
+  const canonical = await getCanonicalRepoPath(cwd).catch((error: Error) => {
+    throw new Error(
+      `Cannot resolve the canonical repository for worktree ${cwd}, so the run's authoring ` +
+        `source is unknown: ${error.message}`
+    );
+  });
+  if (canonical === cwd) return undefined;
+  getLog().debug({ cwd, canonical }, 'workflow.source_root_resolved_canonical');
+  return canonical;
 }

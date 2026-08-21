@@ -57,7 +57,7 @@ import { createLogger } from '@archon/paths';
 import * as archonPaths from '@archon/paths';
 import { BUNDLED_VERSION } from '@archon/paths/bundled-build';
 import { isBinaryBuild } from './defaults/bundled-defaults';
-import { readWorkflowSourceMetadata } from './schemas/workflow-run';
+import { readWorkflowSourceMetadata, readWorkflowSourceState } from './schemas/workflow-run';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -72,20 +72,21 @@ const BUNDLED_SCOPE_DIR = 'bundled';
 const MANIFEST_FILE = 'manifest.json';
 
 /**
- * Directory names never worth capturing: build caches, virtualenvs, and VCS metadata.
- * No workflow, command, or script reads these, and `__pycache__` alone can be larger
- * than the scripts it belongs to.
+ * The only directories excluded from a capture.
+ *
+ * Deliberately tiny. An earlier version also skipped `node_modules`, `.venv`, and `venv`
+ * on the theory that they are caches — but a packaged script may legitimately import from
+ * a sibling `node_modules` or run against a checked-in virtualenv, so excluding them
+ * produced a script that worked live and failed only once captured. Saving disk is not
+ * worth breaking a workflow that runs today.
+ *
+ * What remains has to be provably not-executable-input:
+ *  - `.git` is VCS metadata. Nothing reads it as source, and copying it can dwarf the
+ *    tree it belongs to.
+ *  - `__pycache__` is derived bytecode Python regenerates on demand. Copying it does not
+ *    just waste space: stale `.pyc` files next to edited sources can change behavior.
  */
-const SKIP_DIRECTORIES = new Set([
-  'node_modules',
-  '.git',
-  '.venv',
-  'venv',
-  '__pycache__',
-  '.mypy_cache',
-  '.pytest_cache',
-  '.ruff_cache',
-]);
+const SKIP_DIRECTORIES = new Set(['.git', '__pycache__']);
 
 /**
  * Soft ceiling on a capture, in bytes. Exceeding it is NOT an error — a repo is
@@ -112,6 +113,20 @@ export interface WorkflowSourceRoots {
   /** Directory holding packaged bundled workflows (the parent of the defaults folder). */
   bundledWorkflows: string;
 }
+
+/** Source-side settings that affect which executable bytes a workflow resolves. */
+export const workflowSourceConfigSchema = z.object({
+  load_default_workflows: z.boolean(),
+  load_default_commands: z.boolean(),
+  command_folder: z.string().optional(),
+});
+
+export type WorkflowSourceConfig = z.infer<typeof workflowSourceConfigSchema>;
+
+export const DEFAULT_WORKFLOW_SOURCE_CONFIG: WorkflowSourceConfig = {
+  load_default_workflows: true,
+  load_default_commands: true,
+};
 
 /** Roots for reading source live off disk, exactly as Archon always has. */
 export function liveSourceRoots(project: string | null): WorkflowSourceRoots {
@@ -169,6 +184,7 @@ export const workflowSourceManifestSchema = z.object({
   file_count: z.number(),
   byte_count: z.number(),
   scopes: z.array(z.enum([PROJECT_SCOPE_DIR, GLOBAL_SCOPE_DIR, BUNDLED_SCOPE_DIR])),
+  source_config: workflowSourceConfigSchema,
   /** Absent until the caller has selected which workflow this run executes. */
   workflow_name: z.string().optional(),
 });
@@ -360,8 +376,14 @@ export async function captureWorkflowSource(opts: {
   sourceRoot: string;
   captureRoot: string;
   commandFolder?: string;
+  sourceConfig?: WorkflowSourceConfig;
 }): Promise<WorkflowSourceCapture> {
-  const { sourceRoot, captureRoot, commandFolder } = opts;
+  const {
+    sourceRoot,
+    captureRoot,
+    commandFolder,
+    sourceConfig = DEFAULT_WORKFLOW_SOURCE_CONFIG,
+  } = opts;
 
   // (relative destination, absolute origin) pairs, one per directory worth copying.
   const jobs: { dest: string; from: string; scope: 'project' | 'global' | 'bundled' }[] = [];
@@ -414,6 +436,7 @@ export async function captureWorkflowSource(opts: {
       file_count: fileCount,
       byte_count: byteCount,
       scopes: [...new Set(jobs.map(j => j.scope))],
+      source_config: sourceConfig,
     };
     await writeManifest(staging, manifest);
 
@@ -491,8 +514,26 @@ async function readManifest(captureRoot: string): Promise<WorkflowSourceManifest
  * run's executable source cannot be established, which is a reason to stop rather than to
  * quietly execute something else.
  */
-export async function loadWorkflowSource(captureRoot: string): Promise<WorkflowSourceCapture> {
+export async function loadWorkflowSource(
+  captureRoot: string,
+  /**
+   * The digest the RUN recorded, when the caller has it.
+   *
+   * Without this, verification is circular: the manifest is inside the capture, so
+   * replacing the whole directory — files and manifest together — with a different but
+   * internally consistent capture passes every check. The run row holds the digest
+   * out-of-band, and comparing against it is what closes that.
+   */
+  expectedDigest?: string
+): Promise<WorkflowSourceCapture> {
   const manifest = await readManifest(captureRoot);
+  if (expectedDigest !== undefined && manifest.digest !== expectedDigest) {
+    throw new WorkflowSourceIntegrityError(
+      `Workflow source capture at ${captureRoot} is not the one this run recorded ` +
+        `(run expects ${expectedDigest.slice(0, 12)}…, capture claims ` +
+        `${manifest.digest.slice(0, 12)}…). The capture has been replaced.`
+    );
+  }
   const { digest } = await digestTree(captureRoot);
   if (digest !== manifest.digest) {
     throw new WorkflowSourceIntegrityError(
@@ -529,10 +570,18 @@ export function getRunSourceCapturePath(artifactsDir: string): string {
 export async function resolveRunSourceRoot(
   metadata: Record<string, unknown> | undefined
 ): Promise<string | undefined> {
-  const recorded = readWorkflowSourceMetadata(metadata);
-  if (!recorded) return undefined;
-  await loadWorkflowSource(recorded.root);
-  return recorded.root;
+  const state = readWorkflowSourceState(metadata);
+  if (state.kind === 'unreadable') {
+    // NOT the same as having no record. This run recorded something; we simply cannot
+    // read it. Resolving live here would execute source the run never agreed to.
+    throw new WorkflowSourceIntegrityError(
+      `This run's workflow source record cannot be read by this build: ${state.detail}`
+    );
+  }
+  if (state.kind === 'absent') return undefined;
+  const capture = await loadWorkflowSource(state.record.root, state.record.digest);
+  assertBundledSourceStillTrustworthy(capture.manifest);
+  return state.record.root;
 }
 
 /**
@@ -556,4 +605,26 @@ export async function resolveChildDiscoveryRoot(
   const recorded = readWorkflowSourceMetadata(metadata);
   if (!recorded) return undefined;
   return (await isDirectory(recorded.origin)) ? recorded.origin : undefined;
+}
+
+/**
+ * Refuse to resume a binary-built run whose engine changed under it.
+ *
+ * A compiled binary embeds its bundled workflows, commands, and scripts as constants
+ * rather than files, so a capture cannot freeze them — `scopes` omits `bundled`. That is
+ * harmless while the binary is the same one: constants cannot move. It stops being
+ * harmless across an upgrade, where a bundled workflow the run statically included may
+ * have changed while project and global digests still verify perfectly.
+ *
+ * Source builds capture the bundled tree, so they are unaffected.
+ */
+export function assertBundledSourceStillTrustworthy(manifest: WorkflowSourceManifest): void {
+  if (manifest.scopes.includes(BUNDLED_SCOPE_DIR)) return; // captured — verified by digest
+  if (manifest.engine_version === BUNDLED_VERSION) return; // same build — constants identical
+  throw new WorkflowSourceIntegrityError(
+    `This run was captured by Archon ${manifest.engine_version} and is resuming under ` +
+      `${BUNDLED_VERSION}. Its bundled workflows are compiled into the binary rather than ` +
+      'stored with the run, so they cannot be verified across an upgrade. Start a fresh ' +
+      'run to execute the current workflow.'
+  );
 }

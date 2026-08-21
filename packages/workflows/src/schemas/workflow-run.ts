@@ -270,10 +270,37 @@ export type WorkflowSourceMetadata = z.infer<typeof workflowSourceMetadataSchema
 export function readWorkflowSourceMetadata(
   metadata: Record<string, unknown> | undefined
 ): WorkflowSourceMetadata | undefined {
+  const state = readWorkflowSourceState(metadata);
+  return state.kind === 'recorded' ? state.record : undefined;
+}
+
+/**
+ * What a run says about its executable source.
+ *
+ * Three states, and collapsing any two of them is a correctness bug:
+ *
+ *  - `absent` — the run predates source capture. It has nothing to honor, so it may
+ *    resume against live source. This is the ONLY tolerable fallback.
+ *  - `recorded` — the run froze source and named it. That source, or nothing.
+ *  - `unreadable` — the run recorded SOMETHING this build cannot parse: a corrupt value,
+ *    a hand edit, or a future format. Emphatically not the same as `absent`. Treating it
+ *    as absent would resume the run against whatever is on disk now, which is exactly
+ *    what a run that recorded its source must never do.
+ */
+export type WorkflowSourceState =
+  | { kind: 'absent' }
+  | { kind: 'recorded'; record: WorkflowSourceMetadata }
+  | { kind: 'unreadable'; detail: string };
+
+export function readWorkflowSourceState(
+  metadata: Record<string, unknown> | undefined
+): WorkflowSourceState {
   const raw = metadata?.[WORKFLOW_SOURCE_METADATA_KEY];
-  if (raw === undefined) return undefined;
+  if (raw === undefined) return { kind: 'absent' };
   const parsed = workflowSourceMetadataSchema.safeParse(raw);
-  return parsed.success ? parsed.data : undefined;
+  return parsed.success
+    ? { kind: 'recorded', record: parsed.data }
+    : { kind: 'unreadable', detail: parsed.error.message };
 }
 
 /** Approval context stored in workflow run metadata when paused for human review. */

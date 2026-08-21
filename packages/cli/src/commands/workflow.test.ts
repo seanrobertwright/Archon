@@ -146,6 +146,8 @@ mock.module('@archon/workflows/executor', () => ({
     })
   ),
   recordSelectedWorkflow: mock(() => Promise.resolve()),
+  disposeWorkflowSource: mock(() => Promise.resolve()),
+  finalizeWorkflowSource: mock((_deps: unknown, prepared: unknown) => Promise.resolve(prepared)),
 }));
 mock.module('@archon/workflows/dry-run', () => ({
   loadDryRunStubs: mock(() => Promise.resolve({ node: 'stubbed output' })),
@@ -1260,6 +1262,7 @@ describe('workflowRunCommand', () => {
     // so the call carries the target cwd plus the capture's roots.
     const executorDiag = await import('@archon/workflows/executor');
     expect(executorDiag.prepareWorkflowSource as ReturnType<typeof mock>).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({ sourceRoot: '/repo/source' })
     );
     expect(discoverWorkflowsWithConfig).toHaveBeenCalledWith(

@@ -143,6 +143,7 @@ export {
   WORKFLOW_SOURCE_METADATA_KEY,
   workflowSourceMetadataSchema,
   readWorkflowSourceMetadata,
+  readWorkflowSourceState,
 } from './workflow-run';
 export type {
   WorkflowRunStatus,
@@ -155,6 +156,7 @@ export type {
   ApprovalContext,
   LoopGateRunMetadata,
   WorkflowSourceMetadata,
+  WorkflowSourceState,
 } from './workflow-run';
 
 // Per-node persisted provider sessions

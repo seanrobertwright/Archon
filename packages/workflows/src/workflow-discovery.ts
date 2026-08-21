@@ -29,7 +29,11 @@ import type {
 } from './schemas';
 import { isIncludeNode, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  liveSourceRoots,
+  type WorkflowSourceConfig,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 // Re-exported here because this is the module callers already import to discover with.
 export { liveSourceRoots } from './workflow-source';
 export type { WorkflowSourceRoots } from './workflow-source';
@@ -865,15 +869,16 @@ export async function discoverWorkflowsWithConfig(
    * directory. Config is always read from `cwd` regardless — settings belong to the
    * workspace being acted on, not to the source being executed.
    */
-  sourceRoots?: WorkflowSourceRoots
+  sourceRoots?: WorkflowSourceRoots,
+  sourceConfig?: WorkflowSourceConfig
 ): Promise<WorkflowLoadResult> {
-  let loadDefaults = true;
+  let loadDefaults = sourceConfig?.load_default_workflows ?? true;
   // Command-scan parity: pass the repo's configured command folder + loadDefaultCommands
   // opt-out through so the include safety scan resolves the same command files the
   // runtime/validator would (else it silently degrades to WARN on custom-folder repos).
-  let commandFolder: string | undefined;
-  let loadDefaultCommands: boolean | undefined;
-  if (cwd !== null) {
+  let commandFolder = sourceConfig?.command_folder;
+  let loadDefaultCommands = sourceConfig?.load_default_commands;
+  if (cwd !== null && sourceConfig === undefined) {
     try {
       const cfg = await loadConfig(cwd);
       loadDefaults = cfg.defaults?.loadDefaultWorkflows ?? true;

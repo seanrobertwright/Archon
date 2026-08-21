@@ -45,6 +45,7 @@ import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discover
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
   capturedSourceRoots,
+  disposeWorkflowSource,
   executeWorkflow,
   finalizeWorkflowSource,
   hydrateResumableRun,
@@ -964,7 +965,9 @@ export async function workflowRunCommand(
   let preparedSource: PreparedWorkflowSource | undefined;
   if (!recordedRoots && !isContinuation && !options.dryRun && !options.stubsInitPath) {
     try {
-      preparedSource = await prepareWorkflowSource({ sourceRoot: effectiveDiscoveryCwd });
+      preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
+        sourceRoot: effectiveDiscoveryCwd,
+      });
     } catch (error) {
       throw new Error(
         `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
@@ -987,6 +990,7 @@ export async function workflowRunCommand(
   }
 
   if (workflowEntries.length === 0 && errors.length === 0) {
+    if (preparedSource) await disposeWorkflowSource(preparedSource);
     throw new Error('No workflows found in .archon/workflows/');
   }
 
@@ -1316,6 +1320,9 @@ export async function workflowRunCommand(
     if (options.discoveryCwd !== undefined) {
       extraArgs.push('--workflow-source', options.discoveryCwd);
     }
+
+    // The detached child captures its own source; this process's capture is dead weight.
+    if (preparedSource) await disposeWorkflowSource(preparedSource);
 
     const logPath = await spawnDetachedWorkflowRun(cwd, childConversationId, extraArgs);
 

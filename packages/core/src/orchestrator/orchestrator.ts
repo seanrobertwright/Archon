@@ -460,7 +460,9 @@ export async function dispatchBackgroundWorkflow(
   const workflowSourceRoot = await resolveWorkflowSourceRoot(workerCwd);
   let preparedSource: PreparedWorkflowSource;
   try {
-    preparedSource = await prepareWorkflowSource({ sourceRoot: workflowSourceRoot ?? workerCwd });
+    preparedSource = await prepareWorkflowSource(workflowDeps, {
+      sourceRoot: workflowSourceRoot ?? workerCwd,
+    });
     // See the note in orchestrator-agent.ts: an empty capture means the definition came
     // from a binary's embedded bundled set, which has nothing on disk to re-read.
     if (preparedSource.manifest.scopes.length > 0) {

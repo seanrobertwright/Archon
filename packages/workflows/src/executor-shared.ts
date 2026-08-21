@@ -9,7 +9,11 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  liveSourceRoots,
+  type WorkflowSourceConfig,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
@@ -286,7 +290,8 @@ export async function loadCommandPrompt(
   cwd: string,
   commandName: string,
   configuredFolder?: string,
-  sourceRoots?: WorkflowSourceRoots
+  sourceRoots?: WorkflowSourceRoots,
+  sourceConfig?: WorkflowSourceConfig
 ): Promise<LoadCommandResult> {
   const roots = sourceRoots ?? liveSourceRoots(cwd);
   // Validate command name first
@@ -300,26 +305,28 @@ export async function loadCommandPrompt(
   }
 
   // Load config to check opt-out
-  let config;
-  try {
-    config = await deps.loadConfig(cwd);
-  } catch (error) {
-    const err = error as Error;
-    getLog().warn(
-      {
-        err,
-        cwd,
-        note: 'Default commands will be loaded. Check your .archon/config.yaml if this is unexpected.',
-      },
-      'config_load_failed_using_defaults'
-    );
-    config = { defaults: { loadDefaultCommands: true } };
+  let loadDefaultCommands = sourceConfig?.load_default_commands;
+  if (loadDefaultCommands === undefined) {
+    try {
+      loadDefaultCommands = (await deps.loadConfig(cwd)).defaults?.loadDefaultCommands ?? true;
+    } catch (error) {
+      const err = error as Error;
+      getLog().warn(
+        {
+          err,
+          cwd,
+          note: 'Default commands will be loaded. Check your .archon/config.yaml if this is unexpected.',
+        },
+        'config_load_failed_using_defaults'
+      );
+      loadDefaultCommands = true;
+    }
   }
 
   const packaged = parsePackagedResourceReference(commandName);
   if (packaged !== null) {
     if (packaged.owner.source === 'bundled') {
-      if (config.defaults?.loadDefaultCommands === false) {
+      if (!loadDefaultCommands) {
         return {
           success: false,
           reason: 'not_found',
@@ -451,7 +458,6 @@ export async function loadCommandPrompt(
   }
 
   // If not found in repo/home and app defaults enabled, search app defaults
-  const loadDefaultCommands = config.defaults?.loadDefaultCommands ?? true;
   if (loadDefaultCommands) {
     if (isBinaryBuild()) {
       // Binary: check bundled commands

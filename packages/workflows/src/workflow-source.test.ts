@@ -178,19 +178,28 @@ describe('captureWorkflowSource', () => {
     expect(await readFile(copied, 'utf-8')).toBe('external');
   });
 
-  test('skips caches that no workflow reads', async () => {
+  test('keeps script dependencies but drops derived bytecode', async () => {
     await writeFile(join(source, '.archon', 'scripts', 'main.py'), 'print(1)');
     await mkdir(join(source, '.archon', 'scripts', '__pycache__'), { recursive: true });
     await writeFile(join(source, '.archon', 'scripts', '__pycache__', 'main.pyc'), 'junk');
     await mkdir(join(source, '.archon', 'scripts', 'node_modules', 'dep'), { recursive: true });
-    await writeFile(join(source, '.archon', 'scripts', 'node_modules', 'dep', 'i.js'), 'junk');
+    await writeFile(join(source, '.archon', 'scripts', 'node_modules', 'dep', 'i.js'), 'dep();');
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
 
-    expect(await countScopeFiles(capture.captureRoot, 'project')).toBe(1);
+    // A packaged script may genuinely import from a sibling `node_modules`, so excluding
+    // it produced a script that worked live and failed only once captured. `__pycache__`
+    // is the opposite: derived, regenerated on demand, and a stale copy next to an edited
+    // source can change behavior.
+    expect(
+      await readFile(
+        join(capture.captureRoot, 'project/.archon/scripts/node_modules/dep/i.js'),
+        'utf-8'
+      )
+    ).toBe('dep();');
     await expect(
       readFile(join(capture.captureRoot, 'project/.archon/scripts/__pycache__/main.pyc'), 'utf-8')
     ).rejects.toThrow();
@@ -370,7 +379,7 @@ describe("a run's own source versus a child's discovery root", () => {
       sourceRoot: source,
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
-    const metadata = recorded(capture!.captureRoot, source);
+    const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
 
     expect(await resolveRunSourceRoot(metadata)).toBe(capture!.captureRoot);
   });
@@ -384,7 +393,7 @@ describe("a run's own source versus a child's discovery root", () => {
       sourceRoot: source,
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
-    const metadata = recorded(capture!.captureRoot, source);
+    const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
 
     expect(await resolveChildDiscoveryRoot(metadata)).toBe(source);
     expect(await resolveChildDiscoveryRoot(metadata)).not.toBe(
@@ -406,7 +415,7 @@ describe("a run's own source versus a child's discovery root", () => {
     expect(await resolveChildDiscoveryRoot(undefined)).toBeUndefined();
   });
 
-  test('a relative recorded path reads as absent instead of resolving against process.cwd', async () => {
+  test('a relative recorded path fails closed rather than resolving against process.cwd', async () => {
     const relative = {
       [WORKFLOW_SOURCE_METADATA_KEY]: {
         version: 1,
@@ -418,13 +427,18 @@ describe("a run's own source versus a child's discovery root", () => {
         byte_count: 1,
       },
     };
-    expect(await resolveRunSourceRoot(relative)).toBeUndefined();
+    // Unreadable, not absent: the run DID record a source, so resolving live would
+    // execute something it never agreed to.
+    await expect(resolveRunSourceRoot(relative)).rejects.toThrow(WorkflowSourceIntegrityError);
     expect(await resolveChildDiscoveryRoot(relative)).toBeUndefined();
   });
 
-  test('an unrecognized record version reads as absent rather than failing a resume', async () => {
+  test('a record from a newer Archon fails closed rather than resuming live', async () => {
+    // The tempting mistake is to treat "I cannot parse this" as "there is nothing here".
+    // Only a genuinely absent record — a run predating capture — may resume live.
     const future = { [WORKFLOW_SOURCE_METADATA_KEY]: { version: 99, root: source } };
-    expect(await resolveRunSourceRoot(future)).toBeUndefined();
+    await expect(resolveRunSourceRoot(future)).rejects.toThrow(WorkflowSourceIntegrityError);
+    expect(await resolveRunSourceRoot({})).toBeUndefined();
   });
 });
 

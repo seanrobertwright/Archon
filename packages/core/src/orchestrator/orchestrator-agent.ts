@@ -41,6 +41,7 @@ import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow, resolveWorkflowName } from '@archon/workflows/router';
 import {
+  disposeWorkflowSource,
   executeWorkflow,
   hydrateResumableRun,
   prepareWorkflowSource,
@@ -742,53 +743,6 @@ async function dispatchOrchestratorWorkflow(
   // executeWorkflow dispatch below (repo config worktree.baseBranch still wins).
   const codebaseBaseBranch = codebase.default_branch?.trim() || undefined;
 
-  // Freeze this run's executable source, then re-resolve the workflow FROM the frozen
-  // copy. The caller discovered `workflow` a moment ago against live files; re-resolving
-  // is what guarantees the definition being executed and the commands and scripts beside
-  // it are one consistent set of bytes rather than two moments' worth.
-  //
-  // The authoring root is the canonical repo when the conversation cwd is a worktree,
-  // whose `.archon` belongs to whatever branch it is on rather than to the author.
-  const runCwd = conversation.cwd ?? codebase.default_cwd;
-  const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);
-  let preparedSource: PreparedWorkflowSource | undefined;
-  try {
-    preparedSource = await prepareWorkflowSource({ sourceRoot: workflowSourceRoot ?? runCwd });
-    // Re-resolve only when files were actually frozen. An empty capture means the
-    // definition came from the bundled set a binary embeds as constants — immutable for
-    // that binary, with nothing on disk to re-read — so the caller's definition stands.
-    if (preparedSource.manifest.scopes.length > 0) {
-      const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
-        runCwd,
-        loadConfig,
-        preparedSource.roots
-      );
-      const reResolved = resolveWorkflowName(
-        workflow.name,
-        capturedWorkflows.map(w => w.workflow)
-      );
-      if (!reResolved) {
-        await platform.sendMessage(
-          conversationId,
-          `Could not read workflow **${workflow.name}** from this run's captured source. ` +
-            'Nothing has been started.'
-        );
-        return;
-      }
-      workflow = reResolved;
-    }
-    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
-  } catch (error) {
-    const err = error as Error;
-    getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
-    await platform.sendMessage(
-      conversationId,
-      `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
-        'Nothing has been started.'
-    );
-    return;
-  }
-
   // Per-child isolation resolver (#2121 slice 2, PR-A): a `workflow:` node with
   // `isolation: 'worktree'` gets its own worktree per child. Built for git-repo
   // codebases only — a folder project can't make worktrees, so the engine fails
@@ -849,6 +803,62 @@ async function dispatchOrchestratorWorkflow(
   const willContinueExistingRun =
     Boolean(resumableRun?.working_path) &&
     (resumableRun?.status === 'paused' || resumableRun?.id === options?.resumeRunId);
+
+  // ── Executable source ───────────────────────────────────────────────────────
+  //
+  // AFTER resume detection, on purpose. A continuation must execute the source its run
+  // already froze; capturing here would freeze current bytes, re-resolve the graph from
+  // them, and then hand the executor a run whose recorded capture supplies the commands
+  // and scripts — a graph from one moment against resources from another. Capturing a
+  // resume also leaves a staging directory nothing adopts.
+  //
+  // For a fresh run: freeze, then re-resolve the workflow FROM the frozen copy, so the
+  // definition executed and the resources beside it are one consistent set of bytes.
+  const runCwd = conversation.cwd ?? codebase.default_cwd;
+  let preparedSource: PreparedWorkflowSource | undefined;
+  if (!willContinueExistingRun) {
+    try {
+      const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);
+      preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
+        sourceRoot: workflowSourceRoot ?? runCwd,
+      });
+      // Re-resolve only when files were actually frozen. An empty capture means the
+      // definition came from the bundled set a binary embeds as constants — immutable for
+      // that binary, with nothing on disk to re-read.
+      if (preparedSource.manifest.scopes.length > 0) {
+        const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
+          runCwd,
+          loadConfig,
+          preparedSource.roots
+        );
+        const reResolved = resolveWorkflowName(
+          workflow.name,
+          capturedWorkflows.map(w => w.workflow)
+        );
+        if (!reResolved) {
+          await disposeWorkflowSource(preparedSource);
+          await platform.sendMessage(
+            conversationId,
+            `Could not read workflow **${workflow.name}** from this run's captured source. ` +
+              'Nothing has been started.'
+          );
+          return;
+        }
+        workflow = reResolved;
+      }
+      await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+    } catch (error) {
+      const err = error as Error;
+      if (preparedSource) await disposeWorkflowSource(preparedSource);
+      getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+      await platform.sendMessage(
+        conversationId,
+        `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
+          'Nothing has been started.'
+      );
+      return;
+    }
+  }
 
   // Signature gate (#2470, #2554): resolve this invocation's declared inputs from the
   // values its channel supplied — the run route's `inputs` map today; chat platforms

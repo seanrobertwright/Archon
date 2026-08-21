@@ -982,6 +982,16 @@ export async function completeWorkflowRun(
   }
 }
 
+/**
+ * Mark a run failed.
+ *
+ * Matches `pending` as well as `running`. A run can fail BEFORE it ever transitions to
+ * running — source capture, artifact setup, and credential resolution all happen against
+ * a freshly inserted `pending` row — and a `running`-only guard left those rows pending
+ * forever: no terminal state, no error recorded, and nothing to tell the operator the run
+ * is dead. Both are non-terminal states owned by this process, so failing either is the
+ * same decision. Terminal rows still never transition.
+ */
 export async function failWorkflowRun(id: string, error: string): Promise<void> {
   const dialect = getDialect();
   let result: Awaited<ReturnType<IDatabase['query']>>;
@@ -989,7 +999,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
     result = await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status = 'running'`,
+       WHERE id = $1 AND status IN ('running', 'pending')`,
       [id, JSON.stringify({ error })]
     );
   } catch (dbError) {
@@ -999,7 +1009,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
   }
   if (result.rowCount === 0) {
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_fail_no_match');
-    throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    throw new Error(`Workflow run not found or already terminal (id: ${id})`);
   }
 }
 

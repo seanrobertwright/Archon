@@ -1575,7 +1575,7 @@ async function executeNodeInternal(
   stepNamePrefix = '',
   iteration?: number,
   checkpointSession?: SessionCheckpoint,
-  /** Roots command files resolve under; see RunLayersContext. Undefined → live `cwd`. */
+  /** Roots command files resolve under; always supplied from RunLayersContext. */
   workflowSourceRoots?: WorkflowSourceRoots
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
@@ -3241,7 +3241,7 @@ async function executeScriptNode(
   // iterations (mirrors executeBashNode, which delivers loop input via quoted splice).
   loopUserInput = '',
   execContext: ExecutionContext = { kind: 'host' },
-  /** Roots named scripts resolve under; see RunLayersContext. Undefined → live `cwd`. */
+  /** Roots named scripts resolve under; always supplied from RunLayersContext. */
   workflowSourceRoots?: WorkflowSourceRoots
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
@@ -3936,8 +3936,10 @@ async function executeLoopGroupNode(
       workflowRun,
       workflowName: node.id,
       // A body node's commands and scripts come from the same frozen source as the
-      // enclosing run's — the group is part of one workflow, not a separate one.
-      workflowSourceRoots,
+      // enclosing run's — the group is part of one workflow, not a separate one. The
+      // enclosing context already normalized these, so the fallback is unreachable; it
+      // exists because the positional parameter cannot be made required after optionals.
+      workflowSourceRoots: workflowSourceRoots ?? liveSourceRoots(cwd),
       config,
       workflowProvider,
       // Forward inherited workflow-level model/tier/options/profile so body AI nodes
@@ -4560,7 +4562,7 @@ async function executeLoopNode(
   resolvedTier?: TierName,
   resolvedEffort?: string,
   checkpointSession?: SessionCheckpoint,
-  /** Roots a `loop.command` file resolves under; see RunLayersContext. Undefined → live `cwd`. */
+  /** Roots a `loop.command` file resolves under; always supplied from RunLayersContext. */
   workflowSourceRoots?: WorkflowSourceRoots
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
@@ -7430,11 +7432,15 @@ interface RunLayersContext {
   cwd: string;
   /**
    * The roots nodes READ executable source from — command files and named scripts.
-   * Undefined means "read `cwd` live". These are different directories on every
-   * isolated run, and conflating them is what made a workflow's own commands
-   * invisible inside the worktree it was executing against.
+   *
+   * REQUIRED and concrete: normalized once at the DAG boundary so no leaf lookup can be
+   * reached without them. They were optional at first, and an omitted argument at any one
+   * of six call sites silently recreated the original source/target bug — the resolver
+   * would fall back to `cwd` and look for the workflow's own files inside the workspace it
+   * was executing against. Public discovery helpers keep their live-source defaults; this
+   * internal path does not.
    */
-  workflowSourceRoots: WorkflowSourceRoots | undefined;
+  workflowSourceRoots: WorkflowSourceRoots;
   /**
    * Injected closure that starts a child sub-run for a `workflow:` node (#2121
    * Phase 2). Undefined when the caller (e.g. a unit test) doesn't wire it — a
@@ -9084,9 +9090,9 @@ export async function executeDagWorkflow(
   /** Private run-scoped handles restored before a cold resume transitions to running. */
   priorNodeSessions?: readonly WorkflowRunNodeSession[],
   /**
-   * Roots this run's commands and scripts are read from, when that is not `cwd` — the
-   * run's frozen source capture. Undefined resolves them under `cwd` live, which is
-   * both the in-place case and the pre-capture behavior.
+   * Roots this run's commands and scripts are read from. Undefined here means the caller
+   * has no capture (an in-process caller with a hand-built definition); the boundary below
+   * normalizes it to live roots ONCE so nothing downstream has to.
    */
   workflowSourceRoots?: WorkflowSourceRoots
 ): Promise<string | undefined> {
@@ -9280,7 +9286,8 @@ export async function executeDagWorkflow(
     runChildWorkflow,
     workflowRun,
     workflowName: workflow.name,
-    workflowSourceRoots,
+    // Normalized once, here. Everything below takes concrete roots.
+    workflowSourceRoots: workflowSourceRoots ?? liveSourceRoots(cwd),
     config,
     workflowProvider,
     workflowModel,
