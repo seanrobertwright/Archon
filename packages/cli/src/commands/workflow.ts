@@ -2824,7 +2824,10 @@ export async function workflowResumeCommand(
   // and report its state, but do NOT re-execute the workflow inline (execution
   // streams workflow output to stdout, which would corrupt the JSON contract).
   // To actually execute a resumable run, use the blocking `resume` (no --json,
-  // run as a background task) or `run <name> --resume --detach`.
+  // run as a background task) or `resume <run-id> --detach`. Prefer that exact-id
+  // form over `run <name> --resume --detach`, which selects the newest resumable
+  // run of that workflow in the CURRENT checkout — a different question, and the
+  // wrong one when the caller already holds a run id (#2645).
   if (json) {
     try {
       const resolvedId = await resolveRunIdArg(runId, cwd);

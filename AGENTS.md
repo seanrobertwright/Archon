@@ -203,6 +203,7 @@ The rules `--help` will not tell you:
 - Isolation is the default for `workflow run` — it creates a worktree unless you pass `--no-worktree` or `--folder`.
 - `--json` is supported on the read/write subcommands (`list`, `status`, `runs`, `get`, `approve`, `reject`, `abandon`, `resume`). On `approve`/`reject`/`resume` it records the decision and returns an ack **without** the inline auto-resume, leaving the run resumable — drive continuation separately.
 - `--detach` works on `approve`/`reject`/`resume` as well as `run`. Adding it INVERTS the `--json` rule above: the parent validates the run read-only and refuses synchronously, then spawns a child without `--json`, so the child takes the inline path and DOES continue the run. The ack carries `continues: true` so an automation knows it no longer owns continuation.
+- When you already hold a run id, recover with `workflow resume <run-id> --detach`, not `workflow run <name> --resume --detach`. The name form selects the newest resumable run of that workflow **in the current checkout**, so it finds nothing from another worktree and expresses less than the id you already have (#2645).
 
 ## Architecture
 
