@@ -1303,8 +1303,11 @@ interface ResolvedGate {
  * the user a manual `/workflow resume`, not the decision. The whole body is
  * guarded so that guarantee holds for the `finally` this runs from, where a
  * throw would replace the error the user actually needs to see.
+ *
+ * Exported so its continuation behavior can be tested without staging a whole agent turn
+ * with a gate-resolving tool call.
  */
-async function continueResolvedGateRun(
+export async function continueResolvedGateRun(
   platform: IPlatformAdapter,
   conversationId: string,
   conversation: Conversation,
@@ -1326,21 +1329,6 @@ async function continueResolvedGateRun(
   };
 
   try {
-    const workflow = findWorkflow(
-      run.workflow_name,
-      workflowsWithSource.map(w => w.workflow)
-    );
-    if (!workflow) {
-      getLog().warn(
-        { conversationId, workflowRunId: run.id, workflowName: run.workflow_name },
-        'orchestrator.gate_continuation_workflow_not_found'
-      );
-      await notify(
-        `${decision}, but workflow \`${run.workflow_name}\` was not found, so the run could not ` +
-          'continue. The decision is recorded — use `/workflow list` to check available workflows.'
-      );
-      return;
-    }
     if (!codebase) {
       getLog().warn(
         { conversationId, workflowRunId: run.id },
@@ -1349,6 +1337,53 @@ async function continueResolvedGateRun(
       await notify(
         `${decision}, but no project is attached to this conversation, so the run could not ` +
           `continue. The decision is recorded — use \`/workflow resume ${run.id}\` from the project.`
+      );
+      return;
+    }
+
+    // The graph this run FROZE. The chat turn's discovery list describes the checkout as
+    // it is NOW, which is the wrong question twice over: a workflow deleted or renamed
+    // since the run started is missing from it, and this path would then refuse a run
+    // whose own captured source still holds it. `/workflow resume` resolves it this way
+    // too — the two gate surfaces must not disagree about what a run is.
+    let resolvedContinuation: WorkflowDefinition | undefined;
+    try {
+      resolvedContinuation = (
+        await resolveContinuationWorkflow(
+          createWorkflowDeps(),
+          run,
+          conversation.cwd ?? codebase.default_cwd
+        )
+      )?.workflow;
+    } catch (error) {
+      const err = toError(error);
+      getLog().error(
+        { err, conversationId, workflowRunId: run.id },
+        'orchestrator.gate_continuation_source_failed'
+      );
+      await notify(
+        `${decision}, but run \`${run.id}\` could not continue: ${err.message} ` +
+          'The decision is recorded — start a fresh run to execute the current workflow.'
+      );
+      return;
+    }
+
+    // Undefined only for a run predating captures: fall back to the live list, exactly
+    // as that run's executor does.
+    const workflow =
+      resolvedContinuation ??
+      findWorkflow(
+        run.workflow_name,
+        workflowsWithSource.map(w => w.workflow)
+      );
+    if (!workflow) {
+      getLog().warn(
+        { conversationId, workflowRunId: run.id, workflowName: run.workflow_name },
+        'orchestrator.gate_continuation_workflow_not_found'
+      );
+      await notify(
+        `${decision}, but workflow \`${run.workflow_name}\` was not found, so the run could not ` +
+          'continue. The decision is recorded — use `/workflow list` to check available workflows.'
       );
       return;
     }
@@ -1370,7 +1405,9 @@ async function continueResolvedGateRun(
         isolationHints,
         userId,
         source,
-        { resumeRunId: run.id, resumeRun: run }
+        // Already verified and discovered above; dispatch reuses it rather than
+        // resolving the same capture a second time.
+        { resumeRunId: run.id, resumeRun: run, resolvedContinuation }
       );
       getLog().info(
         { conversationId, workflowRunId: run.id, workflowName: workflow.name, action },

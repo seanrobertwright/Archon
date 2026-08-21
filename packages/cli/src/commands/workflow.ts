@@ -231,6 +231,10 @@ export interface WorkflowRunOptions {
    * the target at all, and even when it is, re-discovering live resumes the run against a
    * different graph. The whole run is passed, not just its capture path, because
    * `resolveContinuationWorkflow` needs the recorded digest to verify against.
+   *
+   * Optional because `run <name> --resume` names the run indirectly; that form resolves the
+   * row itself, before discovery, and joins the same path. `resume` alone therefore never
+   * means live discovery.
    */
   continuationRun?: WorkflowRun;
   quiet?: boolean;
@@ -963,20 +967,35 @@ async function runWorkflowWithOwnedSource(
   // hand-roll the same load/rebuild/discover sequence: correct at the time, which is the
   // risk — a change to the shared path would silently not reach CLI resume, and that is
   // exactly the shape that produced the mixed-vintage and default-settings bugs.
+  //
+  // `run <name> --resume` is a continuation too, but it arrives as a flag rather than as a
+  // run: its row is only located much further down, where it binds the worktree. That is
+  // too late to choose the graph. Resolving it here is what makes every resume form — this
+  // flag, `resume <id>`, approve, reject, parent auto-resume — reach the shared entry point
+  // with a run in hand, and it also stops the id-based forms re-finding by name a run they
+  // already identified exactly (#2645).
+  let resumeLookupError: Error | undefined;
+  let continuationRun = options.continuationRun;
+  if (continuationRun === undefined && options.resume === true) {
+    try {
+      continuationRun = (await workflowDb.findResumableRun(workflowName, cwd)) ?? undefined;
+    } catch (error) {
+      // The resume block below owns the actionable message for a database that cannot
+      // answer, and reports the codebase failure first. Nothing executes before it.
+      resumeLookupError = error as Error;
+    }
+  }
+
   let continuation: ResolvedContinuation | undefined;
-  if (options.continuationRun !== undefined) {
-    continuation = await resolveContinuationWorkflow(
-      createWorkflowDeps(),
-      options.continuationRun,
-      cwd
-    );
+  if (continuationRun !== undefined) {
+    continuation = await resolveContinuationWorkflow(createWorkflowDeps(), continuationRun, cwd);
   }
 
   // A continuation never captures. With a record it reads that record (above); without
   // one it is a run created before captures existed, and reads live source — the same
   // legacy path the executor takes for it. Capturing here would freeze bytes the run
   // never agreed to and still not make it deterministic.
-  const isContinuation = options.resume === true || options.continuationRun !== undefined;
+  const isContinuation = options.resume === true || continuationRun !== undefined;
 
   let preparedSource: PreparedWorkflowSource | undefined;
   // Mirrors the owner's own flag, readable from the signal handler — which exits the
@@ -1529,7 +1548,16 @@ async function runWorkflowWithOwnedSource(
       );
     }
 
-    resumable = await workflowDb.findResumableRun(workflowName, cwd);
+    if (resumeLookupError) {
+      throw new Error(
+        'Cannot resume: Database lookup failed.\n' +
+          `Error: ${resumeLookupError.message}\n` +
+          'Hint: Check your database connection before using --resume.'
+      );
+    }
+    // Resolved before discovery (top of this function), because the graph this run
+    // executes had to be chosen from it.
+    resumable = continuationRun ?? null;
 
     if (!resumable) {
       throw new Error(`No resumable run found for workflow '${workflowName}' at path '${cwd}'.`);

@@ -248,7 +248,7 @@ Every run freezes its workflow source when it starts, whether or not you pass th
 
 - **The target stays clean.** Nothing from the source checkout is written into it, so its `git status` and its validators only ever see its own files.
 - **A run does not change shape while it is running.** Edit, move, or delete the source checkout after a run starts and a resume still executes what the run began with. Start a new run to pick up the edits.
-- **Resume needs no source path.** `archon workflow resume <run-id>`, `approve`, and `reject` all load the run's own captured source, which is why `--workflow-source` is refused alongside `--resume`.
+- **Resume needs no source path.** Every continuation -- `archon workflow resume <run-id>`, `archon workflow run <name> --resume`, `approve`, and `reject` -- loads the run's own captured source, which is why `--workflow-source` is refused alongside `--resume`.
 
 The captured source lives under that run's artifacts (`~/.archon/workspaces/<project>/artifacts/runs/<run-id>/workflow-source/`) and is removed with the rest of the run's artifacts. Its manifest records a content digest, which the run row also stores, and a resume checks both: if the capture is missing, its bytes have changed, or it has been replaced with a different capture, the run **fails** rather than continuing against different source. Start a fresh run to execute the current workflow.
 
