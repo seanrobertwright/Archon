@@ -1564,6 +1564,56 @@ export async function handleMessage(
       }
     }
 
+    // A conversation's `cwd` override can outlive the directory it names. Every
+    // path that tears a worktree down (`archon isolation cleanup`, the periodic
+    // reaper, the isolation API route, a user's own `rm -rf`) marks the env row
+    // destroyed without touching the conversation row, so `cwd` keeps pointing at
+    // a path that is gone. Only the WORKFLOW path re-resolves isolation and
+    // notices; a chat turn reads `cwd` verbatim and hands it to the provider,
+    // which spawns its subprocess there and fails ENOENT — an error the Claude
+    // SDK reports as a binary/libc mismatch, sending the operator after entirely
+    // the wrong thing.
+    //
+    // Deliberately does NOT fall back to codebase.default_cwd: this conversation
+    // asked to work in an isolated worktree, and quietly relocating the agent
+    // into the live checkout would widen its write scope without consent. Runs
+    // before the persist below so a refused turn leaves no `user` row without its
+    // `assistant` pair, and after the deterministic-command early-returns above so
+    // the commands that get out of this state keep working. Which of them applies
+    // depends on `isolation_env_id` — see the message branch below.
+    if (conversation.codebase_id !== null && conversation.cwd !== null) {
+      if (!existsSync(conversation.cwd)) {
+        getLog().warn(
+          {
+            conversationId: conversation.id,
+            cwd: conversation.cwd,
+            isolationEnvId: conversation.isolation_env_id,
+          },
+          'orchestrator.conversation_cwd_missing'
+        );
+        // The recovery advice branches on whether a worktree is still attached,
+        // because `/worktree remove` hard-returns "This conversation is not using
+        // a worktree." when `isolation_env_id` is null (command-handler.ts:428).
+        // That state is reachable, not hypothetical: the `stale_cleaned` branch in
+        // validateAndResolveIsolation (orchestrator.ts:204) clears
+        // `isolation_env_id` and leaves `cwd` set, so a workflow run can strand a
+        // conversation exactly here and the next chat turn would be told to run a
+        // command that dead-ends. `/setproject` clears the cwd override and works
+        // in both states, so it is the one suggestion that always applies.
+        await platform.sendMessage(
+          conversationId,
+          `This conversation's working directory no longer exists:\n\`${conversation.cwd}\`\n\n` +
+            (conversation.isolation_env_id !== null
+              ? 'Its isolated worktree was removed after this conversation was bound to it. ' +
+                'Run `/worktree remove` to detach and go back to the project root, or ' +
+                '`/setproject <name>` to rebind this conversation to a project.'
+              : 'This conversation is not bound to an isolated workspace, so there is nothing ' +
+                'to detach. Run `/setproject <name>` to rebind this conversation to a project.')
+        );
+        return;
+      }
+    }
+
     // Persist the inbound user message for non-web platforms (Slack/Telegram/
     // GitHub/Discord/CLI) — the web adapter's route persists web turns itself.
     // Placed AFTER the deterministic-command and approval early-returns so only

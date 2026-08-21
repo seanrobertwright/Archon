@@ -1662,6 +1662,70 @@ describe('onConversationClosed', () => {
       deleteRemoteBranch: undefined,
     });
   });
+
+  test('clears cwd when it points at the environment being removed', async () => {
+    mockGetConversationByPlatformId.mockResolvedValueOnce({
+      id: 'conv-cwd',
+      isolation_env_id: 'env-cwd',
+      cwd: '/workspace/worktrees/pr-300',
+    });
+    mockGetActiveSession.mockResolvedValueOnce(null);
+
+    const env = {
+      id: 'env-cwd',
+      codebase_id: 'codebase-1',
+      working_path: '/workspace/worktrees/pr-300',
+      branch_name: 'feature-z',
+      status: 'active',
+    };
+    mockGetById.mockResolvedValueOnce(env);
+    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
+    mockGetById.mockResolvedValueOnce(env);
+    mockGetCodebase.mockResolvedValueOnce({
+      id: 'codebase-1',
+      name: 'test-repo',
+      default_cwd: '/workspace/repo',
+    });
+
+    await onConversationClosed('github', 'owner/repo#300');
+
+    // Leaving cwd set would strand the conversation on a deleted directory.
+    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-cwd', {
+      isolation_env_id: null,
+      cwd: null,
+    });
+  });
+
+  test('leaves an unrelated cwd untouched', async () => {
+    mockGetConversationByPlatformId.mockResolvedValueOnce({
+      id: 'conv-other-cwd',
+      isolation_env_id: 'env-other',
+      cwd: '/somewhere/else',
+    });
+    mockGetActiveSession.mockResolvedValueOnce(null);
+
+    const env = {
+      id: 'env-other',
+      codebase_id: 'codebase-1',
+      working_path: '/workspace/worktrees/pr-301',
+      branch_name: 'feature-w',
+      status: 'active',
+    };
+    mockGetById.mockResolvedValueOnce(env);
+    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
+    mockGetById.mockResolvedValueOnce(env);
+    mockGetCodebase.mockResolvedValueOnce({
+      id: 'codebase-1',
+      name: 'test-repo',
+      default_cwd: '/workspace/repo',
+    });
+
+    await onConversationClosed('github', 'owner/repo#301');
+
+    expect(mockUpdateConversation).toHaveBeenCalledWith('conv-other-cwd', {
+      isolation_env_id: null,
+    });
+  });
 });
 
 describe('cleanupStaleWorktrees', () => {

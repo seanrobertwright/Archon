@@ -264,9 +264,19 @@ export async function onConversationClosed(
     return;
   }
 
-  // Clear this conversation's reference (best-effort - conversation may be deleted)
+  // Clear this conversation's reference (best-effort - conversation may be deleted).
+  // `cwd` is cleared alongside it when it names the environment being torn down:
+  // leaving it set would strand the conversation on a directory that is about to
+  // be deleted, and a chat turn uses `cwd` verbatim (the orchestrator refuses the
+  // turn outright once the path is gone). Null means "no override" — the
+  // conversation falls back to codebase.default_cwd, the same end state
+  // /setproject produces. A cwd pointing somewhere else is left untouched.
+  const cwdBelongsToEnv = conversation.cwd === env.working_path;
   await conversationDb
-    .updateConversation(conversation.id, { isolation_env_id: null })
+    .updateConversation(conversation.id, {
+      isolation_env_id: null,
+      ...(cwdBelongsToEnv ? { cwd: null } : {}),
+    })
     .catch(err => {
       if (!(err instanceof ConversationNotFoundError)) throw err;
     });
