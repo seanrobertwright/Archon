@@ -146,6 +146,9 @@ const mockHydrateResumableRun = mock(
       priorCompletedNodes: new Map([['n1', 'v1']]),
     }) as unknown
 );
+/** Ownership calls the dispatch path makes on its capture, in order. */
+const capturedSourceOwnerCalls: string[] = [];
+
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   hydrateResumableRun: mockHydrateResumableRun,
@@ -180,8 +183,34 @@ mock.module('@archon/workflows/executor', () => ({
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
   withCapturedSource: mock(
-    async (body: (owner: { hold: () => void; adopt: () => void }) => Promise<unknown>) =>
-      body({ hold: () => undefined, adopt: () => undefined })
+    async (
+      body: (owner: {
+        hold: (prepared: { captureRoot: string }) => void;
+        adopt: () => void;
+      }) => Promise<unknown>
+    ) => {
+      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim. A stub
+      // that swallowed the owner would let a dropped adopt() through, and one that
+      // recorded only hold/adopt would still miss an adopt that arrives after the body
+      // returns — by which time the real wrapper has already deleted the capture a live
+      // run is executing from. Recording the reclaim in order is what distinguishes them.
+      let held: string | undefined;
+      let adopted = false;
+      try {
+        return await body({
+          hold: prepared => {
+            held = prepared.captureRoot;
+            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
+          },
+          adopt: () => {
+            adopted = true;
+            capturedSourceOwnerCalls.push('adopt');
+          },
+        });
+      } finally {
+        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
+      }
+    }
   ),
 }));
 
@@ -1715,6 +1744,7 @@ describe('workflow dispatch routing — interactive flag', () => {
   }
 
   beforeEach(() => {
+    capturedSourceOwnerCalls.length = 0;
     mockExecuteWorkflow.mockClear();
     mockDispatchBackgroundWorkflow.mockClear();
     mockFindResumableRunByParentConversation.mockClear();
@@ -2117,6 +2147,51 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(sent).toContain("requires input 'diff'");
     expect(sent).toContain('--input');
     expect(sent).not.toContain('reusable block');
+  });
+
+  test('hands the capture to a fresh foreground run', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'adopt']);
+  });
+
+  test('keeps holding the capture when the dispatch refuses after taking it', async () => {
+    // The invocation gate fires AFTER the capture, so every refusal past that point has a
+    // frozen tree to reclaim. Nothing starts, so nothing owns it.
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
+    );
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'reclaim:/capture']);
+  });
+
+  test('a continuation takes no capture at all', async () => {
+    // It executes the source its run already froze. Capturing here would freeze current
+    // bytes the run never agreed to AND leave a staged tree nothing adopts.
+    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
+    (prepareWorkflowSource as ReturnType<typeof mock>).mockClear();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(makeResumableRun({ id: 'paused-run', status: 'paused' }))
+    );
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(prepareWorkflowSource).not.toHaveBeenCalled();
+    expect(capturedSourceOwnerCalls).toEqual([]);
   });
 
   test('refuses an undeclared supplied key, starting nothing', async () => {

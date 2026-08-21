@@ -154,6 +154,9 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 // Resolves to a paused result so dispatchBackgroundWorkflow's fire-and-forget
 // tail is a no-op (no result card is surfaced to the parent conversation).
 const mockExecuteWorkflow = mock(() => Promise.resolve({ paused: true }));
+/** Ownership calls the dispatch path makes on its capture, in order. */
+const capturedSourceOwnerCalls: string[] = [];
+
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   // Source capture runs before dispatch and does real filesystem work; stub it so these
@@ -187,8 +190,34 @@ mock.module('@archon/workflows/executor', () => ({
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
   withCapturedSource: mock(
-    async (body: (owner: { hold: () => void; adopt: () => void }) => Promise<unknown>) =>
-      body({ hold: () => undefined, adopt: () => undefined })
+    async (
+      body: (owner: {
+        hold: (prepared: { captureRoot: string }) => void;
+        adopt: () => void;
+      }) => Promise<unknown>
+    ) => {
+      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim. A stub
+      // that swallowed the owner would let a dropped adopt() through, and one that
+      // recorded only hold/adopt would still miss an adopt that arrives after the body
+      // returns — by which time the real wrapper has already deleted the capture a live
+      // run is executing from. Recording the reclaim in order is what distinguishes them.
+      let held: string | undefined;
+      let adopted = false;
+      try {
+        return await body({
+          hold: prepared => {
+            held = prepared.captureRoot;
+            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
+          },
+          adopt: () => {
+            adopted = true;
+            capturedSourceOwnerCalls.push('adopt');
+          },
+        });
+      } finally {
+        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
+      }
+    }
   ),
 }));
 mock.module('@archon/workflows/router', () => ({
@@ -388,6 +417,7 @@ describe('dispatchBackgroundWorkflow', () => {
 
   beforeEach(() => {
     platform = new MockPlatformAdapter();
+    capturedSourceOwnerCalls.length = 0;
     mockResolve.mockClear();
     mockUpdateConversation.mockClear();
     mockCreateWorkflowRun.mockClear();
@@ -454,6 +484,36 @@ describe('dispatchBackgroundWorkflow', () => {
     );
 
     await flushBackgroundExecution();
+  });
+
+  test('adopts the capture BEFORE returning, not inside the fire-and-forget tail', async () => {
+    // The wrapper reclaims whatever is still held the moment this function returns, and
+    // execution here is fire-and-forget — so `adopt()` has to run synchronously, ahead of
+    // the first await inside that tail. Push an await in front of it and the wrapper
+    // deletes the capture a live run is executing from. Asserting BEFORE the flush is the
+    // whole point: after it, an adopt that came too late looks identical to one on time.
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'adopt']);
+
+    await flushBackgroundExecution();
+  });
+
+  test('keeps holding the capture when the dispatch gives up after taking it', async () => {
+    // No run exists to own the bytes, so the wrapper must reclaim them — one leaked tree
+    // per failed dispatch otherwise, on the console's default path.
+    const { recordSelectedWorkflow } = await import('@archon/workflows/executor');
+    (recordSelectedWorkflow as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('capture manifest is read-only')
+    );
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'reclaim:/capture']);
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
   });
 
   // This path PRE-CREATES the run row (so the console can fetch it immediately), which

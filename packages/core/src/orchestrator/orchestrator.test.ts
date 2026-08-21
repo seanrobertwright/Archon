@@ -202,6 +202,9 @@ mock.module('../utils/error-formatter', () => ({
 mock.module('@archon/workflows/workflow-discovery', () => ({
   discoverWorkflowsWithConfig: mockDiscoverWorkflows,
 }));
+/** Ownership calls the dispatch path makes on its capture, in order. */
+const capturedSourceOwnerCalls: string[] = [];
+
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   hydrateResumableRun: mock(() => Promise.resolve(null)),
@@ -236,8 +239,34 @@ mock.module('@archon/workflows/executor', () => ({
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
   withCapturedSource: mock(
-    async (body: (owner: { hold: () => void; adopt: () => void }) => Promise<unknown>) =>
-      body({ hold: () => undefined, adopt: () => undefined })
+    async (
+      body: (owner: {
+        hold: (prepared: { captureRoot: string }) => void;
+        adopt: () => void;
+      }) => Promise<unknown>
+    ) => {
+      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim. A stub
+      // that swallowed the owner would let a dropped adopt() through, and one that
+      // recorded only hold/adopt would still miss an adopt that arrives after the body
+      // returns — by which time the real wrapper has already deleted the capture a live
+      // run is executing from. Recording the reclaim in order is what distinguishes them.
+      let held: string | undefined;
+      let adopted = false;
+      try {
+        return await body({
+          hold: prepared => {
+            held = prepared.captureRoot;
+            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
+          },
+          adopt: () => {
+            adopted = true;
+            capturedSourceOwnerCalls.push('adopt');
+          },
+        });
+      } finally {
+        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
+      }
+    }
   ),
 }));
 mock.module('@archon/workflows/router', () => ({
