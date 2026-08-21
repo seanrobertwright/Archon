@@ -9,11 +9,7 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
-import {
-  liveSourceRoots,
-  type WorkflowSourceConfig,
-  type WorkflowSourceRoots,
-} from './workflow-source';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
@@ -290,8 +286,7 @@ export async function loadCommandPrompt(
   cwd: string,
   commandName: string,
   configuredFolder?: string,
-  sourceRoots?: WorkflowSourceRoots,
-  sourceConfig?: WorkflowSourceConfig
+  sourceRoots?: WorkflowSourceRoots
 ): Promise<LoadCommandResult> {
   const roots = sourceRoots ?? liveSourceRoots(cwd);
   // Validate command name first
@@ -304,8 +299,10 @@ export async function loadCommandPrompt(
     };
   }
 
-  // Load config to check opt-out
-  let loadDefaultCommands = sourceConfig?.load_default_commands;
+  // Opt-out comes from the SOURCE when there is one — a capture carries the settings that
+  // were in force when it was taken, so a resume cannot let the target's `defaults:`
+  // decide whether the bundled scope counts. Falls back to reading `cwd` live.
+  let loadDefaultCommands = sourceRoots?.config.load_default_commands;
   if (loadDefaultCommands === undefined) {
     try {
       loadDefaultCommands = (await deps.loadConfig(cwd)).defaults?.loadDefaultCommands ?? true;
@@ -410,7 +407,12 @@ export async function loadCommandPrompt(
   // Each scope is walked 1 subfolder deep so `triage/review.md` resolves as
   // `review` — matching the workflows/scripts convention. Resolution
   // precedence: repo > home (~/.archon/commands/) > bundled/app defaults.
-  const searchPaths = archonPaths.getCommandFolderSearchPaths(configuredFolder);
+  // The SOURCE's command folder, when a capture supplied one. `configuredFolder` is the
+  // target's, which is the right answer only for an in-place run — for a captured run it
+  // would search folders the frozen source never used.
+  const searchPaths = archonPaths.getCommandFolderSearchPaths(
+    sourceRoots?.config.command_folder ?? configuredFolder
+  );
   const projectRoot = roots.project;
   const resolvedSearchPaths: string[] = [
     ...(projectRoot !== null ? searchPaths.map(folder => join(projectRoot, folder)) : []),

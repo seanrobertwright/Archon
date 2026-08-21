@@ -658,7 +658,11 @@ export async function finalizeWorkflowSource(
   await mkdir(dirname(finalRoot), { recursive: true });
   await rm(finalRoot, { recursive: true, force: true });
   await rename(prepared.captureRoot, finalRoot);
-  return { ...prepared, captureRoot: finalRoot, roots: capturedSourceRoots(finalRoot) };
+  return {
+    ...prepared,
+    captureRoot: finalRoot,
+    roots: capturedSourceRoots(finalRoot, prepared.manifest.source_config),
+  };
 }
 
 /**
@@ -721,7 +725,7 @@ export async function prepareWorkflowSource(
     captureRoot: capture.captureRoot,
     origin: capture.origin,
     manifest: capture.manifest,
-    roots: capturedSourceRoots(capture.captureRoot),
+    roots: capturedSourceRoots(capture.captureRoot, capture.manifest.source_config),
   };
 }
 
@@ -1275,7 +1279,12 @@ async function maybeResumeParentRun(
     const { workflows } = await discoverWorkflowsWithConfig(
       parentCwd,
       deps.loadConfig,
-      parentSourceRoot === undefined ? undefined : capturedSourceRoots(parentSourceRoot)
+      parentSourceRoot === undefined
+        ? undefined
+        : capturedSourceRoots(
+            parentSourceRoot,
+            (await loadWorkflowSource(parentSourceRoot)).manifest.source_config
+          )
     );
     parentWorkflow = resolveWorkflowName(
       parent.workflow_name,
@@ -1954,7 +1963,10 @@ export async function executeWorkflow(
     try {
       const loaded = await loadWorkflowSource(recordedSource.root, recordedSource.digest);
       assertBundledSourceStillTrustworthy(loaded.manifest);
-      workflowSourceRoots = capturedSourceRoots(recordedSource.root);
+      // The settings frozen WITH the capture, not the target's. Without this a resume
+      // would re-read `commands.folder` and `defaults:` from the workspace it acts on and
+      // reinterpret the frozen bytes through them.
+      workflowSourceRoots = capturedSourceRoots(recordedSource.root, loaded.manifest.source_config);
       getLog().debug(
         { workflowRunId: workflowRun.id, captureRoot: recordedSource.root },
         'workflow.source_restored'
@@ -1997,7 +2009,10 @@ export async function executeWorkflow(
         `Could not move this run's captured workflow source into place: ${(error as Error).message}`
       );
     }
-    workflowSourceRoots = capturedSourceRoots(finalCaptureRoot);
+    workflowSourceRoots = capturedSourceRoots(
+      finalCaptureRoot,
+      preparedSource.manifest.source_config
+    );
     const sourceRecord = {
       version: 1 as const,
       root: finalCaptureRoot,

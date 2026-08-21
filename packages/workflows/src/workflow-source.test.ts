@@ -514,3 +514,56 @@ describe('the capture is authoritative, not advisory', () => {
     expect(reloaded.manifest.digest).toBe(capture.manifest.digest);
   });
 });
+
+describe("the source's own settings travel with its bytes", () => {
+  test('a custom commands.folder is captured and resolves from the capture', async () => {
+    // Discovery honors `commands.folder`, so a capture taken without it finds the command
+    // at selection time and loses it at execution time.
+    await mkdir(join(source, 'team-commands'), { recursive: true });
+    await writeFile(join(source, 'team-commands', 'shipit.md'), 'ship it');
+
+    const capture = await captureWorkflowSource({
+      sourceRoot: source,
+      captureRoot: getRunSourceCapturePath(runArtifacts),
+      commandFolder: 'team-commands',
+      sourceConfig: {
+        load_default_workflows: true,
+        load_default_commands: true,
+        command_folder: 'team-commands',
+      },
+    });
+
+    expect(capture.manifest.source_config.command_folder).toBe('team-commands');
+
+    // Resolved with the TARGET's cwd and no target-side folder setting: the only way this
+    // finds the command is by using the folder the capture recorded.
+    const result = await loadCommandPrompt(
+      deps,
+      target,
+      'shipit',
+      undefined,
+      capturedSourceRoots(capture.captureRoot, capture.manifest.source_config)
+    );
+    expect(result).toEqual({ success: true, content: 'ship it' });
+  });
+
+  test('without the recorded folder the same command is not found', async () => {
+    await mkdir(join(source, 'team-commands'), { recursive: true });
+    await writeFile(join(source, 'team-commands', 'shipit.md'), 'ship it');
+    const capture = await captureWorkflowSource({
+      sourceRoot: source,
+      captureRoot: getRunSourceCapturePath(runArtifacts),
+      commandFolder: 'team-commands',
+    });
+
+    // Default config — the folder was captured but the settings were not recorded.
+    const result = await loadCommandPrompt(
+      deps,
+      target,
+      'shipit',
+      undefined,
+      capturedSourceRoots(capture.captureRoot)
+    );
+    expect(result.success).toBe(false);
+  });
+});

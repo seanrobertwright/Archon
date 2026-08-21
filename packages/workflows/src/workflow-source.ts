@@ -112,6 +112,17 @@ export interface WorkflowSourceRoots {
   globalScripts: string;
   /** Directory holding packaged bundled workflows (the parent of the defaults folder). */
   bundledWorkflows: string;
+  /**
+   * The SOURCE's own settings for what those roots mean.
+   *
+   * Carried here rather than passed beside it, because the two are meaningless apart: a
+   * root without its `command_folder` resolves a different set of files than the source
+   * intended, and the source's `loadDefaultCommands` is what decides whether the bundled
+   * root counts at all. Two values that must always travel together are two values that
+   * eventually do not — and every leaf that received only one would silently resolve
+   * against the target's settings instead.
+   */
+  config: WorkflowSourceConfig;
 }
 
 /** Source-side settings that affect which executable bytes a workflow resolves. */
@@ -129,13 +140,17 @@ export const DEFAULT_WORKFLOW_SOURCE_CONFIG: WorkflowSourceConfig = {
 };
 
 /** Roots for reading source live off disk, exactly as Archon always has. */
-export function liveSourceRoots(project: string | null): WorkflowSourceRoots {
+export function liveSourceRoots(
+  project: string | null,
+  config: WorkflowSourceConfig = DEFAULT_WORKFLOW_SOURCE_CONFIG
+): WorkflowSourceRoots {
   return {
     project,
     globalWorkflows: archonPaths.getHomeWorkflowsPath(),
     globalCommands: archonPaths.getHomeCommandsPath(),
     globalScripts: archonPaths.getHomeScriptsPath(),
     bundledWorkflows: dirname(archonPaths.getDefaultWorkflowsPath()),
+    config,
   };
 }
 
@@ -146,7 +161,12 @@ export function liveSourceRoots(project: string | null): WorkflowSourceRoots {
  * compiled in rather than stored on disk, so there was nothing to copy and nothing that
  * can change under the run.
  */
-export function capturedSourceRoots(captureRoot: string): WorkflowSourceRoots {
+export function capturedSourceRoots(
+  captureRoot: string,
+  /** From the capture's manifest, so a resume cannot reinterpret frozen bytes with the
+   *  TARGET's settings. */
+  config: WorkflowSourceConfig = DEFAULT_WORKFLOW_SOURCE_CONFIG
+): WorkflowSourceRoots {
   return {
     project: join(captureRoot, PROJECT_SCOPE_DIR),
     globalWorkflows: join(captureRoot, GLOBAL_SCOPE_DIR, 'workflows'),
@@ -155,6 +175,7 @@ export function capturedSourceRoots(captureRoot: string): WorkflowSourceRoots {
     bundledWorkflows: isBinaryBuild()
       ? dirname(archonPaths.getDefaultWorkflowsPath())
       : join(captureRoot, BUNDLED_SCOPE_DIR),
+    config,
   };
 }
 

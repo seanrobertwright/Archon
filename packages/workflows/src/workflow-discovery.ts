@@ -29,11 +29,7 @@ import type {
 } from './schemas';
 import { isIncludeNode, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
-import {
-  liveSourceRoots,
-  type WorkflowSourceConfig,
-  type WorkflowSourceRoots,
-} from './workflow-source';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 // Re-exported here because this is the module callers already import to discover with.
 export { liveSourceRoots } from './workflow-source';
 export type { WorkflowSourceRoots } from './workflow-source';
@@ -864,14 +860,17 @@ export async function discoverWorkflowsWithConfig(
     commands?: { folder?: string };
   }>,
   /**
-   * Where source is read from, when that is not `cwd`. An executing run passes the roots
-   * of its frozen capture; every listing caller omits it and keeps reading the working
-   * directory. Config is always read from `cwd` regardless — settings belong to the
-   * workspace being acted on, not to the source being executed.
+   * Where source is read from, when that is not `cwd`, and the settings that govern it.
+   *
+   * An executing run passes the roots of its frozen capture; every listing caller omits
+   * this and keeps reading the working directory live. The settings ride ON the roots
+   * because they decide what those roots mean — which command folder is searched, and
+   * whether the bundled scope counts at all — and a resume must use the ones in force
+   * when the capture was taken, not the target's.
    */
-  sourceRoots?: WorkflowSourceRoots,
-  sourceConfig?: WorkflowSourceConfig
+  sourceRoots?: WorkflowSourceRoots
 ): Promise<WorkflowLoadResult> {
+  const sourceConfig = sourceRoots?.config;
   let loadDefaults = sourceConfig?.load_default_workflows ?? true;
   // Command-scan parity: pass the repo's configured command folder + loadDefaultCommands
   // opt-out through so the include safety scan resolves the same command files the
