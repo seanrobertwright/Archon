@@ -540,11 +540,15 @@ export async function rejectWorkflow(
   const rejectReason = reason ?? 'Rejected';
   const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
   const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
-  // `!= null` (not `!== undefined`): a gate with no on_reject leaves this ABSENT
-  // today (pauseWorkflowRun replaces the approval object wholesale, #2673), but runs
-  // paused by builds before that change hold a stored explicit null. Both must read
-  // as "not configured", so keep the loose check — tightening it would cancel a
-  // legacy paused run's rework on resume.
+  // `!= null` (not `!== undefined`): "no on_reject" reaches this read in two stored
+  // shapes. Absent — every pause since #2673 (the approval object is replaced
+  // wholesale, so an unset field is simply not there), and every SQLite pause before
+  // it too, since json_patch is RFC 7396 and DELETED the key the old explicit-null
+  // reset patched. An explicit JSON null — Postgres runs paused before #2673, where
+  // `||` stored the null as written. Keep the loose check: `null !== undefined` is
+  // true, so tightening would read such a run as HAVING an on_reject and stage a
+  // rework the workflow never declared — and the resume path takes its prompt from
+  // `node.approval.on_reject` (dag-executor), which is exactly what is missing.
   const onRejectConfigured = approval?.onRejectPrompt != null;
   const maxAttemptsReached = onRejectConfigured && currentCount + 1 >= maxAttempts;
   // The on_reject rework is staged (run stays 'paused') only when a prompt is
