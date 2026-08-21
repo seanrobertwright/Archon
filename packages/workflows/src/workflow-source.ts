@@ -14,32 +14,49 @@
  * and megabytes of `state/` along with it.
  *
  * This module replaces that copy with a capture the RUN owns: the source directories
- * are frozen once, at run start, into `<run artifacts>/workflow-source/`, and every
- * later lookup resolves against the capture instead of the target. Two consequences
- * matter:
+ * are frozen once, before the workflow is even selected, and every later lookup
+ * resolves against the capture instead of the target. Two consequences matter:
  *
  *   - **The target stays clean.** Nothing is written into B at all.
- *   - **The run stops moving under itself.** Editing or deleting A mid-run no longer
- *     changes the graph a paused run resumes into. That determinism is not new; today
- *     the `.archon` copy provides it accidentally. It is preserved here on purpose,
- *     somewhere it does not contaminate anything.
+ *   - **The run stops moving under itself.** Editing or deleting A mid-run cannot
+ *     change the graph a paused run resumes into.
  *
- * The capture mirrors relative paths exactly, so `captureRoot` is a drop-in
- * replacement for a project root: `join(captureRoot, '.archon', 'workflows')` resolves
- * the same way `join(cwd, '.archon', 'workflows')` always has. That is deliberate —
- * it is what lets every existing resolver keep its shape and take a different root
- * instead of learning a new resource-lookup protocol.
+ * The capture is the SOLE executable source for its run, not a convenience copy. That
+ * is why a capture that cannot be taken, recorded, or verified fails the run instead of
+ * degrading to live source: a silent fallback would reintroduce exactly the drift the
+ * capture exists to remove. The one exception is a run created before captures existed,
+ * which has no record to honor and resumes the way it always did, with a warning.
  *
- * SCOPE: only PROJECT-scope source is captured. Global (`~/.archon`) and bundled
- * source are left live, because neither participates in the source/target split that
- * causes the bug: they resolve identically from any cwd. Freezing them would buy only
- * protection against a user editing their own home directory mid-run, at the cost of
- * copying two more trees per run.
+ * SCOPE: every source scope a static `include:` can reach is captured — project, global
+ * (`~/.archon/`), and, in source builds, the on-disk bundled defaults. Freezing only the
+ * project scope would leave a hole: a project workflow that includes a global one would
+ * still change shape across a resume. In a compiled binary the bundled defaults are
+ * embedded constants rather than files, so they cannot move under a run at all; the
+ * manifest records the engine version, which is what distinguishes one binary's bundled
+ * set from another's.
+ *
+ * Runtime `workflow:` children are deliberately NOT part of the closure. A child is not a
+ * run until it starts and freezes its own source — see {@link resolveChildDiscoveryRoot}.
  */
-import { mkdir, readdir, copyFile, rm, rename, stat, lstat, realpath } from 'fs/promises';
+import {
+  mkdir,
+  readdir,
+  copyFile,
+  rm,
+  rename,
+  stat,
+  lstat,
+  realpath,
+  readFile,
+  writeFile,
+} from 'fs/promises';
+import { createHash } from 'crypto';
 import { dirname, join, relative, sep } from 'path';
+import { z } from '@hono/zod-openapi';
 import { createLogger } from '@archon/paths';
 import * as archonPaths from '@archon/paths';
+import { BUNDLED_VERSION } from '@archon/paths/bundled-build';
+import { isBinaryBuild } from './defaults/bundled-defaults';
 import { readWorkflowSourceMetadata } from './schemas/workflow-run';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -48,6 +65,11 @@ function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.source');
   return cachedLog;
 }
+
+const PROJECT_SCOPE_DIR = 'project';
+const GLOBAL_SCOPE_DIR = 'global';
+const BUNDLED_SCOPE_DIR = 'bundled';
+const MANIFEST_FILE = 'manifest.json';
 
 /**
  * Directory names never worth capturing: build caches, virtualenvs, and VCS metadata.
@@ -73,24 +95,111 @@ const SKIP_DIRECTORIES = new Set([
  */
 const CAPTURE_WARN_BYTES = 64 * 1024 * 1024;
 
-/** Where a run's executable source came from, and what was frozen. */
-export interface WorkflowSourceCapture {
-  /** Absolute path usable directly as a project source root. */
-  captureRoot: string;
-  /** The authoring directory this was captured from. */
-  origin: string;
-  fileCount: number;
-  byteCount: number;
+/**
+ * The roots every source lookup resolves under.
+ *
+ * Naming the three scopes explicitly is what lets one set of resolvers serve both a live
+ * checkout and a run's frozen capture: the live form derives them from `ARCHON_HOME` and
+ * a project root, the captured form from a capture directory, and nothing downstream has
+ * to know which it was handed.
+ */
+export interface WorkflowSourceRoots {
+  /** Project root (the directory containing `.archon/`), or null with no project context. */
+  project: string | null;
+  globalWorkflows: string;
+  globalCommands: string;
+  globalScripts: string;
+  /** Directory holding packaged bundled workflows (the parent of the defaults folder). */
+  bundledWorkflows: string;
+}
+
+/** Roots for reading source live off disk, exactly as Archon always has. */
+export function liveSourceRoots(project: string | null): WorkflowSourceRoots {
+  return {
+    project,
+    globalWorkflows: archonPaths.getHomeWorkflowsPath(),
+    globalCommands: archonPaths.getHomeCommandsPath(),
+    globalScripts: archonPaths.getHomeScriptsPath(),
+    bundledWorkflows: dirname(archonPaths.getDefaultWorkflowsPath()),
+  };
 }
 
 /**
- * Project-relative directories that hold executable source.
+ * Roots for reading a run's frozen capture.
  *
- * `.archon/commands/defaults` is nested inside `.archon/commands`, and a configured
- * `commands.folder` may nest inside either — {@link dedupeNestedDirs} collapses those
- * so a directory is never copied twice.
+ * `bundledWorkflows` still points at the live path in a binary build: the bundled set is
+ * compiled in rather than stored on disk, so there was nothing to copy and nothing that
+ * can change under the run.
  */
-function sourceDirectories(commandFolder: string | undefined): string[] {
+export function capturedSourceRoots(captureRoot: string): WorkflowSourceRoots {
+  return {
+    project: join(captureRoot, PROJECT_SCOPE_DIR),
+    globalWorkflows: join(captureRoot, GLOBAL_SCOPE_DIR, 'workflows'),
+    globalCommands: join(captureRoot, GLOBAL_SCOPE_DIR, 'commands'),
+    globalScripts: join(captureRoot, GLOBAL_SCOPE_DIR, 'scripts'),
+    bundledWorkflows: isBinaryBuild()
+      ? dirname(archonPaths.getDefaultWorkflowsPath())
+      : join(captureRoot, BUNDLED_SCOPE_DIR),
+  };
+}
+
+/**
+ * What a capture records about itself.
+ *
+ * `digest` is the reason this file exists. A directory that merely EXISTS proves nothing
+ * about the bytes inside it: a partial restore, an interrupted sync, or an edit under the
+ * artifacts tree would all pass an existence check while changing what the run executes.
+ * Recomputing the digest on load is what makes the capture authoritative rather than
+ * merely present.
+ *
+ * `engine_version` is recorded, never enforced. It lets someone reading a run afterwards
+ * tell "this resumed under a different Archon" apart from "this changed" — including for
+ * the bundled scope a binary embeds rather than copies.
+ *
+ * `workflow_name` is stamped after selection (see {@link recordSelectedWorkflow}), because
+ * the capture is taken BEFORE discovery. That ordering is what stops a run executing one
+ * moment's YAML against another moment's scripts.
+ */
+export const workflowSourceManifestSchema = z.object({
+  version: z.literal(1),
+  engine_version: z.string(),
+  origin: z.string(),
+  captured_at: z.string(),
+  digest: z.string(),
+  file_count: z.number(),
+  byte_count: z.number(),
+  scopes: z.array(z.enum([PROJECT_SCOPE_DIR, GLOBAL_SCOPE_DIR, BUNDLED_SCOPE_DIR])),
+  /** Absent until the caller has selected which workflow this run executes. */
+  workflow_name: z.string().optional(),
+});
+
+export type WorkflowSourceManifest = z.infer<typeof workflowSourceManifestSchema>;
+
+/**
+ * A capture whose bytes could not be trusted.
+ *
+ * Distinct from an ordinary Error so callers can fail a run closed on it rather than
+ * treat it as one more reason to fall back to live source. Falling back is precisely what
+ * the capture exists to prevent.
+ */
+export class WorkflowSourceIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkflowSourceIntegrityError';
+  }
+}
+
+/** Where a run's executable source came from, and what was frozen. */
+export interface WorkflowSourceCapture {
+  /** Absolute path to the capture; pass to {@link capturedSourceRoots} to resolve under it. */
+  captureRoot: string;
+  /** The authoring directory this was captured from. */
+  origin: string;
+  manifest: WorkflowSourceManifest;
+}
+
+/** Project-relative directories that hold executable source. */
+function projectSourceDirs(commandFolder: string | undefined): string[] {
   return dedupeNestedDirs([
     ...archonPaths.getWorkflowFolderSearchPaths(),
     '.archon/scripts',
@@ -109,6 +218,15 @@ function dedupeNestedDirs(dirs: readonly string[]): string[] {
     candidate =>
       !normalized.some(other => other !== candidate && (candidate + sep).startsWith(other + sep))
   );
+}
+
+/** True when `path` exists and is a directory. */
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -138,13 +256,12 @@ async function copyTree(
     // Symlinks are DEREFERENCED into ordinary files. Preserving the link would keep a
     // live reference to a path outside the capture, which is the exact mutability this
     // module exists to remove. `stat` (not `lstat`) resolves the target; a dangling
-    // link throws ENOENT and is skipped below rather than failing the whole capture.
+    // link throws and is skipped below rather than failing the whole capture.
     let info;
     try {
       info = await stat(src);
     } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      getLog().warn({ err, path: src }, 'workflow.source_capture_entry_skipped');
+      getLog().warn({ err: error as Error, path: src }, 'workflow.source_capture_entry_skipped');
       continue;
     }
 
@@ -179,21 +296,61 @@ async function copyTree(
   return { files, bytes };
 }
 
-/** True when `path` exists and is a directory. */
-async function isDirectory(path: string): Promise<boolean> {
-  try {
-    return (await lstat(path)).isDirectory();
-  } catch {
-    return false;
+/**
+ * Content digest over every captured file.
+ *
+ * Path-and-bytes, sorted, so the value depends only on what was captured and never on
+ * walk order or timestamps. The manifest is excluded because it carries this value.
+ */
+async function digestTree(root: string): Promise<{ digest: string; files: number; bytes: number }> {
+  const hash = createHash('sha256');
+  let files = 0;
+  let bytes = 0;
+  const entries: string[] = [];
+
+  const walk = async (dir: string): Promise<void> => {
+    let dirEntries;
+    try {
+      dirEntries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of dirEntries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()) {
+        entries.push(full);
+      }
+    }
+  };
+  await walk(root);
+
+  for (const file of entries.sort()) {
+    const rel = relative(root, file).split(sep).join('/');
+    if (rel === MANIFEST_FILE) continue;
+    const content = await readFile(file);
+    files += 1;
+    bytes += content.byteLength;
+    hash.update(rel);
+    hash.update('\0');
+    hash.update(createHash('sha256').update(content).digest('hex'));
+    hash.update('\n');
   }
+
+  return { digest: hash.digest('hex'), files, bytes };
+}
+
+async function writeManifest(captureRoot: string, manifest: WorkflowSourceManifest): Promise<void> {
+  await writeFile(join(captureRoot, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 /**
- * Freeze `sourceRoot`'s project-scope executable source into `captureRoot`.
+ * Freeze `sourceRoot`'s executable source, plus every other statically reachable scope,
+ * into `captureRoot`.
  *
- * Returns `null` when the source root holds no executable source at all — there is
- * nothing to freeze, so the caller keeps resolving live and the run behaves exactly
- * as it did before this feature existed.
+ * Throws on failure. A capture is the run's only executable source, so a caller that
+ * cannot take one must fail the run rather than proceed against live files.
  *
  * The capture is built in a sibling `.partial` directory and renamed into place, so a
  * failure part-way through can never leave a half-populated capture that later reads
@@ -203,16 +360,30 @@ export async function captureWorkflowSource(opts: {
   sourceRoot: string;
   captureRoot: string;
   commandFolder?: string;
-}): Promise<WorkflowSourceCapture | null> {
+}): Promise<WorkflowSourceCapture> {
   const { sourceRoot, captureRoot, commandFolder } = opts;
 
-  const present: string[] = [];
-  for (const dir of sourceDirectories(commandFolder)) {
-    if (await isDirectory(join(sourceRoot, dir))) present.push(dir);
+  // (relative destination, absolute origin) pairs, one per directory worth copying.
+  const jobs: { dest: string; from: string; scope: 'project' | 'global' | 'bundled' }[] = [];
+
+  for (const dir of projectSourceDirs(commandFolder)) {
+    const from = join(sourceRoot, dir);
+    if (await isDirectory(from))
+      jobs.push({ dest: join(PROJECT_SCOPE_DIR, dir), from, scope: 'project' });
   }
-  if (present.length === 0) {
-    getLog().debug({ sourceRoot }, 'workflow.source_capture_skipped_empty');
-    return null;
+  for (const [name, from] of [
+    ['workflows', archonPaths.getHomeWorkflowsPath()],
+    ['commands', archonPaths.getHomeCommandsPath()],
+    ['scripts', archonPaths.getHomeScriptsPath()],
+  ] as const) {
+    if (await isDirectory(from))
+      jobs.push({ dest: join(GLOBAL_SCOPE_DIR, name), from, scope: 'global' });
+  }
+  // Source builds read bundled defaults off disk, so they are capturable and mutable.
+  // A binary embeds them as constants: nothing to copy, and nothing that can change.
+  if (!isBinaryBuild()) {
+    const from = dirname(archonPaths.getDefaultWorkflowsPath());
+    if (await isDirectory(from)) jobs.push({ dest: BUNDLED_SCOPE_DIR, from, scope: 'bundled' });
   }
 
   const staging = `${captureRoot}.partial`;
@@ -221,41 +392,125 @@ export async function captureWorkflowSource(opts: {
   let fileCount = 0;
   let byteCount = 0;
   try {
-    for (const dir of present) {
-      const target = join(staging, dir);
+    await mkdir(staging, { recursive: true });
+    for (const job of jobs) {
+      const target = join(staging, job.dest);
       await mkdir(dirname(target), { recursive: true });
-      const origin = join(sourceRoot, dir);
       // Seed the cycle guard with this root's canonical path so a link straight back to
       // the top of the tree is caught at depth one.
-      const rootCanonical = await realpath(origin).catch(() => origin);
-      const copied = await copyTree(origin, target, new Set([rootCanonical]));
+      const rootCanonical = await realpath(job.from).catch(() => job.from);
+      const copied = await copyTree(job.from, target, new Set([rootCanonical]));
       fileCount += copied.files;
       byteCount += copied.bytes;
     }
+
+    const { digest } = await digestTree(staging);
+    const manifest: WorkflowSourceManifest = {
+      version: 1,
+      engine_version: BUNDLED_VERSION,
+      origin: sourceRoot,
+      captured_at: new Date().toISOString(),
+      digest,
+      file_count: fileCount,
+      byte_count: byteCount,
+      scopes: [...new Set(jobs.map(j => j.scope))],
+    };
+    await writeManifest(staging, manifest);
+
     // Replace rather than merge: a stale capture at this path would silently mix two
     // vintages of source, which is the failure this module exists to prevent.
     await rm(captureRoot, { recursive: true, force: true });
     await mkdir(dirname(captureRoot), { recursive: true });
     await rename(staging, captureRoot);
+
+    if (byteCount > CAPTURE_WARN_BYTES) {
+      getLog().warn(
+        { sourceRoot, captureRoot, fileCount, byteCount, limitBytes: CAPTURE_WARN_BYTES },
+        'workflow.source_capture_large'
+      );
+    }
+    getLog().debug(
+      { sourceRoot, captureRoot, fileCount, byteCount, scopes: manifest.scopes },
+      'workflow.source_captured'
+    );
+    return { captureRoot, origin: sourceRoot, manifest };
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => {
       /* best-effort: the partial directory is inert, and the original error matters more */
     });
     throw error;
   }
+}
 
-  if (byteCount > CAPTURE_WARN_BYTES) {
-    getLog().warn(
-      { sourceRoot, captureRoot, fileCount, byteCount, limitBytes: CAPTURE_WARN_BYTES },
-      'workflow.source_capture_large'
+/**
+ * Stamp the selected workflow onto an existing capture.
+ *
+ * Selection happens after the capture because discovery must read the frozen bytes, not
+ * whatever is on disk a moment later. The manifest is excluded from the digest, so
+ * rewriting it here cannot invalidate the capture it describes.
+ */
+export async function recordSelectedWorkflow(
+  captureRoot: string,
+  workflowName: string
+): Promise<void> {
+  const manifest = await readManifest(captureRoot);
+  await writeManifest(captureRoot, { ...manifest, workflow_name: workflowName });
+}
+
+async function readManifest(captureRoot: string): Promise<WorkflowSourceManifest> {
+  let raw: string;
+  try {
+    raw = await readFile(join(captureRoot, MANIFEST_FILE), 'utf-8');
+  } catch (error) {
+    throw new WorkflowSourceIntegrityError(
+      `Workflow source capture at ${captureRoot} has no manifest: ${(error as Error).message}`
     );
   }
-  getLog().debug(
-    { sourceRoot, captureRoot, fileCount, byteCount, dirs: present },
-    'workflow.source_captured'
-  );
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(raw);
+  } catch (error) {
+    throw new WorkflowSourceIntegrityError(
+      `Workflow source manifest at ${captureRoot} is not valid JSON: ${(error as Error).message}`
+    );
+  }
+  const parsed = workflowSourceManifestSchema.safeParse(parsedJson);
+  if (!parsed.success) {
+    throw new WorkflowSourceIntegrityError(
+      `Workflow source manifest at ${captureRoot} is not a shape this build understands: ${parsed.error.message}`
+    );
+  }
+  return parsed.data;
+}
 
-  return { captureRoot, origin: sourceRoot, fileCount, byteCount };
+/**
+ * Load a capture and prove its bytes are the ones that were frozen.
+ *
+ * Throws {@link WorkflowSourceIntegrityError} when the manifest is missing, unreadable, of
+ * an unknown shape, or when the digest no longer matches. Every one of those means the
+ * run's executable source cannot be established, which is a reason to stop rather than to
+ * quietly execute something else.
+ */
+export async function loadWorkflowSource(captureRoot: string): Promise<WorkflowSourceCapture> {
+  const manifest = await readManifest(captureRoot);
+  const { digest } = await digestTree(captureRoot);
+  if (digest !== manifest.digest) {
+    throw new WorkflowSourceIntegrityError(
+      `Workflow source capture at ${captureRoot} does not match its recorded digest ` +
+        `(expected ${manifest.digest.slice(0, 12)}…, found ${digest.slice(0, 12)}…). ` +
+        'The captured source has changed since the run started.'
+    );
+  }
+  if (manifest.engine_version !== BUNDLED_VERSION) {
+    // Recorded, never enforced: a paused run must stay resumable across an upgrade. It is
+    // worth saying out loud, because the bundled scope a binary embeds is the one part of
+    // the source this capture cannot freeze.
+    getLog().warn(
+      { captureRoot, capturedBy: manifest.engine_version, runningOn: BUNDLED_VERSION },
+      'workflow.source_engine_version_changed'
+    );
+  }
+  return { captureRoot, origin: manifest.origin, manifest };
 }
 
 /** Canonical location of a run's captured source, under that run's artifacts. */
@@ -264,44 +519,35 @@ export function getRunSourceCapturePath(artifactsDir: string): string {
 }
 
 /**
- * True when `capturePath` still holds a usable capture.
+ * The frozen source a run recorded at start.
  *
- * Resume calls this before trusting recorded source. A capture that was removed (an
- * artifact-retention sweep, a hand-deleted run directory) must fall back to live
- * discovery with a warning rather than resolve every command to "not found".
- */
-export async function isCaptureUsable(capturePath: string): Promise<boolean> {
-  return isDirectory(capturePath);
-}
-
-/**
- * The frozen source a run recorded at start, if still on disk.
- *
- * This is what a run reloads its OWN graph and resources from. Returns `undefined` when
- * the run predates capture or its capture is gone — both mean "resolve live", the
- * pre-capture behavior.
+ * Throws {@link WorkflowSourceIntegrityError} when the run HAS a record but the capture
+ * cannot be verified. Returns `undefined` only when the run has no record at all — a run
+ * created before captures existed, which resumes against live source with a warning
+ * because its original bytes were never stored and cannot be reconstructed.
  */
 export async function resolveRunSourceRoot(
   metadata: Record<string, unknown> | undefined
 ): Promise<string | undefined> {
   const recorded = readWorkflowSourceMetadata(metadata);
   if (!recorded) return undefined;
-  return (await isDirectory(recorded.root)) ? recorded.root : undefined;
+  await loadWorkflowSource(recorded.root);
+  return recorded.root;
 }
 
 /**
  * The AUTHORING directory a run was captured from, if it still exists.
  *
  * Deliberately different from {@link resolveRunSourceRoot}, and the difference is the
- * whole contract for sub-runs: a run freezes its own source, but a `workflow:` child
- * that has not started yet is not a run, so it must not be frozen into its parent.
+ * whole contract for sub-runs: a run freezes its own source, but a `workflow:` child that
+ * has not started yet is not a run, so it must not be frozen into its parent.
  *
  * Two behaviors depend on reading the live origin here rather than the parent's capture:
  * a parent may author a workflow mid-flight and then execute it as a child, and — the
  * case with a test on it — a fan-out child cancelled at a gate is recovered by removing
- * the gate from the child workflow and resuming the parent. Resolving that child from
- * the parent's frozen copy would re-drive the OLD gated definition forever, so the fix
- * could never take. The child's own run captures at its own start, which is where its
+ * the gate from the child workflow and resuming the parent. Resolving that child from the
+ * parent's frozen copy would re-drive the OLD gated definition forever, so the fix could
+ * never take. The child's own run captures at its own start, which is where its
  * determinism begins.
  */
 export async function resolveChildDiscoveryRoot(
@@ -310,10 +556,4 @@ export async function resolveChildDiscoveryRoot(
   const recorded = readWorkflowSourceMetadata(metadata);
   if (!recorded) return undefined;
   return (await isDirectory(recorded.origin)) ? recorded.origin : undefined;
-}
-
-/** Describe a capture path relative to a run's artifacts, for log/event payloads. */
-export function describeCapture(artifactsDir: string, capturePath: string): string {
-  const rel = relative(artifactsDir, capturePath);
-  return rel === '' || rel.startsWith('..') ? capturePath : rel;
 }

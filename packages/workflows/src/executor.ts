@@ -1,7 +1,9 @@
 /**
  * Workflow Executor - runs DAG-based workflows
  */
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, rename, rm, writeFile } from 'fs/promises';
+import { join } from 'path';
+import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { dirname } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
@@ -32,10 +34,14 @@ import {
 } from './schemas';
 import {
   captureWorkflowSource,
+  capturedSourceRoots,
   getRunSourceCapturePath,
-  isCaptureUsable,
+  loadWorkflowSource,
+  recordSelectedWorkflow,
   resolveRunSourceRoot,
   resolveChildDiscoveryRoot,
+  type WorkflowSourceManifest,
+  type WorkflowSourceRoots,
 } from './workflow-source';
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
 import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
@@ -52,6 +58,9 @@ import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers'
 import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
+// Re-exported so callers driving the capture-first sequence need only this module.
+export { recordSelectedWorkflow, capturedSourceRoots } from './workflow-source';
+export type { WorkflowSourceRoots } from './workflow-source';
 import type { ChildIsolationResolver, ChildIsolationResult } from './child-isolation';
 export type {
   ChildIsolationResolver,
@@ -571,19 +580,77 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    */
   inputs?: Readonly<Record<string, string>>;
   /**
-   * Directory the workflow, its commands, and its scripts were DISCOVERED from, when
-   * that is not `cwd`.
+   * The frozen source this run executes, from {@link prepareWorkflowSource}.
    *
-   * The two diverge on every isolated run: the caller discovers from the authoring
-   * checkout and then executes against a fresh worktree. Passing the discovery root
-   * here is what lets the run freeze that source and keep resolving against it,
-   * instead of looking for the workflow's own files inside a workspace that never had
-   * them. Omitted means "same directory", which is correct for an in-place run.
+   * Callers that run a workflow read off disk MUST prepare one and discover the workflow
+   * from it, so the YAML being executed and the commands and scripts beside it are one
+   * consistent set of bytes. Omitting it is for in-process callers that build a
+   * definition themselves and have no on-disk source to freeze.
    *
    * Ignored on a resume: the run resolves the source it recorded at start.
    */
-  workflowSourceRoot?: string;
+  preparedSource?: PreparedWorkflowSource;
 };
+
+/**
+ * A capture taken BEFORE its workflow was selected, with the run id it is filed under.
+ *
+ * The reserved id is what makes the ordering possible: the capture has to live at the
+ * run's own artifacts path so a container can bind it and cleanup can reclaim it, but it
+ * has to exist before discovery — and therefore before the run row. Reserving the id up
+ * front is cheaper than inventing a second staging lifecycle for the gap.
+ */
+export interface PreparedWorkflowSource {
+  /** Reserved run id; the caller passes it back so the row and the capture agree. */
+  runId: string;
+  captureRoot: string;
+  origin: string;
+  manifest: WorkflowSourceManifest;
+  /** Roots to discover from — pass to `discoverWorkflowsWithConfig`. */
+  roots: WorkflowSourceRoots;
+}
+
+/**
+ * Freeze a run's executable source and reserve the run id it belongs to, BEFORE the
+ * workflow is discovered.
+ *
+ * Order is the whole point. Discovering first and capturing afterwards leaves a window
+ * where the YAML a run executes and the scripts it calls come from two different moments;
+ * capturing first and discovering from the capture closes it. Callers should therefore:
+ *
+ *   1. `prepareWorkflowSource(...)`
+ *   2. discover with `discoverWorkflowsWithConfig(cwd, loadConfig, prepared.roots)`
+ *   3. `recordSelectedWorkflow(prepared.captureRoot, workflow.name)`
+ *   4. `executeWorkflow(..., { preparedSource: prepared })`
+ *
+ * Throws when the source cannot be frozen. There is no degraded mode: a run with no
+ * capture has no established executable source.
+ */
+export async function prepareWorkflowSource(opts: {
+  /** Directory to freeze. */
+  sourceRoot: string;
+  commandFolder?: string;
+}): Promise<PreparedWorkflowSource> {
+  const runId = randomUUID();
+  // Staged, not final. The run's artifacts path depends on its registered project
+  // identity, which the caller often has not resolved yet at capture time — and looking
+  // it up early would duplicate a lookup the run does properly later. Staging under
+  // ARCHON_HOME keeps the capture on the same filesystem, so `executeWorkflow` moves it
+  // into `<artifactsDir>/workflow-source` with a rename once the real path is known. The
+  // bytes never change, so the digest taken here still describes the final capture.
+  const capture = await captureWorkflowSource({
+    sourceRoot: opts.sourceRoot,
+    captureRoot: join(archonPaths.getArchonHome(), 'staged-source', runId),
+    commandFolder: opts.commandFolder,
+  });
+  return {
+    runId,
+    captureRoot: capture.captureRoot,
+    origin: capture.origin,
+    manifest: capture.manifest,
+    roots: capturedSourceRoots(capture.captureRoot),
+  };
+}
 
 /**
  * Hydrate an already-located resumable `WorkflowRun` candidate into the form
@@ -723,13 +790,21 @@ async function runChildWorkflow(
     error,
   });
 
-  // Resolve the child against the parent's AUTHORING directory — live, not the parent's
-  // frozen copy of it. A sibling workflow lives next to the parent in that checkout,
-  // which the target workspace may never have contained; and reading it live is what
-  // lets an author fix a child workflow (removing a gate, say) and have a resumed parent
-  // pick the fix up. The child freezes its own source when its own run starts, which is
-  // also why this value is handed to it as `workflowSourceRoot`.
+  // A `workflow:` child freezes its own source AT ITS OWN START, from the parent's
+  // AUTHORING directory rather than the parent's frozen copy of it. Both halves matter:
+  // taking the bytes now (not at parent start) is what lets an author fix a child
+  // workflow — removing a gate, say — and have a resumed parent pick the fix up; and
+  // discovering from the capture rather than from the live directory is what stops the
+  // child executing one moment's YAML against another moment's scripts.
   const parentSourceRoot = await resolveChildDiscoveryRoot(parentRun.metadata);
+  let childSource: PreparedWorkflowSource | undefined;
+  try {
+    childSource = await prepareWorkflowSource({ sourceRoot: parentSourceRoot ?? cwd });
+  } catch (err) {
+    return failOutcome(
+      `Failed to capture workflow source for sub-run '${childWorkflowName}': ${(err as Error).message}`
+    );
+  }
 
   // 1. Resolve the child workflow by NAME (static target — constitution guardrail).
   //    Resolution runs BEFORE the cycle check so a case-variant / suffix / substring
@@ -745,11 +820,16 @@ async function runChildWorkflow(
     // table (reference/workflow-language-constitution.md) and locked by
     // `describe('workflow: late resolution is a deliberate affordance')` in
     // subrun.test.ts.
-    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, parentSourceRoot);
+    const { workflows } = await discoverWorkflowsWithConfig(
+      cwd,
+      deps.loadConfig,
+      childSource.roots
+    );
     childWorkflow = resolveWorkflowName(
       childWorkflowName,
       workflows.map(w => w.workflow)
     );
+    if (childWorkflow) await recordSelectedWorkflow(childSource.captureRoot, childWorkflow.name);
   } catch (err) {
     // resolveWorkflowName throws only on ambiguity.
     return failOutcome(
@@ -891,7 +971,7 @@ async function runChildWorkflow(
           ...hydrated,
           codebaseId,
           resolveChildIsolation,
-          workflowSourceRoot: parentSourceRoot,
+          preparedSource: childSource,
         };
         childRunId = hydrated.preCreatedRun.id;
       } else {
@@ -902,12 +982,14 @@ async function runChildWorkflow(
           preCreatedRun,
           codebaseId,
           resolveChildIsolation,
-          workflowSourceRoot: parentSourceRoot,
+          preparedSource: childSource,
         };
         childRunId = preCreatedRun.id;
       }
     } else {
       const childRun = await deps.store.createWorkflowRun({
+        // The id its capture is already filed under (see prepareWorkflowSource).
+        id: childSource.runId,
         workflow_name: childWorkflow.name,
         conversation_id: conversationDbId,
         codebase_id: codebaseId,
@@ -950,7 +1032,7 @@ async function runChildWorkflow(
         preCreatedRun: childRun,
         codebaseId,
         resolveChildIsolation,
-        workflowSourceRoot: parentSourceRoot,
+        preparedSource: childSource,
       };
       childRunId = childRun.id;
     }
@@ -1106,11 +1188,16 @@ async function maybeResumeParentRun(
     // Reload the parent's graph from the source IT started with. Rediscovering from
     // `parentCwd` is how a mid-run authoring edit used to change an already-running
     // parent's DAG, so stored node output could be reinterpreted by a different node.
+    // Reload the parent's graph from the source IT started with. Rediscovering from
+    // `parentCwd` is how a mid-run authoring edit used to change an already-running
+    // parent's DAG, so stored node output could be reinterpreted by a different node.
+    // Throws when the recorded capture no longer verifies; the catch below surfaces it
+    // and leaves the parent resumable rather than silently running other source.
     const parentSourceRoot = await resolveRunSourceRoot(parent.metadata);
     const { workflows } = await discoverWorkflowsWithConfig(
       parentCwd,
       deps.loadConfig,
-      parentSourceRoot
+      parentSourceRoot === undefined ? undefined : capturedSourceRoots(parentSourceRoot)
     );
     parentWorkflow = resolveWorkflowName(
       parent.workflow_name,
@@ -1240,7 +1327,7 @@ export async function executeWorkflow(
     container: containerCtx,
     resolveChildIsolation,
     inputs: suppliedInputs,
-    workflowSourceRoot: discoveredSourceRoot,
+    preparedSource,
   } = opts;
 
   if (preCreatedRun !== undefined) {
@@ -1473,6 +1560,9 @@ export async function executeWorkflow(
     // Create workflow run record
     try {
       workflowRun = await deps.store.createWorkflowRun({
+        // Reserved by `prepareWorkflowSource` so the row and its already-written source
+        // capture share one id; absent for callers that prepared nothing.
+        ...(preparedSource ? { id: preparedSource.runId } : {}),
         workflow_name: workflow.name,
         conversation_id: conversationDbId,
         codebase_id: codebaseId,
@@ -1749,86 +1839,117 @@ export async function executeWorkflow(
   // Order matters. A run that already RECORDED a source uses it, always — that is what
   // makes a resume deterministic. Only a run with no record captures, so a resume can
   // never recapture and quietly pull in edits made since it paused.
+  //
+  // This path FAILS CLOSED. A capture that cannot be taken, recorded, or verified means
+  // the run's executable source cannot be established, and running anyway would execute
+  // something other than what the run is supposed to be — the exact drift the capture
+  // exists to remove. The sole exception is a run created before captures existed, which
+  // has no record to honor.
   const recordedSource = readWorkflowSourceMetadata(workflowRun.metadata);
   const isResume = priorCompletedNodes !== undefined;
-  let workflowSourceRoot: string | undefined;
+  let workflowSourceRoots: WorkflowSourceRoots | undefined;
+
+  const failRunOnSource = async (message: string): Promise<WorkflowExecutionResult> => {
+    getLog().error({ workflowRunId: workflowRun.id, message }, 'workflow.source_unavailable');
+    await deps.store.failWorkflowRun(workflowRun.id, message).catch((dbErr: Error) => {
+      getLog().error(
+        { err: dbErr, workflowRunId: workflowRun.id },
+        'workflow.source_fail_db_record_failed'
+      );
+    });
+    await sendCriticalMessage(platform, conversationId, `❌ **Workflow failed**: ${message}`);
+    return { success: false, workflowRunId: workflowRun.id, error: message };
+  };
 
   if (recordedSource) {
-    if (await isCaptureUsable(recordedSource.root)) {
-      workflowSourceRoot = recordedSource.root;
+    // Verifies the digest, not merely that the directory exists: a partial restore or an
+    // edit under the artifacts tree would pass an existence check while changing what
+    // this run executes.
+    try {
+      await loadWorkflowSource(recordedSource.root);
+      workflowSourceRoots = capturedSourceRoots(recordedSource.root);
       getLog().debug(
-        { workflowRunId: workflowRun.id, sourceRoot: workflowSourceRoot },
+        { workflowRunId: workflowRun.id, captureRoot: recordedSource.root },
         'workflow.source_restored'
       );
-    } else {
-      // The capture is gone (artifact retention, a deleted run directory). Falling back
-      // to live source is better than failing every command lookup, but it is a real
-      // change in what this run executes, so it is never silent.
-      getLog().warn(
-        { workflowRunId: workflowRun.id, recordedRoot: recordedSource.root },
-        'workflow.source_capture_missing'
-      );
-      await safeSendMessage(
-        platform,
-        conversationId,
-        `⚠️ This run's captured workflow source is no longer at \`${recordedSource.root}\`. ` +
-          'Continuing with the current source on disk, which may differ from what the run started with.'
+    } catch (error) {
+      return await failRunOnSource(
+        `This run's captured workflow source at ${recordedSource.root} is missing or altered ` +
+          `(${(error as Error).message}). The run cannot be resumed against different source; ` +
+          'start a fresh run to execute the current workflow.'
       );
     }
   } else if (isResume) {
-    // Started before source capture existed. Its original bytes were never recorded and
+    // Created before source capture existed. Its original bytes were never recorded and
     // cannot be reconstructed, so it resumes the way it always did — against live source.
+    // This is the ONLY warning-and-continue path, and it retires with those runs.
     getLog().warn({ workflowRunId: workflowRun.id }, 'workflow.source_legacy_live');
-  } else {
-    const captureFrom = discoveredSourceRoot ?? cwd;
+    await safeSendMessage(
+      platform,
+      conversationId,
+      '⚠️ This run started before Archon captured workflow source, so there is nothing ' +
+        'recorded to resume from. Continuing against the current source on disk, which may ' +
+        'differ from what the run originally executed.'
+    );
+  } else if (preparedSource) {
+    // The normal fresh path: the caller captured BEFORE selecting a workflow and
+    // discovered from that capture, so the YAML being executed and the commands and
+    // scripts beside it are one consistent set of bytes.
+    //
+    // Move the staged capture under this run's artifacts, so it lives and dies with the
+    // rest of the run's output instead of accumulating in a staging directory nothing
+    // reclaims. Same filesystem, so this is a rename.
+    const finalCaptureRoot = getRunSourceCapturePath(artifactsDir);
     try {
-      const capture = await captureWorkflowSource({
-        sourceRoot: captureFrom,
-        captureRoot: getRunSourceCapturePath(artifactsDir),
-        commandFolder: configuredCommandFolder,
-      });
-      if (capture) {
-        workflowSourceRoot = capture.captureRoot;
-        await deps.store
-          .updateWorkflowRun(workflowRun.id, {
-            metadata: {
-              [WORKFLOW_SOURCE_METADATA_KEY]: {
-                version: 1,
-                root: capture.captureRoot,
-                origin: capture.origin,
-                captured_at: new Date().toISOString(),
-                file_count: capture.fileCount,
-                byte_count: capture.byteCount,
-              },
-            },
-          })
-          .catch((err: Error) => {
-            // The capture is on disk and this run will use it; only a LATER resume
-            // loses the pointer and falls back to live source with the warning above.
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, captureRoot: capture.captureRoot },
-              'workflow.source_metadata_persist_failed'
-            );
-          });
-        getLog().info(
-          {
-            workflowRunId: workflowRun.id,
-            origin: capture.origin,
-            fileCount: capture.fileCount,
-            byteCount: capture.byteCount,
-          },
-          'workflow.source_captured'
-        );
+      if (preparedSource.captureRoot !== finalCaptureRoot) {
+        await rm(finalCaptureRoot, { recursive: true, force: true });
+        await rename(preparedSource.captureRoot, finalCaptureRoot);
       }
     } catch (error) {
-      // Capture is an optimization of WHERE source is read, not a precondition for
-      // running. A failure here degrades to live resolution — the pre-capture behavior —
-      // rather than failing a run that would otherwise work.
-      getLog().error(
-        { err: error as Error, sourceRoot: captureFrom, workflowRunId: workflowRun.id },
-        'workflow.source_capture_failed'
+      return await failRunOnSource(
+        `Could not move this run's captured workflow source into place: ${(error as Error).message}`
       );
     }
+    workflowSourceRoots = capturedSourceRoots(finalCaptureRoot);
+    try {
+      await deps.store.updateWorkflowRun(workflowRun.id, {
+        metadata: {
+          [WORKFLOW_SOURCE_METADATA_KEY]: {
+            version: 1,
+            root: finalCaptureRoot,
+            origin: preparedSource.origin,
+            captured_at: preparedSource.manifest.captured_at,
+            digest: preparedSource.manifest.digest,
+            file_count: preparedSource.manifest.file_count,
+            byte_count: preparedSource.manifest.byte_count,
+          },
+        },
+      });
+    } catch (error) {
+      // Without the pointer the run is unresumable in the only way that matters: a later
+      // resume would find no record and fall through the legacy branch, executing live
+      // source. Fail now, while the failure is attributable.
+      return await failRunOnSource(
+        `Could not record this run's workflow source: ${(error as Error).message}`
+      );
+    }
+    getLog().info(
+      {
+        workflowRunId: workflowRun.id,
+        origin: preparedSource.origin,
+        captureRoot: finalCaptureRoot,
+        digest: preparedSource.manifest.digest.slice(0, 12),
+        fileCount: preparedSource.manifest.file_count,
+        byteCount: preparedSource.manifest.byte_count,
+      },
+      'workflow.source_captured'
+    );
+  } else {
+    // A fresh run whose caller did not prepare a capture. In-process callers that hand
+    // the executor a definition they built themselves (tests, programmatic embedders)
+    // land here; they have no on-disk source to freeze, so there is nothing to record
+    // and nothing that can drift. Resolution stays live under `cwd`, unchanged.
+    getLog().debug({ workflowRunId: workflowRun.id }, 'workflow.source_unprepared_live');
   }
 
   // Per-user AI-provider credentials (Phase 2). Resolved AFTER artifactsDir is
@@ -2104,7 +2225,16 @@ export async function executeWorkflow(
         runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
       dagPriorUsage,
       priorNodeSessions,
-      workflowSourceRoot
+      // Container runs resolve node-level source LIVE, from the mounted project root.
+      // A container `docker exec`s named scripts by absolute path, and the capture lives
+      // on the host outside the mount, so pointing at it would fail every named-script
+      // lookup. This is sound rather than a hole only because container isolation is
+      // folder-project-only and those run in place: source and target are the same
+      // mounted directory, and `--workflow-source` is refused with `--container` so they
+      // cannot diverge. The run's DEFINITION still comes from the capture, discovered on
+      // the host. Making the capture authoritative in-container as well needs a
+      // read-only bind of it at the same absolute path — see the PR discussion.
+      execContext.kind === 'container' ? undefined : workflowSourceRoots
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

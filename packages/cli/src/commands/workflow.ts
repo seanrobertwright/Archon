@@ -43,7 +43,15 @@ import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolat
 import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
-import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import {
+  capturedSourceRoots,
+  executeWorkflow,
+  hydrateResumableRun,
+  prepareWorkflowSource,
+  recordSelectedWorkflow,
+  type PreparedWorkflowSource,
+} from '@archon/workflows/executor';
+import { readWorkflowSourceMetadata } from '@archon/workflows/schemas/workflow-run';
 import {
   assertWorkflowRequirementsMet,
   resolveTopLevelInputs,
@@ -211,6 +219,15 @@ export interface WorkflowRunOptions {
    * covers both the internal resume/approve lookups and the user-facing split.
    */
   discoveryCwd?: string;
+  /**
+   * A run's already-recorded source capture, for continuing that run.
+   *
+   * Resume, approve, and reject re-enter through this command, and they must read the
+   * source the run FROZE, not take a fresh capture of whatever the target holds now — a
+   * workflow that lives only in the authoring checkout is not in the target at all, and
+   * even when it is, recapturing would resume the run against different bytes.
+   */
+  sourceCaptureRoot?: string;
   quiet?: boolean;
   verbose?: boolean;
   /** Platform conversation ID (e.g. `cli-{ts}-{rand}`), NOT a DB UUID. */
@@ -923,7 +940,41 @@ export async function workflowRunCommand(
   options: WorkflowRunOptions = {}
 ): Promise<void> {
   const effectiveDiscoveryCwd = options.discoveryCwd ?? cwd;
-  const { workflows: workflowEntries, errors } = await loadWorkflows(effectiveDiscoveryCwd);
+
+  // Freeze the source BEFORE discovering, then discover from the frozen copy. Discovering
+  // first and capturing after would leave a window where the YAML this run executes and
+  // the commands and scripts it calls come from two different moments — the drift the
+  // capture exists to remove, reintroduced at the one place nobody would look for it.
+  //
+  // A dry run creates no run and no artifacts, so it has nothing to freeze into and reads
+  // live, exactly as it did before captures existed.
+  // Continuing an existing run: discover from the source it recorded, and take no new
+  // capture. The executor verifies the same capture before executing a node.
+  const recordedRoots = options.sourceCaptureRoot
+    ? capturedSourceRoots(options.sourceCaptureRoot)
+    : undefined;
+
+  // A continuation never captures. With a record it reads that record (above); without
+  // one it is a run created before captures existed, and reads live source — the same
+  // legacy path the executor takes for it. Capturing here would freeze bytes the run
+  // never agreed to and still not make it deterministic.
+  const isContinuation = options.resume === true || options.sourceCaptureRoot !== undefined;
+
+  let preparedSource: PreparedWorkflowSource | undefined;
+  if (!recordedRoots && !isContinuation && !options.dryRun && !options.stubsInitPath) {
+    try {
+      preparedSource = await prepareWorkflowSource({ sourceRoot: effectiveDiscoveryCwd });
+    } catch (error) {
+      throw new Error(
+        `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
+      );
+    }
+  }
+
+  const discoveryRoots = recordedRoots ?? preparedSource?.roots;
+  const { workflows: workflowEntries, errors } = discoveryRoots
+    ? await discoverWorkflowsWithConfig(cwd, loadConfig, discoveryRoots)
+    : await loadWorkflows(effectiveDiscoveryCwd);
   const sourceCounts = countWorkflowSources(workflowEntries);
 
   if (!options.json && !options.quiet) {
@@ -946,6 +997,12 @@ export async function workflowRunCommand(
   // and for the parse warnings surfaced just below.
   const workflowEntry = workflow ? workflowEntries.find(ws => ws.workflow === workflow) : undefined;
   const workflowSource = workflowEntry?.source;
+
+  // Name the selection in the capture's manifest, now that it is known. The manifest is
+  // outside the digest, so this records provenance without disturbing what was frozen.
+  if (workflow && preparedSource) {
+    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+  }
 
   if (!workflow) {
     // Check if the requested workflow had a load error
@@ -2037,10 +2094,9 @@ export async function workflowRunCommand(
           resolveChildIsolation,
           // Fresh run only: a resume (`prepared`) replays the inputs already on its row.
           inputs: resolvedInputs,
-          // The directory the workflow was actually read from, which is NOT `workingCwd`
-          // once isolation has swapped in a worktree. A fresh run freezes this; a resume
-          // ignores it and uses the source already recorded on the run.
-          workflowSourceRoot: effectiveDiscoveryCwd,
+          // The frozen source this run executes, captured before the workflow was even
+          // selected. A resume ignores it and loads the source recorded on its own row.
+          preparedSource,
         };
     result = await executeWorkflow(
       deps,
@@ -2896,6 +2952,8 @@ export async function workflowResumeCommand(
   // itself no longer auto-detects resumable runs).
   try {
     await workflowRunCommand(run.working_path, run.workflow_name, run.user_message ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      sourceCaptureRoot: readWorkflowSourceMetadata(run.metadata)?.root,
       resume: true,
       codebaseId: run.codebase_id ?? undefined,
       discoveryCwd,
@@ -3078,6 +3136,10 @@ export async function workflowApproveCommand(
       : undefined;
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      sourceCaptureRoot: readWorkflowSourceMetadata(
+        (await workflowDb.getWorkflowRun(resolvedId))?.metadata
+      )?.root,
       resume: true,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,
@@ -3205,6 +3267,10 @@ export async function workflowRejectCommand(
       : undefined;
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      sourceCaptureRoot: readWorkflowSourceMetadata(
+        (await workflowDb.getWorkflowRun(resolvedId))?.metadata
+      )?.root,
       resume: true,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,

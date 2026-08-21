@@ -119,6 +119,33 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mock(() => Promise.resolve({ success: true, workflowRunId: 'test-run-id' })),
   hydrateResumableRun: mock(() => Promise.resolve(null)),
+  // Source capture is real filesystem work the run path now performs BEFORE discovery.
+  // Stubbed so these tests keep exercising flag validation and gating rather than disk.
+  prepareWorkflowSource: mock(() =>
+    Promise.resolve({
+      runId: 'test-run-id',
+      captureRoot: '/test/capture',
+      origin: '/test/path',
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/test/path',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/test/capture/project',
+        globalWorkflows: '/test/capture/global/workflows',
+        globalCommands: '/test/capture/global/commands',
+        globalScripts: '/test/capture/global/scripts',
+        bundledWorkflows: '/test/capture/bundled',
+      },
+    })
+  ),
+  recordSelectedWorkflow: mock(() => Promise.resolve()),
 }));
 mock.module('@archon/workflows/dry-run', () => ({
   loadDryRunStubs: mock(() => Promise.resolve({ node: 'stubbed output' })),
@@ -1229,7 +1256,17 @@ describe('workflowRunCommand', () => {
       discoveryCwd: '/repo/source',
     });
 
-    expect(discoverWorkflowsWithConfig).toHaveBeenCalledWith('/repo/source', expect.any(Function));
+    // The source is captured from the discovery root; discovery then reads that capture,
+    // so the call carries the target cwd plus the capture's roots.
+    const executorDiag = await import('@archon/workflows/executor');
+    expect(executorDiag.prepareWorkflowSource as ReturnType<typeof mock>).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceRoot: '/repo/source' })
+    );
+    expect(discoverWorkflowsWithConfig).toHaveBeenCalledWith(
+      '/test/path',
+      expect.any(Function),
+      expect.objectContaining({ project: '/test/capture/project' })
+    );
     expect(consoleSpy).toHaveBeenCalledWith(
       'Discovery: root=/repo/source workflows=1 bundled=0 global=0 project=1'
     );
@@ -5741,7 +5778,8 @@ describe('workflowResumeCommand', () => {
       // downstream failure is acceptable — we only need to assert the discovery cwd
     }
 
-    // Discovery must use the codebase source path, NOT working_path
+    // A continuation takes no new capture, so discovery still reads the codebase source
+    // path directly — #1663's guarantee, unchanged.
     expect(discoverSpy).toHaveBeenCalledWith(
       '/users/me/source-repo-with-yaml',
       expect.any(Function)
@@ -6449,7 +6487,8 @@ describe('workflowRejectCommand', () => {
       // downstream failure is acceptable
     }
 
-    // Discovery must use the codebase source path, NOT working_path
+    // A continuation takes no new capture, so discovery still reads the codebase source
+    // path directly — #1663's guarantee, unchanged.
     expect(discoverSpy).toHaveBeenCalledWith(
       '/users/me/source-repo-with-yaml',
       expect.any(Function)

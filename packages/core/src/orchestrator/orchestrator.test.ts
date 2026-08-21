@@ -205,9 +205,41 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   hydrateResumableRun: mock(() => Promise.resolve(null)),
+  // Source capture runs before dispatch and does real filesystem work; stub it so these
+  // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
+  // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
+  prepareWorkflowSource: mock(() =>
+    Promise.resolve({
+      runId: 'prepared-run-id',
+      captureRoot: '/capture',
+      origin: '/origin',
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/origin',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/capture/project',
+        globalWorkflows: '/capture/global/workflows',
+        globalCommands: '/capture/global/commands',
+        globalScripts: '/capture/global/scripts',
+        bundledWorkflows: '/capture/bundled',
+      },
+    })
+  ),
+  recordSelectedWorkflow: mock(() => Promise.resolve()),
 }));
 mock.module('@archon/workflows/router', () => ({
   findWorkflow: mockFindWorkflow,
+  // Statically imported by the background dispatch path (see orchestrator.ts).
+  resolveWorkflowName: mock((name: string, workflows: { name: string }[]) =>
+    workflows.find(w => w.name === name)
+  ),
 }));
 mock.module('@archon/workflows/utils/tool-formatter', () => ({
   formatToolCall: mock((toolName: string, _toolInput: unknown) => `🔧 ${toolName.toUpperCase()}`),
@@ -1378,10 +1410,10 @@ describe('orchestrator-agent handleMessage', () => {
         Promise.resolve('/workspace/canonical')
       );
 
-      const sourceRoots: (string | undefined)[] = [];
+      const seenRoots: (string | undefined)[] = [];
       mockDiscoverWorkflows.mockImplementation(
-        async (cwd: string, _loadConfig: unknown, sourceRoot?: string) => {
-          if (cwd === '/workspace/project') sourceRoots.push(sourceRoot);
+        async (cwd: string, _loadConfig: unknown, roots?: { project: string | null }) => {
+          if (cwd === '/workspace/project') seenRoots.push(roots?.project ?? undefined);
           return { workflows: [], errors: [] };
         }
       );
@@ -1389,7 +1421,8 @@ describe('orchestrator-agent handleMessage', () => {
       await handleMessage(platform, 'chat-456', 'help');
 
       expect(mockResolveWorkflowSourceRoot).toHaveBeenCalledWith('/workspace/project');
-      expect(sourceRoots).toEqual(['/workspace/canonical']);
+      // Discovery is pointed at the canonical repo's source, not the worktree's.
+      expect(seenRoots).toEqual(['/workspace/canonical']);
     });
 
     test('handles workflow discovery failure gracefully', async () => {

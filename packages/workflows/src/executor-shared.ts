@@ -6,9 +6,10 @@
  * utilities. Single source of truth; no logic changes from either copy.
  */
 import { readFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
@@ -267,8 +268,8 @@ export function detectCreditExhaustion(text: string): string | null {
  *
  * Two directories are in play and they are not interchangeable. `cwd` is the workspace
  * the run acts on: it owns config, and it is where a `commands.folder` setting is read
- * from. `sourceRoot` is where the command TEXT lives — the authoring checkout, or a
- * run's frozen capture of it. They are the same directory for an ordinary in-place run
+ * from. `sourceRoots` is where the command TEXT lives — the authoring checkout, or a
+ * run's frozen capture of it. They describe the same place for an ordinary in-place run
  * and differ whenever a workflow authored in one checkout executes against another.
  * Passing `cwd` for both is what made a workflow's own commands invisible inside its
  * isolated worktree.
@@ -277,7 +278,7 @@ export function detectCreditExhaustion(text: string): string | null {
  * @param cwd - Target workspace; owns config only
  * @param commandName - Name of the command (without .md extension)
  * @param configuredFolder - Optional additional folder from config to search
- * @param sourceRoot - Root to resolve command files under; defaults to `cwd`
+ * @param sourceRoots - Roots to resolve command files under; defaults to reading `cwd` live
  * @returns On success: `{ success: true, content }`. On failure: `{ success: false, reason, message }`.
  */
 export async function loadCommandPrompt(
@@ -285,9 +286,9 @@ export async function loadCommandPrompt(
   cwd: string,
   commandName: string,
   configuredFolder?: string,
-  sourceRoot?: string
+  sourceRoots?: WorkflowSourceRoots
 ): Promise<LoadCommandResult> {
-  const commandSourceRoot = sourceRoot ?? cwd;
+  const roots = sourceRoots ?? liveSourceRoots(cwd);
   // Validate command name first
   if (!isValidCommandName(commandName)) {
     getLog().error({ commandName }, 'invalid_command_name');
@@ -347,11 +348,18 @@ export async function loadCommandPrompt(
 
     let workflowsRoot: string;
     if (packaged.owner.source === 'project') {
-      workflowsRoot = join(commandSourceRoot, '.archon', 'workflows');
+      if (roots.project === null) {
+        return {
+          success: false,
+          reason: 'not_found',
+          message: `Packaged command not found (no project source): ${packaged.name}.md`,
+        };
+      }
+      workflowsRoot = join(roots.project, '.archon', 'workflows');
     } else if (packaged.owner.source === 'global') {
-      workflowsRoot = archonPaths.getHomeWorkflowsPath();
+      workflowsRoot = roots.globalWorkflows;
     } else {
-      workflowsRoot = dirname(archonPaths.getDefaultWorkflowsPath());
+      workflowsRoot = roots.bundledWorkflows;
     }
     const filePath = join(
       getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
@@ -396,9 +404,10 @@ export async function loadCommandPrompt(
   // `review` — matching the workflows/scripts convention. Resolution
   // precedence: repo > home (~/.archon/commands/) > bundled/app defaults.
   const searchPaths = archonPaths.getCommandFolderSearchPaths(configuredFolder);
+  const projectRoot = roots.project;
   const resolvedSearchPaths: string[] = [
-    ...searchPaths.map(folder => join(commandSourceRoot, folder)),
-    archonPaths.getHomeCommandsPath(),
+    ...(projectRoot !== null ? searchPaths.map(folder => join(projectRoot, folder)) : []),
+    roots.globalCommands,
   ];
 
   for (const dir of resolvedSearchPaths) {

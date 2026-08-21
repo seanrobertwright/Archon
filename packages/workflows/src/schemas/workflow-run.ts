@@ -248,6 +248,14 @@ export const workflowSourceMetadataSchema = z.object({
   /** The authoring directory it was captured from (provenance; never read for lookup). */
   origin: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
   captured_at: z.string(),
+  /**
+   * Content digest of the capture, mirrored from its manifest.
+   *
+   * Duplicated onto the run row on purpose: it is what lets a reader inspect a run's
+   * source identity — and compare two runs — without touching the capture directory,
+   * which may since have been reclaimed. Verification still reads the manifest.
+   */
+  digest: z.string(),
   file_count: z.number(),
   byte_count: z.number(),
 });

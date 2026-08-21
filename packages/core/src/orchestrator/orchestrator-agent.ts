@@ -40,7 +40,14 @@ import {
 import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow, resolveWorkflowName } from '@archon/workflows/router';
-import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import {
+  executeWorkflow,
+  hydrateResumableRun,
+  prepareWorkflowSource,
+  recordSelectedWorkflow,
+  type PreparedWorkflowSource,
+} from '@archon/workflows/executor';
+import { liveSourceRoots } from '@archon/workflows/workflow-discovery';
 import {
   assertWorkflowRequirementsMet,
   WorkflowRequirementError,
@@ -735,15 +742,52 @@ async function dispatchOrchestratorWorkflow(
   // executeWorkflow dispatch below (repo config worktree.baseBranch still wins).
   const codebaseBaseBranch = codebase.default_branch?.trim() || undefined;
 
-  // Where this run reads its workflow's own commands and scripts from. A conversation
-  // cwd is often a worktree, whose `.archon` belongs to whatever branch it is on rather
-  // than to the author. Resolving the canonical repo here means the run captures the
-  // authoring source and never needs anything copied into the worktree. Undefined for a
-  // non-worktree cwd, which reads the cwd exactly as before. Ignored on a resume — the
-  // run resolves the source it recorded when it started.
-  const workflowSourceRoot = await resolveWorkflowSourceRoot(
-    conversation.cwd ?? codebase.default_cwd
-  );
+  // Freeze this run's executable source, then re-resolve the workflow FROM the frozen
+  // copy. The caller discovered `workflow` a moment ago against live files; re-resolving
+  // is what guarantees the definition being executed and the commands and scripts beside
+  // it are one consistent set of bytes rather than two moments' worth.
+  //
+  // The authoring root is the canonical repo when the conversation cwd is a worktree,
+  // whose `.archon` belongs to whatever branch it is on rather than to the author.
+  const runCwd = conversation.cwd ?? codebase.default_cwd;
+  const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);
+  let preparedSource: PreparedWorkflowSource | undefined;
+  try {
+    preparedSource = await prepareWorkflowSource({ sourceRoot: workflowSourceRoot ?? runCwd });
+    // Re-resolve only when files were actually frozen. An empty capture means the
+    // definition came from the bundled set a binary embeds as constants — immutable for
+    // that binary, with nothing on disk to re-read — so the caller's definition stands.
+    if (preparedSource.manifest.scopes.length > 0) {
+      const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
+        runCwd,
+        loadConfig,
+        preparedSource.roots
+      );
+      const reResolved = resolveWorkflowName(
+        workflow.name,
+        capturedWorkflows.map(w => w.workflow)
+      );
+      if (!reResolved) {
+        await platform.sendMessage(
+          conversationId,
+          `Could not read workflow **${workflow.name}** from this run's captured source. ` +
+            'Nothing has been started.'
+        );
+        return;
+      }
+      workflow = reResolved;
+    }
+    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+    await platform.sendMessage(
+      conversationId,
+      `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
+        'Nothing has been started.'
+    );
+    return;
+  }
 
   // Per-child isolation resolver (#2121 slice 2, PR-A): a `workflow:` node with
   // `isolation: 'worktree'` gets its own worktree per child. Built for git-repo
@@ -1041,7 +1085,7 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
-          workflowSourceRoot,
+          preparedSource,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
@@ -1073,7 +1117,7 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
-          workflowSourceRoot,
+          preparedSource,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
@@ -1134,7 +1178,7 @@ async function dispatchOrchestratorWorkflow(
         parentConversationId: conversation.id,
         userId,
         source,
-        workflowSourceRoot,
+        preparedSource,
         parseWarnings: options?.parseWarnings,
         baseBranch: codebaseBaseBranch,
         resolveChildIsolation,
@@ -1391,7 +1435,7 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
         const repoResult = await discoverWorkflowsWithConfig(
           workflowCwd,
           () => Promise.resolve(loadedConfig),
-          workflowSourceRoot
+          workflowSourceRoot === undefined ? undefined : liveSourceRoots(workflowSourceRoot)
         );
         const workflowMap = new Map(workflows.map(w => [w.workflow.name, w]));
         for (const rw of repoResult.workflows) {
@@ -3085,7 +3129,11 @@ async function handleWorkflowRunCommand(
 
     let discovery;
     try {
-      discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig, workflowSourceRoot);
+      discovery = await discoverWorkflowsWithConfig(
+        workflowCwd,
+        loadConfig,
+        workflowSourceRoot === undefined ? undefined : liveSourceRoots(workflowSourceRoot)
+      );
     } catch (error) {
       const err = error as Error;
       getLog().error({ err, cwd: workflowCwd }, 'workflow_discovery_failed');

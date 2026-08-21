@@ -17,7 +17,7 @@
  * Same-named files at a higher scope override those at lower scopes.
  */
 import { readFile, readdir, access, stat } from 'fs/promises';
-import { dirname, join } from 'path';
+import { basename, join } from 'path';
 import type {
   WorkflowDefinition,
   WorkflowLoadError,
@@ -29,6 +29,10 @@ import type {
 } from './schemas';
 import { isIncludeNode, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+// Re-exported here because this is the module callers already import to discover with.
+export { liveSourceRoots } from './workflow-source';
+export type { WorkflowSourceRoots } from './workflow-source';
 import {
   BUNDLED_WORKFLOWS,
   BUNDLED_COMMANDS,
@@ -407,7 +411,7 @@ interface CommandScanConfig {
  * block's command body while proving its lexical reference boundary.
  */
 async function resolveCommandContentForScan(
-  cwd: string | null,
+  roots: WorkflowSourceRoots,
   commandName: string,
   config: CommandScanConfig
 ): Promise<IncludeCommandContent> {
@@ -422,12 +426,12 @@ async function resolveCommandContentForScan(
 
     let workflowsRoot: string;
     if (packaged.owner.source === 'project') {
-      if (cwd === null) return null;
-      workflowsRoot = join(cwd, '.archon', 'workflows');
+      if (roots.project === null) return null;
+      workflowsRoot = join(roots.project, '.archon', 'workflows');
     } else if (packaged.owner.source === 'global') {
-      workflowsRoot = archonPaths.getHomeWorkflowsPath();
+      workflowsRoot = roots.globalWorkflows;
     } else {
-      workflowsRoot = dirname(archonPaths.getDefaultWorkflowsPath());
+      workflowsRoot = roots.bundledWorkflows;
     }
     const commandPath = join(
       getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
@@ -443,15 +447,15 @@ async function resolveCommandContentForScan(
   }
 
   const dirs: string[] = [];
-  if (cwd !== null) {
+  if (roots.project !== null) {
     // Pass the configured folder so a repo with a custom command directory is scanned
     // (not silently skipped → downgraded to WARN). Matches getCommandFolderSearchPaths use
     // in the validator/executor.
     for (const folder of archonPaths.getCommandFolderSearchPaths(config.commandFolder)) {
-      dirs.push(join(cwd, folder));
+      dirs.push(join(roots.project, folder));
     }
   }
-  dirs.push(archonPaths.getHomeCommandsPath());
+  dirs.push(roots.globalCommands);
 
   for (const dir of dirs) {
     let entries: Awaited<ReturnType<typeof archonPaths.findMarkdownFilesRecursive>>;
@@ -507,7 +511,7 @@ async function resolveCommandContentForScan(
  * Touches disk only when includes exist; returns an empty map otherwise.
  */
 async function resolveIncludeBlockCommandContents(
-  cwd: string | null,
+  roots: WorkflowSourceRoots,
   byName: ReadonlyMap<string, WorkflowDefinition>,
   config: CommandScanConfig
 ): Promise<Map<string, IncludeCommandContent>> {
@@ -533,7 +537,7 @@ async function resolveIncludeBlockCommandContents(
     if (!workflow) continue;
     for (const commandName of collectFileBackedCommandNames(workflow.nodes)) {
       if (!contents.has(commandName)) {
-        contents.set(commandName, await resolveCommandContentForScan(cwd, commandName, config));
+        contents.set(commandName, await resolveCommandContentForScan(roots, commandName, config));
       }
     }
   }
@@ -565,17 +569,17 @@ export async function discoverWorkflows(
     commandFolder?: string;
     loadDefaultCommands?: boolean;
     /**
-     * Root to read PROJECT-scope workflows, commands, and scripts from, when that is
-     * not the working directory. Set by an executing run to its frozen source capture
-     * so the graph a resume reloads is the one the run started with. Defaults to
-     * `cwd`, which is correct for every listing and in-place caller.
+     * Roots to read workflows, commands, and scripts from, when that is not the working
+     * directory. An executing run passes the roots of its frozen source capture, so the
+     * graph a resume reloads — including any statically included global or bundled
+     * workflow — is the one the run started with. Defaults to reading `cwd` live, which
+     * is correct for every listing and in-place caller.
      */
-    sourceRoot?: string;
+    sourceRoots?: WorkflowSourceRoots;
   }
 ): Promise<WorkflowLoadResult> {
-  // Project-scope source root. Null only when there is no project context at all, in
-  // which case no project-scope read happens.
-  const projectRoot = cwd === null ? null : (options?.sourceRoot ?? cwd);
+  const roots = options?.sourceRoots ?? liveSourceRoots(cwd);
+  const projectRoot = roots.project;
   // Map of filename -> workflow + source + parse warnings, for deduplication.
   // A later scope's `set()` replaces all three together, so a clean project file
   // can never inherit the bundled file's warnings (see ParsedWorkflowFile).
@@ -634,7 +638,7 @@ export async function discoverWorkflows(
     }
     // Pre-resolve command-file contents for include-target command nodes so the expander
     // can catch a block command file that references a sibling id namespacing renames.
-    const commandContents = await resolveIncludeBlockCommandContents(projectRoot, rawByName, {
+    const commandContents = await resolveIncludeBlockCommandContents(roots, rawByName, {
       commandFolder: options?.commandFolder,
       loadDefaultCommands: options?.loadDefaultCommands,
     });
@@ -689,8 +693,11 @@ export async function discoverWorkflows(
       getLog().info({ count: bundledResult.workflows.size }, 'bundled_default_workflows_loaded');
     } else {
       // Bun: load from filesystem (development mode)
-      const appDefaultsPath = archonPaths.getDefaultWorkflowsPath();
-      const appWorkflowsPath = dirname(appDefaultsPath);
+      const appWorkflowsPath = roots.bundledWorkflows;
+      const appDefaultsPath = join(
+        appWorkflowsPath,
+        basename(archonPaths.getDefaultWorkflowsPath())
+      );
       getLog().debug({ appWorkflowsPath }, 'loading_app_default_workflows');
       try {
         await access(appWorkflowsPath);
@@ -723,7 +730,7 @@ export async function discoverWorkflows(
   // 2. Load home-scoped workflows from ~/.archon/workflows/. No caller option —
   // discovery is responsible for surfacing home-scoped content everywhere.
   await maybeWarnLegacyHomePath();
-  const homeWorkflowPath = archonPaths.getHomeWorkflowsPath();
+  const homeWorkflowPath = roots.globalWorkflows;
   getLog().debug({ homeWorkflowPath }, 'searching_home_workflows');
   try {
     await access(homeWorkflowPath);
@@ -853,12 +860,12 @@ export async function discoverWorkflowsWithConfig(
     commands?: { folder?: string };
   }>,
   /**
-   * Where PROJECT-scope source is read from, when that is not `cwd`. An executing run
-   * passes its frozen source capture; every listing caller omits it and keeps reading
-   * the working directory. Config is always read from `cwd` regardless — settings
-   * belong to the workspace being acted on, not to the source being executed.
+   * Where source is read from, when that is not `cwd`. An executing run passes the roots
+   * of its frozen capture; every listing caller omits it and keeps reading the working
+   * directory. Config is always read from `cwd` regardless — settings belong to the
+   * workspace being acted on, not to the source being executed.
    */
-  sourceRoot?: string
+  sourceRoots?: WorkflowSourceRoots
 ): Promise<WorkflowLoadResult> {
   let loadDefaults = true;
   // Command-scan parity: pass the repo's configured command folder + loadDefaultCommands
@@ -879,5 +886,5 @@ export async function discoverWorkflowsWithConfig(
       );
     }
   }
-  return discoverWorkflows(cwd, { loadDefaults, commandFolder, loadDefaultCommands, sourceRoot });
+  return discoverWorkflows(cwd, { loadDefaults, commandFolder, loadDefaultCommands, sourceRoots });
 }

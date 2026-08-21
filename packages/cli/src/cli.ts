@@ -619,6 +619,19 @@ async function main(): Promise<number> {
                 );
                 return 1;
               }
+              if (containerFlag) {
+                // A container run executes inside the container, which mounts the folder
+                // project and nothing else. The capture lives outside that mount, so a
+                // separate source root could be frozen but never read — the run would
+                // fail looking for its own commands. Refuse the combination rather than
+                // ship a flag that silently does not apply.
+                console.error(
+                  'Error: --workflow-source and --container are mutually exclusive.\n' +
+                    '  A container run reads source from the project it mounts.\n' +
+                    '  Run without --container to execute source from another directory.'
+                );
+                return 1;
+              }
               workflowSource = resolve(workflowSourceFlag);
               if (!(await isPathDirectory(workflowSource))) {
                 console.error(

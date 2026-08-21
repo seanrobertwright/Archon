@@ -50,6 +50,14 @@ import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
+import {
+  prepareWorkflowSource,
+  recordSelectedWorkflow,
+  type PreparedWorkflowSource,
+} from '@archon/workflows/executor';
+import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import { resolveWorkflowName } from '@archon/workflows/router';
+import { loadConfig } from '../config/config-loader';
 import { assertComposedGateDriveable } from '@archon/workflows/utils/workflow-requirements';
 import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
@@ -440,20 +448,56 @@ export async function dispatchBackgroundWorkflow(
     unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformId, ctx.conversationId);
   }
 
-  // Authoring root for this run's workflow source. `workerCwd` is frequently a worktree,
-  // whose `.archon` belongs to whatever branch it is on rather than to the author; the
-  // canonical repo is what the run should capture. Resolved here rather than inherited,
-  // because this background path calls `executeWorkflow` directly and would otherwise
-  // capture the worktree — the one surface that would silently keep the old behavior.
+  const workflowDeps = createWorkflowDeps();
+
+  // Freeze this run's executable source, then re-resolve the workflow FROM the frozen
+  // copy so the definition executed and the commands and scripts beside it are one
+  // consistent set of bytes. This background path calls `executeWorkflow` directly, so
+  // without its own capture it would be the one surface still reading live source.
+  //
+  // `workerCwd` is frequently a worktree, whose `.archon` belongs to whatever branch it
+  // is on rather than to the author; the canonical repo is what gets captured.
   const workflowSourceRoot = await resolveWorkflowSourceRoot(workerCwd);
+  let preparedSource: PreparedWorkflowSource;
+  try {
+    preparedSource = await prepareWorkflowSource({ sourceRoot: workflowSourceRoot ?? workerCwd });
+    // See the note in orchestrator-agent.ts: an empty capture means the definition came
+    // from a binary's embedded bundled set, which has nothing on disk to re-read.
+    if (preparedSource.manifest.scopes.length > 0) {
+      const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
+        workerCwd,
+        loadConfig,
+        preparedSource.roots
+      );
+      const reResolved = resolveWorkflowName(
+        workflow.name,
+        capturedWorkflows.map(w => w.workflow)
+      );
+      if (!reResolved) {
+        throw new Error(`workflow '${workflow.name}' is not present in the captured source`);
+      }
+      workflow = reResolved;
+    }
+    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+    await ctx.platform.sendMessage(
+      ctx.conversationId,
+      `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
+        'Nothing has been started.'
+    );
+    return;
+  }
 
   // 7. Pre-create workflow run row so the UI can fetch it immediately.
   // Without this, navigating to the execution page before executeWorkflow's
   // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
-  const workflowDeps = createWorkflowDeps();
   let preCreatedRun: Awaited<ReturnType<typeof workflowDeps.store.createWorkflowRun>> | undefined;
   try {
     preCreatedRun = await workflowDeps.store.createWorkflowRun({
+      // The id its already-written source capture is filed under.
+      id: preparedSource.runId,
       workflow_name: workflow.name,
       conversation_id: workerConv.id,
       codebase_id: ctx.codebaseId,
@@ -500,7 +544,7 @@ export async function dispatchBackgroundWorkflow(
             parseWarnings: ctx.parseWarnings,
             baseBranch: codebaseBaseBranch,
             resolveChildIsolation,
-            workflowSourceRoot,
+            preparedSource,
             // Only consumed when `preCreatedRun` is undefined (pre-creation failed and
             // the executor creates the row itself); otherwise the row above already
             // carries them.
