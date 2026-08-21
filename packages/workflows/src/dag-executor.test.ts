@@ -80,6 +80,7 @@ import {
   collectContainerIncompatibleProviders,
   containerCommandName,
   buildSubprocessDockerArgs,
+  childOutcomeFromRun,
 } from './dag-executor';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emitter';
@@ -9438,7 +9439,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             completionSignaled: true,
             signaledOutput: 'REPORT',
             signaledCostUsd: 0.02,
-            signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
+            // Paused on a floor: the gate's cumulative cache was already incomplete.
+            signaledTokens: {
+              input: 40,
+              output: 4,
+              cacheRead: 20,
+              cacheWrite: 0,
+              cachePartial: true,
+            },
           },
           loop_user_input: 'actually re-check X',
           loop_feedback_given: true,
@@ -9485,11 +9493,15 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         ([event]) => event.event_type === 'node_completed' && event.step_name === 'refine'
       );
       expect(completed?.[0].data?.cost_usd).toBeCloseTo(0.05, 5);
+      // The gate paused on a floor, so the resumed node and run totals stay a floor.
+      // Decoding the persisted usage without the flag let a resumed loop claim an exact
+      // total it never had.
       expect(completed?.[0].data?.tokens).toEqual({
         input: 100,
         output: 10,
         cacheRead: 50,
         cacheWrite: 0,
+        cachePartial: true,
       });
       expect(runUsageWrites(mockDeps.store)).toEqual([
         {
@@ -9498,6 +9510,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           total_tokens_out: 10,
           total_cache_read_tokens: 50,
           total_cache_write_tokens: 0,
+          total_cache_partial: true,
         },
       ]);
     });
@@ -11514,6 +11527,18 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       cacheWrite: 0,
       cachePartial: true,
     });
+    // And the flag survives the node -> run fold. Rebuilding the usage field-by-field
+    // here dropped it, so a partial node total silently became a complete run total.
+    expect(runUsageWrites(mockDeps.store)).toEqual([
+      {
+        total_cost_usd: 0.03,
+        total_tokens_in: 30,
+        total_tokens_out: 3,
+        total_cache_read_tokens: 5,
+        total_cache_write_tokens: 0,
+        total_cache_partial: true,
+      },
+    ]);
   });
 
   it('best-effort provider: a non-finite reask cost does not erase prior valid cost', async () => {
@@ -23717,5 +23742,52 @@ describe('executeDagWorkflow -- a workflow-level provider/model conflict is repo
     expect(conflictMessages).toHaveLength(1);
     // All three nodes still RESOLVED to codex — only the reporting is de-duplicated.
     expect(mockSendQueryDag.mock.calls).toHaveLength(3);
+  });
+});
+
+describe('childOutcomeFromRun cache reporting', () => {
+  const settledRun = (metadata: Record<string, unknown>) =>
+    ({ id: 'child-1', status: 'completed', metadata }) as unknown as Parameters<
+      typeof childOutcomeFromRun
+    >[0];
+
+  it('carries a child run total that is only a floor up to its parent', () => {
+    const outcome = childOutcomeFromRun(
+      settledRun({
+        total_tokens_in: 100,
+        total_tokens_out: 10,
+        total_cache_read_tokens: 60,
+        total_cache_write_tokens: 0,
+        total_cache_partial: true,
+      })
+    );
+
+    // Reading the numbers but not the flag let a parent merge a child's floor as
+    // though it were exact, which is the same defect one run boundary up.
+    expect(outcome.tokens).toEqual({
+      input: 100,
+      output: 10,
+      cacheRead: 60,
+      cacheWrite: 0,
+      cachePartial: true,
+    });
+  });
+
+  it('leaves a complete child total unflagged', () => {
+    const outcome = childOutcomeFromRun(
+      settledRun({
+        total_tokens_in: 100,
+        total_tokens_out: 10,
+        total_cache_read_tokens: 60,
+        total_cache_write_tokens: 0,
+      })
+    );
+
+    expect(outcome.tokens).toEqual({
+      input: 100,
+      output: 10,
+      cacheRead: 60,
+      cacheWrite: 0,
+    });
   });
 });

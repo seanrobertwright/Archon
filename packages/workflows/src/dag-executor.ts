@@ -462,12 +462,17 @@ function sumTokenUsage(
       getLog().warn({ ...context, tokens: usage }, 'dag.usage_tokens_non_finite_ignored');
       continue;
     }
-    const normalized: TokenUsage = { input: usage.input, output: usage.output };
+    // Spread rather than rebuild field-by-field: a rebuilt literal silently drops any
+    // axis this function does not know about, which is how `cachePartial` was lost on
+    // re-aggregation (a partial total became complete on the next merge).
+    const normalized: TokenUsage = { ...usage };
     for (const axis of ['cacheRead', 'cacheWrite'] as const) {
       const value = usage[axis];
       if (value === undefined) continue;
-      if (Number.isFinite(value)) normalized[axis] = value;
-      else {
+      if (!Number.isFinite(value)) {
+        // Cleared rather than deleted (no-dynamic-delete): every reader treats an
+        // undefined axis as unreported, and JSON.stringify omits the key entirely.
+        normalized[axis] = undefined;
         getLog().warn({ ...context, axis, value }, 'dag.usage_optional_tokens_non_finite_ignored');
       }
     }
@@ -593,6 +598,9 @@ export function childOutcomeFromRun(run: WorkflowRun): ChildWorkflowOutcome {
           output: output ?? 0,
           ...(cacheRead !== undefined ? { cacheRead } : {}),
           ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+          // Persisted by persistRunUsage; without it a child's floor would contribute to
+          // the parent as though it were an exact total.
+          ...(md.total_cache_partial === true ? { cachePartial: true as const } : {}),
         }
       : undefined;
   return {
@@ -3591,11 +3599,12 @@ function readSignaledTokens(
 ): TokenUsage | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw === 'object') {
-    const { input, output, cacheRead, cacheWrite } = raw as {
+    const { input, output, cacheRead, cacheWrite, cachePartial } = raw as {
       input?: unknown;
       output?: unknown;
       cacheRead?: unknown;
       cacheWrite?: unknown;
+      cachePartial?: unknown;
     };
     if (
       typeof input === 'number' &&
@@ -3610,6 +3619,8 @@ function readSignaledTokens(
             output,
             ...(cacheRead !== undefined ? { cacheRead: cacheRead as number } : {}),
             ...(cacheWrite !== undefined ? { cacheWrite: cacheWrite as number } : {}),
+            // A loop that paused on a floor must not resume claiming an exact total.
+            ...(cachePartial === true ? { cachePartial: true as const } : {}),
           },
         ],
         context

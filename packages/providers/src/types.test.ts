@@ -88,6 +88,25 @@ describe('mergeTokenUsage', () => {
     });
   });
 
+  test('re-merging an aggregate keeps it a floor', () => {
+    // Re-aggregation is the common case: run totals fold each node into the running
+    // total. If the flag were dropped on the way back in, a partial total would quietly
+    // become complete on the very next merge.
+    const first = mergeTokenUsage([
+      { input: 100, output: 10, cacheRead: 60 },
+      { input: 50, output: 5 },
+    ]);
+    expect(first?.cachePartial).toBe(true);
+
+    const second = mergeTokenUsage([first!, { input: 10, output: 1, cacheRead: 4 }]);
+    expect(second).toEqual({
+      input: 160,
+      output: 16,
+      cacheRead: 64,
+      cachePartial: true,
+    });
+  });
+
   test('ignores total and cost rather than half-aggregating them', () => {
     const merged = mergeTokenUsage([
       { input: 10, output: 1, total: 11, cost: 0.5 },
