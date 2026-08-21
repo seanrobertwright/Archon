@@ -13966,6 +13966,222 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     ]);
   });
 
+  it('a node that fails mid-stream reports its spend in the transcript, not just the DB', async () => {
+    // #2609's worked example. Node A completes at $0.01; node B burns $0.02 and then
+    // the provider throws. The DB row has carried that $0.02 since #2654 — the JSONL
+    // failure row did not, because logNodeError had no usage parameter. The two sinks
+    // disagreeing about what a node cost is the bug.
+    let call = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      call++;
+      if (call === 1) {
+        yield { type: 'assistant', content: 'node A output' };
+        yield { type: 'result', sessionId: 'sid-a', cost: 0.01, tokens: { input: 10, output: 1 } };
+        return;
+      }
+      // Node B streams, reports what it burned, and the same result chunk carries the
+      // provider's error — so the node throws with its usage already accumulated. This
+      // is the ordering that makes the bug reachable: the spend is real and the node
+      // still ends at a failure writer.
+      yield { type: 'assistant', content: 'node B got this far' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-b',
+        cost: 0.02,
+        tokens: { input: 20, output: 2 },
+        isError: true,
+        errorSubtype: 'stream_error',
+      };
+    });
+
+    const store = createMockStore();
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('spend-transcript-run');
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-spend',
+      testDir,
+      {
+        name: 'spend-transcript',
+        nodes: [
+          { id: 'a', prompt: 'Cheap work.' },
+          { id: 'b', prompt: 'Expensive work that dies.', depends_on: ['a'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const rows = (await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+
+    const failureRow = rows.find(row => row.type === 'node_error' && row.step === 'b');
+    expect(failureRow?.cost_usd).toBe(0.02);
+    expect(failureRow?.tokens).toEqual({ input: 20, output: 2 });
+
+    // The completed node was already right; asserting it here proves the transcript
+    // now accounts for the whole run rather than trading one gap for another.
+    const completeRow = rows.find(row => row.type === 'node_complete' && row.step === 'a');
+    expect(completeRow?.cost_usd).toBe(0.01);
+
+    // Same figure in the persisted event: the fix closes the gap between the sinks
+    // rather than moving it.
+    const failedEvents = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+      (c: unknown[]) => {
+        const e = c[0] as { event_type: string; step_name?: string };
+        return e.event_type === 'node_failed' && e.step_name === 'b';
+      }
+    );
+    expect(failedEvents.length).toBe(1);
+    expect((failedEvents[0][0] as { data: Record<string, unknown> }).data.cost_usd).toBe(0.02);
+
+    // And the run total is the money burned across both nodes.
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.03, total_tokens_in: 30, total_tokens_out: 3 },
+    ]);
+  });
+
+  it('a node cancelled by the user leaves its spend in the transcript', async () => {
+    // The abort branch called no logNodeError at all, so a cancelled node produced no
+    // transcript row whatsoever — not even one without usage (#2693). It is the only
+    // terminal outcome in executeNodeInternal that was missing from the transcript.
+    //
+    // The cancel is driven the way production drives it: the throttled mid-stream
+    // status check sees a non-running run and aborts. setSystemTime jumps past
+    // CANCEL_CHECK_INTERVAL_MS between chunks so that check fires deterministically,
+    // and the usage-bearing result chunk is delivered BEFORE the jump so the node has
+    // something to report by the time it is torn down.
+    let usageDelivered = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      // A live background task keeps the stream open past the result chunk, which is
+      // what lets the node still be streaming once it has usage to report.
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't-live', taskType: 'local_agent', description: 'still running' }],
+      };
+      yield { type: 'assistant', content: 'partial work' };
+      yield { type: 'result', sessionId: 'sid-x', cost: 0.02, tokens: { input: 30, output: 3 } };
+      usageDelivered = true;
+      setSystemTime(new Date(Date.now() + 11_000));
+      yield { type: 'assistant', content: 'MUST NOT BE REACHED' };
+    });
+
+    const store = createMockStore();
+    (store.getWorkflowRunStatus as Mock<() => Promise<string | null>>).mockImplementation(() =>
+      Promise.resolve(usageDelivered ? 'cancelled' : 'running')
+    );
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('cancel-transcript-run');
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-cancel',
+        testDir,
+        { name: 'cancel-transcript', nodes: [{ id: 'only', prompt: 'Work.' }] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      setSystemTime(); // restore the real clock
+    }
+
+    // Prove the abort branch is the one that ran: it is the only path that reports
+    // exactly 'Cancelled by user'.
+    const rows = (await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const cancelRow = rows.find(row => row.type === 'node_error' && row.step === 'only');
+    expect(cancelRow?.error).toBe('Cancelled by user');
+    expect(cancelRow?.cost_usd).toBe(0.02);
+    expect(cancelRow?.tokens).toEqual({ input: 30, output: 3 });
+  });
+
+  it('a cancel that surfaces as a thrown error still leaves a transcript row', async () => {
+    // The abort has TWO exits. One returns from the streaming-cancel branch; the other
+    // reaches the outer catch, because an aborted node with `output_format` is refused a
+    // reask and throws instead. Only the first was fixed at first, which would have made
+    // a cancelled node's transcript row depend on whether the node declared
+    // `output_format` — the provider-shaped inconsistency #2693 exists to remove.
+    let usageDelivered = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't-live', taskType: 'local_agent', description: 'still running' }],
+      };
+      yield { type: 'assistant', content: 'prose, not the declared JSON' };
+      yield { type: 'result', sessionId: 'sid-of', cost: 0.02, tokens: { input: 30, output: 3 } };
+      usageDelivered = true;
+      setSystemTime(new Date(Date.now() + 11_000));
+      yield { type: 'assistant', content: 'MUST NOT BE REACHED' };
+    });
+
+    const store = createMockStore();
+    (store.getWorkflowRunStatus as Mock<() => Promise<string | null>>).mockImplementation(() =>
+      Promise.resolve(usageDelivered ? 'cancelled' : 'running')
+    );
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('cancel-throw-run');
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-cancel-throw',
+        testDir,
+        {
+          name: 'cancel-throw',
+          nodes: [
+            {
+              id: 'only',
+              prompt: 'Work.',
+              output_format: { type: 'object', properties: { status: { type: 'string' } } },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      setSystemTime();
+    }
+
+    const rows = (await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const cancelRow = rows.find(row => row.type === 'node_error' && row.step === 'only');
+    expect(cancelRow?.error).toBe('Cancelled by user');
+    expect(cancelRow?.cost_usd).toBe(0.02);
+  });
+
   it('records usage when the run is CANCELLED out of band mid-flight', async () => {
     // A cancel is driven by another process (CLI abandon, the API abandon route, a
     // fan-out cancelling a child), so the cancelling side has no usage in scope. The
@@ -24159,18 +24375,27 @@ describe('TokenUsage axis seam guard', () => {
    * single run: the node event, the run metadata, the telemetry props, and the
    * JSONL transcript row.
    */
-  async function runSpecimenDag(): Promise<{
+  async function runSpecimenDag(outcome: 'completed' | 'failed' = 'completed'): Promise<{
     store: MockWorkflowStore;
     runId: string;
     logDir: string;
   }> {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'done' };
-      yield { type: 'result', sessionId: 'axis-sid', tokens: AXIS_SPECIMEN };
+      yield {
+        type: 'result',
+        sessionId: 'axis-sid',
+        tokens: AXIS_SPECIMEN,
+        // The provider reports its usage and its failure on the SAME chunk, so the
+        // node reaches a failure writer with the specimen already accumulated. Any
+        // earlier throw would leave nothing for the failure sink to carry, and the
+        // row would pass the guard by being empty on both sides.
+        ...(outcome === 'failed' ? { isError: true, errorSubtype: 'stream_error' } : {}),
+      };
     });
     const store = createMockStore();
     const logDir = join(testDir, 'logs');
-    const workflowRun = makeWorkflowRun('axis-seam-run');
+    const workflowRun = makeWorkflowRun(`axis-seam-run-${outcome}`);
     await executeDagWorkflow(
       createMockDeps(store),
       createMockPlatform(),
@@ -24264,6 +24489,23 @@ describe('TokenUsage axis seam guard', () => {
       'JSONL node_complete.tokens',
       WHOLE_OBJECT_AXIS_KEYS,
       nodeComplete?.tokens as Record<string, unknown>
+    );
+  });
+
+  it('JSONL transcript node_error row carries every axis it claims', async () => {
+    // The failure sink joins the guard here (#2693). It reuses the whole-object map
+    // because logNodeError spreads the same WorkflowUsage carrier logNodeComplete
+    // does — one decision, so a new axis either rides both rows or neither.
+    const { runId, logDir } = await runSpecimenDag('failed');
+    const rows = (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const nodeError = rows.find(row => row.type === 'node_error' && row.step === 'step');
+    expectSeamCarriesAxes(
+      'JSONL node_error.tokens',
+      WHOLE_OBJECT_AXIS_KEYS,
+      nodeError?.tokens as Record<string, unknown>
     );
   });
 

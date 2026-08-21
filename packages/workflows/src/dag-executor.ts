@@ -809,6 +809,12 @@ function shouldRetryNodeFailure(
  * the backoff math and user-facing wording are defined once and can't drift.
  * `initialOutput` seeds `output` for the unreachable zero-iteration case. Usage is
  * accumulated across failed attempts so a later success still reports all paid work.
+ *
+ * Each attempt also writes its OWN terminal event carrying only that attempt's usage,
+ * so the event log and this accumulated total agree rather than double-counting: two
+ * attempts costing $0.02 then $0.03 leave two rows summing to $0.05, which is what this
+ * returns. That is the "money burned" reading of a run's total — every attempt counts
+ * (#2654 made failed rows contribute; see getDagResumeSnapshot for what that means).
  */
 async function runNodeRetryLoop(
   node: DagNode,
@@ -1754,10 +1760,8 @@ async function executeNodeInternal(
   const batchMessages: string[] = [];
 
   // What this node reported, built once and passed whole rather than re-listed per sink:
-  // the DB event on every outcome, and the JSONL transcript row on completion. The JSONL
-  // FAILURE row is still outside it — logNodeError takes no usage, so a node that spent
-  // money and then failed records that spend in the DB and not in the transcript (#2614).
-  // See WorkflowUsage.
+  // the DB event and the JSONL transcript row, on every outcome that can hold spend —
+  // completion, failure, and user cancellation alike (#2693). See WorkflowUsage.
   const nodeUsageEventData = (): WorkflowUsage => ({
     ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
     ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
@@ -2552,6 +2556,16 @@ async function executeNodeInternal(
         { nodeId: node.id, durationMs: duration },
         'dag_node_cancelled_during_streaming'
       );
+      // Cancellation is a terminal outcome like any other failure, and the work it
+      // interrupted was already paid for. This branch wrote no transcript row at all
+      // until #2693, so a cancelled node's spend reached the DB and nothing else.
+      await logNodeError(
+        logDir,
+        workflowRun.id,
+        node.id,
+        'Cancelled by user',
+        nodeUsageEventData()
+      );
 
       deps.store
         .createWorkflowEvent({
@@ -2607,7 +2621,7 @@ async function executeNodeInternal(
     if (creditError) {
       const duration = Date.now() - nodeStartTime;
       getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
-      await logNodeError(logDir, workflowRun.id, node.id, creditError);
+      await logNodeError(logDir, workflowRun.id, node.id, creditError, nodeUsageEventData());
 
       deps.store
         .createWorkflowEvent({
@@ -2650,7 +2664,7 @@ async function executeNodeInternal(
         ? `Node '${node.id}' timed out with no output (idle for ${String(effectiveIdleTimeout / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
         : `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
-      await logNodeError(logDir, workflowRun.id, node.id, emptyError);
+      await logNodeError(logDir, workflowRun.id, node.id, emptyError, nodeUsageEventData());
 
       deps.store
         .createWorkflowEvent({
@@ -2798,8 +2812,12 @@ async function executeNodeInternal(
       getLog().info({ nodeId: node.id }, 'dag_node_cancelled_via_abort');
     } else {
       getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
-      await logNodeError(logDir, workflowRun.id, node.id, failureMessage);
     }
+    // Transcript row on BOTH branches. The persisted event below is written either way,
+    // and a cancel reaches this catch only when the provider SDK threw on abort rather
+    // than ending its stream — an implementation detail of the provider that must not
+    // decide whether the run's transcript records the node at all (#2693).
+    await logNodeError(logDir, workflowRun.id, node.id, failureMessage, nodeUsageEventData());
 
     deps.store
       .createWorkflowEvent({
@@ -4647,7 +4665,12 @@ async function executeLoopNode(
     } = {}
   ): Promise<NodeExecutionResult> => {
     getLog().error({ nodeId: node.id, error, ...(extras.data ?? {}) }, 'loop_node.failed');
-    await logNodeError(logDir, workflowRun.id, node.id, error);
+    // A loop that failed part-way still paid for the iterations it ran, so the
+    // transcript row carries the same totals as the persisted event below (#2693).
+    await logNodeError(logDir, workflowRun.id, node.id, error, {
+      ...(extras.tokens !== undefined ? { tokens: extras.tokens } : {}),
+      ...(extras.costUsd !== undefined ? { cost_usd: extras.costUsd } : {}),
+    });
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
@@ -9091,7 +9114,7 @@ export async function executeDagWorkflow(
    * tests) may omit it, in which case a `workflow:` node fails fast.
    */
   runChildWorkflow?: RunChildWorkflowFn,
-  /** Cumulative usage restored from prior node_completed events on resume. */
+  /** Cumulative usage restored on resume, from prior completion AND failure events. */
   priorUsage?: PriorRunUsage,
   /** Private run-scoped handles restored before a cold resume transitions to running. */
   priorNodeSessions?: readonly WorkflowRunNodeSession[],
