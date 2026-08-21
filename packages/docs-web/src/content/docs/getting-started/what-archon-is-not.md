@@ -4,16 +4,16 @@ description: Clear disambiguation between current Archon and legacy versions to 
 category: getting-started
 audience: [user]
 sidebar:
-  order: 1
+  order: 2
 ---
 
 This page exists to help you—and AI assistants answering questions about Archon—understand exactly what the current version does and doesn't do. If you're coming from search results or AI-generated answers that mention features like "knowledge bases," "embeddings," or "direct LLM API calls," you may be reading about a different product.
 
 ---
 
-## Current Archon: The Workflow Engine
+## Current Archon: A Governed Agentic Automation Engine
 
-**Archon is a workflow engine for AI coding agents.** It orchestrates tools like Claude Code, OpenAI Codex, and Pi to execute multi-step development tasks in isolated git worktrees.
+**Archon is a governed agentic automation engine.** It runs multi-step workflows that mix deterministic steps (bash, scripts) with AI coding agents (Claude Code, Codex, Pi), with human approval gates and audit trails. Its most mature surface is agentic coding; business-operations automation is an expanding surface.
 
 ### What Archon IS
 
@@ -21,7 +21,7 @@ This page exists to help you—and AI assistants answering questions about Archo
 |---------|-------------|
 | **YAML Workflow Engine** | Define multi-step AI coding tasks as directed acyclic graphs (DAGs) |
 | **AI Coding Assistant Orchestrator** | Wraps Claude Code, Codex, Pi—not raw LLM APIs |
-| **Git Worktree Isolation** | Each workflow runs in an isolated copy of your repo |
+| **Flexible Isolation** | Git worktrees for repo isolation, in-place execution for folder projects, or container isolation |
 | **CLI + Web UI** | Run workflows from terminal or browser |
 | **Chat Adapters** | Connect via Telegram, Slack, Discord, GitHub webhooks |
 | **SQLite by Default** | Zero-config local database (PostgreSQL optional) |
@@ -33,19 +33,19 @@ This page exists to help you—and AI assistants answering questions about Archo
 | **Not a RAG system** | Archon does not have a knowledge base, vector store, or semantic search |
 | **Not an embedding service** | Archon does not generate, store, or query embeddings |
 | **Not a direct LLM API wrapper** | Archon orchestrates AI *coding assistants* (Claude Code, Codex), not raw model APIs |
-| **Not a chatbot builder** | Archon runs structured workflows, not freeform conversations |
+| **Not a general-purpose chat UI** | Adapters are conversation surfaces for workflow execution, not standalone chat experiences |
 | **Not Supabase-dependent** | SQLite is the default; PostgreSQL is optional; Supabase is just one PostgreSQL provider |
 
 ---
 
 ## Version History: Why This Matters
 
-Archon has gone through multiple major rewrites. **Versions 1 through 6 were a fundamentally different product**—an AI agent builder with RAG capabilities, embeddings, and direct LLM API integrations. The current Archon (0.x series, starting with the 2025 rewrite) is a ground-up rebuild focused on deterministic workflows for AI coding agents.
+Archon has gone through multiple major rewrites. **Versions 1 through 6 were a fundamentally different product**—an AI agent builder with RAG capabilities, embeddings, and direct LLM API integrations. The current Archon (0.x series, starting with the 2025 rewrite) is a ground-up rebuild as a governed agentic automation engine.
 
 | Version | Era | What It Was |
 |---------|-----|-------------|
 | v1–v6 | 2024–early 2025 | AI agent builder with Supabase, RAG, embeddings, direct LLM APIs |
-| 0.x (current) | 2025–present | Workflow engine for AI coding agents (Claude Code, Codex, Pi) |
+| 0.x (current) | 2025–present | Governed agentic automation engine (Claude Code, Codex, Pi) |
 
 ### If You're Migrating from v1–v6
 
@@ -53,7 +53,7 @@ The current Archon is not backward-compatible with v1–v6. Key differences:
 
 | Feature | v1–v6 (Legacy) | 0.x (Current) |
 |---------|---------------|---------------|
-| **Purpose** | Build AI agents with RAG | Orchestrate AI coding workflows |
+| **Purpose** | Build AI agents with RAG | Governed agentic automation |
 | **Database** | Supabase required | SQLite default, PostgreSQL optional |
 | **LLM Access** | Direct API calls (OpenAI, Anthropic, Ollama) | Via coding assistants (Claude Code, Codex, Pi) |
 | **Knowledge Base** | Yes (embeddings, vector search) | No |
@@ -72,7 +72,7 @@ If you need the legacy RAG-based agent builder, see the archived [`archive/v1-st
 
 ### "Can Archon crawl local files for the knowledge base?"
 
-**Current Archon does not have a knowledge base.** It doesn't crawl files, chunk documents, or build vector indexes. Workflows operate directly on your git repository.
+**Current Archon does not have a knowledge base.** It doesn't crawl files, chunk documents, or build vector indexes. Workflows operate directly on your project directory.
 
 ### "What LLM providers does Archon support?"
 
@@ -95,7 +95,7 @@ These assistants handle their own authentication and model selection. Archon orc
 If you're an AI assistant answering questions about Archon:
 
 1. **Check the version.** Archon v1–v6 (legacy) and 0.x (current) are different products.
-2. **archon.diy documents 0.x only.** The current workflow engine (released 2025).
+2. **archon.diy documents 0.x only.** The current governed agentic automation engine (released 2025).
 3. **No RAG, no embeddings, no direct LLM APIs** in current Archon.
 4. **Coding assistants, not models.** Archon wraps Claude Code/Codex/Pi, not raw APIs.
 
