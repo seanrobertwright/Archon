@@ -9,9 +9,23 @@
     "dedicated bun manager instead, which reads the text bun.lock and the packages/* workspaces.",
     "Operator coupling worth knowing before changing repository settings: Dependabot ALERTS and the",
     "dependency graph must stay ENABLED even though Dependabot SECURITY UPDATES are turned off.",
-    "Renovate's vulnerabilityAlerts reads GitHub's alert feed; disabling alerts blinds it."
+    "Renovate's vulnerabilityAlerts reads GitHub's alert feed; disabling alerts blinds it.",
+    "",
+    "baseBranchPatterns is a product-history guard, not a style preference. Archon was rewritten",
+    "(#957) and the Python-era product was archived rather than deleted. It still lives on",
+    "archive/v1-stable and archive/v1-task-management-rag, which between them carry",
+    "python/pyproject.toml, python/uv.lock, archon-ui-main/package.json, docs/package.json, several",
+    "python/Dockerfile.* and their own docker-compose.yml - manifests of a product that no longer",
+    "exists. Naming the working branch is what keeps Renovate off them. Leaving this key out would",
+    "make correctness depend on the repository's default-branch setting, which breaks silently if",
+    "someone flips the default to main (releases go through main, and AGENTS.md forbids committing",
+    "to it directly, so Renovate PRs must never target it) or adds a base branch later. A plain",
+    "string matches exactly - only the /regex/ form consults the branch list - so 'dev' cannot",
+    "widen to archive/*. The current option name is baseBranchPatterns; the older baseBranches has",
+    "been removed from the schema."
   ],
   "extends": ["config:recommended"],
+  "baseBranchPatterns": ["dev"],
   "lockFileMaintenance": {
     "description": [
       "Off by Renovate default, and the reason this file exists. Most of this repository's exposure",
