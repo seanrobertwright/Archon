@@ -540,9 +540,11 @@ export async function rejectWorkflow(
   const rejectReason = reason ?? 'Rejected';
   const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
   const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
-  // `!= null` (not `!== undefined`): pauseWorkflowRun now explicit-nulls this field
-  // on every pause when the gate has no on_reject (L1 dialect-parity reset), so a
-  // null must read as "not configured" exactly like an absent key.
+  // `!= null` (not `!== undefined`): a gate with no on_reject leaves this ABSENT
+  // today (pauseWorkflowRun replaces the approval object wholesale, #2673), but runs
+  // paused by builds before that change hold a stored explicit null. Both must read
+  // as "not configured", so keep the loose check — tightening it would cancel a
+  // legacy paused run's rework on resume.
   const onRejectConfigured = approval?.onRejectPrompt != null;
   const maxAttemptsReached = onRejectConfigured && currentCount + 1 >= maxAttempts;
   // The on_reject rework is staged (run stays 'paused') only when a prompt is
