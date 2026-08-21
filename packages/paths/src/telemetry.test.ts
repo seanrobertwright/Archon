@@ -788,7 +788,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     }
   });
 
-  test('captureWorkflowCompleted serializes cache totals with schema version 5', async () => {
+  test('captureWorkflowCompleted serializes cache totals with schema version 6', async () => {
     delete process.env.ARCHON_TELEMETRY_DISABLED;
     delete process.env.DO_NOT_TRACK;
     delete process.env.CI;
@@ -813,6 +813,16 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         cacheReadTokens: 70,
         cacheWriteTokens: 0,
       });
+      captureWorkflowCompleted({
+        outcome: 'completed',
+        workflowName: 'plan',
+        workflowSource: 'bundled',
+        tokensIn: 100,
+        tokensOut: 10,
+        cacheReadTokens: 70,
+        cacheWriteTokens: 0,
+        cachePartialTokens: true,
+      });
       await shutdownTelemetry();
     } finally {
       fetchSpy.mockRestore();
@@ -829,13 +839,28 @@ describe('new capture functions are fire-and-forget no-throw', () => {
       };
       events.push(...(payload.batch ?? []));
     }
-    const props = events.find(event => event.event === 'workflow_completed')?.properties;
-    expect(props).toMatchObject({
-      schema_version: 5,
+    const completed = events.filter(event => event.event === 'workflow_completed');
+    const exact = completed.find(
+      event => event.properties.workflow_name === 'implement'
+    )?.properties;
+    expect(exact).toMatchObject({
+      schema_version: 6,
       tokens_in: 100,
       tokens_out: 10,
       cache_read_tokens: 70,
       cache_write_tokens: 0,
+    });
+    // A complete total carries no flag, so absence keeps its meaning.
+    expect(exact).not.toHaveProperty('cache_partial');
+
+    // Identical totals, but only a floor. Without the flag these two would pool together
+    // and bias aggregate cache figures low across installs (#2662).
+    const floor = completed.find(event => event.properties.workflow_name === 'plan')?.properties;
+    expect(floor).toMatchObject({
+      schema_version: 6,
+      cache_read_tokens: 70,
+      cache_write_tokens: 0,
+      cache_partial: true,
     });
   });
 });

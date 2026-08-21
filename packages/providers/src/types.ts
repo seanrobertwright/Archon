@@ -174,9 +174,54 @@ export interface TokenUsage {
   cacheRead?: number;
   /** Provider-reported cache-creation input. Absent means unsupported or unknown; zero is known. */
   cacheWrite?: number;
+  /**
+   * Set only by aggregation ({@link mergeTokenUsage}), never by a provider. When true the
+   * cache axes on this usage are a FLOOR: at least one contributing usage did not report
+   * that axis, so true cache use is at least the reported total and
+   * `input - cacheRead - cacheWrite` is an UPPER bound on full-price input rather than an
+   * exact figure. Absent means the cache totals are complete, or that no axis is present
+   * at all (#2662).
+   */
+  cachePartial?: true;
   /** Total of gross input, output, and any provider-reported reasoning tokens. */
   total?: number;
   cost?: number;
+}
+
+/**
+ * Sum usages into one aggregate, keeping every cache figure that was actually reported.
+ *
+ * `input` and `output` always sum across every entry. Each cache axis sums over only the
+ * entries that define it and is emitted when at least one did, so a silent contributor
+ * NARROWS the total instead of erasing it; `cachePartial` then marks the result as a floor.
+ * Withholding the axis entirely, as this once did, left gross `input` standing beside no
+ * cache context at all and read as "nothing was cached" (#2662).
+ *
+ * An axis no entry reports stays absent, which already encodes "unknown" — that case is not
+ * flagged. The two axes are decided independently.
+ *
+ * Pure by design: callers own validation and logging, because their contexts differ (persisted
+ * JSON in @archon/core, non-finite guarding in @archon/workflows). Entries are expected to have
+ * finite `input`/`output` already; `total` and `cost` are not aggregated here.
+ */
+export function mergeTokenUsage(usages: readonly TokenUsage[]): TokenUsage | undefined {
+  if (usages.length === 0) return undefined;
+  const merged: TokenUsage = {
+    input: usages.reduce((sum, usage) => sum + usage.input, 0),
+    output: usages.reduce((sum, usage) => sum + usage.output, 0),
+  };
+  // A contribution that is itself a floor keeps the whole aggregate a floor.
+  let partial = usages.some(usage => usage.cachePartial === true);
+  for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+    const reporters = usages.filter(usage => usage[axis] !== undefined);
+    if (reporters.length === 0) continue;
+    merged[axis] = reporters.reduce((sum, usage) => sum + (usage[axis] ?? 0), 0);
+    if (reporters.length < usages.length) partial = true;
+  }
+  if (partial && (merged.cacheRead !== undefined || merged.cacheWrite !== undefined)) {
+    merged.cachePartial = true;
+  }
+  return merged;
 }
 
 /** Concrete model identifier reported by a provider after a request completes. */

@@ -233,7 +233,7 @@ describe('workflow-events', () => {
       ]);
     });
 
-    test('omits cache totals when any token-bearing event has unknown cache usage', async () => {
+    test('reports cache from a mixed run as a floor instead of withholding it', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
           {
@@ -251,7 +251,66 @@ describe('workflow-events', () => {
 
       const result = await getDagResumeSnapshot('run-mixed-cache');
 
+      // The legacy row narrows the cache total rather than erasing it; input is unchanged.
+      expect(result.tokens).toEqual({
+        input: 100,
+        output: 10,
+        cacheRead: 30,
+        cacheWrite: 0,
+        cachePartial: true,
+      });
+    });
+
+    test('leaves cache absent and unflagged when no event reported it', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'legacy-a',
+            event_type: 'node_completed',
+            data: { tokens: { input: 40, output: 4 } },
+          },
+          {
+            step_name: 'legacy-b',
+            event_type: 'node_completed',
+            data: { tokens: { input: 60, output: 6 } },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-all-legacy');
+
+      // A run written entirely by a pre-#2654 build resumes exactly as before.
       expect(result.tokens).toEqual({ input: 100, output: 10 });
+    });
+
+    test('propagates a persisted cachePartial flag into the resumed total', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'loop-total',
+            event_type: 'node_completed',
+            data: {
+              tokens: { input: 500, output: 50, cacheRead: 300, cachePartial: true },
+            },
+          },
+          {
+            step_name: 'plain',
+            event_type: 'node_completed',
+            data: { tokens: { input: 100, output: 10, cacheRead: 40 } },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-partial-node');
+
+      // Every row reports cacheRead, so the axis alone looks complete — the flag
+      // survives only because it round-trips through the persisted event.
+      expect(result.tokens).toEqual({
+        input: 600,
+        output: 60,
+        cacheRead: 340,
+        cachePartial: true,
+      });
     });
 
     test('includes failed-node usage without treating the failed node as completed', async () => {
@@ -282,9 +341,13 @@ describe('workflow-events', () => {
 
       expect(result.completedNodeOutputs).toEqual(new Map([['done', 'kept']]));
       expect(result.costUsd).toBeCloseTo(0.03, 10);
+      // The failed row reports no cache, so the completed row's cache survives as a floor.
       expect(result.tokens).toEqual({
         input: 30,
         output: 3,
+        cacheRead: 5,
+        cacheWrite: 0,
+        cachePartial: true,
       });
       expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining("'node_failed'"), [
         'run-failed-usage',

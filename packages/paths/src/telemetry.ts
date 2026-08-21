@@ -46,7 +46,7 @@ import { BUNDLED_IS_BINARY, BUNDLED_VERSION } from './bundled-build';
 import { createLogger } from './logger';
 
 /** Bumped when the captured property set changes (documented in README). */
-export const TELEMETRY_SCHEMA_VERSION = 5;
+export const TELEMETRY_SCHEMA_VERSION = 6;
 
 // Minimal shape of posthog-node's `fetch` option — copied from @posthog/core
 // (a transitive dep) to avoid pulling it in as a direct dependency.
@@ -640,10 +640,16 @@ export interface WorkflowCompletedProperties {
   tokensIn?: number;
   /** Aggregate provider-reported output tokens for the run. */
   tokensOut?: number;
-  /** Aggregate cache-read input tokens; absent when any contribution is unknown. */
+  /** Aggregate cache-read input tokens; absent when no contribution reported the axis. */
   cacheReadTokens?: number;
-  /** Aggregate cache-write input tokens; absent when any contribution is unknown. */
+  /** Aggregate cache-write input tokens; absent when no contribution reported the axis. */
   cacheWriteTokens?: number;
+  /**
+   * True when the two cache totals above are a FLOOR because at least one contributing
+   * node did not report that axis. Without it a narrowed total would be indistinguishable
+   * from a complete one and would bias aggregate cache figures low (#2662).
+   */
+  cachePartialTokens?: true;
   /** Total loop iterations across all loop nodes in the run. */
   loopIterations?: number;
 }
@@ -890,6 +896,7 @@ export function captureWorkflowCompleted(props: WorkflowCompletedProperties): vo
         ...(props.cacheWriteTokens !== undefined
           ? { cache_write_tokens: props.cacheWriteTokens }
           : {}),
+        ...(props.cachePartialTokens ? { cache_partial: true } : {}),
         ...(props.loopIterations !== undefined ? { loop_iterations: props.loopIterations } : {}),
       },
     });

@@ -11437,6 +11437,85 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     });
   });
 
+  it('best-effort provider: an attempt without cache telemetry narrows the total to a floor', async () => {
+    // Attempt 1 reports cache; attempt 2 reports none. The node's accumulated usage must
+    // keep attempt 1's cache as a floor rather than discarding it — dropping the axes here
+    // left gross `input` standing beside no cache context and read as "nothing cached" (#2662).
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield {
+        type: 'result',
+        sessionId: 's1',
+        structuredOutput: { other: 'x' },
+        cost: 0.01,
+        tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        sessionId: 's2',
+        structuredOutput: { verdict: 'review' },
+        cost: 0.02,
+        tokens: { input: 20, output: 2 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'reask-partial-cache',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' }
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_completed' &&
+        (call[0] as Record<string, unknown>).step_name === 'classify'
+    );
+    expect(completed.length).toBe(1);
+    const tokens = ((completed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
+      .tokens;
+    // Gross input still sums across both attempts; the cache axes are attempt 1's alone.
+    expect(tokens).toEqual({
+      input: 30,
+      output: 3,
+      cacheRead: 5,
+      cacheWrite: 0,
+      cachePartial: true,
+    });
+  });
+
   it('best-effort provider: a non-finite reask cost does not erase prior valid cost', async () => {
     mockSendQueryDag.mockImplementationOnce(async function* () {
       yield { type: 'result', sessionId: 's1', structuredOutput: { other: 'x' }, cost: 0.01 };

@@ -1531,8 +1531,12 @@ input, including cache reads and cache writes. When both cache fields are presen
 uncached input is `input - cacheRead - cacheWrite`. An absent cache field means the
 provider did not report it; `0` means the provider reported zero. Run metadata exposes the
 same totals as `total_tokens_in`, `total_tokens_out`, `total_cache_read_tokens`, and
-`total_cache_write_tokens`. Cache totals are omitted when any contributing node is unknown,
-and cache usage in records created before this contract cannot be recovered.
+`total_cache_write_tokens`. A cache total sums every contributing node that reported that
+axis; when at least one node did not, the total is a **floor** and the aggregate carries
+`cachePartial: true` (run metadata: `total_cache_partial`). So `input - cacheRead -
+cacheWrite` is exact when `cachePartial` is absent and an upper bound on full-price input
+when it is set. An axis no node reported stays absent, and cache usage in records created
+before this contract cannot be recovered.
 
 ### Choosing the child's checkout with `isolation:`
 

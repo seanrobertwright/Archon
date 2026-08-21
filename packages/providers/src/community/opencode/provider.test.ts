@@ -378,6 +378,83 @@ describe('OpencodeProvider', () => {
     );
   });
 
+  test('multi-agent usage keeps cache from the sub-agent that reported it', async () => {
+    const cwd = await createTempProjectDir();
+    const sessionIds = ['scout-session', 'reviewer-session'];
+    const runtime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: sessionIds.shift() } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'message-scout',
+            role: 'assistant',
+            sessionID: 'scout-session',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet',
+            cost: 0.25,
+            finish: 'stop',
+            tokens: { input: 11, output: 7, cache: { read: 5, write: 0 } },
+          },
+        },
+      },
+      {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'message-reviewer',
+            role: 'assistant',
+            sessionID: 'reviewer-session',
+            providerID: 'anthropic',
+            modelID: 'claude-sonnet',
+            cost: 0.25,
+            finish: 'stop',
+            // No `cache` key at all — this sub-agent reports no cache telemetry.
+            tokens: { input: 20, output: 3 },
+          },
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+      { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
+    // Scout's cache survives as a floor instead of being erased by the reviewer's silence,
+    // while gross input still sums across both sub-agents (#2662).
+    expect(chunks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'result',
+          tokens: {
+            input: 36,
+            output: 10,
+            cacheRead: 5,
+            cacheWrite: 0,
+            cachePartial: true,
+            total: 46,
+            cost: 0.5,
+          },
+        }),
+      ])
+    );
+  });
+
   test('terminal result chunk includes sessionId and normalized tokens', async () => {
     scriptedEvents = [
       {

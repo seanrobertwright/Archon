@@ -27,7 +27,7 @@ import type {
   ExecutionContext,
   OverlayChangeSummary,
 } from '@archon/providers/types';
-import { CONTAINER_ENV_DENYLIST } from '@archon/providers/types';
+import { CONTAINER_ENV_DENYLIST, mergeTokenUsage } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 import { WRITEBACK_GATE_NODE_ID } from './container-context';
 import {
@@ -255,6 +255,7 @@ function buildRunUsageProps(totals: {
   tokensOut?: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  cachePartialTokens?: true;
   loopIterations?: number;
 } {
   return {
@@ -269,6 +270,9 @@ function buildRunUsageProps(totals: {
           ...(totals.tokens.cacheWrite !== undefined
             ? { cacheWriteTokens: totals.tokens.cacheWrite }
             : {}),
+          // Without this a floor is indistinguishable from a complete total, which would
+          // bias aggregate cache stats low instead of merely leaving them absent (#2662).
+          ...(totals.tokens.cachePartial ? { cachePartialTokens: true as const } : {}),
         }
       : {}),
     ...(totals.loopIterations > 0 ? { loopIterations: totals.loopIterations } : {}),
@@ -443,7 +447,8 @@ type NodeExecutionResult = NodeOutput & {
 };
 
 /**
- * Add provider usage without turning an unknown cache axis into a partial total.
+ * Add provider usage, keeping each cache axis that was actually reported and marking the
+ * result a floor when some contribution stayed silent (see `mergeTokenUsage`).
  * Required non-finite counters invalidate only that contribution; malformed optional
  * counters are treated as unknown while valid gross input/output remain usable.
  */
@@ -468,17 +473,9 @@ function sumTokenUsage(
     }
     valid.push(normalized);
   }
-  if (valid.length === 0) return undefined;
-  const summed: TokenUsage = {
-    input: valid.reduce((total, usage) => total + usage.input, 0),
-    output: valid.reduce((total, usage) => total + usage.output, 0),
-  };
-  for (const axis of ['cacheRead', 'cacheWrite'] as const) {
-    if (valid.every(usage => usage[axis] !== undefined)) {
-      summed[axis] = valid.reduce((total, usage) => total + (usage[axis] ?? 0), 0);
-    }
-  }
-  return summed;
+  // The merge rule itself lives with TokenUsage so every aggregation site shares one
+  // owner; this function keeps the validation and warn events, which differ per caller.
+  return mergeTokenUsage(valid);
 }
 
 // ---------------------------------------------------------------------------
@@ -9288,6 +9285,8 @@ export async function executeDagWorkflow(
             ...(runCtx.totalTokens.cacheWrite !== undefined
               ? { total_cache_write_tokens: runCtx.totalTokens.cacheWrite }
               : {}),
+            // Marks the two cache totals above as a floor rather than an exact figure.
+            ...(runCtx.totalTokens.cachePartial ? { total_cache_partial: true } : {}),
           }
         : {}),
     };
