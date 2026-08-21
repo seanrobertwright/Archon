@@ -1635,11 +1635,12 @@ export async function handleMessage(
     // (#2663).
     //
     // Scoped to `conversation.cwd === null` on purpose. A conversation WITH a cwd
-    // override is a different situation with different recovery advice — that case
-    // belongs to #2551, which is UNMERGED as of this change, so until it lands a
-    // stale `cwd` override is still unguarded here. Either way, do not collapse the
-    // two into a `conversation.cwd ?? default_cwd` check: that silently absorbs the
-    // override case and replaces its message with this one.
+    // override is a different situation with different recovery advice, handled by
+    // the guard directly above this one (#2551). The two conditions are disjoint on
+    // the same field with no mutation between the reads, which is what lets them sit
+    // side by side. Do not collapse them into a `conversation.cwd ?? default_cwd`
+    // check: that silently absorbs the override case and replaces its message —
+    // which branches on `isolation_env_id` — with this one.
     //
     // Refuses rather than falling back to the workspaces root the way the
     // `scopedCodebase === undefined` branch below does: relocating the agent into a
