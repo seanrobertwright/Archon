@@ -562,7 +562,7 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     ).not.toThrow();
   });
 
-  test('captureWorkflowCompleted accepts v4 usage fields without throwing (disabled)', () => {
+  test('captureWorkflowCompleted accepts v5 cache usage fields without throwing (disabled)', () => {
     process.env.ARCHON_TELEMETRY_DISABLED = '1';
     expect(() =>
       captureWorkflowCompleted({
@@ -575,6 +575,8 @@ describe('new capture functions are fire-and-forget no-throw', () => {
         costUsd: 1.5,
         tokensIn: 50000,
         tokensOut: 12000,
+        cacheReadTokens: 40000,
+        cacheWriteTokens: 0,
         loopIterations: 4,
       })
     ).not.toThrow();
@@ -784,6 +786,57 @@ describe('new capture functions are fire-and-forget no-throw', () => {
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+
+  test('captureWorkflowCompleted serializes cache totals with schema version 5', async () => {
+    delete process.env.ARCHON_TELEMETRY_DISABLED;
+    delete process.env.DO_NOT_TRACK;
+    delete process.env.CI;
+    delete process.env.POSTHOG_API_KEY;
+    const bodies: (string | Blob)[] = [];
+    const fetchImpl = Object.assign(
+      (_url: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
+        const body = (options as { body?: unknown } | undefined)?.body;
+        if (typeof body === 'string' || body instanceof Blob) bodies.push(body);
+        return Promise.resolve(new Response('{"status":"ok"}', { status: 200 }));
+      },
+      { preconnect: (): void => undefined }
+    );
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchImpl);
+    try {
+      captureWorkflowCompleted({
+        outcome: 'completed',
+        workflowName: 'implement',
+        workflowSource: 'bundled',
+        tokensIn: 100,
+        tokensOut: 10,
+        cacheReadTokens: 70,
+        cacheWriteTokens: 0,
+      });
+      await shutdownTelemetry();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+
+    const events: Array<{ event: string; properties: Record<string, unknown> }> = [];
+    for (const body of bodies) {
+      const raw =
+        typeof body === 'string'
+          ? body
+          : new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await body.arrayBuffer())));
+      const payload = JSON.parse(raw) as {
+        batch?: Array<{ event: string; properties: Record<string, unknown> }>;
+      };
+      events.push(...(payload.batch ?? []));
+    }
+    const props = events.find(event => event.event === 'workflow_completed')?.properties;
+    expect(props).toMatchObject({
+      schema_version: 5,
+      tokens_in: 100,
+      tokens_out: 10,
+      cache_read_tokens: 70,
+      cache_write_tokens: 0,
+    });
   });
 });
 

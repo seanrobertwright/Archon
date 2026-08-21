@@ -1027,7 +1027,7 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
  * Sets status to 'paused' and stores approval context in metadata.
  * Does NOT set completed_at — the run is not finished.
  *
- * `resolved`, `completionSignaled`, and `signaledOutput` are reset to an
+ * `resolved`, completion state, and persisted loop usage are reset to an
  * explicit null on every fresh pause so a prior gate's resolution or signal
  * state can never leak into this one: SQLite's json_patch deep-merges the new
  * context into the stored one (an omitted key would keep the old value —
@@ -1062,6 +1062,7 @@ export async function pauseWorkflowRun(
             completionSignaled: approvalContext.completionSignaled ?? null,
             signaledOutput: approvalContext.signaledOutput ?? null,
             signaledTokens: approvalContext.signaledTokens ?? null,
+            signaledCostUsd: approvalContext.signaledCostUsd ?? null,
             onRejectPrompt: approvalContext.onRejectPrompt ?? null,
             onRejectMaxAttempts: approvalContext.onRejectMaxAttempts ?? null,
             captureResponse: approvalContext.captureResponse ?? null,

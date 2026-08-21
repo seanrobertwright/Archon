@@ -1525,6 +1525,15 @@ sub-pipeline.**
   a partly-failed fan-out reports the spend of every child, not just the ones that
   finished.
 
+Workflow JSONL `node_complete.tokens` and persisted `node_completed.data.tokens` use
+`input`, `output`, and optional `cacheRead` / `cacheWrite` fields. `input` is gross prompt
+input, including cache reads and cache writes. When both cache fields are present,
+uncached input is `input - cacheRead - cacheWrite`. An absent cache field means the
+provider did not report it; `0` means the provider reported zero. Run metadata exposes the
+same totals as `total_tokens_in`, `total_tokens_out`, `total_cache_read_tokens`, and
+`total_cache_write_tokens`. Cache totals are omitted when any contributing node is unknown,
+and cache usage in records created before this contract cannot be recovered.
+
 ### Choosing the child's checkout with `isolation:`
 
 `isolation:` decides which working directory the child run executes in. It is valid **only**

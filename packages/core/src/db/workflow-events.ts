@@ -12,6 +12,7 @@ import { pool, getDialect, getDatabaseType } from './connection';
 import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
+import type { TokenUsage } from '@archon/providers/types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -218,8 +219,10 @@ export async function listWorkflowEventsSince(
  * run. Used by the DAG executor to restore state when resuming a failed run.
  * Throws on DB error — caller owns the degradation policy.
  *
- * Both usage axes are summed from `node_completed` rows only, and only from rows that are
- * not marked `data.aggregate`. Two distinct duplication hazards:
+ * Both usage axes are summed from `node_completed` and `node_failed` rows, and only
+ * from rows that are not marked `data.aggregate`. Failed rows contribute spend but
+ * never completed outputs, so their nodes remain eligible for resume. Two distinct
+ * duplication hazards:
  *
  * - `node_skipped_prior_success` rows replay a node an earlier pass already counted, so
  *   counting them would multiply that node's usage by the number of resume passes.
@@ -234,21 +237,21 @@ export async function listWorkflowEventsSince(
  */
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   completedNodeOutputs: Map<string, string>;
-  tokens: { input: number; output: number };
+  tokens?: TokenUsage;
   costUsd: number;
 }> {
   const result = await pool.query<{
     step_name: string | null;
-    event_type: 'node_completed' | 'node_skipped_prior_success';
+    event_type: 'node_completed' | 'node_failed' | 'node_skipped_prior_success';
     data: string | Record<string, unknown>;
   }>(
     `SELECT step_name, event_type, data FROM remote_agent_workflow_events
-     WHERE workflow_run_id = $1 AND event_type IN ('node_completed', 'node_skipped_prior_success')
+     WHERE workflow_run_id = $1 AND event_type IN ('node_completed', 'node_failed', 'node_skipped_prior_success')
      ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
     [workflowRunId]
   );
   const completedNodeOutputs = new Map<string, string>();
-  const tokens = { input: 0, output: 0 };
+  let tokens: TokenUsage | undefined;
   let costUsd = 0;
   for (const row of result.rows) {
     if (!row.step_name) continue;
@@ -262,12 +265,12 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       );
       continue;
     }
-    if (typeof data.node_output === 'string') {
+    if (row.event_type !== 'node_failed' && typeof data.node_output === 'string') {
       completedNodeOutputs.set(row.step_name, data.node_output);
     }
     // A derived row restates usage that other rows in this same log already carry.
     if (data.aggregate === true) continue;
-    if (row.event_type === 'node_completed' && data.tokens !== undefined) {
+    if (row.event_type !== 'node_skipped_prior_success' && data.tokens !== undefined) {
       const eventTokens = data.tokens;
       if (
         typeof eventTokens === 'object' &&
@@ -279,8 +282,37 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         Number.isFinite(eventTokens.input) &&
         Number.isFinite(eventTokens.output)
       ) {
-        tokens.input += eventTokens.input;
-        tokens.output += eventTokens.output;
+        const normalized: TokenUsage = {
+          input: eventTokens.input,
+          output: eventTokens.output,
+        };
+        const optionalTokens = eventTokens as Record<string, unknown>;
+        for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+          const value = optionalTokens[axis];
+          if (value === undefined) continue;
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            normalized[axis] = value;
+          } else {
+            getLog().warn(
+              { runId: workflowRunId, stepName: row.step_name, axis, value },
+              'db.workflow_dag_node_optional_tokens_invalid_ignored'
+            );
+          }
+        }
+        if (tokens === undefined) {
+          tokens = normalized;
+        } else {
+          tokens = {
+            input: tokens.input + normalized.input,
+            output: tokens.output + normalized.output,
+            ...(tokens.cacheRead !== undefined && normalized.cacheRead !== undefined
+              ? { cacheRead: tokens.cacheRead + normalized.cacheRead }
+              : {}),
+            ...(tokens.cacheWrite !== undefined && normalized.cacheWrite !== undefined
+              ? { cacheWrite: tokens.cacheWrite + normalized.cacheWrite }
+              : {}),
+          };
+        }
       } else {
         getLog().warn(
           { runId: workflowRunId, stepName: row.step_name, tokens: eventTokens },
@@ -288,7 +320,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         );
       }
     }
-    if (row.event_type === 'node_completed' && data.cost_usd !== undefined) {
+    if (row.event_type !== 'node_skipped_prior_success' && data.cost_usd !== undefined) {
       const eventCost = data.cost_usd;
       // Same guard shape as tokens: a non-finite value from a provider must not
       // silently poison the total (NaN > 0 is false, which would drop the run's

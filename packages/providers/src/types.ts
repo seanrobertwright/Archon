@@ -167,8 +167,14 @@ export type ProviderDefaultsMap = Record<string, ProviderDefaults>;
  * Token usage statistics from AI provider responses.
  */
 export interface TokenUsage {
+  /** Gross prompt input, including cache reads and writes reported separately. */
   input: number;
   output: number;
+  /** Provider-reported cached input. Absent means unsupported or unknown; zero is known. */
+  cacheRead?: number;
+  /** Provider-reported cache-creation input. Absent means unsupported or unknown; zero is known. */
+  cacheWrite?: number;
+  /** Total of gross input, output, and any provider-reported reasoning tokens. */
   total?: number;
   cost?: number;
 }

@@ -2,6 +2,7 @@
  * Zod schemas for workflow run state types.
  */
 import { z } from '@hono/zod-openapi';
+import type { TokenUsage } from '@archon/providers/types';
 
 // ---------------------------------------------------------------------------
 // WorkflowRunStatus
@@ -295,31 +296,15 @@ export interface ApprovalContext {
    */
   signaledOutput?: string | null;
   /**
-   * Interactive-loop only, and written by the single-node `loop` gate ONLY. Token usage
-   * accumulated by the invocation that produced the signal-bearing paused iteration,
-   * persisted so the finalize-on-approve path can write a node_completed carrying the
-   * usage it really consumed instead of a silent zero (#2333). Only set when
-   * completionSignaled is true; null otherwise. A `loop_group` gate deliberately does
-   * NOT write this: its body nodes persist their own `<groupId>.<nodeId>` rows (with
-   * tokens) before the pause, so a finalize row repeating the total would double-count.
-   *
-   * Scope note: this is the PAUSING invocation's total, matching what the normal
-   * (re-run) completion path reports — a loop that gates more than once attributes each
-   * invocation's usage to that invocation, so on a twice-gated loop the surviving NODE
-   * row reports only the final invocation. That under-report predates this field (before
-   * #2333 nothing was persisted at all) and belongs to the "preserve terminal provider
-   * stats across a gate" fix tracked by #2345, which also covers the `cost_usd` and
-   * resolved-model loss at the same gate.
-   *
-   * The RUN row has the SAME per-invocation attribution, for the same root cause. Since
-   * #2469 the run-tail write is no longer skipped on pause, so a paused run's row does
-   * carry what that invocation spent — but the baseline it adds to (`priorUsage`) is
-   * rebuilt from `node_completed` rows, and a gate pause deliberately writes none. The
-   * metadata merge replaces each key it names rather than adding to it, so a loop that
-   * gates twice leaves the run row reporting only the final invocation. Same fix
-   * boundary as the node row: #2345.
+   * Interactive-loop only, and written by the single-node `loop` gate ONLY. Cumulative
+   * token usage through this pause, restored when the loop resumes so later gates and
+   * terminal metadata retain every pre-gate iteration. The historical name remains for
+   * compatibility with already-paused runs. A `loop_group` gate deliberately omits it:
+   * body nodes persist their own namespaced usage rows before the pause.
    */
-  signaledTokens?: { input: number; output: number } | null;
+  signaledTokens?: TokenUsage | null;
+  /** Cumulative USD cost through this single-node loop pause; paired with signaledTokens. */
+  signaledCostUsd?: number | null;
   /**
    * Interactive-loop only. Read-once snapshot of the resolved loop prompt
    * template, whether authored as `loop.prompt` or loaded from `loop.command`,

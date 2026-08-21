@@ -346,6 +346,12 @@ export async function* streamMultiAgentOpencodeSession(
             return {
               input: acc.input + next.input,
               output: acc.output + next.output,
+              ...(acc.cacheRead !== undefined && next.cacheRead !== undefined
+                ? { cacheRead: acc.cacheRead + next.cacheRead }
+                : {}),
+              ...(acc.cacheWrite !== undefined && next.cacheWrite !== undefined
+                ? { cacheWrite: acc.cacheWrite + next.cacheWrite }
+                : {}),
               total:
                 (acc.total ?? acc.input + acc.output) + (next.total ?? next.input + next.output),
               cost: (acc.cost ?? 0) + (next.cost ?? 0),

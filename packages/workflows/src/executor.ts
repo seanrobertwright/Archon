@@ -615,7 +615,10 @@ export async function hydrateResumableRun(
   return {
     preCreatedRun,
     priorCompletedNodes,
-    priorUsage: { tokens: snapshot.tokens, costUsd: snapshot.costUsd },
+    priorUsage: {
+      ...(snapshot.tokens !== undefined ? { tokens: snapshot.tokens } : {}),
+      costUsd: snapshot.costUsd,
+    },
     priorNodeSessions,
   };
 }
