@@ -9376,6 +9376,101 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       ]);
     });
 
+    it('carries the structured payload across the gate: pause persists it, bare-approve finalize re-emits it (#2637)', async () => {
+      // Round trip, writer to reader. Without `signaledStructuredOutput` the finalize
+      // row loses the payload a natural completion would persist, so a resume AFTER
+      // the finalize rehydrates text-only and the node's completion route changes
+      // its downstream field-access tier.
+      const payload = { summary: 'draft one <promise>APPROVED</promise>' };
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'prose' };
+        yield { type: 'result', sessionId: 'sig-struct-1', structuredOutput: payload };
+      });
+      const loopNodes: DagNode[] = [
+        {
+          id: 'refine',
+          loop: {
+            fresh_context: false,
+            prompt: 'Refine.',
+            until: 'APPROVED',
+            max_iterations: 10,
+            interactive: true,
+            gate_message: 'Review.',
+          },
+          output_format: { type: 'object', properties: { summary: { type: 'string' } } },
+        },
+      ];
+      const pausingDeps = createMockDeps();
+      await executeDagWorkflow(
+        pausingDeps,
+        createMockPlatform(),
+        'conv-dag',
+        testDir,
+        { name: 'finalize-struct-pause', nodes: loopNodes },
+        makeWorkflowRun('finalize-struct-pause-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+      const pauseCalls = (
+        pausingDeps.store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>
+      ).mock.calls;
+      expect(pauseCalls.length).toBe(1);
+      const approval = pauseCalls[0][1] as {
+        signaledOutput?: string | null;
+        signaledStructuredOutput?: unknown;
+      };
+      expect(approval.signaledStructuredOutput).toEqual(payload);
+
+      // Bare approve → finalize. The row must carry the payload like any other
+      // completion row so a later resume rehydrates it (#2637 AC1).
+      mockSendQueryDag.mockClear();
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'should never run' };
+        yield { type: 'result', sessionId: 'never' };
+      });
+      const resumingDeps = createMockDeps();
+      await executeDagWorkflow(
+        resumingDeps,
+        createMockPlatform(),
+        'conv-dag',
+        testDir,
+        { name: 'finalize-struct-resume', nodes: loopNodes },
+        makeWorkflowRun('finalize-struct-resume-run', {
+          metadata: {
+            approval: { ...approval },
+            loop_user_input: 'Approved',
+            loop_feedback_given: false,
+          },
+        }),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+      expect(mockSendQueryDag.mock.calls.length).toBe(0);
+      const completed = (
+        resumingDeps.store.createWorkflowEvent as Mock<
+          (e: {
+            event_type: string;
+            step_name: string;
+            data: Record<string, unknown>;
+          }) => Promise<void>
+        >
+      ).mock.calls.filter(c => c[0].event_type === 'node_completed' && c[0].step_name === 'refine');
+      expect(completed.length).toBe(1);
+      expect(completed[0][0].data.structured_output).toEqual(payload);
+    });
+
     it('finalize omits tokens when the gate persisted none (legacy pause / no usage) (#2333)', async () => {
       mockSendQueryDag.mockImplementation(async function* () {
         yield { type: 'assistant', content: 'should never run' };
@@ -17953,6 +18048,82 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(receivedPrompts[1]).toContain('iter-1-draft');
   });
 
+  it('substitutes $LOOP_PREV in a body node-local with: binding, like every other body surface (#2637)', async () => {
+    // The two features compose: a body script binds the PREVIOUS iteration's output
+    // by name ($LOOP_PREV — text semantics, '' on iteration 1) beside a
+    // current-iteration sibling ref. Before the fix the $LOOP_PREV string survived
+    // substitution as the literal token and landed in the env silently.
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      yield { type: 'assistant', content: callCount === 1 ? 'draft-1' : 'DONE' };
+      yield { type: 'result', sessionId: `s-${callCount}` };
+    });
+
+    const mockDeps = createMockDeps();
+    const workflowRun = makeWorkflowRun('lg-binding-loopprev');
+    const nodes: DagNode[] = [
+      {
+        id: 'grp',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 3,
+          fresh_context: false,
+          nodes: [
+            { id: 'gen', prompt: 'Draft or DONE.', depends_on: [] },
+            {
+              id: 'consume',
+              script: [
+                "const prev = process.env.INPUTS_PREV ?? 'unset';",
+                "const now = process.env.INPUTS_NOW ?? 'unset';",
+                'console.log(`prev=[${prev}] now=[${now}]`);',
+                "if (now === 'DONE') console.log('DONE');",
+              ].join('\n'),
+              runtime: 'bun',
+              depends_on: ['gen'],
+              with: { prev: '$LOOP_PREV.gen.output', now: '$gen.output' },
+            },
+          ],
+        },
+        depends_on: [],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      { name: 'lg-binding-loopprev', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const consumeRows = (
+      mockDeps.store.createWorkflowEvent as Mock<
+        (e: {
+          event_type: string;
+          step_name: string;
+          data: Record<string, unknown>;
+        }) => Promise<void>
+      >
+    ).mock.calls
+      .filter(c => c[0].event_type === 'node_completed' && c[0].step_name === 'grp.consume')
+      .map(c => c[0].data);
+    expect(consumeRows.length).toBe(2);
+    // Iteration 1: no prior iteration — $LOOP_PREV is '', never the literal token.
+    expect(consumeRows[0].node_output).toContain('prev=[] now=[draft-1]');
+    // Iteration 2: the previous gen output, delivered by name through the env.
+    expect(consumeRows[1].node_output).toContain('prev=[draft-1] now=[DONE]');
+  });
+
   it('reads oversized $LOOP_PREV output from the run-owned spill directory', async () => {
     const artifactsDir = join(testDir, 'loop-prev-artifacts');
     const logDir = join(testDir, 'loop-prev-logs');
@@ -19380,6 +19551,125 @@ describe('executeDagWorkflow -- loop_group node', () => {
     );
     expect(completed.length).toBe(1);
     expect(completed[0][0].data.node_output).toBe('GROUP REPORT');
+  });
+
+  it('INTERACTIVE: gate-finalize keeps the terminal sink payload, so both completion routes share one field-access tier (#2637)', async () => {
+    // Round trip. A naturally-completed group attaches its sink's structuredOutput
+    // (tier-2 lenient field access — an absent key resolves to ''); before this fix
+    // the bare-approve finalize returned text only, landing the SAME iteration output
+    // in the strict text-parse tier, where the same absent key throws and fails the
+    // downstream node. One node type, two completion routes, one contract.
+    const payload = { verdict: 'ship <promise>APPROVED</promise>' };
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'prose' };
+      yield { type: 'result', sessionId: 'lg-struct-1', structuredOutput: payload };
+    });
+    const workflow = {
+      name: 'lg-finalize-struct',
+      nodes: [
+        {
+          id: 'refine',
+          loop_group: {
+            until: 'APPROVED',
+            max_iterations: 5,
+            fresh_context: false,
+            interactive: true,
+            gate_message: 'Review.',
+            nodes: [
+              {
+                id: 'work',
+                prompt: 'produce verdict',
+                depends_on: [],
+                output_format: { type: 'object', properties: { verdict: { type: 'string' } } },
+              },
+            ],
+          },
+          depends_on: [],
+        },
+        // Reads a key the payload does NOT carry: lenient tier → '', strict tier → throw.
+        {
+          id: 'after',
+          bash: 'echo "[$refine.output.confidence]"',
+          depends_on: ['refine'],
+        },
+      ] as DagNode[],
+    };
+
+    const pausingDeps = createMockDeps();
+    await executeDagWorkflow(
+      pausingDeps,
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      workflow,
+      makeWorkflowRun('lg-struct-pause'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    const pauseCalls = (
+      pausingDeps.store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>
+    ).mock.calls;
+    expect(pauseCalls.length).toBe(1);
+    const approval = pauseCalls[0][1] as { signaledStructuredOutput?: unknown };
+    expect(approval.signaledStructuredOutput).toEqual(payload);
+
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'should never run' };
+      yield { type: 'result', sessionId: 'never' };
+    });
+    const resumingDeps = createMockDeps();
+    await executeDagWorkflow(
+      resumingDeps,
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      workflow,
+      makeWorkflowRun('lg-struct-resume', {
+        metadata: {
+          approval: { ...approval },
+          loop_user_input: 'Approved',
+          loop_feedback_given: false,
+        },
+      }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+    const eventCalls2 = (
+      resumingDeps.store.createWorkflowEvent as Mock<
+        (e: {
+          event_type: string;
+          step_name: string;
+          data: Record<string, unknown>;
+        }) => Promise<void>
+      >
+    ).mock.calls;
+    const groupCompleted = eventCalls2.filter(
+      c => c[0].event_type === 'node_completed' && c[0].step_name === 'refine'
+    );
+    expect(groupCompleted.length).toBe(1);
+    expect(groupCompleted[0][0].data.structured_output).toEqual(payload);
+    // The downstream consumer ran on the lenient tier — the absent optional key
+    // resolved to empty (shell-quoted into the bash body as '') instead of throwing
+    // missing-key and failing the node, which is what the strict text-parse tier does.
+    const afterCompleted = eventCalls2.filter(
+      c => c[0].event_type === 'node_completed' && c[0].step_name === 'after'
+    );
+    expect(afterCompleted.length).toBe(1);
+    expect(afterCompleted[0][0].data.node_output).toBe("['']");
   });
 
   it('INTERACTIVE: resumed loop_group continues from the next iteration and completes', async () => {
@@ -24813,6 +25103,9 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
   });
 
   it('implement pattern (PR #2627): a boolean travels producer → script binding with no artifact file', async () => {
+    // Deliberately overlaps the AC4 script-env test's code path: this one exists as
+    // the issue's named acceptance bar (#2627's `.green` bridge, replicated as a
+    // fixture), so the acceptance claim stays pinned even if the AC4 test evolves.
     let checkPrompt: string | undefined;
     mockStructuredProducer(p => {
       checkPrompt = p;

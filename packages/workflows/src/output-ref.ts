@@ -116,6 +116,27 @@ export function canonicalValueText(value: unknown): string {
  */
 export const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
 
+/**
+ * The one shape of a declared-input NAME — `with:` keys, `inputs:` keys, and the
+ * `<name>` of a `$INPUTS.<name>` reference all share it. Lives here beside
+ * OUTPUT_REF_SOURCE so every ref grammar has one home; schemas/dag-node re-exports
+ * it for the schema-side validators.
+ */
+export const INPUT_NAME_SOURCE = String.raw`[a-zA-Z_][a-zA-Z0-9_-]*`;
+
+/** Anchored whole-value form: the ENTIRE (trimmed) string is one `$INPUTS.<name>` ref. */
+const WHOLE_INPUTS_REF_PATTERN = new RegExp(String.raw`^\$INPUTS\.(${INPUT_NAME_SOURCE})$`);
+
+/**
+ * Parse a string that is exactly one whole `$INPUTS.<name>` reference (after
+ * trimming) to its input name, or undefined for anything else. The `$INPUTS`
+ * sibling of {@link parseWholeOutputRef}: binding value positions use both to
+ * decide "forward the logical value" vs "splice text into a template".
+ */
+export function parseWholeInputsRef(text: string): string | undefined {
+  return WHOLE_INPUTS_REF_PATTERN.exec(text.trim())?.[1];
+}
+
 /** Anchored whole-value form: the ENTIRE (trimmed) string is one `$id.output[.field]` ref. */
 const WHOLE_OUTPUT_REF_PATTERN = new RegExp(
   `^${OUTPUT_REF_SOURCE}(?:\\.([a-zA-Z_][a-zA-Z0-9_]*))?$`
@@ -173,7 +194,7 @@ export class OutputRefError extends Error {
       case 'unparseable':
         return `'${ref}' references field '${field}', but node '${nodeId}'s output is not a JSON object, so the field cannot be read. Emit JSON containing '${field}', or reference '$${nodeId}.output' (whole text) instead.`;
       case 'array-aggregate':
-        return `'${ref}' references field '${field}', but node '${nodeId}' is a fan-out and its output is a JSON ARRAY of per-child results (each element the child's result value, single-encoded — never a JSON string to parse again), not an object — there is no '${field}' on it and no producer prompt to change, because the array shape is fixed by the engine. Reference '$${nodeId}.output' (the whole array) and read it in a script node, which is also where a failed child's { error, status } entry can be handled. See the fan_out docs.`;
+        return `'${ref}' references field '${field}', but node '${nodeId}' is a fan-out and its output is a JSON ARRAY of per-child results (each element the child's result value, single-encoded — never a JSON string to parse again), not an object — there is no '${field}' on it and no producer prompt to change, because the array shape is fixed by the engine. Reference '$${nodeId}.output' (the whole array) and read it in a script node, which is also where a failed child's marker ({ archon_failed: true, error, status }) can be handled. See the fan_out docs.`;
       case 'truncated':
         return `'${ref}' references field '${field}', but node '${nodeId}'s persisted output was clipped at the event size cap and no longer parses as JSON. The node very likely emitted '${field}' correctly — this surfaces on a resumed run, which reads the clipped copy rather than the original. Write the payload to a file under $ARTIFACTS_DIR and read it downstream, or shrink the node's output.`;
       case 'missing-key':
@@ -230,8 +251,8 @@ function unparseableReason(output: string): OutputRefErrorReason {
   // A fan-out aggregate parses fine — it is simply an array, which `asPlainObject` rejects.
   // Reporting that as 'unparseable' told the author to "emit JSON containing 'x'" from a
   // producer they cannot change, since the engine fixes the array shape. Failing loudly
-  // here is correct (a { error, status } entry must never be consumed as data); only the
-  // advice was wrong.
+  // here is correct (a failed slot's { archon_failed, error, status } marker must never
+  // be consumed as data); only the advice was wrong.
   try {
     if (Array.isArray(JSON.parse(output) as unknown)) return 'array-aggregate';
   } catch {

@@ -24,6 +24,7 @@ import {
   declaredFieldsFromSchema,
   jsonValueSchema,
   parseWholeOutputRef,
+  INPUT_NAME_SOURCE,
   type JsonValue,
 } from '../output-ref';
 import {
@@ -547,16 +548,20 @@ export type CancelNode = z.infer<typeof cancelNodeSchema> & {
 /**
  * Identifier grammar for an include input name.
  *
- * Shared deliberately with the `$INPUTS.<name>` reference pattern in include-expander.ts,
- * which builds its regex from this source. The two encode the identical concept and the
- * drift between them is one-directional and silent: loosening this validator alone would
+ * Shared deliberately with every `$INPUTS.<name>` reference pattern (include-expander,
+ * executor-shared, and the whole-ref parser in output-ref), which all build from this
+ * source. They encode the identical concept and the drift between them is
+ * one-directional and silent: loosening this validator alone would
  * let `with: {my.key: v}` pass while `$INPUTS.my.key` matches only `$INPUTS.my`, leaving
  * `.key` as trailing literal text in the prompt. (The reverse drift fails loudly at load,
  * because the matching `with:` key would be rejected here.) Sharing one source removes the
- * dangerous direction. This is scoped to that pair only — the similar-looking node-id
+ * dangerous direction. This is scoped to that family only — the similar-looking node-id
  * grammar elsewhere in the tree encodes a different concept and stays separate.
+ *
+ * The source itself lives in output-ref.ts beside OUTPUT_REF_SOURCE (one home for
+ * every ref grammar); re-exported here so schema-side validators keep their import.
  */
-export const INPUT_NAME_SOURCE = String.raw`[a-zA-Z_][a-zA-Z0-9_-]*`;
+export { INPUT_NAME_SOURCE };
 export const INPUT_NAME_PATTERN = new RegExp(`^${INPUT_NAME_SOURCE}$`);
 
 /**
@@ -617,7 +622,9 @@ export type IncludeNode = z.infer<typeof includeNodeSchema> & {
  * budget ceiling is deferred to #1961. `join` reduces the
  * N child outcomes into the node's single outcome + `$<id>.output` aggregate:
  *   - `all_done` (DEFAULT): the node succeeds once every child is terminal; failed and
- *      cancelled entries are represented as `{ error, status }` objects in the array.
+ *      cancelled entries are represented as `{ archon_failed: true, error, status }`
+ *      marker objects in the array (`archon_failed` is the reserved discriminator —
+ *      a structured child's own payload may legitimately carry `error`/`status`).
  *      Default because fan-out children are independent by default (see the constitution's
  *      independence rule) — two researchers with different scopes, or ten triage children
  *      over ten issues, do not depend on each other, so one failing must not discard the
@@ -1011,9 +1018,15 @@ export const dagNodeSchema = dagNodeFlatSchema
           continue;
         }
         if (parseWholeOutputRef(parsed.data.from) === undefined) {
+          // $LOOP_PREV is a per-iteration TEXT substitution, not a node ref — a
+          // directive's `from` must stay a ref so `if_skipped` has a producer to
+          // check. Name the supported spelling instead of the generic grammar error.
+          const message = parsed.data.from.trim().startsWith('$LOOP_PREV')
+            ? `${kind} binding '${key}': 'from' cannot read '$LOOP_PREV' — it is not a node reference. Use the string form (e.g. '${key}: ${parsed.data.from.trim()}'), which substitutes the previous iteration's text each pass.`
+            : `${kind} binding '${key}': 'from' must be exactly one whole '$node.output' or '$node.output.field' reference, got '${parsed.data.from}'`;
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `${kind} binding '${key}': 'from' must be exactly one whole '$node.output' or '$node.output.field' reference, got '${parsed.data.from}'`,
+            message,
             path: ['with', key],
           });
         }

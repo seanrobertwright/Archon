@@ -709,6 +709,13 @@ string. Field access uses the same strict semantics as `$nodeId.output.field`
 (a field not in the producer's declared schema fails the consuming node rather
 than silently degrading).
 
+`$LOOP_PREV` works in a body node's `with:` binding **string values** too, with the
+same text semantics as every other body surface: the previous iteration's output is
+substituted into the value each pass (so `with: { prev: $LOOP_PREV.test.output }`
+delivers last iteration's text, `''` on iteration 1 — never a typed value). It is
+**not** a node reference, so a binding directive's `from:` cannot read it — the
+loader rejects that at load and names the string form instead.
+
 ### Configuration fields
 
 `loop_group` shares the same iteration-control fields as `loop`:

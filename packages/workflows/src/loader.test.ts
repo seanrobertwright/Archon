@@ -6894,6 +6894,37 @@ nodes:
     expect(result.error?.error).toContain('literal value');
   });
 
+  it("rejects $LOOP_PREV in a directive's from, naming the string form that works", () => {
+    // $LOOP_PREV is per-iteration text substitution, not a node ref — the directive
+    // needs a producer to check for `if_skipped`. The generic grammar error would be
+    // technically true and useless; the message must point at the supported spelling.
+    const result = parseWorkflow(
+      `
+name: bind-loopprev-directive
+description: directive from cannot read the previous iteration
+nodes:
+  - id: grp
+    loop_group:
+      until: DONE
+      max_iterations: 3
+      nodes:
+        - id: gen
+          prompt: Draft.
+        - id: consume
+          script: console.log("x")
+          runtime: bun
+          depends_on: [gen]
+          with:
+            prev:
+              from: $LOOP_PREV.gen.output
+              if_skipped: ''
+`,
+      'bind-loopprev-directive.yaml'
+    );
+    expect(result.error?.error).toContain("'from' cannot read '$LOOP_PREV'");
+    expect(result.error?.error).toContain('prev: $LOOP_PREV.gen.output');
+  });
+
   it('rejects two binding names that fold to one INPUTS_<UPPER_SNAKE> env key', () => {
     const result = parseWorkflow(
       `

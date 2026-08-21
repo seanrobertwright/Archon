@@ -406,6 +406,17 @@ export interface ApprovalContext {
    */
   signaledOutput?: string | null;
   /**
+   * Interactive-loop only. The signal-bearing iteration's structured payload (#2637),
+   * persisted beside `signaledOutput` so a bare-approve finalize attaches the same
+   * `structuredOutput` a natural completion would — without it the two completion
+   * routes of one node diverge in `$node.output.field` strictness (finalize would
+   * land in the strict text-parse tier while natural completion stays lenient).
+   * Only set when completionSignaled is true AND the iteration produced a payload;
+   * null otherwise. Absent on gates paused by builds predating this field — those
+   * finalize text-only, exactly as before.
+   */
+  signaledStructuredOutput?: unknown;
+  /**
    * Interactive-loop only, and written by the single-node `loop` gate ONLY. Cumulative
    * token usage through this pause, restored when the loop resumes so later gates and
    * terminal metadata retain every pre-gate iteration. The historical name remains for

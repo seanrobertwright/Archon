@@ -10,7 +10,9 @@ import {
   buildTopologicalLayers,
   checkComposedBlockBoundaries,
   checkTriggerRule,
+  resolveNodeBindings,
   substituteNodeOutputRefs,
+  type ShellInputContext,
 } from './dag-executor';
 import { evaluateCondition } from './condition-evaluator';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
@@ -453,7 +455,11 @@ function resolveText(
   outputs: Map<string, NodeOutput>,
   shellSafe = false,
   loopPrevOutput = '',
-  escapeNodeOutputs = shellSafe
+  escapeNodeOutputs = shellSafe,
+  // The `$INPUTS` bag for this text — run-level inputs unless the node carries
+  // node-local `with:` bindings, which merge OVER them (#2637; nearest wins,
+  // matching the executor's command-prompt path).
+  inputs: Record<string, JsonValue> | undefined = ctx.inputs
 ): string {
   const docsDir = join(ctx.cwd, 'docs');
   const substituted = substituteWorkflowVariables(
@@ -467,9 +473,30 @@ function resolveText(
     undefined,
     undefined,
     loopPrevOutput,
-    { shellSafe, stateDir: ctx.stateDir, ...(ctx.inputs ? { inputs: ctx.inputs } : {}) }
+    { shellSafe, stateDir: ctx.stateDir, ...(inputs ? { inputs } : {}) }
   ).prompt;
   return substituteNodeOutputRefs(substituted, outputs, escapeNodeOutputs);
+}
+
+/**
+ * A minimal executor `ShellInputContext` over the simulation's state, so node-local
+ * `with:` bindings resolve through the executor's OWN `resolveNodeBindings` — the
+ * preview and the real run share one resolver and cannot drift (#2637). The
+ * simulation has no WorkflowRun row; run inputs are passed explicitly instead of
+ * riding metadata.
+ */
+function bindingShellContext(
+  ctx: DryRunContext,
+  outputs: Map<string, NodeOutput>
+): ShellInputContext {
+  return {
+    workflowRun: { id: 'dry-run', user_message: ctx.userMessage, metadata: {} },
+    artifactsDir: ctx.artifactsDir,
+    stateDir: ctx.stateDir,
+    baseBranch: 'dry-run-base',
+    docsDir: join(ctx.cwd, 'docs'),
+    nodeOutputs: outputs,
+  };
 }
 
 /**
@@ -551,7 +578,10 @@ function recordFailed(
 async function executeCodeNode(
   node: DagNode,
   code: string,
-  ctx: DryRunContext
+  ctx: DryRunContext,
+  /** Resolved node-local `with:` bindings (#2637) — the nearest env source, layered
+   *  over run inputs exactly like the executor's `inputEnvVars` third tier. */
+  nodeBindings?: Record<string, JsonValue>
 ): Promise<{ output: string } | { error: string }> {
   try {
     let command: string;
@@ -586,12 +616,16 @@ async function executeCodeNode(
     } else {
       return { error: `Node '${node.id}' is not executable code` };
     }
-    // Run-level inputs ride the env bag as `INPUTS_<UPPER_SNAKE>`, never text
-    // substitution — the run-inputs half of a real run's `inputEnvVars`
-    // (dag-executor.ts). Composed include-block inputs for named scripts are a
-    // real-run-only channel the dry run does not deliver.
+    // Run-level inputs and node-local bindings ride the env bag as
+    // `INPUTS_<UPPER_SNAKE>`, never text substitution — the outer tiers of a real
+    // run's `inputEnvVars` (dag-executor.ts), bindings layered over run inputs in
+    // the same nearest-wins order. Composed include-block inputs for named scripts
+    // remain a real-run-only channel the dry run does not deliver.
     const inputEnv: Record<string, string> = {};
     for (const [name, value] of Object.entries(ctx.inputs ?? {})) {
+      inputEnv[inputEnvKey(name)] = canonicalValueText(value);
+    }
+    for (const [name, value] of Object.entries(nodeBindings ?? {})) {
       inputEnv[inputEnvKey(name)] = canonicalValueText(value);
     }
     // The executor pre-creates the artifacts dir it advertises; the simulator honors
@@ -939,9 +973,22 @@ async function simulateNode(
         : isScriptNode(node)
           ? node.script
           : node.prompt;
+    // Node-local `with:` bindings (#2637) resolve BEFORE the stub check, exactly as
+    // the executor resolves them before execution — a binding a real run would fail
+    // on (unknown producer, skipped without if_skipped) fails the simulated node
+    // with the executor's own error, via the catch below. Command bindings merge
+    // over run inputs into the `$INPUTS` bag; script bindings ride the exec env.
+    const nodeBindings =
+      (isCommandNode(node) || isScriptNode(node)) && node.with !== undefined
+        ? resolveNodeBindings(node.id, node.with, bindingShellContext(ctx, outputs), ctx.inputs)
+        : undefined;
+    const commandInputs =
+      isCommandNode(node) && nodeBindings !== undefined
+        ? { ...(ctx.inputs ?? {}), ...nodeBindings }
+        : undefined;
     const resolvedText = isScriptNode(node)
       ? resolveText(sourceText, ctx, outputs, true, '', false)
-      : resolveText(sourceText, ctx, outputs, isBashNode(node));
+      : resolveText(sourceText, ctx, outputs, isBashNode(node), '', undefined, commandInputs);
     const stub = stubFor(node, ctx);
     if (stub !== undefined) {
       const hydrated = completedOutput(node, stub);
@@ -958,7 +1005,7 @@ async function simulateNode(
       return;
     }
     if ((isBashNode(node) || isScriptNode(node)) && ctx.execCode) {
-      const executed = await executeCodeNode(node, resolvedText, ctx);
+      const executed = await executeCodeNode(node, resolvedText, ctx, nodeBindings);
       if ('error' in executed) {
         recordFailed(node, outputs, ctx, executed.error, resolvedText, iteration);
       } else {

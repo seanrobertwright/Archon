@@ -5,6 +5,7 @@ import {
   declaredFieldsFromSchema,
   jsonValueSchema,
   OutputRefError,
+  parseWholeInputsRef,
   parseWholeOutputRef,
   resolveNodeOutputField,
   similarNodeIds,
@@ -79,6 +80,21 @@ describe('parseWholeOutputRef', () => {
     expect(parseWholeOutputRef('$INPUTS.name')).toBeUndefined();
     expect(parseWholeOutputRef('literal')).toBeUndefined();
     expect(parseWholeOutputRef('')).toBeUndefined();
+  });
+});
+
+describe('parseWholeInputsRef', () => {
+  it('parses a whole $INPUTS.<name> ref to its name, tolerating whitespace', () => {
+    expect(parseWholeInputsRef('$INPUTS.mode')).toBe('mode');
+    expect(parseWholeInputsRef('  $INPUTS.foo-bar ')).toBe('foo-bar');
+  });
+
+  it('returns undefined for templates, output refs, and non-refs', () => {
+    expect(parseWholeInputsRef('v=$INPUTS.mode')).toBeUndefined();
+    expect(parseWholeInputsRef('$INPUTS.mode!')).toBeUndefined();
+    expect(parseWholeInputsRef('$plan.output')).toBeUndefined();
+    expect(parseWholeInputsRef('literal')).toBeUndefined();
+    expect(parseWholeInputsRef('')).toBeUndefined();
   });
 });
 

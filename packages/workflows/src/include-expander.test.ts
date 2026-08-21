@@ -2211,4 +2211,41 @@ describe('expandWorkflowIncludes — typed with: values (#2637)', () => {
       guarded: { from: '$use__gather.output.field', if_skipped: true },
     });
   });
+
+  test('an object forwarded into a command/script binding position fails the expansion, never mid-run', () => {
+    // The schema promises a load error for a non-directive object on these maps, and
+    // only substitution can smuggle one past it: the block's string is valid at its
+    // own parse, then the caller supplies an object for the input. Re-validate after
+    // the macro (the substituteWhen precedent) so the workflow never lists clean and
+    // then fails at the node after upstream cost.
+    const block = withSignature(
+      wf('bind-obj-blk', [
+        {
+          id: 'consume',
+          script: 'console.log("x")',
+          runtime: 'bun',
+          with: { mode: '$INPUTS.mode' },
+        },
+      ]),
+      { inputs: { mode: {} } }
+    );
+    const parent = wf('parent', [
+      { id: 'use', include: 'bind-obj-blk', with: { mode: { nested: 'object' } } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(workflows.has('parent')).toBe(false);
+    const message = errors.find(e => e.filename === 'parent')?.error;
+    expect(message).toContain("binding 'mode'");
+    expect(message).toContain('OBJECT');
+
+    // A directive-SHAPED caller object is rejected the same way — data must not be
+    // able to inject reference semantics the block never authored.
+    const sneaky = wf('parent', [
+      { id: 'use', include: 'bind-obj-blk', with: { mode: { from: '$use__consume.output' } } },
+    ]);
+    const second = expandWorkflowIncludes(mapOf(block, sneaky));
+    expect(second.workflows.has('parent')).toBe(false);
+    expect(second.errors.find(e => e.filename === 'parent')?.error).toContain("binding 'mode'");
+  });
 });

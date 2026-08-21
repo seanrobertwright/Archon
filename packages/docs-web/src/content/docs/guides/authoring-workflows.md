@@ -1840,7 +1840,7 @@ consequences worth planning for:
 
 | `join` | The node succeeds when… | `$<id>.output` |
 |--------|------------------------|----------------|
-| `all_done` (default) | every child reached a terminal state | JSON array in item order — each element is the child's **result value** (a structured child's terminal payload lands as the object itself, single-encoded; a text child's output stays the raw string), with each failed/cancelled child represented as `{ error, status }` in its slot |
+| `all_done` (default) | every child reached a terminal state | JSON array in item order — each element is the child's **result value** (a structured child's terminal payload lands as the object itself, single-encoded; a text child's output stays the raw string), with each failed/cancelled child represented as `{ archon_failed: true, error, status }` in its slot |
 | `all_success` | every child completed | same array; any failed or cancelled child fails the node instead |
 | `first_success` | — | Racing: **rejected**, not deferred — see below. Rejected at load rather than silently treated as another join |
 
@@ -1859,8 +1859,8 @@ the default were all-or-nothing, a single failed child would discard nine good r
 the join, after you had already paid for them.
 
 So the default treats **failure as data**. Every terminal outcome reaches the aggregate,
-failed ones as `{ error, status }` in their slot, and the node succeeds. What to do about
-the gaps is then an ordinary decision made by an ordinary node:
+failed ones as `{ archon_failed: true, error, status }` in their slot, and the node
+succeeds. What to do about the gaps is then an ordinary decision made by an ordinary node:
 
 ```yaml
   - id: triage-each
@@ -1872,10 +1872,13 @@ the gaps is then an ordinary decision made by an ordinary node:
   - id: check
     script: |
       const results = $triage-each.output;
-      // A failed slot is the engine's { error, status } marker; everything else is
-      // the child's own result value (an object for a structured child, a raw
-      // string for a text child — single-encoded either way, parse nothing twice).
-      const failed = r => r !== null && typeof r === 'object' && 'status' in r && 'error' in r;
+      // A failed slot carries the engine's reserved `archon_failed: true` marker;
+      // everything else is the child's own result value (an object for a structured
+      // child, a raw string for a text child — single-encoded either way, parse
+      // nothing twice). Check the marker key, NOT the presence of error/status
+      // fields — a child whose own schema declares `error` and `status` is still a
+      // result, and only the marker separates it from a failed slot.
+      const failed = r => r !== null && typeof r === 'object' && r.archon_failed === true;
       const ok = results.filter(r => !failed(r));
       console.log(JSON.stringify({ ok: ok.length, total: results.length }));
     runtime: bun

@@ -55,7 +55,7 @@ import {
   isBindingDirective,
   INPUT_NAME_SOURCE,
 } from './schemas';
-import { canonicalValueText, type JsonValue } from './output-ref';
+import { canonicalValueText, parseWholeInputsRef, type JsonValue } from './output-ref';
 import { createLogger } from '@archon/paths';
 import { validateDagStructure, validateWorkflowOutcomeDeclaration } from './loader';
 import { resolveDeclaredInputs } from './workflow-inputs';
@@ -129,14 +129,11 @@ const WHEN_REF_PATTERN = /\$([a-zA-Z_][a-zA-Z0-9_-]*)(?=\.[a-zA-Z_])/g;
 
 /**
  * Load-time include parameter references. Built from the same identifier source the
- * `with:` key validator uses (INPUT_NAME_SOURCE in schemas/dag-node.ts) so a key that
- * validates can never fail to match here — see that constant for why the drift between
- * the two is silent in one direction.
+ * `with:` key validator uses (INPUT_NAME_SOURCE, homed in output-ref.ts and re-exported
+ * by schemas/dag-node.ts) so a key that validates can never fail to match here — see the
+ * re-export's comment for why the drift between the two is silent in one direction.
  */
 const INPUTS_REF = new RegExp(String.raw`\$INPUTS\.(${INPUT_NAME_SOURCE})`, 'g');
-
-/** Anchored whole-value form of {@link INPUTS_REF} for `with:` value positions (#2637). */
-const WHOLE_INPUTS_REF = new RegExp(String.raw`^\$INPUTS\.(${INPUT_NAME_SOURCE})$`);
 
 function applyOutputRefRename(text: string, rename: (id: string) => string): string {
   return text.replace(OUTPUT_REF_PATTERN, (match, id: string) => {
@@ -527,9 +524,8 @@ function applyInputsMacro(
   // non-strings carry no macro at all.
   const substituteValue = (value: JsonValue): JsonValue => {
     if (typeof value !== 'string') return value;
-    const whole = WHOLE_INPUTS_REF.exec(value.trim());
-    if (whole !== null) {
-      const name = whole[1];
+    const name = parseWholeInputsRef(value);
+    if (name !== undefined) {
       if (Object.hasOwn(args, name)) return args[name];
       missing.add(name);
       return value;
@@ -617,6 +613,15 @@ function applyInputsMacro(
   // Node-local bindings (#2637): command/script `with:` value positions accept block
   // inputs like every other with map; a directive's `from` is a node ref (never an
   // input), while a string `if_skipped` default may carry the macro.
+  //
+  // Re-validate what substitution could have broken (the same pass substituteWhen
+  // runs for `when:` grammar): the schema promises that on command/script nodes an
+  // object `with:` value is a load error unless it is a binding directive, and only
+  // substitution can put an object here after that check ran — a caller forwarding
+  // an object through a whole-`$INPUTS.<name>` value. Letting it through would turn
+  // the promised load error into a mid-run node failure after every upstream node
+  // has already spent its cost; and treating a directive-SHAPED caller object as a
+  // live directive would let data inject reference semantics the block never wrote.
   if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
     for (const [key, value] of Object.entries(node.with)) {
       if (isBindingDirective(value)) {
@@ -624,7 +629,17 @@ function applyInputsMacro(
           value.if_skipped = substituteValue(value.if_skipped);
         }
       } else {
-        node.with[key] = substituteValue(value);
+        const substituted = substituteValue(value);
+        if (
+          substituted !== null &&
+          typeof substituted === 'object' &&
+          !Array.isArray(substituted)
+        ) {
+          throw new IncludeExpansionError(
+            `Node '${includeNode.id}': input substitution supplied an OBJECT to binding '${key}' of included node '${node.id}' (value '${canonicalValueText(value)}'). Command/script binding values must be strings, numbers, booleans, null, or arrays; a binding directive must be authored in the block itself, never forwarded through an input.`
+          );
+        }
+        node.with[key] = substituted;
       }
     }
   }

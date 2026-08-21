@@ -28,9 +28,7 @@ export function scriptFromDag(variantSpecific: Partial<WireDagNode>): ScriptNode
     ...ifDefined('deps', variantSpecific.deps),
     ...ifDefined('timeout', variantSpecific.timeout),
     // Opaque passthrough (#2637): no editor yet, but a round-trip must not drop it.
-    ...(variantSpecific.with !== undefined
-      ? { with: variantSpecific.with as Record<string, unknown> }
-      : {}),
+    ...ifDefined('with', variantSpecific.with as Record<string, unknown> | undefined),
   };
 }
 
@@ -41,6 +39,6 @@ export function scriptToDag(data: ScriptNodeData): Partial<WireDagNode> {
     runtime: data.runtime,
     ...ifDefined('deps', data.deps),
     ...ifDefined('timeout', data.timeout),
-    ...(data.with !== undefined ? { with: data.with } : {}),
+    ...ifDefined('with', data.with),
   };
 }

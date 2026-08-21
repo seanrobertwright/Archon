@@ -70,6 +70,7 @@ import type {
 } from './schemas';
 import {
   isBashNode,
+  isCommandNode,
   isLoopNode,
   isLoopGroupNode,
   isApprovalNode,
@@ -81,7 +82,6 @@ import {
   readSubrunMetadata,
   isApprovalContext,
   inputEnvKey,
-  INPUT_NAME_SOURCE,
   isNodeContextResume,
   isBindingDirective,
   SUBRUN_METADATA_KEYS,
@@ -100,6 +100,7 @@ import {
   similarNodeIds,
   canonicalValueText,
   parseWholeOutputRef,
+  parseWholeInputsRef,
   type JsonValue,
 } from './output-ref';
 import { buildTruncationMarker } from './utils/output-truncation';
@@ -175,13 +176,20 @@ function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
  * Values are logical JSON values (#2637): `readSubrunMetadata` prefers the
  * `inputs_values` sibling key and degrades to the legacy text map.
  */
-function resolveRunInputs(workflowRun: WorkflowRun): Record<string, JsonValue> | undefined {
+function resolveRunInputs(
+  workflowRun: Pick<WorkflowRun, 'metadata'>
+): Record<string, JsonValue> | undefined {
   return readSubrunMetadata(workflowRun.metadata as Record<string, unknown> | undefined).inputs;
 }
 
-/** Everything resolving a composed input value needs; the caller has all of it in scope. */
-interface ShellInputContext {
-  workflowRun: WorkflowRun;
+/**
+ * Everything resolving a composed input value needs; the caller has all of it in scope.
+ * `workflowRun` is a Pick so the dry-run simulator — which has no WorkflowRun row —
+ * can construct one for {@link resolveNodeBindings} (#2637); executor callers pass
+ * their full run unchanged.
+ */
+export interface ShellInputContext {
+  workflowRun: Pick<WorkflowRun, 'id' | 'user_message' | 'metadata'>;
   artifactsDir: string;
   stateDir: string;
   baseBranch: string;
@@ -244,15 +252,14 @@ function inputEnvVars(node: DagNode, ctx: ShellInputContext): NodeJS.ProcessEnv 
   // contract, so it wins over composed and run inputs (extends the documented order
   // above). Resolution failures throw and fail the node — never a silent ''.
   if (isScriptNode(node) && node.with !== undefined) {
-    for (const [name, value] of Object.entries(resolveNodeBindings(node.id, node.with, ctx))) {
+    for (const [name, value] of Object.entries(
+      resolveNodeBindings(node.id, node.with, ctx, runInputs)
+    )) {
       env[inputEnvKey(name)] = canonicalValueText(value);
     }
   }
   return env;
 }
-
-/** Whole-value `$INPUTS.<name>` matcher for binding value positions (#2637). */
-const WHOLE_INPUTS_REF_PATTERN = new RegExp(String.raw`^\$INPUTS\.(${INPUT_NAME_SOURCE})$`);
 
 /**
  * The logical value of one whole `$node.output[.field]` reference (#2637): the
@@ -297,9 +304,9 @@ function resolveWorkflowValue(
   strictWholeRef: boolean
 ): JsonValue {
   if (typeof rawValue !== 'string') return rawValue;
-  const inputsMatch = WHOLE_INPUTS_REF_PATTERN.exec(rawValue.trim());
-  if (inputsMatch !== null) {
-    const name = inputsMatch[1];
+  const inputsName = parseWholeInputsRef(rawValue);
+  if (inputsName !== undefined) {
+    const name = inputsName;
     if (runInputs && Object.hasOwn(runInputs, name)) return runInputs[name];
     // Same loud posture (and hint shape) as the text splice in executor-shared.
     const known = runInputs ? Object.keys(runInputs) : [];
@@ -366,13 +373,18 @@ function resolveWorkflowValue(
  * Everything else resolves through {@link resolveWorkflowValue} in strict mode.
  * The loader guarantees bound producers are upstream `depends_on`, so resolution
  * here is a per-node pre-step with no new scheduling.
+ *
+ * `runInputs` is explicit (not derived from ctx) so the dry-run simulator can pass
+ * its effective input map — its synthetic context carries no run metadata. Exported
+ * for that simulator only; it must resolve bindings with THIS function so preview
+ * and execution cannot drift (#2637 R2).
  */
-function resolveNodeBindings(
+export function resolveNodeBindings(
   consumerId: string,
   withMap: Record<string, JsonValue | BindingDirective>,
-  ctx: ShellInputContext
+  ctx: ShellInputContext,
+  runInputs: Record<string, JsonValue> | undefined
 ): Record<string, JsonValue> {
-  const runInputs = resolveRunInputs(ctx.workflowRun);
   const resolved: Record<string, JsonValue> = {};
   for (const [name, rawValue] of Object.entries(withMap)) {
     if (isBindingDirective(rawValue)) {
@@ -1900,15 +1912,20 @@ async function executeNodeInternal(
     const runInputs = resolveRunInputs(workflowRun);
     const nodeBindings =
       node.command !== undefined && node.with !== undefined
-        ? resolveNodeBindings(node.id, node.with, {
-            workflowRun,
-            artifactsDir,
-            stateDir,
-            baseBranch,
-            docsDir,
-            issueContext,
-            nodeOutputs,
-          })
+        ? resolveNodeBindings(
+            node.id,
+            node.with,
+            {
+              workflowRun,
+              artifactsDir,
+              stateDir,
+              baseBranch,
+              docsDir,
+              issueContext,
+              nodeOutputs,
+            },
+            runInputs
+          )
         : undefined;
     const promptInputs =
       nodeBindings !== undefined ? { ...(runInputs ?? {}), ...nodeBindings } : runInputs;
@@ -3902,6 +3919,10 @@ function readSignaledCostUsd(
  * only record. A loop_group omits it — its body nodes persisted their own namespaced
  * rows (with tokens) before the pause, and those rows survive it, so repeating the
  * total here would double-count in the one event stream.
+ *
+ * `finalizeStructuredOutput` is the signaled iteration's structured payload, carried
+ * across the gate the same way (#2637) — persisted here so a resume AFTER the
+ * finalize rehydrates the payload exactly like a natural completion's row.
  */
 async function finalizeLoopFromSignal(
   deps: WorkflowDeps,
@@ -3912,7 +3933,8 @@ async function finalizeLoopFromSignal(
   stepName: string,
   nodeLabel: string,
   finalizeOutput: string,
-  finalizeUsage?: { costUsd?: number; tokens?: TokenUsage }
+  finalizeUsage?: { costUsd?: number; tokens?: TokenUsage },
+  finalizeStructuredOutput?: unknown
 ): Promise<void> {
   // Impossible by construction today (the gate writes signaledOutput whenever
   // completionSignaled is true) — this warn guards a future decoupling so a
@@ -3937,6 +3959,9 @@ async function finalizeLoopFromSignal(
       data: {
         duration_ms: 0,
         node_output: finalizeOutput,
+        ...(finalizeStructuredOutput !== undefined
+          ? { structured_output: finalizeStructuredOutput }
+          : {}),
         ...(finalizeUsage?.costUsd !== undefined ? { cost_usd: finalizeUsage.costUsd } : {}),
         ...(finalizeUsage?.tokens !== undefined ? { tokens: finalizeUsage.tokens } : {}),
       },
@@ -4053,6 +4078,11 @@ async function executeLoopGroupNode(
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
   if (isLoopResume && loopGateMeta?.completionSignaled === true && !feedbackGiven) {
     const finalizeOutput = loopGateMeta.signaledOutput ?? '';
+    // The signaled iteration's structured payload (#2637): attaching it keeps this
+    // route's `$group.output.field` tier IDENTICAL to natural completion (tier-2
+    // lenient) — without it the same absent optional field would throw here and
+    // resolve to '' there. null/absent (pre-#2637 gates) → text-only, as before.
+    const finalizeStructured = loopGateMeta.signaledStructuredOutput ?? null;
     await finalizeLoopFromSignal(
       deps,
       platform,
@@ -4061,7 +4091,7 @@ async function executeLoopGroupNode(
       node.id,
       stepName,
       'Loop-group node',
-      finalizeOutput
+      finalizeOutput,
       // NO usage, deliberately — same double-count reasoning as the
       // natural-completion group row below. A loop_group's body nodes wrote their own
       // `<groupId>.<nodeId>` node_completed rows (with tokens) BEFORE the gate paused,
@@ -4070,8 +4100,14 @@ async function executeLoopGroupNode(
       // consumer summing usage count the pausing iteration twice. The plain `loop`
       // DOES pass it — its per-iteration rows carry no usage, so its finalize row is
       // the only record.
+      undefined,
+      finalizeStructured ?? undefined
     );
-    return { state: 'completed', output: finalizeOutput };
+    return {
+      state: 'completed',
+      output: finalizeOutput,
+      ...(finalizeStructured !== null ? { structuredOutput: finalizeStructured } : {}),
+    };
   }
 
   let loopPrevOutputs: Map<string, NodeOutput> | undefined; // undefined on iteration 1
@@ -4571,9 +4607,13 @@ async function executeLoopGroupNode(
         // a different provider (#1992). null = this pause has no cursor to restore.
         sessionId: loopLastSequentialSession?.sessionId ?? null,
         sessionProvider: loopLastSequentialSession?.provider ?? null,
-        // Signal state for finalize-on-bare-approve (#2074).
+        // Signal state for finalize-on-bare-approve (#2074). The structured payload
+        // rides along (#2637) so the finalize attaches it like a natural completion.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        signaledStructuredOutput: completionDetected
+          ? (lastIterationStructuredOutput ?? null)
+          : null,
         // NO `signaledTokens` — a loop_group gate has no consumer for it. The body's
         // own `<groupId>.<nodeId>` rows already persisted this iteration's usage before
         // the pause, so the finalize path deliberately writes no `tokens` (see the
@@ -4662,6 +4702,31 @@ export function applyLoopPrevToBodyNode(
     const userInputForField = escapedForBash ? shellQuote(loopUserInput) : loopUserInput;
     return prevResolved.replace(/\$LOOP_USER_INPUT/g, userInputForField);
   };
+  // Node-local `with:` bindings (#2637) are per-iteration surfaces like every other
+  // body field: string values (whole refs and templates alike) get the same raw
+  // `$LOOP_PREV` splice — raw because binding values never touch shell source, the
+  // env bag / `$INPUTS` channel is the injection-safe delivery (#2115). A spliced
+  // `$LOOP_PREV.<id>.output` therefore delivers the previous iteration's TEXT
+  // ('' on iteration 1), exactly like the prompt/bash surfaces — never the literal
+  // token. Directives stay untouched: `from` must remain a current-iteration node
+  // ref (the loader rejects `$LOOP_PREV` there, naming this string form), and only
+  // a string `if_skipped` default carries the splice, mirroring the include macro.
+  const subWithMap = (
+    withMap: Record<string, JsonValue | BindingDirective>
+  ): Record<string, JsonValue | BindingDirective> =>
+    Object.fromEntries(
+      Object.entries(withMap).map(([name, value]): [string, JsonValue | BindingDirective] => {
+        if (isBindingDirective(value)) {
+          return [
+            name,
+            typeof value.if_skipped === 'string'
+              ? { ...value, if_skipped: sub(value.if_skipped) }
+              : value,
+          ];
+        }
+        return [name, typeof value === 'string' ? sub(value) : value];
+      })
+    );
   // AI configuration is live prompt text too. Resolve it in this same per-iteration pass
   // before the ordinary workflow-variable/node-output pass runs in `runLayers`, otherwise
   // a namespaced `$LOOP_PREV` inside an included block reaches the provider literally.
@@ -4777,12 +4842,20 @@ export function applyLoopPrevToBodyNode(
   // (mirroring executeScriptNode's substituteNodeOutputRefs(..., false)); $LOOP_USER_INPUT
   // is skipped here (skipUserInput) and delivered via env by executeScriptNode (#2115).
   if (isScriptNode(substitutedNode))
-    return { ...substitutedNode, script: sub(substitutedNode.script, false, true) };
+    return {
+      ...substitutedNode,
+      script: sub(substitutedNode.script, false, true),
+      ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
+    };
   // Cancel reason is display text, never executed — mirrors the normal-path default.
   if (isCancelNode(substitutedNode))
     return { ...substitutedNode, cancel: sub(substitutedNode.cancel) };
-  if ('command' in substitutedNode && typeof substitutedNode.command === 'string')
-    return { ...substitutedNode, command: sub(substitutedNode.command) };
+  if (isCommandNode(substitutedNode))
+    return {
+      ...substitutedNode,
+      command: sub(substitutedNode.command),
+      ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
+    };
   if ('prompt' in substitutedNode && typeof substitutedNode.prompt === 'string')
     return { ...substitutedNode, prompt: sub(substitutedNode.prompt) };
   return substitutedNode;
@@ -4960,6 +5033,10 @@ async function executeLoopNode(
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
   if (isLoopResume && loopGateMeta?.completionSignaled === true && !feedbackGiven) {
     const finalizeOutput = loopGateMeta.signaledOutput ?? '';
+    // The signaled iteration's structured payload (#2637) — attached below so this
+    // route matches natural completion's NodeOutput exactly. null/absent
+    // (pre-#2637 gates) → text-only, as before.
+    const finalizeStructured = loopGateMeta.signaledStructuredOutput ?? null;
     if (currentSessionId !== undefined) {
       await checkpointSession?.(currentSessionId);
     }
@@ -4975,7 +5052,8 @@ async function executeLoopNode(
       {
         ...(persistedLoopCostUsd !== undefined ? { costUsd: persistedLoopCostUsd } : {}),
         ...(persistedLoopTokens !== undefined ? { tokens: persistedLoopTokens } : {}),
-      }
+      },
+      finalizeStructured ?? undefined
     );
     // Same declared-field capture as the normal completion return below and as the
     // resume-hydration path (#2091). This is a COMPLETION exit, so a consumer's
@@ -4991,6 +5069,7 @@ async function executeLoopNode(
       ...(persistedLoopCostUsd !== undefined ? { costUsd: persistedLoopCostUsd } : {}),
       ...(persistedLoopTokens !== undefined ? { tokens: persistedLoopTokens } : {}),
       ...(finalizeDeclaredFields !== undefined ? { declaredFields: finalizeDeclaredFields } : {}),
+      ...(finalizeStructured !== null ? { structuredOutput: finalizeStructured } : {}),
     };
   }
 
@@ -5845,10 +5924,7 @@ async function executeLoopNode(
     let structuredText: string | undefined;
     if (iterationPayload !== undefined) {
       try {
-        structuredText =
-          typeof iterationPayload === 'string'
-            ? iterationPayload
-            : JSON.stringify(iterationPayload);
+        structuredText = canonicalValueText(iterationPayload);
       } catch (serializeErr) {
         const err = serializeErr as Error;
         return await failLoopNode(
@@ -6174,9 +6250,13 @@ async function executeLoopNode(
         iteration: i,
         // null = this pause has no session to restore.
         sessionId: currentSessionId ?? null,
-        // Signal state for finalize-on-bare-approve (#2074).
+        // Signal state for finalize-on-bare-approve (#2074). The structured payload
+        // rides along (#2637) so the finalize attaches it like a natural completion.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        signaledStructuredOutput: completionDetected
+          ? (lastIterationStructuredOutput ?? null)
+          : null,
         // Cumulative usage consumed through this gate. A resumed loop seeds its
         // totals from these values so later gates and terminal metadata preserve
         // every pre-gate iteration; bare approval uses the same values directly.
@@ -7636,12 +7716,19 @@ async function executeFanOutWorkflowNode(
   }
 
   // join: all_done — node succeeds once all children are terminal; a failed/cancelled
-  // entry is represented as a { error, status } object in the aggregate array (so a
+  // entry is represented as a failure-marker object in the aggregate array (so a
   // collector can reconcile partial results). Never fails the node on a partial failure.
+  //
+  // `archon_failed: true` is the marker's reserved discriminator (#2637): now that a
+  // completed structured child's slot is its payload OBJECT, a child whose own schema
+  // happens to carry `error` + `status` fields (a natural verifier shape) would be
+  // indistinguishable from a failed slot by shape alone. No key can be made literally
+  // unproducible through `output_format`, but no schema grows an `archon_failed`
+  // field by accident — collectors check `r?.archon_failed === true`, nothing else.
   const elements = outcomes.map((o, i) =>
     o.status === 'completed'
       ? childElement(o, i)
-      : { error: o.error ?? `child ${o.status}`, status: o.status }
+      : { archon_failed: true, error: o.error ?? `child ${o.status}`, status: o.status }
   );
   const aggregate = JSON.stringify(elements);
   writeCompleted(aggregate, totalCostUsd, totalTokens, elements);

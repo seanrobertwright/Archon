@@ -2533,8 +2533,8 @@ nodes:
     const aggregate = JSON.parse(String(workCompleted?.data?.node_output)) as unknown[];
     expect(aggregate[0]).toBe('ok:a');
     expect(aggregate[2]).toBe('ok:c');
-    // The failed middle child is represented as an error object, not dropped.
-    expect(aggregate[1]).toMatchObject({ status: 'failed' });
+    // The failed middle child is represented as the marked error object, not dropped.
+    expect(aggregate[1]).toMatchObject({ archon_failed: true, status: 'failed' });
   });
 
   it('bounds concurrency to max_parallel (sliding window over the children)', async () => {
@@ -4817,6 +4817,18 @@ describe('workflow: typed value transport (#2637)', () => {
           };
           return;
         }
+        if (prompt.includes('VERIFY')) {
+          // A verifier-shaped payload: top-level `error` + `status` fields as DATA —
+          // the natural schema the aggregate's failure marker must stay separable from.
+          if (prompt.includes('bad')) throw new Error('verifier exploded');
+          yield { type: 'assistant', content: '{"error":"none found","status":"clean"}' };
+          yield {
+            type: 'result',
+            sessionId: 'sess-verify',
+            structuredOutput: { error: 'none found', status: 'clean' },
+          };
+          return;
+        }
         if (prompt.includes('HANDLE')) {
           if (prompt.includes('bad')) throw new Error('handler exploded');
           if (prompt.includes('plain')) {
@@ -5100,7 +5112,7 @@ nodes:
     expect(workCompleted?.data?.structured_output).toEqual(expected);
   });
 
-  it('AC6: all_done represents a failed child as { error, status } beside logical elements', async () => {
+  it('AC6: all_done represents a failed child as { archon_failed, error, status } beside logical elements', async () => {
     await writeWorkflow(
       'fan-handler',
       `
@@ -5152,7 +5164,73 @@ nodes:
     );
     const aggregate = JSON.parse(String(workCompleted?.data?.node_output)) as unknown[];
     expect(aggregate[0]).toEqual({ v: 'alpha' });
-    expect(aggregate[1]).toMatchObject({ status: 'failed' });
+    expect(aggregate[1]).toMatchObject({ archon_failed: true, status: 'failed' });
+  });
+
+  it('AC6: the failure marker stays separable from a payload that carries error+status fields', async () => {
+    // A structured child whose OWN schema emits top-level `error` and `status` —
+    // the natural verifier shape — completes beside a failed sibling. Shape-based
+    // discrimination ('error' in r && 'status' in r) misclassifies the payload;
+    // the reserved `archon_failed: true` marker is the only sound check, and it
+    // must be present on the failed slot and absent from the completed one.
+    await writeWorkflow(
+      'fan-verifier',
+      `
+name: fan-verifier
+description: verifies one item
+mutates_checkout: false
+nodes:
+  - id: work
+    prompt: VERIFY $ARGUMENTS
+`
+    );
+    await writeWorkflow(
+      'fan-verify-parent',
+      `
+name: fan-verify-parent
+description: verifier payloads beside a failed slot
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["alpha","bad"]'
+  - id: work
+    workflow: fan-verifier
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output"
+      join: all_done
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps } = makeStructuredDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('fan-verify-parent'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'fan-verify-parent');
+    const workCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'work'
+    );
+    const aggregate = JSON.parse(String(workCompleted?.data?.node_output)) as Array<
+      Record<string, unknown>
+    >;
+    // The completed verifier's slot is its payload, unmarked.
+    expect(aggregate[0]).toEqual({ error: 'none found', status: 'clean' });
+    // The failed slot carries the reserved discriminator.
+    expect(aggregate[1]).toMatchObject({ archon_failed: true, status: 'failed' });
+    // The documented collector check separates them exactly.
+    expect(aggregate.filter(r => r?.archon_failed === true)).toHaveLength(1);
   });
 
   it('AC6: a chained fan-out consumes the logical aggregate without double-decoding, and `as` carries the logical item', async () => {
