@@ -716,8 +716,9 @@ describe('workflow-events', () => {
 // `getDagResumeSnapshot` rebuilds a persisted `data.tokens` field by field, so
 // an axis it does not know about is dropped from every resumed run's total.
 // Its writer is in @archon/workflows, and that half is guarded there under the
-// same block name — but the two halves cannot meet in one test, so this side
-// cannot be a round trip.
+// same block name. The two cannot share a test: the writer is only reachable by
+// driving `executeDagWorkflow` through that file's own mock harness, which is
+// not importable. So this side cannot be a round trip.
 //
 // It is pinned to `mergeTokenUsage` instead, which is the decoder's actual
 // downstream contract: `getDagResumeSnapshot` folds what it decodes through

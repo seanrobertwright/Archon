@@ -24040,11 +24040,12 @@ describe('TokenUsage axis seam guard', () => {
    *    Pi's event bridge copies it there. `opencode/multi-agent.ts` does not, so
    *    on that path cost is stranded on the usage object. The fold seam carries
    *    no cost scalar at all.
-   *  - `total` is set by the Claude provider and by Pi's event bridge, and
-   *    dropped by the first fold: `mergeTokenUsage` documents that it does not
-   *    aggregate it. So no seam below carries it. It is NOT a dead axis — its
-   *    live reader is `formatCostFooter` in @archon/adapters, on the unfolded
-   *    direct-chat path that never passes through the fold. Recorded, not fixed.
+   *  - `total` is set by the Claude provider, Pi's event bridge and OpenCode's
+   *    token normalizer, then dropped by the first fold — `mergeTokenUsage`
+   *    documents that it does not aggregate it — so no seam below carries it.
+   *    It is NOT a dead axis: its live reader is `formatCostFooter` in
+   *    @archon/adapters, on the direct-chat path, which never folds. Recorded,
+   *    not fixed.
    */
   const WHOLE_OBJECT_AXIS_KEYS: SeamAxisKeys = {
     input: 'input',
@@ -24086,9 +24087,9 @@ describe('TokenUsage axis seam guard', () => {
    * The negative half matters as much as the positive one. Without it a `null`
    * asserts nothing and stays green forever after it stops being true — teach
    * `mergeTokenUsage` to aggregate `total` and it would start flowing to the
-   * five seams that spread the object whole while the two renaming seams drop
-   * it, with every map still reading `total: null`. That is #2662 again, for the
-   * axis most likely to move next.
+   * seams that spread the object whole while the ones that rebuild or rename it
+   * drop it — with every map still reading `total: null` and every row green.
+   * That is #2662 again, for the axis most likely to move next.
    *
    * Seam and axis are folded into the compared object's KEY, not into a sibling
    * field: bun's diff prints only a narrow window around the changed line, so a
