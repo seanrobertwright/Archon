@@ -693,16 +693,20 @@ export function getRunSourceCapturePath(artifactsDir: string): string {
 }
 
 /**
- * The frozen source a run recorded at start.
+ * The verified capture a run recorded at start, manifest included.
+ *
+ * Returns the CAPTURE rather than its path because every caller needs the manifest too —
+ * its `source_config` decides how those bytes resolve, and a caller handed only the path
+ * rebuilt the roots from defaults, which is how a resume re-discovered a different DAG.
  *
  * Throws {@link WorkflowSourceIntegrityError} when the run HAS a record but the capture
  * cannot be verified. Returns `undefined` only when the run has no record at all — a run
- * created before captures existed, which resumes against live source with a warning
- * because its original bytes were never stored and cannot be reconstructed.
+ * created before captures existed, which resumes against live source because its original
+ * bytes were never stored and cannot be reconstructed.
  */
-export async function resolveRunSourceRoot(
+export async function resolveRunSourceCapture(
   metadata: Record<string, unknown> | undefined
-): Promise<string | undefined> {
+): Promise<WorkflowSourceCapture | undefined> {
   const state = readWorkflowSourceState(metadata);
   if (state.kind === 'unreadable') {
     // NOT the same as having no record. This run recorded something; we simply cannot
@@ -712,14 +716,13 @@ export async function resolveRunSourceRoot(
     );
   }
   if (state.kind === 'absent') return undefined;
-  await loadWorkflowSource(state.record.root, state.record.digest);
-  return state.record.root;
+  return loadWorkflowSource(state.record.root, state.record.digest);
 }
 
 /**
  * The AUTHORING directory a run was captured from, if it still exists.
  *
- * Deliberately different from {@link resolveRunSourceRoot}, and the difference is the
+ * Deliberately different from {@link resolveRunSourceCapture}, and the difference is the
  * whole contract for sub-runs: a run freezes its own source, but a `workflow:` child that
  * has not started yet is not a run, so it must not be frozen into its parent.
  *

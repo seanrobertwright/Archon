@@ -13,7 +13,7 @@ import {
   loadWorkflowSource,
   recordSelectedWorkflow,
   resolveChildDiscoveryRoot,
-  resolveRunSourceRoot,
+  resolveRunSourceCapture,
   WorkflowSourceIntegrityError,
   DEFAULT_WORKFLOW_SOURCE_CONFIG,
 } from './workflow-source';
@@ -385,7 +385,7 @@ describe("a run's own source versus a child's discovery root", () => {
     });
     const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
 
-    expect(await resolveRunSourceRoot(metadata)).toBe(capture!.captureRoot);
+    expect((await resolveRunSourceCapture(metadata))?.captureRoot).toBe(capture!.captureRoot);
   });
 
   test('a not-yet-started child resolves from LIVE authoring, so a fix can land', async () => {
@@ -401,7 +401,7 @@ describe("a run's own source versus a child's discovery root", () => {
 
     expect(await resolveChildDiscoveryRoot(metadata)).toBe(source);
     expect(await resolveChildDiscoveryRoot(metadata)).not.toBe(
-      await resolveRunSourceRoot(metadata)
+      await resolveRunSourceCapture(metadata)
     );
   });
 
@@ -410,12 +410,12 @@ describe("a run's own source versus a child's discovery root", () => {
     // source or stop — falling back would resume it against different bytes. A child's
     // origin is only a hint about where to capture FROM, so its absence is recoverable.
     const metadata = recorded(join(root, 'no-capture'), join(root, 'no-origin'));
-    await expect(resolveRunSourceRoot(metadata)).rejects.toThrow(WorkflowSourceIntegrityError);
+    await expect(resolveRunSourceCapture(metadata)).rejects.toThrow(WorkflowSourceIntegrityError);
     expect(await resolveChildDiscoveryRoot(metadata)).toBeUndefined();
   });
 
   test('a run with no recorded source resolves live', async () => {
-    expect(await resolveRunSourceRoot({})).toBeUndefined();
+    expect(await resolveRunSourceCapture({})).toBeUndefined();
     expect(await resolveChildDiscoveryRoot(undefined)).toBeUndefined();
   });
 
@@ -433,7 +433,7 @@ describe("a run's own source versus a child's discovery root", () => {
     };
     // Unreadable, not absent: the run DID record a source, so resolving live would
     // execute something it never agreed to.
-    await expect(resolveRunSourceRoot(relative)).rejects.toThrow(WorkflowSourceIntegrityError);
+    await expect(resolveRunSourceCapture(relative)).rejects.toThrow(WorkflowSourceIntegrityError);
     expect(await resolveChildDiscoveryRoot(relative)).toBeUndefined();
   });
 
@@ -441,8 +441,8 @@ describe("a run's own source versus a child's discovery root", () => {
     // The tempting mistake is to treat "I cannot parse this" as "there is nothing here".
     // Only a genuinely absent record — a run predating capture — may resume live.
     const future = { [WORKFLOW_SOURCE_METADATA_KEY]: { version: 99, root: source } };
-    await expect(resolveRunSourceRoot(future)).rejects.toThrow(WorkflowSourceIntegrityError);
-    expect(await resolveRunSourceRoot({})).toBeUndefined();
+    await expect(resolveRunSourceCapture(future)).rejects.toThrow(WorkflowSourceIntegrityError);
+    expect(await resolveRunSourceCapture({})).toBeUndefined();
   });
 });
 
@@ -482,11 +482,11 @@ describe('the capture is authoritative, not advisory', () => {
         byte_count: capture.manifest.byte_count,
       },
     };
-    expect(await resolveRunSourceRoot(metadata)).toBe(capture.captureRoot);
+    expect((await resolveRunSourceCapture(metadata))?.captureRoot).toBe(capture.captureRoot);
 
     await rm(capture.captureRoot, { recursive: true, force: true });
     // Not `undefined` — that would read as "no record" and fall through to live source.
-    await expect(resolveRunSourceRoot(metadata)).rejects.toThrow(WorkflowSourceIntegrityError);
+    await expect(resolveRunSourceCapture(metadata)).rejects.toThrow(WorkflowSourceIntegrityError);
   });
 
   test('freezes every statically reachable scope, not just the project', async () => {

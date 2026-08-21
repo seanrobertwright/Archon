@@ -38,7 +38,7 @@ import {
   getRunSourceCapturePath,
   loadWorkflowSource,
   recordSelectedWorkflow,
-  resolveRunSourceRoot,
+  resolveRunSourceCapture,
   resolveChildDiscoveryRoot,
   type WorkflowSourceManifest,
   type WorkflowSourceConfig,
@@ -718,19 +718,11 @@ export async function resolveContinuationWorkflow(
   /** Target workspace — owns config; never the source. */
   cwd: string
 ): Promise<{ workflow: WorkflowDefinition; roots: WorkflowSourceRoots } | undefined> {
-  const state = readWorkflowSourceState(run.metadata);
-  if (state.kind === 'unreadable') {
-    throw new WorkflowSourceIntegrityError(
-      `Cannot continue run of '${run.workflow_name}': its workflow source record cannot be ` +
-        `read by this build (${state.detail}).`
-    );
-  }
-  if (state.kind === 'absent') return undefined;
-
   // Verifies the digest against the value the RUN recorded, and yields the manifest whose
   // `source_config` decides how those bytes resolve. Reading the root without the config
   // is what made a repo with a custom `commands.folder` re-discover a different DAG.
-  const capture = await loadWorkflowSource(state.record.root, state.record.digest);
+  const capture = await resolveRunSourceCapture(run.metadata);
+  if (!capture) return undefined; // predates capture — the caller keeps live behavior
   const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
 
   const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, roots);
@@ -1407,26 +1399,23 @@ async function maybeResumeParentRun(
     // Reload the parent's graph from the source IT started with. Rediscovering from
     // `parentCwd` is how a mid-run authoring edit used to change an already-running
     // parent's DAG, so stored node output could be reinterpreted by a different node.
-    // Reload the parent's graph from the source IT started with. Rediscovering from
-    // `parentCwd` is how a mid-run authoring edit used to change an already-running
-    // parent's DAG, so stored node output could be reinterpreted by a different node.
-    // Throws when the recorded capture no longer verifies; the catch below surfaces it
-    // and leaves the parent resumable rather than silently running other source.
-    const parentSourceRoot = await resolveRunSourceRoot(parent.metadata);
-    const { workflows } = await discoverWorkflowsWithConfig(
-      parentCwd,
-      deps.loadConfig,
-      parentSourceRoot === undefined
-        ? undefined
-        : capturedSourceRoots(
-            parentSourceRoot,
-            (await loadWorkflowSource(parentSourceRoot)).manifest.source_config
-          )
-    );
-    parentWorkflow = resolveWorkflowName(
-      parent.workflow_name,
-      workflows.map(w => w.workflow)
-    );
+    //
+    // Through the shared entry point like every other continuation surface. This spot
+    // hand-rolled the same sequence and read the capture twice for it, which is how the
+    // fifth surface quietly ends up behaving differently from the other four. Throws when
+    // the recorded capture no longer verifies; the catch below leaves the parent resumable
+    // rather than silently running other source.
+    const continuation = await resolveContinuationWorkflow(deps, parent, parentCwd);
+    if (continuation) {
+      parentWorkflow = continuation.workflow;
+    } else {
+      // No recorded source: a parent predating capture, which resumes live as it always did.
+      const { workflows } = await discoverWorkflowsWithConfig(parentCwd, deps.loadConfig);
+      parentWorkflow = resolveWorkflowName(
+        parent.workflow_name,
+        workflows.map(w => w.workflow)
+      );
+    }
   } catch (err) {
     getLog().error({ err: err as Error, parentRunId }, 'workflow.parent_resume_discovery_failed');
     await notifyStuck('workflow discovery failed');
