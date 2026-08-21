@@ -313,6 +313,9 @@ async function resolveRunContinuation(
           args: run.user_message,
           resumeRunId: run.id,
           resumeRun: run,
+          // Already resolved from the run's recorded source, digest verified and
+          // discovered. Forwarded so dispatch does not pay for both again.
+          resolvedContinuation: continuation.workflow,
         },
       };
     }

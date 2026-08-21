@@ -235,6 +235,10 @@ mock.module('@archon/workflows/executor', () => ({
   recordSelectedWorkflow: mock(() => Promise.resolve()),
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
+  withCapturedSource: mock(
+    async (body: (owner: { hold: () => void; adopt: () => void }) => Promise<unknown>) =>
+      body({ hold: () => undefined, adopt: () => undefined })
+  ),
 }));
 mock.module('@archon/workflows/router', () => ({
   findWorkflow: mockFindWorkflow,

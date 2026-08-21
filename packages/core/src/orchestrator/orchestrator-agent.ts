@@ -41,9 +41,10 @@ import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow, resolveWorkflowName } from '@archon/workflows/router';
 import {
-  disposeWorkflowSource,
   executeWorkflow,
   resolveContinuationWorkflow,
+  withCapturedSource,
+  type CapturedSourceOwner,
   hydrateResumableRun,
   prepareWorkflowSource,
   recordSelectedWorkflow,
@@ -628,6 +629,15 @@ interface WorkflowDispatchOptions {
   resumeRunId?: string;
   resumeRun?: WorkflowRun;
   /**
+   * The continuation graph a caller already resolved from the run's recorded source.
+   *
+   * `command-handler` resolves it to build its `CommandResult`, which costs a digest read
+   * and a full discovery; without passing it here that work happened twice on every
+   * resume, approve and reject. A value rather than an "already done" flag, so it cannot
+   * claim something it does not carry.
+   */
+  resolvedContinuation?: WorkflowDefinition;
+  /**
    * Keys the engine dropped from the workflow's YAML (#2213). Mirrored into the
    * conversation before the run starts — chat and the console are where most
    * runs are STARTED, so a warning that only reaches the CLI misses the moment
@@ -723,7 +733,8 @@ function buildFailedRunResumePrompt(
  * TODO(#988): Move to operations/ once dispatchBackgroundWorkflow is extracted
  * from the orchestrator (currently coupled to SSE bridging infrastructure).
  */
-async function dispatchOrchestratorWorkflow(
+async function dispatchOrchestratorWorkflowOwned(
+  owner: CapturedSourceOwner,
   platform: IPlatformAdapter,
   conversationId: string,
   conversation: Conversation,
@@ -824,12 +835,16 @@ async function dispatchOrchestratorWorkflow(
     // capture — an edited workflow would silently run its new graph against pre-edit
     // command bytes. Undefined means a run predating capture, which keeps live behavior.
     try {
-      const continuation = await resolveContinuationWorkflow(
-        createWorkflowDeps(),
-        resumableRun,
-        runCwd
-      );
-      if (continuation) workflow = continuation.workflow;
+      if (options?.resolvedContinuation) {
+        workflow = options.resolvedContinuation;
+      } else {
+        const continuation = await resolveContinuationWorkflow(
+          createWorkflowDeps(),
+          resumableRun,
+          runCwd
+        );
+        if (continuation) workflow = continuation.workflow;
+      }
     } catch (error) {
       const err = error as Error;
       getLog().error({ err, runId: resumableRun.id }, 'workflow.continuation_source_failed');
@@ -848,6 +863,8 @@ async function dispatchOrchestratorWorkflow(
       preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
         sourceRoot: workflowSourceRoot ?? runCwd,
       });
+      // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+      owner.hold(preparedSource);
       // Re-resolve only when files were actually frozen. An empty capture means the
       // definition came from the bundled set a binary embeds as constants — immutable for
       // that binary, with nothing on disk to re-read.
@@ -862,7 +879,7 @@ async function dispatchOrchestratorWorkflow(
           capturedWorkflows.map(w => w.workflow)
         );
         if (!reResolved) {
-          await disposeWorkflowSource(preparedSource);
+          // No manual cleanup: the owner reclaims anything unadopted on the way out.
           await platform.sendMessage(
             conversationId,
             `Could not read workflow **${workflow.name}** from this run's captured source. ` +
@@ -875,7 +892,6 @@ async function dispatchOrchestratorWorkflow(
       await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
     } catch (error) {
       const err = error as Error;
-      if (preparedSource) await disposeWorkflowSource(preparedSource);
       getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
       await platform.sendMessage(
         conversationId,
@@ -1108,6 +1124,8 @@ async function dispatchOrchestratorWorkflow(
             `(\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
         );
       }
+      // Handing the capture to a run: it owns the bytes and their lifetime now.
+      if (preparedSource) owner.adopt();
       await executeWorkflow(
         deps,
         platform,
@@ -1140,6 +1158,8 @@ async function dispatchOrchestratorWorkflow(
         conversationId,
         `⚠️ Prior run for **${workflow.name}** had no completed nodes; starting fresh in the same worktree.`
       );
+      // Handing the capture to a run: it owns the bytes and their lifetime now.
+      if (preparedSource) owner.adopt();
       await executeWorkflow(
         deps,
         platform,
@@ -1201,6 +1221,8 @@ async function dispatchOrchestratorWorkflow(
     }
   } else {
     // Fresh foreground execution: web interactive workflows + all chat platforms
+    // Handing the capture to a run: it owns the bytes and their lifetime now.
+    if (preparedSource) owner.adopt();
     await executeWorkflow(
       createWorkflowDeps(),
       platform,
@@ -1222,6 +1244,43 @@ async function dispatchOrchestratorWorkflow(
       }
     );
   }
+}
+
+/**
+ * Dispatch a workflow, owning any capture it takes.
+ *
+ * A thin owner around the implementation, matching the CLI's shape. The implementation has
+ * five ordinary early returns after a capture is allocated — the inputs gate, the GitHub
+ * requirement gate, an isolation error, a resume with no working path, and the routine
+ * "resume or force?" menu — and every one of them used to abandon a complete frozen tree.
+ */
+async function dispatchOrchestratorWorkflow(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  conversation: Conversation,
+  codebase: Codebase,
+  workflow: WorkflowDefinition,
+  userMessage: string,
+  isolationHints?: HandleMessageContext['isolationHints'],
+  userId?: string,
+  source?: WorkflowSource,
+  options?: WorkflowDispatchOptions
+): Promise<void> {
+  await withCapturedSource(owner =>
+    dispatchOrchestratorWorkflowOwned(
+      owner,
+      platform,
+      conversationId,
+      conversation,
+      codebase,
+      workflow,
+      userMessage,
+      isolationHints,
+      userId,
+      source,
+      options
+    )
+  );
 }
 
 /** A human gate the chat agent resolved during a turn, awaiting continuation. */
@@ -1651,6 +1710,7 @@ export async function handleMessage(
               force: result.workflow.force,
               resumeRunId: result.workflow.resumeRunId,
               resumeRun: result.workflow.resumeRun,
+              resolvedContinuation: result.workflow.resolvedContinuation,
               parseWarnings: result.workflow.parseWarnings,
               // Declared inputs (#2554) arrive on the request context, not in the
               // command text — the run route is the only caller that sets them.
@@ -3159,9 +3219,20 @@ async function handleWorkflowRunCommand(
     // Auto-select the only project
     const codebase = codebases[0];
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
-    // Authoring root for discovery (the canonical repo when `workflowCwd` is a
-    // worktree). Never throws — an unresolvable root reads `workflowCwd`, as before.
-    const workflowSourceRoot = await resolveWorkflowSourceRoot(workflowCwd);
+    // Authoring root for discovery (the canonical repo when `workflowCwd` is a worktree).
+    // This THROWS when git cannot answer — the docblock that once said otherwise was
+    // corrected, and this caller had copied the old claim. Guarded rather than propagated
+    // because this branch only LISTS workflows to validate a name: degrading to the cwd
+    // shows a slightly narrower list, while failing would refuse the command outright.
+    let workflowSourceRoot: string | undefined;
+    try {
+      workflowSourceRoot = await resolveWorkflowSourceRoot(workflowCwd);
+    } catch (error) {
+      getLog().warn(
+        { err: error as Error, workflowCwd },
+        'workflow.source_root_unresolved_listing'
+      );
+    }
 
     let discovery;
     try {

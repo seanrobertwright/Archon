@@ -51,9 +51,10 @@ import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
-  disposeWorkflowSource,
   prepareWorkflowSource,
   recordSelectedWorkflow,
+  withCapturedSource,
+  type CapturedSourceOwner,
   type PreparedWorkflowSource,
 } from '@archon/workflows/executor';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
@@ -317,7 +318,8 @@ export interface WorkflowRoutingContext {
  * Creates a hidden worker conversation, sets up event bridging from worker to parent,
  * and fires-and-forgets the workflow execution.
  */
-export async function dispatchBackgroundWorkflow(
+async function dispatchBackgroundWorkflowOwned(
+  owner: CapturedSourceOwner,
   ctx: WorkflowRoutingContext,
   workflow: WorkflowDefinition,
   isolationContext?: {
@@ -464,6 +466,8 @@ export async function dispatchBackgroundWorkflow(
     preparedSource = await prepareWorkflowSource(workflowDeps, {
       sourceRoot: workflowSourceRoot ?? workerCwd,
     });
+    // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+    owner.hold(preparedSource);
     // See the note in orchestrator-agent.ts: an empty capture means the definition came
     // from a binary's embedded bundled set, which has nothing on disk to re-read.
     if (preparedSource.manifest.scopes.length > 0) {
@@ -486,7 +490,6 @@ export async function dispatchBackgroundWorkflow(
     const err = error as Error;
     // Reclaim before returning: this branch is the console's default dispatch path, and
     // leaving the tree behind here leaks one capture per failed dispatch.
-    if (preparedSource !== undefined) await disposeWorkflowSource(preparedSource);
     getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
     await ctx.platform.sendMessage(
       ctx.conversationId,
@@ -531,6 +534,8 @@ export async function dispatchBackgroundWorkflow(
   void (async (): Promise<void> => {
     try {
       try {
+        // Handing the capture to a run: it owns the bytes and their lifetime now.
+        if (preparedSource) owner.adopt();
         const result = await executeWorkflow(
           workflowDeps,
           ctx.platform,
@@ -641,6 +646,28 @@ export async function dispatchBackgroundWorkflow(
       getLog().error({ err: toError(outerError) }, 'background_workflow_unhandled_error');
     }
   })();
+}
+
+/**
+ * Dispatch a workflow in the background, owning any capture it takes.
+ *
+ * Same owner as the CLI and chat. This path previously reclaimed with a manual dispose in
+ * one catch, which covered that one branch and nothing else — three shapes for one
+ * invariant is how the busiest surface ended up with none.
+ */
+export async function dispatchBackgroundWorkflow(
+  ctx: WorkflowRoutingContext,
+  workflow: WorkflowDefinition,
+  isolationContext?: {
+    branchName?: string;
+    isPrReview?: boolean;
+    prSha?: string;
+    prBranch?: string;
+  }
+): Promise<void> {
+  await withCapturedSource(owner =>
+    dispatchBackgroundWorkflowOwned(owner, ctx, workflow, isolationContext)
+  );
 }
 
 /**

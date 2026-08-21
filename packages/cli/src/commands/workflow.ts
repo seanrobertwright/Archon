@@ -44,18 +44,18 @@ import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-chec
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
-  capturedSourceRoots,
   disposeWorkflowSource,
-  loadWorkflowSource,
-  type WorkflowSourceRoots,
   executeWorkflow,
   finalizeWorkflowSource,
   hydrateResumableRun,
   prepareWorkflowSource,
   recordSelectedWorkflow,
+  resolveContinuationWorkflow,
+  withCapturedSource,
+  type CapturedSourceOwner,
   type PreparedWorkflowSource,
+  type ResolvedContinuation,
 } from '@archon/workflows/executor';
-import { readWorkflowSourceMetadata } from '@archon/workflows/schemas/workflow-run';
 import {
   assertWorkflowRequirementsMet,
   resolveTopLevelInputs,
@@ -224,14 +224,15 @@ export interface WorkflowRunOptions {
    */
   discoveryCwd?: string;
   /**
-   * A run's already-recorded source capture, for continuing that run.
+   * The run being continued, when this invocation continues one.
    *
-   * Resume, approve, and reject re-enter through this command, and they must read the
-   * source the run FROZE, not take a fresh capture of whatever the target holds now — a
-   * workflow that lives only in the authoring checkout is not in the target at all, and
-   * even when it is, recapturing would resume the run against different bytes.
+   * Resume, approve, and reject re-enter through this command, and they must execute the
+   * source the run FROZE — a workflow that lives only in the authoring checkout is not in
+   * the target at all, and even when it is, re-discovering live resumes the run against a
+   * different graph. The whole run is passed, not just its capture path, because
+   * `resolveContinuationWorkflow` needs the recorded digest to verify against.
    */
-  sourceCaptureRoot?: string;
+  continuationRun?: WorkflowRun;
   quiet?: boolean;
   verbose?: boolean;
   /** Platform conversation ID (e.g. `cli-{ts}-{rand}`), NOT a DB UUID. */
@@ -937,19 +938,8 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 /**
  * Run a specific workflow
  */
-/**
- * A prepared capture's owner, supplied by {@link workflowRunCommand}.
- *
- * The implementation reports what it did — held a capture, then adopted it into a run —
- * and the owner reclaims anything unadopted no matter which of the many exits was taken.
- */
-interface CaptureOwner {
-  hold: (prepared: PreparedWorkflowSource) => void;
-  adopt: () => void;
-}
-
 async function runWorkflowWithOwnedSource(
-  owner: CaptureOwner,
+  owner: CapturedSourceOwner,
   cwd: string,
   workflowName: string,
   userMessage: string,
@@ -969,20 +959,30 @@ async function runWorkflowWithOwnedSource(
   // from defaults instead re-discovered a different DAG on any repo with a non-default
   // `commands.folder`, confidently rather than degraded, because a defined-but-default
   // config also suppresses discovery's live-config fallback.
-  let recordedRoots: WorkflowSourceRoots | undefined;
-  if (options.sourceCaptureRoot !== undefined) {
-    const capture = await loadWorkflowSource(options.sourceCaptureRoot);
-    recordedRoots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+  // Continuation goes through the shared entry point, like chat and web. The CLI used to
+  // hand-roll the same load/rebuild/discover sequence: correct at the time, which is the
+  // risk — a change to the shared path would silently not reach CLI resume, and that is
+  // exactly the shape that produced the mixed-vintage and default-settings bugs.
+  let continuation: ResolvedContinuation | undefined;
+  if (options.continuationRun !== undefined) {
+    continuation = await resolveContinuationWorkflow(
+      createWorkflowDeps(),
+      options.continuationRun,
+      cwd
+    );
   }
 
   // A continuation never captures. With a record it reads that record (above); without
   // one it is a run created before captures existed, and reads live source — the same
   // legacy path the executor takes for it. Capturing here would freeze bytes the run
   // never agreed to and still not make it deterministic.
-  const isContinuation = options.resume === true || options.sourceCaptureRoot !== undefined;
+  const isContinuation = options.resume === true || options.continuationRun !== undefined;
 
   let preparedSource: PreparedWorkflowSource | undefined;
-  if (!recordedRoots && !isContinuation && !options.dryRun && !options.stubsInitPath) {
+  // Mirrors the owner's own flag, readable from the signal handler — which exits the
+  // process rather than returning, so it cannot consult the owner's closure.
+  let sourceAdopted = false;
+  if (!isContinuation && !options.dryRun && !options.stubsInitPath) {
     try {
       preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
         sourceRoot: effectiveDiscoveryCwd,
@@ -996,10 +996,13 @@ async function runWorkflowWithOwnedSource(
     }
   }
 
-  const discoveryRoots = recordedRoots ?? preparedSource?.roots;
-  const { workflows: workflowEntries, errors } = discoveryRoots
-    ? await discoverWorkflowsWithConfig(cwd, loadConfig, discoveryRoots)
-    : await loadWorkflows(effectiveDiscoveryCwd);
+  // A resolved continuation already discovered over its own roots; reusing that result is
+  // what keeps a resume from paying digest verification and full discovery twice.
+  const { workflows: workflowEntries, errors } = continuation
+    ? { workflows: continuation.workflows, errors: continuation.errors }
+    : preparedSource
+      ? await discoverWorkflowsWithConfig(cwd, loadConfig, preparedSource.roots)
+      : await loadWorkflows(effectiveDiscoveryCwd);
   const sourceCounts = countWorkflowSources(workflowEntries);
 
   if (!options.json && !options.quiet) {
@@ -1011,13 +1014,15 @@ async function runWorkflowWithOwnedSource(
   }
 
   if (workflowEntries.length === 0 && errors.length === 0) {
-    if (preparedSource) await disposeWorkflowSource(preparedSource);
+    // No manual cleanup here or anywhere else in this function: the owner reclaims
+    // anything unadopted on the way out, which is the point of having one.
     throw new Error('No workflows found in .archon/workflows/');
   }
 
   const workflows = workflowEntries.map(ws => ws.workflow);
 
-  const workflow = resolveWorkflowName(workflowName, workflows);
+  // A continuation executes the graph it froze; only a fresh invocation resolves by name.
+  const workflow = continuation?.workflow ?? resolveWorkflowName(workflowName, workflows);
   // Recover the discovery entry (dropped by the .map above) for telemetry —
   // bundled workflows report their real name, custom ones report "custom" —
   // and for the parse warnings surfaced just below.
@@ -1342,9 +1347,8 @@ async function runWorkflowWithOwnedSource(
       extraArgs.push('--workflow-source', options.discoveryCwd);
     }
 
-    // The detached child captures its own source; this process's capture is dead weight.
-    if (preparedSource) await disposeWorkflowSource(preparedSource);
-
+    // The detached child captures its own source, so this process's capture is dead
+    // weight — and never adopted, so the owner reclaims it when this returns.
     const logPath = await spawnDetachedWorkflowRun(cwd, childConversationId, extraArgs);
 
     if (options.json) {
@@ -1999,6 +2003,15 @@ async function runWorkflowWithOwnedSource(
           }
         }
       })
+      // Reclaim the staged capture for the same reason the container is destroyed above:
+      // `process.exit(1)` never returns up the stack, so the ownership `finally` — whose
+      // whole premise is "whichever way we leave" — never runs. Ctrl-C during isolation
+      // resolution or worktree creation would otherwise strand a complete frozen tree.
+      .then(async () => {
+        if (preparedSource && !sourceAdopted) {
+          await disposeWorkflowSource(preparedSource).catch(() => undefined);
+        }
+      })
       .catch(() => undefined)
       .finally(() => {
         process.exit(1);
@@ -2142,7 +2155,10 @@ async function runWorkflowWithOwnedSource(
           preparedSource,
         };
     // Handing the capture to a run: it now owns the bytes and their lifetime.
-    if (preparedSource) owner.adopt();
+    if (preparedSource) {
+      owner.adopt();
+      sourceAdopted = true;
+    }
     result = await executeWorkflow(
       deps,
       adapter,
@@ -2315,47 +2331,9 @@ export async function workflowRunCommand(
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
-  let held: PreparedWorkflowSource | undefined;
-  await withCapturedSourceOwner(
-    p => {
-      held = p;
-      return held;
-    },
-    async owner => runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, options)
+  await withCapturedSource(owner =>
+    runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, options)
   );
-}
-
-/**
- * Run `body` with an owner that reclaims any capture it was handed but never adopted.
- *
- * The staged path is recorded at `hold` time, before anything can move it: a container run
- * finalizes its capture early and reassigns `captureRoot`, and reclaiming THAT would delete
- * a live run's source. After adoption the staged path no longer exists, so reclaiming is a
- * no-op — which is what makes the guard safe to run unconditionally.
- */
-async function withCapturedSourceOwner(
-  register: (prepared: PreparedWorkflowSource) => PreparedWorkflowSource,
-  body: (owner: CaptureOwner) => Promise<void>
-): Promise<void> {
-  let stagedRoot: string | undefined;
-  let adopted = false;
-  const owner: CaptureOwner = {
-    hold: prepared => {
-      stagedRoot = register(prepared).captureRoot;
-    },
-    adopt: () => {
-      adopted = true;
-    },
-  };
-  try {
-    await body(owner);
-  } finally {
-    if (stagedRoot && !adopted) {
-      await disposeWorkflowSource({ captureRoot: stagedRoot }).catch(() => {
-        /* reclaiming must never mask why the run stopped */
-      });
-    }
-  }
 }
 
 /**
@@ -3055,7 +3033,7 @@ export async function workflowResumeCommand(
   try {
     await workflowRunCommand(run.working_path, run.workflow_name, run.user_message ?? '', {
       // Continue from the source this run froze, not a fresh capture of the target.
-      sourceCaptureRoot: readWorkflowSourceMetadata(run.metadata)?.root,
+      continuationRun: run,
       resume: true,
       codebaseId: run.codebase_id ?? undefined,
       discoveryCwd,
@@ -3239,9 +3217,7 @@ export async function workflowApproveCommand(
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
       // Continue from the source this run froze, not a fresh capture of the target.
-      sourceCaptureRoot: readWorkflowSourceMetadata(
-        (await workflowDb.getWorkflowRun(resolvedId))?.metadata
-      )?.root,
+      continuationRun: (await workflowDb.getWorkflowRun(resolvedId)) ?? undefined,
       resume: true,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,
@@ -3370,9 +3346,7 @@ export async function workflowRejectCommand(
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
       // Continue from the source this run froze, not a fresh capture of the target.
-      sourceCaptureRoot: readWorkflowSourceMetadata(
-        (await workflowDb.getWorkflowRun(resolvedId))?.metadata
-      )?.root,
+      continuationRun: (await workflowDb.getWorkflowRun(resolvedId)) ?? undefined,
       resume: true,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,

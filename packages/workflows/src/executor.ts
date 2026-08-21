@@ -47,6 +47,7 @@ import {
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
 import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
+import type { WorkflowWithSource, WorkflowLoadError } from './schemas';
 import { validateWorkflowOutcomeDeclaration } from './loader';
 import { maybeWarnLegacyStatePath, maybeWarnLegacyArtifactsPath } from './state-migration';
 import { resolveWorkflowName } from './router';
@@ -632,14 +633,19 @@ const STAGED_SOURCE_TTL_MS = 6 * 60 * 60 * 1000;
  *
  * Hygiene only: it never mutates a run and cannot affect one in progress.
  *
- * Runs at most ONCE per process. It was on every capture, which put a directory scan on
- * the spawn path of every fan-out child — N sweeps to reclaim the same nothing, on the one
- * path where captures are most numerous and latency is most visible.
+ * Throttled by TIME, not by process. Once-per-capture put a directory scan on the spawn
+ * path of every fan-out child; once-per-*process* fixed that and broke the server, which
+ * is one process for weeks — it swept on the first dispatch after boot and never again,
+ * leaving crash debris to accumulate for the lifetime of the install. An interval is
+ * correct for both: the CLI sweeps on its first capture, a server keeps sweeping, and no
+ * dispatch pays more than one `readdir` an hour.
  */
-let stagedSourcesSwept = false;
+const STAGED_SOURCE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+let lastStagedSweepAt = 0;
 async function sweepStaleStagedSources(): Promise<void> {
-  if (stagedSourcesSwept) return;
-  stagedSourcesSwept = true;
+  const now = Date.now();
+  if (now - lastStagedSweepAt < STAGED_SOURCE_SWEEP_INTERVAL_MS) return;
+  lastStagedSweepAt = now;
   const stagingRoot = join(archonPaths.getArchonHome(), 'staged-source');
   try {
     const entries = await readdir(stagingRoot, { withFileTypes: true });
@@ -671,24 +677,45 @@ async function sweepStaleStagedSources(): Promise<void> {
  * `adopt()` transfers ownership to a run. Anything else — a return, a throw, a branch
  * nobody has written yet — reclaims. That is the difference between a leak that is fixed
  * and one that cannot recur.
+ *
+ * ONE mechanism, deliberately. An earlier pass built this, described this exact leak in
+ * this exact docblock, and then never called it: the CLI hand-rolled an equivalent, the
+ * background dispatch used a manual `dispose` in one catch, and chat — the highest-traffic
+ * surface — got neither and kept leaking on five returns. Three shapes for one invariant is
+ * how the busiest path ends up with none.
  */
+export interface CapturedSourceOwner {
+  /**
+   * Take responsibility for a capture. Call again if its path changes — a container run
+   * finalizes early and moves the capture out of staging, and reclaiming the pre-move path
+   * would leave the real one behind while looking like it cleaned up.
+   */
+  hold: (prepared: Pick<PreparedWorkflowSource, 'captureRoot'>) => void;
+  /** A run now owns the bytes and their lifetime; stop tracking them. */
+  adopt: () => void;
+}
+
 export async function withCapturedSource<T>(
-  prepared: PreparedWorkflowSource | undefined,
-  body: (adopt: () => void) => Promise<T>
+  body: (owner: CapturedSourceOwner) => Promise<T>
 ): Promise<T> {
+  let held: string | undefined;
   let adopted = false;
-  // The STAGED path, captured before anything can move it: a container run finalizes the
-  // capture early and reassigns `captureRoot`, and reclaiming that would delete a live
-  // run's source. Once adopted, this path no longer exists and reclaiming is a no-op.
-  const stagedRoot = prepared?.captureRoot;
-  try {
-    return await body(() => {
+  const owner: CapturedSourceOwner = {
+    hold: prepared => {
+      held = prepared.captureRoot;
+    },
+    adopt: () => {
       adopted = true;
-    });
+    },
+  };
+  try {
+    return await body(owner);
   } finally {
-    if (stagedRoot && !adopted) {
-      await rm(stagedRoot, { recursive: true, force: true }).catch((err: Error) => {
-        getLog().warn({ err, captureRoot: stagedRoot }, 'workflow.source_capture_dispose_failed');
+    // Adoption MOVES the capture, so reclaiming an adopted one is a no-op even if the
+    // flag were wrong. That is what makes running this unconditionally safe.
+    if (held && !adopted) {
+      await rm(held, { recursive: true, force: true }).catch((err: Error) => {
+        getLog().warn({ err, captureRoot: held }, 'workflow.source_capture_dispose_failed');
       });
     }
   }
@@ -711,13 +738,17 @@ export async function withCapturedSource<T>(
  * so the caller keeps its old live behavior. THROWS when a run recorded a source that
  * cannot be read, verified, or no longer contains its workflow: a run that froze its
  * source must continue with that source or stop.
+ *
+ * The full discovery result comes back with it so a caller that needs the other entries —
+ * parse warnings, load errors, source counts — does not run discovery a second time over
+ * the same roots.
  */
 export async function resolveContinuationWorkflow(
   deps: WorkflowDeps,
   run: Pick<WorkflowRun, 'workflow_name' | 'metadata'>,
   /** Target workspace — owns config; never the source. */
   cwd: string
-): Promise<{ workflow: WorkflowDefinition; roots: WorkflowSourceRoots } | undefined> {
+): Promise<ResolvedContinuation | undefined> {
   // Verifies the digest against the value the RUN recorded, and yields the manifest whose
   // `source_config` decides how those bytes resolve. Reading the root without the config
   // is what made a repo with a custom `commands.folder` re-discover a different DAG.
@@ -725,7 +756,7 @@ export async function resolveContinuationWorkflow(
   if (!capture) return undefined; // predates capture — the caller keeps live behavior
   const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
 
-  const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, roots);
+  const { workflows, errors } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, roots);
   const workflow = resolveWorkflowName(
     run.workflow_name,
     workflows.map(w => w.workflow)
@@ -736,7 +767,15 @@ export async function resolveContinuationWorkflow(
         `${capture.captureRoot} no longer contains that workflow.`
     );
   }
-  return { workflow, roots };
+  return { workflow, roots, workflows, errors };
+}
+
+/** What a continuation resolved to, plus the discovery it already paid for. */
+export interface ResolvedContinuation {
+  workflow: WorkflowDefinition;
+  roots: WorkflowSourceRoots;
+  workflows: readonly WorkflowWithSource[];
+  errors: readonly WorkflowLoadError[];
 }
 
 /**

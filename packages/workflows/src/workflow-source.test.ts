@@ -20,6 +20,7 @@ import {
 import { WORKFLOW_SOURCE_METADATA_KEY } from './schemas/workflow-run';
 import { discoverScriptsForCwd } from './script-discovery';
 import { loadCommandPrompt } from './executor-shared';
+import { withCapturedSource } from './executor';
 import type { WorkflowDeps } from './deps';
 
 let root: string;
@@ -598,5 +599,74 @@ describe('continuing a run resolves with the settings it froze', () => {
 
     const result = await loadCommandPrompt(deps, target, 'shipit', undefined, roots);
     expect(result).toEqual({ success: true, content: 'ship it' });
+  });
+});
+
+describe('a capture is adopted or reclaimed, whichever way the caller leaves', () => {
+  /** Stand in for a staged capture: what the owner is handed and may have to reclaim. */
+  async function stage(name: string): Promise<{ captureRoot: string }> {
+    const captureRoot = join(root, name);
+    await mkdir(captureRoot, { recursive: true });
+    await writeFile(join(captureRoot, 'manifest.json'), '{}');
+    return { captureRoot };
+  }
+
+  const exists = async (p: string): Promise<boolean> =>
+    readFile(join(p, 'manifest.json'), 'utf-8').then(
+      () => true,
+      () => false
+    );
+
+  test('reclaims when the body returns without adopting', async () => {
+    // The shape of every early exit that used to leak: an unknown workflow, a refused
+    // input contract, the "resume or force?" menu. None of them adopt.
+    let staged: { captureRoot: string } | undefined;
+    await withCapturedSource(async owner => {
+      staged = await stage('returned');
+      owner.hold(staged);
+    });
+    expect(await exists(staged!.captureRoot)).toBe(false);
+  });
+
+  test('reclaims when the body throws', async () => {
+    let staged: { captureRoot: string } | undefined;
+    await expect(
+      withCapturedSource(async owner => {
+        staged = await stage('threw');
+        owner.hold(staged);
+        throw new Error('a gate refused this run');
+      })
+    ).rejects.toThrow('a gate refused this run');
+    expect(await exists(staged!.captureRoot)).toBe(false);
+  });
+
+  test('leaves an adopted capture alone — a run owns it now', async () => {
+    let staged: { captureRoot: string } | undefined;
+    await withCapturedSource(async owner => {
+      staged = await stage('adopted');
+      owner.hold(staged);
+      owner.adopt();
+    });
+    expect(await exists(staged!.captureRoot)).toBe(true);
+  });
+
+  test('reclaims the CURRENT path after a container run moves the capture', async () => {
+    // `finalizeWorkflowSource` moves a container run's capture out of staging early. If
+    // the owner kept tracking the pre-move path it would reclaim a directory that is
+    // already gone and leave the real one behind, looking like it had cleaned up.
+    let moved: { captureRoot: string } | undefined;
+    await withCapturedSource(async owner => {
+      const staged = await stage('pre-move');
+      owner.hold(staged);
+      moved = await stage('post-move');
+      owner.hold(moved);
+    });
+    expect(await exists(moved!.captureRoot)).toBe(false);
+  });
+
+  test('holding nothing is not an error', async () => {
+    await expect(withCapturedSource(async () => 'no capture taken')).resolves.toBe(
+      'no capture taken'
+    );
   });
 });
