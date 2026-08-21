@@ -335,9 +335,10 @@ describe('isolationCompleteCommand', () => {
 
   it('allows never-pushed branch with 0 unique commits to complete without --force', async () => {
     mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
-    // Branch is byte-identical to base: every commit on it is reachable from
-    // a surviving ref. Combined with origin/<branch> missing, there is
-    // provably nothing to lose — completion must succeed without --force.
+    // Every commit on the branch is reachable from a surviving ref (so
+    // getUniqueCommitCount returns 0), and origin/<branch> does not exist.
+    // Combined, there is provably nothing to lose — completion must succeed
+    // without --force.
     mockGetUniqueCommitCount.mockResolvedValueOnce(0);
     mockRemoveEnvironment.mockResolvedValueOnce({
       worktreeRemoved: true,

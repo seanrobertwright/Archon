@@ -331,8 +331,9 @@ export async function isolationCompleteCommand(
 
       // Check 5: unpushed commits (not yet on remote).
       // A branch that was never pushed carries zero commits we can lose — every
-      // commit on it is also on the local base — so the "never pushed" blocker
-      // is gated on check 4 having confirmed there ARE unique commits. If check
+      // commit on it is already reachable from a surviving ref — so the
+      // "never pushed" blocker is gated on check 4 having confirmed there ARE
+      // unique commits. If check
       // 4 failed (uniqueCommitCount undefined), the gate is false and this
       // check is suppressed; check 4's own blocker still covers the case.
       try {
