@@ -1309,6 +1309,158 @@ describe('dryRunWorkflow — declared inputs (#2610)', () => {
 // requiring provider+model on every node was rejected: legibility instead of redundancy.
 // ---------------------------------------------------------------------------
 
+describe('dryRunWorkflow — node-local with: bindings (#2637)', () => {
+  const producer = {
+    id: 'plan',
+    prompt: 'Make a plan',
+    output_format: { type: 'object', properties: { green: { type: 'boolean' } } },
+  };
+
+  test('delivers a command binding into the $INPUTS bag of the resolved text', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-bindings-'));
+    temporaryDirectories.push(cwd);
+    mkdirSync(join(cwd, '.archon', 'commands'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'commands', 'deploy.md'), 'Deploy green=$INPUTS.flag');
+    const workflow = makeTestWorkflow({
+      name: 'binding-command',
+      nodes: [
+        producer,
+        {
+          id: 'deploy',
+          command: 'deploy',
+          depends_on: ['plan'],
+          with: { flag: '$plan.output.green' },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd,
+      stubs: { plan: { green: true }, deploy: 'done' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.trace[1]?.resolvedText).toBe('Deploy green=true');
+  });
+
+  test('a node-local binding wins over a run-level input of the same name', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-bindings-'));
+    temporaryDirectories.push(cwd);
+    mkdirSync(join(cwd, '.archon', 'commands'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'commands', 'report.md'), 'Mode: $INPUTS.mode');
+    const workflow = makeTestWorkflow({
+      name: 'binding-precedence',
+      inputs: { mode: { default: 'run-level' } },
+      nodes: [{ id: 'report', command: 'report', with: { mode: 'node-local' } }],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd,
+      stubs: { report: 'done' },
+    });
+
+    // Without the nearest-wins merge the preview silently shows 'run-level' — the
+    // wrong value, with no failure to notice it by.
+    expect(result.trace[0]?.resolvedText).toBe('Mode: node-local');
+  });
+
+  test('delivers script bindings as INPUTS_* env under --exec-code', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'binding-exec',
+      nodes: [
+        producer,
+        {
+          id: 'check',
+          script: 'console.log(`green=${process.env.INPUTS_GREEN ?? "unset"}`)',
+          runtime: 'bun' as const,
+          depends_on: ['plan'],
+          with: { green: '$plan.output.green' },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { plan: { green: true } },
+      execCode: true,
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.trace[1]?.output).toBe('green=true');
+  });
+
+  test('fails the node with the executor error when a binding names an unknown producer', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'binding-unknown',
+      nodes: [
+        producer,
+        {
+          id: 'check',
+          script: 'console.log("never")',
+          runtime: 'bun' as const,
+          depends_on: ['plan'],
+          with: { green: '$plann.output' },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { plan: { green: true } },
+      execCode: true,
+    });
+
+    expect(result.outcome).toBe('failed');
+    const failed = result.trace.find(t => t.nodeId === 'check');
+    expect(failed?.state).toBe('failed');
+    // The executor's own resolver produced this — preview and run share one error.
+    expect(failed?.reason).toContain("references node 'plann'");
+  });
+
+  test('a directive on a skipped producer takes if_skipped, matching the real run', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'binding-skipped',
+      nodes: [
+        producer,
+        {
+          id: 'maybe',
+          prompt: 'Only sometimes',
+          depends_on: ['plan'],
+          when: "$plan.output.green == 'false'",
+          output_format: { type: 'object', properties: { ready: { type: 'boolean' } } },
+        },
+        {
+          id: 'gate',
+          script: 'console.log(`ready=${process.env.INPUTS_READY ?? "unset"}`)',
+          runtime: 'bun' as const,
+          depends_on: ['plan', 'maybe'],
+          trigger_rule: 'all_done' as const,
+          with: { ready: { from: '$maybe.output.ready', if_skipped: false } },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { plan: { green: true } },
+      execCode: true,
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.trace.find(t => t.nodeId === 'gate')?.output).toBe('ready=false');
+  });
+});
+
 describe('dryRunWorkflow — effective provider/model per node', () => {
   const config = {
     assistant: 'claude',

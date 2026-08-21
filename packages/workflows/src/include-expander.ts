@@ -52,8 +52,10 @@ import {
   isWorkflowNode,
   isPersistableNode,
   isNodeContextResume,
+  isBindingDirective,
   INPUT_NAME_SOURCE,
 } from './schemas';
+import { canonicalValueText, parseWholeInputsRef, type JsonValue } from './output-ref';
 import { createLogger } from '@archon/paths';
 import { validateDagStructure, validateWorkflowOutcomeDeclaration } from './loader';
 import { resolveDeclaredInputs } from './workflow-inputs';
@@ -127,9 +129,9 @@ const WHEN_REF_PATTERN = /\$([a-zA-Z_][a-zA-Z0-9_-]*)(?=\.[a-zA-Z_])/g;
 
 /**
  * Load-time include parameter references. Built from the same identifier source the
- * `with:` key validator uses (INPUT_NAME_SOURCE in schemas/dag-node.ts) so a key that
- * validates can never fail to match here — see that constant for why the drift between
- * the two is silent in one direction.
+ * `with:` key validator uses (INPUT_NAME_SOURCE, homed in output-ref.ts and re-exported
+ * by schemas/dag-node.ts) so a key that validates can never fail to match here — see the
+ * re-export's comment for why the drift between the two is silent in one direction.
  */
 const INPUTS_REF = new RegExp(String.raw`\$INPUTS\.(${INPUT_NAME_SOURCE})`, 'g');
 
@@ -393,10 +395,13 @@ function rewriteNodeOutputRefs(
   // The composed-input stamp holds caller-supplied VALUES, which are live code/expression
   // ref surfaces exactly like `workflow.with` above it — a value naming a node of the
   // level now being inlined has to follow that node's rename. Walked outside the mode
-  // chain because any node type can carry a stamp.
+  // chain because any node type can carry a stamp. Only strings can carry refs (#2637);
+  // typed values pass through untouched.
   const stamped = readComposedMeta(node)?.inputs;
   if (stamped !== undefined) {
-    for (const [key, value] of Object.entries(stamped)) stamped[key] = code(value);
+    for (const [key, value] of Object.entries(stamped)) {
+      if (typeof value === 'string') stamped[key] = code(value);
+    }
   }
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
     boundary.dependsOn = boundary.dependsOn.flatMap(expandDependency);
@@ -440,16 +445,29 @@ function rewriteNodeOutputRefs(
   } else if (isWorkflowNode(node)) {
     // workflow.input, workflow.with values and workflow.fan_out.items are live
     // code/expression ref surfaces (data strings), so refs inside an included block's
-    // `workflow:` node namespace verbatim.
+    // `workflow:` node namespace verbatim. Non-string with values carry no refs (#2637).
     if (node.input !== undefined) node.input = code(node.input);
     if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) node.with[key] = code(value);
+      for (const [key, value] of Object.entries(node.with)) {
+        if (typeof value === 'string') node.with[key] = code(value);
+      }
     }
     if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
   } else if (isCancelNode(node)) {
     node.cancel = code(node.cancel);
   } else if ('prompt' in node && typeof node.prompt === 'string') {
     node.prompt = code(node.prompt);
+  }
+
+  // Node-local bindings (#2637) — command/script `with:` string values and directive
+  // `from` refs are live ref surfaces (KEEP IN SYNC item 2), so an included block's
+  // bindings follow its nodes' namespace rename. Outside the mode chain above because
+  // command nodes have no other inline text surface of their own.
+  if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
+    for (const [key, value] of Object.entries(node.with)) {
+      if (typeof value === 'string') node.with[key] = code(value);
+      else if (isBindingDirective(value)) value.from = code(value.from);
+    }
   }
 }
 
@@ -480,7 +498,7 @@ function rewriteNodeOutputRefs(
  */
 function applyInputsMacro(
   node: DagNode,
-  args: Record<string, string>,
+  args: Record<string, JsonValue>,
   missing: Set<string>,
   includeNode: IncludeNode
 ): void {
@@ -491,13 +509,29 @@ function applyInputsMacro(
       // would resolve to an inherited member and splice a native function body into the
       // prompt instead of being reported as a missing input. Anything not supplied as an
       // OWN key is missing, and missing always fails the load — never a silent passthrough.
-      const value = Object.hasOwn(args, name) ? args[name] : undefined;
-      if (value === undefined) {
+      if (!Object.hasOwn(args, name)) {
         missing.add(name);
         return match;
       }
-      return value;
+      // Canonical text (#2637): a typed input splices as its one deterministic
+      // representation (strings raw, everything else canonical JSON text).
+      return canonicalValueText(args[name]);
     });
+
+  // Value-position substitution (#2637): in a `with:` map value, a string that is
+  // EXACTLY `$INPUTS.<name>` forwards the LOGICAL input value (a boolean stays a
+  // boolean through nested composition); any other string splices text as usual, and
+  // non-strings carry no macro at all.
+  const substituteValue = (value: JsonValue): JsonValue => {
+    if (typeof value !== 'string') return value;
+    const name = parseWholeInputsRef(value);
+    if (name !== undefined) {
+      if (Object.hasOwn(args, name)) return args[name];
+      missing.add(name);
+      return value;
+    }
+    return substitute(value);
+  };
 
   const substituteWhen = (when: string): string => {
     const expanded = substitute(when);
@@ -516,9 +550,11 @@ function applyInputsMacro(
   // An inherited stamp's values may reference THIS level's inputs — `with: { plan:
   // '$INPUTS.topic' }` one file down. Without this walk the stamp keeps the literal
   // `$INPUTS.topic` and the composed script receives the token instead of the value.
+  // Value-position semantics (#2637): a whole-`$INPUTS.<name>` stamp forwards the
+  // logical value; typed stamps pass through.
   const stamped = readComposedMeta(node)?.inputs;
   if (stamped !== undefined) {
-    for (const [key, value] of Object.entries(stamped)) stamped[key] = substitute(value);
+    for (const [key, value] of Object.entries(stamped)) stamped[key] = substituteValue(value);
   }
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
     if (boundary.when !== undefined) boundary.when = substituteWhen(boundary.when);
@@ -559,15 +595,53 @@ function applyInputsMacro(
   } else if (isScriptNode(node)) {
     node.script = substitute(node.script);
   } else if (isWorkflowNode(node)) {
+    // `input:` is the child's $ARGUMENTS — a TEXT channel by construction, so a typed
+    // input splices as canonical text there; `with:` values are typed positions.
     if (node.input !== undefined) node.input = substitute(node.input);
     if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) node.with[key] = substitute(value);
+      for (const [key, value] of Object.entries(node.with)) {
+        node.with[key] = substituteValue(value);
+      }
     }
     if (node.fan_out !== undefined) node.fan_out.items = substitute(node.fan_out.items);
   } else if (isCancelNode(node)) {
     node.cancel = substitute(node.cancel);
   } else if ('prompt' in node && typeof node.prompt === 'string') {
     node.prompt = substitute(node.prompt);
+  }
+
+  // Node-local bindings (#2637): command/script `with:` value positions accept block
+  // inputs like every other with map; a directive's `from` is a node ref (never an
+  // input), while a string `if_skipped` default may carry the macro.
+  //
+  // Re-validate what substitution could have broken (the same pass substituteWhen
+  // runs for `when:` grammar): the schema promises that on command/script nodes an
+  // object `with:` value is a load error unless it is a binding directive, and only
+  // substitution can put an object here after that check ran — a caller forwarding
+  // an object through a whole-`$INPUTS.<name>` value. Letting it through would turn
+  // the promised load error into a mid-run node failure after every upstream node
+  // has already spent its cost; and treating a directive-SHAPED caller object as a
+  // live directive would let data inject reference semantics the block never wrote.
+  if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
+    for (const [key, value] of Object.entries(node.with)) {
+      if (isBindingDirective(value)) {
+        if (typeof value.if_skipped === 'string') {
+          value.if_skipped = substituteValue(value.if_skipped);
+        }
+      } else {
+        const substituted = substituteValue(value);
+        if (
+          substituted !== null &&
+          typeof substituted === 'object' &&
+          !Array.isArray(substituted)
+        ) {
+          throw new IncludeExpansionError(
+            `Node '${includeNode.id}': input substitution supplied an OBJECT to binding '${key}' of included node '${node.id}' (value '${canonicalValueText(value)}'). Command/script binding values must be strings, numbers, booleans, null, or arrays; a binding directive must be authored in the block itself, never forwarded through an input.`
+          );
+        }
+        node.with[key] = substituted;
+      }
+    }
   }
 }
 
@@ -590,7 +664,7 @@ interface ExpandedInclude {
 function resolveIncludeInputs(
   includeNode: IncludeNode,
   child: WorkflowDefinition
-): Record<string, string> {
+): Record<string, JsonValue> {
   try {
     return resolveDeclaredInputs(
       includeNode.with ?? {},

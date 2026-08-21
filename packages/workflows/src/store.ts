@@ -17,8 +17,19 @@ import type { TokenUsage } from '@archon/providers/types';
 
 export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 
+/**
+ * One completed node's persisted result, as rehydrated for resume (#2637).
+ * `structuredOutput` is the logical value the node's `node_completed` event carried
+ * under `structured_output`; absent for text-only nodes and rows persisted before
+ * the key existed — those degrade to text re-parsing, the pre-#2637 behavior.
+ */
+export interface PersistedNodeOutput {
+  output: string;
+  structuredOutput?: unknown;
+}
+
 export interface DagResumeSnapshot {
-  completedNodeOutputs: Map<string, string>;
+  completedNodeOutputs: Map<string, PersistedNodeOutput>;
   tokens?: TokenUsage;
   /** Cumulative USD cost persisted by completed and failed node attempts across prior passes. */
   costUsd: number;

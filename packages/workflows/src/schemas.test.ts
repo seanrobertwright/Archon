@@ -1363,7 +1363,7 @@ describe('dagNodeSchema — include', () => {
   test.each([
     ['null', null],
     ['an array', ['main']],
-    ['a non-string value', { branch: 42 }],
+    ['a non-JSON value', { branch: new Date() }],
     ['an invalid key', { 'bad.key': 'main' }],
   ])("include rejects 'with:' when it is %s", (_description, withValue) => {
     const result = dagNodeSchema.safeParse({
@@ -1374,6 +1374,26 @@ describe('dagNodeSchema — include', () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error.issues.some(issue => issue.path[0] === 'with')).toBe(true);
+    }
+  });
+
+  // #2637: with values widened from string-only to JSON values — a boolean/number/
+  // array/object literal loads and keeps its logical type through the transform.
+  test("include accepts and retains typed JSON 'with:' values", () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'r',
+      include: 'archon-review-block',
+      with: { flag: true, count: 3, tags: ['a', 'b'], meta: { k: 'v' }, nothing: null },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as IncludeNode).with).toEqual({
+        flag: true,
+        count: 3,
+        tags: ['a', 'b'],
+        meta: { k: 'v' },
+        nothing: null,
+      });
     }
   });
 

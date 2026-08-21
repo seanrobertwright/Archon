@@ -36,7 +36,7 @@ function composedMeta(node: DagNode | undefined): ComposedNodeMeta | undefined {
   return node === undefined ? undefined : (node as DagNode & NodeWithComposedMeta)[COMPOSED_NODE];
 }
 
-function composedInputs(node: DagNode | undefined): Record<string, string> | undefined {
+function composedInputs(node: DagNode | undefined): Record<string, unknown> | undefined {
   return composedMeta(node)?.inputs;
 }
 
@@ -2122,5 +2122,130 @@ describe('expandWorkflowIncludes — where a workflow-level model: travels (#176
       betas: ['beta-x'],
       fallbackModel: 'fallback-1',
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2637 — JSON-valued include inputs: literals splice as canonical text into
+// text surfaces, while whole-`$INPUTS.<name>` value positions forward the
+// LOGICAL value (a boolean stays a boolean through nested composition).
+// ---------------------------------------------------------------------------
+
+describe('expandWorkflowIncludes — typed with: values (#2637)', () => {
+  test('typed literals splice as canonical text into prompt and bash surfaces', () => {
+    const block = wf('typed-blk', [
+      { id: 'think', prompt: 'flag=$INPUTS.flag items=$INPUTS.items' },
+      { id: 'run', bash: 'echo "n=$INPUTS.count"', depends_on: ['think'] },
+    ]);
+    const parent = wf('parent', [
+      { id: 'use', include: 'typed-blk', with: { flag: true, items: ['a', 'b'], count: 3 } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+    const think = nodeById(workflows.get('parent')!, 'use__think');
+    expect(think && 'prompt' in think ? think.prompt : '').toBe('flag=true items=["a","b"]');
+    const run = nodeById(workflows.get('parent')!, 'use__run');
+    expect(run && 'bash' in run ? run.bash : '').toBe('echo "n=3"');
+  });
+
+  test('a whole-$INPUTS with: value position forwards the LOGICAL value; templates splice text', () => {
+    const block = withSignature(
+      wf('fwd-blk', [
+        {
+          id: 'call',
+          workflow: 'child',
+          with: { x: '$INPUTS.flag', label: 'v=$INPUTS.flag' },
+        },
+      ]),
+      { inputs: { flag: {} } }
+    );
+    const parent = wf('parent', [{ id: 'outer', include: 'fwd-blk', with: { flag: true } }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+    const call = nodeById(workflows.get('parent')!, 'outer__call')!;
+    expect('with' in call ? call.with : undefined).toEqual({ x: true, label: 'v=true' });
+  });
+
+  test('the composed-node stamp keeps typed inputs logical for shell env delivery', () => {
+    const block = withSignature(wf('stamp-blk', [{ id: 'run', bash: 'echo hi' }]), {
+      inputs: { flag: {}, note: {} },
+    });
+    const parent = wf('parent', [
+      { id: 'use', include: 'stamp-blk', with: { flag: false, note: 'text' } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+    const run = nodeById(workflows.get('parent')!, 'use__run');
+    expect(composedInputs(run)).toEqual({ flag: false, note: 'text' });
+  });
+
+  test('command/script node-local bindings are walked: refs namespaced, $INPUTS resolved', () => {
+    const block = withSignature(
+      wf('bind-blk', [
+        { id: 'gather', bash: 'echo data' },
+        {
+          id: 'consume',
+          script: 'console.log("x")',
+          runtime: 'bun',
+          depends_on: ['gather'],
+          with: {
+            data: '$gather.output',
+            mode: '$INPUTS.mode',
+            guarded: { from: '$gather.output.field', if_skipped: '$INPUTS.mode' },
+          },
+        },
+      ]),
+      { inputs: { mode: {} } }
+    );
+    const parent = wf('parent', [{ id: 'use', include: 'bind-blk', with: { mode: true } }]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+    const consume = nodeById(workflows.get('parent')!, 'use__consume')!;
+    expect('with' in consume ? consume.with : undefined).toEqual({
+      data: '$use__gather.output',
+      mode: true,
+      guarded: { from: '$use__gather.output.field', if_skipped: true },
+    });
+  });
+
+  test('an object forwarded into a command/script binding position fails the expansion, never mid-run', () => {
+    // The schema promises a load error for a non-directive object on these maps, and
+    // only substitution can smuggle one past it: the block's string is valid at its
+    // own parse, then the caller supplies an object for the input. Re-validate after
+    // the macro (the substituteWhen precedent) so the workflow never lists clean and
+    // then fails at the node after upstream cost.
+    const block = withSignature(
+      wf('bind-obj-blk', [
+        {
+          id: 'consume',
+          script: 'console.log("x")',
+          runtime: 'bun',
+          with: { mode: '$INPUTS.mode' },
+        },
+      ]),
+      { inputs: { mode: {} } }
+    );
+    const parent = wf('parent', [
+      { id: 'use', include: 'bind-obj-blk', with: { mode: { nested: 'object' } } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(workflows.has('parent')).toBe(false);
+    const message = errors.find(e => e.filename === 'parent')?.error;
+    expect(message).toContain("binding 'mode'");
+    expect(message).toContain('OBJECT');
+
+    // A directive-SHAPED caller object is rejected the same way — data must not be
+    // able to inject reference semantics the block never authored.
+    const sneaky = wf('parent', [
+      { id: 'use', include: 'bind-obj-blk', with: { mode: { from: '$use__consume.output' } } },
+    ]);
+    const second = expandWorkflowIncludes(mapOf(block, sneaky));
+    expect(second.workflows.has('parent')).toBe(false);
+    expect(second.errors.find(e => e.filename === 'parent')?.error).toContain("binding 'mode'");
   });
 });

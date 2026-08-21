@@ -1,8 +1,12 @@
 import { describe, it, expect } from 'bun:test';
 
 import {
+  canonicalValueText,
   declaredFieldsFromSchema,
+  jsonValueSchema,
   OutputRefError,
+  parseWholeInputsRef,
+  parseWholeOutputRef,
   resolveNodeOutputField,
   similarNodeIds,
 } from './output-ref';
@@ -21,6 +25,78 @@ function completed(
     ...(declaredFields !== undefined ? { declaredFields } : {}),
   };
 }
+
+// #2637 — THE deterministic value→text rule: strings raw, everything else canonical
+// JSON. Pinned per JSON type so any drift from the pre-extraction inline mappings
+// (String(number|boolean), JSON.stringify(array|object|null)) fails here first.
+describe('canonicalValueText', () => {
+  it('passes strings through raw (never quoted)', () => {
+    expect(canonicalValueText('hello world')).toBe('hello world');
+    expect(canonicalValueText('')).toBe('');
+    expect(canonicalValueText('{"already":"json"}')).toBe('{"already":"json"}');
+  });
+
+  it('maps numbers and booleans to their JSON text (identical to String())', () => {
+    expect(canonicalValueText(42)).toBe('42');
+    expect(canonicalValueText(-1.5)).toBe('-1.5');
+    expect(canonicalValueText(true)).toBe('true');
+    expect(canonicalValueText(false)).toBe('false');
+  });
+
+  it('maps null, arrays, and objects to canonical JSON text', () => {
+    expect(canonicalValueText(null)).toBe('null');
+    expect(canonicalValueText([1, 'a', null])).toBe('[1,"a",null]');
+    expect(canonicalValueText({ b: 1, a: [true] })).toBe('{"b":1,"a":[true]}');
+  });
+
+  it("defensively maps JSON-unrepresentable values to '' (unreachable from parsed JSON)", () => {
+    expect(canonicalValueText(undefined)).toBe('');
+    expect(canonicalValueText(Symbol('x'))).toBe('');
+  });
+});
+
+describe('jsonValueSchema', () => {
+  it('accepts every JSON value shape and rejects undefined', () => {
+    for (const value of ['s', 0, -2.5, true, false, null, [1, 'a'], { k: { n: null } }]) {
+      expect(jsonValueSchema.safeParse(value).success).toBe(true);
+    }
+    expect(jsonValueSchema.safeParse(undefined).success).toBe(false);
+    expect(jsonValueSchema.safeParse(new Date()).success).toBe(false);
+  });
+});
+
+describe('parseWholeOutputRef', () => {
+  it('parses a whole unfielded and fielded ref, tolerating surrounding whitespace', () => {
+    expect(parseWholeOutputRef('$plan.output')).toEqual({ nodeId: 'plan' });
+    expect(parseWholeOutputRef('  $plan.output.items ')).toEqual({
+      nodeId: 'plan',
+      field: 'items',
+    });
+  });
+
+  it('returns undefined for templates, prose, and non-refs', () => {
+    expect(parseWholeOutputRef('before $plan.output')).toBeUndefined();
+    expect(parseWholeOutputRef('$plan.output and after')).toBeUndefined();
+    expect(parseWholeOutputRef('$INPUTS.name')).toBeUndefined();
+    expect(parseWholeOutputRef('literal')).toBeUndefined();
+    expect(parseWholeOutputRef('')).toBeUndefined();
+  });
+});
+
+describe('parseWholeInputsRef', () => {
+  it('parses a whole $INPUTS.<name> ref to its name, tolerating whitespace', () => {
+    expect(parseWholeInputsRef('$INPUTS.mode')).toBe('mode');
+    expect(parseWholeInputsRef('  $INPUTS.foo-bar ')).toBe('foo-bar');
+  });
+
+  it('returns undefined for templates, output refs, and non-refs', () => {
+    expect(parseWholeInputsRef('v=$INPUTS.mode')).toBeUndefined();
+    expect(parseWholeInputsRef('$INPUTS.mode!')).toBeUndefined();
+    expect(parseWholeInputsRef('$plan.output')).toBeUndefined();
+    expect(parseWholeInputsRef('literal')).toBeUndefined();
+    expect(parseWholeInputsRef('')).toBeUndefined();
+  });
+});
 
 describe('declaredFieldsFromSchema', () => {
   it('returns the property names for an object schema', () => {

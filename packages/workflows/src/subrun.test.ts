@@ -232,7 +232,7 @@ class InMemoryStore implements IWorkflowStore {
   };
 
   getDagResumeSnapshot: IWorkflowStore['getDagResumeSnapshot'] = workflowRunId => {
-    const completedNodeOutputs = new Map<string, string>();
+    const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
     const tokens = { input: 0, output: 0 };
     let costUsd = 0;
     for (const e of this.events) {
@@ -241,7 +241,13 @@ class InMemoryStore implements IWorkflowStore {
         (e.event_type === 'node_completed' || e.event_type === 'node_skipped_prior_success') &&
         typeof e.step_name === 'string'
       ) {
-        completedNodeOutputs.set(e.step_name, String(e.data?.node_output ?? ''));
+        // Mirrors the real store (#2637): the logical value rides beside the text.
+        completedNodeOutputs.set(e.step_name, {
+          output: String(e.data?.node_output ?? ''),
+          ...(e.data?.structured_output !== undefined
+            ? { structuredOutput: e.data.structured_output }
+            : {}),
+        });
         // Mirrors the real store: a derived row (loop_group roll-up) restates usage
         // other rows already carry, so it contributes output but never usage (#2469).
         if (e.data?.aggregate === true) continue;
@@ -2527,8 +2533,8 @@ nodes:
     const aggregate = JSON.parse(String(workCompleted?.data?.node_output)) as unknown[];
     expect(aggregate[0]).toBe('ok:a');
     expect(aggregate[2]).toBe('ok:c');
-    // The failed middle child is represented as an error object, not dropped.
-    expect(aggregate[1]).toMatchObject({ status: 'failed' });
+    // The failed middle child is represented as the marked error object, not dropped.
+    expect(aggregate[1]).toMatchObject({ archon_failed: true, status: 'failed' });
   });
 
   it('bounds concurrency to max_parallel (sliding window over the children)', async () => {
@@ -4766,5 +4772,632 @@ nodes:
           event.step_name === 'sub'
       )
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2637 — typed value transport across the run boundary: `with:` values keep
+// their logical type into the child (AC3), a child's terminal structured value
+// threads back to the parent (AC6), and fan-out aggregates are logical arrays
+// (single-encoded — never a JSON string that must be parsed twice).
+// ---------------------------------------------------------------------------
+
+describe('workflow: typed value transport (#2637)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  /**
+   * Deps whose provider branches on prompt content: a prompt containing PRODUCE
+   * yields a structured payload; a prompt containing HANDLE yields per-item
+   * structured/plain/failing behavior for fan-out children; everything else is
+   * recorded so parent-side delivery is observable.
+   */
+  function makeStructuredDeps(store: IWorkflowStore): { deps: WorkflowDeps; prompts: string[] } {
+    const prompts: string[] = [];
+    const provider = {
+      ...makeProvider(),
+      sendQuery: mock(function* (prompt: string) {
+        if (prompt.includes('PRODUCE')) {
+          yield { type: 'assistant', content: '{"green":true,"items":["a","b"]}' };
+          yield {
+            type: 'result',
+            sessionId: 'sess-prod',
+            structuredOutput: { green: true, items: ['a', 'b'] },
+          };
+          return;
+        }
+        if (prompt.includes('VERIFY')) {
+          // A verifier-shaped payload: top-level `error` + `status` fields as DATA —
+          // the natural schema the aggregate's failure marker must stay separable from.
+          if (prompt.includes('bad')) throw new Error('verifier exploded');
+          yield { type: 'assistant', content: '{"error":"none found","status":"clean"}' };
+          yield {
+            type: 'result',
+            sessionId: 'sess-verify',
+            structuredOutput: { error: 'none found', status: 'clean' },
+          };
+          return;
+        }
+        if (prompt.includes('HANDLE')) {
+          if (prompt.includes('bad')) throw new Error('handler exploded');
+          if (prompt.includes('plain')) {
+            yield { type: 'assistant', content: 'did:plain' };
+            yield { type: 'result', sessionId: 'sess-plain' };
+            return;
+          }
+          const item = prompt.includes('alpha') ? 'alpha' : 'beta';
+          yield { type: 'assistant', content: `{"v":"${item}"}` };
+          yield { type: 'result', sessionId: `sess-${item}`, structuredOutput: { v: item } };
+          return;
+        }
+        prompts.push(prompt);
+        yield { type: 'assistant', content: 'ai-output' };
+        yield { type: 'result', sessionId: 'sess' };
+      }),
+    };
+    return {
+      deps: {
+        ...makeDeps(store),
+        getAgentProvider: mock(() => provider) as unknown as WorkflowDeps['getAgentProvider'],
+      },
+      prompts,
+    };
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subval-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true }).catch(() => {});
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  it('AC3: a typed with: literal reaches the child as its logical type and forwards typed into a nested with:', async () => {
+    await writeWorkflow(
+      'grandchild-typed',
+      `
+name: grandchild-typed
+description: leaf that echoes the forwarded input
+inputs:
+  x: {}
+nodes:
+  - id: leaf
+    bash: echo "x=$INPUTS_X"
+`
+    );
+    await writeWorkflow(
+      'child-typed',
+      `
+name: child-typed
+description: child that echoes and forwards a typed input
+inputs:
+  flag: {}
+  note: {}
+nodes:
+  - id: emit
+    bash: echo "flag=$INPUTS_FLAG note=$INPUTS_NOTE"
+  - id: forward
+    workflow: grandchild-typed
+    depends_on: [emit]
+    with:
+      x: $INPUTS.flag
+`
+    );
+    await writeWorkflow(
+      'parent-typed',
+      `
+name: parent-typed
+description: supplies a boolean and a string
+nodes:
+  - id: sub
+    workflow: child-typed
+    with:
+      flag: true
+      note: plain
+`
+    );
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-typed'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-typed');
+    // Legacy text map stays string-valued forever (old-binary compat); the logical
+    // map rides the additive sibling, written because a value is non-string.
+    expect(child?.metadata?.inputs).toEqual({ flag: 'true', note: 'plain' });
+    expect(child?.metadata?.inputs_values).toEqual({ flag: true, note: 'plain' });
+    // Env delivery is the canonical text.
+    const emitted = store.events.find(
+      e => e.workflow_run_id === child?.id && e.event_type === 'node_completed'
+    );
+    expect(String(emitted?.data?.node_output)).toContain('flag=true note=plain');
+    // The whole-value `$INPUTS.flag` position forwarded the LOGICAL boolean.
+    const grandchild = [...store.runs.values()].find(r => r.workflow_name === 'grandchild-typed');
+    expect(grandchild?.metadata?.inputs_values).toEqual({ x: true });
+    expect(grandchild?.metadata?.inputs).toEqual({ x: 'true' });
+  });
+
+  it('AC3: a whole `$node.output.field` ref in with: arrives as a logical array, single-encoded in env', async () => {
+    await writeWorkflow(
+      'child-items',
+      `
+name: child-items
+description: echoes the received items input
+inputs:
+  items: {}
+nodes:
+  - id: emit
+    bash: printf '%s' "items=$INPUTS_ITEMS"
+`
+    );
+    await writeWorkflow(
+      'parent-items',
+      `
+name: parent-items
+description: passes a structured field through the with map
+nodes:
+  - id: plan
+    prompt: PRODUCE the plan
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+        items: { type: array }
+  - id: sub
+    workflow: child-items
+    depends_on: [plan]
+    with:
+      items: $plan.output.items
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps } = makeStructuredDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-items'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-items');
+    expect(child?.metadata?.inputs_values).toEqual({ items: ['a', 'b'] });
+    const emitted = store.events.find(
+      e => e.workflow_run_id === child?.id && e.event_type === 'node_completed'
+    );
+    // Single-encoded JSON text in the env bag — parse once, never twice.
+    expect(String(emitted?.data?.node_output)).toBe('items=["a","b"]');
+  });
+
+  it("AC6: a structured child's terminal value threads back typed — summary_value, parent field access, event payload", async () => {
+    await writeWorkflow(
+      'child-structured',
+      `
+name: child-structured
+description: terminal node emits a structured payload
+nodes:
+  - id: verdict
+    prompt: PRODUCE the verdict
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+        items: { type: array }
+`
+    );
+    await writeWorkflow(
+      'parent-structured',
+      `
+name: parent-structured
+description: reads a typed field off the child result
+nodes:
+  - id: sub
+    workflow: child-structured
+  - id: consume
+    prompt: g=[$sub.output.green]
+    depends_on: [sub]
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps, prompts } = makeStructuredDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-structured'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-structured');
+    expect(child?.metadata?.summary).toBe('{"green":true,"items":["a","b"]}');
+    expect(child?.metadata?.summary_value).toEqual({ green: true, items: ['a', 'b'] });
+    // Typed field access on the parent side.
+    expect(prompts).toContain('g=[true]');
+    // The parent's sub node persisted the logical value for its own cold resume.
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-structured');
+    const subCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'sub'
+    );
+    expect(subCompleted?.data?.structured_output).toEqual({ green: true, items: ['a', 'b'] });
+  });
+
+  it('AC6: fan-out aggregates are logical arrays — structured children single-encoded, string children raw', async () => {
+    await writeWorkflow(
+      'fan-handler',
+      `
+name: fan-handler
+description: handles one item
+mutates_checkout: false
+nodes:
+  - id: work
+    prompt: HANDLE $ARGUMENTS
+`
+    );
+    await writeWorkflow(
+      'fan-mixed-parent',
+      `
+name: fan-mixed-parent
+description: mixed structured and plain children
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["alpha","beta","plain"]'
+  - id: work
+    workflow: fan-handler
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output"
+      join: all_success
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps } = makeStructuredDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('fan-mixed-parent'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'fan-mixed-parent');
+    const workCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'work'
+    );
+    // Single-encoded: object elements are objects, the string child stays the exact
+    // raw string it always was (byte-identical to pre-#2637 for text children).
+    const expected = [{ v: 'alpha' }, { v: 'beta' }, 'did:plain'];
+    expect(JSON.parse(String(workCompleted?.data?.node_output))).toEqual(expected);
+    expect(workCompleted?.data?.structured_output).toEqual(expected);
+  });
+
+  it('AC6: all_done represents a failed child as { archon_failed, error, status } beside logical elements', async () => {
+    await writeWorkflow(
+      'fan-handler',
+      `
+name: fan-handler
+description: handles one item
+mutates_checkout: false
+nodes:
+  - id: work
+    prompt: HANDLE $ARGUMENTS
+`
+    );
+    await writeWorkflow(
+      'fan-partial-parent',
+      `
+name: fan-partial-parent
+description: one child fails, aggregate keeps the rest
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["alpha","bad"]'
+  - id: work
+    workflow: fan-handler
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output"
+      join: all_done
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps } = makeStructuredDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('fan-partial-parent'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'fan-partial-parent');
+    const workCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'work'
+    );
+    const aggregate = JSON.parse(String(workCompleted?.data?.node_output)) as unknown[];
+    expect(aggregate[0]).toEqual({ v: 'alpha' });
+    expect(aggregate[1]).toMatchObject({ archon_failed: true, status: 'failed' });
+  });
+
+  it('AC6: the failure marker stays separable from a payload that carries error+status fields', async () => {
+    // A structured child whose OWN schema emits top-level `error` and `status` —
+    // the natural verifier shape — completes beside a failed sibling. Shape-based
+    // discrimination ('error' in r && 'status' in r) misclassifies the payload;
+    // the reserved `archon_failed: true` marker is the only sound check, and it
+    // must be present on the failed slot and absent from the completed one.
+    await writeWorkflow(
+      'fan-verifier',
+      `
+name: fan-verifier
+description: verifies one item
+mutates_checkout: false
+nodes:
+  - id: work
+    prompt: VERIFY $ARGUMENTS
+`
+    );
+    await writeWorkflow(
+      'fan-verify-parent',
+      `
+name: fan-verify-parent
+description: verifier payloads beside a failed slot
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["alpha","bad"]'
+  - id: work
+    workflow: fan-verifier
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output"
+      join: all_done
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps } = makeStructuredDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('fan-verify-parent'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'fan-verify-parent');
+    const workCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'work'
+    );
+    const aggregate = JSON.parse(String(workCompleted?.data?.node_output)) as Array<
+      Record<string, unknown>
+    >;
+    // The completed verifier's slot is its payload, unmarked.
+    expect(aggregate[0]).toEqual({ error: 'none found', status: 'clean' });
+    // The failed slot carries the reserved discriminator.
+    expect(aggregate[1]).toMatchObject({ archon_failed: true, status: 'failed' });
+    // The documented collector check separates them exactly.
+    expect(aggregate.filter(r => r?.archon_failed === true)).toHaveLength(1);
+  });
+
+  it('AC6: a chained fan-out consumes the logical aggregate without double-decoding, and `as` carries the logical item', async () => {
+    await writeWorkflow(
+      'fan-handler',
+      `
+name: fan-handler
+description: handles one item
+mutates_checkout: false
+nodes:
+  - id: work
+    prompt: HANDLE $ARGUMENTS
+`
+    );
+    await writeWorkflow(
+      'fan-collector',
+      `
+name: fan-collector
+description: consumes one aggregate element
+mutates_checkout: false
+inputs:
+  item: {}
+nodes:
+  - id: read
+    bash: printf '%s' "got=$INPUTS_ITEM"
+`
+    );
+    await writeWorkflow(
+      'fan-chain-parent',
+      `
+name: fan-chain-parent
+description: second fan-out over the first aggregate
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["alpha","beta"]'
+  - id: first
+    workflow: fan-handler
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output"
+      join: all_success
+  - id: second
+    workflow: fan-collector
+    depends_on: [first]
+    fan_out:
+      items: "$first.output"
+      as: item
+      join: all_success
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps } = makeStructuredDeps(store);
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('fan-chain-parent'),
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(true);
+    const collectors = [...store.runs.values()].filter(r => r.workflow_name === 'fan-collector');
+    expect(collectors).toHaveLength(2);
+    // The per-item `as` binding carries the LOGICAL object element.
+    const byIndex = new Map(
+      collectors.map(c => [(c.metadata as Record<string, unknown>).child_index as number, c])
+    );
+    expect(byIndex.get(0)?.metadata?.inputs_values).toEqual({ item: { v: 'alpha' } });
+    // $ARGUMENTS still carries the canonical text form of the item.
+    expect(byIndex.get(0)?.user_message).toBe('{"v":"alpha"}');
+    // Env delivery: single-encoded JSON, parse once.
+    const read0 = store.events.find(
+      e =>
+        e.workflow_run_id === byIndex.get(0)?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'read'
+    );
+    expect(String(read0?.data?.node_output)).toBe('got={"v":"alpha"}');
+  });
+
+  it('AC1+AC6: a parent cold resume rehydrates the logical fan-out aggregate', async () => {
+    await writeWorkflow(
+      'fan-handler',
+      `
+name: fan-handler
+description: handles one item
+mutates_checkout: false
+nodes:
+  - id: work
+    prompt: HANDLE $ARGUMENTS
+`
+    );
+    await writeWorkflow(
+      'fan-resume-parent',
+      `
+name: fan-resume-parent
+description: collector fails once, resume replays the aggregate
+nodes:
+  - id: plan
+    bash: |
+      printf '%s' '["alpha","beta"]'
+  - id: work
+    workflow: fan-handler
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output"
+      join: all_success
+  - id: collect
+    bash: |
+      if [ -f "$STATE_DIR/collect-marker" ]; then printf 'agg=%s' $work.output; else touch "$STATE_DIR/collect-marker"; exit 1; fi
+    depends_on: [work]
+`
+    );
+
+    const store = new InMemoryStore();
+    const { deps } = makeStructuredDeps(store);
+    const first = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('fan-resume-parent'),
+      'goal',
+      'conv-db'
+    );
+    expect(first.success).toBe(false);
+
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'fan-resume-parent');
+    expect(parent?.status).toBe('failed');
+    const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(parent!.id))!);
+    expect(hydrated).not.toBeNull();
+    // The snapshot rehydrated the fan-out node's LOGICAL aggregate, not just text.
+    expect(hydrated?.priorCompletedNodes.get('work')?.structuredOutput).toEqual([
+      { v: 'alpha' },
+      { v: 'beta' },
+    ]);
+
+    const second = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('fan-resume-parent'),
+      'goal',
+      'conv-db',
+      { ...hydrated! }
+    );
+    expect(second.success).toBe(true);
+    // The resumed collector read the identical single-encoded aggregate.
+    const collectCompleted = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_completed' &&
+        e.step_name === 'collect'
+    );
+    expect(String(collectCompleted?.data?.node_output)).toBe('agg=[{"v":"alpha"},{"v":"beta"}]');
+    // And the fan-out node's replay row carried the logical value forward.
+    const replayed = store.events.find(
+      e =>
+        e.workflow_run_id === parent?.id &&
+        e.event_type === 'node_skipped_prior_success' &&
+        e.step_name === 'work'
+    );
+    expect(replayed?.data?.structured_output).toEqual([{ v: 'alpha' }, { v: 'beta' }]);
   });
 });

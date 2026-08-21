@@ -46,6 +46,8 @@ import {
 } from './workflow-source';
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
 import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
+import type { PersistedNodeOutput } from './store';
+import { canonicalValueText, type JsonValue } from './output-ref';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
 import type { WorkflowWithSource, WorkflowLoadError } from './schemas';
 import { validateWorkflowOutcomeDeclaration } from './loader';
@@ -458,7 +460,7 @@ export function resolveScopeArtifactsDir(
 type ResumePayload =
   | {
       preCreatedRun: WorkflowRun;
-      priorCompletedNodes?: Map<string, string>;
+      priorCompletedNodes?: Map<string, PersistedNodeOutput>;
       priorUsage?: PriorRunUsage;
       priorNodeSessions?: readonly WorkflowRunNodeSession[];
     }
@@ -915,7 +917,7 @@ export async function hydrateResumableRun(
   candidate: WorkflowRun
 ): Promise<{
   preCreatedRun: WorkflowRun;
-  priorCompletedNodes: Map<string, string>;
+  priorCompletedNodes: Map<string, PersistedNodeOutput>;
   priorUsage: PriorRunUsage;
   priorNodeSessions: WorkflowRunNodeSession[];
 } | null> {
@@ -1119,7 +1121,7 @@ async function runChildWorkflow(
   //     late by design, so it sits before isolation/worktree creation and before the
   //     child run row exists: a contract violation must never leave an orphan worktree
   //     or a doomed child row behind.
-  let childInputs: Record<string, string> | undefined;
+  let childInputs: Record<string, JsonValue> | undefined;
   try {
     const resolved = resolveDeclaredInputs(
       inputs ?? {},
@@ -1260,13 +1262,25 @@ async function runChildWorkflow(
           ...(childIndex !== undefined ? { [SUBRUN_METADATA_KEYS.childIndex]: childIndex } : {}),
           ...(itemHash !== undefined ? { [SUBRUN_METADATA_KEYS.fanOutItemHash]: itemHash } : {}),
           // Named inputs (#2470) — persisted at spawn so the child's `$INPUTS.<name>`
-          // resolves from `metadata.inputs` at runtime (resolveRunInputs) and survives a
-          // COLD resume: both resume paths (hydrateResumableRun and the zero-completed-node
+          // resolves from metadata at runtime (resolveRunInputs) and survives a COLD
+          // resume: both resume paths (hydrateResumableRun and the zero-completed-node
           // resumeWorkflowRun fallback) reload THIS run row, so the map is intact without
           // re-resolving parent refs that may be out of scope. Stamped only when non-empty.
           // This is the CONTRACT-RESOLVED map (declared defaults applied), not the raw
           // caller map — the child must see exactly what its `inputs:` block promises.
-          ...(childInputs !== undefined ? { [SUBRUN_METADATA_KEYS.inputs]: childInputs } : {}),
+          // `inputs` stays canonical TEXT forever (shipped binaries read a non-string map
+          // as corrupt/unset); the logical map rides the additive `inputs_values` sibling
+          // (#2637), written only when a value is actually non-string.
+          ...(childInputs !== undefined
+            ? {
+                [SUBRUN_METADATA_KEYS.inputs]: Object.fromEntries(
+                  Object.entries(childInputs).map(([k, v]) => [k, canonicalValueText(v)])
+                ),
+                ...(Object.values(childInputs).some(v => typeof v !== 'string')
+                  ? { [SUBRUN_METADATA_KEYS.inputsValues]: childInputs }
+                  : {}),
+              }
+            : {}),
           // Record the child's own worktree env + branch (mirrors the container path's
           // isolation_env_id) so `isolation list` correlation + PR-E console grouping
           // can find it. Absent for `inherit`/shared-checkout children.
@@ -2453,12 +2467,17 @@ export async function executeWorkflow(
     // correct across a cold resume and when the defaults are later edited. Any caller-
     // supplied value already on the row wins; only defaults are filled in.
     const declaredDefaults = defaultRunInputs(workflow.inputs);
+    // The effective map is layered under the LOGICAL sibling key (#2637): defaults may
+    // now be typed (`default: true`), and `readSubrunMetadata` prefers `inputs_values`,
+    // so the in-memory overlay must not push a non-string value into the legacy text
+    // map (a shipped binary reads a non-string `inputs` as corrupt). This overlay is
+    // never persisted — it only shapes what resolveRunInputs sees for this execution.
     const runForDag: WorkflowRun = declaredDefaults
       ? {
           ...workflowRun,
           metadata: {
             ...(workflowRun.metadata as Record<string, unknown> | undefined),
-            [SUBRUN_METADATA_KEYS.inputs]: {
+            [SUBRUN_METADATA_KEYS.inputsValues]: {
               ...declaredDefaults,
               ...(readSubrunMetadata(workflowRun.metadata as Record<string, unknown> | undefined)
                 .inputs ?? {}),

@@ -12,6 +12,7 @@ import {
   KNOWN_DAG_NODE_KEYS,
 } from './dag-node';
 import type { NestedKeySpec } from './dag-node';
+import { jsonValueSchema } from '../output-ref';
 
 // ---------------------------------------------------------------------------
 // Shared enum schemas
@@ -144,7 +145,9 @@ export type WorkflowEvidencePolicy = z.infer<typeof workflowEvidencePolicySchema
  */
 export const workflowInputSpecSchema = z.object({
   required: z.boolean().optional(),
-  default: z.string().optional(),
+  // Any JSON-compatible value (#2637): a boolean/number/array default keeps its
+  // logical type through the input contract instead of arriving as text.
+  default: jsonValueSchema.optional(),
   description: z.string().optional(),
 });
 

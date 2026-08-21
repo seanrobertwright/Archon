@@ -124,11 +124,20 @@ export interface ScriptNodeData {
   runtime: 'bun' | 'uv';
   deps?: string[];
   timeout?: number;
+  /**
+   * Node-local bindings (#2637). Opaque passthrough: the builder has no editor
+   * for them yet, but dropping the field on save would silently destroy a
+   * workflow's bindings, so it round-trips verbatim. String values and directive
+   * `from` refs are scanned by content validation.
+   */
+  with?: Record<string, unknown>;
 }
 
 /** Named-command node data. */
 export interface CommandNodeData {
   command: string;
+  /** Node-local bindings (#2637) — opaque passthrough, same contract as script. */
+  with?: Record<string, unknown>;
 }
 
 /** Inline-prompt node data. */

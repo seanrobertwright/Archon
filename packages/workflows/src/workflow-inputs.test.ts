@@ -117,3 +117,47 @@ describe('defaultRunInputs', () => {
     expect(defaultRunInputs({ diff: { required: true } })).toBeUndefined();
   });
 });
+
+// #2637 — the input channel is JSON-valued: literals and defaults keep their
+// logical type through the one shared contract implementation.
+describe('typed input values (#2637)', () => {
+  test('typed supplied values resolve with their logical type', () => {
+    const resolved = resolveDeclaredInputs(
+      { flag: true, count: 3, items: ['a'], meta: { k: 'v' }, note: 'text' },
+      {
+        flag: {},
+        count: {},
+        items: {},
+        meta: {},
+        note: {},
+      },
+      "Node 'n'",
+      "workflow 'w'"
+    );
+    expect(resolved).toEqual({
+      flag: true,
+      count: 3,
+      items: ['a'],
+      meta: { k: 'v' },
+      note: 'text',
+    });
+  });
+
+  test('typed declared defaults resolve with their logical type', () => {
+    expect(
+      resolveDeclaredInputs({}, { flag: { default: false }, n: { default: 0 } }, 'ctx', 'callee')
+    ).toEqual({ flag: false, n: 0 });
+    expect(defaultRunInputs({ flag: { default: false }, req: { required: true } })).toEqual({
+      flag: false,
+    });
+  });
+
+  test('contract errors are unchanged for typed maps (undeclared key, missing required)', () => {
+    expect(() => resolveDeclaredInputs({ typo: true }, { real: {} }, 'ctx', 'callee')).toThrow(
+      /does not declare input 'typo'/
+    );
+    expect(() => resolveDeclaredInputs({}, { need: { required: true } }, 'ctx', 'callee')).toThrow(
+      /requires input 'need'/
+    );
+  });
+});

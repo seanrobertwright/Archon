@@ -56,7 +56,8 @@ import type {
 import { INPUT_NAME_PATTERN, inputEnvKey } from './schemas/dag-node';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { parseWhenAtom, whenAtoms, WHEN_INPUTS_SCOPE } from './when-atom';
-import { declaredFieldsFromSchema } from './output-ref';
+import { declaredFieldsFromSchema, OUTPUT_REF_SOURCE, parseWholeOutputRef } from './output-ref';
+import { isBindingDirective } from './schemas/dag-node';
 import { z } from '@hono/zod-openapi';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -110,15 +111,13 @@ function formatNodeIssue(id: string, issue: z.ZodIssue): string {
   return `Node '${id}': ${pathStr}${issue.message}`;
 }
 
-/**
- * The one shape of a `$nodeId.output` reference. Both scanners below build their own
- * RegExp from it — a `g`-flagged one for the multi-match dangling-ref sweep and a plain one
- * for `fan_out.items` — because a `g` regex carries mutable `lastIndex` and sharing a single
- * instance across call sites is how that turns into skipped matches. Sharing the SOURCE is
- * the part that matters: a second hand-written copy inside a function that already warns
- * "KEEP IN SYNC" is exactly the drift that warning is about.
- */
-const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
+// OUTPUT_REF_SOURCE — the one shape of a `$nodeId.output` reference — moved to
+// output-ref.ts (#2637) so the binding-value whole-ref parser, the schema's directive
+// validation, and these scanners share ONE grammar. Both scanners below still build
+// their own RegExp from it — a `g`-flagged one for the multi-match dangling-ref sweep
+// and a plain one for `fan_out.items` — because a `g` regex carries mutable
+// `lastIndex` and sharing a single instance across call sites is how that turns into
+// skipped matches.
 
 /** `when:` also accepts `$nodeId.field` as shorthand for `$nodeId.output.field`. */
 const WHEN_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z_][a-zA-Z0-9_]*)`;
@@ -372,6 +371,23 @@ function parseDagNode(
 
   collectUnknownNodeKeys(raw, id, `Node '${id}'`, warnings);
 
+  // `with:` is live on command/script (node-local bindings, #2637) and include/workflow
+  // (caller inputs). On every other node type Zod strips it silently — surface that
+  // through the parse-warnings channel (#2213) so an author learns the binding never
+  // attached, without rejecting YAML that loaded fine before.
+  if (
+    (raw as Record<string, unknown>).with !== undefined &&
+    !isCommandNode(node) &&
+    !isScriptNode(node) &&
+    !isIncludeNode(node) &&
+    !isWorkflowNode(node)
+  ) {
+    warnings.push(
+      `Node '${id}': 'with' is only supported on command, script, include, and workflow nodes — it is ignored here`
+    );
+    getLog().warn({ id: node.id }, 'node_with_ignored');
+  }
+
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
   let nonAiNode: { type: string; fields: readonly string[] } | undefined;
   if (isCancelNode(node)) {
@@ -597,6 +613,19 @@ export function validateDagStructure(
     }
     if (isBashNode(node)) sources.push({ field: 'bash', text: node.bash });
     if (isScriptNode(node)) sources.push({ field: 'script', text: node.script });
+    // Node-local bindings (#2637): command/script `with:` string values are live ref
+    // surfaces (whole refs and templates), and a directive's `from` is one whole ref.
+    // KEEP IN SYNC item 1 — rewriteNodeOutputRefs and the builder scan walk the same
+    // surface. Non-string literals carry no refs.
+    if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
+      for (const [name, value] of Object.entries(node.with)) {
+        if (typeof value === 'string') {
+          sources.push({ field: `with.${name}`, text: value });
+        } else if (isBindingDirective(value)) {
+          sources.push({ field: `with.${name}.from`, text: value.from });
+        }
+      }
+    }
     // workflow.input is a live ref surface (a data string), scanned verbatim like
     // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
     // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
@@ -607,9 +636,10 @@ export function validateDagStructure(
       // an `include:` node's `with:` (inlined by the macro and caught post-expansion
       // by this same scan), sub-run `with:` values are never inlined — they resolve
       // at runtime into `$INPUTS.<name>` — so scan them here for dangling refs.
+      // Only strings can carry refs (#2637); typed literals pass through untouched.
       if (node.with) {
         for (const [name, value] of Object.entries(node.with)) {
-          sources.push({ field: `with.${name}`, text: value });
+          if (typeof value === 'string') sources.push({ field: `with.${name}`, text: value });
         }
       }
     }
@@ -752,6 +782,34 @@ export function validateDagStructure(
     if (producerId === undefined) continue; // no ref surface — runtime fail-closed owns it
     if (!transitiveDepsOf(node.id).has(producerId)) {
       return `Node '${node.id}' fan_out.items references '$${producerId}.output', which is not an upstream dependency — add '${producerId}' to '${node.id}'.depends_on so its item array is produced first`;
+    }
+  }
+
+  // Node-local bindings (#2637) must read UPSTREAM producers, mirroring fan_out.items:
+  // depends_on is what guarantees a bound producer is terminal before the consumer
+  // runs, so binding resolution needs no new scheduling. Only same-scope producers are
+  // enforced — a loop_group body node may read the enclosing scope, whose outputs are
+  // settled before the group starts (existing body-ref semantics).
+  for (const node of nodes) {
+    if (!(isCommandNode(node) || isScriptNode(node)) || node.with === undefined) continue;
+    for (const [name, value] of Object.entries(node.with)) {
+      const producerIds: string[] = [];
+      if (typeof value === 'string') {
+        const refPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
+        let refMatch: RegExpExecArray | null;
+        while ((refMatch = refPattern.exec(value)) !== null) {
+          if (refMatch[1] !== WHEN_INPUTS_SCOPE) producerIds.push(refMatch[1]);
+        }
+      } else if (isBindingDirective(value)) {
+        const ref = parseWholeOutputRef(value.from);
+        if (ref !== undefined) producerIds.push(ref.nodeId);
+      }
+      for (const producerId of producerIds) {
+        if (!nodesById.has(producerId)) continue; // enclosing scope, or already rejected above
+        if (!transitiveDepsOf(node.id).has(producerId)) {
+          return `Node '${node.id}' binding 'with.${name}' references '$${producerId}.output', which is not an upstream dependency — add '${producerId}' to '${node.id}'.depends_on so its value is produced first`;
+        }
+      }
     }
   }
 

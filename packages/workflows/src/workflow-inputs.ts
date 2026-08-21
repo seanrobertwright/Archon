@@ -22,6 +22,7 @@
  */
 import type { WorkflowDefinition } from './schemas/workflow';
 import { INPUT_NAME_PATTERN } from './schemas/dag-node';
+import type { JsonValue } from './output-ref';
 
 /** A workflow's declared `inputs:` block, or undefined when it declares none. */
 export type DeclaredInputs = WorkflowDefinition['inputs'];
@@ -62,18 +63,19 @@ function quoteNames(names: string[]): string {
 /**
  * Resolve a caller's supplied map against a callee's declared `inputs:`.
  *
- * @param supplied - the caller's `with:` values, already substituted to concrete strings.
+ * @param supplied - the caller's `with:` values, already substituted to concrete
+ *   JSON values (#2637 — a boolean/number/array keeps its logical type here).
  * @param declared - the callee's `inputs:` block (undefined ⇒ Phase-1 passthrough).
  * @param context - message prefix identifying the call site, e.g. `Node 'review'`.
  * @param calleeLabel - how the callee is named in errors, e.g. `included block 'blk'`.
  * @throws WorkflowInputContractError on an undeclared key or a missing required input.
  */
 export function resolveDeclaredInputs(
-  supplied: Record<string, string>,
+  supplied: Record<string, JsonValue>,
   declared: DeclaredInputs,
   context: string,
   calleeLabel: string
-): Record<string, string> {
+): Record<string, JsonValue> {
   if (declared === undefined) return supplied;
 
   // Reject caller keys the callee does not declare. Checked before defaults so a typo
@@ -86,7 +88,7 @@ export function resolveDeclaredInputs(
     );
   }
 
-  const resolved: Record<string, string> = {};
+  const resolved: Record<string, JsonValue> = {};
   const missingRequired: string[] = [];
   for (const [name, spec] of Object.entries(declared)) {
     if (Object.hasOwn(supplied, name)) {
@@ -117,9 +119,9 @@ export function resolveDeclaredInputs(
  * `workflow:` child would resolve them. Required inputs are NOT synthesized here: a bare
  * run supplies nothing, so the reference fails at its use site with the normal message.
  */
-export function defaultRunInputs(declared: DeclaredInputs): Record<string, string> | undefined {
+export function defaultRunInputs(declared: DeclaredInputs): Record<string, JsonValue> | undefined {
   if (declared === undefined) return undefined;
-  const defaults: Record<string, string> = {};
+  const defaults: Record<string, JsonValue> = {};
   for (const [name, spec] of Object.entries(declared)) {
     if (spec.default !== undefined) defaults[name] = spec.default;
   }

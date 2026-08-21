@@ -38,9 +38,122 @@
  * a whole-text `$typo.output` to an unresolved id stays lenient ('') as a
  * long-documented surface. See `similarNodeIds`.
  */
+import { z } from '@hono/zod-openapi';
 import type { NodeOutput } from './schemas';
 import { findSimilar } from './utils/fuzzy-match';
 import { hasTruncationMarker } from './utils/output-truncation';
+
+// ---------------------------------------------------------------------------
+// Workflow values (#2637)
+// ---------------------------------------------------------------------------
+
+/**
+ * A workflow value: any JSON-compatible logical value (string, number, boolean,
+ * null, array, object). This is the type `with:` maps, `inputs:` defaults, and
+ * whole-value bindings carry — `undefined` is rejected (a binding either has a
+ * value or fails loudly; it is never silently absent).
+ */
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value) as unknown;
+    return (
+      (proto === Object.prototype || proto === null) && Object.values(value).every(isJsonValue)
+    );
+  }
+  return false;
+}
+
+/**
+ * Deliberately NOT `z.json()`: zod's built-in recursive JSON schema blows the
+ * stack when @hono/zod-openapi walks it for spec generation (the engine's
+ * workflow schemas are embedded in server route schemas). A refined `unknown`
+ * validates the same value set — rejects `undefined`, non-finite numbers, and
+ * non-plain objects like Date — while serializing to OpenAPI as an
+ * unconstrained value, which is exactly what "any JSON value" means there.
+ * The explicit `z.ZodType<JsonValue>` annotation (through the checked guard)
+ * is the project's sanctioned recursive-type escape hatch — structural drift
+ * between the guard and the type is a compile error at the cast site.
+ */
+export const jsonValueSchema: z.ZodType<JsonValue> = z.unknown().refine(isJsonValue, {
+  message: 'must be a JSON-compatible value (string, number, boolean, null, array, or object)',
+}) as unknown as z.ZodType<JsonValue>;
+
+/**
+ * THE deterministic value→text rule (#2637): embedding a workflow value in
+ * surrounding text uses exactly one representation — strings raw, everything
+ * else canonical JSON text.
+ *
+ * One line on purpose: for the non-string JSON types, `String(number|boolean)`
+ * is byte-identical to `JSON.stringify` (JSON has no NaN/Infinity), and null,
+ * arrays, and objects have only their JSON form — so a single `JSON.stringify`
+ * covers them all. Callers that need bash escaping or unquoted numerics decide
+ * that at the call site; this rule owns only the text.
+ *
+ * The `?? ''` covers the values JSON.stringify cannot represent (undefined,
+ * symbols, functions) — unreachable from parsed JSON, kept as the same
+ * defensive empty the pre-extraction call sites had.
+ */
+export function canonicalValueText(value: unknown): string {
+  return typeof value === 'string' ? value : (JSON.stringify(value) ?? '');
+}
+
+/**
+ * The one shape of a `$nodeId.output` reference — shared with the loader's
+ * dangling-ref scan and every scanner that must agree with it (KEEP IN SYNC
+ * list in loader.ts). Scanners build their own RegExp from this source (a
+ * `g`-flagged instance carries mutable lastIndex and must not be shared).
+ */
+export const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
+
+/**
+ * The one shape of a declared-input NAME — `with:` keys, `inputs:` keys, and the
+ * `<name>` of a `$INPUTS.<name>` reference all share it. Lives here beside
+ * OUTPUT_REF_SOURCE so every ref grammar has one home; schemas/dag-node re-exports
+ * it for the schema-side validators.
+ */
+export const INPUT_NAME_SOURCE = String.raw`[a-zA-Z_][a-zA-Z0-9_-]*`;
+
+/** Anchored whole-value form: the ENTIRE (trimmed) string is one `$INPUTS.<name>` ref. */
+const WHOLE_INPUTS_REF_PATTERN = new RegExp(String.raw`^\$INPUTS\.(${INPUT_NAME_SOURCE})$`);
+
+/**
+ * Parse a string that is exactly one whole `$INPUTS.<name>` reference (after
+ * trimming) to its input name, or undefined for anything else. The `$INPUTS`
+ * sibling of {@link parseWholeOutputRef}: binding value positions use both to
+ * decide "forward the logical value" vs "splice text into a template".
+ */
+export function parseWholeInputsRef(text: string): string | undefined {
+  return WHOLE_INPUTS_REF_PATTERN.exec(text.trim())?.[1];
+}
+
+/** Anchored whole-value form: the ENTIRE (trimmed) string is one `$id.output[.field]` ref. */
+const WHOLE_OUTPUT_REF_PATTERN = new RegExp(
+  `^${OUTPUT_REF_SOURCE}(?:\\.([a-zA-Z_][a-zA-Z0-9_]*))?$`
+);
+
+/**
+ * Parse a string that is exactly one whole `$node.output[.field]` reference
+ * (after trimming), or undefined when it is anything else — a literal, a
+ * template with surrounding text, or not a ref at all. This is what lets a
+ * binding value distinguish "pass the logical value through" from "splice text
+ * into a template" without inventing a second ref grammar.
+ */
+export function parseWholeOutputRef(text: string): { nodeId: string; field?: string } | undefined {
+  const m = WHOLE_OUTPUT_REF_PATTERN.exec(text.trim());
+  if (!m) return undefined;
+  return { nodeId: m[1], ...(m[2] !== undefined ? { field: m[2] } : {}) };
+}
 
 /**
  * Thrown when a `$nodeId.output.field` reference cannot be honored under the
@@ -81,7 +194,7 @@ export class OutputRefError extends Error {
       case 'unparseable':
         return `'${ref}' references field '${field}', but node '${nodeId}'s output is not a JSON object, so the field cannot be read. Emit JSON containing '${field}', or reference '$${nodeId}.output' (whole text) instead.`;
       case 'array-aggregate':
-        return `'${ref}' references field '${field}', but node '${nodeId}' is a fan-out and its output is a JSON ARRAY of per-child results, not an object — there is no '${field}' on it and no producer prompt to change, because the array shape is fixed by the engine. Reference '$${nodeId}.output' (the whole array) and read it in a script node, which is also where a failed child's { error, status } entry can be handled. See the fan_out docs.`;
+        return `'${ref}' references field '${field}', but node '${nodeId}' is a fan-out and its output is a JSON ARRAY of per-child results (each element the child's result value, single-encoded — never a JSON string to parse again), not an object — there is no '${field}' on it and no producer prompt to change, because the array shape is fixed by the engine. Reference '$${nodeId}.output' (the whole array) and read it in a script node, which is also where a failed child's marker ({ archon_failed: true, error, status }) can be handled. See the fan_out docs.`;
       case 'truncated':
         return `'${ref}' references field '${field}', but node '${nodeId}'s persisted output was clipped at the event size cap and no longer parses as JSON. The node very likely emitted '${field}' correctly — this surfaces on a resumed run, which reads the clipped copy rather than the original. Write the payload to a file under $ARTIFACTS_DIR and read it downstream, or shrink the node's output.`;
       case 'missing-key':
@@ -138,8 +251,8 @@ function unparseableReason(output: string): OutputRefErrorReason {
   // A fan-out aggregate parses fine — it is simply an array, which `asPlainObject` rejects.
   // Reporting that as 'unparseable' told the author to "emit JSON containing 'x'" from a
   // producer they cannot change, since the engine fixes the array shape. Failing loudly
-  // here is correct (a { error, status } entry must never be consumed as data); only the
-  // advice was wrong.
+  // here is correct (a failed slot's { archon_failed, error, status } marker must never
+  // be consumed as data); only the advice was wrong.
   try {
     if (Array.isArray(JSON.parse(output) as unknown)) return 'array-aggregate';
   } catch {
@@ -198,9 +311,10 @@ export function resolveNodeOutputField(
     if (!declaredFields.includes(field)) {
       throw new OutputRefError(nodeId, field, 'not-in-schema');
     }
-    // Prefer the parsed payload; fall back to parsing the JSON-serialized output
-    // (covers older NodeOutput rows that predate `structuredOutput`, and the resume
-    // path, which rehydrates text only).
+    // Prefer the parsed payload; fall back to parsing the JSON-serialized output.
+    // The fallback covers older NodeOutput rows that predate `structuredOutput`,
+    // and resumes of runs persisted before `structured_output` rode along in
+    // `node_completed` events (#2637) — current resumes rehydrate the payload.
     const obj = structuredObj ?? parseOutputObject(nodeOutput.output);
     // No parseable object AT ALL is not a declared-optional field — it is a producer
     // that did not honour its schema, and it must fail exactly as loudly as the

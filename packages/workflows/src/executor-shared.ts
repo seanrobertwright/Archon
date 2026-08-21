@@ -15,7 +15,7 @@ import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import type { LoadCommandResult } from './schemas';
 import { INPUT_NAME_SOURCE } from './schemas/dag-node';
-import { similarNodeIds } from './output-ref';
+import { similarNodeIds, canonicalValueText, type JsonValue } from './output-ref';
 import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
 
 /**
@@ -562,7 +562,7 @@ export function substituteWorkflowVariables(
   loopUserInput?: string,
   rejectionReason?: string,
   loopPrevOutput?: string,
-  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, string> }
+  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, JsonValue> }
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
   if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
@@ -615,7 +615,9 @@ export function substituteWorkflowVariables(
     // substituting '' — a typo'd input silently emptying is worse than a load-visible error.
     const inputs = options?.inputs;
     result = result.replace(INPUTS_RUNTIME_REF, (_match, name: string) => {
-      if (inputs && Object.hasOwn(inputs, name)) return inputs[name];
+      // Canonical text (#2637): a typed input splices as its one deterministic
+      // representation — strings raw, everything else canonical JSON text.
+      if (inputs && Object.hasOwn(inputs, name)) return canonicalValueText(inputs[name]);
       const known = inputs ? Object.keys(inputs) : [];
       const hint = similarNodeIds(name, known);
       const suffix =
@@ -677,7 +679,7 @@ export function buildPromptWithContext(
   docsDir: string,
   issueContext: string | undefined,
   logLabel: string,
-  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, string> }
+  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, JsonValue> }
 ): string {
   const { prompt, contextSubstituted } = substituteWorkflowVariables(
     template,

@@ -311,7 +311,7 @@ describe('executeWorkflow', () => {
         makeWorkflow(),
         'msg',
         'db-conv-1',
-        { preCreatedRun, priorCompletedNodes: new Map([['node1', 'out']]) }
+        { preCreatedRun, priorCompletedNodes: new Map([['node1', { output: 'out' }]]) }
       );
       expect(result.success).toBe(false);
       if (result.success) throw new Error('Expected missing-container-context failure');
@@ -342,7 +342,7 @@ describe('executeWorkflow', () => {
         'db-conv-1',
         {
           preCreatedRun,
-          priorCompletedNodes: new Map([['node1', 'out']]),
+          priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
           priorUsage: { tokens: { input: 40, output: 4 }, costUsd: 0.5 },
           execContext: { kind: 'container', containerId: 'cid' },
           container: { envId: 'env-x', writeBack: 'approve', backend },
@@ -1225,8 +1225,8 @@ describe('executeWorkflow', () => {
     it('runs the dag-executor with priorCompletedNodes when caller supplies them', async () => {
       const resumed = makeRun({ id: 'resumed-run', status: 'running' });
       const priorCompletedNodes = new Map([
-        ['node-a', 'a-output'],
-        ['node-b', 'b-output'],
+        ['node-a', { output: 'a-output' }],
+        ['node-b', { output: 'b-output' }],
       ]);
       const store = makeStore();
       const deps = makeDeps(store);
@@ -1245,7 +1245,7 @@ describe('executeWorkflow', () => {
       // workflowRun, provider, model, artifactsDir, logDir, baseBranch,
       // docsDir, config, configuredCommandFolder, issueContext, priorCompletedNodes
       const passedPriors = mockExecuteDagWorkflow.mock.calls[0]?.[16] as
-        | Map<string, string>
+        | Map<string, { output: string }>
         | undefined;
       expect(passedPriors).toBe(priorCompletedNodes);
       // No fresh row created when a preCreatedRun is supplied.
@@ -1276,7 +1276,7 @@ describe('executeWorkflow', () => {
           'db-conv-1',
           {
             preCreatedRun,
-            priorCompletedNodes: new Map([['source', 'prior output']]),
+            priorCompletedNodes: new Map([['source', { output: 'prior output' }]]),
             priorNodeSessions: [foreignSession],
           }
         )
@@ -1290,7 +1290,7 @@ describe('executeWorkflow', () => {
     it('forwards a hydrated resume snapshot into resumed DAG execution', async () => {
       const candidate = makeRun({ id: 'failed-run', status: 'failed' });
       const resumed = makeRun({ id: 'failed-run', status: 'running' });
-      const completedNodeOutputs = new Map([['node-a', 'first output']]);
+      const completedNodeOutputs = new Map([['node-a', { output: 'first output' }]]);
       const tokens = { input: 40, output: 4 };
       const costUsd = 0.25;
       const store = makeStore({
@@ -2162,7 +2162,7 @@ describe('hydrateResumableRun', () => {
   it('returns hydrated run + prior outputs for a candidate with completed nodes', async () => {
     const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
     const resumed = makeRun({ id: 'prior-failed', status: 'running' });
-    const priorNodes = new Map([['n1', 'out1']]);
+    const priorNodes = new Map([['n1', { output: 'out1' }]]);
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: priorNodes,
@@ -2253,7 +2253,7 @@ describe('hydrateResumableRun', () => {
     const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
-        completedNodeOutputs: new Map([['n1', 'v1']]),
+        completedNodeOutputs: new Map([['n1', { output: 'v1' }]]),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),

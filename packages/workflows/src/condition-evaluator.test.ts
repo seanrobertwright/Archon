@@ -832,3 +832,34 @@ describe('evaluateCondition — $INPUTS refs', () => {
     );
   });
 });
+
+// #2637 — inputs are JSON-valued: a typed input compares as its canonical text,
+// so the existing unquoted-RHS grammar works on real booleans and numbers.
+describe('typed $INPUTS values in when: (#2637)', () => {
+  const noOutputs = new Map<string, NodeOutput>();
+
+  it('a boolean input matches an unquoted boolean literal', () => {
+    expect(evaluateCondition('$INPUTS.flag == true', noOutputs, { flag: true })).toEqual({
+      result: true,
+      parsed: true,
+    });
+    expect(evaluateCondition('$INPUTS.flag == true', noOutputs, { flag: false })).toEqual({
+      result: false,
+      parsed: true,
+    });
+  });
+
+  it('a numeric input compares numerically', () => {
+    expect(evaluateCondition('$INPUTS.count > 2', noOutputs, { count: 3 })).toEqual({
+      result: true,
+      parsed: true,
+    });
+  });
+
+  it('a null input compares as its canonical text "null", never as empty', () => {
+    expect(evaluateCondition("$INPUTS.v == 'null'", noOutputs, { v: null })).toEqual({
+      result: true,
+      parsed: true,
+    });
+  });
+});

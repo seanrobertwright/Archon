@@ -70,6 +70,7 @@ import type {
 } from './schemas';
 import {
   isBashNode,
+  isCommandNode,
   isLoopNode,
   isLoopGroupNode,
   isApprovalNode,
@@ -82,7 +83,11 @@ import {
   isApprovalContext,
   inputEnvKey,
   isNodeContextResume,
+  isBindingDirective,
+  SUBRUN_METADATA_KEYS,
 } from './schemas';
+import type { BindingDirective } from './schemas';
+import type { PersistedNodeOutput } from './store';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger, captureWorkflowCompleted } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
@@ -93,6 +98,10 @@ import {
   resolveNodeOutputField,
   OutputRefError,
   similarNodeIds,
+  canonicalValueText,
+  parseWholeOutputRef,
+  parseWholeInputsRef,
+  type JsonValue,
 } from './output-ref';
 import { buildTruncationMarker } from './utils/output-truncation';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
@@ -164,14 +173,23 @@ function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
  * only for `workflow:` sub-run children (the parent stamps `metadata.inputs` at spawn);
  * a top-level run has none. Threaded into every AI/prompt substitution so `$INPUTS.<name>`
  * resolves, and mangled to `INPUTS_<UPPER_SNAKE>` env vars for bash/script nodes.
+ * Values are logical JSON values (#2637): `readSubrunMetadata` prefers the
+ * `inputs_values` sibling key and degrades to the legacy text map.
  */
-function resolveRunInputs(workflowRun: WorkflowRun): Record<string, string> | undefined {
+function resolveRunInputs(
+  workflowRun: Pick<WorkflowRun, 'metadata'>
+): Record<string, JsonValue> | undefined {
   return readSubrunMetadata(workflowRun.metadata as Record<string, unknown> | undefined).inputs;
 }
 
-/** Everything resolving a composed input value needs; the caller has all of it in scope. */
-interface ShellInputContext {
-  workflowRun: WorkflowRun;
+/**
+ * Everything resolving a composed input value needs; the caller has all of it in scope.
+ * `workflowRun` is a Pick so the dry-run simulator — which has no WorkflowRun row —
+ * can construct one for {@link resolveNodeBindings} (#2637); executor callers pass
+ * their full run unchanged.
+ */
+export interface ShellInputContext {
+  workflowRun: Pick<WorkflowRun, 'id' | 'user_message' | 'metadata'>;
   artifactsDir: string;
   stateDir: string;
   baseBranch: string;
@@ -203,27 +221,215 @@ function inputEnvVars(node: DagNode, ctx: ShellInputContext): NodeJS.ProcessEnv 
   const runInputs = resolveRunInputs(ctx.workflowRun);
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(runInputs ?? {})) {
-    env[inputEnvKey(name)] = value;
+    // Canonical text (#2637): env vars are text, so a typed input rides its one
+    // deterministic representation (strings raw, everything else JSON text).
+    env[inputEnvKey(name)] = canonicalValueText(value);
   }
   for (const [name, value] of Object.entries(readComposedMeta(node)?.inputs ?? {})) {
-    env[inputEnvKey(name)] = substituteNodeOutputRefs(
-      substituteWorkflowVariables(
-        value,
-        ctx.workflowRun.id,
-        ctx.workflowRun.user_message,
-        ctx.artifactsDir,
-        ctx.baseBranch,
-        ctx.docsDir,
-        ctx.issueContext,
-        undefined,
-        undefined,
-        undefined,
-        { stateDir: ctx.stateDir, inputs: runInputs }
-      ).prompt,
-      ctx.nodeOutputs
-    );
+    // Only strings can carry templates/refs; a typed composed value passes as-is.
+    env[inputEnvKey(name)] =
+      typeof value === 'string'
+        ? substituteNodeOutputRefs(
+            substituteWorkflowVariables(
+              value,
+              ctx.workflowRun.id,
+              ctx.workflowRun.user_message,
+              ctx.artifactsDir,
+              ctx.baseBranch,
+              ctx.docsDir,
+              ctx.issueContext,
+              undefined,
+              undefined,
+              undefined,
+              { stateDir: ctx.stateDir, inputs: runInputs }
+            ).prompt,
+            ctx.nodeOutputs
+          )
+        : canonicalValueText(value);
+  }
+  // Node-local bindings (#2637) — a script node's own `with:` map, resolved against
+  // upstream outputs. Third and NEAREST source: the node's own file is the nearest
+  // contract, so it wins over composed and run inputs (extends the documented order
+  // above). Resolution failures throw and fail the node — never a silent ''.
+  if (isScriptNode(node) && node.with !== undefined) {
+    for (const [name, value] of Object.entries(
+      resolveNodeBindings(node.id, node.with, ctx, runInputs)
+    )) {
+      env[inputEnvKey(name)] = canonicalValueText(value);
+    }
   }
   return env;
+}
+
+/**
+ * The logical value of one whole `$node.output[.field]` reference (#2637): the
+ * producer's parsed structured payload when it has one (else its output text) for
+ * the unfielded form, and the raw field value under the strict no-silent-drop
+ * contract for the fielded form (declared-optional-absent → '').
+ */
+function wholeRefLogicalValue(
+  producer: NodeOutput,
+  nodeId: string,
+  field: string | undefined
+): JsonValue {
+  if (field === undefined) {
+    const structured = 'structuredOutput' in producer ? producer.structuredOutput : undefined;
+    // Provider payloads are ajv-validated / DB-round-tripped JSON, so the cast
+    // asserts what production already guarantees.
+    return structured !== undefined ? (structured as JsonValue) : producer.output;
+  }
+  const resolution = resolveNodeOutputField(producer, nodeId, field);
+  return resolution.kind === 'empty' ? '' : (resolution.value as JsonValue);
+}
+
+/**
+ * Resolve one `with:` value to its logical JSON value (#2637).
+ *
+ * Three tiers, in order:
+ *  - a non-string literal (boolean/number/null/array/object) passes through as-is;
+ *  - a string that is EXACTLY one whole `$INPUTS.<name>` or `$node.output[.field]`
+ *    reference resolves to the LOGICAL value (type preserved);
+ *  - any other string is a template: two-pass text substitution (workflow vars,
+ *    then `$node.output` refs), exactly as `input:` resolves.
+ *
+ * `strictWholeRef` selects the unknown-producer posture for the unfielded whole-ref
+ * form: node-local bindings are a new surface and FAIL (with a did-you-mean hint);
+ * `workflow:`/fan-out `with:` values keep the template path's historical lenient ''
+ * so pre-#2637 workflows resolve byte-identically. Fielded refs fail everywhere.
+ */
+function resolveWorkflowValue(
+  rawValue: JsonValue,
+  ctx: ShellInputContext,
+  runInputs: Record<string, JsonValue> | undefined,
+  strictWholeRef: boolean
+): JsonValue {
+  if (typeof rawValue !== 'string') return rawValue;
+  const inputsName = parseWholeInputsRef(rawValue);
+  if (inputsName !== undefined) {
+    const name = inputsName;
+    if (runInputs && Object.hasOwn(runInputs, name)) return runInputs[name];
+    // Same loud posture (and hint shape) as the text splice in executor-shared.
+    const known = runInputs ? Object.keys(runInputs) : [];
+    const hint = similarNodeIds(name, known);
+    const suffix =
+      hint.length > 0
+        ? ` Did you mean ${hint.map(h => `$INPUTS.${h}`).join(', ')}?`
+        : known.length > 0
+          ? ` Available inputs: ${known.map(k => `$INPUTS.${k}`).join(', ')}.`
+          : ' This run has no declared inputs.';
+    throw new Error(`Unknown input '$INPUTS.${name}'.${suffix}`);
+  }
+  const wholeRef = parseWholeOutputRef(rawValue);
+  if (wholeRef !== undefined) {
+    const producer = ctx.nodeOutputs.get(wholeRef.nodeId);
+    if (producer !== undefined) {
+      return wholeRefLogicalValue(producer, wholeRef.nodeId, wholeRef.field);
+    }
+    if (wholeRef.field !== undefined) {
+      throw new OutputRefError(
+        wholeRef.nodeId,
+        wholeRef.field,
+        'unknown-node',
+        similarNodeIds(wholeRef.nodeId, ctx.nodeOutputs.keys())
+      );
+    }
+    if (strictWholeRef) {
+      const candidates = similarNodeIds(wholeRef.nodeId, ctx.nodeOutputs.keys());
+      const hint =
+        candidates.length > 0 ? ` Did you mean: ${candidates.map(c => `'${c}'`).join(', ')}?` : '';
+      throw new Error(
+        `Binding value '$${wholeRef.nodeId}.output' references node '${wholeRef.nodeId}', ` +
+          'but no node with that id has produced output at this point — the id is either ' +
+          'unknown (a typo) or belongs to a node that has not run before this reference.' +
+          `${hint} Fix the id, or add '${wholeRef.nodeId}' to depends_on.`
+      );
+    }
+    // Lenient legacy surface: fall through to the template path, which resolves the
+    // unknown whole-text ref to '' with a warn — byte-identical to pre-#2637.
+  }
+  const { prompt: substituted } = substituteWorkflowVariables(
+    rawValue,
+    ctx.workflowRun.id,
+    ctx.workflowRun.user_message,
+    ctx.artifactsDir,
+    ctx.baseBranch,
+    ctx.docsDir,
+    ctx.issueContext,
+    undefined,
+    undefined,
+    undefined,
+    { stateDir: ctx.stateDir, inputs: runInputs }
+  );
+  return substituteNodeOutputRefs(substituted, ctx.nodeOutputs);
+}
+
+/**
+ * Resolve a command/script node's node-local `with:` map (#2637) to logical values.
+ *
+ * A plain-object value is the explicit binding directive `{ from, if_skipped? }`:
+ * `from` reads one whole upstream ref; a producer that did not run (skipped or
+ * pending — reachable under `trigger_rule: all_done` across a skipped branch)
+ * takes `if_skipped` instead, and without one the node fails with the fix named.
+ * Everything else resolves through {@link resolveWorkflowValue} in strict mode.
+ * The loader guarantees bound producers are upstream `depends_on`, so resolution
+ * here is a per-node pre-step with no new scheduling.
+ *
+ * `runInputs` is explicit (not derived from ctx) so the dry-run simulator can pass
+ * its effective input map — its synthetic context carries no run metadata. Exported
+ * for that simulator only; it must resolve bindings with THIS function so preview
+ * and execution cannot drift (#2637 R2).
+ */
+export function resolveNodeBindings(
+  consumerId: string,
+  withMap: Record<string, JsonValue | BindingDirective>,
+  ctx: ShellInputContext,
+  runInputs: Record<string, JsonValue> | undefined
+): Record<string, JsonValue> {
+  const resolved: Record<string, JsonValue> = {};
+  for (const [name, rawValue] of Object.entries(withMap)) {
+    if (isBindingDirective(rawValue)) {
+      resolved[name] = resolveBindingDirective(consumerId, name, rawValue, ctx);
+      continue;
+    }
+    if (typeof rawValue === 'object' && rawValue !== null && !Array.isArray(rawValue)) {
+      // The loader rejects this shape at load time; programmatic definitions can
+      // still reach here, so keep the failure loud and actionable.
+      throw new Error(
+        `Node '${consumerId}' binding '${name}': an object value must be a binding directive ` +
+          "{ from: '$node.output[.field]', if_skipped?: <value> }. Use a string, number, " +
+          'boolean, null, or array for a literal value.'
+      );
+    }
+    resolved[name] = resolveWorkflowValue(rawValue, ctx, runInputs, true);
+  }
+  return resolved;
+}
+
+function resolveBindingDirective(
+  consumerId: string,
+  name: string,
+  directive: BindingDirective,
+  ctx: ShellInputContext
+): JsonValue {
+  const ref = parseWholeOutputRef(directive.from);
+  if (ref === undefined) {
+    throw new Error(
+      `Node '${consumerId}' binding '${name}': 'from' must be exactly one whole ` +
+        `'$node.output' or '$node.output.field' reference, got '${directive.from}'.`
+    );
+  }
+  const producer = ctx.nodeOutputs.get(ref.nodeId);
+  if (producer === undefined || producer.state === 'skipped' || producer.state === 'pending') {
+    // Presence-keyed: `if_skipped: null` (or false/0/'') is a real declared default.
+    if (Object.hasOwn(directive, 'if_skipped')) return directive.if_skipped as JsonValue;
+    throw new Error(
+      `Node '${consumerId}' binding '${name}' reads '${directive.from}', but node ` +
+        `'${ref.nodeId}' did not run (skipped or pending), so it has no output to read. ` +
+        "Declare 'if_skipped:' on the binding to supply a default for that branch, or " +
+        `guard '${consumerId}' with a 'when:' condition.`
+    );
+  }
+  return wholeRefLogicalValue(producer, ref.nodeId, ref.field);
 }
 
 interface RunningTool {
@@ -511,6 +717,13 @@ export interface ChildWorkflowOutcome {
   status: 'completed' | 'paused' | 'failed' | 'cancelled';
   /** Child's terminal output (its first sink node's output), threaded as `$<id>.output`. */
   output?: string;
+  /**
+   * The terminal node's structured payload (#2637), read from `metadata.summary_value`
+   * when the child stamped one. Threads the LOGICAL value back to the parent so
+   * `$<id>.output.field` access and fan-out aggregation keep the type instead of
+   * re-encoding the text. Absent for text-only children and pre-#2637 rows.
+   */
+  structuredOutput?: unknown;
   /** Child run's total cost, rolled up into the parent node's costUsd (D8). */
   costUsd?: number;
   tokens?: TokenUsage;
@@ -556,11 +769,13 @@ export interface RunChildWorkflowArgs {
   resumeFailedChild?: WorkflowRun;
   /**
    * Named inputs (#2470) — the resolved `with:` map the parent supplied, plus (for a
-   * fan-out child) the per-item `fan_out.as` entry. Persisted to the child's
-   * `metadata.inputs` at spawn so `$INPUTS.<name>` resolves at runtime and reconstitutes
-   * on cold resume. Undefined/empty when the node declares no `with:`/`as`.
+   * fan-out child) the per-item `fan_out.as` entry. Logical JSON values (#2637).
+   * Persisted to the child's `metadata.inputs` (canonical text) plus, when any value
+   * is non-string, the `metadata.inputs_values` sibling, so `$INPUTS.<name>` resolves
+   * at runtime and reconstitutes typed on cold resume. Undefined/empty when the node
+   * declares no `with:`/`as`.
    */
-  inputs?: Record<string, string>;
+  inputs?: Record<string, JsonValue>;
 }
 
 /**
@@ -609,10 +824,15 @@ export function childOutcomeFromRun(run: WorkflowRun): ChildWorkflowOutcome {
           ...(md.total_cache_partial === true ? { cachePartial: true as const } : {}),
         }
       : undefined;
+  // Presence-keyed (#2637): `false`/`0`/`null` are legitimate structured values, so
+  // reading through readSubrunMetadata's summaryValue keeps them distinguishable
+  // from "not stamped".
+  const summaryValue = readSubrunMetadata(md).summaryValue;
   return {
     childRunId: run.id,
     status: run.status,
     output: typeof md.summary === 'string' ? md.summary : undefined,
+    ...(summaryValue !== undefined ? { structuredOutput: summaryValue } : {}),
     costUsd: typeof md.total_cost_usd === 'number' ? md.total_cost_usd : undefined,
     tokens,
     error: typeof md.error === 'string' ? md.error : undefined,
@@ -991,16 +1211,15 @@ export function substituteNodeOutputRefs(
       const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
       if (resolution.kind === 'empty') return escapedForBash ? "''" : '';
       const value = resolution.value;
-      if (typeof value === 'string')
-        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, artifactsDir) : value;
       // numbers and booleans are shell-safe without quoting: JSON disallows
       // NaN/Infinity so String(number) is digits/sign/'.', and String(boolean) is
       // 'true'/'false' — no shell metacharacters.
       if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-      // arrays and objects: JSON-stringify so downstream tools (jq, etc.) get a
-      // single JSON literal argument.
-      const json = JSON.stringify(value);
-      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, artifactsDir) : json;
+      // Everything else takes the one value→text rule (strings raw; arrays/objects/
+      // null as canonical JSON so downstream tools like jq get one JSON literal),
+      // with the bash-escaping decision staying here at the call site.
+      const text = canonicalValueText(value);
+      return escapedForBash ? shellQuoteOrFile(text, nodeId, field, artifactsDir) : text;
     }
   );
 }
@@ -1122,11 +1341,9 @@ export function substituteLoopPrevRefs(
       const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
       if (resolution.kind === 'empty') return escapedForBash ? "''" : '';
       const value = resolution.value;
-      if (typeof value === 'string')
-        return escapedForBash ? shellQuoteOrFile(value, nodeId, field, outputFileDir) : value;
       if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-      const json = JSON.stringify(value);
-      return escapedForBash ? shellQuoteOrFile(json, nodeId, field, outputFileDir) : json;
+      const text = canonicalValueText(value);
+      return escapedForBash ? shellQuoteOrFile(text, nodeId, field, outputFileDir) : text;
     }
   );
 }
@@ -1473,7 +1690,7 @@ function checkTriggerRuleForDependencies(
 export function checkComposedBlockBoundaries(
   node: DagNode,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs?: Record<string, string>,
+  inputs?: Record<string, JsonValue>,
   evaluateEntryBoundary = false
 ): 'run' | 'skip' {
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
@@ -1688,6 +1905,30 @@ async function executeNodeInternal(
   // Standard variable substitution
   let substitutedPrompt: string;
   try {
+    // Node-local bindings (#2637): a command node's `with:` map resolves against
+    // upstream outputs and merges OVER the run's inputs into the `$INPUTS` bag —
+    // nearest-wins, the same precedence the shell env channel documents. A binding
+    // that cannot be satisfied throws here and fails the node via the catch below.
+    const runInputs = resolveRunInputs(workflowRun);
+    const nodeBindings =
+      node.command !== undefined && node.with !== undefined
+        ? resolveNodeBindings(
+            node.id,
+            node.with,
+            {
+              workflowRun,
+              artifactsDir,
+              stateDir,
+              baseBranch,
+              docsDir,
+              issueContext,
+              nodeOutputs,
+            },
+            runInputs
+          )
+        : undefined;
+    const promptInputs =
+      nodeBindings !== undefined ? { ...(runInputs ?? {}), ...nodeBindings } : runInputs;
     substitutedPrompt = buildPromptWithContext(
       rawPrompt,
       workflowRun.id,
@@ -1697,7 +1938,7 @@ async function executeNodeInternal(
       docsDir,
       issueContext,
       `dag node '${node.id}' prompt`,
-      { stateDir, inputs: resolveRunInputs(workflowRun) }
+      { stateDir, inputs: promptInputs }
     );
   } catch (error) {
     const err = error as Error;
@@ -2482,10 +2723,7 @@ async function executeNodeInternal(
         }
         if (validation.valid) {
           try {
-            nodeOutputText =
-              typeof structuredOutput === 'string'
-                ? structuredOutput
-                : JSON.stringify(structuredOutput);
+            nodeOutputText = canonicalValueText(structuredOutput);
           } catch (serializeErr) {
             const err = serializeErr as Error;
             throw new Error(
@@ -2728,6 +2966,10 @@ async function executeNodeInternal(
         data: {
           duration_ms: duration,
           node_output: nodeOutputText,
+          // The logical value beside its text (#2637), so a cold resume rehydrates
+          // typed field access instead of degrading to a text re-parse. Additive:
+          // rows without it resume exactly as before.
+          ...(structuredOutput !== undefined ? { structured_output: structuredOutput } : {}),
           ...nodeUsageEventData(),
           ...(nodeStopReason ? { stop_reason: nodeStopReason } : {}),
           ...(nodeNumTurns !== undefined ? { num_turns: nodeNumTurns } : {}),
@@ -3677,6 +3919,10 @@ function readSignaledCostUsd(
  * only record. A loop_group omits it — its body nodes persisted their own namespaced
  * rows (with tokens) before the pause, and those rows survive it, so repeating the
  * total here would double-count in the one event stream.
+ *
+ * `finalizeStructuredOutput` is the signaled iteration's structured payload, carried
+ * across the gate the same way (#2637) — persisted here so a resume AFTER the
+ * finalize rehydrates the payload exactly like a natural completion's row.
  */
 async function finalizeLoopFromSignal(
   deps: WorkflowDeps,
@@ -3687,7 +3933,8 @@ async function finalizeLoopFromSignal(
   stepName: string,
   nodeLabel: string,
   finalizeOutput: string,
-  finalizeUsage?: { costUsd?: number; tokens?: TokenUsage }
+  finalizeUsage?: { costUsd?: number; tokens?: TokenUsage },
+  finalizeStructuredOutput?: unknown
 ): Promise<void> {
   // Impossible by construction today (the gate writes signaledOutput whenever
   // completionSignaled is true) — this warn guards a future decoupling so a
@@ -3712,6 +3959,9 @@ async function finalizeLoopFromSignal(
       data: {
         duration_ms: 0,
         node_output: finalizeOutput,
+        ...(finalizeStructuredOutput !== undefined
+          ? { structured_output: finalizeStructuredOutput }
+          : {}),
         ...(finalizeUsage?.costUsd !== undefined ? { cost_usd: finalizeUsage.costUsd } : {}),
         ...(finalizeUsage?.tokens !== undefined ? { tokens: finalizeUsage.tokens } : {}),
       },
@@ -3828,6 +4078,11 @@ async function executeLoopGroupNode(
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
   if (isLoopResume && loopGateMeta?.completionSignaled === true && !feedbackGiven) {
     const finalizeOutput = loopGateMeta.signaledOutput ?? '';
+    // The signaled iteration's structured payload (#2637): attaching it keeps this
+    // route's `$group.output.field` tier IDENTICAL to natural completion (tier-2
+    // lenient) — without it the same absent optional field would throw here and
+    // resolve to '' there. null/absent (pre-#2637 gates) → text-only, as before.
+    const finalizeStructured = loopGateMeta.signaledStructuredOutput ?? null;
     await finalizeLoopFromSignal(
       deps,
       platform,
@@ -3836,7 +4091,7 @@ async function executeLoopGroupNode(
       node.id,
       stepName,
       'Loop-group node',
-      finalizeOutput
+      finalizeOutput,
       // NO usage, deliberately — same double-count reasoning as the
       // natural-completion group row below. A loop_group's body nodes wrote their own
       // `<groupId>.<nodeId>` node_completed rows (with tokens) BEFORE the gate paused,
@@ -3845,12 +4100,22 @@ async function executeLoopGroupNode(
       // consumer summing usage count the pausing iteration twice. The plain `loop`
       // DOES pass it — its per-iteration rows carry no usage, so its finalize row is
       // the only record.
+      undefined,
+      finalizeStructured ?? undefined
     );
-    return { state: 'completed', output: finalizeOutput };
+    return {
+      state: 'completed',
+      output: finalizeOutput,
+      ...(finalizeStructured !== null ? { structuredOutput: finalizeStructured } : {}),
+    };
   }
 
   let loopPrevOutputs: Map<string, NodeOutput> | undefined; // undefined on iteration 1
   let lastIterationOutput = '';
+  // The terminal sink's structured payload for the same iteration (#2637) — tracked
+  // beside the text so the group's completed NodeOutput carries the logical value
+  // (sibling `loop:` has done this since #2563; the group used to discard it).
+  let lastIterationStructuredOutput: unknown;
   let loopTotalCostUsd: number | undefined;
   let loopTotalTokens: TokenUsage | undefined;
   // Loop-level session cursor: threaded across iterations when fresh_context is false
@@ -4062,11 +4327,11 @@ async function executeLoopGroupNode(
     // result and only rebinds a child run's terminal output (see executeDagWorkflow). Leave
     // this positional scan as-is; do not "fix" the inconsistency.
     const allDeps = new Set(iterBodyNodes.flatMap(n => n.depends_on ?? []));
-    const terminalOutput = iterBodyNodes
+    const terminalSink = iterBodyNodes
       .filter(n => !allDeps.has(n.id))
       .map(n => scopedNodeOutputs.get(n.id))
-      .find(o => o?.state === 'completed' && o.output.trim().length > 0)?.output;
-    const iterationOutput = terminalOutput ?? '';
+      .find(o => o?.state === 'completed' && o.output.trim().length > 0);
+    const iterationOutput = terminalSink?.output ?? '';
     // Capture the PREVIOUS iteration's (cleaned) output before overwriting — the
     // until_bash env below exposes it as LOOP_PREV_OUTPUT (previous iteration, same
     // semantics as executeLoopNode; empty on the first iteration).
@@ -4075,6 +4340,12 @@ async function executeLoopGroupNode(
     // completion-signal tags so the marker never leaks into $groupId.output (mirrors
     // executeLoopNode's cleanOutput handling).
     lastIterationOutput = stripCompletionTags(iterationOutput, group.until);
+    // The sink's structured payload rides along AS-IS (#2637): a JSON payload never
+    // contains the completion tag, so no stripping applies to it.
+    lastIterationStructuredOutput =
+      terminalSink !== undefined && 'structuredOutput' in terminalSink
+        ? terminalSink.structuredOutput
+        : undefined;
 
     // Completion gate: until-signal in the terminal output, and/or until_bash exit 0.
     // Short-circuit: if the until-signal already detected completion, skip the
@@ -4229,6 +4500,11 @@ async function executeLoopGroupNode(
           data: {
             duration_ms: duration,
             node_output: lastIterationOutput,
+            // The terminal sink's logical value (#2637) — persisted so cold resume
+            // rehydrates typed `$group.output.field` access identically to fresh runs.
+            ...(lastIterationStructuredOutput !== undefined
+              ? { structured_output: lastIterationStructuredOutput }
+              : {}),
             // This row is an AGGREGATE of rows that are already in the event log.
             // Unlike every other node type, a loop_group's body nodes write their OWN
             // node_completed rows (namespaced `<groupId>.<nodeId>`, one per iteration)
@@ -4273,6 +4549,12 @@ async function executeLoopGroupNode(
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
+        // The final iteration's sink payload, so downstream `$group.output.field`
+        // resolves from the logical value (#2637). No declaredFields: a group's
+        // own output_format is ignored, so field access stays tier-2 lenient.
+        ...(lastIterationStructuredOutput !== undefined
+          ? { structuredOutput: lastIterationStructuredOutput }
+          : {}),
       };
     }
 
@@ -4325,9 +4607,13 @@ async function executeLoopGroupNode(
         // a different provider (#1992). null = this pause has no cursor to restore.
         sessionId: loopLastSequentialSession?.sessionId ?? null,
         sessionProvider: loopLastSequentialSession?.provider ?? null,
-        // Signal state for finalize-on-bare-approve (#2074).
+        // Signal state for finalize-on-bare-approve (#2074). The structured payload
+        // rides along (#2637) so the finalize attaches it like a natural completion.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        signaledStructuredOutput: completionDetected
+          ? (lastIterationStructuredOutput ?? null)
+          : null,
         // NO `signaledTokens` — a loop_group gate has no consumer for it. The body's
         // own `<groupId>.<nodeId>` rows already persisted this iteration's usage before
         // the pause, so the finalize path deliberately writes no `tokens` (see the
@@ -4416,6 +4702,31 @@ export function applyLoopPrevToBodyNode(
     const userInputForField = escapedForBash ? shellQuote(loopUserInput) : loopUserInput;
     return prevResolved.replace(/\$LOOP_USER_INPUT/g, userInputForField);
   };
+  // Node-local `with:` bindings (#2637) are per-iteration surfaces like every other
+  // body field: string values (whole refs and templates alike) get the same raw
+  // `$LOOP_PREV` splice — raw because binding values never touch shell source, the
+  // env bag / `$INPUTS` channel is the injection-safe delivery (#2115). A spliced
+  // `$LOOP_PREV.<id>.output` therefore delivers the previous iteration's TEXT
+  // ('' on iteration 1), exactly like the prompt/bash surfaces — never the literal
+  // token. Directives stay untouched: `from` must remain a current-iteration node
+  // ref (the loader rejects `$LOOP_PREV` there, naming this string form), and only
+  // a string `if_skipped` default carries the splice, mirroring the include macro.
+  const subWithMap = (
+    withMap: Record<string, JsonValue | BindingDirective>
+  ): Record<string, JsonValue | BindingDirective> =>
+    Object.fromEntries(
+      Object.entries(withMap).map(([name, value]): [string, JsonValue | BindingDirective] => {
+        if (isBindingDirective(value)) {
+          return [
+            name,
+            typeof value.if_skipped === 'string'
+              ? { ...value, if_skipped: sub(value.if_skipped) }
+              : value,
+          ];
+        }
+        return [name, typeof value === 'string' ? sub(value) : value];
+      })
+    );
   // AI configuration is live prompt text too. Resolve it in this same per-iteration pass
   // before the ordinary workflow-variable/node-output pass runs in `runLayers`, otherwise
   // a namespaced `$LOOP_PREV` inside an included block reaches the provider literally.
@@ -4442,7 +4753,11 @@ export function applyLoopPrevToBodyNode(
     (substitutedNode as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = {
       ...composedMeta,
       inputs: Object.fromEntries(
-        Object.entries(composedMeta.inputs).map(([name, value]) => [name, sub(value)])
+        // Only strings carry substitutable refs (#2637); typed values pass through.
+        Object.entries(composedMeta.inputs).map(([name, value]) => [
+          name,
+          typeof value === 'string' ? sub(value) : value,
+        ])
       ),
     };
   }
@@ -4527,12 +4842,20 @@ export function applyLoopPrevToBodyNode(
   // (mirroring executeScriptNode's substituteNodeOutputRefs(..., false)); $LOOP_USER_INPUT
   // is skipped here (skipUserInput) and delivered via env by executeScriptNode (#2115).
   if (isScriptNode(substitutedNode))
-    return { ...substitutedNode, script: sub(substitutedNode.script, false, true) };
+    return {
+      ...substitutedNode,
+      script: sub(substitutedNode.script, false, true),
+      ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
+    };
   // Cancel reason is display text, never executed — mirrors the normal-path default.
   if (isCancelNode(substitutedNode))
     return { ...substitutedNode, cancel: sub(substitutedNode.cancel) };
-  if ('command' in substitutedNode && typeof substitutedNode.command === 'string')
-    return { ...substitutedNode, command: sub(substitutedNode.command) };
+  if (isCommandNode(substitutedNode))
+    return {
+      ...substitutedNode,
+      command: sub(substitutedNode.command),
+      ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
+    };
   if ('prompt' in substitutedNode && typeof substitutedNode.prompt === 'string')
     return { ...substitutedNode, prompt: sub(substitutedNode.prompt) };
   return substitutedNode;
@@ -4710,6 +5033,10 @@ async function executeLoopNode(
   const feedbackGiven = loopGateRunMeta.loop_feedback_given === true;
   if (isLoopResume && loopGateMeta?.completionSignaled === true && !feedbackGiven) {
     const finalizeOutput = loopGateMeta.signaledOutput ?? '';
+    // The signaled iteration's structured payload (#2637) — attached below so this
+    // route matches natural completion's NodeOutput exactly. null/absent
+    // (pre-#2637 gates) → text-only, as before.
+    const finalizeStructured = loopGateMeta.signaledStructuredOutput ?? null;
     if (currentSessionId !== undefined) {
       await checkpointSession?.(currentSessionId);
     }
@@ -4725,7 +5052,8 @@ async function executeLoopNode(
       {
         ...(persistedLoopCostUsd !== undefined ? { costUsd: persistedLoopCostUsd } : {}),
         ...(persistedLoopTokens !== undefined ? { tokens: persistedLoopTokens } : {}),
-      }
+      },
+      finalizeStructured ?? undefined
     );
     // Same declared-field capture as the normal completion return below and as the
     // resume-hydration path (#2091). This is a COMPLETION exit, so a consumer's
@@ -4741,6 +5069,7 @@ async function executeLoopNode(
       ...(persistedLoopCostUsd !== undefined ? { costUsd: persistedLoopCostUsd } : {}),
       ...(persistedLoopTokens !== undefined ? { tokens: persistedLoopTokens } : {}),
       ...(finalizeDeclaredFields !== undefined ? { declaredFields: finalizeDeclaredFields } : {}),
+      ...(finalizeStructured !== null ? { structuredOutput: finalizeStructured } : {}),
     };
   }
 
@@ -5595,10 +5924,7 @@ async function executeLoopNode(
     let structuredText: string | undefined;
     if (iterationPayload !== undefined) {
       try {
-        structuredText =
-          typeof iterationPayload === 'string'
-            ? iterationPayload
-            : JSON.stringify(iterationPayload);
+        structuredText = canonicalValueText(iterationPayload);
       } catch (serializeErr) {
         const err = serializeErr as Error;
         return await failLoopNode(
@@ -5812,6 +6138,11 @@ async function executeLoopNode(
           data: {
             duration_ms: Date.now() - iterationStart,
             node_output: lastIterationOutput,
+            // The completing iteration's logical payload (#2637) — mirrors the
+            // prompt/command emit so cold resume keeps typed field access.
+            ...(lastIterationStructuredOutput !== undefined
+              ? { structured_output: lastIterationStructuredOutput }
+              : {}),
             ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
             ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
             ...(loopFinalStopReason ? { stop_reason: loopFinalStopReason } : {}),
@@ -5919,9 +6250,13 @@ async function executeLoopNode(
         iteration: i,
         // null = this pause has no session to restore.
         sessionId: currentSessionId ?? null,
-        // Signal state for finalize-on-bare-approve (#2074).
+        // Signal state for finalize-on-bare-approve (#2074). The structured payload
+        // rides along (#2637) so the finalize attaches it like a natural completion.
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
+        signaledStructuredOutput: completionDetected
+          ? (lastIterationStructuredOutput ?? null)
+          : null,
         // Cumulative usage consumed through this gate. A resumed loop seeds its
         // totals from these values so later gates and terminal metadata preserve
         // every pre-gate iteration; bare approval uses the same values directly.
@@ -6337,29 +6672,28 @@ async function executeWorkflowNode(
   );
   const input = substituteNodeOutputRefs(substitutedInput, ctx.nodeOutputs);
 
-  // Resolve the node's `with:` map (#2470) into concrete strings — same two-pass
-  // resolution as `input`: workflow vars (non-shellSafe: these values become the child's
-  // `$INPUTS`, not shell source) then `$node.output` refs. The result is persisted to the
-  // child's metadata.inputs at spawn and reconstituted on cold resume. Throws on a bad ref
-  // exactly as the input surface does — caught by the caller's try/catch → fail closed.
-  let resolvedInputs: Record<string, string> | undefined;
+  // Resolve the node's `with:` map (#2470/#2637) into concrete JSON values: a
+  // non-string literal passes through with its logical type; a string that is exactly
+  // one whole `$INPUTS.<name>` / `$node.output[.field]` ref resolves to the LOGICAL
+  // value; any other string keeps the two-pass text-template path (workflow vars —
+  // non-shellSafe: these become the child's `$INPUTS`, not shell source — then
+  // `$node.output` refs). The result is persisted to the child's metadata at spawn
+  // and reconstituted on cold resume. Throws on a bad ref exactly as the input
+  // surface does — caught by the caller's try/catch → fail closed.
+  const withResolutionCtx: ShellInputContext = {
+    workflowRun: parentRun,
+    artifactsDir: ctx.artifactsDir,
+    stateDir: ctx.stateDir,
+    baseBranch: ctx.baseBranch,
+    docsDir: ctx.docsDir,
+    issueContext: ctx.issueContext,
+    nodeOutputs: ctx.nodeOutputs,
+  };
+  let resolvedInputs: Record<string, JsonValue> | undefined;
   if (node.with !== undefined) {
     resolvedInputs = {};
     for (const [name, rawValue] of Object.entries(node.with)) {
-      const { prompt: substituted } = substituteWorkflowVariables(
-        rawValue,
-        parentRun.id,
-        parentRun.user_message ?? '',
-        ctx.artifactsDir,
-        ctx.baseBranch,
-        ctx.docsDir,
-        ctx.issueContext,
-        undefined,
-        undefined,
-        undefined,
-        { stateDir: ctx.stateDir, inputs: parentInputs }
-      );
-      resolvedInputs[name] = substituteNodeOutputRefs(substituted, ctx.nodeOutputs);
+      resolvedInputs[name] = resolveWorkflowValue(rawValue, withResolutionCtx, parentInputs, false);
     }
   }
 
@@ -6399,6 +6733,11 @@ async function executeWorkflowNode(
           node_output: output,
           type: 'workflow',
           child_run_id: outcome.childRunId,
+          // The child's terminal logical value (#2637), so parent cold resume
+          // rehydrates typed access to `$<node>.output.field`.
+          ...(outcome.structuredOutput !== undefined
+            ? { structured_output: outcome.structuredOutput }
+            : {}),
           ...(outcome.costUsd !== undefined ? { cost_usd: outcome.costUsd } : {}),
           // Rolled up from the child run's persisted totals, exactly like cost_usd —
           // tokens are the axis every provider reports (Codex reports no cost at all),
@@ -6429,6 +6768,9 @@ async function executeWorkflowNode(
       output,
       ...(outcome.costUsd !== undefined ? { costUsd: outcome.costUsd } : {}),
       ...(outcome.tokens !== undefined ? { tokens: outcome.tokens } : {}),
+      ...(outcome.structuredOutput !== undefined
+        ? { structuredOutput: outcome.structuredOutput }
+        : {}),
       ...(declaredFields !== undefined ? { declaredFields } : {}),
     };
   };
@@ -6849,7 +7191,12 @@ async function executeFanOutWorkflowNode(
   // node_completed writer (mirrors executeWorkflowNode.asCompleted) — written ONLY when
   // the join is satisfied, so getCompletedDagNodeOutputs skips a finished fan-out node
   // on resume but re-runs an unfinished one (which re-inspects children by child_index).
-  const writeCompleted = (output: string, costUsd?: number, tokens?: TokenUsage): void => {
+  const writeCompleted = (
+    output: string,
+    costUsd?: number,
+    tokens?: TokenUsage,
+    structured?: unknown
+  ): void => {
     deps.store
       .createWorkflowEvent({
         workflow_run_id: parentRun.id,
@@ -6859,6 +7206,9 @@ async function executeFanOutWorkflowNode(
           node_output: output,
           type: 'workflow',
           fan_out: true,
+          // The logical aggregate array (#2637), so parent cold resume rehydrates
+          // it identically to the fresh join.
+          ...(structured !== undefined ? { structured_output: structured } : {}),
           ...(costUsd !== undefined ? { cost_usd: costUsd } : {}),
           // Both usage keys are what survives resume: getDagResumeSnapshot rebuilds a
           // run's cumulative usage by summing `data.tokens` and `data.cost_usd` off
@@ -6913,10 +7263,10 @@ async function executeFanOutWorkflowNode(
     });
   };
 
-  // Item → child input/$ARGUMENTS (objects JSON-stringified). Also the pre-image for the
-  // resume item-hash (S2).
-  const itemToInput = (item: unknown): string =>
-    typeof item === 'string' ? item : JSON.stringify(item);
+  // Item → child input/$ARGUMENTS (canonical value text: strings raw, objects JSON).
+  // Also the pre-image for the resume item-hash (S2) — identity unchanged by #2637,
+  // since canonicalValueText is byte-identical to the previous inline mapping.
+  const itemToInput = (item: unknown): string => canonicalValueText(item);
 
   // 1. Resolve `fan_out.items` → a JSON array. Two-pass substitution (workflow vars,
   //    then $node.output refs) exactly as the input surface uses. A `.field` ref that
@@ -6952,26 +7302,29 @@ async function executeFanOutWorkflowNode(
   // Resolve the node's static `with:` map (#2470) once — the same $INPUTS applied to EVERY
   // fan-out child. Per-item, the `fan_out.as` channel adds `$INPUTS.<as> = <item>` on top
   // (load-time collision-checked so `as` never overwrites a `with:` key). Resolved here
-  // rather than per-child because the values don't depend on the item.
-  const fanOutStaticInputs: Record<string, string> = {};
+  // rather than per-child because the values don't depend on the item. Same three-tier
+  // value resolution as the 1:1 path (#2637): literals typed, whole refs logical,
+  // templates text.
+  const fanOutStaticInputs: Record<string, JsonValue> = {};
   const parentInputs = resolveRunInputs(parentRun);
   try {
     if (node.with !== undefined) {
+      const fanOutResolutionCtx: ShellInputContext = {
+        workflowRun: parentRun,
+        artifactsDir: ctx.artifactsDir,
+        stateDir: ctx.stateDir,
+        baseBranch: ctx.baseBranch,
+        docsDir: ctx.docsDir,
+        issueContext: ctx.issueContext,
+        nodeOutputs: ctx.nodeOutputs,
+      };
       for (const [name, rawValue] of Object.entries(node.with)) {
-        const { prompt: substituted } = substituteWorkflowVariables(
+        fanOutStaticInputs[name] = resolveWorkflowValue(
           rawValue,
-          parentRun.id,
-          parentRun.user_message ?? '',
-          ctx.artifactsDir,
-          ctx.baseBranch,
-          ctx.docsDir,
-          ctx.issueContext,
-          undefined,
-          undefined,
-          undefined,
-          { stateDir: ctx.stateDir, inputs: parentInputs }
+          fanOutResolutionCtx,
+          parentInputs,
+          false
         );
-        fanOutStaticInputs[name] = substituteNodeOutputRefs(substituted, ctx.nodeOutputs);
       }
     }
   } catch (err) {
@@ -7208,10 +7561,12 @@ async function executeFanOutWorkflowNode(
       const input = itemToInput(item);
       // Per-child $INPUTS (#2470): the static `with:` map plus the per-item `fan_out.as`
       // channel (the item value under `$INPUTS.<as>`). `as` is load-time guaranteed not to
-      // collide with a `with:` key, so this spread order is unambiguous.
-      const childInputs: Record<string, string> = {
+      // collide with a `with:` key, so this spread order is unambiguous. The item travels
+      // LOGICALLY under `as` (#2637 — an object item stays an object for the child);
+      // `itemToInput`'s text form remains the `$ARGUMENTS`/item-hash channel.
+      const childInputs: Record<string, JsonValue> = {
         ...fanOutStaticInputs,
-        ...(fanOut.as !== undefined ? { [fanOut.as]: input } : {}),
+        ...(fanOut.as !== undefined ? { [fanOut.as]: item as JsonValue } : {}),
       };
       // A fan-out-recoverable-cancelled child (gate/sibling) can't be resumed while
       // 'cancelled' (resumeWorkflowRun rejects that status) — clear it to 'failed' first,
@@ -7292,6 +7647,15 @@ async function executeFanOutWorkflowNode(
     return o.output ?? '';
   };
 
+  // A completed child's aggregate ELEMENT (#2637): its terminal LOGICAL value when it
+  // produced one, else its output text — so a structured child lands single-encoded
+  // (`[{"v":1}]`, never `["{\"v\":1}"]`) while a string-output child stays the exact
+  // string it always was. A structured child always has text too (the canonical
+  // serialization), so the missing-output warn in childOutput still covers every
+  // genuinely empty completion.
+  const childElement = (o: ChildWorkflowOutcome, index: number): JsonValue =>
+    o.structuredOutput !== undefined ? (o.structuredOutput as JsonValue) : childOutput(o, index);
+
   // 7. #2180 (first-run path): a freshly-spawned child that paused at a gate fails the
   //    node. Cancel the paused child(ren) tagged `fan_out_gate` (recoverable once the gate
   //    is removed) and name the offending child (I4).
@@ -7337,31 +7701,41 @@ async function executeFanOutWorkflowNode(
         totalTokens
       );
     }
-    // All completed → aggregate the child outputs in item order (JSON array string).
-    const aggregate = JSON.stringify(outcomes.map((o, i) => childOutput(o, i)));
-    writeCompleted(aggregate, totalCostUsd, totalTokens);
+    // All completed → aggregate the child results in item order: a LOGICAL array
+    // (#2637), serialized once for the text channel.
+    const elements = outcomes.map((o, i) => childElement(o, i));
+    const aggregate = JSON.stringify(elements);
+    writeCompleted(aggregate, totalCostUsd, totalTokens, elements);
     return {
       state: 'completed',
       output: aggregate,
+      structuredOutput: elements,
       ...(totalCostUsd !== undefined ? { costUsd: totalCostUsd } : {}),
       ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),
     };
   }
 
   // join: all_done — node succeeds once all children are terminal; a failed/cancelled
-  // entry is represented as a { error, status } object in the aggregate array (so a
+  // entry is represented as a failure-marker object in the aggregate array (so a
   // collector can reconcile partial results). Never fails the node on a partial failure.
-  const aggregate = JSON.stringify(
-    outcomes.map((o, i) =>
-      o.status === 'completed'
-        ? childOutput(o, i)
-        : { error: o.error ?? `child ${o.status}`, status: o.status }
-    )
+  //
+  // `archon_failed: true` is the marker's reserved discriminator (#2637): now that a
+  // completed structured child's slot is its payload OBJECT, a child whose own schema
+  // happens to carry `error` + `status` fields (a natural verifier shape) would be
+  // indistinguishable from a failed slot by shape alone. No key can be made literally
+  // unproducible through `output_format`, but no schema grows an `archon_failed`
+  // field by accident — collectors check `r?.archon_failed === true`, nothing else.
+  const elements = outcomes.map((o, i) =>
+    o.status === 'completed'
+      ? childElement(o, i)
+      : { archon_failed: true, error: o.error ?? `child ${o.status}`, status: o.status }
   );
-  writeCompleted(aggregate, totalCostUsd, totalTokens);
+  const aggregate = JSON.stringify(elements);
+  writeCompleted(aggregate, totalCostUsd, totalTokens, elements);
   return {
     state: 'completed',
     output: aggregate,
+    structuredOutput: elements,
     ...(totalCostUsd !== undefined ? { costUsd: totalCostUsd } : {}),
     ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),
   };
@@ -7505,7 +7879,7 @@ interface RunLayersContext {
    */
   afterLayer?: () => Promise<void>;
   /** Resume cache: node ids that completed in a prior run (top-level only; undefined for body). */
-  priorCompletedNodes?: Map<string, string>;
+  priorCompletedNodes?: Map<string, PersistedNodeOutput>;
   /**
    * Private provider session handles produced by completed top-level nodes. Undefined
    * inside loop_group bodies because repeated local IDs have no addressable lineage
@@ -7676,7 +8050,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   workflow_run_id: workflowRun.id,
                   event_type: 'node_always_run_reset',
                   step_name: stepNamePrefix + node.id,
-                  data: { prior_output: priorCompletedNodes.get(node.id) ?? '' },
+                  data: { prior_output: priorCompletedNodes.get(node.id)?.output ?? '' },
                 })
                 .catch((err: Error) => {
                   getLog().error(
@@ -7699,7 +8073,12 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   step_name: stepNamePrefix + node.id,
                   data: {
                     reason: 'prior_success',
-                    node_output: priorCompletedNodes.get(node.id) ?? '',
+                    node_output: priorCompletedNodes.get(node.id)?.output ?? '',
+                    // Copy the logical value forward (#2637) so a SECOND resume's
+                    // snapshot still sees it — this re-emit is that resume's source.
+                    ...(priorCompletedNodes.get(node.id)?.structuredOutput !== undefined
+                      ? { structured_output: priorCompletedNodes.get(node.id)?.structuredOutput }
+                      : {}),
                   },
                 })
                 .catch((err: Error) => {
@@ -9062,7 +9441,7 @@ export async function executeDagWorkflow(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>,
+  priorCompletedNodes?: Map<string, PersistedNodeOutput>,
   /** Discovery source — telemetry only (custom-vs-default + name redaction). */
   source?: WorkflowSource,
   aiProfile?: ResolvedAiProfile,
@@ -9189,21 +9568,28 @@ export async function executeDagWorkflow(
   if (priorCompletedNodes && priorCompletedNodes.size > 0) {
     const nodesById = new Map(workflow.nodes.map(n => [n.id, n]));
     let prepopulatedCount = 0;
-    for (const [nodeId, output] of priorCompletedNodes) {
+    for (const [nodeId, prior] of priorCompletedNodes) {
       const node = nodesById.get(nodeId);
       // Nodes flagged always_run re-execute on resume — leave them for fresh output.
       if (node?.always_run) continue;
       // Re-derive a schema-capable producer's declared field set from the loaded
       // definition so its strict `$node.output.field` contract survives resume (#2091).
-      // A loop_group is the exception: its output_format is ignored and fresh completion
-      // exposes the final body output as raw text, so resumed output must stay raw too.
+      // A loop_group is the exception: its output_format is ignored, so it never gets
+      // declaredFields — but its persisted terminal payload (below) still rehydrates,
+      // matching fresh completion since #2637.
       const declaredFields =
         node !== undefined && !isLoopGroupNode(node)
           ? declaredFieldsFromSchema(node.output_format)
           : undefined;
       nodeOutputs.set(nodeId, {
         state: 'completed',
-        output,
+        output: prior.output,
+        // The persisted logical value (#2637): downstream whole-value and `.field`
+        // consumers observe exactly what fresh execution exposed. Absent for rows
+        // persisted before the key existed — those keep the text-parse fallback.
+        ...(prior.structuredOutput !== undefined
+          ? { structuredOutput: prior.structuredOutput }
+          : {}),
         ...(declaredFields !== undefined ? { declaredFields } : {}),
       });
       prepopulatedCount++;
@@ -9703,11 +10089,19 @@ export async function executeDagWorkflow(
   // (~executeLoopGroupNode) is byte-identical and DELIBERATELY unchanged — its result is
   // the iteration's, never a caller's.
   let terminalOutput: string | undefined;
+  // The selected terminal node's structured payload (#2637), stamped beside the text
+  // summary as `metadata.summary_value` so a parent `workflow:` node threads the
+  // LOGICAL value back (fan-out aggregation and `.field` access keep the type).
+  let terminalStructuredOutput: unknown;
   if (workflow.returns !== undefined && workflowRun.parent_run_id) {
     const returnsOutput = nodeOutputs.get(workflow.returns);
     const value = returnsOutput?.state === 'completed' ? returnsOutput.output : undefined;
     if (value !== undefined && value.trim().length > 0) {
       terminalOutput = value;
+      terminalStructuredOutput =
+        returnsOutput !== undefined && 'structuredOutput' in returnsOutput
+          ? returnsOutput.structuredOutput
+          : undefined;
     } else {
       getLog().warn(
         { workflowRunId: workflowRun.id, returns: workflow.returns },
@@ -9717,10 +10111,15 @@ export async function executeDagWorkflow(
     }
   } else {
     const allDependencies = new Set(workflow.nodes.flatMap(n => n.depends_on ?? []));
-    terminalOutput = workflow.nodes
+    const terminalSink = workflow.nodes
       .filter(n => !allDependencies.has(n.id))
       .map(n => nodeOutputs.get(n.id))
-      .find(o => o?.state === 'completed' && o.output.trim().length > 0)?.output;
+      .find(o => o?.state === 'completed' && o.output.trim().length > 0);
+    terminalOutput = terminalSink?.output;
+    terminalStructuredOutput =
+      terminalSink !== undefined && 'structuredOutput' in terminalSink
+        ? terminalSink.structuredOutput
+        : undefined;
   }
 
   // Update DB and emit completion
@@ -9733,7 +10132,12 @@ export async function executeDagWorkflow(
       // A sub-run persists its terminal summary so the parent can thread it as
       // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
       // growth to child runs only (top-level runs return the summary directly).
+      // `summary_value` is the additive logical sibling (#2637): old binaries keep
+      // reading `summary`, new parents prefer the typed value when present.
       ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
+      ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
+        ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
+        : {}),
     });
   } catch (dbErr) {
     getLog().error(
