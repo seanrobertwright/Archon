@@ -244,7 +244,7 @@ archon workflow run implement \
   "implement the plan"
 ```
 
-Every run freezes its workflow source when it starts, whether or not you pass this flag. That freeze is what makes the rest predictable:
+Every run freezes its **project** workflow source when it starts — the `.archon/workflows`, `.archon/commands`, and `.archon/scripts` of the source directory — whether or not you pass this flag. Home-scoped (`~/.archon/`) and bundled workflows are not captured: they resolve the same way from any working directory, so they take no part in this split. That freeze is what makes the rest predictable:
 
 - **The target stays clean.** Nothing from the source checkout is written into it, so its `git status` and its validators only ever see its own files.
 - **A run does not change shape while it is running.** Edit, move, or delete the source checkout after a run starts and a resume still executes what the run began with. Start a new run to pick up the edits.

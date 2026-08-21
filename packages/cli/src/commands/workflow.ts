@@ -780,8 +780,12 @@ function renderWorkflowEvent(event: WorkflowEmitterEvent, verbose: boolean): voi
 }
 
 /**
- * Load workflows from cwd with standardized error handling.
- * Returns the WorkflowLoadResult with both workflows and errors.
+ * Load workflows from the DISCOVERY root with standardized error handling.
+ *
+ * The root passed here owns both the workflow files and the `defaults:` /
+ * `commands.folder` settings that govern how they are discovered — a workflow's own
+ * checkout decides which command folder its command nodes name. What the run then DOES
+ * is governed separately by the target's config, loaded inside `executeWorkflow`.
  */
 async function loadWorkflows(cwd: string): Promise<WorkflowLoadResult> {
   try {
@@ -1013,15 +1017,18 @@ export async function workflowRunCommand(
       options.inputs ? parseInputAssignments(options.inputs) : undefined
     );
 
+    // Relative stub paths resolve from `--cwd`, as the CLI reference states. They are the
+    // operator's dry-run inputs, not part of the workflow's source, so `--workflow-source`
+    // must not silently move where they are read from or written to.
     const stubsPath = options.stubsPath
       ? isAbsolute(options.stubsPath)
         ? options.stubsPath
-        : join(effectiveDiscoveryCwd, options.stubsPath)
+        : join(cwd, options.stubsPath)
       : undefined;
     const stubsInitPath = options.stubsInitPath
       ? isAbsolute(options.stubsInitPath)
         ? options.stubsInitPath
-        : join(effectiveDiscoveryCwd, options.stubsInitPath)
+        : join(cwd, options.stubsInitPath)
       : undefined;
     if (stubsInitPath !== undefined) {
       const scaffold = await writeDryRunStubScaffold(workflow, stubsInitPath);
@@ -1044,11 +1051,14 @@ export async function workflowRunCommand(
     // so a throw means a malformed or unreadable one. Reporting against fabricated
     // defaults would hand the user a clean-looking trace of a run that cannot happen —
     // the same fail-fast reasoning the container-policy load below spells out.
-    const dryRunConfig = await loadConfig(effectiveDiscoveryCwd);
+    // The target workspace, never the authoring root: `--exec-code` runs real bash and
+    // script nodes, and running them in the checkout the workflow was merely READ from
+    // would mutate the author's tree instead of the one they aimed the dry run at.
+    const dryRunConfig = await loadConfig(cwd);
     const result = await dryRunWorkflow({
       workflow,
       userMessage,
-      cwd: effectiveDiscoveryCwd,
+      cwd,
       stubs,
       ...(dryRunInputs ? { inputs: dryRunInputs } : {}),
       execCode: options.execCode,

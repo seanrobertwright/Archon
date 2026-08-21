@@ -20,10 +20,13 @@ created a git worktree on the correct branch. In that case:
   modified before you start belongs to someone else. Leave it exactly as it is and commit
   only the files your implementation touched. Before every commit, confirm with
   `git diff --cached --name-only` that nothing you did not deliberately change is staged.
-- **`.archon/` is ordinary source here.** The workflow running you reads its own
-  commands and scripts from a frozen copy outside this worktree, so anything you see
-  under `.archon/` is this repository's own committed content. If the issue's fix lives
-  in a workflow, command, or script, edit and commit that file like any other.
+- **`.archon/` is ordinary source, but check its provenance before committing it.** The
+  workflow running you reads its own commands and scripts from a frozen copy outside this
+  worktree, so `.archon/` here is usually just this repository's committed content. It is
+  not guaranteed to be: an operator can still copy files in by listing `.archon` under
+  `worktree.copyFiles`. So the rule above applies unchanged — anything already modified
+  when you arrived is not yours. If the issue's fix genuinely lives in a workflow,
+  command, or script, edit and commit **that file**.
 
   Distinguish the two by intent, not by path: a file your plan names is your work; every
   other dirty `.archon/` file is not. On 2026-08-03 a run blocked outright on this,

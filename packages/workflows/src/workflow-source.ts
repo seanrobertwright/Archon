@@ -36,7 +36,7 @@
  * protection against a user editing their own home directory mid-run, at the cost of
  * copying two more trees per run.
  */
-import { mkdir, readdir, copyFile, rm, rename, stat, lstat } from 'fs/promises';
+import { mkdir, readdir, copyFile, rm, rename, stat, lstat, realpath } from 'fs/promises';
 import { dirname, join, relative, sep } from 'path';
 import { createLogger } from '@archon/paths';
 import * as archonPaths from '@archon/paths';
@@ -111,8 +111,20 @@ function dedupeNestedDirs(dirs: readonly string[]): string[] {
   );
 }
 
-/** Recursively copy `from` into `to`, skipping cache directories. Returns files+bytes copied. */
-async function copyTree(from: string, to: string): Promise<{ files: number; bytes: number }> {
+/**
+ * Recursively copy `from` into `to`, skipping cache directories. Returns files+bytes copied.
+ *
+ * `ancestors` holds the canonical (symlink-resolved) path of every directory currently open
+ * above this one. Because directory symlinks are followed rather than preserved, a link
+ * pointing at one of its own ancestors would otherwise re-enter the same tree: the walk only
+ * stops when the kernel refuses the path with ELOOP, by which point the same files have been
+ * copied a dozen-plus times. Comparing canonical paths cuts the cycle at the first repeat.
+ */
+async function copyTree(
+  from: string,
+  to: string,
+  ancestors: ReadonlySet<string> = new Set()
+): Promise<{ files: number; bytes: number }> {
   let files = 0;
   let bytes = 0;
 
@@ -138,7 +150,20 @@ async function copyTree(from: string, to: string): Promise<{ files: number; byte
 
     if (info.isDirectory()) {
       if (SKIP_DIRECTORIES.has(entry.name)) continue;
-      const sub = await copyTree(src, dest);
+      let canonical: string;
+      try {
+        canonical = await realpath(src);
+      } catch (error) {
+        getLog().warn({ err: error as Error, path: src }, 'workflow.source_capture_entry_skipped');
+        continue;
+      }
+      if (ancestors.has(canonical)) {
+        // A link back into a directory we are already inside. Copying it would duplicate
+        // that subtree under itself, so record it and move on.
+        getLog().warn({ path: src, canonical }, 'workflow.source_capture_cycle_skipped');
+        continue;
+      }
+      const sub = await copyTree(src, dest, new Set([...ancestors, canonical]));
       files += sub.files;
       bytes += sub.bytes;
       continue;
@@ -199,7 +224,11 @@ export async function captureWorkflowSource(opts: {
     for (const dir of present) {
       const target = join(staging, dir);
       await mkdir(dirname(target), { recursive: true });
-      const copied = await copyTree(join(sourceRoot, dir), target);
+      const origin = join(sourceRoot, dir);
+      // Seed the cycle guard with this root's canonical path so a link straight back to
+      // the top of the tree is caught at depth one.
+      const rootCanonical = await realpath(origin).catch(() => origin);
+      const copied = await copyTree(origin, target, new Set([rootCanonical]));
       fileCount += copied.files;
       byteCount += copied.bytes;
     }

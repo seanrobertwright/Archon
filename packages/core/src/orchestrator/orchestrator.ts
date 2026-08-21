@@ -49,6 +49,7 @@ import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import { assertComposedGateDriveable } from '@archon/workflows/utils/workflow-requirements';
 import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
@@ -439,6 +440,13 @@ export async function dispatchBackgroundWorkflow(
     unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformId, ctx.conversationId);
   }
 
+  // Authoring root for this run's workflow source. `workerCwd` is frequently a worktree,
+  // whose `.archon` belongs to whatever branch it is on rather than to the author; the
+  // canonical repo is what the run should capture. Resolved here rather than inherited,
+  // because this background path calls `executeWorkflow` directly and would otherwise
+  // capture the worktree — the one surface that would silently keep the old behavior.
+  const workflowSourceRoot = await resolveWorkflowSourceRoot(workerCwd);
+
   // 7. Pre-create workflow run row so the UI can fetch it immediately.
   // Without this, navigating to the execution page before executeWorkflow's
   // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
@@ -492,6 +500,7 @@ export async function dispatchBackgroundWorkflow(
             parseWarnings: ctx.parseWarnings,
             baseBranch: codebaseBaseBranch,
             resolveChildIsolation,
+            workflowSourceRoot,
             // Only consumed when `preCreatedRun` is undefined (pre-creation failed and
             // the executor creates the row itself); otherwise the row above already
             // carries them.

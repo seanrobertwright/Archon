@@ -162,6 +162,26 @@ describe('captureWorkflowSource', () => {
     );
   });
 
+  test('cuts a directory symlink that points back into its own tree', async () => {
+    // Directory symlinks are FOLLOWED (that is what dereferencing means), so a link to an
+    // ancestor re-enters the tree. Without a cycle guard the walk only stops when the
+    // kernel refuses the path with ELOOP, having copied the same files at every level.
+    await writeFile(join(source, '.archon', 'scripts', 'only.ts'), 'export const a = 1;');
+    await mkdir(join(source, '.archon', 'scripts', 'sub'), { recursive: true });
+    await symlink(
+      join(source, '.archon', 'scripts'),
+      join(source, '.archon', 'scripts', 'sub', 'loop')
+    );
+
+    const capture = await captureWorkflowSource({
+      sourceRoot: source,
+      captureRoot: getRunSourceCapturePath(runArtifacts),
+    });
+
+    // Exactly one copy of the one real file — not one per level of re-entry.
+    expect(capture?.fileCount).toBe(1);
+  });
+
   test('returns null when there is no executable source to freeze', async () => {
     const empty = join(root, 'empty');
     await mkdir(empty, { recursive: true });
@@ -258,8 +278,11 @@ describe('resolving against a capture instead of the target', () => {
     const script = (await discoverScriptsForCwd(target, capture!.captureRoot)).get('check');
     expect(script?.runtime).toBe('bun');
     // The script runs from the capture while the process still works in the target.
-    expect(script?.path.startsWith(capture!.captureRoot)).toBe(true);
-    expect(script?.path.startsWith(target)).toBe(false);
+    // `discoverScripts` returns POSIX-separated paths on every platform (normalizeSep),
+    // so compare in that form rather than against a raw `join()` result.
+    const posix = (p: string) => p.replaceAll('\\', '/');
+    expect(script?.path.startsWith(posix(capture!.captureRoot))).toBe(true);
+    expect(script?.path.startsWith(posix(target))).toBe(false);
   });
 
   test('the target cannot shadow a command the run captured', async () => {
@@ -326,6 +349,21 @@ describe("a run's own source versus a child's discovery root", () => {
   test('a run with no recorded source resolves live', async () => {
     expect(await resolveRunSourceRoot({})).toBeUndefined();
     expect(await resolveChildDiscoveryRoot(undefined)).toBeUndefined();
+  });
+
+  test('a relative recorded path reads as absent instead of resolving against process.cwd', async () => {
+    const relative = {
+      [WORKFLOW_SOURCE_METADATA_KEY]: {
+        version: 1,
+        root: 'artifacts/runs/x/workflow-source',
+        origin: 'some/where',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        file_count: 1,
+        byte_count: 1,
+      },
+    };
+    expect(await resolveRunSourceRoot(relative)).toBeUndefined();
+    expect(await resolveChildDiscoveryRoot(relative)).toBeUndefined();
   });
 
   test('an unrecognized record version reads as absent rather than failing a resume', async () => {

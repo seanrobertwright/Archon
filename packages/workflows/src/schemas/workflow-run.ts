@@ -3,6 +3,7 @@
  */
 import { z } from '@hono/zod-openapi';
 import type { TokenUsage } from '@archon/providers/types';
+import { isAbsolute } from 'path';
 
 // ---------------------------------------------------------------------------
 // WorkflowRunStatus
@@ -234,10 +235,18 @@ export const WORKFLOW_SOURCE_METADATA_KEY = 'workflow_source';
  */
 export const workflowSourceMetadataSchema = z.object({
   version: z.literal(1),
-  /** Absolute path to the captured source; usable directly as a project root. */
-  root: z.string(),
+  /**
+   * Absolute path to the captured source; usable directly as a project root.
+   *
+   * Absoluteness is enforced rather than assumed: every root reaching here is built from
+   * the run's own artifacts path, so a relative or blank one means the record is corrupt
+   * or foreign. Resolving it against whatever `process.cwd()` happens to be would send
+   * every command and script lookup somewhere arbitrary, so it reads as absent instead
+   * and the run falls back to live source with a warning.
+   */
+  root: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
   /** The authoring directory it was captured from (provenance; never read for lookup). */
-  origin: z.string(),
+  origin: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
   captured_at: z.string(),
   file_count: z.number(),
   byte_count: z.number(),
