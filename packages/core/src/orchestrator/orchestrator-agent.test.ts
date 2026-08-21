@@ -374,6 +374,9 @@ function makeCodebase(name: string, id = `id-${name}`): Codebase {
 // here reject one literal path — that is luck, not a guarantee, and it stops
 // being true the moment a test rejects something broader. Reset before every
 // test so no describe can poison another.
+//
+// Deliberately no count here: any number rots on the next test added, and the
+// mechanism is the argument.
 beforeEach(() => {
   mockExistsSync.mockImplementation(() => true);
 });
@@ -1579,6 +1582,210 @@ describe('provider cwd resolution', () => {
     // so a stale override must not block the turn.
     expect(mockEnsureArchonWorkspacesPath).toHaveBeenCalled();
     expect(mockSendQuery).toHaveBeenCalled();
+  });
+
+  // ─── missing project directory (#2663) ──────────────────────────────────────
+
+  describe('missing project directory', () => {
+    test('refuses the turn and never reaches the provider when default_cwd is gone', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      // Handing a missing path to the provider is the whole defect: the spawn
+      // fails ENOENT against the BINARY, so the user is told the wrong thing.
+      expect(mockSendQuery).not.toHaveBeenCalled();
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      expect(sent).toContain('/repos/test-repo');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ codebaseId: 'codebase-1', cwd: '/repos/test-repo' }),
+        'orchestrator.codebase_cwd_missing'
+      );
+    });
+
+    test('offers recovery that actually works, and not the traps', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      // /update-project validates the new path and repairs the registration.
+      expect(sent).toContain('/update-project');
+      expect(sent).toContain('/setproject');
+      // /worktree remove answers "not using a worktree" when isolation_env_id is
+      // null, and otherwise repoints cwd at this same missing directory.
+      expect(sent).not.toContain('/worktree remove');
+      // /register-project creates a new registration rather than repairing this one.
+      expect(sent).not.toContain('/register-project');
+    });
+
+    test('quotes a project name containing whitespace so the suggestion parses', async () => {
+      const codebase = { ...makeCodebaseForSync(), name: 'Client Ops' };
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      // handleUpdateProject takes only the FIRST token as the project name, so an
+      // unquoted `Client Ops` parses as `Client` and hands the user a second, more
+      // confusing error instead of a repair. Verified against the real parser:
+      // `/update-project Client Ops <path>` -> name "Client", path "Ops <path>";
+      // the quoted form -> name "Client Ops", path "<path>".
+      expect(sent).toContain('/update-project "Client Ops" <new-path>');
+      expect(sent).not.toContain('/update-project Client Ops');
+    });
+
+    test('escapes quotes and backslashes in the project name', async () => {
+      // Quoting alone is not enough: a `"` inside the name closes the quoted token
+      // early and reproduces the original defect, and a trailing `\` escapes the
+      // closing quote. parseCommand honours backslash escapes inside quotes, so a
+      // single pass over both characters round-trips. One pass, not two chained
+      // replaces — escaping `"` first and `\` second would double-escape the
+      // backslashes the first pass just added.
+      const codebase = { ...makeCodebaseForSync(), name: 'Bob"s \\Ops' };
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      expect(sent).toContain('/update-project "Bob\\"s \\\\Ops" <new-path>');
+    });
+
+    test('writes no user row when it refuses, so none is left unpaired', async () => {
+      mockAddMessage.mockClear();
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      // Non-web only: the web adapter's route persists its own turns, so the
+      // orchestrator never writes a user row for it and this could not regress.
+      const platform = makePlatform();
+      platform.getPlatformType = mock(() => 'telegram') as typeof platform.getPlatformType;
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      expect(mockSendQuery).not.toHaveBeenCalled();
+      expect(mockAddMessage.mock.calls.filter(c => c[1] === 'user')).toHaveLength(0);
+    });
+
+    test('a stale cwd override gets the conversation-cwd message, not this one', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({
+        codebase_id: 'codebase-1',
+        cwd: '/worktrees/removed',
+      });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/removed');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      // Pins WHICH refusal the user gets, which is the part still observable here.
+      //
+      // Be clear about what this does not do: it cannot catch widening this guard's
+      // condition to `conversation.cwd ?? default_cwd`. The conversation-cwd guard
+      // above returns first for every `cwd !== null` case, so a widened condition
+      // is dead code, and the mutation passes the whole suite. That is a property
+      // of the ordering, not a gap worth papering over with a weaker assertion —
+      // the note on the guard itself carries the reason to keep it narrow.
+      //
+      // What this DOES catch is the two guards' messages crossing: this guard
+      // claiming the override case and answering with project-root advice that says
+      // nothing about `isolation_env_id`.
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      expect(sent).toContain('/worktrees/removed');
+      expect(sent).toContain('working directory no longer exists');
+      // This guard's own message signature — nothing else emits that sentence, so
+      // it cannot false-alarm. Deliberately NOT also asserting the absence of
+      // `/update-project`: the guard above offers `/worktree remove` and
+      // `/setproject` and never that, so the two strings always co-occur and it
+      // would add no detection — while breaking this test if anyone ever adds
+      // `/update-project` to that message, an edit that has nothing to do with
+      // this guard.
+      expect(sent).not.toContain('project directory no longer exists');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.anything(),
+        'orchestrator.conversation_cwd_missing'
+      );
+    });
+
+    test('runs the turn when the cwd override is healthy but default_cwd is gone', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({
+        codebase_id: 'codebase-1',
+        cwd: '/worktrees/healthy',
+      });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      // The project root is gone, but this conversation does not use it.
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      // This is the case that makes `&& conversation.cwd === null` load-bearing
+      // rather than decorative. Drop that clause while leaving the target as
+      // `default_cwd` and this guard refuses a perfectly healthy turn, telling the
+      // user their project directory is gone and offering to repoint a directory
+      // the turn never touches. Nothing else in the suite catches that mutation.
+      expect(getSendQueryCwd()).toBe('/worktrees/healthy');
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'orchestrator.codebase_cwd_missing'
+      );
+    });
+
+    test('does not fire when the project directory is present', async () => {
+      const codebase = makeCodebaseForSync();
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      expect(getSendQueryCwd()).toBe('/repos/test-repo');
+    });
+
+    test('leaves the unscoped path alone — the workspaces root is created on demand', async () => {
+      const conversation = makeConversation({ codebase_id: null });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([]));
+      mockExistsSync.mockImplementation(() => false);
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      expect(getSendQueryCwd()).toBe('/home/test/.archon/workspaces');
+    });
   });
 
   test('unscoped chat uses ensureArchonWorkspacesPath result', async () => {
