@@ -57,7 +57,10 @@ import { dagNodeSchema } from '../packages/workflows/src/schemas';
 import { validateStructural } from '../packages/web/src/experiments/console/builder/validation/structural';
 
 const REPO_ROOT = join(import.meta.dir, '..');
-const ENGINE_LOADER = join(REPO_ROOT, 'packages', 'workflows', 'src', 'loader.ts');
+// OUTPUT_REF_SOURCE moved from loader.ts to output-ref.ts (#2637) so the loader
+// scan, the schema's binding-directive validation, and runtime whole-ref
+// resolution share one grammar — the parity target moved with it.
+const ENGINE_OUTPUT_REF = join(REPO_ROOT, 'packages', 'workflows', 'src', 'output-ref.ts');
 const WEB_NODE_REF = join(REPO_ROOT, 'packages', 'web', 'src', 'lib', 'node-ref.ts');
 
 function missing(name: string, file: string): Error {
@@ -127,7 +130,7 @@ function resolveInterpolations(pattern: string, parts: Record<string, string>): 
 describe('node-ref parity: @archon/web mirrors the engine', () => {
   test('the web OUTPUT_REF_SOURCE is byte-identical to the engine definition', () => {
     // The web copy interpolates NODE_ID_SOURCE, so compare the resolved value.
-    const engine = rawConstant(ENGINE_LOADER, 'OUTPUT_REF_SOURCE');
+    const engine = rawConstant(ENGINE_OUTPUT_REF, 'OUTPUT_REF_SOURCE');
     const nodeId = rawConstant(WEB_NODE_REF, 'NODE_ID_SOURCE');
     const web = resolveInterpolations(rawConstant(WEB_NODE_REF, 'OUTPUT_REF_SOURCE'), {
       NODE_ID_SOURCE: nodeId,

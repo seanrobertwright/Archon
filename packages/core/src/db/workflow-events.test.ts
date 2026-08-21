@@ -220,8 +220,8 @@ describe('workflow-events', () => {
 
       expect(result.completedNodeOutputs).toEqual(
         new Map([
-          ['node-a', 'output A'],
-          ['node-b', 'output B'],
+          ['node-a', { output: 'output A' }],
+          ['node-b', { output: 'output B' }],
         ])
       );
       expect(result.tokens).toEqual({
@@ -233,6 +233,51 @@ describe('workflow-events', () => {
       expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('node_completed'), [
         'run-123',
       ]);
+    });
+
+    test('carries structured_output back out; rows without it stay text-only (#2637)', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'typed',
+            event_type: 'node_completed',
+            data: { node_output: '{"green":true}', structured_output: { green: true } },
+          },
+          {
+            step_name: 'legacy',
+            event_type: 'node_completed',
+            data: { node_output: 'plain text' },
+          },
+          {
+            // A resume re-emit copies the value forward, so a SECOND resume sees it.
+            step_name: 'replayed',
+            event_type: 'node_skipped_prior_success',
+            data: { node_output: '{"n":1}', structured_output: { n: 1 } },
+          },
+          {
+            // `false` is a legitimate value — presence-keyed, never truthiness.
+            step_name: 'falsy',
+            event_type: 'node_completed',
+            data: { node_output: 'false', structured_output: false },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-structured');
+
+      expect(result.completedNodeOutputs.get('typed')).toEqual({
+        output: '{"green":true}',
+        structuredOutput: { green: true },
+      });
+      expect(result.completedNodeOutputs.get('legacy')).toEqual({ output: 'plain text' });
+      expect(result.completedNodeOutputs.get('replayed')).toEqual({
+        output: '{"n":1}',
+        structuredOutput: { n: 1 },
+      });
+      expect(result.completedNodeOutputs.get('falsy')).toEqual({
+        output: 'false',
+        structuredOutput: false,
+      });
     });
 
     test('reports cache from a mixed run as a floor instead of withholding it', async () => {
@@ -341,7 +386,7 @@ describe('workflow-events', () => {
 
       const result = await getDagResumeSnapshot('run-failed-usage');
 
-      expect(result.completedNodeOutputs).toEqual(new Map([['done', 'kept']]));
+      expect(result.completedNodeOutputs).toEqual(new Map([['done', { output: 'kept' }]]));
       expect(result.costUsd).toBeCloseTo(0.03, 10);
       // The failed row reports no cache, so the completed row's cache survives as a floor.
       expect(result.tokens).toEqual({
@@ -411,8 +456,8 @@ describe('workflow-events', () => {
       const result = await getDagResumeSnapshot('run-resume');
 
       expect(result.completedNodeOutputs.size).toBe(2);
-      expect(result.completedNodeOutputs.get('node-a')).toBe('output A');
-      expect(result.completedNodeOutputs.get('node-b')).toBe('output B');
+      expect(result.completedNodeOutputs.get('node-a')).toEqual({ output: 'output A' });
+      expect(result.completedNodeOutputs.get('node-b')).toEqual({ output: 'output B' });
       expect(result.tokens).toEqual({ input: 40, output: 4 });
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining('node_skipped_prior_success'),
@@ -439,8 +484,8 @@ describe('workflow-events', () => {
       const result = await getDagResumeSnapshot('run-all-skipped');
 
       expect(result.completedNodeOutputs.size).toBe(2);
-      expect(result.completedNodeOutputs.get('node-x')).toBe('skipped output X');
-      expect(result.completedNodeOutputs.get('node-y')).toBe('skipped output Y');
+      expect(result.completedNodeOutputs.get('node-x')).toEqual({ output: 'skipped output X' });
+      expect(result.completedNodeOutputs.get('node-y')).toEqual({ output: 'skipped output Y' });
       expect(result.tokens).toBeUndefined();
     });
 
@@ -460,7 +505,7 @@ describe('workflow-events', () => {
 
       const result = await getDagResumeSnapshot('run-456');
 
-      expect(result.completedNodeOutputs.get('node-a')).toBe('parsed output');
+      expect(result.completedNodeOutputs.get('node-a')).toEqual({ output: 'parsed output' });
       expect(result.tokens).toEqual({ input: 8, output: 2 });
     });
 
@@ -482,7 +527,7 @@ describe('workflow-events', () => {
 
       const result = await getDagResumeSnapshot('run-789');
 
-      expect(result.completedNodeOutputs).toEqual(new Map([['node-a', 'kept']]));
+      expect(result.completedNodeOutputs).toEqual(new Map([['node-a', { output: 'kept' }]]));
       expect(result.tokens).toEqual({ input: 1, output: 2 });
     });
 
@@ -516,8 +561,8 @@ describe('workflow-events', () => {
 
       expect(result.completedNodeOutputs).toEqual(
         new Map([
-          ['node-c', 'valid'],
-          ['node-d', 'also valid'],
+          ['node-c', { output: 'valid' }],
+          ['node-d', { output: 'also valid' }],
         ])
       );
       expect(result.tokens).toEqual({ input: 10, output: 1 });
@@ -537,7 +582,9 @@ describe('workflow-events', () => {
 
       const result = await getDagResumeSnapshot('run-without-tokens');
 
-      expect(result.completedNodeOutputs).toEqual(new Map([['node-a', 'output without usage']]));
+      expect(result.completedNodeOutputs).toEqual(
+        new Map([['node-a', { output: 'output without usage' }]])
+      );
       expect(result.tokens).toBeUndefined();
       expect(mockLogger.warn).not.toHaveBeenCalled();
     });
@@ -562,8 +609,8 @@ describe('workflow-events', () => {
       const result = await getDagResumeSnapshot('run-corrupt');
 
       expect(result.completedNodeOutputs.size).toBe(2);
-      expect(result.completedNodeOutputs.get('node-a')).toBe('good first');
-      expect(result.completedNodeOutputs.get('node-c')).toBe('good last');
+      expect(result.completedNodeOutputs.get('node-a')).toEqual({ output: 'good first' });
+      expect(result.completedNodeOutputs.get('node-c')).toEqual({ output: 'good last' });
       expect(result.tokens).toEqual({ input: 10, output: 3 });
     });
 
@@ -688,8 +735,8 @@ describe('workflow-events', () => {
       expect(result.tokens).toEqual({ input: 10, output: 1 });
       // The roll-up still marks the group node completed, so resume skips it rather
       // than re-running the whole group.
-      expect(result.completedNodeOutputs.get('group')).toBe('last iteration');
-      expect(result.completedNodeOutputs.get('group.body')).toBe('iteration 1');
+      expect(result.completedNodeOutputs.get('group')).toEqual({ output: 'last iteration' });
+      expect(result.completedNodeOutputs.get('group.body')).toEqual({ output: 'iteration 1' });
     });
 
     test('returns an empty snapshot when no events exist', async () => {

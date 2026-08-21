@@ -14,7 +14,7 @@ import {
 } from './dag-executor';
 import { evaluateCondition } from './condition-evaluator';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
-import { declaredFieldsFromSchema } from './output-ref';
+import { declaredFieldsFromSchema, canonicalValueText, type JsonValue } from './output-ref';
 import { discoverScriptsForCwd } from './script-discovery';
 import {
   describeUnmetCompletion,
@@ -406,8 +406,9 @@ interface DryRunContext {
    * The run's EFFECTIVE `$INPUTS` map — declared defaults layered under caller-supplied
    * values, the same merge a real run performs at executor.ts (`defaultRunInputs`).
    * Undefined when the workflow declares no inputs and the caller supplied none.
+   * Values are logical JSON values (#2637 — a typed declared default stays typed).
    */
-  inputs?: Record<string, string>;
+  inputs?: Record<string, JsonValue>;
   /**
    * Per-simulation `$ARTIFACTS_DIR` / `$STATE_DIR`, under a uniquely named root in
    * `<archonHome>/temp/` — NEVER inside the simulated repository, which holds source
@@ -591,7 +592,7 @@ async function executeCodeNode(
     // real-run-only channel the dry run does not deliver.
     const inputEnv: Record<string, string> = {};
     for (const [name, value] of Object.entries(ctx.inputs ?? {})) {
-      inputEnv[inputEnvKey(name)] = value;
+      inputEnv[inputEnvKey(name)] = canonicalValueText(value);
     }
     // The executor pre-creates the artifacts dir it advertises; the simulator honors
     // the same contract (#2617). Idempotent, and only reached when code executes, so

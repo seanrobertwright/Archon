@@ -112,7 +112,7 @@ function createMockStore(): IWorkflowStore {
     createWorkflowEvent: mock(() => Promise.resolve()),
     getDagResumeSnapshot: mock(() =>
       Promise.resolve({
-        completedNodeOutputs: new Map<string, string>(),
+        completedNodeOutputs: new Map<string, { output: string }>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })

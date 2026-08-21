@@ -33,7 +33,13 @@
  */
 import type { NodeOutput } from './schemas';
 import { createLogger } from '@archon/paths';
-import { resolveNodeOutputField, OutputRefError, similarNodeIds } from './output-ref';
+import {
+  resolveNodeOutputField,
+  OutputRefError,
+  similarNodeIds,
+  canonicalValueText,
+  type JsonValue,
+} from './output-ref';
 import { parseWhenAtom, splitOutsideQuotes, type WhenAtomRef } from './when-atom';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -86,14 +92,12 @@ function resolveOutputRef(
 
   const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
   if (resolution.kind === 'empty') return '';
-  const value = resolution.value;
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  // Arrays, objects, AND null are JSON-stringified here (typeof null === 'object').
-  // A present null on the lenient no-schema path stringifies to "null", matching
-  // legacy structuredOutput-preference behavior — it is NOT mapped to empty.
-  if (Array.isArray(value) || typeof value === 'object') return JSON.stringify(value);
-  return ''; // defensive: JSON.parse can't yield undefined/symbol/bigint
+  // The one deterministic value→text rule (#2637): strings raw, everything else
+  // canonical JSON text. Numbers/booleans compare as their digits/true/false; a
+  // present null on the lenient no-schema path stringifies to "null" (NOT empty),
+  // matching legacy structuredOutput-preference behavior. The helper's defensive
+  // '' covers what JSON.parse can't yield (undefined/symbol/bigint).
+  return canonicalValueText(resolution.value);
 }
 
 /**
@@ -136,8 +140,10 @@ export class InputRefError extends Error {
  * `--input`), reach the child as `metadata.inputs`, and are threaded here by the
  * executor. An undeclared name THROWS — see {@link InputRefError}.
  */
-function resolveInputRef(name: string, inputs: Record<string, string> | undefined): string {
-  if (inputs && Object.hasOwn(inputs, name)) return inputs[name];
+function resolveInputRef(name: string, inputs: Record<string, JsonValue> | undefined): string {
+  // Canonical text (#2637): a typed input compares as its deterministic text —
+  // `$INPUTS.flag == true` matches a boolean `true` via the unquoted-RHS grammar.
+  if (inputs && Object.hasOwn(inputs, name)) return canonicalValueText(inputs[name]);
   throw new InputRefError(name, inputs ? Object.keys(inputs) : []);
 }
 
@@ -145,7 +151,7 @@ function resolveInputRef(name: string, inputs: Record<string, string> | undefine
 function resolveAtomRef(
   ref: WhenAtomRef,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs: Record<string, string> | undefined
+  inputs: Record<string, JsonValue> | undefined
 ): string {
   return ref.kind === 'input'
     ? resolveInputRef(ref.name, inputs)
@@ -158,7 +164,7 @@ function resolveAtomRef(
 function evaluateAtom(
   expr: string,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs: Record<string, string> | undefined
+  inputs: Record<string, JsonValue> | undefined
 ): { result: boolean; parsed: boolean } {
   const atom = parseWhenAtom(expr);
 
@@ -215,7 +221,7 @@ function evaluateAtom(
 export function evaluateCondition(
   expr: string,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs?: Record<string, string>
+  inputs?: Record<string, JsonValue>
 ): { result: boolean; parsed: boolean } {
   const trimmed = expr.trim();
 

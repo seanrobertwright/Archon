@@ -1,4 +1,5 @@
 import type { TriggerRule } from './schemas';
+import type { JsonValue } from './output-ref';
 
 /** Engine-private per-node metadata attached during load-time include expansion.
  * Symbols survive object spreads but stay out of YAML, JSON, API payloads, and
@@ -64,7 +65,7 @@ export type ComposedBlockBoundary = ComposedBlockBoundaryBase &
  */
 export interface ComposedNodeMeta {
   origin: string;
-  inputs?: Record<string, string>;
+  inputs?: Record<string, JsonValue>;
   blockEntry?: true;
   boundaries?: ComposedBlockBoundary[];
 }

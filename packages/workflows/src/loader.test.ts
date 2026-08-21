@@ -6736,3 +6736,195 @@ describe('workflow-level field parity (#2457)', () => {
     });
   }
 });
+
+// ---------------------------------------------------------------------------
+// #2637 — node-local `with:` bindings on command/script nodes, and JSON-valued
+// `with:` maps. Load-time validation: shape, whole-ref grammar, upstream
+// dependency, env-key uniqueness, and the ignored-elsewhere warning.
+// ---------------------------------------------------------------------------
+
+describe('node-local with: bindings (#2637)', () => {
+  it('accepts and round-trips typed values and a binding directive on command and script nodes', () => {
+    const { workflow } = parseWorkflowYaml(`
+name: bind-ok
+description: node-local bindings load and survive the transform
+nodes:
+  - id: producer
+    prompt: emit
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+  - id: consume
+    command: review
+    depends_on: [producer]
+    with:
+      green: $producer.output.green
+      typed: 42
+      guarded:
+        from: $producer.output.green
+        if_skipped: false
+  - id: emit
+    script: console.log("x")
+    runtime: bun
+    depends_on: [producer]
+    with:
+      payload: $producer.output
+`);
+    const consume = workflow.nodes.find(n => n.id === 'consume');
+    expect(consume && 'with' in consume ? consume.with : undefined).toEqual({
+      green: '$producer.output.green',
+      typed: 42,
+      guarded: { from: '$producer.output.green', if_skipped: false },
+    });
+    const emit = workflow.nodes.find(n => n.id === 'emit');
+    expect(emit && 'with' in emit ? emit.with : undefined).toEqual({
+      payload: '$producer.output',
+    });
+  });
+
+  it('accepts typed JSON values on a workflow node with: map (previously a load error)', () => {
+    const { workflow } = parseWorkflowYaml(`
+name: typed-with
+description: pure relaxation — with values are JSON now
+nodes:
+  - id: sub
+    workflow: some-child
+    with:
+      flag: true
+      count: 3
+      tags: [a, b]
+`);
+    const sub = workflow.nodes.find(n => n.id === 'sub');
+    expect(sub && 'with' in sub ? sub.with : undefined).toEqual({
+      flag: true,
+      count: 3,
+      tags: ['a', 'b'],
+    });
+  });
+
+  it('rejects a binding ref to an unknown producer at load time', () => {
+    const result = parseWorkflow(
+      `
+name: bind-unknown
+description: binding names a node that does not exist
+nodes:
+  - id: consume
+    command: review
+    with:
+      v: $ghost.output
+`,
+      'bind-unknown.yaml'
+    );
+    expect(result.error?.error).toContain("references unknown node '$ghost.output'");
+  });
+
+  it('rejects a binding whose producer is not an upstream dependency, naming the fix', () => {
+    const result = parseWorkflow(
+      `
+name: bind-not-upstream
+description: producer exists but there is no depends_on edge
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    with:
+      v: $producer.output
+`,
+      'bind-not-upstream.yaml'
+    );
+    expect(result.error?.error).toContain(
+      "add 'producer' to 'consume'.depends_on so its value is produced first"
+    );
+  });
+
+  it('rejects a directive whose from is not a whole ref, and enforces upstream for directive refs too', () => {
+    const badFrom = parseWorkflow(
+      `
+name: bind-bad-from
+description: from must be exactly one whole ref
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    depends_on: [producer]
+    with:
+      v:
+        from: "prefix $producer.output"
+`,
+      'bind-bad-from.yaml'
+    );
+    expect(badFrom.error?.error).toContain("'from' must be exactly one whole");
+
+    const notUpstream = parseWorkflow(
+      `
+name: bind-directive-race
+description: directive producer without a depends_on edge
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    with:
+      v:
+        from: $producer.output.green
+`,
+      'bind-directive-race.yaml'
+    );
+    expect(notUpstream.error?.error).toContain("add 'producer' to 'consume'.depends_on");
+  });
+
+  it('rejects an object binding value that is not the directive shape, naming both accepted forms', () => {
+    const result = parseWorkflow(
+      `
+name: bind-bad-object
+description: plain object literals are reserved for the directive
+nodes:
+  - id: consume
+    command: review
+    with:
+      v:
+        some: thing
+`,
+      'bind-bad-object.yaml'
+    );
+    expect(result.error?.error).toContain('must be a binding directive');
+    expect(result.error?.error).toContain('literal value');
+  });
+
+  it('rejects two binding names that fold to one INPUTS_<UPPER_SNAKE> env key', () => {
+    const result = parseWorkflow(
+      `
+name: bind-env-collision
+description: foo-bar and foo_bar collide on INPUTS_FOO_BAR
+nodes:
+  - id: emit
+    script: console.log("x")
+    runtime: bun
+    with:
+      foo-bar: a
+      foo_bar: b
+`,
+      'bind-env-collision.yaml'
+    );
+    expect(result.error?.error).toContain("both map to env var 'INPUTS_FOO_BAR'");
+  });
+
+  it('warns (never errors) about with: on a node type that ignores it', () => {
+    const { workflow, warnings } = parseWorkflowYaml(`
+name: with-ignored
+description: with on bash is dropped with a visible warning
+nodes:
+  - id: run
+    bash: echo hi
+    with:
+      v: x
+`);
+    expect(workflow.nodes).toHaveLength(1);
+    expect(
+      warnings.some(w => w.includes("'with' is only supported on command, script, include"))
+    ).toBe(true);
+  });
+});

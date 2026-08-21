@@ -17,10 +17,16 @@ export function commandFromDag(variantSpecific: Partial<WireDagNode>): CommandNo
       "commandFromDag: wire node has no 'command' field — use defaultCommandData() for new nodes"
     );
   }
-  return { command: variantSpecific.command };
+  return {
+    command: variantSpecific.command,
+    // Opaque passthrough (#2637): no editor yet, but a round-trip must not drop it.
+    ...(variantSpecific.with !== undefined
+      ? { with: variantSpecific.with as Record<string, unknown> }
+      : {}),
+  };
 }
 
 /** Serialize `CommandNodeData` to the sparse `{ command: … }` wire fragment. */
 export function commandToDag(data: CommandNodeData): Partial<WireDagNode> {
-  return { command: data.command };
+  return { command: data.command, ...(data.with !== undefined ? { with: data.with } : {}) };
 }

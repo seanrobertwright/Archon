@@ -110,7 +110,7 @@ import {
 } from './compiled-command';
 import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
-import type { IWorkflowStore } from './store';
+import type { IWorkflowStore, PersistedNodeOutput } from './store';
 import {
   buildAiProfile,
   isLiteralSpec,
@@ -178,7 +178,7 @@ function createMockStore(): MockWorkflowStore {
     createWorkflowEvent: mock<IWorkflowStore['createWorkflowEvent']>(async _data => {}),
     getDagResumeSnapshot: mock<IWorkflowStore['getDagResumeSnapshot']>(async _workflowRunId =>
       Promise.resolve({
-        completedNodeOutputs: new Map<string, string>(),
+        completedNodeOutputs: new Map<string, { output: string }>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })
@@ -4905,7 +4905,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
   async function runRawLoopGroupWorkflow(
     field: 'note' | 'status',
     runId: string,
-    priorCompletedNodes?: Map<string, string>
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>
   ): Promise<{
     prompt: string | undefined;
     result: string | undefined;
@@ -4952,7 +4952,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
 
-    const priorCompletedNodes = new Map([['step1', 'prior step1 output']]);
+    const priorCompletedNodes = new Map([['step1', { output: 'prior step1 output' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -4997,7 +4997,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       yield { type: 'result', sessionId: 'session-id' };
     });
 
-    const priorCompletedNodes = new Map([['step1', 'hello from prior run']]);
+    const priorCompletedNodes = new Map([['step1', { output: 'hello from prior run' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -5035,7 +5035,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('resume-run-id');
 
-    const priorCompletedNodes = new Map([['step1', 'prior output']]);
+    const priorCompletedNodes = new Map([['step1', { output: 'prior output' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -5081,8 +5081,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const workflowRun = makeWorkflowRun('resume-empty-output');
 
     // priorCompletedNodes has step1 but with undefined value to test the ?? '' fallback
-    const priorCompletedNodes = new Map<string, string>([
-      ['step1', undefined as unknown as string],
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['step1', { output: undefined as unknown as string }],
     ]);
 
     await executeDagWorkflow(
@@ -5227,12 +5227,12 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           data?: Record<string, unknown>;
         }
     );
-    const priorCompletedNodes = new Map<string, string>();
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>();
     const priorUsage = { tokens: { input: 0, output: 0 }, costUsd: 0 };
     for (const event of firstExecutionEvents) {
       if (event.event_type !== 'node_completed' || !event.step_name) continue;
       if (typeof event.data?.node_output === 'string') {
-        priorCompletedNodes.set(event.step_name, event.data.node_output);
+        priorCompletedNodes.set(event.step_name, { output: event.data.node_output });
       }
       const eventTokens = event.data?.tokens as { input?: unknown; output?: unknown } | undefined;
       if (
@@ -5249,7 +5249,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         priorUsage.costUsd += eventCost;
       }
     }
-    expect(priorCompletedNodes).toEqual(new Map([['step1', 'first execution output']]));
+    expect(priorCompletedNodes).toEqual(new Map([['step1', { output: 'first execution output' }]]));
     // Both axes are reconstructable from the event log — this mirrors what
     // getDagResumeSnapshot does, and cost is now among them (#2469).
     expect(priorUsage).toEqual({ tokens: { input: 40, output: 4 }, costUsd: 0.02 });
@@ -5330,7 +5330,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const resumed = await runRawLoopGroupWorkflow(
       'note',
       'raw-group-present-resumed',
-      new Map([['group', rawOutput]])
+      new Map([['group', { output: rawOutput }]])
     );
 
     expect(fresh.prompt).toBe(`whole=[${rawOutput}]\nfield=[hi]`);
@@ -5354,7 +5354,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const resumed = await runRawLoopGroupWorkflow(
       'status',
       'raw-group-absent-resumed',
-      new Map([['group', rawOutput]])
+      new Map([['group', { output: rawOutput }]])
     );
 
     expect(fresh.prompt).toBeUndefined();
@@ -5431,7 +5431,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       minimalConfig,
       undefined,
       undefined,
-      new Map([['iterate', '{"done":true}']])
+      new Map([['iterate', { output: '{"done":true}' }]])
     );
 
     expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
@@ -5456,7 +5456,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     });
 
     // Prior JSON output omits the declared-optional `note` field.
-    const priorCompletedNodes = new Map([['step1', '{"type":"BUG"}']]);
+    const priorCompletedNodes = new Map([['step1', { output: '{"type":"BUG"}' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -5505,7 +5505,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const workflowRun = makeWorkflowRun('resume-undeclared-key');
 
     // Prior JSON output carries an `extra` key that the schema does NOT declare.
-    const priorCompletedNodes = new Map([['step1', '{"type":"BUG","extra":"x"}']]);
+    const priorCompletedNodes = new Map([['step1', { output: '{"type":"BUG","extra":"x"}' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -10749,7 +10749,7 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
 
-    const priorCompletedNodes = new Map([['producer', 'cached stale output']]);
+    const priorCompletedNodes = new Map([['producer', { output: 'cached stale output' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -10808,8 +10808,8 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
     const workflowRun = makeWorkflowRun();
 
     const priorCompletedNodes = new Map([
-      ['producer', 'cached stale output'],
-      ['cached', 'cached output'],
+      ['producer', { output: 'cached stale output' }],
+      ['cached', { output: 'cached output' }],
     ]);
 
     await executeDagWorkflow(
@@ -10869,7 +10869,7 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
       yield { type: 'result', sessionId: 'session-id' };
     });
 
-    const priorCompletedNodes = new Map([['producer', 'STALE_CACHED_VALUE']]);
+    const priorCompletedNodes = new Map([['producer', { output: 'STALE_CACHED_VALUE' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -15247,7 +15247,7 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
     options: {
       workflowRun?: WorkflowRun;
       declared?: boolean;
-      priorCompletedNodes?: Map<string, string>;
+      priorCompletedNodes?: Map<string, PersistedNodeOutput>;
     } = {}
   ): Promise<void> => {
     await executeDagWorkflow(
@@ -15409,7 +15409,7 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
     const store = createMockStore();
 
     await run(store, [resultNode()], {
-      priorCompletedNodes: new Map([['result', JSON.stringify({ green: true })]]),
+      priorCompletedNodes: new Map([['result', { output: JSON.stringify({ green: true }) }]]),
     });
 
     expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
@@ -15421,7 +15421,7 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
 
     await run(store, [resultNode()], {
       workflowRun: makeWorkflowRun('resume-existing-outcome', { outcome: 'succeeded' }),
-      priorCompletedNodes: new Map([['result', JSON.stringify({ green: true })]]),
+      priorCompletedNodes: new Map([['result', { output: JSON.stringify({ green: true }) }]]),
     });
 
     expect(authoredOutcomeWrites(store)).toEqual([]);
@@ -15433,7 +15433,7 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
 
     await run(store, [resultNode(true)], {
       workflowRun: makeWorkflowRun('resume-reworked-outcome', { outcome: 'succeeded' }),
-      priorCompletedNodes: new Map([['result', JSON.stringify({ green: true })]]),
+      priorCompletedNodes: new Map([['result', { output: JSON.stringify({ green: true }) }]]),
     });
 
     expect(authoredOutcomeWrites(store)).toEqual(['failed']);
@@ -15661,7 +15661,7 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
     store: IWorkflowStore;
     platform: IWorkflowPlatform;
     evidencePolicy?: { required: boolean };
-    priorCompletedNodes?: Map<string, string>;
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>;
   }): Promise<void> {
     const mockDeps = createMockDeps(opts.store);
     const workflowRun = makeWorkflowRun('dag-evidence-run');
@@ -15818,7 +15818,7 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
       store: mockStore,
       platform,
       evidencePolicy: { required: true },
-      priorCompletedNodes: new Map([['work', 'done']]),
+      priorCompletedNodes: new Map([['work', { output: 'done' }]]),
     });
 
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
@@ -15833,7 +15833,7 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
       store: mockStore,
       platform,
       evidencePolicy: { required: true },
-      priorCompletedNodes: new Map([['work', 'done']]),
+      priorCompletedNodes: new Map([['work', { output: 'done' }]]),
     });
 
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
@@ -20476,9 +20476,9 @@ describe('executeDagWorkflow -- loop_group body step_name namespacing (#2090)', 
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('lg-resume');
 
-    const priorCompletedNodes = new Map<string, string>([
-      ['fixer', 'group output from prior run'],
-      ['fixer.work', 'body output from prior run'],
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['fixer', { output: 'group output from prior run' }],
+      ['fixer.work', { output: 'body output from prior run' }],
     ]);
 
     const nodes: DagNode[] = [
@@ -20563,7 +20563,7 @@ describe('executeDagWorkflow -- addressable session resume', () => {
   async function runAddressableWorkflow(
     nodes: DagNode[],
     store = createMockStore(),
-    priorCompletedNodes?: Map<string, string>,
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>,
     priorNodeSessions?: readonly WorkflowRunNodeSession[]
   ): Promise<MockWorkflowStore> {
     await executeDagWorkflow(
@@ -20815,7 +20815,7 @@ describe('executeDagWorkflow -- addressable session resume', () => {
         },
       ],
       createMockStore(),
-      new Map([['source', 'prior output']]),
+      new Map([['source', { output: 'prior output' }]]),
       [
         {
           workflow_run_id: 'addressable-run',
@@ -20954,7 +20954,7 @@ describe('executeDagWorkflow -- addressable session resume', () => {
       yield { type: 'assistant', content: 'must not run' };
       yield { type: 'result', sessionId: 'unexpected' };
     });
-    const priorCompleted = new Map([['source', 'prior output']]);
+    const priorCompleted = new Map([['source', { output: 'prior output' }]]);
     const priorSession = {
       workflow_run_id: 'addressable-run',
       node_id: 'source',
@@ -21694,7 +21694,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
   async function executeExpanded(
     nodes: DagNode[],
     runId: string,
-    priorCompletedNodes?: Map<string, string>
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>
   ): Promise<{
     events: Array<{ event_type: string; step_name: string }>;
     output: string | undefined;
@@ -21839,12 +21839,12 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
   });
 
   it('resume discards cached block output when its include gate becomes inactive', async () => {
-    const priorCompletedNodes = new Map<string, string>([
-      ['gate', 'run'],
-      ['review__entry', 'started'],
-      ['review__required', 'report'],
-      ['review__synthesize', 'old-sink'],
-      ['consumer', 'old-consumer'],
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['gate', { output: 'run' }],
+      ['review__entry', { output: 'started' }],
+      ['review__required', { output: 'report' }],
+      ['review__synthesize', { output: 'old-sink' }],
+      ['consumer', { output: 'old-consumer' }],
     ]);
     const { events } = await executeExpanded(
       expandedGatedParentNodes('false-condition', true),
@@ -21876,11 +21876,11 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
   });
 
   it("resume evaluates each cached block entry with that entry's trigger rule", async () => {
-    const priorCompletedNodes = new Map<string, string>([
-      ['up__start', 'start'],
-      ['up__good', 'good'],
-      ['down__strict', 'old-strict'],
-      ['down__lenient', 'old-lenient'],
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['up__start', { output: 'start' }],
+      ['up__good', { output: 'good' }],
+      ['down__strict', { output: 'old-strict' }],
+      ['down__lenient', { output: 'old-lenient' }],
     ]);
     const { events } = await executeExpanded(
       expandedMixedEntryTriggerNodes(),
@@ -21943,7 +21943,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     const workflowRun = makeWorkflowRun('inc-resume-id', { workflow_name: 'inc-parent' });
 
     // Prior run completed the namespaced entry node inc__a.
-    const prior = new Map<string, string>([['inc__a', 'AAA']]);
+    const prior = new Map([['inc__a', { output: 'AAA' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -21982,7 +21982,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('inc-always-id', { workflow_name: 'inc-parent' });
 
-    const prior = new Map<string, string>([['inc__a', 'AAA']]);
+    const prior = new Map([['inc__a', { output: 'AAA' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -22055,7 +22055,7 @@ describe('executeDagWorkflow -- unexpanded include node fail-fast guard', () => 
     // A raw include node reaching the executor with a resume entry for its own id: the
     // guard must fire BEFORE the resume-skip check, so it fails instead of being skipped.
     const includeNode = dagNodeSchema.parse({ id: 'inc', include: 'some-block' });
-    const prior = new Map<string, string>([['inc', 'stale prior output']]);
+    const prior = new Map([['inc', { output: 'stale prior output' }]]);
 
     await executeDagWorkflow(
       mockDeps,
@@ -22411,7 +22411,7 @@ describe('executeDagWorkflow -- container write-back gate', () => {
       minimalConfig,
       undefined,
       undefined,
-      new Map([['a', 'out']]), // pre-completed → node skipped, DAG reaches the gate
+      new Map([['a', { output: 'out' }]]), // pre-completed → node skipped, DAG reaches the gate
       undefined,
       undefined,
       undefined,
@@ -22559,7 +22559,7 @@ describe('executeDagWorkflow -- container write-back gate', () => {
         minimalConfig,
         undefined,
         undefined,
-        new Map([['a', 'out']]),
+        new Map([['a', { output: 'out' }]]),
         undefined,
         undefined,
         undefined,
@@ -22625,7 +22625,7 @@ describe('executeDagWorkflow -- container write-back gate', () => {
       minimalConfig,
       undefined,
       undefined,
-      new Map([['a', 'out']]),
+      new Map([['a', { output: 'out' }]]),
       undefined,
       undefined,
       undefined,
@@ -23729,7 +23729,7 @@ describe('executeDagWorkflow -- composition governance survives the collapse', (
     expect(errors).toEqual([]);
 
     // Written by a build that predates this change: bare namespaced ids, no payload.
-    const prior = new Map<string, string>([['inc__first', 'FIRST OUTPUT']]);
+    const prior = new Map([['inc__first', { output: 'FIRST OUTPUT' }]]);
 
     const store = createMockStore();
     const seen: string[] = [];
@@ -24358,5 +24358,549 @@ describe('TokenUsage axis seam guard', () => {
       WHOLE_OBJECT_AXIS_KEYS,
       nodeCompletedTokens(resumingDeps.store, 'refine') as Record<string, unknown>
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2637 — workflow values survive every boundary; resource-backed nodes bind
+// them by name. AC1 (persistence round-trip), AC4 (node-local bindings),
+// AC5 (skipped-branch reads).
+// ---------------------------------------------------------------------------
+
+describe('value transport (#2637): persistence, resume, and node-local bindings', () => {
+  let testDir: string;
+
+  type PersistedEvent = {
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  };
+
+  const PRODUCER_PAYLOAD = { green: true, items: ['a', 'b'], count: 2 };
+  const PRODUCER_SCHEMA = {
+    type: 'object',
+    properties: {
+      green: { type: 'boolean' },
+      items: { type: 'array' },
+      count: { type: 'number' },
+    },
+    required: ['green', 'items', 'count'],
+  };
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-value-transport-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    await rm(testDir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  /** Provider mock: the producer prompt returns the structured payload; every other
+   *  prompt is captured so consumer-side delivery is observable. */
+  function mockStructuredProducer(capture: (prompt: string) => void): void {
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      if (prompt.includes('PRODUCE')) {
+        yield { type: 'assistant', content: JSON.stringify(PRODUCER_PAYLOAD) };
+        yield { type: 'result', sessionId: 'sid-prod', structuredOutput: PRODUCER_PAYLOAD };
+        return;
+      }
+      capture(prompt);
+      yield { type: 'assistant', content: 'consumer done' };
+      yield { type: 'result', sessionId: 'sid-cons' };
+    });
+  }
+
+  async function runDag(
+    workflow: WorkflowDefinition,
+    runId: string,
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>,
+    workflowRunOverrides?: Partial<WorkflowRun>
+  ): Promise<{ events: PersistedEvent[]; store: MockWorkflowStore }> {
+    const store = createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-2637',
+      testDir,
+      workflow,
+      makeWorkflowRun(runId, workflowRunOverrides),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+    return { events, store };
+  }
+
+  function producerConsumerWorkflow(): WorkflowDefinition {
+    return {
+      name: 'transport-roundtrip',
+      description: 'structured producer feeding a typed consumer',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'producer',
+          prompt: 'PRODUCE the classification',
+          output_format: PRODUCER_SCHEMA,
+        }),
+        dagNodeSchema.parse({
+          id: 'consumer',
+          prompt:
+            'green=[$producer.output.green] items=[$producer.output.items] whole=[$producer.output]',
+          depends_on: ['producer'],
+        }),
+      ],
+    };
+  }
+
+  it('AC1: persists structured_output in node_completed and rehydrates identical values on cold resume', async () => {
+    let freshPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      freshPrompt = p;
+    });
+
+    const fresh = await runDag(producerConsumerWorkflow(), 'transport-fresh');
+
+    // The producer's node_completed event carries the logical value beside its text.
+    const producerCompleted = fresh.events.find(
+      e => e.event_type === 'node_completed' && e.step_name === 'producer'
+    );
+    expect(producerCompleted?.data?.structured_output).toEqual(PRODUCER_PAYLOAD);
+    expect(String(producerCompleted?.data?.node_output)).toBe(JSON.stringify(PRODUCER_PAYLOAD));
+    expect(freshPrompt).toBe(
+      `green=[true] items=[["a","b"]] whole=[${JSON.stringify(PRODUCER_PAYLOAD)}]`
+    );
+
+    // Cold resume: the snapshot the store would rebuild from that event.
+    let resumedPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      resumedPrompt = p;
+    });
+    const prior = new Map<string, PersistedNodeOutput>([
+      [
+        'producer',
+        {
+          output: String(producerCompleted?.data?.node_output),
+          structuredOutput: producerCompleted?.data?.structured_output,
+        },
+      ],
+    ]);
+    const resumed = await runDag(producerConsumerWorkflow(), 'transport-resumed', prior);
+
+    // Byte-identical consumer view — the invariant the whole slice exists for.
+    expect(resumedPrompt).toBe(freshPrompt);
+    // The re-emit copies the logical value forward so a SECOND resume still sees it.
+    const replayed = resumed.events.find(e => e.event_type === 'node_skipped_prior_success');
+    expect(replayed?.data?.structured_output).toEqual(PRODUCER_PAYLOAD);
+
+    // A pre-#2637 snapshot row (text only) still resolves via the text-parse fallback.
+    let legacyPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      legacyPrompt = p;
+    });
+    await runDag(
+      producerConsumerWorkflow(),
+      'transport-legacy',
+      new Map([['producer', { output: JSON.stringify(PRODUCER_PAYLOAD) }]])
+    );
+    expect(legacyPrompt).toBe(freshPrompt);
+  });
+
+  it('AC1: a loop_group persists its terminal sink structured payload and re-exposes it after resume', async () => {
+    const groupWorkflow = (): WorkflowDefinition => ({
+      name: 'transport-group',
+      description: 'loop_group whose terminal sink emits a structured payload',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'group',
+          loop_group: {
+            until_bash: 'exit 0',
+            max_iterations: 1,
+            fresh_context: false,
+            nodes: [
+              {
+                id: 'emit',
+                prompt: 'PRODUCE inside the group',
+                output_format: PRODUCER_SCHEMA,
+              },
+            ],
+          },
+        }),
+        dagNodeSchema.parse({
+          id: 'consumer',
+          prompt: 'field=[$group.output.green]',
+          depends_on: ['group'],
+        }),
+      ],
+    });
+
+    let freshPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      freshPrompt = p;
+    });
+    const fresh = await runDag(groupWorkflow(), 'transport-group-fresh');
+
+    const groupCompleted = fresh.events.find(
+      e => e.event_type === 'node_completed' && e.step_name === 'group'
+    );
+    expect(groupCompleted?.data?.structured_output).toEqual(PRODUCER_PAYLOAD);
+    expect(freshPrompt).toBe('field=[true]');
+
+    let resumedPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      resumedPrompt = p;
+    });
+    await runDag(
+      groupWorkflow(),
+      'transport-group-resumed',
+      new Map([
+        [
+          'group',
+          {
+            output: String(groupCompleted?.data?.node_output),
+            structuredOutput: groupCompleted?.data?.structured_output,
+          },
+        ],
+      ])
+    );
+    expect(resumedPrompt).toBe(freshPrompt);
+  });
+
+  it('AC4: a command node binds upstream values by name through $INPUTS (typed, whole-ref, and template)', async () => {
+    await writeFile(
+      join(testDir, '.archon', 'commands', 'consume.md'),
+      'g=[$INPUTS.green] t=[$INPUTS.typed] items=[$INPUTS.items] msg=[$INPUTS.msg]'
+    );
+    let consumerPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      consumerPrompt = p;
+    });
+
+    const workflow: WorkflowDefinition = {
+      name: 'transport-command-binding',
+      description: 'command node with node-local bindings',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'producer',
+          prompt: 'PRODUCE',
+          output_format: PRODUCER_SCHEMA,
+        }),
+        dagNodeSchema.parse({
+          id: 'consume',
+          command: 'consume',
+          depends_on: ['producer'],
+          with: {
+            green: '$producer.output.green',
+            typed: 42,
+            items: '$producer.output.items',
+            msg: 'count is $producer.output.count',
+          },
+        }),
+      ],
+    };
+
+    await runDag(workflow, 'transport-cmd-bind');
+    // Whole refs keep the logical value (boolean/array), the literal stays typed, and
+    // the template splices canonical text — all through one deterministic rule.
+    expect(consumerPrompt).toBe('g=[true] t=[42] items=[["a","b"]] msg=[count is 2]');
+  });
+
+  it('AC4: a script node receives bindings as INPUTS_<UPPER_SNAKE> env text, single-encoded', async () => {
+    let consumerPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      consumerPrompt = p;
+    });
+
+    const workflow: WorkflowDefinition = {
+      name: 'transport-script-binding',
+      description: 'script node with node-local bindings',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'producer',
+          prompt: 'PRODUCE',
+          output_format: PRODUCER_SCHEMA,
+        }),
+        dagNodeSchema.parse({
+          id: 'emit',
+          script:
+            'console.log(`g=${process.env.INPUTS_GREEN}|payload=${process.env.INPUTS_PAYLOAD}`);',
+          runtime: 'bun',
+          depends_on: ['producer'],
+          with: {
+            green: '$producer.output.green',
+            payload: '$producer.output',
+          },
+        }),
+        dagNodeSchema.parse({
+          id: 'check',
+          prompt: 'script said [$emit.output]',
+          depends_on: ['emit'],
+        }),
+      ],
+    };
+
+    await runDag(workflow, 'transport-script-bind');
+    // Boolean delivers as its canonical text `true` (never re-quoted), and the whole
+    // structured payload arrives single-encoded — no artifact-file bridge required.
+    expect(consumerPrompt).toBe(`script said [g=true|payload=${JSON.stringify(PRODUCER_PAYLOAD)}]`);
+  });
+
+  it('AC4: node-local bindings win over a run input of the same name (nearest contract)', async () => {
+    await writeFile(join(testDir, '.archon', 'commands', 'consume.md'), 'v=[$INPUTS.green]');
+    let consumerPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      consumerPrompt = p;
+    });
+
+    const workflow: WorkflowDefinition = {
+      name: 'transport-binding-precedence',
+      description: 'node-local binding shadows the run input',
+      nodes: [
+        dagNodeSchema.parse({ id: 'producer', prompt: 'PRODUCE', output_format: PRODUCER_SCHEMA }),
+        dagNodeSchema.parse({
+          id: 'consume',
+          command: 'consume',
+          depends_on: ['producer'],
+          with: { green: '$producer.output.green' },
+        }),
+      ],
+    };
+
+    await runDag(workflow, 'transport-precedence', undefined, {
+      metadata: { inputs: { green: 'from-run-input' } },
+    });
+    expect(consumerPrompt).toBe('v=[true]');
+  });
+
+  it('AC4: an unknown or non-upstream binding fails the node with an actionable error, never an empty string', async () => {
+    await writeFile(join(testDir, '.archon', 'commands', 'consume.md'), 'v=[$INPUTS.v]');
+    mockStructuredProducer(() => {});
+
+    // Built programmatically (the loader rejects this at load time) to prove the
+    // runtime seam fails loudly too.
+    const workflow: WorkflowDefinition = {
+      name: 'transport-binding-unknown',
+      description: 'binding to a producer that never ran',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'consume',
+          command: 'consume',
+          with: { v: '$ghost.output' },
+        }),
+      ],
+    };
+
+    const { events } = await runDag(workflow, 'transport-unknown');
+    const failed = events.find(e => e.event_type === 'node_failed');
+    expect(String(failed?.data?.error)).toContain("'$ghost.output' references node 'ghost'");
+  });
+
+  it('AC5: a binding on a skipped producer takes if_skipped; without one the node fails naming the fix', async () => {
+    await writeFile(join(testDir, '.archon', 'commands', 'gate.md'), 'ready=[$INPUTS.ready]');
+    let consumerPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      consumerPrompt = p;
+    });
+
+    const skippedProducerWorkflow = (withValue: unknown): WorkflowDefinition => ({
+      name: 'transport-skipped',
+      description: 'reads across a skipped branch',
+      nodes: [
+        dagNodeSchema.parse({ id: 'seed', bash: "printf '%s' no" }),
+        dagNodeSchema.parse({
+          id: 'maybe',
+          prompt: 'PRODUCE',
+          output_format: PRODUCER_SCHEMA,
+          depends_on: ['seed'],
+          when: "$seed.output == 'yes'",
+        }),
+        dagNodeSchema.parse({
+          id: 'gate',
+          command: 'gate',
+          depends_on: ['maybe'],
+          trigger_rule: 'all_done',
+          with: { ready: withValue },
+        }),
+      ],
+    });
+
+    // With the declared default, the skipped branch resolves to it — explicitly.
+    await runDag(
+      skippedProducerWorkflow({ from: '$maybe.output.green', if_skipped: false }),
+      'transport-skipped-default'
+    );
+    expect(consumerPrompt).toBe('ready=[false]');
+
+    // Without it, the node fails and the message names the binding, producer, and fix.
+    const { events } = await runDag(
+      skippedProducerWorkflow({ from: '$maybe.output.green' }),
+      'transport-skipped-loud'
+    );
+    const failed = events.find(e => e.event_type === 'node_failed');
+    expect(String(failed?.data?.error)).toContain("binding 'ready' reads '$maybe.output.green'");
+    expect(String(failed?.data?.error)).toContain("'maybe' did not run");
+    expect(String(failed?.data?.error)).toContain('if_skipped');
+  });
+
+  it('AC1+AC4 (issue acceptance): bindings resolve identically from a rehydrated snapshot after cold resume', async () => {
+    await writeFile(
+      join(testDir, '.archon', 'commands', 'consume.md'),
+      'g=[$INPUTS.green] items=[$INPUTS.items]'
+    );
+    let freshPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      freshPrompt = p;
+    });
+
+    const workflow = (): WorkflowDefinition => ({
+      name: 'transport-resume-binding',
+      description: 'binding consumer after resume',
+      nodes: [
+        dagNodeSchema.parse({ id: 'producer', prompt: 'PRODUCE', output_format: PRODUCER_SCHEMA }),
+        dagNodeSchema.parse({
+          id: 'consume',
+          command: 'consume',
+          depends_on: ['producer'],
+          with: { green: '$producer.output.green', items: '$producer.output.items' },
+        }),
+      ],
+    });
+
+    const fresh = await runDag(workflow(), 'transport-resume-bind-fresh');
+    const producerCompleted = fresh.events.find(
+      e => e.event_type === 'node_completed' && e.step_name === 'producer'
+    );
+
+    let resumedPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      resumedPrompt = p;
+    });
+    await runDag(
+      workflow(),
+      'transport-resume-bind-resumed',
+      new Map([
+        [
+          'producer',
+          {
+            output: String(producerCompleted?.data?.node_output),
+            structuredOutput: producerCompleted?.data?.structured_output,
+          },
+        ],
+      ])
+    );
+    expect(resumedPrompt).toBe(freshPrompt);
+    expect(resumedPrompt).toBe('g=[true] items=[["a","b"]]');
+  });
+
+  it('implement pattern (PR #2627): a boolean travels producer → script binding with no artifact file', async () => {
+    let checkPrompt: string | undefined;
+    mockStructuredProducer(p => {
+      checkPrompt = p;
+    });
+
+    const workflow: WorkflowDefinition = {
+      name: 'transport-implement-pattern',
+      description: 'the .green file bridge, replaced by a binding',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'impl',
+          prompt: 'PRODUCE the validation verdict',
+          output_format: PRODUCER_SCHEMA,
+        }),
+        dagNodeSchema.parse({
+          id: 'record',
+          script: 'console.log(`green=${process.env.INPUTS_GREEN}`);',
+          runtime: 'bun',
+          depends_on: ['impl'],
+          with: { green: '$impl.output.green' },
+        }),
+        dagNodeSchema.parse({
+          id: 'check',
+          prompt: 'recorded [$record.output]',
+          depends_on: ['record'],
+        }),
+      ],
+    };
+
+    await runDag(workflow, 'transport-implement');
+    expect(checkPrompt).toBe('recorded [green=true]');
+  });
+
+  it('deliver pattern (PR #2627): an all_done join binds two mutually exclusive producers via if_skipped, on both branches', async () => {
+    const deliverWorkflow = (seed: 'initial' | 'iteration'): WorkflowDefinition => ({
+      name: 'transport-deliver-pattern',
+      description: 'the .ready latch, replaced by explicit skipped-branch bindings',
+      nodes: [
+        dagNodeSchema.parse({ id: 'route', bash: `printf '%s' ${seed}` }),
+        dagNodeSchema.parse({
+          id: 'initial-ready',
+          bash: `printf '%s' '{"ready":true,"source":"initial"}'`,
+          output_format: {
+            type: 'object',
+            properties: { ready: { type: 'boolean' }, source: { type: 'string' } },
+          },
+          depends_on: ['route'],
+          when: "$route.output == 'initial'",
+        }),
+        dagNodeSchema.parse({
+          id: 'iteration-ready',
+          bash: `printf '%s' '{"ready":true,"source":"iteration"}'`,
+          output_format: {
+            type: 'object',
+            properties: { ready: { type: 'boolean' }, source: { type: 'string' } },
+          },
+          depends_on: ['route'],
+          when: "$route.output == 'iteration'",
+        }),
+        dagNodeSchema.parse({
+          id: 'join',
+          script:
+            'console.log(`initial=${process.env.INPUTS_INITIAL}|iteration=${process.env.INPUTS_ITERATION}`);',
+          runtime: 'bun',
+          depends_on: ['initial-ready', 'iteration-ready'],
+          trigger_rule: 'all_done',
+          with: {
+            initial: { from: '$initial-ready.output.ready', if_skipped: false },
+            iteration: { from: '$iteration-ready.output.ready', if_skipped: false },
+          },
+        }),
+        dagNodeSchema.parse({
+          id: 'check',
+          prompt: 'joined [$join.output]',
+          depends_on: ['join'],
+        }),
+      ],
+    });
+
+    const checkPrompts: string[] = [];
+    mockStructuredProducer(p => {
+      checkPrompts.push(p);
+    });
+    await runDag(deliverWorkflow('initial'), 'transport-deliver-initial');
+    expect(checkPrompts).toEqual(['joined [initial=true|iteration=false]']);
+
+    checkPrompts.length = 0;
+    await runDag(deliverWorkflow('iteration'), 'transport-deliver-iteration');
+    expect(checkPrompts).toEqual(['joined [initial=false|iteration=true]']);
   });
 });

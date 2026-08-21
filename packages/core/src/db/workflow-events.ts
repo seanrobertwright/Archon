@@ -238,7 +238,7 @@ export async function listWorkflowEventsSince(
  * never carried `tokens`), and only until those runs reach a terminal state.
  */
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
-  completedNodeOutputs: Map<string, string>;
+  completedNodeOutputs: Map<string, { output: string; structuredOutput?: unknown }>;
   tokens?: TokenUsage;
   costUsd: number;
 }> {
@@ -252,7 +252,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
      ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
     [workflowRunId]
   );
-  const completedNodeOutputs = new Map<string, string>();
+  const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
   // Collected and merged once at the end rather than folded pairwise: a pairwise fold
   // cannot tell "one of five contributions reported" from "one of two" (#2662).
   const usages: TokenUsage[] = [];
@@ -270,7 +270,15 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       continue;
     }
     if (row.event_type !== 'node_failed' && typeof data.node_output === 'string') {
-      completedNodeOutputs.set(row.step_name, data.node_output);
+      completedNodeOutputs.set(row.step_name, {
+        output: data.node_output,
+        // The node's logical value (#2637), persisted beside its text by the emit
+        // sites (and copied forward by node_skipped_prior_success re-emits). Absent
+        // on pre-#2637 rows — the executor then falls back to text re-parsing.
+        ...(data.structured_output !== undefined
+          ? { structuredOutput: data.structured_output }
+          : {}),
+      });
     }
     // A derived row restates usage that other rows in this same log already carry.
     if (data.aggregate === true) continue;

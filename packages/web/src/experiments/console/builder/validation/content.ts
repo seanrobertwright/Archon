@@ -40,17 +40,35 @@ function baseTextBodies(node: BuilderNode): string[] {
   return bodies;
 }
 
+/**
+ * String surfaces of a node-local `with:` map (#2637): string values are live ref
+ * surfaces (whole refs and templates), and a binding directive's `from` is exactly
+ * one whole ref. Non-string literals carry no refs.
+ */
+function bindingTextBodies(withMap: Record<string, unknown> | undefined): string[] {
+  const bodies: string[] = [];
+  for (const value of Object.values(withMap ?? {})) {
+    if (typeof value === 'string') {
+      bodies.push(value);
+    } else if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      const from = (value as { from?: unknown }).from;
+      if (typeof from === 'string') bodies.push(from);
+    }
+  }
+  return bodies;
+}
+
 /** The text bodies that carry `$nodeId.output` references for a given variant. */
 function variantTextBodies(node: BuilderNode): string[] {
   switch (node.variant) {
     case 'prompt':
       return [node.data.prompt];
     case 'command':
-      return [node.data.command];
+      return [node.data.command, ...bindingTextBodies(node.data.with)];
     case 'bash':
       return [node.data.bash];
     case 'script':
-      return [node.data.script];
+      return [node.data.script, ...bindingTextBodies(node.data.with)];
     case 'approval':
       // `on_reject.prompt` is an ordinary prompt the engine substitutes and scans.
       return [node.data.message, ...(node.data.on_reject ? [node.data.on_reject.prompt] : [])];

@@ -17,8 +17,15 @@ import { stepRetryConfigSchema } from './retry';
 // type-only `NodeOutput`, which is erased. Reused rather than reimplemented so
 // `loop.until_field` and the strict `$node.output.field` access agree on what
 // counts as a declared property — a second definition could drift into accepting
-// a name that consumers then reject.
-import { declaredFieldsFromSchema } from '../output-ref';
+// a name that consumers then reject. `jsonValueSchema`/`parseWholeOutputRef`
+// come from the same module for the same reason: one value type and one ref
+// grammar, everywhere (#2637).
+import {
+  declaredFieldsFromSchema,
+  jsonValueSchema,
+  parseWholeOutputRef,
+  type JsonValue,
+} from '../output-ref';
 import {
   BASE_COMPLETION_CHANNELS,
   addMissingChannelIssue,
@@ -288,8 +295,47 @@ export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;
 // Per-variant schemas — exported for type derivation only (use dagNodeSchema for validation)
 // ---------------------------------------------------------------------------
 
+/**
+ * Node-local binding directive (#2637) — the explicit form of a `with:` value on a
+ * `command:`/`script:` node that reads an upstream output across a possibly-skipped
+ * branch. `from` must be exactly one whole `$node.output[.field]` reference; when the
+ * producer was skipped, the binding takes `if_skipped` instead — and without one, the
+ * consuming node fails loudly (never a silent `''`).
+ *
+ * On command/script `with:` maps, a plain OBJECT value is ALWAYS parsed as this
+ * directive (any other object shape is a load error naming both accepted forms) —
+ * reserving the object position removes the literal-vs-directive grammar ambiguity
+ * without a `$literal` escape. Include/workflow `with:` maps have no directive, so
+ * objects there stay ordinary JSON literals.
+ */
+export const bindingDirectiveSchema = z.strictObject({
+  from: z.string().min(1, "'from' must be a non-empty $node.output reference"),
+  if_skipped: jsonValueSchema.optional(),
+});
+
+export type BindingDirective = z.infer<typeof bindingDirectiveSchema>;
+
+/**
+ * Runtime guard for a command/script `with:` value: loader-validated maps only ever
+ * hold a directive in object position, but programmatic definitions bypass the
+ * loader, so the executor re-checks the discriminating shape before trusting it.
+ */
+export function isBindingDirective(value: unknown): value is BindingDirective {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as Record<string, unknown>).from === 'string'
+  );
+}
+
 export const commandNodeSchema = dagNodeBaseSchema.extend({
   command: z.string(),
+  // Node-local named bindings (#2637): values delivered to the command file's
+  // `$INPUTS.<name>` surface. Strings may hold refs/templates; a whole
+  // `$node.output[.field]` ref passes the logical value; objects are binding
+  // directives ({ from, if_skipped }) — validated in dagNodeSchema's superRefine.
+  with: z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema])).optional(),
 });
 
 /** DAG node that runs a named command from .archon/commands/ */
@@ -348,6 +394,9 @@ export const scriptNodeSchema = dagNodeBaseSchema.extend({
   runtime: z.enum(['bun', 'uv']),
   deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
   timeout: z.number().optional(),
+  // Node-local named bindings (#2637): delivered as INPUTS_<UPPER_SNAKE> env vars —
+  // the only channel a NAMED script file has. Same value grammar as command nodes.
+  with: z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema])).optional(),
 });
 
 /** DAG node that runs a TypeScript or Python script via bun or uv */
@@ -533,7 +582,10 @@ export function inputEnvKey(name: string): string {
  */
 export const includeNodeSchema = dagNodeBaseSchema.extend({
   include: z.string().min(1, "'include' must be a non-empty workflow name"),
-  with: z.record(z.string(), z.string()).optional(),
+  // JSON-compatible input values (#2637): strings splice into text surfaces via
+  // the load-time macro; non-string values keep their logical type through the
+  // declared-input contract and canonicalize to JSON text where spliced.
+  with: z.record(z.string(), jsonValueSchema).optional(),
 });
 
 /** DAG node that inlines another workflow's nodes at discovery time (load-time expansion) */
@@ -617,8 +669,9 @@ export const workflowNodeSchema = dagNodeBaseSchema.extend({
   workflow: z.string().min(1, "'workflow' must be a non-empty workflow name"),
   input: z.string().optional(),
   // Named inputs passed to the child sub-run as `$INPUTS.<name>` (#2470). Mutually
-  // exclusive with `input:`. Same identifier-keyed string-map shape as `include.with`.
-  with: z.record(z.string(), z.string()).optional(),
+  // exclusive with `input:`. Same identifier-keyed JSON-value map as `include.with`
+  // (#2637): non-string values reach the child with their logical type.
+  with: z.record(z.string(), jsonValueSchema).optional(),
   isolation: z.enum(['inherit', 'worktree']).optional(),
   fan_out: fanOutConfigSchema.optional(),
 });
@@ -873,11 +926,15 @@ export const dagNodeSchema = dagNodeFlatSchema
       });
     }
 
-    // `with:` is an identifier-keyed string map on BOTH include and workflow nodes
-    // (#2470). For includes it inlines at load time (applyInputsMacro); for sub-runs it
-    // becomes `$INPUTS.<name>` runtime variables on the child. Same shape validation for
-    // both; the flat field stays `z.unknown()` so other node variants strip it contextually.
-    const validateWithShape = (kind: 'include' | 'workflow'): void => {
+    // `with:` is an identifier-keyed JSON-value map on include and workflow nodes
+    // (#2470, values widened from string-only in #2637). For includes it inlines at
+    // load time (applyInputsMacro); for sub-runs it becomes `$INPUTS.<name>` runtime
+    // variables on the child. The flat field stays `z.unknown()` so other node
+    // variants validate it contextually. Returns the validated plain-object map, or
+    // undefined when the surrounding shape is wrong (issues already added).
+    const validateWithShape = (
+      kind: 'include' | 'workflow' | 'command' | 'script'
+    ): Record<string, unknown> | undefined => {
       const prototype =
         typeof data.with === 'object' && data.with !== null
           ? Object.getPrototypeOf(data.with)
@@ -890,12 +947,13 @@ export const dagNodeSchema = dagNodeFlatSchema
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `'with' on ${kind} nodes must be an object mapping input names to strings`,
+          message: `'with' on ${kind} nodes must be an object mapping input names to values`,
           path: ['with'],
         });
-        return;
+        return undefined;
       }
-      for (const [key, value] of Object.entries(data.with)) {
+      const map = data.with as Record<string, unknown>;
+      for (const [key, value] of Object.entries(map)) {
         if (!INPUT_NAME_PATTERN.test(key)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
@@ -903,17 +961,68 @@ export const dagNodeSchema = dagNodeFlatSchema
             path: ['with'],
           });
         }
-        if (typeof value !== 'string') {
+        if (!jsonValueSchema.safeParse(value).success) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `${kind} input '${key}' must be a string`,
+            message: `${kind} input '${key}' must be a JSON-compatible value (string, number, boolean, null, array, or object)`,
             path: ['with'],
+          });
+        }
+      }
+      return map;
+    };
+    // Node-local bindings on command/script nodes (#2637): same key/value grammar as
+    // include/workflow `with:`, plus the object position is RESERVED for the binding
+    // directive — any other object shape is rejected naming both accepted forms.
+    const validateNodeBindings = (kind: 'command' | 'script'): void => {
+      const map = validateWithShape(kind);
+      if (map === undefined) return;
+      // Two names folding to one INPUTS_<UPPER_SNAKE> env key would silently clobber
+      // each other on script env delivery — same rule the loader enforces for a
+      // workflow's declared `inputs:` block, applied here where the map is visible.
+      // Scoped to this NEW surface only: include/workflow `with:` maps predate the
+      // check and must keep loading (their callee's own `inputs:` block carries it).
+      const envKeyOwners = new Map<string, string>();
+      for (const key of Object.keys(map)) {
+        const envKey = inputEnvKey(key);
+        const existing = envKeyOwners.get(envKey);
+        if (existing !== undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `${kind} bindings '${existing}' and '${key}' both map to env var '${envKey}' — rename one so each binding has a unique env key`,
+            path: ['with'],
+          });
+        }
+        envKeyOwners.set(envKey, key);
+      }
+      for (const [key, value] of Object.entries(map)) {
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+        const parsed = bindingDirectiveSchema.safeParse(value);
+        if (!parsed.success) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message:
+              `${kind} binding '${key}': an object value must be a binding directive ` +
+              "{ from: '$node.output[.field]', if_skipped?: <value> } — " +
+              `${parsed.error.issues[0]?.message ?? 'invalid shape'}. ` +
+              'Use a string, number, boolean, null, or array for a literal value.',
+            path: ['with', key],
+          });
+          continue;
+        }
+        if (parseWholeOutputRef(parsed.data.from) === undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `${kind} binding '${key}': 'from' must be exactly one whole '$node.output' or '$node.output.field' reference, got '${parsed.data.from}'`,
+            path: ['with', key],
           });
         }
       }
     };
     if (hasInclude && data.with !== undefined) validateWithShape('include');
     if (hasWorkflow && data.with !== undefined) validateWithShape('workflow');
+    if (hasCommand && data.with !== undefined) validateNodeBindings('command');
+    if (hasScript && data.with !== undefined) validateNodeBindings('script');
     // A `workflow:` node has ONE input channel per invocation: either the untyped
     // `input:` string ($ARGUMENTS) or the named `with:` map ($INPUTS.<name>). Accepting
     // both would require a precedence rule between two overlapping channels — the exact
@@ -1245,8 +1354,21 @@ export const dagNodeSchema = dagNodeFlatSchema
       ...(data.persist_session !== undefined ? { persist_session: data.persist_session } : {}),
     };
 
+    // Node-local bindings (#2637) — validated by validateNodeBindings above; carried
+    // only by the command/script variants (other modes keep stripping the field).
+    const nodeBindings =
+      data.with !== undefined
+        ? { with: data.with as Record<string, JsonValue | BindingDirective> }
+        : {};
+
     if (data.command !== undefined && data.command.trim().length > 0) {
-      return { ...base, ...shared, ...aiOnly, command: data.command.trim() } as CommandNode;
+      return {
+        ...base,
+        ...shared,
+        ...aiOnly,
+        command: data.command.trim(),
+        ...nodeBindings,
+      } as CommandNode;
     }
     if (data.prompt !== undefined && data.prompt.trim().length > 0) {
       return { ...base, ...shared, ...aiOnly, prompt: data.prompt.trim() } as PromptNode;
@@ -1269,6 +1391,7 @@ export const dagNodeSchema = dagNodeFlatSchema
         runtime: data.runtime,
         ...(data.deps !== undefined ? { deps: data.deps } : {}),
         ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+        ...nodeBindings,
       } as ScriptNode;
     }
     if (data.approval !== undefined) {
@@ -1287,7 +1410,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       return {
         ...structuralBase,
         include: data.include.trim(),
-        ...(data.with !== undefined ? { with: data.with as Record<string, string> } : {}),
+        ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
       } as IncludeNode;
     }
     if (data.workflow !== undefined && data.workflow.trim().length > 0) {
@@ -1306,7 +1429,7 @@ export const dagNodeSchema = dagNodeFlatSchema
         // `with:` supplies named $INPUTS to the child sub-run (#2470), validated in shape
         // by the superRefine above and mutually exclusive with `input:`. Mirrors the
         // include transform's `with` assembly.
-        ...(data.with !== undefined ? { with: data.with as Record<string, string> } : {}),
+        ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
         // Isolation is EXPLICIT-ONLY — never inferred, including from `fan_out`. How many
         // children a node spawns says nothing about whether they write; N review or
         // research children over the shared checkout is the common case. A shared-checkout

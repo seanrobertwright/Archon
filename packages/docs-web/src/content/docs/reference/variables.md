@@ -146,6 +146,65 @@ nodes:
     depends_on: [classify]
 ```
 
+### Node-local `with:` bindings on `command:` and `script:` nodes
+
+A command file and a named script are opaque to inline text substitution — the engine never
+rewrites their bodies. `with:` on a `command:` or `script:` node binds upstream values **by
+name** through the channels those bodies already read: `$INPUTS.<name>` in a command file,
+`INPUTS_<UPPER_SNAKE>` env vars in a script.
+
+```yaml
+nodes:
+  - id: validate
+    prompt: Run validation and report the verdict.
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+
+  - id: record
+    script: record-verdict          # named script — reads process.env.INPUTS_GREEN
+    runtime: bun
+    depends_on: [validate]
+    with:
+      green: $validate.output.green
+```
+
+Three value forms, resolved per binding:
+
+| Value | Resolves to |
+|-------|-------------|
+| A non-string literal (`true`, `42`, `[a, b]`) | The value itself, with its logical type |
+| A string that is **exactly one** whole `$node.output`, `$node.output.field`, or `$INPUTS.<name>` reference | The **logical value** — a boolean field arrives as a boolean, an object as an object (env delivery uses its canonical text: strings raw, everything else JSON) |
+| Any other string | A text template, substituted like `input:` (workflow vars, then `$node.output` refs) |
+
+An object value is reserved for the **binding directive** `{ from, if_skipped }`: `from` is
+one whole `$node.output[.field]` reference, and when that producer was **skipped** (a
+`when:`-false branch reached through `trigger_rule: all_done`) the binding takes `if_skipped`
+instead. A skipped producer with no `if_skipped` fails the node with the fix named — a
+binding never silently resolves to an empty string.
+
+```yaml
+  - id: join
+    script: read-ready
+    runtime: bun
+    depends_on: [initial-ready, iteration-ready]
+    trigger_rule: all_done
+    with:
+      initial:   { from: $initial-ready.output.ready,   if_skipped: false }
+      iteration: { from: $iteration-ready.output.ready, if_skipped: false }
+```
+
+Every referenced producer must be an upstream `depends_on` dependency — the loader rejects
+the workflow otherwise, so a binding can never race its producer. Node-local bindings are
+the **nearest** input layer: they win over a composed block's inputs, which win over the
+run's own `$INPUTS`.
+
+`with:` on other node types: `include:` and `workflow:` nodes keep their existing caller-input
+meaning (values may be any JSON value); on `bash:`, `prompt:`, and loop nodes the field is
+ignored with a load warning — inline bodies already reference `$node.output` directly.
+
 ## Substitution Order
 
 Variables are substituted in a defined order:

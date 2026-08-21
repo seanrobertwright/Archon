@@ -103,7 +103,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     createWorkflowEvent: mock(async () => {}),
     findResumableRun: mock(async () => null),
     getDagResumeSnapshot: mock(async () => ({
-      completedNodeOutputs: new Map<string, string>(),
+      completedNodeOutputs: new Map<string, { output: string }>(),
       tokens: { input: 0, output: 0 },
       costUsd: 0,
     })),
@@ -370,7 +370,7 @@ describe('executeWorkflow preamble', () => {
       // to executeWorkflow. The executor must NOT touch findResumableRun on
       // its own — that decision lives at the caller.
       const resumedRun = makeRun({ id: 'prior-run', status: 'running' });
-      const priorCompletedNodes = new Map([['node-a', 'output from node-a']]);
+      const priorCompletedNodes = new Map([['node-a', { output: 'output from node-a' }]]);
 
       const findSpy = mock(async () => null);
       const store = makeStore({ findResumableRun: findSpy });
@@ -402,7 +402,7 @@ describe('executeWorkflow preamble', () => {
 
     it('sends interactive-loop notification when priorCompletedNodes is empty (paused approval gate)', async () => {
       const resumedRun = makeRun({ id: 'paused-loop-run', status: 'running' });
-      const priorCompletedNodes = new Map<string, string>();
+      const priorCompletedNodes = new Map<string, { output: string }>();
 
       const store = makeStore();
       const deps = makeDeps(store);

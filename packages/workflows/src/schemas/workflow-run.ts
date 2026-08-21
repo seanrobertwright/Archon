@@ -3,6 +3,8 @@
  */
 import { z } from '@hono/zod-openapi';
 import type { TokenUsage } from '@archon/providers/types';
+// Type-only, so the output-ref ↔ schemas edge stays erased (no runtime cycle).
+import type { JsonValue } from '../output-ref';
 import { isAbsolute } from 'path';
 
 // ---------------------------------------------------------------------------
@@ -172,15 +174,27 @@ export type WorkflowRun = z.infer<typeof workflowRunSchema>;
  *                    child, which is what distinguishes the two on re-entry.
  * `fan_out_item_hash` — hash of the item the child was spawned with, so a resume can warn
  *                    when a non-deterministic producer changed it under the same index.
- * `inputs`         — the resolved `with:` map (name → string) the parent supplied (#2470),
- *                    persisted at spawn so the child's `$INPUTS.<name>` reconstitutes on a
- *                    cold resume without re-resolving parent refs that may be out of scope.
+ * `inputs`         — the resolved `with:` map as canonical TEXT (name → string), persisted
+ *                    at spawn so the child's `$INPUTS.<name>` reconstitutes on a cold
+ *                    resume without re-resolving parent refs that may be out of scope
+ *                    (#2470). Kept string-valued forever: shipped binaries read a
+ *                    non-string map as corrupt/unset, so widening it in place would make
+ *                    an older binary resuming a newer run lose ALL inputs.
+ * `inputs_values`  — additive sibling of `inputs` (#2637): the same map with its LOGICAL
+ *                    JSON values, written only when any value is non-string. Readers
+ *                    prefer it; its absence degrades to the text map — exactly the old
+ *                    behavior, which is what keeps old rows and old binaries correct.
+ * `summary_value`  — additive sibling of `summary` (#2637): the child's terminal
+ *                    structured value, stamped at completion alongside the text summary
+ *                    so a parent `workflow:` node threads the logical value back.
  */
 export const SUBRUN_METADATA_KEYS = {
   parentNodeId: 'parent_node_id',
   childIndex: 'child_index',
   fanOutItemHash: 'fan_out_item_hash',
   inputs: 'inputs',
+  inputsValues: 'inputs_values',
+  summaryValue: 'summary_value',
 } as const;
 
 /** Typed view of the sub-run keys on a run's metadata; each is undefined when unset. */
@@ -188,29 +202,39 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
   parentNodeId: string | undefined;
   childIndex: number | undefined;
   fanOutItemHash: string | undefined;
-  inputs: Record<string, string> | undefined;
+  inputs: Record<string, JsonValue> | undefined;
+  summaryValue: unknown;
 } {
   const parentNodeId = metadata?.[SUBRUN_METADATA_KEYS.parentNodeId];
   const childIndex = metadata?.[SUBRUN_METADATA_KEYS.childIndex];
   const fanOutItemHash = metadata?.[SUBRUN_METADATA_KEYS.fanOutItemHash];
-  const rawInputs = metadata?.[SUBRUN_METADATA_KEYS.inputs];
-  // Accept only a plain object of string values; anything else reads as unset. The
-  // writer always stores a Record<string,string>, so a non-conforming value is
-  // corrupt/foreign metadata, not a shape this reader should try to coerce.
-  let inputs: Record<string, string> | undefined;
-  if (
-    typeof rawInputs === 'object' &&
-    rawInputs !== null &&
-    !Array.isArray(rawInputs) &&
-    Object.values(rawInputs as Record<string, unknown>).every(v => typeof v === 'string')
-  ) {
-    inputs = rawInputs as Record<string, string>;
-  }
+  const asPlainObject = (raw: unknown): Record<string, unknown> | undefined =>
+    typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : undefined;
+  // Prefer the logical map (#2637); fall back to the legacy text map, accepting only a
+  // plain object of string values there — the legacy writer always stored strings, so a
+  // non-conforming value is corrupt/foreign metadata, not a shape to coerce.
+  // Metadata is DB-round-tripped JSON, so a plain object here can only hold JSON
+  // values — the casts assert what the storage layer already guarantees.
+  const rawValues = asPlainObject(metadata?.[SUBRUN_METADATA_KEYS.inputsValues]) as
+    | Record<string, JsonValue>
+    | undefined;
+  const rawLegacy = asPlainObject(metadata?.[SUBRUN_METADATA_KEYS.inputs]);
+  const legacyInputs =
+    rawLegacy !== undefined && Object.values(rawLegacy).every(v => typeof v === 'string')
+      ? (rawLegacy as Record<string, string>)
+      : undefined;
   return {
     parentNodeId: typeof parentNodeId === 'string' ? parentNodeId : undefined,
     childIndex: typeof childIndex === 'number' ? childIndex : undefined,
     fanOutItemHash: typeof fanOutItemHash === 'string' ? fanOutItemHash : undefined,
-    inputs,
+    inputs: rawValues ?? legacyInputs,
+    // Presence-keyed rather than truthiness: `false`/`0`/`null` are legitimate values.
+    summaryValue:
+      metadata !== undefined && Object.hasOwn(metadata, SUBRUN_METADATA_KEYS.summaryValue)
+        ? metadata[SUBRUN_METADATA_KEYS.summaryValue]
+        : undefined,
   };
 }
 

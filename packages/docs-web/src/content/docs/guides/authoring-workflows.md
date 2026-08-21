@@ -199,10 +199,10 @@ nodes:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `command` | string | Command name. Packaged workflows resolve it only from their own `commands/`; legacy workflows use shared repo → home → bundled lookup. |
+| `command` | string | Command name. Packaged workflows resolve it only from their own `commands/`; legacy workflows use shared repo → home → bundled lookup. Optional `with:` binds upstream values by name into the file's `$INPUTS.<name>` surface — see [Binding values into command and script nodes](#binding-values-into-command-and-script-nodes) |
 | `prompt` | string | Inline prompt string |
 | `bash` | string | Shell script (no AI). Stdout captured as `$nodeId.output`; successful stdout is also stored in `node_completed.data.node_output` as an audit preview capped at 32 KiB (UTF-8 bytes). Optional `timeout` (ms, default 120000) |
-| `script` | string | TypeScript/JavaScript (via `bun`) or Python (via `uv`) — inline code or named reference. Packaged workflows resolve named scripts only from their own `scripts/`; legacy workflows use shared script directories. Stdout captured as `$nodeId.output`. Requires `runtime: bun` or `runtime: uv`. Optional `deps` (uv only) and `timeout` (ms, default 120000). See [Script Nodes](/guides/script-nodes/) |
+| `script` | string | TypeScript/JavaScript (via `bun`) or Python (via `uv`) — inline code or named reference. Packaged workflows resolve named scripts only from their own `scripts/`; legacy workflows use shared script directories. Stdout captured as `$nodeId.output`. Requires `runtime: bun` or `runtime: uv`. Optional `deps` (uv only) and `timeout` (ms, default 120000); optional `with:` binds upstream values by name into `INPUTS_<UPPER_SNAKE>` env vars — see [Binding values into command and script nodes](#binding-values-into-command-and-script-nodes). See [Script Nodes](/guides/script-nodes/) |
 | `loop` | object | Iterative AI prompt until a declared completion condition is met. See [Loop Nodes](/guides/loop-nodes/) |
 | `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a declared completion condition is met. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
 | `approval` | object | Pauses workflow for human review. See [Approval Nodes](/guides/approval-nodes/) |
@@ -881,6 +881,77 @@ The Claude Agent SDK also has a `persistSession` flag controlling whether the SD
 
 ---
 
+## Binding Values into Command and Script Nodes
+
+A `command:` file and a named `script:` file are opaque to inline substitution — the engine
+never rewrites their bodies, so `$producer.output.green` written inside one stays literal
+text. Before node-local bindings, the only way to hand such a node a VALUE was an artifact
+file: the producer wrote `$ARTIFACTS_DIR/verdict.green`, the consumer re-read and re-parsed
+it, and a one-bit boolean traveled through the filesystem.
+
+`with:` on a `command:` or `script:` node replaces that bridge. It binds upstream values by
+name into the channels those bodies already read — `$INPUTS.<name>` in a command file,
+`INPUTS_<UPPER_SNAKE>` env vars in a script:
+
+```yaml
+nodes:
+  - id: implement
+    command: implement-issue
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+
+  - id: record-verdict
+    script: record-verdict            # reads process.env.INPUTS_GREEN — no .green file
+    runtime: bun
+    depends_on: [implement]
+    with:
+      green: $implement.output.green
+```
+
+Values keep their **logical type**: a whole `$node.output[.field]` (or `$INPUTS.<name>`)
+reference passes the value itself — a boolean stays a boolean, an object stays an object —
+and non-string literals (`retries: 3`, `flag: true`) pass as written. Text delivery uses one
+deterministic rule everywhere: strings raw, everything else canonical JSON text, so a bound
+object arrives in the env var single-encoded (`{"a":1}`) and is parsed **once**. Any other
+string is a template, substituted exactly like `input:`.
+
+### Reading across a skipped branch
+
+When mutually exclusive branches join with `trigger_rule: all_done`, a consumer may need a
+value from a producer that was **skipped**. Declare that case per binding with the
+`{ from, if_skipped }` directive instead of a file latch:
+
+```yaml
+  - id: join
+    script: decide-ready
+    runtime: bun
+    depends_on: [initial-ready, iteration-ready]
+    trigger_rule: all_done
+    with:
+      initial:   { from: $initial-ready.output.ready,   if_skipped: false }
+      iteration: { from: $iteration-ready.output.ready, if_skipped: false }
+```
+
+`if_skipped` is **data** — the value the binding takes when its producer did not run. The
+coalescing decision ("ready if either branch said so") stays in the consuming script, which
+is the [constitution's](/reference/workflow-language-constitution/) YAML-coordinates /
+code-computes split. A skipped producer with **no** `if_skipped` fails the node with the
+binding, producer, and fix named — a binding never silently resolves to `''`.
+
+Two guarantees the loader enforces: every bound producer must be reachable through
+`depends_on` (a binding can never race its producer), and two binding names may not fold to
+the same `INPUTS_*` env key. At runtime, node-local bindings are the **nearest** input
+layer — they win over a composed block's inputs, which win over the run's `$INPUTS`.
+
+Bindings carry *values*. For documents — a plan, a findings report, a diff — keep using the
+artifact chain below; a path in a binding plus a file on disk is still the right shape for
+anything big enough to have structure of its own.
+
+---
+
 ## The Artifact Chain
 
 Workflows work because **artifacts pass data between nodes**:
@@ -1130,8 +1201,8 @@ nodes; an include in a `loop_group` body produces body-local nodes. There is no 
 
 ### Passing values into an included block
 
-An include can pass an identifier-keyed string map through `with:`. The included block uses
-those values through `$INPUTS.<name>` in its inline text:
+An include can pass an identifier-keyed map of JSON values through `with:`. The included
+block uses those values through `$INPUTS.<name>` in its inline text:
 
 ```yaml
 # parent workflow
@@ -1155,9 +1226,12 @@ nodes:
 ```
 
 Input names must start with a letter or underscore and may then contain letters, numbers,
-underscores, or hyphens. Values must be strings and are inserted verbatim during load-time
-expansion — they are **never expressions**: nothing is evaluated, computed, or interpreted,
-and the value is spliced in as text exactly as written. An inserted `$node.output` reference
+underscores, or hyphens. Values may be any JSON value (string, number, boolean, null, array,
+object) and are inserted verbatim during load-time expansion — they are **never
+expressions**: nothing is evaluated, computed, or interpreted. A string value is spliced in
+as text exactly as written; a non-string value keeps its logical type wherever the channel
+is typed (a nested `with:` value position, `INPUTS_*` env delivery) and splices as its
+canonical JSON text into text surfaces. An inserted `$node.output` reference
 remains a reference and resolves through the normal runtime output substitution. A missing
 input referenced by the block is a load error. Whether **extra** caller keys are allowed
 depends on whether the block declares `inputs:` (see
@@ -1766,7 +1840,7 @@ consequences worth planning for:
 
 | `join` | The node succeeds when… | `$<id>.output` |
 |--------|------------------------|----------------|
-| `all_done` (default) | every child reached a terminal state | JSON array in item order, with each failed/cancelled child represented as `{ error, status }` in its slot |
+| `all_done` (default) | every child reached a terminal state | JSON array in item order — each element is the child's **result value** (a structured child's terminal payload lands as the object itself, single-encoded; a text child's output stays the raw string), with each failed/cancelled child represented as `{ error, status }` in its slot |
 | `all_success` | every child completed | same array; any failed or cancelled child fails the node instead |
 | `first_success` | — | Racing: **rejected**, not deferred — see below. Rejected at load rather than silently treated as another join |
 
@@ -1798,7 +1872,11 @@ the gaps is then an ordinary decision made by an ordinary node:
   - id: check
     script: |
       const results = $triage-each.output;
-      const ok = results.filter(r => typeof r === 'string');
+      // A failed slot is the engine's { error, status } marker; everything else is
+      // the child's own result value (an object for a structured child, a raw
+      // string for a text child — single-encoded either way, parse nothing twice).
+      const failed = r => r !== null && typeof r === 'object' && 'status' in r && 'error' in r;
+      const ok = results.filter(r => !failed(r));
       console.log(JSON.stringify({ ok: ok.length, total: results.length }));
     runtime: bun
     depends_on: [triage-each]
