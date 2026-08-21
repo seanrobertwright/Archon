@@ -16,19 +16,17 @@ created a git worktree on the correct branch. In that case:
 
 - **Use the current branch as-is.** Do not switch branches, do not create one, do not
   fetch-and-reset. The branch you are on is the branch this work belongs to.
-- **A dirty working tree is expected and is NOT a reason to stop.** Archon copies the
-  operator's `.archon/` directory — workflows, commands, scripts — into every run
-  worktree, deliberately, so a workflow can be iterated on before it is committed.
-  Those files are present *before* you start and are not your changes.
-- **Pre-existing modifications under `.archon/` are never yours to commit, stash, or
-  remove.** Leave them exactly as they are and commit only the files your implementation
-  touched. Before every commit, confirm with `git diff --cached --name-only` that no
-  `.archon/` file you did not deliberately change is staged.
-- **The exception: when the issue's fix genuinely lives under `.archon/`.** Workflows,
-  commands and scripts are source too, and an issue can legitimately target one. If your
-  plan says to edit a specific `.archon/` file, edit and commit **that file** — the rule
-  above exists to stop you sweeping up the operator's unrelated copied-in edits, not to
-  make a whole directory unfixable.
+- **A pre-existing dirty working tree is not yours to clean up.** Whatever you find
+  modified before you start belongs to someone else. Leave it exactly as it is and commit
+  only the files your implementation touched. Before every commit, confirm with
+  `git diff --cached --name-only` that nothing you did not deliberately change is staged.
+- **`.archon/` is ordinary source, but check its provenance before committing it.** The
+  workflow running you reads its own commands and scripts from a frozen copy outside this
+  worktree, so `.archon/` here is usually just this repository's committed content. It is
+  not guaranteed to be: an operator can still copy files in by listing `.archon` under
+  `worktree.copyFiles`. So the rule above applies unchanged — anything already modified
+  when you arrived is not yours. If the issue's fix genuinely lives in a workflow,
+  command, or script, edit and commit **that file**.
 
   Distinguish the two by intent, not by path: a file your plan names is your work; every
   other dirty `.archon/` file is not. On 2026-08-03 a run blocked outright on this,

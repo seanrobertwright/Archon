@@ -28,7 +28,7 @@ import { safeDeactivateSession } from '../state/session-transitions';
 import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
 import { buildManageRunTool } from './manage-run-tool';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
-import { syncArchonToWorktree } from '../utils/worktree-sync';
+import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
   execFileAsync,
   findRepoRoot,
@@ -40,7 +40,17 @@ import {
 import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow, resolveWorkflowName } from '@archon/workflows/router';
-import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import {
+  executeWorkflow,
+  resolveContinuationWorkflow,
+  withCapturedSource,
+  type CapturedSourceOwner,
+  hydrateResumableRun,
+  prepareWorkflowSource,
+  recordSelectedWorkflow,
+  type PreparedWorkflowSource,
+} from '@archon/workflows/executor';
+import { liveSourceRoots } from '@archon/workflows/workflow-discovery';
 import {
   assertWorkflowRequirementsMet,
   WorkflowRequirementError,
@@ -619,6 +629,15 @@ interface WorkflowDispatchOptions {
   resumeRunId?: string;
   resumeRun?: WorkflowRun;
   /**
+   * The continuation graph a caller already resolved from the run's recorded source.
+   *
+   * `command-handler` resolves it to build its `CommandResult`, which costs a digest read
+   * and a full discovery; without passing it here that work happened twice on every
+   * resume, approve and reject. A value rather than an "already done" flag, so it cannot
+   * claim something it does not carry.
+   */
+  resolvedContinuation?: WorkflowDefinition;
+  /**
    * Keys the engine dropped from the workflow's YAML (#2213). Mirrored into the
    * conversation before the run starts — chat and the console are where most
    * runs are STARTED, so a warning that only reaches the CLI misses the moment
@@ -714,7 +733,8 @@ function buildFailedRunResumePrompt(
  * TODO(#988): Move to operations/ once dispatchBackgroundWorkflow is extracted
  * from the orchestrator (currently coupled to SSE bridging infrastructure).
  */
-async function dispatchOrchestratorWorkflow(
+async function dispatchOrchestratorWorkflowOwned(
+  owner: CapturedSourceOwner,
   platform: IPlatformAdapter,
   conversationId: string,
   conversation: Conversation,
@@ -795,6 +815,92 @@ async function dispatchOrchestratorWorkflow(
   const willContinueExistingRun =
     Boolean(resumableRun?.working_path) &&
     (resumableRun?.status === 'paused' || resumableRun?.id === options?.resumeRunId);
+
+  // ── Executable source ───────────────────────────────────────────────────────
+  //
+  // AFTER resume detection, on purpose. A continuation must execute the source its run
+  // already froze; capturing here would freeze current bytes, re-resolve the graph from
+  // them, and then hand the executor a run whose recorded capture supplies the commands
+  // and scripts — a graph from one moment against resources from another. Capturing a
+  // resume also leaves a staging directory nothing adopts.
+  //
+  // For a fresh run: freeze, then re-resolve the workflow FROM the frozen copy, so the
+  // definition executed and the resources beside it are one consistent set of bytes.
+  const runCwd = conversation.cwd ?? codebase.default_cwd;
+  let preparedSource: PreparedWorkflowSource | undefined;
+
+  if (willContinueExistingRun && resumableRun) {
+    // Continuing: execute the GRAPH this run froze, not the one on disk now. Skipping
+    // this left the DAG live while the executor fed it commands and scripts from the old
+    // capture — an edited workflow would silently run its new graph against pre-edit
+    // command bytes. Undefined means a run predating capture, which keeps live behavior.
+    try {
+      if (options?.resolvedContinuation) {
+        workflow = options.resolvedContinuation;
+      } else {
+        const continuation = await resolveContinuationWorkflow(
+          createWorkflowDeps(),
+          resumableRun,
+          runCwd
+        );
+        if (continuation) workflow = continuation.workflow;
+      }
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, runId: resumableRun.id }, 'workflow.continuation_source_failed');
+      await platform.sendMessage(
+        conversationId,
+        `Cannot continue run \`${resumableRun.id}\`: ${err.message} ` +
+          'Start a fresh run to execute the current workflow.'
+      );
+      return;
+    }
+  }
+
+  if (!willContinueExistingRun) {
+    try {
+      const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);
+      preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
+        sourceRoot: workflowSourceRoot ?? runCwd,
+      });
+      // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+      owner.hold(preparedSource);
+      // Re-resolve only when files were actually frozen. An empty capture means the
+      // definition came from the bundled set a binary embeds as constants — immutable for
+      // that binary, with nothing on disk to re-read.
+      if (preparedSource.manifest.scopes.length > 0) {
+        const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
+          runCwd,
+          loadConfig,
+          preparedSource.roots
+        );
+        const reResolved = resolveWorkflowName(
+          workflow.name,
+          capturedWorkflows.map(w => w.workflow)
+        );
+        if (!reResolved) {
+          // No manual cleanup: the owner reclaims anything unadopted on the way out.
+          await platform.sendMessage(
+            conversationId,
+            `Could not read workflow **${workflow.name}** from this run's captured source. ` +
+              'Nothing has been started.'
+          );
+          return;
+        }
+        workflow = reResolved;
+      }
+      await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+      await platform.sendMessage(
+        conversationId,
+        `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
+          'Nothing has been started.'
+      );
+      return;
+    }
+  }
 
   // Signature gate (#2470, #2554): resolve this invocation's declared inputs from the
   // values its channel supplied — the run route's `inputs` map today; chat platforms
@@ -1018,6 +1124,8 @@ async function dispatchOrchestratorWorkflow(
             `(\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
         );
       }
+      // Handing the capture to a run: it owns the bytes and their lifetime now.
+      if (preparedSource) owner.adopt();
       await executeWorkflow(
         deps,
         platform,
@@ -1031,6 +1139,7 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
+          preparedSource,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
@@ -1049,6 +1158,8 @@ async function dispatchOrchestratorWorkflow(
         conversationId,
         `⚠️ Prior run for **${workflow.name}** had no completed nodes; starting fresh in the same worktree.`
       );
+      // Handing the capture to a run: it owns the bytes and their lifetime now.
+      if (preparedSource) owner.adopt();
       await executeWorkflow(
         deps,
         platform,
@@ -1062,6 +1173,7 @@ async function dispatchOrchestratorWorkflow(
           parentConversationId: conversation.id,
           userId,
           source,
+          preparedSource,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
@@ -1109,6 +1221,8 @@ async function dispatchOrchestratorWorkflow(
     }
   } else {
     // Fresh foreground execution: web interactive workflows + all chat platforms
+    // Handing the capture to a run: it owns the bytes and their lifetime now.
+    if (preparedSource) owner.adopt();
     await executeWorkflow(
       createWorkflowDeps(),
       platform,
@@ -1122,6 +1236,7 @@ async function dispatchOrchestratorWorkflow(
         parentConversationId: conversation.id,
         userId,
         source,
+        preparedSource,
         parseWarnings: options?.parseWarnings,
         baseBranch: codebaseBaseBranch,
         resolveChildIsolation,
@@ -1129,6 +1244,43 @@ async function dispatchOrchestratorWorkflow(
       }
     );
   }
+}
+
+/**
+ * Dispatch a workflow, owning any capture it takes.
+ *
+ * A thin owner around the implementation, matching the CLI's shape. The implementation has
+ * five ordinary early returns after a capture is allocated — the inputs gate, the GitHub
+ * requirement gate, an isolation error, a resume with no working path, and the routine
+ * "resume or force?" menu — and every one of them used to abandon a complete frozen tree.
+ */
+async function dispatchOrchestratorWorkflow(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  conversation: Conversation,
+  codebase: Codebase,
+  workflow: WorkflowDefinition,
+  userMessage: string,
+  isolationHints?: HandleMessageContext['isolationHints'],
+  userId?: string,
+  source?: WorkflowSource,
+  options?: WorkflowDispatchOptions
+): Promise<void> {
+  await withCapturedSource(owner =>
+    dispatchOrchestratorWorkflowOwned(
+      owner,
+      platform,
+      conversationId,
+      conversation,
+      codebase,
+      workflow,
+      userMessage,
+      isolationHints,
+      userId,
+      source,
+      options
+    )
+  );
 }
 
 /** A human gate the chat agent resolved during a turn, awaiting continuation. */
@@ -1151,8 +1303,11 @@ interface ResolvedGate {
  * the user a manual `/workflow resume`, not the decision. The whole body is
  * guarded so that guarantee holds for the `finally` this runs from, where a
  * throw would replace the error the user actually needs to see.
+ *
+ * Exported so its continuation behavior can be tested without staging a whole agent turn
+ * with a gate-resolving tool call.
  */
-async function continueResolvedGateRun(
+export async function continueResolvedGateRun(
   platform: IPlatformAdapter,
   conversationId: string,
   conversation: Conversation,
@@ -1174,21 +1329,6 @@ async function continueResolvedGateRun(
   };
 
   try {
-    const workflow = findWorkflow(
-      run.workflow_name,
-      workflowsWithSource.map(w => w.workflow)
-    );
-    if (!workflow) {
-      getLog().warn(
-        { conversationId, workflowRunId: run.id, workflowName: run.workflow_name },
-        'orchestrator.gate_continuation_workflow_not_found'
-      );
-      await notify(
-        `${decision}, but workflow \`${run.workflow_name}\` was not found, so the run could not ` +
-          'continue. The decision is recorded — use `/workflow list` to check available workflows.'
-      );
-      return;
-    }
     if (!codebase) {
       getLog().warn(
         { conversationId, workflowRunId: run.id },
@@ -1197,6 +1337,53 @@ async function continueResolvedGateRun(
       await notify(
         `${decision}, but no project is attached to this conversation, so the run could not ` +
           `continue. The decision is recorded — use \`/workflow resume ${run.id}\` from the project.`
+      );
+      return;
+    }
+
+    // The graph this run FROZE. The chat turn's discovery list describes the checkout as
+    // it is NOW, which is the wrong question twice over: a workflow deleted or renamed
+    // since the run started is missing from it, and this path would then refuse a run
+    // whose own captured source still holds it. `/workflow resume` resolves it this way
+    // too — the two gate surfaces must not disagree about what a run is.
+    let resolvedContinuation: WorkflowDefinition | undefined;
+    try {
+      resolvedContinuation = (
+        await resolveContinuationWorkflow(
+          createWorkflowDeps(),
+          run,
+          conversation.cwd ?? codebase.default_cwd
+        )
+      )?.workflow;
+    } catch (error) {
+      const err = toError(error);
+      getLog().error(
+        { err, conversationId, workflowRunId: run.id },
+        'orchestrator.gate_continuation_source_failed'
+      );
+      await notify(
+        `${decision}, but run \`${run.id}\` could not continue: ${err.message} ` +
+          'The decision is recorded — start a fresh run to execute the current workflow.'
+      );
+      return;
+    }
+
+    // Undefined only for a run predating captures: fall back to the live list, exactly
+    // as that run's executor does.
+    const workflow =
+      resolvedContinuation ??
+      findWorkflow(
+        run.workflow_name,
+        workflowsWithSource.map(w => w.workflow)
+      );
+    if (!workflow) {
+      getLog().warn(
+        { conversationId, workflowRunId: run.id, workflowName: run.workflow_name },
+        'orchestrator.gate_continuation_workflow_not_found'
+      );
+      await notify(
+        `${decision}, but workflow \`${run.workflow_name}\` was not found, so the run could not ` +
+          'continue. The decision is recorded — use `/workflow list` to check available workflows.'
       );
       return;
     }
@@ -1218,7 +1405,9 @@ async function continueResolvedGateRun(
         isolationHints,
         userId,
         source,
-        { resumeRunId: run.id, resumeRun: run }
+        // Already verified and discovered above; dispatch reuses it rather than
+        // resolving the same capture a second time.
+        { resumeRunId: run.id, resumeRun: run, resolvedContinuation }
       );
       getLog().info(
         { conversationId, workflowRunId: run.id, workflowName: workflow.name, action },
@@ -1368,12 +1557,17 @@ async function discoverAllWorkflows(conversation: Conversation): Promise<Discove
           }
         }
         const workflowCwd = conversation.cwd ?? codebase.default_cwd;
-        await syncArchonToWorktree(workflowCwd);
+        // Read workflows from the authoring repo rather than copying its `.archon` into
+        // this worktree first. Config still comes from `workflowCwd` — settings belong to
+        // the workspace being acted on.
+        const workflowSourceRoot = await resolveWorkflowSourceRoot(workflowCwd);
         // Load config once for this codebase path; reuse below to avoid a second disk read
         const loadedConfig = await loadConfig(workflowCwd);
         config = loadedConfig;
-        const repoResult = await discoverWorkflowsWithConfig(workflowCwd, () =>
-          Promise.resolve(loadedConfig)
+        const repoResult = await discoverWorkflowsWithConfig(
+          workflowCwd,
+          () => Promise.resolve(loadedConfig),
+          workflowSourceRoot === undefined ? undefined : liveSourceRoots(workflowSourceRoot)
         );
         const workflowMap = new Map(workflows.map(w => [w.workflow.name, w]));
         for (const rw of repoResult.workflows) {
@@ -1553,6 +1747,7 @@ export async function handleMessage(
               force: result.workflow.force,
               resumeRunId: result.workflow.resumeRunId,
               resumeRun: result.workflow.resumeRun,
+              resolvedContinuation: result.workflow.resolvedContinuation,
               parseWarnings: result.workflow.parseWarnings,
               // Declared inputs (#2554) arrive on the request context, not in the
               // command text — the run route is the only caller that sets them.
@@ -3140,18 +3335,28 @@ async function handleWorkflowRunCommand(
     // Auto-select the only project
     const codebase = codebases[0];
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
+    // Authoring root for discovery (the canonical repo when `workflowCwd` is a worktree).
+    // This THROWS when git cannot answer — the docblock that once said otherwise was
+    // corrected, and this caller had copied the old claim. Guarded rather than propagated
+    // because this branch only LISTS workflows to validate a name: degrading to the cwd
+    // shows a slightly narrower list, while failing would refuse the command outright.
+    let workflowSourceRoot: string | undefined;
     try {
-      await syncArchonToWorktree(workflowCwd);
+      workflowSourceRoot = await resolveWorkflowSourceRoot(workflowCwd);
     } catch (error) {
-      getLog().debug(
+      getLog().warn(
         { err: error as Error, workflowCwd },
-        'workflow_sync_before_validation_failed'
+        'workflow.source_root_unresolved_listing'
       );
     }
 
     let discovery;
     try {
-      discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
+      discovery = await discoverWorkflowsWithConfig(
+        workflowCwd,
+        loadConfig,
+        workflowSourceRoot === undefined ? undefined : liveSourceRoots(workflowSourceRoot)
+      );
     } catch (error) {
       const err = error as Error;
       getLog().error({ err, cwd: workflowCwd }, 'workflow_discovery_failed');

@@ -289,6 +289,13 @@ export class WorkflowNotResumableError extends Error {
 }
 
 export async function createWorkflowRun(data: {
+  /**
+   * Caller-reserved row id. Supplied when something had to exist at this run's own
+   * paths before the row could be written — today that is the workflow-source capture,
+   * which is frozen (and, for a container, bind-mounted) before the workflow is even
+   * selected. Omitted, the database generates one as it always has.
+   */
+  id?: string;
   workflow_name: string;
   conversation_id: string;
   codebase_id?: string;
@@ -331,9 +338,14 @@ export async function createWorkflowRun(data: {
 
   try {
     const result = await pool.query<WorkflowRun>(
-      `INSERT INTO remote_agent_workflow_runs
+      data.id === undefined
+        ? `INSERT INTO remote_agent_workflow_runs
        (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id, user_id, parent_run_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`
+        : `INSERT INTO remote_agent_workflow_runs
+       (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id, user_id, parent_run_id, id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
       [
         data.workflow_name,
@@ -345,6 +357,7 @@ export async function createWorkflowRun(data: {
         data.parent_conversation_id ?? null,
         data.user_id ?? null,
         data.parent_run_id ?? null,
+        ...(data.id === undefined ? [] : [data.id]),
       ]
     );
     const row = result.rows[0];
@@ -1002,6 +1015,16 @@ export async function completeWorkflowRun(
   }
 }
 
+/**
+ * Mark a run failed.
+ *
+ * Matches `pending` as well as `running`. A run can fail BEFORE it ever transitions to
+ * running — source capture, artifact setup, and credential resolution all happen against
+ * a freshly inserted `pending` row — and a `running`-only guard left those rows pending
+ * forever: no terminal state, no error recorded, and nothing to tell the operator the run
+ * is dead. Both are non-terminal states owned by this process, so failing either is the
+ * same decision. Terminal rows still never transition.
+ */
 export async function failWorkflowRun(id: string, error: string): Promise<void> {
   const dialect = getDialect();
   let result: Awaited<ReturnType<IDatabase['query']>>;
@@ -1009,7 +1032,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
     result = await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status = 'running'`,
+       WHERE id = $1 AND status IN ('running', 'pending')`,
       [id, JSON.stringify({ error })]
     );
   } catch (dbError) {
@@ -1019,7 +1042,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
   }
   if (result.rowCount === 0) {
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_fail_no_match');
-    throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    throw new Error(`Workflow run not found or already terminal (id: ${id})`);
   }
 }
 

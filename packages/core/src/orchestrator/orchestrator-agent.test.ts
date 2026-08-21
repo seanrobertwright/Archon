@@ -146,9 +146,72 @@ const mockHydrateResumableRun = mock(
       priorCompletedNodes: new Map([['n1', 'v1']]),
     }) as unknown
 );
+/** Ownership calls the dispatch path makes on its capture, in order. */
+const capturedSourceOwnerCalls: string[] = [];
+
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   hydrateResumableRun: mockHydrateResumableRun,
+  // Source capture runs before dispatch and does real filesystem work; stub it so these
+  // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
+  // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
+  prepareWorkflowSource: mock(() =>
+    Promise.resolve({
+      runId: 'prepared-run-id',
+      captureRoot: '/capture',
+      origin: '/origin',
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/origin',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/capture/project',
+        globalWorkflows: '/capture/global/workflows',
+        globalCommands: '/capture/global/commands',
+        globalScripts: '/capture/global/scripts',
+        bundledWorkflows: '/capture/bundled',
+      },
+    })
+  ),
+  recordSelectedWorkflow: mock(() => Promise.resolve()),
+  disposeWorkflowSource: mock(() => Promise.resolve()),
+  resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
+  withCapturedSource: mock(
+    async (
+      body: (owner: {
+        hold: (prepared: { captureRoot: string }) => void;
+        adopt: () => void;
+      }) => Promise<unknown>
+    ) => {
+      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim. A stub
+      // that swallowed the owner would let a dropped adopt() through, and one that
+      // recorded only hold/adopt would still miss an adopt that arrives after the body
+      // returns — by which time the real wrapper has already deleted the capture a live
+      // run is executing from. Recording the reclaim in order is what distinguishes them.
+      let held: string | undefined;
+      let adopted = false;
+      try {
+        return await body({
+          hold: prepared => {
+            held = prepared.captureRoot;
+            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
+          },
+          adopt: () => {
+            adopted = true;
+            capturedSourceOwnerCalls.push('adopt');
+          },
+        });
+      } finally {
+        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
+      }
+    }
+  ),
 }));
 
 /** Baseline capabilities the mocked registry reports. Tests that narrow this
@@ -277,8 +340,8 @@ mock.module('@archon/isolation', () => ({
   classifyIsolationError: (err: Error) => err.message,
 }));
 
-mock.module('../utils/worktree-sync', () => ({
-  syncArchonToWorktree: mock(() => Promise.resolve()),
+mock.module('../utils/workflow-source-root', () => ({
+  resolveWorkflowSourceRoot: mock(() => Promise.resolve(undefined)),
 }));
 
 mock.module('@archon/git', () => ({
@@ -347,6 +410,7 @@ import {
   handleMessage,
   resolveChatModelRequest,
   resolveTitleRequest,
+  continueResolvedGateRun,
 } from './orchestrator-agent';
 import { buildAiProfile } from '@archon/workflows/model-validation';
 
@@ -1887,6 +1951,7 @@ describe('workflow dispatch routing — interactive flag', () => {
   }
 
   beforeEach(() => {
+    capturedSourceOwnerCalls.length = 0;
     mockExecuteWorkflow.mockClear();
     mockDispatchBackgroundWorkflow.mockClear();
     mockFindResumableRunByParentConversation.mockClear();
@@ -2289,6 +2354,51 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(sent).toContain("requires input 'diff'");
     expect(sent).toContain('--input');
     expect(sent).not.toContain('reusable block');
+  });
+
+  test('hands the capture to a fresh foreground run', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'adopt']);
+  });
+
+  test('keeps holding the capture when the dispatch refuses after taking it', async () => {
+    // The invocation gate fires AFTER the capture, so every refusal past that point has a
+    // frozen tree to reclaim. Nothing starts, so nothing owns it.
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve(makeWorkflowResult(true, { inputs: { diff: { required: true } } }))
+    );
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'reclaim:/capture']);
+  });
+
+  test('a continuation takes no capture at all', async () => {
+    // It executes the source its run already froze. Capturing here would freeze current
+    // bytes the run never agreed to AND leave a staged tree nothing adopts.
+    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
+    (prepareWorkflowSource as ReturnType<typeof mock>).mockClear();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(makeResumableRun({ id: 'paused-run', status: 'paused' }))
+    );
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
+
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(prepareWorkflowSource).not.toHaveBeenCalled();
+    expect(capturedSourceOwnerCalls).toEqual([]);
   });
 
   test('refuses an undeclared supplied key, starting nothing', async () => {
@@ -5274,5 +5384,153 @@ describe('resolveTitleRequest', () => {
     const req = await resolveTitleRequest('codex', 'user-1');
 
     expect(req).toEqual({ provider: 'codex', options: {} });
+  });
+});
+
+describe('continueResolvedGateRun — chat gate continuation source (#2646)', () => {
+  function makeGateCodebase(): Codebase {
+    return {
+      id: 'codebase-1',
+      name: 'test-repo',
+      repository_url: null,
+      default_cwd: '/repos/test-repo',
+      default_branch: null,
+      ai_assistant_type: 'claude',
+      commands: {},
+      created_at: new Date(),
+      updated_at: new Date(),
+    } as Codebase;
+  }
+
+  function makeGateRun(): WorkflowRun {
+    return {
+      id: 'run-gated',
+      workflow_name: 'gated',
+      conversation_id: 'conv-1-db',
+      parent_conversation_id: 'conv-1-db',
+      codebase_id: 'codebase-1',
+      status: 'paused',
+      user_message: 'go',
+      metadata: {},
+      started_at: new Date(),
+      completed_at: null,
+      last_activity_at: null,
+      working_path: '/repos/test-repo/worktrees/feature',
+      user_id: null,
+    } as WorkflowRun;
+  }
+
+  beforeEach(async () => {
+    mockExecuteWorkflow.mockClear();
+    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
+    // Reset, not clear: a queued `…Once` value that a test never consumes would otherwise
+    // leak into the next one. Restores the factory default — a run predating captures.
+    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockReset();
+    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+  });
+
+  test("continues with the graph the run froze, not the chat turn's discovery list", async () => {
+    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
+    const frozen = makeTestWorkflow({ name: 'gated', description: 'frozen' });
+    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflow: frozen,
+      roots: { kind: 'captured' },
+      workflows: [{ workflow: frozen, source: 'project' }],
+      errors: [],
+    });
+
+    await continueResolvedGateRun(
+      makePlatform(),
+      'conv-1',
+      makeConversation({ codebase_id: 'codebase-1' }),
+      makeGateCodebase(),
+      // What the checkout holds now: same name, edited since the run paused.
+      [makeTestWorkflowWithSource({ name: 'gated', description: 'edited' })],
+      makeGateRun(),
+      'approve'
+    );
+
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    const executed = (mockExecuteWorkflow.mock.calls[0] as unknown[])[4] as {
+      description?: string;
+    };
+    expect(executed.description).toBe('frozen');
+  });
+
+  test('continues a run whose workflow the current checkout no longer has', async () => {
+    // The refusal this replaces was a false one: the chat turn's list describes the
+    // checkout, and a workflow deleted or renamed since the run started is missing from
+    // it — while the run's own captured source still holds exactly what it was running.
+    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
+    const frozen = makeTestWorkflow({ name: 'gated', description: 'frozen' });
+    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflow: frozen,
+      roots: { kind: 'captured' },
+      workflows: [{ workflow: frozen, source: 'project' }],
+      errors: [],
+    });
+
+    const platform = makePlatform();
+    await continueResolvedGateRun(
+      platform,
+      'conv-1',
+      makeConversation({ codebase_id: 'codebase-1' }),
+      makeGateCodebase(),
+      [], // workflow gone from the checkout
+      makeGateRun(),
+      'approve'
+    );
+
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      c => (c as unknown[])[1] as string
+    );
+    expect(messages.some(m => m.includes('was not found'))).toBe(false);
+  });
+
+  test('a run predating captures still resolves from the live list', async () => {
+    // resolveContinuationWorkflow returns undefined for it, and the fallback is the only
+    // thing that can name its graph.
+    await continueResolvedGateRun(
+      makePlatform(),
+      'conv-1',
+      makeConversation({ codebase_id: 'codebase-1' }),
+      makeGateCodebase(),
+      [makeTestWorkflowWithSource({ name: 'gated', description: 'live' })],
+      makeGateRun(),
+      'approve'
+    );
+
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    const executed = (mockExecuteWorkflow.mock.calls[0] as unknown[])[4] as {
+      description?: string;
+    };
+    expect(executed.description).toBe('live');
+  });
+
+  test('an unreadable captured source refuses instead of running something else', async () => {
+    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
+    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('captured source digest mismatch')
+    );
+
+    const platform = makePlatform();
+    await continueResolvedGateRun(
+      platform,
+      'conv-1',
+      makeConversation({ codebase_id: 'codebase-1' }),
+      makeGateCodebase(),
+      [makeTestWorkflowWithSource({ name: 'gated', description: 'edited' })],
+      makeGateRun(),
+      'approve'
+    );
+
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      c => (c as unknown[])[1] as string
+    );
+    expect(messages.some(m => m.includes('digest mismatch'))).toBe(true);
   });
 });

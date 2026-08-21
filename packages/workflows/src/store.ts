@@ -127,6 +127,12 @@ export interface IWorkflowRunNodeSessionStore {
 export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionStore {
   // Run lifecycle
   createWorkflowRun(data: {
+    /**
+     * Caller-reserved row id, from `prepareWorkflowSource`. Supplied when the run's
+     * frozen workflow source had to be written at this run's own artifacts path before
+     * the row existed. Omitted, the store generates one.
+     */
+    id?: string;
     workflow_name: string;
     conversation_id: string;
     codebase_id?: string;

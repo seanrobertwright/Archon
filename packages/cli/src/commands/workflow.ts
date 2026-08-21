@@ -43,7 +43,19 @@ import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolat
 import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
-import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import {
+  disposeWorkflowSource,
+  executeWorkflow,
+  finalizeWorkflowSource,
+  hydrateResumableRun,
+  prepareWorkflowSource,
+  recordSelectedWorkflow,
+  resolveContinuationWorkflow,
+  withCapturedSource,
+  type CapturedSourceOwner,
+  type PreparedWorkflowSource,
+  type ResolvedContinuation,
+} from '@archon/workflows/executor';
 import {
   assertWorkflowRequirementsMet,
   resolveTopLevelInputs,
@@ -202,11 +214,29 @@ export interface WorkflowRunOptions {
   resume?: boolean;
   codebaseId?: string; // Skips path-based codebase lookup when resume/approve/reject already resolved it
   /**
-   * Override the directory used for workflow YAML discovery.
+   * Override the directory used for workflow YAML discovery — and, for a fresh run,
+   * the source the run captures.
+   *
    * Pass `codebase.default_cwd` here so the source repo is searched even when
-   * `working_path` is a worktree or workspace clone that lacks the file.
+   * `working_path` is a worktree or workspace clone that lacks the file. The public
+   * `--workflow-source <path>` flag sets the same field, which is why one concept
+   * covers both the internal resume/approve lookups and the user-facing split.
    */
   discoveryCwd?: string;
+  /**
+   * The run being continued, when this invocation continues one.
+   *
+   * Resume, approve, and reject re-enter through this command, and they must execute the
+   * source the run FROZE — a workflow that lives only in the authoring checkout is not in
+   * the target at all, and even when it is, re-discovering live resumes the run against a
+   * different graph. The whole run is passed, not just its capture path, because
+   * `resolveContinuationWorkflow` needs the recorded digest to verify against.
+   *
+   * Optional because `run <name> --resume` names the run indirectly; that form resolves the
+   * row itself, before discovery, and joins the same path. `resume` alone therefore never
+   * means live discovery.
+   */
+  continuationRun?: WorkflowRun;
   quiet?: boolean;
   verbose?: boolean;
   /** Platform conversation ID (e.g. `cli-{ts}-{rand}`), NOT a DB UUID. */
@@ -776,8 +806,12 @@ function renderWorkflowEvent(event: WorkflowEmitterEvent, verbose: boolean): voi
 }
 
 /**
- * Load workflows from cwd with standardized error handling.
- * Returns the WorkflowLoadResult with both workflows and errors.
+ * Load workflows from the DISCOVERY root with standardized error handling.
+ *
+ * The root passed here owns both the workflow files and the `defaults:` /
+ * `commands.folder` settings that govern how they are discovered — a workflow's own
+ * checkout decides which command folder its command nodes name. What the run then DOES
+ * is governed separately by the target's config, loaded inside `executeWorkflow`.
  */
 async function loadWorkflows(cwd: string): Promise<WorkflowLoadResult> {
   try {
@@ -908,14 +942,86 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 /**
  * Run a specific workflow
  */
-export async function workflowRunCommand(
+async function runWorkflowWithOwnedSource(
+  owner: CapturedSourceOwner,
   cwd: string,
   workflowName: string,
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
   const effectiveDiscoveryCwd = options.discoveryCwd ?? cwd;
-  const { workflows: workflowEntries, errors } = await loadWorkflows(effectiveDiscoveryCwd);
+
+  // Freeze the source BEFORE discovering, then discover from the frozen copy. Discovering
+  // first and capturing after would leave a window where the YAML this run executes and
+  // the commands and scripts it calls come from two different moments — the drift the
+  // capture exists to remove, reintroduced at the one place nobody would look for it.
+  //
+  // A dry run creates no run and no artifacts, so it has nothing to freeze into and reads
+  // live, exactly as it did before captures existed.
+  // Continuing an existing run: discover from the source it recorded, and take no new
+  // capture. The MANIFEST supplies the settings those roots resolve under — building them
+  // from defaults instead re-discovered a different DAG on any repo with a non-default
+  // `commands.folder`, confidently rather than degraded, because a defined-but-default
+  // config also suppresses discovery's live-config fallback.
+  // Continuation goes through the shared entry point, like chat and web. The CLI used to
+  // hand-roll the same load/rebuild/discover sequence: correct at the time, which is the
+  // risk — a change to the shared path would silently not reach CLI resume, and that is
+  // exactly the shape that produced the mixed-vintage and default-settings bugs.
+  //
+  // `run <name> --resume` is a continuation too, but it arrives as a flag rather than as a
+  // run: its row is only located much further down, where it binds the worktree. That is
+  // too late to choose the graph. Resolving it here is what makes every resume form — this
+  // flag, `resume <id>`, approve, reject, parent auto-resume — reach the shared entry point
+  // with a run in hand, and it also stops the id-based forms re-finding by name a run they
+  // already identified exactly (#2645).
+  let resumeLookupError: Error | undefined;
+  let continuationRun = options.continuationRun;
+  if (continuationRun === undefined && options.resume === true) {
+    try {
+      continuationRun = (await workflowDb.findResumableRun(workflowName, cwd)) ?? undefined;
+    } catch (error) {
+      // The resume block below owns the actionable message for a database that cannot
+      // answer, and reports the codebase failure first. Nothing executes before it.
+      resumeLookupError = error as Error;
+    }
+  }
+
+  let continuation: ResolvedContinuation | undefined;
+  if (continuationRun !== undefined) {
+    continuation = await resolveContinuationWorkflow(createWorkflowDeps(), continuationRun, cwd);
+  }
+
+  // A continuation never captures. With a record it reads that record (above); without
+  // one it is a run created before captures existed, and reads live source — the same
+  // legacy path the executor takes for it. Capturing here would freeze bytes the run
+  // never agreed to and still not make it deterministic.
+  const isContinuation = options.resume === true || continuationRun !== undefined;
+
+  let preparedSource: PreparedWorkflowSource | undefined;
+  // Mirrors the owner's own flag, readable from the signal handler — which exits the
+  // process rather than returning, so it cannot consult the owner's closure.
+  let sourceAdopted = false;
+  if (!isContinuation && !options.dryRun && !options.stubsInitPath) {
+    try {
+      preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
+        sourceRoot: effectiveDiscoveryCwd,
+      });
+      // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+      owner.hold(preparedSource);
+    } catch (error) {
+      throw new Error(
+        `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
+      );
+    }
+  }
+
+  // A resolved continuation already discovered over its own roots; reusing that result is
+  // what keeps a resume from paying digest verification and full discovery twice.
+  const { workflows: workflowEntries, errors } = continuation
+    ? { workflows: continuation.workflows, errors: continuation.errors }
+    : preparedSource
+      ? await discoverWorkflowsWithConfig(cwd, loadConfig, preparedSource.roots)
+      : await loadWorkflows(effectiveDiscoveryCwd);
   const sourceCounts = countWorkflowSources(workflowEntries);
 
   if (!options.json && !options.quiet) {
@@ -927,17 +1033,26 @@ export async function workflowRunCommand(
   }
 
   if (workflowEntries.length === 0 && errors.length === 0) {
+    // No manual cleanup here or anywhere else in this function: the owner reclaims
+    // anything unadopted on the way out, which is the point of having one.
     throw new Error('No workflows found in .archon/workflows/');
   }
 
   const workflows = workflowEntries.map(ws => ws.workflow);
 
-  const workflow = resolveWorkflowName(workflowName, workflows);
+  // A continuation executes the graph it froze; only a fresh invocation resolves by name.
+  const workflow = continuation?.workflow ?? resolveWorkflowName(workflowName, workflows);
   // Recover the discovery entry (dropped by the .map above) for telemetry —
   // bundled workflows report their real name, custom ones report "custom" —
   // and for the parse warnings surfaced just below.
   const workflowEntry = workflow ? workflowEntries.find(ws => ws.workflow === workflow) : undefined;
   const workflowSource = workflowEntry?.source;
+
+  // Name the selection in the capture's manifest, now that it is known. The manifest is
+  // outside the digest, so this records provenance without disturbing what was frozen.
+  if (workflow && preparedSource) {
+    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+  }
 
   if (!workflow) {
     // Check if the requested workflow had a load error
@@ -1009,15 +1124,18 @@ export async function workflowRunCommand(
       options.inputs ? parseInputAssignments(options.inputs) : undefined
     );
 
+    // Relative stub paths resolve from `--cwd`, as the CLI reference states. They are the
+    // operator's dry-run inputs, not part of the workflow's source, so `--workflow-source`
+    // must not silently move where they are read from or written to.
     const stubsPath = options.stubsPath
       ? isAbsolute(options.stubsPath)
         ? options.stubsPath
-        : join(effectiveDiscoveryCwd, options.stubsPath)
+        : join(cwd, options.stubsPath)
       : undefined;
     const stubsInitPath = options.stubsInitPath
       ? isAbsolute(options.stubsInitPath)
         ? options.stubsInitPath
-        : join(effectiveDiscoveryCwd, options.stubsInitPath)
+        : join(cwd, options.stubsInitPath)
       : undefined;
     if (stubsInitPath !== undefined) {
       const scaffold = await writeDryRunStubScaffold(workflow, stubsInitPath);
@@ -1040,11 +1158,14 @@ export async function workflowRunCommand(
     // so a throw means a malformed or unreadable one. Reporting against fabricated
     // defaults would hand the user a clean-looking trace of a run that cannot happen —
     // the same fail-fast reasoning the container-policy load below spells out.
-    const dryRunConfig = await loadConfig(effectiveDiscoveryCwd);
+    // The target workspace, never the authoring root: `--exec-code` runs real bash and
+    // script nodes, and running them in the checkout the workflow was merely READ from
+    // would mutate the author's tree instead of the one they aimed the dry run at.
+    const dryRunConfig = await loadConfig(cwd);
     const result = await dryRunWorkflow({
       workflow,
       userMessage,
-      cwd: effectiveDiscoveryCwd,
+      cwd,
       stubs,
       ...(dryRunInputs ? { inputs: dryRunInputs } : {}),
       execCode: options.execCode,
@@ -1237,7 +1358,16 @@ export async function workflowRunCommand(
     if (options.conversationId === undefined) {
       extraArgs.push('--conversation-id', childConversationId);
     }
+    // Re-pin the source as an ABSOLUTE path (parseArgs is last-wins, same as --cwd).
+    // The original argv may hold a relative `--workflow-source`, and the child is
+    // spawned with a different working directory, so passing it through unresolved
+    // would silently point the child at another directory — or at nothing.
+    if (options.discoveryCwd !== undefined) {
+      extraArgs.push('--workflow-source', options.discoveryCwd);
+    }
 
+    // The detached child captures its own source, so this process's capture is dead
+    // weight — and never adopted, so the owner reclaims it when this returns.
     const logPath = await spawnDetachedWorkflowRun(cwd, childConversationId, extraArgs);
 
     if (options.json) {
@@ -1418,7 +1548,16 @@ export async function workflowRunCommand(
       );
     }
 
-    resumable = await workflowDb.findResumableRun(workflowName, cwd);
+    if (resumeLookupError) {
+      throw new Error(
+        'Cannot resume: Database lookup failed.\n' +
+          `Error: ${resumeLookupError.message}\n` +
+          'Hint: Check your database connection before using --resume.'
+      );
+    }
+    // Resolved before discovery (top of this function), because the graph this run
+    // executes had to be chosen from it.
+    resumable = continuationRun ?? null;
 
     if (!resumable) {
       throw new Error(`No resumable run found for workflow '${workflowName}' at path '${cwd}'.`);
@@ -1578,7 +1717,21 @@ export async function workflowRunCommand(
           'workflow.running_in_container'
         );
         try {
-          prepared = await backend.prepare({ codebase: folderCodebase });
+          // The container fixes its mounts at creation, so the run's source must already
+          // be at its final path. Move it there now; executeWorkflow recomputes the same
+          // destination and skips its own move.
+          if (preparedSource) {
+            preparedSource = await finalizeWorkflowSource(createWorkflowDeps(), preparedSource, {
+              cwd: folderCodebase.defaultCwd,
+              codebaseId: folderCodebase.id,
+            });
+          }
+          prepared = await backend.prepare({
+            codebase: folderCodebase,
+            // Read-only, at the same absolute path inside the container, so a named
+            // script resolves identically on both sides of the boundary.
+            ...(preparedSource ? { sourceMount: preparedSource.captureRoot } : {}),
+          });
         } catch (prepErr) {
           // Map docker/daemon/image failures to an actionable message (daemon down,
           // runner image missing, docker-group permission — see errors.ts).
@@ -1878,6 +2031,15 @@ export async function workflowRunCommand(
           }
         }
       })
+      // Reclaim the staged capture for the same reason the container is destroyed above:
+      // `process.exit(1)` never returns up the stack, so the ownership `finally` — whose
+      // whole premise is "whichever way we leave" — never runs. Ctrl-C during isolation
+      // resolution or worktree creation would otherwise strand a complete frozen tree.
+      .then(async () => {
+        if (preparedSource && !sourceAdopted) {
+          await disposeWorkflowSource(preparedSource).catch(() => undefined);
+        }
+      })
       .catch(() => undefined)
       .finally(() => {
         process.exit(1);
@@ -2016,7 +2178,15 @@ export async function workflowRunCommand(
           resolveChildIsolation,
           // Fresh run only: a resume (`prepared`) replays the inputs already on its row.
           inputs: resolvedInputs,
+          // The frozen source this run executes, captured before the workflow was even
+          // selected. A resume ignores it and loads the source recorded on its own row.
+          preparedSource,
         };
+    // Handing the capture to a run: it now owns the bytes and their lifetime.
+    if (preparedSource) {
+      owner.adopt();
+      sourceAdopted = true;
+    }
     result = await executeWorkflow(
       deps,
       adapter,
@@ -2173,6 +2343,25 @@ export async function workflowRunCommand(
   } else {
     throw new Error(`Workflow failed: ${result.error}`);
   }
+}
+
+/**
+ * Run a specific workflow.
+ *
+ * A thin owner around the implementation: whatever the run does with its captured source,
+ * the capture is either adopted by a run or reclaimed. The implementation has a dozen
+ * ordinary ways out — unknown workflow, refused inputs, flag conflicts, a detached
+ * dispatch — and asking each to remember a disposal call is how most of them did not.
+ */
+export async function workflowRunCommand(
+  cwd: string,
+  workflowName: string,
+  userMessage: string,
+  options: WorkflowRunOptions = {}
+): Promise<void> {
+  await withCapturedSource(owner =>
+    runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, options)
+  );
 }
 
 /**
@@ -2871,6 +3060,8 @@ export async function workflowResumeCommand(
   // itself no longer auto-detects resumable runs).
   try {
     await workflowRunCommand(run.working_path, run.workflow_name, run.user_message ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      continuationRun: run,
       resume: true,
       codebaseId: run.codebase_id ?? undefined,
       discoveryCwd,
@@ -3053,6 +3244,8 @@ export async function workflowApproveCommand(
       : undefined;
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      continuationRun: (await workflowDb.getWorkflowRun(resolvedId)) ?? undefined,
       resume: true,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,
@@ -3180,6 +3373,8 @@ export async function workflowRejectCommand(
       : undefined;
 
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      continuationRun: (await workflowDb.getWorkflowRun(resolvedId)) ?? undefined,
       resume: true,
       codebaseId: result.codebaseId ?? undefined,
       conversationId: platformConversationId,

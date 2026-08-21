@@ -433,6 +433,16 @@ export interface BackendPrepareRequest {
     name: string;
     kind: 'repo' | 'folder';
   };
+  /**
+   * Host path of the run's frozen workflow source, to bind read-only at the SAME
+   * absolute path inside the environment.
+   *
+   * ENGINE-INTERNAL. There is deliberately no YAML or `archon.config` surface for this:
+   * it is one Archon-owned path the engine already knows, not a general mount facility.
+   * Backends that do not isolate the filesystem (in-place) ignore it — the path is
+   * already reachable there.
+   */
+  sourceMount?: string;
 }
 
 /**

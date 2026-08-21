@@ -6,9 +6,10 @@
  * utilities. Single source of truth; no logic changes from either copy.
  */
 import { readFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
@@ -265,18 +266,29 @@ export function detectCreditExhaustion(text: string): string | null {
 /**
  * Load command prompt from file.
  *
+ * Two directories are in play and they are not interchangeable. `cwd` is the workspace
+ * the run acts on: it owns config, and it is where a `commands.folder` setting is read
+ * from. `sourceRoots` is where the command TEXT lives — the authoring checkout, or a
+ * run's frozen capture of it. They describe the same place for an ordinary in-place run
+ * and differ whenever a workflow authored in one checkout executes against another.
+ * Passing `cwd` for both is what made a workflow's own commands invisible inside its
+ * isolated worktree.
+ *
  * @param deps - Workflow dependencies (for config loading)
- * @param cwd - Working directory (repo root)
+ * @param cwd - Target workspace; owns config only
  * @param commandName - Name of the command (without .md extension)
  * @param configuredFolder - Optional additional folder from config to search
+ * @param sourceRoots - Roots to resolve command files under; defaults to reading `cwd` live
  * @returns On success: `{ success: true, content }`. On failure: `{ success: false, reason, message }`.
  */
 export async function loadCommandPrompt(
   deps: Pick<WorkflowDeps, 'loadConfig'>,
   cwd: string,
   commandName: string,
-  configuredFolder?: string
+  configuredFolder?: string,
+  sourceRoots?: WorkflowSourceRoots
 ): Promise<LoadCommandResult> {
+  const roots = sourceRoots ?? liveSourceRoots(cwd);
   // Validate command name first
   if (!isValidCommandName(commandName)) {
     getLog().error({ commandName }, 'invalid_command_name');
@@ -287,34 +299,40 @@ export async function loadCommandPrompt(
     };
   }
 
-  // Load config to check opt-out
-  let config;
-  try {
-    config = await deps.loadConfig(cwd);
-  } catch (error) {
-    const err = error as Error;
-    getLog().warn(
-      {
-        err,
-        cwd,
-        note: 'Default commands will be loaded. Check your .archon/config.yaml if this is unexpected.',
-      },
-      'config_load_failed_using_defaults'
-    );
-    config = { defaults: { loadDefaultCommands: true } };
+  // Opt-out comes from the SOURCE when there is one — a capture carries the settings that
+  // were in force when it was taken, so a resume cannot let the target's `defaults:`
+  // decide whether the bundled scope counts. Falls back to reading `cwd` live.
+  let loadDefaultCommands = sourceRoots?.config.load_default_commands;
+  if (loadDefaultCommands === undefined) {
+    try {
+      loadDefaultCommands = (await deps.loadConfig(cwd)).defaults?.loadDefaultCommands ?? true;
+    } catch (error) {
+      const err = error as Error;
+      getLog().warn(
+        {
+          err,
+          cwd,
+          note: 'Default commands will be loaded. Check your .archon/config.yaml if this is unexpected.',
+        },
+        'config_load_failed_using_defaults'
+      );
+      loadDefaultCommands = true;
+    }
   }
 
   const packaged = parsePackagedResourceReference(commandName);
   if (packaged !== null) {
     if (packaged.owner.source === 'bundled') {
-      if (config.defaults?.loadDefaultCommands === false) {
+      if (!loadDefaultCommands) {
         return {
           success: false,
           reason: 'not_found',
           message: `Packaged command not found: ${packaged.name}.md`,
         };
       }
-      if (isBinaryBuild()) {
+      // A captured run reads the bundled bytes IT froze, even in a binary: the capture
+      // materialized the constants to files, and those are what its digest covers.
+      if (isBinaryBuild() && roots.kind === 'live') {
         const content = BUNDLED_COMMANDS[commandName];
         if (content === undefined) {
           return {
@@ -336,11 +354,18 @@ export async function loadCommandPrompt(
 
     let workflowsRoot: string;
     if (packaged.owner.source === 'project') {
-      workflowsRoot = join(cwd, '.archon', 'workflows');
+      if (roots.project === null) {
+        return {
+          success: false,
+          reason: 'not_found',
+          message: `Packaged command not found (no project source): ${packaged.name}.md`,
+        };
+      }
+      workflowsRoot = join(roots.project, '.archon', 'workflows');
     } else if (packaged.owner.source === 'global') {
-      workflowsRoot = archonPaths.getHomeWorkflowsPath();
+      workflowsRoot = roots.globalWorkflows;
     } else {
-      workflowsRoot = dirname(archonPaths.getDefaultWorkflowsPath());
+      workflowsRoot = roots.bundledWorkflows;
     }
     const filePath = join(
       getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
@@ -384,10 +409,16 @@ export async function loadCommandPrompt(
   // Each scope is walked 1 subfolder deep so `triage/review.md` resolves as
   // `review` — matching the workflows/scripts convention. Resolution
   // precedence: repo > home (~/.archon/commands/) > bundled/app defaults.
-  const searchPaths = archonPaths.getCommandFolderSearchPaths(configuredFolder);
+  // The SOURCE's command folder, when a capture supplied one. `configuredFolder` is the
+  // target's, which is the right answer only for an in-place run — for a captured run it
+  // would search folders the frozen source never used.
+  const searchPaths = archonPaths.getCommandFolderSearchPaths(
+    sourceRoots?.config.command_folder ?? configuredFolder
+  );
+  const projectRoot = roots.project;
   const resolvedSearchPaths: string[] = [
-    ...searchPaths.map(folder => join(cwd, folder)),
-    archonPaths.getHomeCommandsPath(),
+    ...(projectRoot !== null ? searchPaths.map(folder => join(projectRoot, folder)) : []),
+    roots.globalCommands,
   ];
 
   for (const dir of resolvedSearchPaths) {
@@ -431,9 +462,9 @@ export async function loadCommandPrompt(
   }
 
   // If not found in repo/home and app defaults enabled, search app defaults
-  const loadDefaultCommands = config.defaults?.loadDefaultCommands ?? true;
   if (loadDefaultCommands) {
-    if (isBinaryBuild()) {
+    // A captured run reads the bundled command bytes IT froze; see the note above.
+    if (isBinaryBuild() && roots.kind === 'live') {
       // Binary: check bundled commands
       const bundledContent = BUNDLED_COMMANDS[commandName];
       if (bundledContent) {
@@ -442,8 +473,9 @@ export async function loadCommandPrompt(
       }
       getLog().debug({ commandName }, 'command_bundled_not_found');
     } else {
-      // Bun: load from filesystem (walk 1 level deep so `defaults/archon-*.md` resolves)
-      const appDefaultsPath = archonPaths.getDefaultCommandsPath();
+      // Bun (or any captured run): load from the bundled-commands root, walking 1 level
+      // deep so `defaults/archon-*.md` resolves.
+      const appDefaultsPath = roots.bundledCommands;
       const entries = await archonPaths.findMarkdownFilesRecursive(appDefaultsPath, '', {
         maxDepth: 1,
       });

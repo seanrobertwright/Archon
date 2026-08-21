@@ -1872,35 +1872,34 @@ describe('WorktreeProvider', () => {
       provider = new WorktreeProvider(configLoader);
 
       copyWorktreeFilesSpy.mockResolvedValue([
-        { source: '.archon', destination: '.archon' },
         { source: '.env.example', destination: '.env' },
         { source: '.vscode/settings.json', destination: '.vscode/settings.json' },
       ]);
 
       await provider.create(baseRequest);
 
-      // Should include default .archon plus user config
+      // Exactly what the operator configured, in order — nothing prepended.
       expect(copyWorktreeFilesSpy).toHaveBeenCalledWith(
         '/.archon/workspaces/owner/repo',
         expect.stringContaining('issue-42'),
-        expect.arrayContaining(['.archon', '.env.example -> .env', '.vscode/settings.json'])
+        ['.env.example -> .env', '.vscode/settings.json']
       );
     });
 
-    test('calls copyWorktreeFiles with default .archon when no copyFiles configured', async () => {
+    test('copies nothing when no copyFiles are configured', async () => {
       copyWorktreeFilesSpy.mockResolvedValue([]);
 
       await provider.create(baseRequest);
 
-      // Should still be called with default .archon
-      expect(copyWorktreeFilesSpy).toHaveBeenCalledWith(
-        '/.archon/workspaces/owner/repo',
-        expect.stringContaining('issue-42'),
-        ['.archon']
-      );
+      // A worktree already holds the repo's tracked files. The implicit `.archon` copy
+      // that used to happen here also carried IGNORED content (`.archon/.env`, cross-run
+      // `state/`) and overwrote the worktree's own tracked `.archon` with another
+      // branch's, which is what put authoring files into the target's git status and its
+      // validators' inputs. Workflow source now travels with the run instead.
+      expect(copyWorktreeFilesSpy).not.toHaveBeenCalled();
     });
 
-    test('calls copyWorktreeFiles with default .archon when copyFiles is empty', async () => {
+    test('copies nothing when copyFiles is configured empty', async () => {
       const configLoader: RepoConfigLoader = async () => ({
         baseBranch: git.toBranchName('main'),
         copyFiles: [],
@@ -1911,12 +1910,7 @@ describe('WorktreeProvider', () => {
 
       await provider.create(baseRequest);
 
-      // Should still be called with default .archon
-      expect(copyWorktreeFilesSpy).toHaveBeenCalledWith(
-        '/.archon/workspaces/owner/repo',
-        expect.stringContaining('issue-42'),
-        ['.archon']
-      );
+      expect(copyWorktreeFilesSpy).not.toHaveBeenCalled();
     });
 
     test('throws with config error details when config load fails and no fromBranch', async () => {
@@ -1963,51 +1957,39 @@ describe('WorktreeProvider', () => {
       expect(copyWorktreeFilesSpy).not.toHaveBeenCalled();
     });
 
-    test('should copy .archon directory by default (without config)', async () => {
-      // Mock: copyWorktreeFiles succeeds
-      copyWorktreeFilesSpy.mockResolvedValue([{ source: '.archon', destination: '.archon' }]);
+    test('leaves the worktree clean when nothing is configured to copy', async () => {
+      copyWorktreeFilesSpy.mockResolvedValue([]);
 
-      // Create worktree
       const result = await provider.create(baseRequest);
 
-      // Verify .archon was copied even without config
-      expect(copyWorktreeFilesSpy).toHaveBeenCalledWith(
-        '/.archon/workspaces/owner/repo',
-        expect.stringContaining('issue-42'),
-        ['.archon'] // Default only
-      );
-
+      expect(copyWorktreeFilesSpy).not.toHaveBeenCalled();
       expect(result.workingPath).toContain('issue-42');
     });
 
-    test('should merge .archon default with user copyFiles config', async () => {
-      // Mock: User config with additional files
+    test('copies exactly the user copyFiles config', async () => {
       const configLoader: RepoConfigLoader = async () => ({
         baseBranch: git.toBranchName('main'),
         copyFiles: ['.env', '.vscode'],
       });
       provider = new WorktreeProvider(configLoader);
 
-      // Mock: copyWorktreeFiles succeeds
       copyWorktreeFilesSpy.mockResolvedValue([
-        { source: '.archon', destination: '.archon' },
         { source: '.env', destination: '.env' },
         { source: '.vscode', destination: '.vscode' },
       ]);
 
-      // Create worktree
       await provider.create(baseRequest);
 
-      // Verify .archon + user files were copied
       expect(copyWorktreeFilesSpy).toHaveBeenCalledWith(
         '/.archon/workspaces/owner/repo',
         expect.stringContaining('issue-42'),
-        expect.arrayContaining(['.archon', '.env', '.vscode'])
+        ['.env', '.vscode']
       );
     });
 
-    test('should deduplicate .archon if user explicitly includes it', async () => {
-      // Mock: User config explicitly includes .archon
+    test('still honors .archon when the operator lists it explicitly', async () => {
+      // The migration path off the removed implicit copy: an operator who genuinely
+      // wants `.archon` in the worktree names it, and gets it exactly once.
       const configLoader: RepoConfigLoader = async () => ({
         baseBranch: git.toBranchName('main'),
         copyFiles: ['.archon', '.env'],

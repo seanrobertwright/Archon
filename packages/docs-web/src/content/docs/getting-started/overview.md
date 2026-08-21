@@ -393,7 +393,7 @@ commands:
   folder: .claude/commands/archon    # additional command search path
 worktree:
   copyFiles:                         # gitignored files/dirs to copy into worktrees
-    - .env                           # (`.archon/` is copied automatically — no need to list it)
+    - .env                           # nothing is copied unless listed here
     - plans/
 ```
 

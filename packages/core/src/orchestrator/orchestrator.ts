@@ -49,6 +49,17 @@ import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
+import {
+  prepareWorkflowSource,
+  recordSelectedWorkflow,
+  withCapturedSource,
+  type CapturedSourceOwner,
+  type PreparedWorkflowSource,
+} from '@archon/workflows/executor';
+import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import { resolveWorkflowName } from '@archon/workflows/router';
+import { loadConfig } from '../config/config-loader';
 import { assertComposedGateDriveable } from '@archon/workflows/utils/workflow-requirements';
 import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
@@ -307,7 +318,8 @@ export interface WorkflowRoutingContext {
  * Creates a hidden worker conversation, sets up event bridging from worker to parent,
  * and fires-and-forgets the workflow execution.
  */
-export async function dispatchBackgroundWorkflow(
+async function dispatchBackgroundWorkflowOwned(
+  owner: CapturedSourceOwner,
   ctx: WorkflowRoutingContext,
   workflow: WorkflowDefinition,
   isolationContext?: {
@@ -439,13 +451,62 @@ export async function dispatchBackgroundWorkflow(
     unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformId, ctx.conversationId);
   }
 
+  const workflowDeps = createWorkflowDeps();
+
+  // Freeze this run's executable source, then re-resolve the workflow FROM the frozen
+  // copy so the definition executed and the commands and scripts beside it are one
+  // consistent set of bytes. This background path calls `executeWorkflow` directly, so
+  // without its own capture it would be the one surface still reading live source.
+  //
+  // `workerCwd` is frequently a worktree, whose `.archon` belongs to whatever branch it
+  // is on rather than to the author; the canonical repo is what gets captured.
+  const workflowSourceRoot = await resolveWorkflowSourceRoot(workerCwd);
+  let preparedSource: PreparedWorkflowSource | undefined;
+  try {
+    preparedSource = await prepareWorkflowSource(workflowDeps, {
+      sourceRoot: workflowSourceRoot ?? workerCwd,
+    });
+    // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+    owner.hold(preparedSource);
+    // See the note in orchestrator-agent.ts: an empty capture means the definition came
+    // from a binary's embedded bundled set, which has nothing on disk to re-read.
+    if (preparedSource.manifest.scopes.length > 0) {
+      const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
+        workerCwd,
+        loadConfig,
+        preparedSource.roots
+      );
+      const reResolved = resolveWorkflowName(
+        workflow.name,
+        capturedWorkflows.map(w => w.workflow)
+      );
+      if (!reResolved) {
+        throw new Error(`workflow '${workflow.name}' is not present in the captured source`);
+      }
+      workflow = reResolved;
+    }
+    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+  } catch (error) {
+    const err = error as Error;
+    // Reclaim before returning: this branch is the console's default dispatch path, and
+    // leaving the tree behind here leaks one capture per failed dispatch.
+    getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+    await ctx.platform.sendMessage(
+      ctx.conversationId,
+      `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
+        'Nothing has been started.'
+    );
+    return;
+  }
+
   // 7. Pre-create workflow run row so the UI can fetch it immediately.
   // Without this, navigating to the execution page before executeWorkflow's
   // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
-  const workflowDeps = createWorkflowDeps();
   let preCreatedRun: Awaited<ReturnType<typeof workflowDeps.store.createWorkflowRun>> | undefined;
   try {
     preCreatedRun = await workflowDeps.store.createWorkflowRun({
+      // The id its already-written source capture is filed under.
+      id: preparedSource.runId,
       workflow_name: workflow.name,
       conversation_id: workerConv.id,
       codebase_id: ctx.codebaseId,
@@ -473,6 +534,8 @@ export async function dispatchBackgroundWorkflow(
   void (async (): Promise<void> => {
     try {
       try {
+        // Handing the capture to a run: it owns the bytes and their lifetime now.
+        if (preparedSource) owner.adopt();
         const result = await executeWorkflow(
           workflowDeps,
           ctx.platform,
@@ -492,6 +555,7 @@ export async function dispatchBackgroundWorkflow(
             parseWarnings: ctx.parseWarnings,
             baseBranch: codebaseBaseBranch,
             resolveChildIsolation,
+            preparedSource,
             // Only consumed when `preCreatedRun` is undefined (pre-creation failed and
             // the executor creates the row itself); otherwise the row above already
             // carries them.
@@ -582,6 +646,28 @@ export async function dispatchBackgroundWorkflow(
       getLog().error({ err: toError(outerError) }, 'background_workflow_unhandled_error');
     }
   })();
+}
+
+/**
+ * Dispatch a workflow in the background, owning any capture it takes.
+ *
+ * Same owner as the CLI and chat. This path previously reclaimed with a manual dispose in
+ * one catch, which covered that one branch and nothing else — three shapes for one
+ * invariant is how the busiest surface ended up with none.
+ */
+export async function dispatchBackgroundWorkflow(
+  ctx: WorkflowRoutingContext,
+  workflow: WorkflowDefinition,
+  isolationContext?: {
+    branchName?: string;
+    isPrReview?: boolean;
+    prSha?: string;
+    prBranch?: string;
+  }
+): Promise<void> {
+  await withCapturedSource(owner =>
+    dispatchBackgroundWorkflowOwned(owner, ctx, workflow, isolationContext)
+  );
 }
 
 /**

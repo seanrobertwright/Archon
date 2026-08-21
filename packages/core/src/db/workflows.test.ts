@@ -491,7 +491,9 @@ describe('workflows database', () => {
         expect.any(Array)
       );
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining("AND status = 'running'"),
+        // Pending too: capture, artifact setup, and credential resolution all run before
+        // the row goes running, and a running-only guard left those failures pending forever.
+        expect.stringContaining("AND status IN ('running', 'pending')"),
         expect.any(Array)
       );
     });
@@ -509,7 +511,7 @@ describe('workflows database', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
 
       await expect(failWorkflowRun('workflow-run-123', 'some error')).rejects.toThrow(
-        'not found or not in running state'
+        'not found or already terminal'
       );
     });
   });

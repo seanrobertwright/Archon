@@ -17,7 +17,7 @@
  * Same-named files at a higher scope override those at lower scopes.
  */
 import { readFile, readdir, access, stat } from 'fs/promises';
-import { dirname, join } from 'path';
+import { basename, join } from 'path';
 import type {
   WorkflowDefinition,
   WorkflowLoadError,
@@ -29,6 +29,10 @@ import type {
 } from './schemas';
 import { isIncludeNode, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+// Re-exported here because this is the module callers already import to discover with.
+export { liveSourceRoots } from './workflow-source';
+export type { WorkflowSourceRoots } from './workflow-source';
 import {
   BUNDLED_WORKFLOWS,
   BUNDLED_COMMANDS,
@@ -407,7 +411,7 @@ interface CommandScanConfig {
  * block's command body while proving its lexical reference boundary.
  */
 async function resolveCommandContentForScan(
-  cwd: string | null,
+  roots: WorkflowSourceRoots,
   commandName: string,
   config: CommandScanConfig
 ): Promise<IncludeCommandContent> {
@@ -417,17 +421,19 @@ async function resolveCommandContentForScan(
   if (packaged !== null) {
     if (packaged.owner.source === 'bundled') {
       if (config.loadDefaultCommands === false) return null;
-      if (isBinaryBuild()) return BUNDLED_COMMANDS[commandName] ?? null;
+      // A captured run reads the bundled bytes IT froze; the capture materialized a
+      // binary's embedded constants to files.
+      if (isBinaryBuild() && roots.kind === 'live') return BUNDLED_COMMANDS[commandName] ?? null;
     }
 
     let workflowsRoot: string;
     if (packaged.owner.source === 'project') {
-      if (cwd === null) return null;
-      workflowsRoot = join(cwd, '.archon', 'workflows');
+      if (roots.project === null) return null;
+      workflowsRoot = join(roots.project, '.archon', 'workflows');
     } else if (packaged.owner.source === 'global') {
-      workflowsRoot = archonPaths.getHomeWorkflowsPath();
+      workflowsRoot = roots.globalWorkflows;
     } else {
-      workflowsRoot = dirname(archonPaths.getDefaultWorkflowsPath());
+      workflowsRoot = roots.bundledWorkflows;
     }
     const commandPath = join(
       getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
@@ -443,15 +449,15 @@ async function resolveCommandContentForScan(
   }
 
   const dirs: string[] = [];
-  if (cwd !== null) {
+  if (roots.project !== null) {
     // Pass the configured folder so a repo with a custom command directory is scanned
     // (not silently skipped → downgraded to WARN). Matches getCommandFolderSearchPaths use
     // in the validator/executor.
     for (const folder of archonPaths.getCommandFolderSearchPaths(config.commandFolder)) {
-      dirs.push(join(cwd, folder));
+      dirs.push(join(roots.project, folder));
     }
   }
-  dirs.push(archonPaths.getHomeCommandsPath());
+  dirs.push(roots.globalCommands);
 
   for (const dir of dirs) {
     let entries: Awaited<ReturnType<typeof archonPaths.findMarkdownFilesRecursive>>;
@@ -477,10 +483,10 @@ async function resolveCommandContentForScan(
   // the workflow/command discovery opt-out so the scan doesn't resolve a command the repo
   // has disabled.
   if (config.loadDefaultCommands === false) return null;
-  if (isBinaryBuild()) {
+  if (isBinaryBuild() && roots.kind === 'live') {
     return BUNDLED_COMMANDS[commandName] ?? null;
   }
-  const defaultsDir = archonPaths.getDefaultCommandsPath();
+  const defaultsDir = roots.bundledCommands;
   let entries: Awaited<ReturnType<typeof archonPaths.findMarkdownFilesRecursive>>;
   try {
     entries = await archonPaths.findMarkdownFilesRecursive(defaultsDir, '', { maxDepth: 1 });
@@ -507,7 +513,7 @@ async function resolveCommandContentForScan(
  * Touches disk only when includes exist; returns an empty map otherwise.
  */
 async function resolveIncludeBlockCommandContents(
-  cwd: string | null,
+  roots: WorkflowSourceRoots,
   byName: ReadonlyMap<string, WorkflowDefinition>,
   config: CommandScanConfig
 ): Promise<Map<string, IncludeCommandContent>> {
@@ -533,7 +539,7 @@ async function resolveIncludeBlockCommandContents(
     if (!workflow) continue;
     for (const commandName of collectFileBackedCommandNames(workflow.nodes)) {
       if (!contents.has(commandName)) {
-        contents.set(commandName, await resolveCommandContentForScan(cwd, commandName, config));
+        contents.set(commandName, await resolveCommandContentForScan(roots, commandName, config));
       }
     }
   }
@@ -560,8 +566,22 @@ async function resolveIncludeBlockCommandContents(
  */
 export async function discoverWorkflows(
   cwd: string | null,
-  options?: { loadDefaults?: boolean; commandFolder?: string; loadDefaultCommands?: boolean }
+  options?: {
+    loadDefaults?: boolean;
+    commandFolder?: string;
+    loadDefaultCommands?: boolean;
+    /**
+     * Roots to read workflows, commands, and scripts from, when that is not the working
+     * directory. An executing run passes the roots of its frozen source capture, so the
+     * graph a resume reloads — including any statically included global or bundled
+     * workflow — is the one the run started with. Defaults to reading `cwd` live, which
+     * is correct for every listing and in-place caller.
+     */
+    sourceRoots?: WorkflowSourceRoots;
+  }
 ): Promise<WorkflowLoadResult> {
+  const roots = options?.sourceRoots ?? liveSourceRoots(cwd);
+  const projectRoot = roots.project;
   // Map of filename -> workflow + source + parse warnings, for deduplication.
   // A later scope's `set()` replaces all three together, so a clean project file
   // can never inherit the bundled file's warnings (see ParsedWorkflowFile).
@@ -620,7 +640,7 @@ export async function discoverWorkflows(
     }
     // Pre-resolve command-file contents for include-target command nodes so the expander
     // can catch a block command file that references a sibling id namespacing renames.
-    const commandContents = await resolveIncludeBlockCommandContents(cwd, rawByName, {
+    const commandContents = await resolveIncludeBlockCommandContents(roots, rawByName, {
       commandFolder: options?.commandFolder,
       loadDefaultCommands: options?.loadDefaultCommands,
     });
@@ -664,7 +684,10 @@ export async function discoverWorkflows(
   // 1. Load from app's bundled defaults (unless opted out)
   const loadDefaultWorkflows = options?.loadDefaults !== false;
   if (loadDefaultWorkflows) {
-    if (isBinaryBuild()) {
+    // A captured run loads the bundled workflows IT froze — including in a binary, where
+    // the capture wrote the embedded constants out as files. That is what lets a paused
+    // run resume across an upgrade instead of failing on unverifiable bundled bytes.
+    if (isBinaryBuild() && roots.kind === 'live') {
       // Binary: load from embedded bundled content
       getLog().debug('loading_bundled_default_workflows');
       const bundledResult = loadBundledWorkflows();
@@ -675,8 +698,11 @@ export async function discoverWorkflows(
       getLog().info({ count: bundledResult.workflows.size }, 'bundled_default_workflows_loaded');
     } else {
       // Bun: load from filesystem (development mode)
-      const appDefaultsPath = archonPaths.getDefaultWorkflowsPath();
-      const appWorkflowsPath = dirname(appDefaultsPath);
+      const appWorkflowsPath = roots.bundledWorkflows;
+      const appDefaultsPath = join(
+        appWorkflowsPath,
+        basename(archonPaths.getDefaultWorkflowsPath())
+      );
       getLog().debug({ appWorkflowsPath }, 'loading_app_default_workflows');
       try {
         await access(appWorkflowsPath);
@@ -709,7 +735,7 @@ export async function discoverWorkflows(
   // 2. Load home-scoped workflows from ~/.archon/workflows/. No caller option —
   // discovery is responsible for surfacing home-scoped content everywhere.
   await maybeWarnLegacyHomePath();
-  const homeWorkflowPath = archonPaths.getHomeWorkflowsPath();
+  const homeWorkflowPath = roots.globalWorkflows;
   getLog().debug({ homeWorkflowPath }, 'searching_home_workflows');
   try {
     await access(homeWorkflowPath);
@@ -747,7 +773,7 @@ export async function discoverWorkflows(
   }
 
   const [workflowFolder] = archonPaths.getWorkflowFolderSearchPaths();
-  const workflowPath = join(cwd, workflowFolder);
+  const workflowPath = join(projectRoot ?? cwd, workflowFolder);
 
   getLog().debug({ workflowPath }, 'searching_repo_workflows');
 
@@ -783,7 +809,7 @@ export async function discoverWorkflows(
     allErrors.push(...repoResult.errors);
 
     // Warn about deprecated non-prefixed defaults in repo's defaults folder
-    const repoDefaultsPath = join(cwd, workflowFolder, 'defaults');
+    const repoDefaultsPath = join(projectRoot ?? cwd, workflowFolder, 'defaults');
     try {
       await access(repoDefaultsPath);
       const defaultEntries = await readdir(repoDefaultsPath);
@@ -837,15 +863,26 @@ export async function discoverWorkflowsWithConfig(
   loadConfig: (cwd: string) => Promise<{
     defaults?: { loadDefaultWorkflows?: boolean; loadDefaultCommands?: boolean };
     commands?: { folder?: string };
-  }>
+  }>,
+  /**
+   * Where source is read from, when that is not `cwd`, and the settings that govern it.
+   *
+   * An executing run passes the roots of its frozen capture; every listing caller omits
+   * this and keeps reading the working directory live. The settings ride ON the roots
+   * because they decide what those roots mean — which command folder is searched, and
+   * whether the bundled scope counts at all — and a resume must use the ones in force
+   * when the capture was taken, not the target's.
+   */
+  sourceRoots?: WorkflowSourceRoots
 ): Promise<WorkflowLoadResult> {
-  let loadDefaults = true;
+  const sourceConfig = sourceRoots?.config;
+  let loadDefaults = sourceConfig?.load_default_workflows ?? true;
   // Command-scan parity: pass the repo's configured command folder + loadDefaultCommands
   // opt-out through so the include safety scan resolves the same command files the
   // runtime/validator would (else it silently degrades to WARN on custom-folder repos).
-  let commandFolder: string | undefined;
-  let loadDefaultCommands: boolean | undefined;
-  if (cwd !== null) {
+  let commandFolder = sourceConfig?.command_folder;
+  let loadDefaultCommands = sourceConfig?.load_default_commands;
+  if (cwd !== null && sourceConfig === undefined) {
     try {
       const cfg = await loadConfig(cwd);
       loadDefaults = cfg.defaults?.loadDefaultWorkflows ?? true;
@@ -858,5 +895,5 @@ export async function discoverWorkflowsWithConfig(
       );
     }
   }
-  return discoverWorkflows(cwd, { loadDefaults, commandFolder, loadDefaultCommands });
+  return discoverWorkflows(cwd, { loadDefaults, commandFolder, loadDefaultCommands, sourceRoots });
 }

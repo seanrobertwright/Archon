@@ -3,6 +3,7 @@
  */
 import { z } from '@hono/zod-openapi';
 import type { TokenUsage } from '@archon/providers/types';
+import { isAbsolute } from 'path';
 
 // ---------------------------------------------------------------------------
 // WorkflowRunStatus
@@ -211,6 +212,95 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
     fanOutItemHash: typeof fanOutItemHash === 'string' ? fanOutItemHash : undefined,
     inputs,
   };
+}
+
+/**
+ * Key under which a run records the executable SOURCE it was started from.
+ *
+ * A run reads its workflows, commands, and scripts from one directory and acts on
+ * another. Recording the first is what lets a resume reach the same source a month
+ * later, from a different process, after the authoring checkout has moved on. Absent
+ * on runs created before source capture existed, and on runs whose source could not
+ * be captured — both resolve live, which is exactly the pre-capture behavior.
+ */
+export const WORKFLOW_SOURCE_METADATA_KEY = 'workflow_source';
+
+/**
+ * A run's recorded executable source.
+ *
+ * `version` exists so a future capture layout can be recognized rather than
+ * misread. A reader that does not know a version treats the record as absent and
+ * falls back to live discovery with a warning — never as an error, because a paused
+ * run must stay resumable across an Archon upgrade.
+ */
+export const workflowSourceMetadataSchema = z.object({
+  version: z.literal(1),
+  /**
+   * Absolute path to the captured source; usable directly as a project root.
+   *
+   * Absoluteness is enforced rather than assumed: every root reaching here is built from
+   * the run's own artifacts path, so a relative or blank one means the record is corrupt
+   * or foreign. Resolving it against whatever `process.cwd()` happens to be would send
+   * every command and script lookup somewhere arbitrary, so it reads as absent instead
+   * and the run falls back to live source with a warning.
+   */
+  root: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
+  /** The authoring directory it was captured from (provenance; never read for lookup). */
+  origin: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
+  captured_at: z.string(),
+  /**
+   * Content digest of the capture, mirrored from its manifest.
+   *
+   * Duplicated onto the run row on purpose: it is what lets a reader inspect a run's
+   * source identity — and compare two runs — without touching the capture directory,
+   * which may since have been reclaimed. Verification still reads the manifest.
+   */
+  digest: z.string(),
+  file_count: z.number(),
+  byte_count: z.number(),
+});
+
+export type WorkflowSourceMetadata = z.infer<typeof workflowSourceMetadataSchema>;
+
+/**
+ * Typed view of a run's recorded source, or `undefined` when it has none this reader
+ * understands. Validation is deliberately total: an unparseable record means "resolve
+ * live", not "fail the resume", so a shape change cannot strand paused work.
+ */
+export function readWorkflowSourceMetadata(
+  metadata: Record<string, unknown> | undefined
+): WorkflowSourceMetadata | undefined {
+  const state = readWorkflowSourceState(metadata);
+  return state.kind === 'recorded' ? state.record : undefined;
+}
+
+/**
+ * What a run says about its executable source.
+ *
+ * Three states, and collapsing any two of them is a correctness bug:
+ *
+ *  - `absent` — the run predates source capture. It has nothing to honor, so it may
+ *    resume against live source. This is the ONLY tolerable fallback.
+ *  - `recorded` — the run froze source and named it. That source, or nothing.
+ *  - `unreadable` — the run recorded SOMETHING this build cannot parse: a corrupt value,
+ *    a hand edit, or a future format. Emphatically not the same as `absent`. Treating it
+ *    as absent would resume the run against whatever is on disk now, which is exactly
+ *    what a run that recorded its source must never do.
+ */
+export type WorkflowSourceState =
+  | { kind: 'absent' }
+  | { kind: 'recorded'; record: WorkflowSourceMetadata }
+  | { kind: 'unreadable'; detail: string };
+
+export function readWorkflowSourceState(
+  metadata: Record<string, unknown> | undefined
+): WorkflowSourceState {
+  const raw = metadata?.[WORKFLOW_SOURCE_METADATA_KEY];
+  if (raw === undefined) return { kind: 'absent' };
+  const parsed = workflowSourceMetadataSchema.safeParse(raw);
+  return parsed.success
+    ? { kind: 'recorded', record: parsed.data }
+    : { kind: 'unreadable', detail: parsed.error.message };
 }
 
 /** Approval context stored in workflow run metadata when paused for human review. */

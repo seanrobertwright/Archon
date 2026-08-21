@@ -20,6 +20,8 @@ import { getArchonWorkspacesPath } from '@archon/paths';
 import { loadConfig } from '../config/config-loader';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
+import { resolveContinuationWorkflow } from '@archon/workflows/executor';
+import { createWorkflowDeps } from '../workflows/store-adapter';
 import type {
   WorkflowWithSource,
   WorkflowLoadError,
@@ -295,6 +297,38 @@ async function resolveRunContinuation(
       resumeHint: `Finish it with \`archon workflow resume ${runId}\` from the CLI in the same project.`,
     };
   }
+  // The graph this run FROZE, not whatever the target holds now. Without this the run
+  // resumes into a possibly-edited DAG while the executor still feeds it commands and
+  // scripts from the old capture — a graph from one moment against resources from
+  // another. Returns undefined only for a run predating capture, which falls through to
+  // live discovery below exactly as before.
+  try {
+    const continuation = await resolveContinuationWorkflow(createWorkflowDeps(), run, workflowCwd);
+    if (continuation) {
+      return {
+        ok: true,
+        workflowName: continuation.workflow.name,
+        workflow: {
+          definition: continuation.workflow,
+          args: run.user_message,
+          resumeRunId: run.id,
+          resumeRun: run,
+          // Already resolved from the run's recorded source, digest verified and
+          // discovered. Forwarded so dispatch does not pay for both again.
+          resolvedContinuation: continuation.workflow,
+        },
+      };
+    }
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, runId }, 'cmd.workflow_continuation_source_failed');
+    return {
+      ok: false,
+      message: `its recorded workflow source is unavailable: ${err.message}`,
+      resumeHint: 'Start a fresh run to execute the current workflow.',
+    };
+  }
+
   let workflowEntries: readonly WorkflowWithSource[];
   let loadErrors: readonly WorkflowLoadError[];
   try {

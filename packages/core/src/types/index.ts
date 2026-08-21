@@ -77,6 +77,13 @@ export interface CommandResult {
     force?: boolean;
     resumeRunId?: string;
     resumeRun?: WorkflowRun;
+    /**
+     * The continuation graph already resolved from that run's recorded source.
+     *
+     * Carried so dispatch does not repeat the digest verification and discovery the
+     * handler just paid for. A value, not a flag: it cannot claim work it did not do.
+     */
+    resolvedContinuation?: WorkflowDefinition;
     /** Keys the engine dropped from this workflow's YAML (#2213). */
     parseWarnings?: readonly string[];
   };
