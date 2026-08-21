@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **19 advisories closed by refreshing two frozen lockfile resolutions.** `axios` (18 advisories, 8 high) sat at 1.15.1 and `qs` (GHSA-q8mj-m7cp-5q26, moderate) at 6.15.1. Both exist only in the root `overrides` block, and both declared ranges already permitted a patched version — the lockfile simply never re-resolved, so neither produced a vulnerability alert to act on. The override floors are raised to the patched versions (`axios ^1.15.2`, `qs ^6.15.2`), which resolves them to 1.19.0 and 6.15.3; the carets stay so future patches keep flowing. No dependent needed its range widened. (#2666)
+- **20 advisories closed by refreshing three frozen lockfile resolutions.** `axios` (18 advisories, 8 high) sat at 1.15.1, `qs` (GHSA-q8mj-m7cp-5q26, moderate) at 6.15.1, and `@hono/node-server` (GHSA-frvp-7c67-39w9, moderate) at 1.19.14. All three exist only in the root `overrides` block, and every declared range already permitted a patched version — the lockfile simply never re-resolved, so none of them produced a vulnerability alert to act on. The override floors are raised to the patched versions (`axios ^1.15.2`, `qs ^6.15.2`, `@hono/node-server ^1.19.15`), resolving to 1.19.0, 6.15.3 and 1.19.17; the carets stay so future patches keep flowing. No dependent needed its range widened. (#2666)
 
 ## [0.9.0] - 2026-08-17
 
