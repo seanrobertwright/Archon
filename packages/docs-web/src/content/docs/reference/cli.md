@@ -223,7 +223,7 @@ Note that a real `run` emits a JSON payload **only** under `--detach`. Without i
 | `--resume` | Resume from last failed run at the working path (skips completed nodes) |
 | `--quiet`, `-q` | Suppress all progress output to stderr |
 | `--verbose`, `-v` | Also show tool-level events (tool name and duration) |
-| `--detach` | Run in a detached background child and return immediately. The child does all the work; find it later with `workflow runs`/`workflow get`. Child stdout/stderr is captured to `~/.archon/logs/detached-run-<id>.log`. Combine with `--json` for a machine-readable ack. |
+| `--detach` | Run in a detached background child and return immediately. The child does all the work; find it later with `workflow runs`/`workflow get`. Child stdout/stderr is captured to `~/.archon/logs/detached-run-<id>.log`. Combine with `--json` for a machine-readable ack. Also available on `approve`/`reject`/`resume` — see [Detached control verbs](#detached-control-verbs). |
 | `--dry-run` | Simulate deterministic DAG control flow in memory. Creates no run, worktree, session, event, artifact, or provider request. |
 | `--stubs <path>` | YAML mapping of node ids to scalar or structured outputs for `--dry-run`. Relative paths resolve from `--cwd`. |
 | `--stubs-init <path>` | Write a complete stub scaffold for the expanded workflow and exit. Refuses to overwrite an existing file. Relative paths resolve from `--cwd`. |
@@ -417,7 +417,11 @@ archon workflow resume <run-id>
 archon workflow resume <run-id> --json   # validate + ack only; does NOT re-execute inline
 ```
 
-In `--json` mode the command is a non-blocking control-plane ack: it validates the run is resumable and reports its state but does **not** re-execute inline (execution streams output to stdout, which would corrupt the JSON). To actually drive a resumable run to completion, use the blocking form or `workflow run <name> --resume --detach`.
+In `--json` mode the command is a non-blocking control-plane ack: it validates the run is resumable and reports its state but does **not** re-execute inline (execution streams output to stdout, which would corrupt the JSON). To actually drive a resumable run to completion, use the blocking form or `workflow resume <run-id> --detach`.
+
+When you already hold a run id, prefer that exact-id form. `workflow run <name> --resume --detach` selects the newest resumable run of that workflow **in the current checkout**, which is a different question — from another worktree it correctly finds nothing, and in a checkout with several historical runs it expresses less than the id you already have. Keep the name form for the case you actually mean: "the latest failed run of this workflow, here."
+
+Adding `--detach` **inverts** that: the child is re-invoked without `--json`, so it takes the inline path and does re-execute the run — just outside your shell. The ack carries `continues: true` to say so. See [Detached control verbs](#detached-control-verbs).
 
 ### `workflow abandon`
 
@@ -446,6 +450,47 @@ archon workflow approve <run-id> --json   # record approval + ack; does NOT auto
 ```
 
 In human mode `approve`/`reject` auto-resume the run inline. In `--json` mode they record the decision and return an ack **without** resuming (the run is left resumable for a backgrounded `resume`/`run --resume`).
+
+#### Detached control verbs
+
+`approve`, `reject`, and `resume` accept `--detach`. The parent validates the run
+**read-only** with the same preconditions the operation itself enforces, so a
+wrong-status, missing-context, `child_workflow`-blocked, already-resolved, or
+no-working-path run is refused synchronously and nothing is spawned. The parent then
+hands the whole command to a detached child that owns all state mutation in its own
+process group. A shell that dies mid-flight can no longer wedge the run.
+
+The parent also waits out the child's startup window before acking, so a child that
+dies immediately surfaces as an error carrying the tail of its log rather than as a
+success you only discover was false minutes later.
+
+```bash
+archon workflow approve <run-id> --detach
+archon workflow approve <run-id> --detach --json
+```
+
+**`--detach --json` deliberately differs from bare `--json`.** Bare `--json` records the
+decision and withholds the inline auto-resume (you drive continuation separately).
+`--detach --json` spawns a child that takes the ordinary inline path, so the run **is**
+driven onward — approve's auto-resume, reject's `on_reject` rework, resume's re-run —
+just outside your shell. The ack carries `continues: true` to say so:
+
+```json
+{
+  "ok": true,
+  "runId": "…",
+  "action": "approve",
+  "detached": true,
+  "continues": true,
+  "workflowName": "assist",
+  "logPath": "~/.archon/logs/detached-run-<id>.log"
+}
+```
+
+Read `continues` to decide whether your automation still owns continuation. `logPath`
+is `null` when the log file could not be opened — the child still runs, but its output
+is discarded, so do not assume a string. Precheck failures follow each verb's existing
+error contract: `{ ok: false }` under `--json`, a thrown error otherwise.
 
 ### `workflow reject`
 

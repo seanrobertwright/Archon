@@ -284,6 +284,51 @@ function firstJsonPayload(spy: ReturnType<typeof spyOn>): string {
   return ((spy.mock.calls[0]?.[0] as string) ?? '').trimEnd();
 }
 
+/**
+ * Stand-in for the child `spawnDetachedWorkflowRun` starts. `node:child_process`'s
+ * spawn routes through `Bun.spawn` under Bun, so spying on `Bun.spawn` intercepts it
+ * and Bun wraps this object into the ChildProcess whose events the startup window
+ * listens on. Shared by both detach suites — `run` and the control verbs.
+ */
+function createDetachedChildFixture(pid: number | null = 12345): {
+  child: ReturnType<typeof Bun.spawn>;
+  unref: ReturnType<typeof mock>;
+} {
+  const unref = mock(() => undefined);
+  const child = {
+    pid: pid ?? undefined,
+    unref,
+  };
+
+  return {
+    child: child as unknown as ReturnType<typeof Bun.spawn>,
+    unref,
+  };
+}
+
+/**
+ * Drive a detach command past `waitForDetachedStartup` (#2279). The command awaits a
+ * 500 ms window in which a dying child would reject, so a test that never advances
+ * the fake timer hangs — and one that never awaits the command silently skips the
+ * window altogether. Both suites go through here so neither can pass by accident.
+ */
+async function finishStartupWindow(
+  commandPromise: Promise<void>,
+  spawnSpy: ReturnType<typeof spyOn>,
+  expectedSpawnCount = 1
+): Promise<void> {
+  for (
+    let attempt = 0;
+    attempt < 20 && spawnSpy.mock.calls.length < expectedSpawnCount;
+    attempt++
+  ) {
+    await Promise.resolve();
+  }
+  expect(spawnSpy).toHaveBeenCalledTimes(expectedSpawnCount);
+  jest.advanceTimersByTime(500);
+  await commandPromise;
+}
+
 describe('workflowListCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let stdoutSpy: ReturnType<typeof spyOn>;
@@ -4524,39 +4569,6 @@ describe('workflowRunCommand — detach', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let stdoutSpy: ReturnType<typeof spyOn>;
 
-  function createDetachedChildFixture(pid: number | null = 12345): {
-    child: ReturnType<typeof Bun.spawn>;
-    unref: ReturnType<typeof mock>;
-  } {
-    const unref = mock(() => undefined);
-    const child = {
-      pid: pid ?? undefined,
-      unref,
-    };
-
-    return {
-      child: child as unknown as ReturnType<typeof Bun.spawn>,
-      unref,
-    };
-  }
-
-  async function finishStartupWindow(
-    commandPromise: Promise<void>,
-    spawnSpy: ReturnType<typeof spyOn>,
-    expectedSpawnCount = 1
-  ): Promise<void> {
-    for (
-      let attempt = 0;
-      attempt < 20 && spawnSpy.mock.calls.length < expectedSpawnCount;
-      attempt++
-    ) {
-      await Promise.resolve();
-    }
-    expect(spawnSpy).toHaveBeenCalledTimes(expectedSpawnCount);
-    jest.advanceTimersByTime(500);
-    await commandPromise;
-  }
-
   beforeEach(() => {
     jest.useFakeTimers();
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
@@ -4903,6 +4915,516 @@ describe('workflowRunCommand — detach', () => {
     // The success ack must never have been printed.
     const logged = consoleSpy.mock.calls.map(call => String(call[0]));
     expect(logged).not.toContain("Started 'assist' in the background.");
+  });
+});
+
+describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand — detach', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+  let warnSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    consoleSpy.mockRestore();
+    warnSpy.mockRestore();
+    stdoutSpy.mockRestore();
+  });
+
+  // working_path is deliberately a distro-style path: the child must spawn with
+  // the PARENT's cwd (it re-resolves by run-id), because a container run's
+  // working_path is unreachable on the host and would ENOENT the spawn.
+  const pausedRun = {
+    id: 'run-123',
+    status: 'paused',
+    workflow_name: 'assist',
+    working_path: '/distro/only/path',
+    conversation_id: 'conv-123',
+    user_message: 'hello',
+    metadata: { approval: { nodeId: 'gate', message: 'Approve?' } },
+  };
+
+  /** Suppress the log file so the test writes nothing to disk (logPath becomes null). */
+  const silenceLogFile = async (): Promise<void> => {
+    const paths = await import('@archon/paths');
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+  };
+
+  it('approve --detach spawns a detached child (minus --detach) and performs ZERO writes in the parent', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    await silenceLogFile();
+
+    const updateBefore = (workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .length;
+    const execBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'approve', 'run-123', 'ship it', '--detach'];
+
+    let spawnCmd: string[] = [];
+    let spawnOptions: { cwd: string; cmd: string[]; detached?: boolean } | undefined;
+    try {
+      // Signature: (runId, comment, json, cwd, detach) — detach is the 5th arg,
+      // layered after upstream's cwd.
+      const commandPromise = workflowApproveCommand(
+        'run-123',
+        'ship it',
+        undefined,
+        undefined,
+        true
+      );
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnOptions = spawnSpy.mock.calls[0]?.[0] as
+        | { cwd: string; cmd: string[]; detached?: boolean }
+        | undefined;
+      spawnCmd = (spawnOptions?.cmd ?? []).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(spawnOptions?.detached).toBe(true);
+    expect(spawnCmd).not.toContain('--detach');
+    expect(spawnCmd).toContain('approve');
+    expect(spawnCmd).toContain('run-123');
+    // Parent cwd, never the run's working_path (see pausedRun comment above).
+    expect(spawnOptions?.cwd).toBe(process.cwd());
+    expect(spawnCmd).not.toContain('/distro/only/path');
+    // ZERO state mutation in the detaching parent — the child owns the approve
+    // (a parent-side approve would record the decision twice).
+    expect((workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(
+      updateBefore
+    );
+    expect((executeWorkflow as ReturnType<typeof mock>).mock.calls.length).toBe(execBefore);
+    expect(consoleSpy).toHaveBeenCalledWith("Started 'approve' for run run-123 in the background.");
+    // No log file could be opened, so the child's output is discarded — say so.
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Warning: could not open a log file — child output will not be captured.'
+    );
+  });
+
+  it('approve --detach --json emits a structured ack on stdout without approving', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    await silenceLogFile();
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'approve', 'run-123', '--detach', '--json'];
+
+    try {
+      const commandPromise = workflowApproveCommand('run-123', undefined, true, undefined, true);
+      await finishStartupWindow(commandPromise, spawnSpy);
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    // The ack goes through writeJsonLine (flushed stdout), not console.log — a
+    // console.log ack can be truncated on a pipe (#2384).
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
+    expect(parsed).toMatchObject({
+      ok: true,
+      runId: 'run-123',
+      action: 'approve',
+      detached: true,
+      workflowName: 'assist',
+    });
+    // logPath is a path or null — never a serialized Promise, which is what an
+    // un-awaited spawnDetachedWorkflowRun produces ({} through JSON.stringify).
+    expect(parsed.logPath).toBeNull();
+  });
+
+  it('--detach --json spawns a child WITHOUT --json (so it continues) and says so in the ack', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    await silenceLogFile();
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'approve', 'run-123', '--detach', '--json'];
+
+    let spawnCmd: string[] = [];
+    try {
+      const commandPromise = workflowApproveCommand('run-123', undefined, true, undefined, true);
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnCmd = (
+        (spawnSpy.mock.calls[0]?.[0] as { cmd: string[] } | undefined)?.cmd ?? []
+      ).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    // Both flags are stripped: the child runs the ordinary inline path, which
+    // auto-resumes. That is deliberate — --detach exists to host that execution.
+    expect(spawnCmd).not.toContain('--detach');
+    expect(spawnCmd).not.toContain('--json');
+    // ...so the ack must tell the caller it does NOT own continuation.
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
+    expect(parsed).toMatchObject({ ok: true, detached: true, continues: true });
+  });
+
+  it('threads a caller-supplied --cwd to the child instead of the parent process.cwd()', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    await silenceLogFile();
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = [
+      'bun',
+      '/abs/cli.ts',
+      'workflow',
+      'approve',
+      'run-123',
+      '--cwd',
+      '/caller/repo',
+      '--detach',
+    ];
+
+    let spawnCmd: string[] = [];
+    let spawnOptions: { cwd: string; cmd: string[] } | undefined;
+    try {
+      const commandPromise = workflowApproveCommand(
+        'run-123',
+        undefined,
+        undefined,
+        '/caller/repo',
+        true
+      );
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnOptions = spawnSpy.mock.calls[0]?.[0] as { cwd: string; cmd: string[] } | undefined;
+      spawnCmd = (spawnOptions?.cmd ?? []).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(spawnOptions?.cwd).toBe('/caller/repo');
+    // buildDetachedRunCmd appends --cwd LAST (parser is last-wins), so the
+    // appended value is what the child actually resolves.
+    const lastCwdIdx = spawnCmd.lastIndexOf('--cwd');
+    expect(spawnCmd[lastCwdIdx + 1]).toBe('/caller/repo');
+  });
+
+  it('approve --detach rejects an immediate non-zero child exit instead of acking success', async () => {
+    // The parent awaits spawnDetachedWorkflowRun's startup window (#2279). Without
+    // that await the failure arrives as an unhandled rejection AFTER `{ok:true}`
+    // has already been printed — the exact hole --detach exists to close.
+    const workflowDb = await import('@archon/core/db/workflows');
+    const tempHome = mkdtempSync(join(tmpdir(), 'archon-detached-control-failure-'));
+    const logPath = join(tempHome, 'logs', 'detached-run-run-123.log');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    const paths = await import('@archon/paths');
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => tempHome);
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'approve', 'run-123', '--detach', '--json'];
+
+    try {
+      const commandPromise = workflowApproveCommand('run-123', undefined, true, undefined, true);
+      for (let attempt = 0; attempt < 20 && spawnSpy.mock.calls.length === 0; attempt++) {
+        await Promise.resolve();
+      }
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      appendFileSync(logPath, 'database unavailable during startup\n');
+      const spawnOptions = spawnSpy.mock.calls[0]?.[0] as
+        | {
+            onExit?: (
+              subprocess: ReturnType<typeof Bun.spawn>,
+              exitCode: number | null,
+              signalCode: number | null,
+              error?: Error
+            ) => void;
+          }
+        | undefined;
+      spawnOptions?.onExit?.(child.child, 1, null);
+      await commandPromise;
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+
+    // --json turns the throw into the standard { ok: false } line; either way the
+    // caller never sees a success ack for a child that died on startup.
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
+    expect(parsed).toMatchObject({ ok: false, runId: 'run-123', action: 'approve' });
+    expect(String(parsed.error)).toMatch(/exit code 1[\s\S]*database unavailable during startup/);
+  });
+
+  it('approve --detach refuses a non-paused run synchronously and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      status: 'running',
+    });
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+
+    let spawnCallCount = -1;
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow("Cannot approve run with status 'running'");
+      spawnCallCount = spawnSpy.mock.calls.length;
+    } finally {
+      spawnSpy.mockRestore();
+    }
+    expect(spawnCallCount).toBe(0);
+  });
+
+  it('approve --detach --json reports a refusal as { ok: false } and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      status: 'completed',
+    });
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+
+    let spawnCallCount = -1;
+    try {
+      await workflowApproveCommand('run-123', undefined, true, undefined, true);
+      spawnCallCount = spawnSpy.mock.calls.length;
+    } finally {
+      spawnSpy.mockRestore();
+    }
+
+    expect(spawnCallCount).toBe(0);
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
+    expect(parsed).toMatchObject({ ok: false, runId: 'run-123', action: 'approve' });
+    expect(String(parsed.error)).toContain("Cannot approve run with status 'completed'");
+  });
+
+  it('approve --detach refuses a child_workflow-blocked parent and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {
+        approval: { nodeId: 'sub', message: 'blocked', type: 'child_workflow', childRunId: 'c-9' },
+      },
+    });
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Approve or reject the child run instead: /workflow approve c-9');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('approve --detach refuses an already-resolved gate and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: 'approved' } },
+    });
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('was already approved and is awaiting resume');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('approve --detach refuses a missing approval context and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {},
+    });
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Workflow run is paused but missing approval context.');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('approve --detach refuses a run with no recorded working path and spawns nothing', async () => {
+    // The child always auto-resumes after approving, and a resume needs a working
+    // path. Refuse in the parent rather than letting the child throw into its log.
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      working_path: null,
+    });
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    try {
+      await expect(
+        workflowApproveCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('has no working path recorded');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('resume --detach refuses a run with no recorded working path and spawns nothing', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      status: 'failed',
+      working_path: null,
+    });
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    try {
+      await expect(workflowResumeCommand('run-123', undefined, undefined, true)).rejects.toThrow(
+        'has no working path recorded'
+      );
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('reject --detach refuses a child_workflow-blocked parent but TOLERATES missing context', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {
+        approval: { nodeId: 'sub', message: 'blocked', type: 'child_workflow', childRunId: 'c-9' },
+      },
+    });
+    const blockedChild = createDetachedChildFixture();
+    let spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(blockedChild.child);
+    try {
+      await expect(
+        workflowRejectCommand('run-123', undefined, undefined, undefined, true)
+      ).rejects.toThrow('Reject the child run instead: /workflow reject c-9');
+      expect(spawnSpy.mock.calls.length).toBe(0);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+
+    // reject has no nodeId requirement — a malformed context must still spawn.
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      metadata: {},
+    });
+    await silenceLogFile();
+    const child = createDetachedChildFixture();
+    spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'reject', 'run-123', '--detach'];
+    try {
+      const commandPromise = workflowRejectCommand(
+        'run-123',
+        undefined,
+        undefined,
+        undefined,
+        true
+      );
+      await finishStartupWindow(commandPromise, spawnSpy);
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+  });
+
+  it('reject --detach spawns a detached child (minus --detach) and performs ZERO writes in the parent', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({ ...pausedRun });
+    await silenceLogFile();
+
+    const updateBefore = (workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .length;
+    const execBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'reject', 'run-123', 'not good', '--detach'];
+
+    let spawnCmd: string[] = [];
+    try {
+      const commandPromise = workflowRejectCommand(
+        'run-123',
+        'not good',
+        undefined,
+        undefined,
+        true
+      );
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnCmd = (
+        (spawnSpy.mock.calls[0]?.[0] as { cmd: string[] } | undefined)?.cmd ?? []
+      ).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(spawnCmd).not.toContain('--detach');
+    expect(spawnCmd).toContain('reject');
+    expect(spawnCmd).toContain('run-123');
+    expect((workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(
+      updateBefore
+    );
+    expect((executeWorkflow as ReturnType<typeof mock>).mock.calls.length).toBe(execBefore);
+    expect(consoleSpy).toHaveBeenCalledWith("Started 'reject' for run run-123 in the background.");
+  });
+
+  it('resume --detach spawns a detached child (minus --detach) and does NOT execute in the parent', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    // resume validates read-only via resumeWorkflowOp, which reads getWorkflowRun;
+    // a failed run is resumable.
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...pausedRun,
+      status: 'failed',
+    });
+    await silenceLogFile();
+
+    const execBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'resume', 'run-123', '--detach'];
+
+    let spawnCmd: string[] = [];
+    try {
+      // Signature: (runId, json, cwd, detach) — detach is the 4th arg.
+      const commandPromise = workflowResumeCommand('run-123', undefined, undefined, true);
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnCmd = (
+        (spawnSpy.mock.calls[0]?.[0] as { cmd: string[] } | undefined)?.cmd ?? []
+      ).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(spawnCmd).not.toContain('--detach');
+    expect(spawnCmd).toContain('resume');
+    expect(spawnCmd).toContain('run-123');
+    expect((executeWorkflow as ReturnType<typeof mock>).mock.calls.length).toBe(execBefore);
   });
 });
 

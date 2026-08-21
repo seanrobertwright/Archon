@@ -75,6 +75,8 @@ import {
   abandonWorkflow,
   getWorkflowStatus,
   resetWorkflowNodeSessions,
+  assertApprovable,
+  assertRejectable,
 } from '@archon/core/operations/workflow-operations';
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
@@ -2673,6 +2675,82 @@ async function resolveRunIdArg(
   return matches[0].id;
 }
 
+/**
+ * Shared `--detach` front half for `approve`/`reject`/`resume`. Validates the run
+ * READ-ONLY via `precheck`, then hands the whole command to a detached child that
+ * re-invokes the same argv (minus `--detach`/`--json`) and owns ALL state mutation
+ * in its own process group — so killing the shell that hosted the parent cannot
+ * zombie the run mid-resume. The parent must never call
+ * approveWorkflow/rejectWorkflow/resumeWorkflow itself, or the decision would be
+ * recorded twice (mirrors workflowRunCommand's detach shape: the parent does nothing).
+ *
+ * Spawns with the command's `cwd` (falling back to `process.cwd()`), never the run's
+ * working_path: the child re-resolves everything by run-id, and a container run's
+ * working_path is a distro path the host cannot spawn into (ENOENT → the detach would
+ * silently no-op). Reuses upstream's spawnDetachedWorkflowRun, which rebuilds the child
+ * command from process.argv AND awaits the startup window (#2279) — so a child that
+ * dies immediately throws here rather than being acked as started. That await is load
+ * bearing: dropping it turns every startup failure into an unhandled rejection arriving
+ * after the parent has already printed `{ ok: true }`.
+ */
+async function runDetachedControlCommand(
+  runId: string,
+  action: 'approve' | 'reject' | 'resume',
+  json: boolean | undefined,
+  cwd: string | undefined,
+  precheck: () => Promise<WorkflowRun>
+): Promise<void> {
+  try {
+    const run = await precheck();
+    // The caller's --cwd, already resolved by cli.ts — NOT process.cwd(). The
+    // appended --cwd is last-wins on the child's argv, so discarding it here
+    // strands the child in the parent's directory (possibly outside any git
+    // repo) after the parent has already acked success. The run's working_path
+    // is still never a candidate: a container run's working_path is a distro
+    // path the host cannot spawn into, so the child re-resolves by run id.
+    const logPath = await spawnDetachedWorkflowRun(cwd ?? process.cwd(), runId, []);
+    if (json) {
+      // Through writeJsonLine, like every other --json ack: it writes with a
+      // completion callback so a piped consumer can't receive a truncated
+      // document (#2384). console.log does not give that guarantee.
+      await writeJsonLine({
+        ok: true,
+        runId,
+        action,
+        detached: true,
+        // The child is spawned WITHOUT --json (buildDetachedRunCmd strips it),
+        // so it takes the inline path and DRIVES THE RUN ONWARD — approve's
+        // auto-resume, reject's on_reject rework, resume's re-run. This is the
+        // opposite of bare `--json`, which withholds continuation on purpose.
+        // Surfaced so an automation knows it does not own continuation here.
+        continues: true,
+        workflowName: run.workflow_name,
+        // null when the log file could not be opened — the child still runs, but
+        // its output is discarded. Same contract as `run --detach`.
+        logPath,
+      });
+      return;
+    }
+    console.log(`Started '${action}' for run ${runId} in the background.`);
+    console.log(`Track it with: archon workflow get ${runId}`);
+    if (logPath) {
+      console.log(`Child output: ${logPath}`);
+    } else {
+      // Mirrors `run --detach`: with no log file the child's output is discarded,
+      // so a failure after the startup window leaves no trail to read.
+      console.warn('Warning: could not open a log file — child output will not be captured.');
+    }
+  } catch (error) {
+    // Precheck failures follow each mode's error contract: --json emits the
+    // standard { ok: false } line; human mode throws like the inline path.
+    if (json) {
+      await printJsonWriteError(runId, action, error);
+      return;
+    }
+    throw error;
+  }
+}
+
 async function resolveDiscoveryCwdForCodebase(
   runId: string,
   codebaseId: string,
@@ -2717,13 +2795,39 @@ async function resolveDiscoveryCwdForCodebase(
 export async function workflowResumeCommand(
   runId: string,
   json?: boolean,
-  cwd?: string
+  cwd?: string,
+  detach?: boolean
 ): Promise<void> {
+  // --detach: validate read-only (resumeWorkflowOp checks the run is resumable),
+  // then let a detached child re-invoke the blocking resume and own all mutation
+  // + execution, so a reaped launching shell can't wedge the run mid-resume.
+  // Composes with --json (structured ack; nothing executes here).
+  if (detach) {
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    await runDetachedControlCommand(resolvedId, 'resume', json, cwd, async () => {
+      const run = await resumeWorkflowOp(resolvedId);
+      // The inline path below refuses a run with no recorded working path. Check it
+      // here too, on the run the precheck already holds (message copied verbatim):
+      // otherwise the parent acks success and the child throws where nobody reads it.
+      if (!run.working_path) {
+        throw new Error(
+          `Workflow run '${resolvedId}' has no working path recorded.\n` +
+            'Cannot determine where to resume. The run may be too old.'
+        );
+      }
+      return run;
+    });
+    return;
+  }
+
   // JSON mode is a non-blocking control-plane ack: validate the run is resumable
   // and report its state, but do NOT re-execute the workflow inline (execution
   // streams workflow output to stdout, which would corrupt the JSON contract).
   // To actually execute a resumable run, use the blocking `resume` (no --json,
-  // run as a background task) or `run <name> --resume --detach`.
+  // run as a background task) or `resume <run-id> --detach`. Prefer that exact-id
+  // form over `run <name> --resume --detach`, which selects the newest resumable
+  // run of that workflow in the CURRENT checkout — a different question, and the
+  // wrong one when the caller already holds a run id (#2645).
   if (json) {
     try {
       const resolvedId = await resolveRunIdArg(runId, cwd);
@@ -2852,8 +2956,37 @@ export async function workflowApproveCommand(
   runId: string,
   comment?: string,
   json?: boolean,
-  cwd?: string
+  cwd?: string,
+  detach?: boolean
 ): Promise<void> {
+  // --detach: hand the approve AND its inline auto-resume to a detached child
+  // (same argv minus --detach/--json). Handled BEFORE any state change — the
+  // parent only validates read-only, so the approval is recorded exactly once,
+  // in the child. Composes with --json (structured ack; nothing executes here).
+  if (detach) {
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    await runDetachedControlCommand(resolvedId, 'approve', json, cwd, async () => {
+      const run = await workflowDb.getWorkflowRun(resolvedId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${resolvedId}`);
+      }
+      // The SAME gate approveWorkflow enforces — not a copy of one branch of it.
+      // A partial copy acks { ok: true } and lets the child die unseen.
+      assertApprovable(run);
+      // The child always auto-resumes after approving, and the inline path below
+      // refuses a run with no recorded working path. Same check here (message
+      // copied verbatim) so the refusal is synchronous instead of buried in a log.
+      if (!run.working_path) {
+        throw new Error(
+          `Workflow run '${resolvedId}' has no working path recorded.\n` +
+            'Cannot determine where to resume.'
+        );
+      }
+      return run;
+    });
+    return;
+  }
+
   // JSON mode records the approval and returns a structured ack WITHOUT the
   // inline auto-resume (resuming executes the workflow and streams output to
   // stdout, which would corrupt the JSON contract). The run becomes resumable
@@ -2949,8 +3082,28 @@ export async function workflowRejectCommand(
   runId: string,
   reason?: string,
   json?: boolean,
-  cwd?: string
+  cwd?: string,
+  detach?: boolean
 ): Promise<void> {
+  // --detach: hand the reject AND its inline on_reject rework to a detached child,
+  // exactly as approve does. Without it, reject hosts the executor in the calling
+  // shell — a reaped shell (harness task, closed terminal) leaves the run wedged
+  // mid-rework. The parent only validates read-only. Composes with --json.
+  if (detach) {
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    await runDetachedControlCommand(resolvedId, 'reject', json, cwd, async () => {
+      const run = await workflowDb.getWorkflowRun(resolvedId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${resolvedId}`);
+      }
+      // The SAME gate rejectWorkflow enforces — not a copy of one branch of it.
+      // A partial copy acks { ok: true } and lets the child die unseen.
+      assertRejectable(run);
+      return run;
+    });
+    return;
+  }
+
   // JSON mode records the rejection and returns a structured ack WITHOUT the
   // inline auto-resume (an on_reject rework executes the workflow and streams
   // to stdout, corrupting the JSON contract). When `cancelled` is false the run
