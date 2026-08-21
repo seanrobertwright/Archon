@@ -2249,6 +2249,8 @@ describe('workflow dispatch routing — interactive flag', () => {
     // hydrateResumableRun finds nothing worth resuming (zero completed nodes,
     // no interactive-loop state), the orchestrator must NOT throw — it sends
     // a user-visible notice and starts a fresh run on the same worktree.
+    // (#2686) The fresh run row must freeze its OWN workflow source — not
+    // inherit the prior run's frozen graph against live commands/scripts.
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(
       Promise.resolve(makeDispatchCodebase({ default_branch: 'develop' }))
@@ -2278,12 +2280,98 @@ describe('workflow dispatch routing — interactive flag', () => {
       baseBranch?: string;
       preCreatedRun?: unknown;
       priorCompletedNodes?: unknown;
+      preparedSource?: { captureRoot?: string; manifest?: { captured_at?: string } };
     };
     expect(opts.parentConversationId).toBe('conv-1-db');
     // The fresh-run-in-same-worktree branch still threads the codebase default.
     expect(opts.baseBranch).toBe('develop');
     expect(opts.preCreatedRun).toBeUndefined();
     expect(opts.priorCompletedNodes).toBeUndefined();
+    // (#2686) This is the key regression assertion: the fresh run row carries
+    // the captured source so its run row records `workflow_source` from this
+    // moment, not the prior run's frozen bytes. Before the fix, `preparedSource`
+    // was undefined here because the outer `if (!willContinueExistingRun)` block
+    // was skipped.
+    expect(opts.preparedSource).toBeDefined();
+    expect(opts.preparedSource?.captureRoot).toBe('/capture');
+    expect(opts.preparedSource?.manifest?.captured_at).toBe('2026-08-21T00:00:00.000Z');
+  });
+
+  test('foreground_resume_detected: fresh-run-in-same-worktree captures and executes the FRESHLY captured graph (#2686)', async () => {
+    // (#2686) Regression for the mixed-vintage shape: when a paused run had nothing to
+    // resume, the orchestrator must capture source here and execute the freshly resolved
+    // graph — not the prior run's frozen definition against live command/script bytes.
+    // Before the fix, the outer `if (!willContinueExistingRun)` block was skipped because
+    // `willContinueExistingRun` was true, leaving `preparedSource` undefined and the
+    // executor in `source_unprepared_live` mode against the prior run's frozen graph.
+    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
+    const freshWorkflow = makeTestWorkflow({
+      name: 'test-workflow',
+      description: 'freshly captured from disk',
+    });
+    // Capture returns a non-empty scope so the helper actually re-resolves the workflow.
+    (prepareWorkflowSource as ReturnType<typeof mock>).mockImplementationOnce(() =>
+      Promise.resolve({
+        runId: 'prepared-run-id',
+        captureRoot: '/capture',
+        origin: '/origin',
+        manifest: {
+          version: 1,
+          engine_version: 'test',
+          origin: '/origin',
+          captured_at: '2026-08-21T00:00:00.000Z',
+          digest: 'test-digest',
+          file_count: 1,
+          byte_count: 1,
+          scopes: ['project'],
+        },
+        roots: {
+          project: '/capture/project',
+          globalWorkflows: '/capture/global/workflows',
+          globalCommands: '/capture/global/commands',
+          globalScripts: '/capture/global/scripts',
+          bundledWorkflows: '/capture/bundled',
+        },
+      })
+    );
+    // Discovery off the FRESH capture returns a workflow distinct from the one the
+    // resume-input would otherwise feed executeWorkflow. If the orchestrator handed
+    // `executeWorkflow` the wrong graph, the description below would mismatch.
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [{ workflow: freshWorkflow }],
+        errors: [],
+      })
+    );
+
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(
+        makeResumableRun({
+          id: 'empty-prior-run',
+          status: 'paused',
+        })
+      )
+    );
+    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+    expect(prepareWorkflowSource).toHaveBeenCalled();
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
+    // The workflow argument (position 4) is the freshly resolved graph, NOT the
+    // resume-input graph. Before the fix this was the prior run's frozen graph.
+    expect(callArgs[4]).toBe(freshWorkflow);
+    // Capture lifecycle: hold then adopt — the prior branch's `if (preparedSource)
+    // owner.adopt()` is now a live guard, not inert.
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'adopt']);
+    // The user-visible notice still fires.
+    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+    expect(sent).toContain('starting fresh in the same worktree');
   });
 
   test('calls dispatchBackgroundWorkflow for non-interactive workflow on web', async () => {
