@@ -155,14 +155,44 @@ cat {artifact-path}
 
 ### 1.3 Validate Artifact Exists
 
-**If artifact not found:** don't just report the error and stop — per the
-unattended-execution note above, no one will see that message in time to
-re-run `/investigate-issue` for you. Instead, do the investigation
-yourself: read the issue body (via `$CONTEXT` or `gh issue view`), read the
-relevant code directly, and proceed with implementation using that as your
-plan. Note in the implementation report's Deviations section that the
-investigation artifact was missing and you substituted a direct read of
-the issue/codebase for it.
+**If the artifact is not found, the unattended rule above does NOT license you
+to invent one.** Everywhere else in this command you are adapting real input —
+a plan that drifted, an approach that turned out wrong — and deciding is better
+than asking. Here there is no input. Implementing from an empty artifact
+produces a plausible-looking diff and a draft PR assembled from guesses, which
+is worse than stopping, because the reviewer cannot see that the plan was
+missing.
+
+The bundled `archon-fix-github-issue` workflow already stops the run before this
+command executes when neither `investigation.md` nor `plan.md` exists (its
+`bridge-artifacts` node exits non-zero). Reaching this branch means you were
+invoked directly, or by a workflow without that guard.
+
+**Proceed only if the issue itself is genuinely in front of you** — one of:
+
+- an issue number is available (from `$ARGUMENTS`, or named by the artifact
+  path) **and** `gh issue view <number> --json title,body` succeeds; or
+- the issue body is already in this prompt — a real title and description you
+  can quote, not an empty context block.
+
+Then read the relevant code directly, treat the issue body as your plan, and
+record in the implementation report's "Deviations from Investigation" section
+that the investigation artifact was missing and what you used instead.
+
+**Otherwise stop, and leave a record that outlives this run's logs.** Write the
+block to `$ARTIFACTS_DIR/implementation.md` and end the turn without touching
+any source file:
+
+````markdown
+# Implementation: BLOCKED
+
+No investigation artifact at `$ARTIFACTS_DIR/investigation.md`, and no issue
+context to substitute for it (no issue number resolved / `gh issue view`
+failed). Nothing was implemented.
+
+Next step: run `/investigate-issue <number>` first, or re-dispatch this run
+with an issue number.
+````
 
 **PHASE_1_CHECKPOINT:**
 - [ ] Artifact found and loaded
