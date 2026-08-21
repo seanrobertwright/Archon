@@ -1582,6 +1582,55 @@ describe('executeWorkflow', () => {
         SHARED_KEY: 'user_wins',
         USER_KEY: 'u_val',
       });
+      expect(configArg?.protectedEnvKeys).toEqual(['SHARED_KEY', 'USER_KEY']);
+    });
+
+    it('protects bot and per-user GitHub credentials beside provider credentials', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'codebase-1',
+          name: 'demo',
+          repository_url: 'https://github.com/acme/demo',
+          default_cwd: '/tmp',
+          kind: 'repo' as const,
+        })),
+      });
+      const deps: WorkflowDeps = {
+        ...makeDeps(store),
+        resolveBotGitHubToken: mock(async () => 'bot-token'),
+        isPerUserGitHubEnabled: () => true,
+        getUserGithubToken: mock(async () => 'user-token'),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async () => ({
+          env: { ANTHROPIC_API_KEY: 'provider-token' },
+          files: [],
+        })),
+      };
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-c1',
+        { codebaseId: 'codebase-1', userId: 'u-1' }
+      );
+
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      expect(configArg?.envVars).toMatchObject({
+        GH_TOKEN: 'user-token',
+        GITHUB_TOKEN: 'user-token',
+        COPILOT_GITHUB_TOKEN: '',
+        ANTHROPIC_API_KEY: 'provider-token',
+      });
+      expect(configArg?.protectedEnvKeys).toEqual([
+        'GH_TOKEN',
+        'GITHUB_TOKEN',
+        'COPILOT_GITHUB_TOKEN',
+        'ANTHROPIC_API_KEY',
+      ]);
     });
 
     it('returns {} and does not throw when getUserProviderEnv rejects', async () => {

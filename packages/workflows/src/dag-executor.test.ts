@@ -12509,12 +12509,20 @@ describe('executeDagWorkflow -- env var injection', () => {
       join(testDir, 'logs'),
       'main',
       'docs/',
-      { ...minimalConfig, envVars: { MY_SECRET: 'abc123' } }
+      {
+        ...minimalConfig,
+        envVars: { MY_SECRET: 'abc123', ANTHROPIC_API_KEY: 'acting-user-secret' },
+        protectedEnvKeys: ['ANTHROPIC_API_KEY'],
+      }
     );
 
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
-    expect(optionsArg?.env).toEqual({ MY_SECRET: 'abc123' });
+    expect(optionsArg?.env).toEqual({
+      MY_SECRET: 'abc123',
+      ANTHROPIC_API_KEY: 'acting-user-secret',
+    });
+    expect(optionsArg?.protectedEnvKeys).toEqual(['ANTHROPIC_API_KEY']);
   });
 
   it('does not set env on claudeOptions when config.envVars is empty', async () => {

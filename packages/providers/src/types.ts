@@ -439,6 +439,12 @@ export interface AgentRequestOptions {
   systemPrompt?: SystemPromptInput;
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   env?: Record<string, string>;
+  /**
+   * Names in `env` whose values Archon injected as credentials rather than
+   * loading from project configuration. Custom provider configuration must not
+   * be allowed to select them.
+   */
+  protectedEnvKeys?: readonly string[];
   maxBudgetUsd?: number;
   fallbackModel?: string;
   /**

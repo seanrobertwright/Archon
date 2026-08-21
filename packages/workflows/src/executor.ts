@@ -1242,6 +1242,10 @@ export async function executeWorkflow(
     // the per-user policy scrub the corresponding key via the subprocess merge.
     envVars: { ...fileConfig.envVars, ...dbEnvVars, ...botGitHubEnv, ...userGitHubEnv },
   };
+  const protectedEnvKeys = new Set([...Object.keys(botGitHubEnv), ...Object.keys(userGitHubEnv)]);
+  if (protectedEnvKeys.size > 0) {
+    config.protectedEnvKeys = [...protectedEnvKeys];
+  }
   const configuredCommandFolder = config.commands.folder;
 
   // Resolve base branch: the per-dispatch override takes priority, then repo
@@ -1685,6 +1689,12 @@ export async function executeWorkflow(
   // returns {} when the feature is disabled or no userId is present).
   const userProviderEnv = await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
   config.envVars = { ...config.envVars, ...userProviderEnv };
+  for (const key of Object.keys(userProviderEnv)) {
+    protectedEnvKeys.add(key);
+  }
+  if (protectedEnvKeys.size > 0) {
+    config.protectedEnvKeys = [...protectedEnvKeys];
+  }
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error.
   //
