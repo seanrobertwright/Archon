@@ -1740,8 +1740,11 @@ async function executeNodeInternal(
   let nodeResolvedModel: ResolvedModel | undefined;
   const batchMessages: string[] = [];
 
-  // What this node reported, built once and passed whole to every sink — the DB event
-  // on each outcome and the JSONL transcript row. See WorkflowUsage for why.
+  // What this node reported, built once and passed whole rather than re-listed per sink:
+  // the DB event on every outcome, and the JSONL transcript row on completion. The JSONL
+  // FAILURE row is still outside it — logNodeError takes no usage, so a node that spent
+  // money and then failed records that spend in the DB and not in the transcript (#2614).
+  // See WorkflowUsage.
   const nodeUsageEventData = (): WorkflowUsage => ({
     ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
     ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),

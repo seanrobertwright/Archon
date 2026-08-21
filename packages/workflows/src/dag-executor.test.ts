@@ -6065,6 +6065,9 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(nodeRow).not.toHaveProperty('cost_usd');
     expect(nodeRow?.tokens).toEqual({ input: 100, output: 10 });
     expect(runRow).not.toHaveProperty('cost_usd');
+    // The two run-level axes are decided independently, so a missing cost must not
+    // suppress the tokens that were reported.
+    expect(runRow?.tokens).toEqual({ input: 100, output: 10 });
   });
 
   // ─── Background Agent Task Gating (#2083) ───────────────────────────────
