@@ -221,10 +221,28 @@ export async function listWorkflowEventsSince(
  *
  * Both usage axes are summed from `node_completed` and `node_failed` rows, and only
  * from rows that are not marked `data.aggregate`. Failed rows contribute spend but
- * never completed outputs, so their nodes remain eligible for resume. Cache axes sum
- * over the rows that reported them and carry `cachePartial` when any row did not, so a
- * pre-#2654 row narrows the cache total instead of erasing it. Two distinct
- * duplication hazards:
+ * never completed outputs, so their nodes remain eligible for resume.
+ *
+ * This makes a run's total MONEY BURNED, not the cost of the surviving path — the
+ * figure an operator watching a budget wants, and a deliberate change from what the
+ * number meant before failed rows were summed (#2654). Three consequences follow, all
+ * intended:
+ *
+ * - The same node's first and second attempt both count. A node that failed at $0.02
+ *   and succeeded at $0.03 on resume contributes $0.05, because both rows are real
+ *   spend.
+ * - `retry:` counts every attempt, for the same reason — `runNodeRetryLoop` writes one
+ *   event per attempt.
+ * - An `always_run` node re-executes on every resume pass and its spend accrues each
+ *   time.
+ *
+ * A resumed run's total therefore exceeds what the surviving path cost, and grows with
+ * each resume. That is the point; it is not double counting, which is what the two
+ * exclusions below prevent.
+ *
+ * Cache axes sum over the rows that reported them and carry `cachePartial` when any row
+ * did not, so a pre-#2654 row narrows the cache total instead of erasing it. Two
+ * distinct duplication hazards:
  *
  * - `node_skipped_prior_success` rows replay a node an earlier pass already counted, so
  *   counting them would multiply that node's usage by the number of resume passes.
