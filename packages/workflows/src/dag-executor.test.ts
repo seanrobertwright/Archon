@@ -11450,6 +11450,64 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     });
   });
 
+  it('flags the run total when only a middle node is silent about cache', async () => {
+    // The run total is accumulated pairwise, so the middle contribution's silence has to
+    // survive two more folds. A 2-round test cannot see this: rounds 1 and 3 both agree on
+    // both axes, so a wrapper that drops the flag still produces a complete-looking total.
+    mockSendQueryDag
+      .mockImplementationOnce(async function* () {
+        yield { type: 'assistant', content: 'a' };
+        yield { type: 'result', tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0 } };
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'assistant', content: 'b' };
+        // Silent middle: reports no cache telemetry at all.
+        yield { type: 'result', tokens: { input: 20, output: 2 } };
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'assistant', content: 'c' };
+        yield { type: 'result', tokens: { input: 30, output: 3, cacheRead: 9, cacheWrite: 1 } };
+      });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'three-node-fold',
+        nodes: [
+          { id: 'a', prompt: 'a' },
+          { id: 'b', prompt: 'b', depends_on: ['a'] },
+          { id: 'c', prompt: 'c', depends_on: ['b'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(runUsageWrites(mockDeps.store)).toEqual([
+      {
+        total_tokens_in: 60,
+        total_tokens_out: 6,
+        total_cache_read_tokens: 14,
+        total_cache_write_tokens: 1,
+        total_cache_partial: true,
+      },
+    ]);
+  });
+
   it('best-effort provider: an attempt without cache telemetry narrows the total to a floor', async () => {
     // Attempt 1 reports cache; attempt 2 reports none. The node's accumulated usage must
     // keep attempt 1's cache as a floor rather than discarding it — dropping the axes here
