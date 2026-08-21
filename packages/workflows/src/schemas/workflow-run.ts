@@ -245,16 +245,15 @@ export interface ApprovalContext {
   iteration?: number;
   /**
    * Session ID to restore on resume (interactive loops only). Gate pauses write an
-   * EXPLICIT null (never omit the key) when there is no session to restore — same
-   * json_patch rationale as `resolved` below: on SQLite an omitted key would let a
-   * stale session id from a previous pause of the same run survive the deep-merge.
+   * explicit null when the loop has no session cursor to restore; readers treat that
+   * exactly like an absent key.
    */
   sessionId?: string | null;
   /**
    * Provider that created `sessionId` (#1992). Persisted by loop_group gates and
    * restored together with the session id so a resumed loop never threads the
    * session into a node that resolves to a different provider (cross-provider
-   * resume is impossible). Same explicit-null-on-pause convention as `sessionId`.
+   * resume is impossible). Same null-means-no-cursor convention as `sessionId`.
    * Absent on single-node loop gates — those restore the session into the same
    * node, so the provider is the same by construction.
    */
@@ -271,22 +270,19 @@ export interface ApprovalContext {
    * 'rejected' = rejection recorded with an on_reject rework staged.
    * null/undefined = gate unresolved (awaiting the human).
    *
-   * Lifecycle: pauseWorkflowRun writes `resolved: null` on every fresh pause —
-   * an EXPLICIT null rather than key omission because SQLite's json_patch
-   * deep-merges the fresh context into the stored one (an omitted key would let
-   * a stale 'approved' from the previous gate survive and falsely block the
-   * next gate), while RFC 7396 null removes the key; Postgres `||` replaces the
-   * approval object wholesale. Never cleared on resume — matches the
-   * never-clear convention for approval_response/rejection_reason/
-   * loop_user_input (consumed in place; the next pause resets it).
+   * Lifecycle: never cleared on resume — matching the never-clear convention for
+   * approval_response/rejection_reason/loop_user_input (consumed in place). The
+   * next fresh pause is what resets it: pauseWorkflowRun REPLACES the whole
+   * approval object, so a gate that sets no `resolved` stores none and a prior
+   * gate's 'approved' cannot survive to block it (#2673).
    */
   resolved?: 'approved' | 'rejected' | null;
   /**
    * Interactive-loop only. True when the iteration this gate paused on emitted the
    * completion signal (detectCompletionSignal / until_bash exit 0). Read at resume by
    * executeLoopNode/executeLoopGroupNode: a signal-bearing gate approved WITHOUT feedback
-   * finalizes the node from `signaledOutput` instead of re-running. Reset to null on every
-   * fresh pause (see pauseWorkflowRun) for the same SQLite json_patch reason as `resolved`.
+   * finalizes the node from `signaledOutput` instead of re-running. Cleared by the next
+   * fresh pause the same way `resolved` is — the whole approval object is replaced.
    */
   completionSignaled?: boolean | null;
   /**

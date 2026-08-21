@@ -341,7 +341,7 @@ describe('workflows database', () => {
   });
 
   describe('pauseWorkflowRun', () => {
-    test('pauses a running run and resets the gate resolution marker', async () => {
+    test('replaces the approval object rather than merging into it', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
       await pauseWorkflowRun('workflow-run-123', {
@@ -353,27 +353,24 @@ describe('workflows database', () => {
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'paused'");
       expect(query).toContain("AND status = 'running'");
-      // resolved must be an EXPLICIT null on every fresh pause: SQLite's
-      // json_patch deep-merges the new approval context into the stored one, so
-      // an omitted key would let a stale 'approved' from the previous gate
-      // survive and falsely block this gate (#2075).
-      const payload = JSON.parse(params[1] as string) as {
-        approval: Record<string, unknown>;
-      };
-      expect(payload.approval.resolved).toBeNull();
-      expect(payload.approval.nodeId).toBe('review');
-      // completionSignaled/signaledOutput follow the same explicit-null rule
-      // (#2074): standard approval pauses never set them, so they must be
-      // written as null (never omitted — JSON.stringify drops undefined and
-      // SQLite would keep a stale value from a previous interactive-loop gate).
-      expect(payload.approval.completionSignaled).toBeNull();
-      expect(payload.approval.signaledOutput).toBeNull();
-      expect(payload.approval.signaledTokens).toBeNull();
-      expect(payload.approval.signaledCostUsd).toBeNull();
-      // commandSnapshot (command-backed interactive loops) follows the same
-      // rule — a stale snapshot from a prior loop gate must never survive
-      // into an unrelated pause.
-      expect(payload.approval.commandSnapshot).toBeNull();
+      // The approval object is SET wholesale, never folded into the stored one —
+      // this suite runs the Postgres dialect, so it pins that branch of
+      // writeApprovalMetadata (#2673). Top-level run metadata still merges.
+      expect(query).toContain(
+        "metadata = jsonb_set(metadata || $2::jsonb, '{approval}', $3::jsonb, true)"
+      );
+
+      // $2 is run-level metadata (empty here); $3 is the complete gate context,
+      // bound separately so the replace can target it.
+      expect(JSON.parse(params[1] as string)).toEqual({});
+      // Exactly what the caller passed — no explicit-null reset list. Every field
+      // this gate leaves unset is absent, which is what makes a prior gate's value
+      // unable to survive at any depth.
+      expect(JSON.parse(params[2] as string)).toEqual({
+        nodeId: 'review',
+        message: 'Please review',
+        type: 'approval',
+      });
     });
 
     test('preserves interactive-loop signal and usage fields when the gate provides them', async () => {
@@ -392,20 +389,34 @@ describe('workflows database', () => {
       });
 
       const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      const payload = JSON.parse(params[1] as string) as {
-        approval: Record<string, unknown>;
-      };
-      expect(payload.approval.completionSignaled).toBe(true);
-      expect(payload.approval.signaledOutput).toBe('REPORT');
-      expect(payload.approval.signaledTokens).toEqual({
+      const approval = JSON.parse(params[2] as string) as Record<string, unknown>;
+      expect(approval.completionSignaled).toBe(true);
+      expect(approval.signaledOutput).toBe('REPORT');
+      expect(approval.signaledTokens).toEqual({
         input: 40,
         output: 4,
         cacheRead: 20,
         cacheWrite: 0,
       });
-      expect(payload.approval.signaledCostUsd).toBe(0.02);
-      expect(payload.approval.commandSnapshot).toBe('Loaded command body');
-      expect(payload.approval.resolved).toBeNull();
+      expect(approval.signaledCostUsd).toBe(0.02);
+      expect(approval.commandSnapshot).toBe('Loaded command body');
+      expect(approval.resolved).toBeUndefined();
+    });
+
+    test('folds caller-supplied run metadata into the same write', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await pauseWorkflowRun(
+        'workflow-run-123',
+        { nodeId: '__writeback__', message: 'Apply changes?', type: 'writeback' },
+        { pending_writeback: true }
+      );
+
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // Same atomic UPDATE, so there is no window where the run is paused
+      // without the marker (M3) — it merges at the top level, beside `approval`.
+      expect(JSON.parse(params[1] as string)).toEqual({ pending_writeback: true });
+      expect((JSON.parse(params[2] as string) as { nodeId: string }).nodeId).toBe('__writeback__');
     });
 
     test('throws when the run is not running', async () => {

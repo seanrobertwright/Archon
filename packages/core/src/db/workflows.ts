@@ -128,6 +128,32 @@ function unresolvedGateClause(): string {
 }
 
 /**
+ * SQL expression writing a fresh approval gate: merge the caller's run-level
+ * metadata into the column at the TOP level, then set `metadata.approval` to the
+ * bound value WHOLESALE. Dialect-aware and kept in ONE place beside
+ * unresolvedGateClause so the two forms cannot drift.
+ *
+ * Deliberately NOT dialect.jsonMerge, because the two merge operators disagree
+ * one level down: Postgres `||` is shallow, so `approval` is replaced; SQLite's
+ * json_patch is RFC 7396 and RECURSES, so a nested object like
+ * `approval.signaledTokens` was merged key by key and interior keys the new gate
+ * omitted survived from the previous gate — fabricating cache-token counts no
+ * provider reported (#2673). Replacing the whole object makes "this gate's
+ * context, and only this gate's" structural on both dialects instead of a list
+ * of resets that every new nested field re-arms.
+ *
+ * @param mergeParamIndex - param holding top-level run metadata (may be `{}`)
+ * @param approvalParamIndex - param holding the complete ApprovalContext
+ */
+function writeApprovalMetadata(mergeParamIndex: number, approvalParamIndex: number): string {
+  const merge = `$${String(mergeParamIndex)}`;
+  const approval = `$${String(approvalParamIndex)}`;
+  return getDatabaseType() === 'postgresql'
+    ? `jsonb_set(metadata || ${merge}::jsonb, '{approval}', ${approval}::jsonb, true)`
+    : `json_set(json_patch(metadata, ${merge}), '$.approval', json(${approval}))`;
+}
+
+/**
  * An audit event written atomically with a gate resolution (#2146). The winning
  * resolver inserts these in the SAME transaction as the resolution UPDATE, so a
  * failed event write rolls the resolution back — a resolved gate can never be
@@ -160,6 +186,13 @@ export interface GateResolutionEvent {
  * Wrapping the resolution and its audit rows in one transaction closes the
  * separate gap where a post-commit event-write failure stranded a resolved gate
  * with no audit event and no way to retry (#2146).
+ *
+ * This one merges (unlike the wholesale pause write — writeApprovalMetadata) and
+ * is safe to, because it stamps the SAME gate rather than opening a new one:
+ * every caller passes `{ ...approval, resolved }`, the stored context plus fields,
+ * so SQLite's deep-merge and a replace produce identical rows. A caller that ever
+ * passed a PARTIAL approval would silently keep the stored values on SQLite and
+ * drop them on Postgres — pass the whole context, or use the pause write's form.
  */
 export async function resolveApprovalGate(
   id: string,
@@ -1027,58 +1060,35 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
  * Sets status to 'paused' and stores approval context in metadata.
  * Does NOT set completed_at — the run is not finished.
  *
- * `resolved`, completion state, and persisted loop usage are reset to an
- * explicit null on every fresh pause so a prior gate's resolution or signal
- * state can never leak into this one: SQLite's json_patch deep-merges the new
- * context into the stored one (an omitted key would keep the old value —
- * JSON.stringify drops undefined, so the values are computed explicitly), and
- * RFC 7396 null removes the key; Postgres `||` replaces the approval object
- * wholesale. See ApprovalContext.resolved / .completionSignaled.
+ * The stored `metadata.approval` is REPLACED with `approvalContext` wholesale
+ * (writeApprovalMetadata), never merged into. So a fresh pause stores exactly
+ * the keys the caller set — at every depth — and nothing a prior gate of the
+ * same run left behind can survive, on either dialect (#2673). Readers treat an
+ * absent key exactly like a JSON null (`!= null`, `=== true`, `?? ''`), and
+ * unresolvedGateClause's `IS NULL` matches both, so omission is the reset.
+ *
+ * `extraMetadata` still merges at the TOP level, so run-level keys the pause
+ * does not own (e.g. `pending_writeback`, `rejection_count`) are preserved.
  */
 export async function pauseWorkflowRun(
   id: string,
   approvalContext: ApprovalContext,
   extraMetadata?: Record<string, unknown>
 ): Promise<void> {
-  const dialect = getDialect();
   try {
     const result = await pool.query(
       `UPDATE remote_agent_workflow_runs
-       SET status = 'paused', metadata = ${dialect.jsonMerge('metadata', 2)}
+       SET status = 'paused', metadata = ${writeApprovalMetadata(2, 3)}
        WHERE id = $1 AND status = 'running'`,
       [
         id,
-        JSON.stringify({
-          approval: {
-            ...approvalContext,
-            resolved: null,
-            // Explicit-null reset of EVERY optional approval sub-field on each fresh
-            // pause (L1) — SQLite's json_patch deep-merges the new approval into the
-            // stored one, so a field the caller omits would otherwise inherit a stale
-            // value from a PRIOR gate in the same run (e.g. an earlier node's
-            // onRejectPrompt misrouting this gate's reject). RFC 7396 null removes the
-            // key; Postgres `||` replaces the approval object wholesale. Readers treat
-            // null as absent (`!= null`).
-            completionSignaled: approvalContext.completionSignaled ?? null,
-            signaledOutput: approvalContext.signaledOutput ?? null,
-            signaledTokens: approvalContext.signaledTokens ?? null,
-            signaledCostUsd: approvalContext.signaledCostUsd ?? null,
-            onRejectPrompt: approvalContext.onRejectPrompt ?? null,
-            onRejectMaxAttempts: approvalContext.onRejectMaxAttempts ?? null,
-            captureResponse: approvalContext.captureResponse ?? null,
-            iteration: approvalContext.iteration ?? null,
-            sessionId: approvalContext.sessionId ?? null,
-            sessionProvider: approvalContext.sessionProvider ?? null,
-            commandSnapshot: approvalContext.commandSnapshot ?? null,
-            // #2121 Phase 2: the child_workflow gate's target child. Reset explicitly
-            // like every other optional sub-field so a prior gate's childRunId can't
-            // leak into a later non-child gate via SQLite json_patch deep-merge.
-            childRunId: approvalContext.childRunId ?? null,
-          },
-          // Fold caller-supplied run-level metadata (e.g. `pending_writeback`) into the
-          // SAME atomic write so there is no window where the run is paused without it (M3).
-          ...(extraMetadata ?? {}),
-        }),
+        // Caller-supplied run-level metadata (e.g. `pending_writeback`) rides the SAME
+        // atomic write so there is no window where the run is paused without it (M3).
+        JSON.stringify(extraMetadata ?? {}),
+        // The complete gate context. JSON.stringify drops undefined, and the write
+        // replaces rather than merges, so an optional field the caller left unset is
+        // simply absent — no explicit-null reset list to keep in sync.
+        JSON.stringify(approvalContext),
       ]
     );
     if (result.rowCount === 0) {

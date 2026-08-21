@@ -200,10 +200,14 @@ class InMemoryStore implements IWorkflowStore {
     const r = this.runs.get(id);
     if (r) {
       r.status = 'paused';
+      // Mirrors the real store's write ORDER: run-level metadata is folded in first,
+      // then `approval` is set wholesale — so nothing from a prior gate survives and
+      // the gate context wins over a same-named extra key. Only the order; a JS
+      // spread cannot model both dialects' merge depth for `extraMetadata`.
       r.metadata = {
         ...r.metadata,
-        approval: { ...approvalContext, resolved: null },
         ...(extraMetadata ?? {}),
+        approval: { ...approvalContext },
       };
     }
     return Promise.resolve();

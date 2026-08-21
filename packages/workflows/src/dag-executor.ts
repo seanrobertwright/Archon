@@ -4300,14 +4300,10 @@ async function executeLoopGroupNode(
         // Persist the body's session cursor so a resumed fresh_context: false loop
         // continues the pre-pause conversation (restored into the cursor on resume).
         // The provider tag rides along so the restore never threads the session into
-        // a different provider (#1992). EXPLICIT null (not key omission) when there
-        // is no cursor — SQLite's json_patch deep-merge would otherwise let a stale
-        // sessionId/sessionProvider from a previous pause of this run survive (same
-        // convention as `resolved`; RFC 7396 null removes the key).
+        // a different provider (#1992). null = this pause has no cursor to restore.
         sessionId: loopLastSequentialSession?.sessionId ?? null,
         sessionProvider: loopLastSequentialSession?.provider ?? null,
-        // Signal state for finalize-on-bare-approve (#2074): written unconditionally
-        // for honesty; pauseWorkflowRun nulls both on every fresh pause.
+        // Signal state for finalize-on-bare-approve (#2074).
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
         // NO `signaledTokens` — a loop_group gate has no consumer for it. The body's
@@ -5896,12 +5892,9 @@ async function executeLoopNode(
         message: honestMessage,
         type: 'interactive_loop',
         iteration: i,
-        // Explicit null (never key omission) when there is no session — SQLite's
-        // json_patch deep-merge would otherwise let a stale sessionId from a previous
-        // pause of this run survive (same convention as `resolved`).
+        // null = this pause has no session to restore.
         sessionId: currentSessionId ?? null,
-        // Signal state for finalize-on-bare-approve (#2074): written unconditionally
-        // for honesty; pauseWorkflowRun nulls both on every fresh pause.
+        // Signal state for finalize-on-bare-approve (#2074).
         completionSignaled: completionDetected,
         signaledOutput: completionDetected ? lastIterationOutput : null,
         // Cumulative usage consumed through this gate. A resumed loop seeds its
