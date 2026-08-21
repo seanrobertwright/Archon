@@ -2814,9 +2814,12 @@ async function executeNodeInternal(
       getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
     }
     // Transcript row on BOTH branches. The persisted event below is written either way,
-    // and a cancel reaches this catch only when the provider SDK threw on abort rather
-    // than ending its stream — an implementation detail of the provider that must not
-    // decide whether the run's transcript records the node at all (#2693).
+    // so the transcript must not disagree with it depending on how the cancel arrived.
+    // A cancel reaches this catch mainly through the engine's own structured-output
+    // gate: it runs before the streaming-cancel branch and cannot reask once the signal
+    // is aborted, so an aborted node declaring `output_format` throws here instead of
+    // returning there. A provider SDK that throws on abort also lands here. Neither is
+    // a reason for a node to be missing from the run's transcript (#2693).
     await logNodeError(logDir, workflowRun.id, node.id, failureMessage, nodeUsageEventData());
 
     deps.store
@@ -4665,12 +4668,15 @@ async function executeLoopNode(
     } = {}
   ): Promise<NodeExecutionResult> => {
     getLog().error({ nodeId: node.id, error, ...(extras.data ?? {}) }, 'loop_node.failed');
-    // A loop that failed part-way still paid for the iterations it ran, so the
-    // transcript row carries the same totals as the persisted event below (#2693).
-    await logNodeError(logDir, workflowRun.id, node.id, error, {
+    // A loop that failed part-way still paid for the iterations it ran. Built once and
+    // spread into both sinks, so the transcript row and the persisted event cannot
+    // disagree — the same reason executeNodeInternal routes both through
+    // nodeUsageEventData (#2693).
+    const loopUsage: WorkflowUsage = {
       ...(extras.tokens !== undefined ? { tokens: extras.tokens } : {}),
       ...(extras.costUsd !== undefined ? { cost_usd: extras.costUsd } : {}),
-    });
+    };
+    await logNodeError(logDir, workflowRun.id, node.id, error, loopUsage);
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
@@ -4678,8 +4684,7 @@ async function executeLoopNode(
         step_name: stepName,
         data: {
           error,
-          ...(extras.costUsd !== undefined ? { cost_usd: extras.costUsd } : {}),
-          ...(extras.tokens !== undefined ? { tokens: extras.tokens } : {}),
+          ...loopUsage,
           ...(extras.data ?? {}),
         },
       })

@@ -405,6 +405,19 @@ function loaderBypassingWorkflow(
 
 // --- Tests ---
 
+/**
+ * A run's JSONL transcript, parsed. Module-scoped so every describe reads a run's
+ * transcript the same way.
+ */
+const readTranscript = async (
+  logDir: string,
+  runId: string
+): Promise<Array<Record<string, unknown>>> =>
+  (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>);
+
 describe('buildTopologicalLayers', () => {
   it('single node with no dependencies -> one layer', () => {
     const layers = buildTopologicalLayers([node('a')]);
@@ -5967,15 +5980,6 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     // gets believed. Absence is the honest answer.
     expect(completedEvent?.[0].data).not.toHaveProperty('tokens');
   });
-
-  const readTranscript = async (
-    logDir: string,
-    runId: string
-  ): Promise<Array<Record<string, unknown>>> =>
-    (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
 
   it('writes node and run cost to the transcript, matching the persisted events', async () => {
     mockSendQueryDag.mockImplementation(async function* () {
@@ -14021,10 +14025,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       minimalConfig
     );
 
-    const rows = (await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const rows = await readTranscript(logDir, workflowRun.id);
 
     const failureRow = rows.find(row => row.type === 'node_error' && row.step === 'b');
     expect(failureRow?.cost_usd).toBe(0.02);
@@ -14107,10 +14108,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
 
     // Prove the abort branch is the one that ran: it is the only path that reports
     // exactly 'Cancelled by user'.
-    const rows = (await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const rows = await readTranscript(logDir, workflowRun.id);
     const cancelRow = rows.find(row => row.type === 'node_error' && row.step === 'only');
     expect(cancelRow?.error).toBe('Cancelled by user');
     expect(cancelRow?.cost_usd).toBe(0.02);
@@ -14173,10 +14171,7 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       setSystemTime();
     }
 
-    const rows = (await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const rows = await readTranscript(logDir, workflowRun.id);
     const cancelRow = rows.find(row => row.type === 'node_error' && row.step === 'only');
     expect(cancelRow?.error).toBe('Cancelled by user');
     expect(cancelRow?.cost_usd).toBe(0.02);
@@ -24480,10 +24475,7 @@ describe('TokenUsage axis seam guard', () => {
 
   it('JSONL transcript node_complete row carries every axis it claims', async () => {
     const { runId, logDir } = await runSpecimenDag();
-    const rows = (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const rows = await readTranscript(logDir, runId);
     const nodeComplete = rows.find(row => row.type === 'node_complete' && row.step === 'step');
     expectSeamCarriesAxes(
       'JSONL node_complete.tokens',
@@ -24497,10 +24489,7 @@ describe('TokenUsage axis seam guard', () => {
     // because logNodeError spreads the same WorkflowUsage carrier logNodeComplete
     // does — one decision, so a new axis either rides both rows or neither.
     const { runId, logDir } = await runSpecimenDag('failed');
-    const rows = (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const rows = await readTranscript(logDir, runId);
     const nodeError = rows.find(row => row.type === 'node_error' && row.step === 'step');
     expectSeamCarriesAxes(
       'JSONL node_error.tokens',
