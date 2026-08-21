@@ -1651,6 +1651,27 @@ describe('provider cwd resolution', () => {
       expect(sent).not.toContain('/update-project Client Ops');
     });
 
+    test('escapes quotes and backslashes in the project name', async () => {
+      // Quoting alone is not enough: a `"` inside the name closes the quoted token
+      // early and reproduces the original defect, and a trailing `\` escapes the
+      // closing quote. parseCommand honours backslash escapes inside quotes, so a
+      // single pass over both characters round-trips. One pass, not two chained
+      // replaces — escaping `"` first and `\` second would double-escape the
+      // backslashes the first pass just added.
+      const codebase = { ...makeCodebaseForSync(), name: 'Bob"s \\Ops' };
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      expect(sent).toContain('/update-project "Bob\\"s \\\\Ops" <new-path>');
+    });
+
     test('writes no user row when it refuses, so none is left unpaired', async () => {
       mockAddMessage.mockClear();
       const codebase = makeCodebaseForSync();
