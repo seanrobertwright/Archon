@@ -452,11 +452,15 @@ In human mode `approve`/`reject` auto-resume the run inline. In `--json` mode th
 #### Detached control verbs
 
 `approve`, `reject`, and `resume` accept `--detach`. The parent validates the run
-**read-only** — the same four/three preconditions the operation itself enforces, so a
-wrong-status, missing-context, `child_workflow`-blocked, or already-resolved run is
-refused synchronously and nothing is spawned — then hands the whole command to a
-detached child that owns all state mutation in its own process group. A shell that
-dies mid-flight can no longer wedge the run.
+**read-only** with the same preconditions the operation itself enforces, so a
+wrong-status, missing-context, `child_workflow`-blocked, already-resolved, or
+no-working-path run is refused synchronously and nothing is spawned. The parent then
+hands the whole command to a detached child that owns all state mutation in its own
+process group. A shell that dies mid-flight can no longer wedge the run.
+
+The parent also waits out the child's startup window before acking, so a child that
+dies immediately surfaces as an error carrying the tail of its log rather than as a
+success you only discover was false minutes later.
 
 ```bash
 archon workflow approve <run-id> --detach
@@ -481,9 +485,10 @@ just outside your shell. The ack carries `continues: true` to say so:
 }
 ```
 
-Read `continues` to decide whether your automation still owns continuation. Precheck
-failures follow each verb's existing error contract: `{ ok: false }` under `--json`,
-a thrown error otherwise.
+Read `continues` to decide whether your automation still owns continuation. `logPath`
+is `null` when the log file could not be opened — the child still runs, but its output
+is discarded, so do not assume a string. Precheck failures follow each verb's existing
+error contract: `{ ok: false }` under `--json`, a thrown error otherwise.
 
 ### `workflow reject`
 
