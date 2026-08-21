@@ -63,6 +63,23 @@ Triage clauses — cite as `direction.md §<clause>`:
 - **§schema-width** — new provider capabilities default into provider config or tier/alias presets, not new node fields; a node field is earned only by genuine per-node variance. Capability mismatches warn loudly, never silently no-op (`capabilities.ts` is the source of truth; docs derive from it — #2116).
 - **§implicit-behavior** — a new implicit behavior (auto-anything) must be documented in the canonical behavior list, individually defeatable, and fail-safe — convenience alone never qualifies.
 
+## Isolation
+
+Isolation has two independent axes, and they are chosen separately:
+
+- **Workspace** — which working tree a run sees, and at which ref. A git worktree is one way to provide that, not the definition of it. A folder project has no git layer at all.
+- **Execution** — where commands actually run and what they can reach. The host today, or a container.
+
+**Execution is always the outer boundary, and the workspace nests inside it.** A worktree is a git mechanism, not an execution sandbox: if a run executes inside a container, VM, or microVM, the worktree is a layer *within* that, never an alternative to it. On its own a worktree bounds which files a run sees and little else — concurrent runs still share `~/.archon` and its single database, `$STATE_DIR`, persisted node sessions, caches, and the machine. The host environment is the clearest case: `buildRequestSubprocessEnv` is the env-isolation enforcement point and it withholds `process.env` only for a **container** run, so a host run inherits the ambient environment whether or not it sits in a worktree. What per-run separation does exist (artifacts, logs, run-scoped sessions) is keyed by **run id**, not by worktree. So a worktree is not a security boundary and must not be described as one. The engine coordinates runs; it does not own how they are isolated.
+
+Today's backends are what exist, not the limit of what we want. Isolation will expand, and proposals with a genuinely good answer for isolating runs are welcome — folder projects especially, where there is no git layer to lean on and execution isolation is the only isolation available. Running a repo checkout inside a container is a gap we want filled (#2206). Cite as `direction.md §isolation-layers`.
+
+Triage clauses — cite as `direction.md §<clause>`:
+
+- **§isolation-never-inferred** — the engine never guesses isolation. A worktree is created only on an explicit `isolation: worktree`, and a mismatch fails fast naming the setting the author must supply. PRs that default, infer, or silently upgrade isolation conflict.
+- **§isolation-arrives-whole** — a new isolation backend lands as one change: backend, contract, and lifecycle together. Contract surface with no producer is declined with a pointer to the backend that would use it — an isolation backend is a security boundary, and a half-landed one is a boundary nobody owns.
+- **§same-path-workspace** — a container addresses the workspace at the same path the host does, which is what lets `$ARTIFACTS_DIR` mean one thing in prompt text, env, and argv alike. Divergent addressing is not forbidden, but it must resolve every path once at a single seam rather than remapping strings at the edges (#2206, #2207).
+
 ## Open questions (no stance yet)
 
 These are direction calls we haven't made. PRs that touch these areas should surface the question for explicit decision rather than be silently accepted or rejected. The workflow may add to this list as new questions appear.
