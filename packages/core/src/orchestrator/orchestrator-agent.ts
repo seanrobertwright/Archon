@@ -827,7 +827,16 @@ async function dispatchOrchestratorWorkflowOwned(
   // For a fresh run: freeze, then re-resolve the workflow FROM the frozen copy, so the
   // definition executed and the resources beside it are one consistent set of bytes.
   const runCwd = conversation.cwd ?? codebase.default_cwd;
+  // `preparedSource` is the outer binding the resume branch's defensive guard reads
+  // (always undefined there — step 2 didn't run for a continuation). The two fresh
+  // dispatches read `freshCaptured` directly, so the helper's narrowed return type
+  // survives: a downstream `let` of type `PreparedWorkflowSource | undefined` would
+  // defeat the narrowing and leave the `if (preparedSource) owner.adopt();` guards
+  // structurally always-true at runtime.
   let preparedSource: PreparedWorkflowSource | undefined;
+  let freshCaptured:
+    | { preparedSource: PreparedWorkflowSource; workflow: WorkflowDefinition }
+    | undefined;
 
   if (willContinueExistingRun && resumableRun) {
     // Continuing: execute the GRAPH this run froze, not the one on disk now. Skipping
@@ -858,10 +867,9 @@ async function dispatchOrchestratorWorkflowOwned(
   }
 
   if (!willContinueExistingRun) {
-    const captured = await captureFreshSource(owner, runCwd, workflow, conversationId, platform);
-    if (!captured) return; // capture failed, message already sent
-    preparedSource = captured.preparedSource;
-    workflow = captured.workflow;
+    freshCaptured = await captureFreshSource(owner, runCwd, workflow, conversationId, platform);
+    if (!freshCaptured) return; // capture failed, message already sent
+    workflow = freshCaptured.workflow;
   }
 
   // Signature gate (#2470, #2554): resolve this invocation's declared inputs from the
@@ -1123,14 +1131,16 @@ async function dispatchOrchestratorWorkflowOwned(
       // the mixed-vintage shape #2660 exists to remove.
       const captured = await captureFreshSource(owner, runCwd, workflow, conversationId, platform);
       if (!captured) return; // capture failed, message already sent
-      preparedSource = captured.preparedSource;
       workflow = captured.workflow;
       await platform.sendMessage(
         conversationId,
         `⚠️ Prior run for **${workflow.name}** had no completed nodes; starting fresh in the same worktree.`
       );
-      // Handing the capture to a run: it owns the bytes and their lifetime now.
-      if (preparedSource) owner.adopt();
+      // Handing the capture to a run: it owns the bytes and their lifetime now. `captured`
+      // proves `preparedSource` is non-undefined via the helper's narrowed return type, so
+      // the previous outer-`let`-defeating `if (preparedSource) owner.adopt();` guard
+      // collapses to an unconditional adopt here.
+      owner.adopt();
       await executeWorkflow(
         deps,
         platform,
@@ -1144,7 +1154,7 @@ async function dispatchOrchestratorWorkflowOwned(
           parentConversationId: conversation.id,
           userId,
           source,
-          preparedSource,
+          preparedSource: captured.preparedSource,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
@@ -1191,9 +1201,24 @@ async function dispatchOrchestratorWorkflowOwned(
       throw err;
     }
   } else {
-    // Fresh foreground execution: web interactive workflows + all chat platforms
+    // Fresh foreground execution: web interactive workflows + all chat platforms.
+    // Reaching this branch means `resumableRun?.working_path` is falsy, which implies
+    // `willContinueExistingRun` was false and step 2 above ran. `freshCaptured` is
+    // invariantly defined here — the previous outer-`let`-defeating
+    // `if (preparedSource) owner.adopt();` guard collapsed to an unconditional adopt
+    // by reading from the hoisted capture instead.
+    if (!freshCaptured) {
+      // Should never trigger; the reasoning above is the invariant. If it does, the
+      // dispatch returned a `preparedSource: undefined` to the executor and we are
+      // about to fall into the executor's `source_unprepared_live` branch — the
+      // mixed-vintage shape #2660 exists to remove — so refuse loudly rather than
+      // ship that regression silently.
+      throw new Error(
+        'orchestrator invariant violated: fresh-foreground dispatch reached without a captured source'
+      );
+    }
     // Handing the capture to a run: it owns the bytes and their lifetime now.
-    if (preparedSource) owner.adopt();
+    owner.adopt();
     await executeWorkflow(
       createWorkflowDeps(),
       platform,
@@ -1207,7 +1232,7 @@ async function dispatchOrchestratorWorkflowOwned(
         parentConversationId: conversation.id,
         userId,
         source,
-        preparedSource,
+        preparedSource: freshCaptured.preparedSource,
         parseWarnings: options?.parseWarnings,
         baseBranch: codebaseBaseBranch,
         resolveChildIsolation,

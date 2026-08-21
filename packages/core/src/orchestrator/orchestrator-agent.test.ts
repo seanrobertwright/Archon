@@ -2297,6 +2297,57 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(opts.preparedSource?.manifest?.captured_at).toBe('2026-08-21T00:00:00.000Z');
   });
 
+  test('foreground_resume_detected: fresh-run-in-same-worktree refuses with the capture-failure message when prepareWorkflowSource rejects (#2686)', async () => {
+    // The new capture call inside the resume-null fallback introduces a SECOND call site
+    // of `captureFreshSource(...)` whose failure path is unexercised by the success-only
+    // test above. A regression that drops `if (!captured) return;` or reorders the
+    // user-visible notice would land uncaught without this test — `executeWorkflow`
+    // would be called against an undefined capture and the user would see the generic
+    // "starting fresh in the same worktree" notice instead of the capture-failure one.
+    //
+    // Note on the lifecycle: `captureFreshSource` calls `owner.hold` AFTER
+    // `prepareWorkflowSource` returns, so a `prepareWorkflowSource` rejection skips
+    // the hold entirely (no reclaim because nothing was held). The
+    // `['hold:/capture', 'reclaim:/capture']` shape is exercised separately by the
+    // "keeps holding the capture when the dispatch refuses after taking it" test
+    // above — that one runs `prepareWorkflowSource` cleanly and trips a gate AFTER
+    // the hold.
+    const { prepareWorkflowSource } = await import('@archon/workflows/executor');
+    (prepareWorkflowSource as ReturnType<typeof mock>).mockImplementationOnce(() =>
+      Promise.reject(new Error('disk full'))
+    );
+
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(
+        makeResumableRun({
+          id: 'empty-prior-run',
+          status: 'paused',
+        })
+      )
+    );
+    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+    // No run started against an undefined capture.
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    // The user-visible failure notice names the workflow and the underlying error.
+    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+    expect(sent).toContain(
+      'Could not capture the workflow source for **test-workflow**: disk full'
+    );
+    // The generic "starting fresh in the same worktree" notice must NOT fire — that
+    // would mislead the user into thinking a fresh run started when none did.
+    expect(sent).not.toContain('starting fresh in the same worktree');
+    // The capture was never held (rejection landed BEFORE `owner.hold`), so the
+    // owner has nothing to reclaim.
+    expect(capturedSourceOwnerCalls).toEqual([]);
+  });
+
   test('foreground_resume_detected: fresh-run-in-same-worktree captures and executes the FRESHLY captured graph (#2686)', async () => {
     // (#2686) Regression for the mixed-vintage shape: when a paused run had nothing to
     // resume, the orchestrator must capture source here and execute the freshly resolved
