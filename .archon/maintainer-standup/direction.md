@@ -63,6 +63,16 @@ Triage clauses — cite as `direction.md §<clause>`:
 - **§schema-width** — new provider capabilities default into provider config or tier/alias presets, not new node fields; a node field is earned only by genuine per-node variance. Capability mismatches warn loudly, never silently no-op (`capabilities.ts` is the source of truth; docs derive from it — #2116).
 - **§implicit-behavior** — a new implicit behavior (auto-anything) must be documented in the canonical behavior list, individually defeatable, and fail-safe — convenience alone never qualifies.
 
+## Isolation
+
+Isolation has two layers, chosen separately: the **git layer** (a worktree, or nothing for a folder project) and the **execution layer** (the host, or a container). Archon supports the combinations it has backends for, not an open matrix. Running a repo checkout inside a container is a gap we want filled (#2206) and is not supported today.
+
+Triage clauses — cite as `direction.md §<clause>`:
+
+- **§isolation-never-inferred** — the engine never guesses isolation. A worktree is created only on an explicit `isolation: worktree`, and a mismatch fails fast naming the setting the author must supply. PRs that default, infer, or silently upgrade isolation conflict.
+- **§isolation-arrives-whole** — a new isolation combination lands as one change: backend, contract, and lifecycle together. Contract surface with no producer is declined with a pointer to the backend that would use it — an isolation backend is a security boundary, and a half-landed one is a boundary nobody owns.
+- **§same-path-workspace** — a container addresses the workspace at the same path the host does, which is what lets `$ARTIFACTS_DIR` mean one thing in prompt text, env, and argv alike. Divergent addressing is not forbidden, but it must resolve every path once at a single seam rather than remapping strings at the edges (#2206, #2207).
+
 ## Open questions (no stance yet)
 
 These are direction calls we haven't made. PRs that touch these areas should surface the question for explicit decision rather than be silently accepted or rejected. The workflow may add to this list as new questions appear.
