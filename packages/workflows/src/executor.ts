@@ -2,10 +2,9 @@
  * Workflow Executor - runs DAG-based workflows
  */
 import { mkdir, rename, rm, writeFile } from 'fs/promises';
-import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
@@ -608,6 +607,36 @@ export interface PreparedWorkflowSource {
   manifest: WorkflowSourceManifest;
   /** Roots to discover from — pass to `discoverWorkflowsWithConfig`. */
   roots: WorkflowSourceRoots;
+}
+
+/**
+ * Move a staged capture to its final home under the run's artifacts, early.
+ *
+ * `executeWorkflow` normally does this itself once it has resolved the run's paths. One
+ * caller cannot wait: a container fixes its bind mounts at `docker run`, which happens
+ * during isolation preparation — before the run row exists — and mounting the staging
+ * path would bind a directory that is about to move. Callers preparing a container
+ * finalize here first, then mount the returned path.
+ *
+ * Idempotent: `executeWorkflow` recomputes the same destination and skips the move.
+ */
+export async function finalizeWorkflowSource(
+  deps: WorkflowDeps,
+  prepared: PreparedWorkflowSource,
+  opts: { cwd: string; codebaseId?: string }
+): Promise<PreparedWorkflowSource> {
+  const { artifactsDir } = await resolveProjectPaths(
+    deps,
+    opts.cwd,
+    prepared.runId,
+    opts.codebaseId
+  );
+  const finalRoot = getRunSourceCapturePath(artifactsDir);
+  if (finalRoot === prepared.captureRoot) return prepared;
+  await mkdir(dirname(finalRoot), { recursive: true });
+  await rm(finalRoot, { recursive: true, force: true });
+  await rename(prepared.captureRoot, finalRoot);
+  return { ...prepared, captureRoot: finalRoot, roots: capturedSourceRoots(finalRoot) };
 }
 
 /**
@@ -2225,16 +2254,10 @@ export async function executeWorkflow(
         runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
       dagPriorUsage,
       priorNodeSessions,
-      // Container runs resolve node-level source LIVE, from the mounted project root.
-      // A container `docker exec`s named scripts by absolute path, and the capture lives
-      // on the host outside the mount, so pointing at it would fail every named-script
-      // lookup. This is sound rather than a hole only because container isolation is
-      // folder-project-only and those run in place: source and target are the same
-      // mounted directory, and `--workflow-source` is refused with `--container` so they
-      // cannot diverge. The run's DEFINITION still comes from the capture, discovered on
-      // the host. Making the capture authoritative in-container as well needs a
-      // read-only bind of it at the same absolute path — see the PR discussion.
-      execContext.kind === 'container' ? undefined : workflowSourceRoots
+      // Container runs resolve from the capture like every other run: it is bind-mounted
+      // read-only at the SAME absolute path inside the container, so one source-roots
+      // value means the same thing on both sides of the boundary.
+      workflowSourceRoots
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

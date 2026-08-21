@@ -46,6 +46,7 @@ import { resolveWorkflowName } from '@archon/workflows/router';
 import {
   capturedSourceRoots,
   executeWorkflow,
+  finalizeWorkflowSource,
   hydrateResumableRun,
   prepareWorkflowSource,
   recordSelectedWorkflow,
@@ -1656,7 +1657,21 @@ export async function workflowRunCommand(
           'workflow.running_in_container'
         );
         try {
-          prepared = await backend.prepare({ codebase: folderCodebase });
+          // The container fixes its mounts at creation, so the run's source must already
+          // be at its final path. Move it there now; executeWorkflow recomputes the same
+          // destination and skips its own move.
+          if (preparedSource) {
+            preparedSource = await finalizeWorkflowSource(createWorkflowDeps(), preparedSource, {
+              cwd: folderCodebase.defaultCwd,
+              codebaseId: folderCodebase.id,
+            });
+          }
+          prepared = await backend.prepare({
+            codebase: folderCodebase,
+            // Read-only, at the same absolute path inside the container, so a named
+            // script resolves identically on both sides of the boundary.
+            ...(preparedSource ? { sourceMount: preparedSource.captureRoot } : {}),
+          });
         } catch (prepErr) {
           // Map docker/daemon/image failures to an actionable message (daemon down,
           // runner image missing, docker-group permission — see errors.ts).

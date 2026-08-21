@@ -250,7 +250,9 @@ Every run freezes its **project** workflow source when it starts — the `.archo
 - **A run does not change shape while it is running.** Edit, move, or delete the source checkout after a run starts and a resume still executes what the run began with. Start a new run to pick up the edits.
 - **Resume needs no source path.** `archon workflow resume <run-id>`, `approve`, and `reject` all load the run's own captured source, which is why `--workflow-source` is refused alongside `--resume`.
 
-The captured source lives under that run's artifacts (`~/.archon/workspaces/<project>/artifacts/runs/<run-id>/workflow-source/`) and is removed with the rest of the run's artifacts. If it is ever missing when a run resumes, Archon says so and continues against the current source on disk rather than failing the run.
+The captured source lives under that run's artifacts (`~/.archon/workspaces/<project>/artifacts/runs/<run-id>/workflow-source/`) and is removed with the rest of the run's artifacts. Its manifest records a content digest, and a resume verifies it: if the capture is missing or its bytes have changed, the run **fails** rather than continuing against different source. Start a fresh run to execute the current workflow. The one exception is a run that started before Archon captured source at all — it has nothing recorded to honor, so it resumes against the current source on disk with a warning.
+
+`--container` runs get the same treatment: the capture is bind-mounted **read-only at the same absolute path** inside the container, so a named script resolves identically whether a node runs on the host or in the container, and a container recreated on resume gets the mount back. `--workflow-source` is refused with `--container` — a folder project runs in place, so its source and its target are the same directory by definition.
 
 #### Deterministic dry-run
 
