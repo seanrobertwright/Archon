@@ -43,6 +43,7 @@ import { findWorkflow, resolveWorkflowName } from '@archon/workflows/router';
 import {
   disposeWorkflowSource,
   executeWorkflow,
+  resolveContinuationWorkflow,
   hydrateResumableRun,
   prepareWorkflowSource,
   recordSelectedWorkflow,
@@ -816,6 +817,31 @@ async function dispatchOrchestratorWorkflow(
   // definition executed and the resources beside it are one consistent set of bytes.
   const runCwd = conversation.cwd ?? codebase.default_cwd;
   let preparedSource: PreparedWorkflowSource | undefined;
+
+  if (willContinueExistingRun && resumableRun) {
+    // Continuing: execute the GRAPH this run froze, not the one on disk now. Skipping
+    // this left the DAG live while the executor fed it commands and scripts from the old
+    // capture — an edited workflow would silently run its new graph against pre-edit
+    // command bytes. Undefined means a run predating capture, which keeps live behavior.
+    try {
+      const continuation = await resolveContinuationWorkflow(
+        createWorkflowDeps(),
+        resumableRun,
+        runCwd
+      );
+      if (continuation) workflow = continuation.workflow;
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, runId: resumableRun.id }, 'workflow.continuation_source_failed');
+      await platform.sendMessage(
+        conversationId,
+        `Cannot continue run \`${resumableRun.id}\`: ${err.message} ` +
+          'Start a fresh run to execute the current workflow.'
+      );
+      return;
+    }
+  }
+
   if (!willContinueExistingRun) {
     try {
       const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);

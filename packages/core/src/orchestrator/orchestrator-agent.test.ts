@@ -177,6 +177,8 @@ mock.module('@archon/workflows/executor', () => ({
     })
   ),
   recordSelectedWorkflow: mock(() => Promise.resolve()),
+  disposeWorkflowSource: mock(() => Promise.resolve()),
+  resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
 }));
 
 /** Baseline capabilities the mocked registry reports. Tests that narrow this

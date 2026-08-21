@@ -15,6 +15,7 @@ import {
   resolveChildDiscoveryRoot,
   resolveRunSourceRoot,
   WorkflowSourceIntegrityError,
+  DEFAULT_WORKFLOW_SOURCE_CONFIG,
 } from './workflow-source';
 import { WORKFLOW_SOURCE_METADATA_KEY } from './schemas/workflow-run';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -293,7 +294,7 @@ describe('resolving against a capture instead of the target', () => {
       target,
       'review',
       undefined,
-      capturedSourceRoots(capture!.captureRoot)
+      capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
     );
     expect(fromCapture).toEqual({ success: true, content: 'from authoring' });
   });
@@ -313,7 +314,7 @@ describe('resolving against a capture instead of the target', () => {
       target,
       '__archon_pack__project:pack:flow::step',
       undefined,
-      capturedSourceRoots(capture!.captureRoot)
+      capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
     );
     expect(result).toEqual({ success: true, content: 'packaged body' });
   });
@@ -328,7 +329,10 @@ describe('resolving against a capture instead of the target', () => {
     expect((await discoverScriptsForCwd(target)).get('check')).toBeUndefined();
 
     const script = (
-      await discoverScriptsForCwd(target, capturedSourceRoots(capture!.captureRoot))
+      await discoverScriptsForCwd(
+        target,
+        capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
+      )
     ).get('check');
     expect(script?.runtime).toBe('bun');
     // The script runs from the capture while the process still works in the target.
@@ -353,7 +357,7 @@ describe('resolving against a capture instead of the target', () => {
       target,
       'review',
       undefined,
-      capturedSourceRoots(capture!.captureRoot)
+      capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
     );
     expect(result).toEqual({ success: true, content: 'authoring version' });
   });
@@ -494,7 +498,7 @@ describe('the capture is authoritative, not advisory', () => {
     // A project workflow can `include:` a global or bundled one, so leaving those live
     // would let an included workflow change shape across a resume.
     expect(capture.manifest.scopes).toContain('project');
-    const roots = capturedSourceRoots(capture.captureRoot);
+    const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
     expect(roots.globalWorkflows.startsWith(capture.captureRoot)).toBe(true);
     expect(roots.globalCommands.startsWith(capture.captureRoot)).toBe(true);
   });
@@ -562,8 +566,37 @@ describe("the source's own settings travel with its bytes", () => {
       target,
       'shipit',
       undefined,
-      capturedSourceRoots(capture.captureRoot)
+      capturedSourceRoots(capture.captureRoot, DEFAULT_WORKFLOW_SOURCE_CONFIG)
     );
     expect(result.success).toBe(false);
+  });
+});
+
+describe('continuing a run resolves with the settings it froze', () => {
+  test('the manifest supplies the config, so a custom command folder survives resume', async () => {
+    // The regression: continuation built roots with DEFAULT_WORKFLOW_SOURCE_CONFIG, which
+    // is worse than degraded — a defined-but-default config also suppresses discovery's
+    // live-config fallback, so the result is confidently wrong.
+    await mkdir(join(source, 'team-commands'), { recursive: true });
+    await writeFile(join(source, 'team-commands', 'shipit.md'), 'ship it');
+    const capture = await captureWorkflowSource({
+      sourceRoot: source,
+      captureRoot: getRunSourceCapturePath(runArtifacts),
+      commandFolder: 'team-commands',
+      sourceConfig: {
+        load_default_workflows: true,
+        load_default_commands: true,
+        command_folder: 'team-commands',
+      },
+    });
+
+    // What a continuation does: read the capture back from its path alone, exactly as
+    // `sourceCaptureRoot` gives it, and rebuild roots from the manifest it finds there.
+    const reloaded = await loadWorkflowSource(capture.captureRoot);
+    const roots = capturedSourceRoots(reloaded.captureRoot, reloaded.manifest.source_config);
+    expect(roots.config.command_folder).toBe('team-commands');
+
+    const result = await loadCommandPrompt(deps, target, 'shipit', undefined, roots);
+    expect(result).toEqual({ success: true, content: 'ship it' });
   });
 });

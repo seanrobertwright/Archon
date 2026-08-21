@@ -28,8 +28,10 @@ function getLog(): ReturnType<typeof createLogger> {
  * otherwise `undefined` (meaning "same as cwd" — every caller treats an absent value
  * as the pre-existing behavior).
  *
- * Never throws: a git failure here should downgrade to reading `cwd`, not fail the
- * conversation.
+ * THROWS when git cannot answer. That is deliberate and the opposite of what this used to
+ * do: swallowing the error returned `undefined`, which callers read as "the cwd IS the
+ * authoring root" and then froze the worktree — the source/target confusion this exists to
+ * prevent. Not knowing and guessing wrong are different outcomes, so the caller decides.
  */
 export async function resolveWorkflowSourceRoot(cwd: string): Promise<string | undefined> {
   // A git failure is NOT the same as "this is not a worktree". Swallowing it returned

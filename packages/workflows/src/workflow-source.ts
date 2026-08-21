@@ -183,9 +183,16 @@ export function liveSourceRoots(
  */
 export function capturedSourceRoots(
   captureRoot: string,
-  /** From the capture's manifest, so a resume cannot reinterpret frozen bytes with the
-   *  TARGET's settings. */
-  config: WorkflowSourceConfig = DEFAULT_WORKFLOW_SOURCE_CONFIG
+  /**
+   * From the capture's MANIFEST, so a resume cannot reinterpret frozen bytes with the
+   * target's settings.
+   *
+   * Required, with no default. A default here is what let the continuation path silently
+   * substitute `DEFAULT_WORKFLOW_SOURCE_CONFIG` after the capture-side fix had landed —
+   * confidently wrong rather than degraded, because a defined-but-default config also
+   * suppresses discovery's live-config fallback. Omitting it is now a compile error.
+   */
+  config: WorkflowSourceConfig
 ): WorkflowSourceRoots {
   return {
     project: join(captureRoot, PROJECT_SCOPE_DIR),

@@ -46,6 +46,8 @@ import { resolveWorkflowName } from '@archon/workflows/router';
 import {
   capturedSourceRoots,
   disposeWorkflowSource,
+  loadWorkflowSource,
+  type WorkflowSourceRoots,
   executeWorkflow,
   finalizeWorkflowSource,
   hydrateResumableRun,
@@ -935,7 +937,19 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 /**
  * Run a specific workflow
  */
-export async function workflowRunCommand(
+/**
+ * A prepared capture's owner, supplied by {@link workflowRunCommand}.
+ *
+ * The implementation reports what it did — held a capture, then adopted it into a run —
+ * and the owner reclaims anything unadopted no matter which of the many exits was taken.
+ */
+interface CaptureOwner {
+  hold: (prepared: PreparedWorkflowSource) => void;
+  adopt: () => void;
+}
+
+async function runWorkflowWithOwnedSource(
+  owner: CaptureOwner,
   cwd: string,
   workflowName: string,
   userMessage: string,
@@ -951,10 +965,15 @@ export async function workflowRunCommand(
   // A dry run creates no run and no artifacts, so it has nothing to freeze into and reads
   // live, exactly as it did before captures existed.
   // Continuing an existing run: discover from the source it recorded, and take no new
-  // capture. The executor verifies the same capture before executing a node.
-  const recordedRoots = options.sourceCaptureRoot
-    ? capturedSourceRoots(options.sourceCaptureRoot)
-    : undefined;
+  // capture. The MANIFEST supplies the settings those roots resolve under — building them
+  // from defaults instead re-discovered a different DAG on any repo with a non-default
+  // `commands.folder`, confidently rather than degraded, because a defined-but-default
+  // config also suppresses discovery's live-config fallback.
+  let recordedRoots: WorkflowSourceRoots | undefined;
+  if (options.sourceCaptureRoot !== undefined) {
+    const capture = await loadWorkflowSource(options.sourceCaptureRoot);
+    recordedRoots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+  }
 
   // A continuation never captures. With a record it reads that record (above); without
   // one it is a run created before captures existed, and reads live source — the same
@@ -968,6 +987,8 @@ export async function workflowRunCommand(
       preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
         sourceRoot: effectiveDiscoveryCwd,
       });
+      // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+      owner.hold(preparedSource);
     } catch (error) {
       throw new Error(
         `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
@@ -2120,6 +2141,8 @@ export async function workflowRunCommand(
           // selected. A resume ignores it and loads the source recorded on its own row.
           preparedSource,
         };
+    // Handing the capture to a run: it now owns the bytes and their lifetime.
+    if (preparedSource) owner.adopt();
     result = await executeWorkflow(
       deps,
       adapter,
@@ -2275,6 +2298,63 @@ export async function workflowRunCommand(
     console.log('\nWorkflow completed successfully.');
   } else {
     throw new Error(`Workflow failed: ${result.error}`);
+  }
+}
+
+/**
+ * Run a specific workflow.
+ *
+ * A thin owner around the implementation: whatever the run does with its captured source,
+ * the capture is either adopted by a run or reclaimed. The implementation has a dozen
+ * ordinary ways out — unknown workflow, refused inputs, flag conflicts, a detached
+ * dispatch — and asking each to remember a disposal call is how most of them did not.
+ */
+export async function workflowRunCommand(
+  cwd: string,
+  workflowName: string,
+  userMessage: string,
+  options: WorkflowRunOptions = {}
+): Promise<void> {
+  let held: PreparedWorkflowSource | undefined;
+  await withCapturedSourceOwner(
+    p => {
+      held = p;
+      return held;
+    },
+    async owner => runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, options)
+  );
+}
+
+/**
+ * Run `body` with an owner that reclaims any capture it was handed but never adopted.
+ *
+ * The staged path is recorded at `hold` time, before anything can move it: a container run
+ * finalizes its capture early and reassigns `captureRoot`, and reclaiming THAT would delete
+ * a live run's source. After adoption the staged path no longer exists, so reclaiming is a
+ * no-op — which is what makes the guard safe to run unconditionally.
+ */
+async function withCapturedSourceOwner(
+  register: (prepared: PreparedWorkflowSource) => PreparedWorkflowSource,
+  body: (owner: CaptureOwner) => Promise<void>
+): Promise<void> {
+  let stagedRoot: string | undefined;
+  let adopted = false;
+  const owner: CaptureOwner = {
+    hold: prepared => {
+      stagedRoot = register(prepared).captureRoot;
+    },
+    adopt: () => {
+      adopted = true;
+    },
+  };
+  try {
+    await body(owner);
+  } finally {
+    if (stagedRoot && !adopted) {
+      await disposeWorkflowSource({ captureRoot: stagedRoot }).catch(() => {
+        /* reclaiming must never mask why the run stopped */
+      });
+    }
   }
 }
 

@@ -1,7 +1,7 @@
 /**
  * Workflow Executor - runs DAG-based workflows
  */
-import { mkdir, rename, rm, writeFile } from 'fs/promises';
+import { mkdir, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
@@ -32,6 +32,7 @@ import {
   readWorkflowSourceState,
 } from './schemas';
 import {
+  WorkflowSourceIntegrityError,
   captureWorkflowSource,
   capturedSourceRoots,
   getRunSourceCapturePath,
@@ -59,7 +60,7 @@ import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
 // Re-exported so callers driving the capture-first sequence need only this module.
-export { recordSelectedWorkflow, capturedSourceRoots } from './workflow-source';
+export { recordSelectedWorkflow, capturedSourceRoots, loadWorkflowSource } from './workflow-source';
 export type { WorkflowSourceRoots } from './workflow-source';
 import type { ChildIsolationResolver, ChildIsolationResult } from './child-isolation';
 export type {
@@ -611,6 +612,135 @@ export interface PreparedWorkflowSource {
 }
 
 /**
+ * How long an unadopted staging directory survives before it is reclaimed.
+ *
+ * Generous on purpose: it must comfortably exceed the gap between capturing and adopting,
+ * which spans discovery, isolation, and — for `--detach` — a child process starting. Not a
+ * timeout on anything; adoption MOVES the capture out of staging, so anything still here
+ * after this long belongs to no run.
+ */
+const STAGED_SOURCE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Reclaim staging directories no run ever adopted.
+ *
+ * The backstop behind {@link withCapturedSource}. That guard covers the paths it wraps;
+ * this covers the ones nobody can enumerate — a process killed between capture and run, a
+ * crash, a surface added later that forgets. Safe by construction, because adoption moves
+ * the capture out of staging, and age-bounded so a concurrent invocation's in-flight
+ * capture is never touched.
+ *
+ * Hygiene only: it never mutates a run and cannot affect one in progress.
+ */
+async function sweepStaleStagedSources(): Promise<void> {
+  const stagingRoot = join(archonPaths.getArchonHome(), 'staged-source');
+  try {
+    const entries = await readdir(stagingRoot, { withFileTypes: true });
+    const cutoff = Date.now() - STAGED_SOURCE_TTL_MS;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const path = join(stagingRoot, entry.name);
+      const info = await stat(path).catch(() => null);
+      if (!info || info.mtimeMs >= cutoff) continue;
+      await rm(path, { recursive: true, force: true }).catch(() => {
+        /* another process may be reclaiming the same entry — losing that race is fine */
+      });
+      getLog().debug({ path }, 'workflow.source_staging_reclaimed');
+    }
+  } catch {
+    // No staging directory yet, or unreadable. Neither is worth failing a run over.
+  }
+}
+
+/**
+ * Own a prepared capture for the length of an operation: adopt it, or reclaim it.
+ *
+ * Preparation happens before a workflow is even selected, so the ways OUT are many — an
+ * unknown name, a refused input contract, a flag conflict, a gate, an isolation error, a
+ * detached dispatch that hands the work to a child. Asking each of those to remember a
+ * disposal call is how a dozen of them came not to: a typo'd workflow name leaked a
+ * complete frozen tree, unbounded, once per invocation.
+ *
+ * `adopt()` transfers ownership to a run. Anything else — a return, a throw, a branch
+ * nobody has written yet — reclaims. That is the difference between a leak that is fixed
+ * and one that cannot recur.
+ */
+export async function withCapturedSource<T>(
+  prepared: PreparedWorkflowSource | undefined,
+  body: (adopt: () => void) => Promise<T>
+): Promise<T> {
+  let adopted = false;
+  // The STAGED path, captured before anything can move it: a container run finalizes the
+  // capture early and reassigns `captureRoot`, and reclaiming that would delete a live
+  // run's source. Once adopted, this path no longer exists and reclaiming is a no-op.
+  const stagedRoot = prepared?.captureRoot;
+  try {
+    return await body(() => {
+      adopted = true;
+    });
+  } finally {
+    if (stagedRoot && !adopted) {
+      await rm(stagedRoot, { recursive: true, force: true }).catch((err: Error) => {
+        getLog().warn({ err, captureRoot: stagedRoot }, 'workflow.source_capture_dispose_failed');
+      });
+    }
+  }
+}
+
+/**
+ * The graph a run must continue with, read from the source IT recorded.
+ *
+ * Every continuation surface goes through here — `/workflow resume`, `approve`, `reject`,
+ * the console Resume button, and `workflow run --resume`. That is the point. Before this
+ * existed each surface discovered the graph itself and had to remember to pass the
+ * capture's roots, and the ones nobody rewrote kept discovering live: the executor then
+ * supplied commands and scripts from the frozen capture while the DAG came from whatever
+ * the target held now. Editing a workflow between pause and resume silently ran the new
+ * graph against the old command bytes.
+ *
+ * A single entry point makes that unforgettable rather than merely fixed once.
+ *
+ * Returns `undefined` only for a run created before captures existed — nothing recorded,
+ * so the caller keeps its old live behavior. THROWS when a run recorded a source that
+ * cannot be read, verified, or no longer contains its workflow: a run that froze its
+ * source must continue with that source or stop.
+ */
+export async function resolveContinuationWorkflow(
+  deps: WorkflowDeps,
+  run: Pick<WorkflowRun, 'workflow_name' | 'metadata'>,
+  /** Target workspace — owns config; never the source. */
+  cwd: string
+): Promise<{ workflow: WorkflowDefinition; roots: WorkflowSourceRoots } | undefined> {
+  const state = readWorkflowSourceState(run.metadata);
+  if (state.kind === 'unreadable') {
+    throw new WorkflowSourceIntegrityError(
+      `Cannot continue run of '${run.workflow_name}': its workflow source record cannot be ` +
+        `read by this build (${state.detail}).`
+    );
+  }
+  if (state.kind === 'absent') return undefined;
+
+  // Verifies the digest against the value the RUN recorded, and yields the manifest whose
+  // `source_config` decides how those bytes resolve. Reading the root without the config
+  // is what made a repo with a custom `commands.folder` re-discover a different DAG.
+  const capture = await loadWorkflowSource(state.record.root, state.record.digest);
+  const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+
+  const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, roots);
+  const workflow = resolveWorkflowName(
+    run.workflow_name,
+    workflows.map(w => w.workflow)
+  );
+  if (!workflow) {
+    throw new WorkflowSourceIntegrityError(
+      `Cannot continue run of '${run.workflow_name}': its captured source at ` +
+        `${capture.captureRoot} no longer contains that workflow.`
+    );
+  }
+  return { workflow, roots };
+}
+
+/**
  * Discard a prepared capture that will never become a run.
  *
  * Preparation happens before a workflow is selected, so several ordinary outcomes end
@@ -621,7 +751,7 @@ export interface PreparedWorkflowSource {
  *
  * Best-effort: a failure to clean up must never mask the reason the run stopped.
  */
-export async function disposeWorkflowSource(prepared: PreparedWorkflowSource): Promise<void> {
+export async function disposeWorkflowSource(prepared: { captureRoot: string }): Promise<void> {
   await rm(prepared.captureRoot, { recursive: true, force: true }).catch((err: Error) => {
     getLog().warn(
       { err, captureRoot: prepared.captureRoot },
@@ -706,6 +836,7 @@ export async function prepareWorkflowSource(
         `be read (${(error as Error).message}).`
     );
   }
+  await sweepStaleStagedSources();
   const runId = randomUUID();
   // Staged, not final. The run's artifacts path depends on its registered project
   // identity, which the caller often has not resolved yet at capture time — and looking

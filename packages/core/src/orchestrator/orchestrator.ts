@@ -51,6 +51,7 @@ import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
+  disposeWorkflowSource,
   prepareWorkflowSource,
   recordSelectedWorkflow,
   type PreparedWorkflowSource,
@@ -458,7 +459,7 @@ export async function dispatchBackgroundWorkflow(
   // `workerCwd` is frequently a worktree, whose `.archon` belongs to whatever branch it
   // is on rather than to the author; the canonical repo is what gets captured.
   const workflowSourceRoot = await resolveWorkflowSourceRoot(workerCwd);
-  let preparedSource: PreparedWorkflowSource;
+  let preparedSource: PreparedWorkflowSource | undefined;
   try {
     preparedSource = await prepareWorkflowSource(workflowDeps, {
       sourceRoot: workflowSourceRoot ?? workerCwd,
@@ -483,6 +484,9 @@ export async function dispatchBackgroundWorkflow(
     await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
   } catch (error) {
     const err = error as Error;
+    // Reclaim before returning: this branch is the console's default dispatch path, and
+    // leaving the tree behind here leaks one capture per failed dispatch.
+    if (preparedSource !== undefined) await disposeWorkflowSource(preparedSource);
     getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
     await ctx.platform.sendMessage(
       ctx.conversationId,
