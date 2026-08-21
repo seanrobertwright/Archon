@@ -2,11 +2,8 @@ import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
-import {
-  AXIS_SPECIMEN,
-  RESUME_SNAPSHOT_AXIS_KEYS,
-  expectSeamCarriesAxes,
-} from '../test/token-usage-axes';
+import { AXIS_SPECIMEN } from '../test/token-usage-axes';
+import { mergeTokenUsage } from '@archon/providers/types';
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = createMockLogger();
@@ -718,18 +715,26 @@ describe('workflow-events', () => {
 //
 // `getDagResumeSnapshot` rebuilds a persisted `data.tokens` field by field, so
 // an axis it does not know about is dropped from every resumed run's total.
-// Its writer lives in @archon/workflows, which cannot be imported from here;
-// that half is guarded in that package's dag-executor tests, under the same
-// block name.
+// Its writer is in @archon/workflows, and that half is guarded there under the
+// same block name — but the two halves cannot meet in one test, so this side
+// cannot be a round trip.
 //
-// The type-level anchors are in `src/test/token-usage-axes.ts`, NOT in this
-// file: `packages/core/tsconfig.json` excludes `**/*.test.ts` from type-check,
-// so an anchor placed here would never fail. That module explains the rest.
+// It is pinned to `mergeTokenUsage` instead, which is the decoder's actual
+// downstream contract: `getDagResumeSnapshot` folds what it decodes through
+// that same function (`workflow-events.ts:335`). Any axis the fold keeps, the
+// decoder must keep; any axis the fold drops is absent from both sides. That is
+// strictly stronger than a hand-written key map here would be, because a map
+// could be dispositioned `null` — truthfully, since the decoder really does
+// drop the axis — while the writer next door carries it, and both packages
+// would stay green. Pinning to the fold makes that disagreement a failure.
+//
+// The type anchor is `AXIS_SPECIMEN` in `src/test/token-usage-axes.ts`, NOT in
+// this file: core's tsconfig excludes `**/*.test.ts` from type-check, so an
+// anchor placed here would never fire. That module explains the rest.
 // ───────────────────────────────────────────────────────────────────────────
 describe('TokenUsage axis seam guard', () => {
-  test('getDagResumeSnapshot carries every axis it claims', async () => {
-    // A single contributing row keeps the fold an identity, so each carried axis
-    // must come back at exactly the value the event stored.
+  test('getDagResumeSnapshot carries every axis the fold keeps', async () => {
+    mockQuery.mockClear();
     mockQuery.mockResolvedValueOnce(
       createQueryResult([
         {
@@ -742,11 +747,10 @@ describe('TokenUsage axis seam guard', () => {
 
     const { tokens } = await getDagResumeSnapshot('run-axis-seam');
 
-    expectSeamCarriesAxes(
-      expect,
-      'getDagResumeSnapshot',
-      RESUME_SNAPSHOT_AXIS_KEYS,
-      tokens as unknown as Record<string, unknown> | undefined
-    );
+    // A single contributing row keeps the fold an identity, so a lossless
+    // decoder must return exactly what the fold makes of the specimen.
+    expect(tokens).toEqual(mergeTokenUsage([AXIS_SPECIMEN]));
+    // ...and that must be a real object, not two matching `undefined`s.
+    expect(tokens).toBeDefined();
   });
 });

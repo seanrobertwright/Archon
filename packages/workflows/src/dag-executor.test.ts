@@ -23974,11 +23974,21 @@ describe('childOutcomeFromRun cache reporting', () => {
 //   3. Every non-null entry is then driven through the REAL production path,
 //      because a declared key spelling is only a claim until a run proves it.
 //
-// One seam is missing from this block: `getDagResumeSnapshot` is in
-// @archon/core, which this package cannot import. It is guarded there, under
-// the same block name — but with its anchors in `src/test/token-usage-axes.ts`
-// rather than the test file, because core's tsconfig excludes `**/*.test.ts`
-// from type-check. Anchors here can sit inline; this package type-checks tests.
+// SCOPE: the workflow engine's seams. `getDagResumeSnapshot` is one of them but
+// lives in @archon/core, which this package cannot import; it is guarded there,
+// under the same block name, with its anchor in `src/test/token-usage-axes.ts`
+// rather than a test file because core's tsconfig excludes `**/*.test.ts` from
+// type-check. Anchors here can sit inline; this package type-checks its tests.
+//
+// Two hand-mapped hops are deliberately OUTSIDE the guard, both in telemetry:
+//   - `captureChatTurn` (@archon/core orchestrator-agent) maps usage for the
+//     direct-chat path, carrying gross totals only;
+//   - `@archon/paths` remaps `buildRunUsageProps`'s output a fourth time on the
+//     way to PostHog, and sits at the root of the dependency order, so it cannot
+//     import `TokenUsage` and no anchor can fire there.
+// A new axis therefore reaches PostHog only if someone follows it past this
+// block. Tracked separately; this block covers the first hop, where the
+// `TokenUsage` axes are still named.
 //
 // What this guard does NOT do: make a new *site* loud. No type can require an
 // author to register the hand-mapped seam they just wrote. The maps below are
@@ -24022,14 +24032,19 @@ describe('TokenUsage axis seam guard', () => {
    * either rides the object or does not. Each still gets its own assertion —
    * "carries it whole" is a claim about today's code, not a guarantee.
    *
-   * `total` and `cost` cross NO seam below, and both `null`s are load-bearing:
-   *  - `cost` is lifted off the usage object at the PROVIDER boundary, onto the
-   *    result message's own `cost` field (Pi's event bridge does exactly that).
-   *    Every seam below carries that scalar — `total_cost_usd`, `cost_usd`,
-   *    `costUsd`, `signaledCostUsd` — and none reads `TokenUsage.cost`.
-   *  - `total` is set by Pi's event bridge and dropped by the first fold:
-   *    `mergeTokenUsage` documents that it does not aggregate it. So a Pi node's
-   *    reasoning-inclusive total reaches no seam. Recorded here, not fixed here.
+   * `total` and `cost` cross none of the seams below, and both `null`s are
+   * load-bearing — each is asserted absent, not merely declared:
+   *  - No seam below reads `TokenUsage.cost`. Each carries its own scalar
+   *    (`total_cost_usd`, `cost_usd`, `costUsd`, `signaledCostUsd`) sourced from
+   *    the result message's `cost` field, which providers are expected to set —
+   *    Pi's event bridge copies it there. `opencode/multi-agent.ts` does not, so
+   *    on that path cost is stranded on the usage object. The fold seam carries
+   *    no cost scalar at all.
+   *  - `total` is set by the Claude provider and by Pi's event bridge, and
+   *    dropped by the first fold: `mergeTokenUsage` documents that it does not
+   *    aggregate it. So no seam below carries it. It is NOT a dead axis — its
+   *    live reader is `formatCostFooter` in @archon/adapters, on the unfolded
+   *    direct-chat path that never passes through the fold. Recorded, not fixed.
    */
   const WHOLE_OBJECT_AXIS_KEYS: SeamAxisKeys = {
     input: 'input',
@@ -24065,7 +24080,15 @@ describe('TokenUsage axis seam guard', () => {
 
   /**
    * Assert that every axis `keys` declares carried arrived under its declared key
-   * with the specimen's value.
+   * with the specimen's value, AND that every axis it declares `null` really is
+   * absent.
+   *
+   * The negative half matters as much as the positive one. Without it a `null`
+   * asserts nothing and stays green forever after it stops being true — teach
+   * `mergeTokenUsage` to aggregate `total` and it would start flowing to the
+   * five seams that spread the object whole while the two renaming seams drop
+   * it, with every map still reading `total: null`. That is #2662 again, for the
+   * axis most likely to move next.
    *
    * Seam and axis are folded into the compared object's KEY, not into a sibling
    * field: bun's diff prints only a narrow window around the changed line, so a
@@ -24081,7 +24104,13 @@ describe('TokenUsage axis seam guard', () => {
       [`${seam} carried usage`]: true,
     });
     for (const [axis, key] of Object.entries(keys) as [keyof TokenUsage, string | null][]) {
-      if (key === null) continue;
+      if (key === null) {
+        // No declared key to look under, so the axis's own name is what a
+        // careless passthrough would surface it as.
+        const label = `${seam} → ${axis} (declared not carried)`;
+        expect({ [label]: carried?.[axis] }).toEqual({ [label]: undefined });
+        continue;
+      }
       const label = `${seam} → ${axis} (as '${key}')`;
       expect({ [label]: carried?.[key] }).toEqual({ [label]: AXIS_SPECIMEN[axis] });
     }
@@ -24108,6 +24137,19 @@ describe('TokenUsage axis seam guard', () => {
     } catch {
       // ignore cleanup errors
     }
+    // Restore the file-level provider stubs. `mockClear()` drops call records
+    // but leaves implementations in place, and this block's last test installs a
+    // generator that yields "should never run" — a describe appended after this
+    // one (the header invites exactly that) would inherit it.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+    mockGetAgentProviderDag.mockImplementation(_provider => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
   });
 
   /**
