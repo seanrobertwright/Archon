@@ -9,26 +9,20 @@
     "dedicated bun manager instead, which reads the text bun.lock and the packages/* workspaces.",
     "Operator coupling worth knowing before changing repository settings: Dependabot ALERTS and the",
     "dependency graph must stay ENABLED even though Dependabot SECURITY UPDATES are turned off.",
-    "Renovate's vulnerabilityAlerts reads GitHub's alert feed; disabling alerts blinds it.",
-    "Only four keys are set. Everything else this repository wants is already a Renovate default:",
-    "the default branch is dev, so PRs already target the working branch; prConcurrentLimit (10)",
-    "and prHourlyLimit (2) already bound how fast PRs arrive; and vulnerabilityAlerts is already",
-    "active - it has no enabled key to turn on."
+    "Renovate's vulnerabilityAlerts reads GitHub's alert feed; disabling alerts blinds it."
   ],
   "extends": ["config:recommended"],
   "lockFileMaintenance": {
     "description": [
-      "The load-bearing setting, and off by default. Most of this repository's exposure is not a",
-      "dependency whose declared range is too old - it is a range that already permits a patched",
-      "version while the frozen bun.lock resolves to a stale one. That produces no GitHub alert at",
-      "all, because the range *could* resolve to something patched. Measured on 2026-08-21:",
-      "regenerating bun.lock with every declared range left byte-identical took bun audit from 163",
-      "advisories to 24. Deleting the lockfile and running bun install is exactly what Renovate's",
-      "bun manager does here, weekly (schedule defaults to 'before 4am on monday').",
+      "Off by Renovate default, and the reason this file exists. Most of this repository's exposure",
+      "is not a declared range that is too old - it is a range that already permits a patched",
+      "version while the frozen bun.lock resolves to a stale one. That class produces no GitHub",
+      "alert at all, because the range *could* resolve to something patched, so no amount of",
+      "alert-driven automation finds it. Regenerating the lockfile does, and deleting bun.lock then",
+      "running bun install is exactly what Renovate's bun manager does here.",
       "This is also why the outcome does not lean on vulnerabilityAlerts: that path defaults to",
       "rangeStrategy 'update-lockfile', and Renovate's docs omit bun from the managers supporting",
-      "that strategy, so alert-driven PRs may no-op. The scheduled regeneration will not.",
-      "Expect the first one to be a large diff. It is the whole lockfile, in its own revertable PR."
+      "that strategy, so alert-driven PRs may no-op. The scheduled regeneration will not."
     ],
     "enabled": true
   },
