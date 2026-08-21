@@ -27,7 +27,7 @@ import type {
   ExecutionContext,
   OverlayChangeSummary,
 } from '@archon/providers/types';
-import { CONTAINER_ENV_DENYLIST } from '@archon/providers/types';
+import { CONTAINER_ENV_DENYLIST, mergeTokenUsage } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 import { WRITEBACK_GATE_NODE_ID } from './container-context';
 import {
@@ -255,6 +255,7 @@ function buildRunUsageProps(totals: {
   tokensOut?: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  cachePartialTokens?: true;
   loopIterations?: number;
 } {
   return {
@@ -269,6 +270,9 @@ function buildRunUsageProps(totals: {
           ...(totals.tokens.cacheWrite !== undefined
             ? { cacheWriteTokens: totals.tokens.cacheWrite }
             : {}),
+          // Without this a floor is indistinguishable from a complete total, which would
+          // bias aggregate cache stats low instead of merely leaving them absent (#2662).
+          ...(totals.tokens.cachePartial ? { cachePartialTokens: true as const } : {}),
         }
       : {}),
     ...(totals.loopIterations > 0 ? { loopIterations: totals.loopIterations } : {}),
@@ -443,7 +447,8 @@ type NodeExecutionResult = NodeOutput & {
 };
 
 /**
- * Add provider usage without turning an unknown cache axis into a partial total.
+ * Add provider usage, keeping each cache axis that was actually reported and marking the
+ * result a floor when some contribution stayed silent (see `mergeTokenUsage`).
  * Required non-finite counters invalidate only that contribution; malformed optional
  * counters are treated as unknown while valid gross input/output remain usable.
  */
@@ -457,28 +462,25 @@ function sumTokenUsage(
       getLog().warn({ ...context, tokens: usage }, 'dag.usage_tokens_non_finite_ignored');
       continue;
     }
-    const normalized: TokenUsage = { input: usage.input, output: usage.output };
+    // Spread rather than rebuild field-by-field: a rebuilt literal silently drops any
+    // axis this function does not know about, which is how `cachePartial` was lost on
+    // re-aggregation (a partial total became complete on the next merge).
+    const normalized: TokenUsage = { ...usage };
     for (const axis of ['cacheRead', 'cacheWrite'] as const) {
       const value = usage[axis];
       if (value === undefined) continue;
-      if (Number.isFinite(value)) normalized[axis] = value;
-      else {
+      if (!Number.isFinite(value)) {
+        // Cleared rather than deleted (no-dynamic-delete): every reader treats an
+        // undefined axis as unreported, and JSON.stringify omits the key entirely.
+        normalized[axis] = undefined;
         getLog().warn({ ...context, axis, value }, 'dag.usage_optional_tokens_non_finite_ignored');
       }
     }
     valid.push(normalized);
   }
-  if (valid.length === 0) return undefined;
-  const summed: TokenUsage = {
-    input: valid.reduce((total, usage) => total + usage.input, 0),
-    output: valid.reduce((total, usage) => total + usage.output, 0),
-  };
-  for (const axis of ['cacheRead', 'cacheWrite'] as const) {
-    if (valid.every(usage => usage[axis] !== undefined)) {
-      summed[axis] = valid.reduce((total, usage) => total + (usage[axis] ?? 0), 0);
-    }
-  }
-  return summed;
+  // The merge rule itself lives with TokenUsage so every aggregation site shares one
+  // owner; this function keeps the validation and warn events, which differ per caller.
+  return mergeTokenUsage(valid);
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +598,9 @@ export function childOutcomeFromRun(run: WorkflowRun): ChildWorkflowOutcome {
           output: output ?? 0,
           ...(cacheRead !== undefined ? { cacheRead } : {}),
           ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+          // Persisted by persistRunUsage; without it a child's floor would contribute to
+          // the parent as though it were an exact total.
+          ...(md.total_cache_partial === true ? { cachePartial: true as const } : {}),
         }
       : undefined;
   return {
@@ -3594,11 +3599,12 @@ function readSignaledTokens(
 ): TokenUsage | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw === 'object') {
-    const { input, output, cacheRead, cacheWrite } = raw as {
+    const { input, output, cacheRead, cacheWrite, cachePartial } = raw as {
       input?: unknown;
       output?: unknown;
       cacheRead?: unknown;
       cacheWrite?: unknown;
+      cachePartial?: unknown;
     };
     if (
       typeof input === 'number' &&
@@ -3613,6 +3619,8 @@ function readSignaledTokens(
             output,
             ...(cacheRead !== undefined ? { cacheRead: cacheRead as number } : {}),
             ...(cacheWrite !== undefined ? { cacheWrite: cacheWrite as number } : {}),
+            // A loop that paused on a floor must not resume claiming an exact total.
+            ...(cachePartial === true ? { cachePartial: true as const } : {}),
           },
         ],
         context
@@ -9288,6 +9296,8 @@ export async function executeDagWorkflow(
             ...(runCtx.totalTokens.cacheWrite !== undefined
               ? { total_cache_write_tokens: runCtx.totalTokens.cacheWrite }
               : {}),
+            // Marks the two cache totals above as a floor rather than an exact figure.
+            ...(runCtx.totalTokens.cachePartial ? { total_cache_partial: true } : {}),
           }
         : {}),
     };

@@ -12,7 +12,7 @@ import { pool, getDialect, getDatabaseType } from './connection';
 import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
-import type { TokenUsage } from '@archon/providers/types';
+import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -221,7 +221,9 @@ export async function listWorkflowEventsSince(
  *
  * Both usage axes are summed from `node_completed` and `node_failed` rows, and only
  * from rows that are not marked `data.aggregate`. Failed rows contribute spend but
- * never completed outputs, so their nodes remain eligible for resume. Two distinct
+ * never completed outputs, so their nodes remain eligible for resume. Cache axes sum
+ * over the rows that reported them and carry `cachePartial` when any row did not, so a
+ * pre-#2654 row narrows the cache total instead of erasing it. Two distinct
  * duplication hazards:
  *
  * - `node_skipped_prior_success` rows replay a node an earlier pass already counted, so
@@ -251,7 +253,9 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
     [workflowRunId]
   );
   const completedNodeOutputs = new Map<string, string>();
-  let tokens: TokenUsage | undefined;
+  // Collected and merged once at the end rather than folded pairwise: a pairwise fold
+  // cannot tell "one of five contributions reported" from "one of two" (#2662).
+  const usages: TokenUsage[] = [];
   let costUsd = 0;
   for (const row of result.rows) {
     if (!row.step_name) continue;
@@ -299,20 +303,13 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
             );
           }
         }
-        if (tokens === undefined) {
-          tokens = normalized;
-        } else {
-          tokens = {
-            input: tokens.input + normalized.input,
-            output: tokens.output + normalized.output,
-            ...(tokens.cacheRead !== undefined && normalized.cacheRead !== undefined
-              ? { cacheRead: tokens.cacheRead + normalized.cacheRead }
-              : {}),
-            ...(tokens.cacheWrite !== undefined && normalized.cacheWrite !== undefined
-              ? { cacheWrite: tokens.cacheWrite + normalized.cacheWrite }
-              : {}),
-          };
+        // A node whose own usage was already a floor (a loop total, an OpenCode
+        // multi-agent node) keeps the resumed run a floor. Anything other than `true`
+        // is ignored without a warn: unlike the numeric axes it carries no total.
+        if (optionalTokens.cachePartial === true) {
+          normalized.cachePartial = true;
         }
+        usages.push(normalized);
       } else {
         getLog().warn(
           { runId: workflowRunId, stepName: row.step_name, tokens: eventTokens },
@@ -335,5 +332,5 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       }
     }
   }
-  return { completedNodeOutputs, tokens, costUsd };
+  return { completedNodeOutputs, tokens: mergeTokenUsage(usages), costUsd };
 }

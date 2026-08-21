@@ -80,6 +80,7 @@ import {
   collectContainerIncompatibleProviders,
   containerCommandName,
   buildSubprocessDockerArgs,
+  childOutcomeFromRun,
 } from './dag-executor';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emitter';
@@ -9438,7 +9439,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             completionSignaled: true,
             signaledOutput: 'REPORT',
             signaledCostUsd: 0.02,
-            signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
+            // Paused on a floor: the gate's cumulative cache was already incomplete.
+            signaledTokens: {
+              input: 40,
+              output: 4,
+              cacheRead: 20,
+              cacheWrite: 0,
+              cachePartial: true,
+            },
           },
           loop_user_input: 'actually re-check X',
           loop_feedback_given: true,
@@ -9485,11 +9493,15 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         ([event]) => event.event_type === 'node_completed' && event.step_name === 'refine'
       );
       expect(completed?.[0].data?.cost_usd).toBeCloseTo(0.05, 5);
+      // The gate paused on a floor, so the resumed node and run totals stay a floor.
+      // Decoding the persisted usage without the flag let a resumed loop claim an exact
+      // total it never had.
       expect(completed?.[0].data?.tokens).toEqual({
         input: 100,
         output: 10,
         cacheRead: 50,
         cacheWrite: 0,
+        cachePartial: true,
       });
       expect(runUsageWrites(mockDeps.store)).toEqual([
         {
@@ -9498,6 +9510,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           total_tokens_out: 10,
           total_cache_read_tokens: 50,
           total_cache_write_tokens: 0,
+          total_cache_partial: true,
         },
       ]);
     });
@@ -11435,6 +11448,155 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       cacheRead: 15,
       cacheWrite: 0,
     });
+  });
+
+  it('flags the run total when only a middle node is silent about cache', async () => {
+    // The run total is accumulated pairwise, so the middle contribution's silence has to
+    // survive two more folds. A 2-round test cannot see this: rounds 1 and 3 both agree on
+    // both axes, so a wrapper that drops the flag still produces a complete-looking total.
+    mockSendQueryDag
+      .mockImplementationOnce(async function* () {
+        yield { type: 'assistant', content: 'a' };
+        yield { type: 'result', tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0 } };
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'assistant', content: 'b' };
+        // Silent middle: reports no cache telemetry at all.
+        yield { type: 'result', tokens: { input: 20, output: 2 } };
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'assistant', content: 'c' };
+        yield { type: 'result', tokens: { input: 30, output: 3, cacheRead: 9, cacheWrite: 1 } };
+      });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'three-node-fold',
+        nodes: [
+          { id: 'a', prompt: 'a' },
+          { id: 'b', prompt: 'b', depends_on: ['a'] },
+          { id: 'c', prompt: 'c', depends_on: ['b'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(runUsageWrites(mockDeps.store)).toEqual([
+      {
+        total_tokens_in: 60,
+        total_tokens_out: 6,
+        total_cache_read_tokens: 14,
+        total_cache_write_tokens: 1,
+        total_cache_partial: true,
+      },
+    ]);
+  });
+
+  it('best-effort provider: an attempt without cache telemetry narrows the total to a floor', async () => {
+    // Attempt 1 reports cache; attempt 2 reports none. The node's accumulated usage must
+    // keep attempt 1's cache as a floor rather than discarding it — dropping the axes here
+    // left gross `input` standing beside no cache context and read as "nothing cached" (#2662).
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield {
+        type: 'result',
+        sessionId: 's1',
+        structuredOutput: { other: 'x' },
+        cost: 0.01,
+        tokens: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        sessionId: 's2',
+        structuredOutput: { verdict: 'review' },
+        cost: 0.02,
+        tokens: { input: 20, output: 2 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'reask-partial-cache',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' }
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_completed' &&
+        (call[0] as Record<string, unknown>).step_name === 'classify'
+    );
+    expect(completed.length).toBe(1);
+    const tokens = ((completed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
+      .tokens;
+    // Gross input still sums across both attempts; the cache axes are attempt 1's alone.
+    expect(tokens).toEqual({
+      input: 30,
+      output: 3,
+      cacheRead: 5,
+      cacheWrite: 0,
+      cachePartial: true,
+    });
+    // And the flag survives the node -> run fold. Rebuilding the usage field-by-field
+    // here dropped it, so a partial node total silently became a complete run total.
+    expect(runUsageWrites(mockDeps.store)).toEqual([
+      {
+        total_cost_usd: 0.03,
+        total_tokens_in: 30,
+        total_tokens_out: 3,
+        total_cache_read_tokens: 5,
+        total_cache_write_tokens: 0,
+        total_cache_partial: true,
+      },
+    ]);
   });
 
   it('best-effort provider: a non-finite reask cost does not erase prior valid cost', async () => {
@@ -23638,5 +23800,53 @@ describe('executeDagWorkflow -- a workflow-level provider/model conflict is repo
     expect(conflictMessages).toHaveLength(1);
     // All three nodes still RESOLVED to codex — only the reporting is de-duplicated.
     expect(mockSendQueryDag.mock.calls).toHaveLength(3);
+  });
+});
+
+describe('childOutcomeFromRun cache reporting', () => {
+  const settledRun = (metadata: Record<string, unknown>) =>
+    makeWorkflowRun('child-1', { status: 'completed', metadata });
+
+  it('carries a child run total that is only a floor up to its parent', () => {
+    const outcome = childOutcomeFromRun(
+      settledRun({
+        total_tokens_in: 100,
+        total_tokens_out: 10,
+        total_cache_read_tokens: 60,
+        total_cache_write_tokens: 0,
+        total_cache_partial: true,
+      })
+    );
+
+    // Reading the numbers but not the flag let a parent merge a child's floor as
+    // though it were exact, which is the same defect one run boundary up.
+    expect(outcome.tokens).toEqual({
+      input: 100,
+      output: 10,
+      cacheRead: 60,
+      cacheWrite: 0,
+      cachePartial: true,
+    });
+  });
+
+  it('leaves a complete child total unflagged', () => {
+    const outcome = childOutcomeFromRun(
+      settledRun({
+        total_tokens_in: 100,
+        total_tokens_out: 10,
+        total_cache_read_tokens: 60,
+        total_cache_write_tokens: 0,
+      })
+    );
+
+    expect(outcome.tokens).toEqual({
+      input: 100,
+      output: 10,
+      cacheRead: 60,
+      cacheWrite: 0,
+    });
+    // toEqual alone would still pass on `cachePartial: undefined`; the key must be absent,
+    // because absence is what every reader treats as "this total is exact".
+    expect(outcome.tokens).not.toHaveProperty('cachePartial');
   });
 });
