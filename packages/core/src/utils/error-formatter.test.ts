@@ -198,6 +198,48 @@ describe('classifyAndFormatError', () => {
     });
   });
 
+  describe('Codex OAuth refresh-token errors (#2509)', () => {
+    // Regression for GitHub #2509: a Codex-wrapped OAuth refresh error used
+    // to be routed to Claude `/login` guidance because the OAuth-refresh
+    // branch matched provider-agnostic refresh phrases. The new Codex
+    // OAuth-refresh branch above the Claude one catches it first.
+    test('routes Codex-wrapped refresh-token race to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error(
+          'Codex query failed: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.'
+        )
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+    });
+
+    test('routes Codex-wrapped "refresh token" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error('Codex query failed: refresh token already used')
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+    });
+
+    test('routes Codex-wrapped "log out and sign in" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error('Codex query failed: Please log out and sign in again.')
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+    });
+
+    test('routes Codex-wrapped "OAuth token has expired" to Codex auth guidance', () => {
+      // No "401" / "Unauthorized" present, so the existing Codex 401 branch
+      // cannot fire — the new OAuth-refresh branch must handle it instead.
+      const result = classifyAndFormatError(
+        new Error('Codex query failed: OAuth token has expired')
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+    });
+  });
+
   describe('general authentication errors', () => {
     test('detects "API key" in message', () => {
       const result = classifyAndFormatError(new Error('Invalid API key provided'));

@@ -36,6 +36,24 @@ export function classifyAndFormatError(error: Error): string {
     return `⚠️ AI usage limit reached${reset ? ` (${reset})` : ''}. Please wait and try again.`;
   }
 
+  // Codex-specific auth errors — OAuth token refresh failures
+  // Codex wraps every provider error with `Codex query failed:` (see
+  // packages/providers/src/codex/provider.ts), so the wrapper prefix is a
+  // reliable Codex-side marker. This branch MUST precede the Claude-OAuth
+  // branch below — the refresh-token phrases are provider-agnostic and would
+  // otherwise be misattributed to Claude (GitHub #2509).
+  // Recovery: `codex login` in terminal.
+  if (
+    message.includes('Codex query failed:') &&
+    (message.includes('refresh token') ||
+      message.includes('could not be refreshed') ||
+      message.includes('log out and sign in') ||
+      message.includes('OAuth token has expired') ||
+      message.includes('sign-in has expired'))
+  ) {
+    return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
+  }
+
   // Claude-specific auth errors — OAuth token refresh failures
   // These come from Claude Code subprocess stderr or SDK result subtypes.
   // Recovery: `/login` in-session or `claude logout && claude login` in terminal.
