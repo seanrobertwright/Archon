@@ -1619,23 +1619,27 @@ export async function handleMessage(
     // The codebase load sits ABOVE the user-message persist so the missing-project
     // guard below can read `default_cwd` without paying a second query. It reads
     // `remote_agent_codebases` while the persist writes `remote_agent_messages`, so
-    // the two are independent in both directions, and every consumer of `codebases`
-    // runs far below. Keep it here: moved back down, the guard would have to refuse
-    // AFTER the user row is written, which is exactly the orphaned-row bug this
-    // ordering exists to prevent.
+    // the two are independent in both directions, and every OTHER consumer of
+    // `codebases` runs far below (the guard just under this line is the one that
+    // needed the hoist). Keep it here: moved back down, the guard would have to
+    // refuse AFTER the user row is written, which is exactly the orphaned-row bug
+    // this ordering exists to prevent.
     const codebases = await codebaseDb.listCodebases();
 
     // A registered project's directory can vanish under a long-lived conversation —
-    // the clone deleted, a container volume reset, a folder project moved. Providers
-    // pass `cwd` straight to their subprocess, and `posix_spawn` reports a missing
-    // WORKING DIRECTORY as ENOENT against the EXECUTABLE's path, so the failure
-    // surfaces as "No such file or directory (os error 2)" on Codex or a bogus
-    // libc/architecture mismatch on Claude. Neither names the directory (#2663).
+    // the clone deleted, the folder moved, the volume holding it unmounted.
+    // Providers pass `cwd` straight to their subprocess, and `posix_spawn` reports
+    // a missing WORKING DIRECTORY as ENOENT against the EXECUTABLE's path, so the
+    // failure surfaces as "No such file or directory (os error 2)" on Codex or a
+    // bogus libc/architecture mismatch on Claude. Neither names the directory
+    // (#2663).
     //
     // Scoped to `conversation.cwd === null` on purpose. A conversation WITH a cwd
-    // override is a different situation with different recovery advice, owned by the
-    // guard in #2551 — do not collapse the two into a `conversation.cwd ??
-    // default_cwd` check, which would silently absorb that case and its message.
+    // override is a different situation with different recovery advice — that case
+    // belongs to #2551, which is UNMERGED as of this change, so until it lands a
+    // stale `cwd` override is still unguarded here. Either way, do not collapse the
+    // two into a `conversation.cwd ?? default_cwd` check: that silently absorbs the
+    // override case and replaces its message with this one.
     //
     // Refuses rather than falling back to the workspaces root the way the
     // `scopedCodebase === undefined` branch below does: relocating the agent into a
@@ -1651,8 +1655,14 @@ export async function handleMessage(
           conversationId,
           `This conversation's project directory no longer exists:\n\`${scoped.default_cwd}\`\n\n` +
             `The project "${scoped.name}" is still registered, but its folder is gone — ` +
-            'deleted, moved, or lost with a reset container volume.\n\n' +
-            `- \`/update-project ${scoped.name} <new-path>\` to point it at the new location\n` +
+            'deleted, moved, or on a volume that is no longer mounted.\n\n' +
+            // The name is quoted so the suggestion survives a project whose name
+            // contains whitespace: handleUpdateProject takes only the first token
+            // as the name (`const [projectName, ...pathParts] = args`), so an
+            // unquoted "Client Ops" would parse as name "Client" and send the user
+            // a second, wronger error. parseCommand understands quoted tokens, and
+            // quoting is a no-op for names without whitespace.
+            `- \`/update-project "${scoped.name}" <new-path>\` to point it at the new location\n` +
             '- `/setproject <name>` to switch this conversation to a different project'
         );
         return;
@@ -1662,10 +1672,16 @@ export async function handleMessage(
     // Persist the inbound user message for non-web platforms (Slack/Telegram/
     // GitHub/Discord/CLI) — the web adapter's route persists web turns itself.
     // Placed AFTER every early return that declines the turn — deterministic
-    // commands, approvals, and the missing-project guard above — so only AI-bound
-    // turns get a user row (no orphaned user message without an assistant reply),
-    // and BEFORE the AI call so the user row's timestamp precedes the assistant
-    // row's. Any new refusal belongs above this block, not below it.
+    // commands (including `/workflow approve|reject`) and the missing-project guard
+    // above — so only AI-bound turns get a user row (no orphaned user message
+    // without an assistant reply), and BEFORE the AI call so the user row's
+    // timestamp precedes the assistant row's. A plain message at a gate is NOT a
+    // refusal since #2577; it flows into the AI turn and earns its user row.
+    //
+    // A new refusal that needs nothing computed below belongs above this block. One
+    // that needs data from further down (workflow discovery, gate lookup) has to
+    // hoist that dependency first, the way `codebases` was hoisted here — putting
+    // the refusal below the persist instead is what orphans the row.
     // Fire-and-forget: a DB failure must not break platform delivery (#1182).
     if (!isWebAdapter(platform)) {
       messageDb

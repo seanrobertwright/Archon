@@ -373,6 +373,8 @@ function makeCodebase(name: string, id = `id-${name}`): Codebase {
 // handleUpdateProject. Today a leak is survivable only because the predicates
 // here reject one literal path — that is luck, not a guarantee, and it stops
 // being true the moment a test rejects something broader. Reset before every
+// Deliberately no count here: any number rots on the next test added, and the
+// mechanism is the argument.
 // test so no describe can poison another.
 beforeEach(() => {
   mockExistsSync.mockImplementation(() => true);
@@ -1626,6 +1628,27 @@ describe('provider cwd resolution', () => {
       expect(sent).not.toContain('/worktree remove');
       // /register-project creates a new registration rather than repairing this one.
       expect(sent).not.toContain('/register-project');
+    });
+
+    test('quotes a project name containing whitespace so the suggestion parses', async () => {
+      const codebase = { ...makeCodebaseForSync(), name: 'Client Ops' };
+      const conversation = makeConversation({ codebase_id: 'codebase-1' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+      mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+      mockExistsSync.mockImplementation((p: string) => p !== '/repos/test-repo');
+
+      const platform = makePlatform();
+      await handleMessage(platform, 'conv-1', 'hello');
+
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      // handleUpdateProject takes only the FIRST token as the project name, so an
+      // unquoted `Client Ops` parses as `Client` and hands the user a second, more
+      // confusing error instead of a repair. Verified against the real parser:
+      // `/update-project Client Ops <path>` -> name "Client", path "Ops <path>";
+      // the quoted form -> name "Client Ops", path "<path>".
+      expect(sent).toContain('/update-project "Client Ops" <new-path>');
+      expect(sent).not.toContain('/update-project Client Ops');
     });
 
     test('writes no user row when it refuses, so none is left unpaired', async () => {
