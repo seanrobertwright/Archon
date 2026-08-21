@@ -23805,9 +23805,7 @@ describe('executeDagWorkflow -- a workflow-level provider/model conflict is repo
 
 describe('childOutcomeFromRun cache reporting', () => {
   const settledRun = (metadata: Record<string, unknown>) =>
-    ({ id: 'child-1', status: 'completed', metadata }) as unknown as Parameters<
-      typeof childOutcomeFromRun
-    >[0];
+    makeWorkflowRun('child-1', { status: 'completed', metadata });
 
   it('carries a child run total that is only a floor up to its parent', () => {
     const outcome = childOutcomeFromRun(
@@ -23847,5 +23845,8 @@ describe('childOutcomeFromRun cache reporting', () => {
       cacheRead: 60,
       cacheWrite: 0,
     });
+    // toEqual alone would still pass on `cachePartial: undefined`; the key must be absent,
+    // because absence is what every reader treats as "this total is exact".
+    expect(outcome.tokens).not.toHaveProperty('cachePartial');
   });
 });
