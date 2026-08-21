@@ -1433,9 +1433,9 @@ export async function handleMessage(
     // asked to work in an isolated worktree, and quietly relocating the agent
     // into the live checkout would widen its write scope without consent. Runs
     // before the persist below so a refused turn leaves no `user` row without its
-    // `assistant` pair, and after the deterministic-command early-returns above
-    // so `/worktree remove` and `/setproject` — the way out of this state — keep
-    // working.
+    // `assistant` pair, and after the deterministic-command early-returns above so
+    // the commands that get out of this state keep working. Which of them applies
+    // depends on `isolation_env_id` — see the message branch below.
     if (conversation.codebase_id !== null && conversation.cwd !== null) {
       if (!existsSync(conversation.cwd)) {
         getLog().warn(
@@ -1446,12 +1446,24 @@ export async function handleMessage(
           },
           'orchestrator.conversation_cwd_missing'
         );
+        // The recovery advice branches on whether a worktree is still attached,
+        // because `/worktree remove` hard-returns "This conversation is not using
+        // a worktree." when `isolation_env_id` is null (command-handler.ts:428).
+        // That state is reachable, not hypothetical: the `stale_cleaned` branch in
+        // validateAndResolveIsolation (orchestrator.ts:204) clears
+        // `isolation_env_id` and leaves `cwd` set, so a workflow run can strand a
+        // conversation exactly here and the next chat turn would be told to run a
+        // command that dead-ends. `/setproject` clears the cwd override and works
+        // in both states, so it is the one suggestion that always applies.
         await platform.sendMessage(
           conversationId,
           `This conversation's working directory no longer exists:\n\`${conversation.cwd}\`\n\n` +
-            'Its isolated worktree was removed after this conversation was bound to it. ' +
-            'Run `/worktree remove` to detach and go back to the project root, or ' +
-            '`/setproject <name>` to rebind this conversation to a project.'
+            (conversation.isolation_env_id !== null
+              ? 'Its isolated worktree was removed after this conversation was bound to it. ' +
+                'Run `/worktree remove` to detach and go back to the project root, or ' +
+                '`/setproject <name>` to rebind this conversation to a project.'
+              : 'This conversation is not bound to an isolated workspace, so there is nothing ' +
+                'to detach. Run `/setproject <name>` to rebind this conversation to a project.')
         );
         return;
       }

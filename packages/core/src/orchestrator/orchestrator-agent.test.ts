@@ -346,6 +346,19 @@ function makeCodebase(name: string, id = `id-${name}`): Codebase {
   };
 }
 
+// `existsSync` is one shared mock for the whole file, so whatever predicate the
+// last test left behind is what the next one inherits. Resetting it inside a
+// single describe is not enough: everything below that block would run against a
+// leaked predicate, including the `/setproject` and `/update-project` suites,
+// which drive the existsSync call sites in handleSetProject and
+// handleUpdateProject. Today a leak is survivable only because the predicates
+// here reject one literal path — that is luck, not a guarantee, and it stops
+// being true the moment a test rejects something broader. Reset before every
+// test so no describe can poison another.
+beforeEach(() => {
+  mockExistsSync.mockImplementation(() => true);
+});
+
 // ─── parseOrchestratorCommands ────────────────────────────────────────────────
 
 describe('parseOrchestratorCommands', () => {
@@ -1407,7 +1420,7 @@ describe('provider cwd resolution', () => {
     mockSendQuery.mockClear();
     mockEnsureArchonWorkspacesPath.mockClear();
     mockLogger.warn.mockClear();
-    mockExistsSync.mockImplementation(() => true);
+    // existsSync is reset by the top-level beforeEach, which covers every describe.
     mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
     mockGetCodebase.mockImplementation(() => Promise.resolve(null));
     mockListCodebases.mockImplementation(() => Promise.resolve([]));
@@ -1468,6 +1481,50 @@ describe('provider cwd resolution', () => {
     expect(mockSendQuery).not.toHaveBeenCalled();
     const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
     expect(sent).toContain('/worktrees/deleted-branch');
+    expect(sent).toContain('/setproject');
+  });
+
+  test('suggests detaching the worktree only while one is still attached', async () => {
+    const codebase = makeCodebaseForSync();
+    const conversation = makeConversation({
+      codebase_id: 'codebase-1',
+      cwd: '/worktrees/deleted-branch',
+      isolation_env_id: 'env-gone',
+    });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/deleted-branch');
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'hello');
+
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+    expect(sent).toContain('/worktree remove');
+    expect(sent).toContain('/setproject');
+  });
+
+  test('drops the worktree advice once isolation_env_id is already cleared', async () => {
+    const codebase = makeCodebaseForSync();
+    const conversation = makeConversation({
+      codebase_id: 'codebase-1',
+      cwd: '/worktrees/deleted-branch',
+      isolation_env_id: null,
+    });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockExistsSync.mockImplementation((p: string) => p !== '/worktrees/deleted-branch');
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'hello');
+
+    const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+    // Reachable via the stale_cleaned branch in validateAndResolveIsolation, which
+    // clears isolation_env_id and leaves cwd set. `/worktree remove` answers "This
+    // conversation is not using a worktree." here, so suggesting it dead-ends.
+    expect(sent).not.toContain('/worktree remove');
+    expect(sent).not.toContain('isolated worktree was removed');
     expect(sent).toContain('/setproject');
   });
 
