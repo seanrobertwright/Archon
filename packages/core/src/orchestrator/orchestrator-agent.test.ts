@@ -1670,7 +1670,7 @@ describe('provider cwd resolution', () => {
       expect(mockAddMessage.mock.calls.filter(c => c[1] === 'user')).toHaveLength(0);
     });
 
-    test('leaves a stale cwd override to the conversation-cwd guard', async () => {
+    test('a stale cwd override gets the conversation-cwd message, not this one', async () => {
       const codebase = makeCodebaseForSync();
       const conversation = makeConversation({
         codebase_id: 'codebase-1',
@@ -1684,25 +1684,27 @@ describe('provider cwd resolution', () => {
       const platform = makePlatform();
       await handleMessage(platform, 'conv-1', 'hello');
 
-      // This guard is deliberately scoped to `cwd === null`; the override case is a
-      // different situation with different advice and belongs to #2551.
+      // Pins WHICH refusal the user gets, which is the part still observable here.
       //
-      // Assert that THIS guard stays silent rather than asserting what the turn
-      // does next. Since #2551 landed, the conversation-cwd guard sitting above
-      // this one refuses the override case, so an assertion about reaching the
-      // provider would be asserting that guard's behaviour, not this one's. The
-      // durable invariant is narrower and is what is checked here: this guard did
-      // not claim the case.
-      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+      // Be clear about what this does not do: it cannot catch widening this guard's
+      // condition to `conversation.cwd ?? default_cwd`. The conversation-cwd guard
+      // above returns first for every `cwd !== null` case, so a widened condition
+      // is dead code, and the mutation passes the whole suite. That is a property
+      // of the ordering, not a gap worth papering over with a weaker assertion —
+      // the note on the guard itself carries the reason to keep it narrow.
+      //
+      // What this DOES catch is the two guards' messages crossing: this guard
+      // claiming the override case and answering with project-root advice that says
+      // nothing about `isolation_env_id`.
+      const sent = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0][1] as string;
+      expect(sent).toContain('/worktrees/removed');
+      expect(sent).toContain('working directory no longer exists');
+      expect(sent).not.toContain('project directory no longer exists');
+      expect(sent).not.toContain('/update-project');
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.anything(),
-        'orchestrator.codebase_cwd_missing'
+        'orchestrator.conversation_cwd_missing'
       );
-      const sends = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(c => c[1]);
-      expect(
-        sends.some(
-          (s: unknown) => typeof s === 'string' && s.includes('project directory no longer exists')
-        )
-      ).toBe(false);
     });
 
     test('does not fire when the project directory is present', async () => {

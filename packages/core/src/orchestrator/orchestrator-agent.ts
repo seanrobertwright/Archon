@@ -1638,9 +1638,16 @@ export async function handleMessage(
     // override is a different situation with different recovery advice, handled by
     // the guard directly above this one (#2551). The two conditions are disjoint on
     // the same field with no mutation between the reads, which is what lets them sit
-    // side by side. Do not collapse them into a `conversation.cwd ?? default_cwd`
-    // check: that silently absorbs the override case and replaces its message —
-    // which branches on `isolation_env_id` — with this one.
+    // side by side.
+    //
+    // Keep the condition narrow rather than widening it to `conversation.cwd ??
+    // default_cwd`. Be aware that no test can hold you to this: the guard above
+    // already returns for every `cwd !== null` case, so a widened condition here is
+    // dead code rather than a behaviour change, and it is unobservable through
+    // handleMessage. The reason to keep it narrow is that it would silently become
+    // observable the moment the guard above is moved, narrowed, or removed — at
+    // which point this guard would answer for a stale worktree with the wrong
+    // message, one that says nothing about `isolation_env_id`.
     //
     // Refuses rather than falling back to the workspaces root the way the
     // `scopedCodebase === undefined` branch below does: relocating the agent into a
@@ -1657,13 +1664,17 @@ export async function handleMessage(
           `This conversation's project directory no longer exists:\n\`${scoped.default_cwd}\`\n\n` +
             `The project "${scoped.name}" is still registered, but its folder is gone — ` +
             'deleted, moved, or on a volume that is no longer mounted.\n\n' +
-            // The name is quoted so the suggestion survives a project whose name
-            // contains whitespace: handleUpdateProject takes only the first token
-            // as the name (`const [projectName, ...pathParts] = args`), so an
-            // unquoted "Client Ops" would parse as name "Client" and send the user
-            // a second, wronger error. parseCommand understands quoted tokens, and
-            // quoting is a no-op for names without whitespace.
-            `- \`/update-project "${scoped.name}" <new-path>\` to point it at the new location\n` +
+            // The name is quoted, and `"`/`\` inside it escaped, so the suggestion
+            // round-trips back through parseCommand as the same string. Without the
+            // quotes, handleUpdateProject takes only the first token as the name
+            // (`const [projectName, ...pathParts] = args`), so `Client Ops` parses
+            // as `Client` and hands the user a second, wronger error; without the
+            // escaping, a name containing a quote terminates the quoted token early
+            // and does the same thing. parseCommand honours backslash escapes inside
+            // quotes (command-handler.ts:206-212), and both are no-ops for a plain
+            // name.
+            `- \`/update-project "${scoped.name.replace(/[\\"]/g, c => `\\${c}`)}" <new-path>\` ` +
+            'to point it at the new location\n' +
             '- `/setproject <name>` to switch this conversation to a different project'
         );
         return;
