@@ -61,6 +61,7 @@ import {
   setUserAliases,
   setUserDefault,
   createWorkflowDeps,
+  createChildWorktreeResolver,
 } from '@archon/core';
 import type { UserTiersPatch, UserAliasesPatch, AliasesPatch } from '@archon/core';
 import { resolveRunContinuation } from '@archon/core/handlers';
@@ -2367,90 +2368,112 @@ export function registerApiRoutes(
    * Returns `true` once execution has been kicked off — never waits for it
    * to finish, matching every other resume call site. Returns `false` when
    * the run cannot be resumed this way (no recorded working path, workflow
-   * source unresolvable, nothing left to resume, or another resumer already
-   * claimed the run) so the caller falls back to its existing "use the CLI"
-   * response.
+   * source unresolvable, nothing left to resume, another resumer already
+   * claimed the run, or an unexpected error) so the caller falls back to its
+   * existing "use the CLI" response. Never throws: the gate decision was
+   * already durably recorded by the caller before this runs, so a failure
+   * here must degrade safely rather than surface as a 500.
    */
   async function resumeRunHeadless(run: WorkflowRun, gateActorUserId?: string): Promise<boolean> {
     if (!run.working_path) {
       getLog().debug({ runId: run.id }, 'api.workflow_resume_headless_no_working_path');
       return false;
     }
-    const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
-    const workflowCwd = codebase?.default_cwd ?? getArchonWorkspacesPath();
-    const deps = createWorkflowDeps();
-
-    let continuation: Awaited<ReturnType<typeof resolveRunContinuation>>;
     try {
-      continuation = await resolveRunContinuation(run.id, workflowCwd);
-    } catch (err) {
-      getLog().info(
-        { err: err as Error, runId: run.id },
-        'api.workflow_resume_headless_continuation_failed'
-      );
-      return false;
-    }
-    if (!continuation.ok) {
-      getLog().info(
-        { runId: run.id, reason: continuation.message },
-        'api.workflow_resume_headless_unresolvable'
-      );
-      return false;
-    }
+      const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
+      const workflowCwd = codebase?.default_cwd ?? getArchonWorkspacesPath();
+      const deps = createWorkflowDeps();
 
-    let hydrated: Awaited<ReturnType<typeof hydrateResumableRun>>;
-    try {
-      hydrated = await hydrateResumableRun(deps, run);
-    } catch (err) {
-      if (err instanceof workflowDb.WorkflowNotResumableError) {
+      const continuation = await resolveRunContinuation(run.id, workflowCwd);
+      if (!continuation.ok) {
         getLog().info(
-          { runId: run.id, status: err.currentStatus },
-          'api.workflow_resume_headless_lost_race'
+          { runId: run.id, reason: continuation.message },
+          'api.workflow_resume_headless_unresolvable'
         );
         return false;
       }
-      throw err;
-    }
-    if (!hydrated) {
-      getLog().info({ runId: run.id }, 'api.workflow_resume_headless_nothing_to_resume');
+
+      const platform = new HeadlessPlatform(run.conversation_id);
+      let hydrated: Awaited<ReturnType<typeof hydrateResumableRun>>;
+      try {
+        hydrated = await hydrateResumableRun(deps, run);
+      } catch (err) {
+        if (err instanceof workflowDb.WorkflowNotResumableError) {
+          getLog().info(
+            { runId: run.id, status: err.currentStatus },
+            'api.workflow_resume_headless_lost_race'
+          );
+          return false;
+        }
+        throw err;
+      }
+      if (!hydrated) {
+        getLog().info({ runId: run.id }, 'api.workflow_resume_headless_nothing_to_resume');
+        return false;
+      }
+
+      // Same per-child worktree resolver every other resume caller builds
+      // from the codebase in scope (orchestrator-agent.ts, CLI resume) — a
+      // `workflow:` node with `isolation: worktree` downstream of this gate
+      // needs it injected, or the engine fails it fast pointing at the CLI.
+      const resolveChildIsolation =
+        codebase && codebase.kind !== 'folder'
+          ? createChildWorktreeResolver({
+              codebaseId: codebase.id,
+              codebaseName: codebase.name,
+              canonicalRepoPath: codebase.default_cwd,
+              baseBranch: codebase.default_branch?.trim() || undefined,
+              createdByPlatform: platform.getPlatformType(),
+              createdByUserId: gateActorUserId,
+            })
+          : undefined;
+
+      executeWorkflow(
+        deps,
+        platform,
+        run.conversation_id,
+        run.working_path,
+        continuation.workflow.definition,
+        run.user_message ?? '',
+        run.conversation_id,
+        {
+          codebaseId: run.codebase_id ?? undefined,
+          userId: gateActorUserId,
+          baseBranch: codebase?.default_branch?.trim() || undefined,
+          resolveChildIsolation,
+          ...hydrated,
+        }
+      ).catch((err: unknown) => {
+        // Mirrors executor.ts's parent-run auto-resume catch: the hydrate CAS
+        // above already flipped the run paused/failed→running, and
+        // executeWorkflow's own failure handling doesn't cover its early setup
+        // (config load, credential resolution). Without this the run would
+        // strand at 'running' — a non-terminal status resumeWorkflow refuses
+        // to touch.
+        getLog().error(
+          { err: err as Error, runId: run.id },
+          'api.workflow_resume_headless_execute_failed'
+        );
+        void workflowDb
+          .failWorkflowRun(run.id, `Headless resume failed: ${(err as Error).message}`)
+          .catch((failErr: unknown) => {
+            getLog().error(
+              { err: failErr as Error, runId: run.id },
+              'api.workflow_resume_headless_fail_mark_failed'
+            );
+          });
+      });
+      return true;
+    } catch (err) {
+      // Safe degrade: the gate decision was already committed by the caller
+      // before this runs, so an unexpected error here (e.g. a transient DB
+      // read) must not surface as a 500 — fall back to the CLI-hint response.
+      getLog().warn(
+        { err: err as Error, runId: run.id },
+        'api.workflow_resume_headless_unexpected_error'
+      );
       return false;
     }
-
-    const platform = new HeadlessPlatform(run.conversation_id);
-    executeWorkflow(
-      deps,
-      platform,
-      run.conversation_id,
-      run.working_path,
-      continuation.workflow.definition,
-      run.user_message ?? '',
-      run.conversation_id,
-      {
-        codebaseId: run.codebase_id ?? undefined,
-        userId: gateActorUserId,
-        ...hydrated,
-      }
-    ).catch((err: unknown) => {
-      // Mirrors executor.ts's parent-run auto-resume catch: the hydrate CAS
-      // above already flipped the run paused/failed→running, and
-      // executeWorkflow's own failure handling doesn't cover its early setup
-      // (config load, credential resolution). Without this the run would
-      // strand at 'running' — a non-terminal status resumeWorkflow refuses
-      // to touch.
-      getLog().error(
-        { err: err as Error, runId: run.id },
-        'api.workflow_resume_headless_execute_failed'
-      );
-      void workflowDb
-        .failWorkflowRun(run.id, `Headless resume failed: ${(err as Error).message}`)
-        .catch((failErr: unknown) => {
-          getLog().error(
-            { err: failErr as Error, runId: run.id },
-            'api.workflow_resume_headless_fail_mark_failed'
-          );
-        });
-    });
-    return true;
   }
 
   /**

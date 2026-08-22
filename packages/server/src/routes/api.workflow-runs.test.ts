@@ -84,6 +84,13 @@ type MockWorkflowEvent = {
   created_at: string;
 };
 
+// resumeRunHeadless (#2008) — stubbed so a future change to it or its
+// neighbors can't silently start touching the real workflow store or the
+// real isolation provider (see #2240 for what an un-stubbed export costs).
+const mockCreateChildWorktreeResolver = mock((_config: unknown) =>
+  mock(async () => ({}) as unknown)
+);
+
 mock.module('@archon/core', () => ({
   handleMessage: mockHandleMessage,
   getDatabaseType: () => 'sqlite',
@@ -99,6 +106,8 @@ mock.module('@archon/core', () => ({
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   generateAndSetTitle: mockGenerateAndSetTitle,
   resolveTitleRequest: mockResolveTitleRequest,
+  createWorkflowDeps: mock(() => ({ store: {} })),
+  createChildWorktreeResolver: mockCreateChildWorktreeResolver,
   createLogger: () => ({
     fatal: mock(() => undefined),
     error: mock(() => undefined),
@@ -253,7 +262,14 @@ mock.module('@archon/core/db/conversations', () => ({
   getConversationById: mockGetConversationById,
 }));
 
-const mockGetCodebase = mock(async (_id: string) => null as null | { name: string });
+type MockCodebase = {
+  id?: string;
+  name: string;
+  kind?: 'repo' | 'folder';
+  default_cwd: string;
+  default_branch?: string | null;
+};
+const mockGetCodebase = mock(async (_id: string) => null as null | MockCodebase);
 
 mock.module('@archon/core/db/codebases', () => ({
   listCodebases: mock(async () => [{ default_cwd: '/tmp/project' }]),
@@ -2170,6 +2186,8 @@ describe('approve/reject auto-resume', () => {
     mockResolveRunContinuation.mockClear();
     mockHydrateResumableRun.mockClear();
     mockExecuteWorkflow.mockClear();
+    mockGetCodebase.mockReset();
+    mockCreateChildWorktreeResolver.mockClear();
   });
 
   test('approve: dispatches resume when parent_conversation_id is set', async () => {
@@ -2212,6 +2230,13 @@ describe('approve/reject auto-resume', () => {
       ...MOCK_PAUSED_RUN,
       parent_conversation_id: null,
     });
+    mockGetCodebase.mockResolvedValueOnce({
+      id: 'cb-uuid-1',
+      name: 'owner/repo',
+      kind: 'repo',
+      default_cwd: '/home/u/owner/repo',
+      default_branch: 'main',
+    });
 
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
@@ -2228,6 +2253,48 @@ describe('approve/reject auto-resume', () => {
     expect(mockGetConversationById).not.toHaveBeenCalled();
     expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
     expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    // #2008 R1: a git-repo codebase in scope gets a child-isolation resolver
+    // wired into the resumed execution, same as CLI/chat resume, so a
+    // downstream `workflow:` node with isolation:worktree doesn't fail.
+    expect(mockCreateChildWorktreeResolver).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-uuid-1', codebaseName: 'owner/repo' })
+    );
+    const [, , , , , , , opts] = mockExecuteWorkflow.mock.calls[0] as [
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      { resolveChildIsolation?: unknown; baseBranch?: string },
+    ];
+    expect(opts.resolveChildIsolation).toBeDefined();
+    expect(opts.baseBranch).toBe('main');
+  });
+
+  test('approve: skips the child-isolation resolver for a folder-project codebase', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      parent_conversation_id: null,
+    });
+    mockGetCodebase.mockResolvedValueOnce({
+      id: 'cb-folder-1',
+      name: 'ops-folder',
+      kind: 'folder',
+      default_cwd: '/home/u/ops-folder',
+      default_branch: null,
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockCreateChildWorktreeResolver).not.toHaveBeenCalled();
   });
 
   test('approve: falls back to the CLI-hint response when headless resume cannot resolve the workflow', async () => {
@@ -2244,6 +2311,30 @@ describe('approve/reject auto-resume', () => {
       headers: { 'Content-Type': 'application/json' },
     });
 
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { message: string };
+    expect(body.message).toContain('archon workflow resume run-paused-1');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('approve: falls back to the CLI-hint response (not a 500) when headless resume hits an unexpected error (#2008 R2)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      parent_conversation_id: null,
+    });
+    mockHydrateResumableRun.mockImplementationOnce(async () => {
+      throw new Error('transient DB error');
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    // The gate decision was already recorded — an unexpected error resuming
+    // it must degrade safely, not surface as a 500.
     expect(response.status).toBe(200);
     const body = (await response.json()) as { message: string };
     expect(body.message).toContain('archon workflow resume run-paused-1');
