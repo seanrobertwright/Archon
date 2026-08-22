@@ -6368,7 +6368,7 @@ async function pauseGateRespectingExternalTransition(
     await deps.store.pauseWorkflowRun(runId, approvalContext, extraMetadata);
   } catch (pauseErr) {
     if (failClosed) throw pauseErr;
-    let status: string | null;
+    let status: WorkflowRunStatus | null;
     try {
       status = await deps.store.getWorkflowRunStatus(runId);
     } catch {
@@ -6427,7 +6427,11 @@ async function executeApprovalNode(
   // Namespaced persisted step_name for loop_group bodies ('' → node.id at top level, #2090).
   const stepName = stepNamePrefix + node.id;
 
-  // Detect rejection resume — check metadata for rejection_reason set by reject handlers
+  // Detect rejection resume — check metadata for rejection_reason set by reject handlers.
+  // Strict `=== 'approval'` excludes `undefined`: a pre-#936 run paused before the
+  // `type` field existed and rejected-with-rework would stage a rework
+  // `rejectWorkflow` treats as equivalent to `type: 'approval'` but this check
+  // won't recognize — legacy-only, pre-existing, not touched by #2489.
   const rawApproval = workflowRun.metadata?.approval;
   const approvalMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
   const rawRejection = workflowRun.metadata?.rejection_reason;

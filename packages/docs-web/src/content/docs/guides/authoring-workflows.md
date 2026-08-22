@@ -1775,8 +1775,9 @@ statement about the children:
 
 One constraint applies however the checkouts are arranged: **one blocking child gate at a
 time.** Two children in the same layer that both pause for approval contend for the parent
-run's single approval slot — the second pause fails its node. Sequence gated sub-runs with
-`depends_on` until a later slice adds real concurrent gating.
+run's single approval slot — the second pause is silently dropped, and that child stays
+unmentioned until a later resume re-pauses on it. Sequence gated sub-runs with `depends_on`
+until a later slice adds real concurrent gating.
 
 ### Fanning out over a list with `fan_out:`
 

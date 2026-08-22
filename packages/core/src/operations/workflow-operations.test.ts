@@ -426,15 +426,17 @@ describe('approveWorkflow', () => {
         approval: {
           nodeId: 'review',
           message: 'Please review',
-          // Simulates a future/corrupted reason value the exhaustive switch must
-          // reject rather than silently resolve via the generic approval branch.
+          // Simulates a future/corrupted reason value assertApprovable's shared
+          // precondition gate must reject rather than silently letting the generic
+          // approval branch resolve it — the SAME check the CLI --detach precheck
+          // runs, so a passing precheck can never diverge from the real resolution.
           type: 'bogus-reason',
         },
       },
     });
     mockGetWorkflowRun.mockResolvedValueOnce(run);
 
-    await expect(approveWorkflow('run-1')).rejects.toThrow(/unhandled gate type 'bogus-reason'/);
+    await expect(approveWorkflow('run-1')).rejects.toThrow(/unrecognized gate type 'bogus-reason'/);
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
   });
 });
@@ -681,15 +683,18 @@ describe('rejectWorkflow', () => {
         approval: {
           nodeId: 'review',
           message: 'Please review',
-          // Simulates a future/corrupted reason value the exhaustive switch must
-          // reject rather than silently resolve via the generic rework/cancel branch.
+          // Simulates a future/corrupted reason value assertRejectable's shared
+          // precondition gate must reject rather than silently letting the generic
+          // rework/cancel branch resolve it — the SAME check the CLI --detach
+          // precheck runs, so a passing precheck can never diverge from the real
+          // resolution.
           type: 'bogus-reason',
         },
       },
     });
     mockGetWorkflowRun.mockResolvedValueOnce(run);
 
-    await expect(rejectWorkflow('run-1')).rejects.toThrow(/unhandled gate type 'bogus-reason'/);
+    await expect(rejectWorkflow('run-1')).rejects.toThrow(/unrecognized gate type 'bogus-reason'/);
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
     expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();

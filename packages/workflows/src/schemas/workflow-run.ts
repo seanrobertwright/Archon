@@ -333,12 +333,49 @@ export function readWorkflowSourceState(
     : { kind: 'unreadable', detail: parsed.error.message };
 }
 
+/**
+ * The suspend reason vocabulary (#2489) — a Zod-backed enum, not a renamed union: the
+ * values are persisted verbatim into `workflow_runs.metadata.approval.type`, so they
+ * cannot change without breaking reads of already-paused runs. Every pause site now
+ * writes through one shared helper (`pauseGateRespectingExternalTransition` in
+ * dag-executor.ts), but each reason's RESUME path stays deliberately separate and
+ * lives at its own named site:
+ *  - `'approval'` / `'interactive_loop'` — resolved externally by a human decision:
+ *    `approveWorkflow`/`rejectWorkflow` (operations/workflow-operations.ts).
+ *  - `'writeback'` — also resolved by `approveWorkflow`/`rejectWorkflow`'s write-back
+ *    branch, then applied on parent resume by `runContainerWriteBackGate`
+ *    (dag-executor.ts, `raiseWriteBackGate`'s sibling).
+ *  - `'child_workflow'` — never resolved by the approve/reject endpoints directly
+ *    (redirected instead — `assertApprovable`/`assertRejectable`); re-inspected by
+ *    `executeWorkflowNode` re-running on parent resume (dag-executor.ts).
+ */
+export const suspendReasonSchema = z.enum([
+  'approval',
+  'interactive_loop',
+  'writeback',
+  'child_workflow',
+]);
+export type SuspendReason = z.infer<typeof suspendReasonSchema>;
+
+/**
+ * True when `type` is `undefined` (every pause before the field existed, or a plain
+ * approval gate that omits it) or a recognized `SuspendReason`. Shared by the CLI
+ * `--detach` precheck (`assertApprovable`/`assertRejectable`) and the real
+ * approve/reject resolution's exhaustive switches so a precheck success can never
+ * diverge from what resolution actually does — an unrecognized reason must be
+ * rejected at the SAME point by both, not silently absorbed by one and only later
+ * caught by the other (#2489).
+ */
+export function isRecognizedSuspendReason(type: string | undefined): boolean {
+  return type === undefined || suspendReasonSchema.safeParse(type).success;
+}
+
 /** Approval context stored in workflow run metadata when paused for human review. */
 export interface ApprovalContext {
   nodeId: string;
   message: string;
   /**
-   * Distinguishes the pause kind — see `SuspendReason` below for the resume-path
+   * Distinguishes the pause kind — see `SuspendReason` above for the resume-path
    * pointer each variant carries:
    *  - `approval`         — a DAG approval node awaiting a human decision.
    *  - `interactive_loop` — an interactive loop gate.
@@ -355,7 +392,7 @@ export interface ApprovalContext {
    *    workflow node, finds the child terminal, and threads its output. NO
    *    node_completed is written for the parent's node on this pause.
    */
-  type?: 'approval' | 'interactive_loop' | 'writeback' | 'child_workflow';
+  type?: SuspendReason;
   /**
    * Child run id when `type === 'child_workflow'` — the specific paused sub-run
    * the parent is blocked on. Read by the parent auto-resume guard so a DIFFERENT
@@ -443,24 +480,6 @@ export interface ApprovalContext {
    */
   commandSnapshot?: string | null;
 }
-
-/**
- * The suspend reason vocabulary (#2489) — a named alias of `ApprovalContext['type']`,
- * not a renamed enum: the values are persisted verbatim into
- * `workflow_runs.metadata.approval.type`, so they cannot change without breaking reads
- * of already-paused runs. Every pause site now writes through one shared helper
- * (`pauseGateRespectingExternalTransition` in dag-executor.ts), but each reason's
- * RESUME path stays deliberately separate and lives at its own named site:
- *  - `'approval'` / `'interactive_loop'` — resolved externally by a human decision:
- *    `approveWorkflow`/`rejectWorkflow` (operations/workflow-operations.ts).
- *  - `'writeback'` — also resolved by `approveWorkflow`/`rejectWorkflow`'s write-back
- *    branch, then applied on parent resume by `runContainerWriteBackGate`
- *    (dag-executor.ts, `raiseWriteBackGate`'s sibling).
- *  - `'child_workflow'` — never resolved by the approve/reject endpoints directly
- *    (redirected instead — `assertApprovable`/`assertRejectable`); re-inspected by
- *    `executeWorkflowNode` re-running on parent resume (dag-executor.ts).
- */
-export type SuspendReason = NonNullable<ApprovalContext['type']>;
 
 /**
  * Top-level (non-`approval`) run-metadata keys of the interactive-loop gate

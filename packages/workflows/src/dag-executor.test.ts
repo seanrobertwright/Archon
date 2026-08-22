@@ -22966,6 +22966,69 @@ describe('executeDagWorkflow -- container write-back gate', () => {
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it('a lost pause CAS during write-back stays fail-closed: throws, never suspends or messages (#2489)', async () => {
+    // Unlike the other four gate types, a lost pause here must NEVER be tolerated —
+    // failClosed: true (dag-executor.ts raiseWriteBackGate) means this rejects
+    // straight through instead of being treated as a legitimate external
+    // transition, so the container teardown path preserves the overlay for retry.
+    const backend = makeWritebackBackend({
+      finalize: mock(async () => ({
+        requiresApproval: true,
+        changeSummary: {
+          added: ['x.md'],
+          modified: [],
+          deleted: [],
+          symlinks: [],
+          skipped: [],
+          totalCount: 1,
+          truncated: false,
+        },
+      })),
+    });
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(() => Promise.resolve('running' as const));
+    store.getWorkflowRun = mock(() => Promise.resolve(makeWorkflowRun('wb-run', { metadata: {} })));
+    store.claimWriteback = mock(() => Promise.resolve({ claimed: true }));
+    store.pauseWorkflowRun = mock(() =>
+      Promise.reject(new Error('Workflow run not found or not in running state (id: wb-run)'))
+    );
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+
+    await expect(
+      executeDagWorkflow(
+        deps,
+        platform,
+        'conv-wb',
+        wbTestDir,
+        { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
+        makeWorkflowRun('wb-run'),
+        'claude',
+        undefined,
+        join(wbTestDir, 'artifacts'),
+        join(wbTestDir, 'state'),
+        join(wbTestDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map([['a', { output: 'out' }]]),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        CONTAINER_EXEC,
+        { envId: 'env-x', writeBack: 'approve', backend }
+      )
+    ).rejects.toThrow(/not found or not in running state/);
+
+    // Fail-closed: never falls through to suspend the container or message the
+    // user as if the gate had been raised successfully.
+    expect(backend.suspend).not.toHaveBeenCalled();
+    expect(platform.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('non-empty diff + auto policy → applies without pausing, then completes', async () => {
     const backend = makeWritebackBackend({
       finalize: mock(async () => ({
