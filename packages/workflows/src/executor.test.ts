@@ -162,7 +162,7 @@ import { keepAwake } from './utils/keep-awake';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './schemas';
-import { workflowDefinitionSchema } from './schemas';
+import { RUN_METADATA_KEYS, workflowDefinitionSchema } from './schemas';
 
 // --- Helpers ---
 
@@ -1782,6 +1782,95 @@ describe('executeWorkflow', () => {
       expect(msg).toContain('Wait for it to finish');
     });
   });
+
+  // #2304 — the persistence block must distinguish three `identityResolution` outcomes:
+  //   • 'faulted'      → skip the `output_root` write, stamp the metadata flag
+  //                      (`metadata.identity_unresolved = true`). The row keeps
+  //                      `output_root` NULL so a later resume can self-heal.
+  //   • 'unregistered' → cwd fallback IS the correct location for this row;
+  //                      persist `output_root` exactly as before.
+  //   • 'resolved'     → repo/folder/_local key; persist `output_root` as before.
+  describe('output_root persistence branching (#2304)', () => {
+    it('does NOT write output_root when identityResolution is "faulted"; stamps the metadata flag instead', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        // Both attempts throw — the retry yields the same fault.
+        getCodebase: mock(async () => {
+          throw new Error('db down');
+        }),
+        updateWorkflowRun: updateSpy,
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-boom' }
+      );
+
+      const writesWithOutputRoot = updateSpy.mock.calls.filter(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(writesWithOutputRoot).toHaveLength(0);
+
+      const flagWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) =>
+          (call[1] as { metadata?: Record<string, unknown> })?.metadata?.[
+            RUN_METADATA_KEYS.identityUnresolved
+          ] === true
+      );
+      expect(flagWrite).toBeDefined();
+      // The patch must not also write `output_root` — a NULL `output_root`
+      // means a later resume can still self-heal.
+      const patch = (flagWrite as unknown as [unknown, { output_root?: unknown }] | undefined)?.[1];
+      expect(patch?.output_root).toBeUndefined();
+    });
+
+    it('persists output_root when identityResolution is "resolved" (a registered codebase)', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const write = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(write).toBeDefined();
+      // The metadata flag must NOT be stamped on a resolved row — that flag is the
+      // faulted-only signal.
+      const flagWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) =>
+          (call[1] as { metadata?: Record<string, unknown> })?.metadata?.[
+            RUN_METADATA_KEYS.identityUnresolved
+          ] !== undefined
+      );
+      expect(flagWrite).toBeUndefined();
+    });
+  });
 });
 
 describe('finally backstop', () => {
@@ -2513,6 +2602,115 @@ describe('resolveProjectPaths', () => {
     });
 
     expect(result.outputRoot).toBe(wsPath('acme', 'widget'));
+  });
+
+  // #2304: identityResolution is the row-level flag the persistence block reads to
+  // decide whether to write `output_root` or stamp `metadata.identity_unresolved`.
+  // The five cases below cover every branch in `resolveProjectPaths`:
+  //   • registered repo / folder / _local  → 'resolved'
+  //   • codebase row exists, no identity   → 'unregistered' (the WARN arm)
+  //   • no codebaseId                      → 'unregistered' (no lookup attempted)
+  //   • codebase lookup returns null       → 'unregistered' (no row)
+  //   • both attempts throw                → 'faulted' (the ERROR arm)
+  //   • persisted-output-root short-circuit → undefined (a resume, no fresh flag)
+  describe('identityResolution (#2304)', () => {
+    it('is "resolved" for a repo codebase', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo');
+
+      expect(result.identityResolution).toBe('resolved');
+    });
+
+    it('is "resolved" for a folder codebase', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-folder',
+          name: 'My Platform',
+          repository_url: null,
+          default_cwd: '/tmp/platform',
+          kind: 'folder' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/tmp/platform', RUN_ID, 'cb-folder');
+
+      expect(result.identityResolution).toBe('resolved');
+    });
+
+    it('is "unregistered" when the lookup returns a codebase row that resolves to a cwd key (WARN arm)', async () => {
+      // The fake resolver only falls back to { kind: 'cwd', cwd } when the basename
+      // is '.' or '..' (the corner that excludes owner/repo and `_local` derivation).
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-noop',
+          name: 'orphan',
+          repository_url: null,
+          default_cwd: '/tmp/.',
+          kind: 'repo' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/tmp/.', RUN_ID, 'cb-noop');
+
+      expect(result.identityResolution).toBe('unregistered');
+    });
+
+    it('is "unregistered" when no codebaseId is provided (no lookup attempted)', async () => {
+      const deps = makeDeps();
+
+      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID);
+
+      expect(result.identityResolution).toBe('unregistered');
+    });
+
+    it('is "unregistered" when the lookup returns null (no codebase row)', async () => {
+      const store = makeStore({ getCodebase: mock(async () => null) });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'missing-id');
+
+      expect(result.identityResolution).toBe('unregistered');
+    });
+
+    it('is "faulted" when both getCodebase attempts throw (ERROR arm)', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => {
+          throw new Error('db down');
+        }),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'cb-boom');
+
+      expect(result.identityResolution).toBe('faulted');
+    });
+
+    it('is undefined on the persisted-output-root short-circuit (resume reading an existing row)', async () => {
+      // A resume reads its `output_root` from the row and re-derives nothing; the
+      // persistence block has nothing to flag on a branch that never resolved.
+      const store = makeStore();
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo', {
+        persistedOutputRoot: wsPath('acme', 'original'),
+      });
+
+      expect(result.identityResolution).toBeUndefined();
+      // The resolved paths still come from the persisted root, not from a fresh lookup.
+      expect(result.outputRoot).toBe(wsPath('acme', 'original'));
+    });
   });
 });
 

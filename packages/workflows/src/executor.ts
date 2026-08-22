@@ -28,6 +28,7 @@ import {
   isRunBlockedOnChild,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
+  RUN_METADATA_KEYS,
   WORKFLOW_SOURCE_METADATA_KEY,
   readWorkflowSourceState,
 } from './schemas';
@@ -305,6 +306,25 @@ export interface ResolvedProjectPaths {
   stateDir: string;
   /** The project root persisted to `workflow_runs.output_root`. */
   outputRoot: string;
+  /**
+   * How the run's project identity was determined (#2304). Three states; collapsing
+   * any two is a correctness bug:
+   *  - `'resolved'`     — `getCodebase` returned a row whose identity resolves to a
+   *                      repo / folder / `_local` key.
+   *  - `'unregistered'` — `getCodebase` returned a row, but no owner/repo nor a
+   *                      `_local` identity could be derived from it; the run still
+   *                      gets external storage, keyed on cwd (`codebase_project_identity_unresolved`
+   *                      WARN). This is a legitimate outcome of a registered codebase,
+   *                      NOT a fault.
+   *  - `'faulted'`      — `getCodebase` threw on BOTH retry attempts; the run fell
+   *                      through to the cwd fallback (`project_paths_resolve_failed_using_fallback`
+   *                      ERROR). The persistence block must NOT write `output_root`
+   *                      for these runs — see `executeWorkflow`.
+   *
+   * Undefined on the persisted-`output_root` short-circuit branch (a resume reading
+   * an existing root re-derives nothing and there is nothing to flag).
+   */
+  identityResolution?: 'resolved' | 'unregistered' | 'faulted';
 }
 
 /**
@@ -356,13 +376,16 @@ export async function resolveProjectPaths(
   }
 
   let key: archonPaths.ProjectStorageKey | undefined;
+  let identityResolution: 'resolved' | 'unregistered' | 'faulted' | undefined;
   if (codebaseId) {
     // Retried once (#2304). A failing lookup drops the run onto the `_cwd/<basename>`
-    // pseudo-project, and because `output_root` is write-once that location is then
-    // pinned for the run's whole life — including its `$STATE_DIR`, so a stateful
-    // workflow silently reads an empty state directory. Failing the run instead was
-    // considered and rejected: the fallback exists precisely because a registry blip
-    // must not kill a run.
+    // pseudo-project. The fallback itself stays — a registry blip must not kill a run.
+    // What changed is what happens to the row afterwards: a faulted run no longer
+    // has its fault-derived location PERSISTED as `output_root` (so the rename hazard
+    // #1192 protects stays scoped to rows with real roots), and the run carries
+    // `metadata.identity_unresolved = true` so "unregistered" and "we could not tell"
+    // are distinguishable after the fact. See the persistence block in `executeWorkflow`
+    // and `ResolvedProjectPaths.identityResolution`.
     //
     // What the retry is worth, honestly, differs by dialect:
     //   • Postgres — it earns its place. A stale or broken pooled connection is exactly
@@ -374,19 +397,17 @@ export async function resolveProjectPaths(
     //     contention have already elapsed, so what reaches us is by construction not
     //     transient, and retrying at that instant retries the moment least likely to
     //     have cleared. Kept because it costs one attempt and cannot make things worse.
-    //
-    // The deeper question — whether an unresolved identity should be recorded on the
-    // row so "unregistered" and "we could not tell" are distinguishable — stays open
-    // in #2304.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const codebase = await deps.store.getCodebase(codebaseId);
         if (codebase) {
           key = archonPaths.resolveProjectStorageKey(codebase, cwd);
+          identityResolution = key.kind === 'cwd' ? 'unregistered' : 'resolved';
           if (key.kind === 'cwd') {
             // The codebase exists but neither an owner/repo nor a _local identity
             // could be derived from it — the run still gets external storage, but
-            // keyed on the working directory rather than the project.
+            // keyed on the working directory rather than the project. NOT a fault;
+            // the persistence block writes the cwd fallback as `output_root` here.
             getLog().warn(
               { codebaseName: codebase.name, cwd: codebase.default_cwd },
               'codebase_project_identity_unresolved'
@@ -402,6 +423,7 @@ export async function resolveProjectPaths(
           );
           continue;
         }
+        identityResolution = 'faulted';
         getLog().error(
           { err: error as Error, codebaseId, cwd },
           'project_paths_resolve_failed_using_fallback'
@@ -410,10 +432,20 @@ export async function resolveProjectPaths(
     }
   }
 
-  return composeRunPaths(
-    archonPaths.getProjectStoragePaths(key ?? { kind: 'cwd', cwd }),
-    workflowRunId
-  );
+  // When the lookup returned null (no codebase row) or no `codebaseId` was provided,
+  // `key` is undefined and the cwd fallback is used. Both are legitimate — neither is
+  // a fault — so they read as `'unregistered'`. A `'faulted'` outcome overrides this.
+  if (identityResolution === undefined) {
+    identityResolution = 'unregistered';
+  }
+
+  return {
+    ...composeRunPaths(
+      archonPaths.getProjectStoragePaths(key ?? { kind: 'cwd', cwd }),
+      workflowRunId
+    ),
+    identityResolution,
+  };
 }
 
 /** Project-level roots → the run-scoped view the executor threads downstream. */
@@ -2009,13 +2041,10 @@ export async function executeWorkflow(
 
   // Resolve external artifact, log, and state directories. A resumed run
   // carries its `output_root` and short-circuits identity resolution entirely.
-  const { artifactsDir, logDir, artifactsRoot, stateDir, outputRoot } = await resolveProjectPaths(
-    deps,
-    cwd,
-    workflowRun.id,
-    codebaseId,
-    { persistedOutputRoot: workflowRun.output_root }
-  );
+  const { artifactsDir, logDir, artifactsRoot, stateDir, outputRoot, identityResolution } =
+    await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
+      persistedOutputRoot: workflowRun.output_root,
+    });
 
   // Record the resolved root ONCE, so every later reader (artifact routes, CLI)
   // addresses this run's output by a durable pointer instead of re-deriving it
@@ -2023,20 +2052,56 @@ export async function executeWorkflow(
   // overwritten — a resumed run already has one, and the store additionally
   // enforces write-once via COALESCE.
   //
+  // Faulted-identity exception (#2304): when `resolveProjectPaths` returned the
+  // cwd fallback BECAUSE both `getCodebase` attempts threw (not because a registered
+  // codebase simply lacked an owner/repo or `_local` identity), the cwd location is
+  // fault-shaped — persisting it here would pin this run's `output_root` AND
+  // `$STATE_DIR` to that empty, fault-derived tree for the run's whole life. We
+  // instead leave `output_root` NULL and stamp `metadata.identity_unresolved = true`,
+  // so:
+  //   • a later resume re-derives once the registry is healthy and the
+  //     `!workflowRun.output_root` guard above writes the now-correct root;
+  //   • the state-preflight gate (#2200), maintainer-triage, and anyone reading the
+  //     row can tell "unregistered" apart from "we could not tell";
+  //   • the write-once invariant is preserved everywhere else (a row with a
+  //     resolved or unregistered identity is still protected across a #1192
+  //     rename — only the empty faulted shape is scoped differently).
+  //
   // A failure here is NOT retried: the guard is `if (!output_root)`, so this run
   // keeps a NULL pointer for its whole lifetime and permanently stays on the
   // re-derive path — the exact orphaning #1192 makes possible. It does not
   // justify failing an otherwise healthy run (re-derivation works today), but it
   // is a durable per-run degradation, so it logs at ERROR rather than WARN.
   if (!workflowRun.output_root) {
-    await deps.store
-      .updateWorkflowRun(workflowRun.id, { output_root: outputRoot })
-      .catch((err: Error) => {
-        getLog().error(
-          { err, workflowRunId: workflowRun.id, outputRoot },
-          'workflow.output_root_persist_failed'
+    if (identityResolution === 'faulted') {
+      workflowRun.metadata = {
+        ...workflowRun.metadata,
+        [RUN_METADATA_KEYS.identityUnresolved]: true,
+      };
+      try {
+        await deps.store.updateWorkflowRun(workflowRun.id, {
+          metadata: { [RUN_METADATA_KEYS.identityUnresolved]: true },
+        });
+      } catch (err) {
+        getLog().warn(
+          { err: err as Error, workflowRunId: workflowRun.id },
+          'workflow.identity_unresolved_flag_persist_failed'
         );
-      });
+      }
+      getLog().warn(
+        { workflowRunId: workflowRun.id, outputRoot },
+        'workflow.output_root_not_persisted_identity_faulted'
+      );
+    } else {
+      await deps.store
+        .updateWorkflowRun(workflowRun.id, { output_root: outputRoot })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, outputRoot },
+            'workflow.output_root_persist_failed'
+          );
+        });
+    }
   }
 
   // Detect (never move) legacy repo-local `.archon/` output directories. State was a

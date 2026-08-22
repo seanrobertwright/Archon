@@ -143,6 +143,8 @@ export {
   isRecognizedSuspendReason,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
+  RUN_METADATA_KEYS,
+  readIdentityUnresolved,
   WORKFLOW_SOURCE_METADATA_KEY,
   workflowSourceMetadataSchema,
   readWorkflowSourceMetadata,
