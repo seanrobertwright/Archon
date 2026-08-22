@@ -61,7 +61,7 @@ mock.module('@openai/codex-sdk', () => ({
   Codex: MockCodex,
 }));
 
-import { CodexProvider, resetCodexSingleton } from './provider';
+import { CodexProvider, classifyCodexError, resetCodexSingleton } from './provider';
 
 describe('CodexProvider', () => {
   let client: CodexProvider;
@@ -2669,4 +2669,28 @@ describe('sendQuery decomposition behaviors', () => {
       process.removeListener('uncaughtException', handler);
     }
   }, 5_000);
+});
+
+describe('classifyCodexError (#2509 R7)', () => {
+  // AUTH_PATTERNS is this classifier's sole gate to 'auth', and 'auth' is what
+  // makes classifyAndEnrichCodexError wrap a message as `Codex auth error:` —
+  // the prefix error-formatter.ts trusts unconditionally. A bare "401"/"403"
+  // used to be enough to classify as 'auth', so any mid-turn error whose text
+  // merely contained those digits (a port, a timeout in ms) was misrouted to
+  // "run codex login" and had its retry disabled.
+  test('does not classify a bare "401"/"403" substring as auth', () => {
+    expect(classifyCodexError('connect ECONNREFUSED 127.0.0.1:401')).not.toBe('auth');
+    expect(classifyCodexError('timeout after 401ms')).not.toBe('auth');
+    expect(classifyCodexError('proxy responded with 403')).not.toBe('auth');
+  });
+
+  test('still classifies genuine auth signals as auth', () => {
+    expect(classifyCodexError('Unauthorized')).toBe('auth');
+    expect(classifyCodexError('authentication failed')).toBe('auth');
+    expect(classifyCodexError('invalid token provided')).toBe('auth');
+    expect(classifyCodexError('Your credit balance is too low to access the API')).toBe('auth');
+    // Real-world provider shape: a 401 co-occurring with the word "Unauthorized" —
+    // the word carries the signal, not the digits.
+    expect(classifyCodexError('exceeded retry limit, last status: 401 Unauthorized')).toBe('auth');
+  });
 });

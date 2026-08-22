@@ -405,6 +405,41 @@ describe('classifyAndFormatError', () => {
       expect(result).toContain('Codex authentication error');
       expect(result).toContain('codex login');
     });
+
+    test('routes a lowercase "unauthorized" in a raw-prefixed message to Codex auth guidance (#2509 R8)', () => {
+      // The provider's own classifyCodexError lowercases before comparing against
+      // AUTH_PATTERNS, so it treats "unauthorized" and "Unauthorized" identically.
+      // This raw-prefix guard must not require the capitalized form specifically.
+      const result = classifyAndFormatError(
+        new Error('Codex query failed: request failed: unauthorized')
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+    });
+  });
+
+  describe('non-auth-classified Codex prefixes reject a bare "401"/"403" (#2509 R7)', () => {
+    // Before the fix, AUTH_PATTERNS's bare "401"/"403" match meant a message
+    // containing either digit sequence could never reach classifyCodexError's
+    // 'crash'/'unknown' branches — it was always classified 'auth' first and
+    // wrapped as `Codex auth error:`, which error-formatter.ts trusts
+    // unconditionally. With AUTH_PATTERNS tightened, a message like this one
+    // now genuinely reaches the provider's `Codex unknown:`/`Codex crash:`
+    // wrap — proving the misroute doesn't just relocate to this branch's own
+    // (now-removed) bare-401 fallback.
+    test('does not route "Codex unknown:" with an unrelated "401" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error('Codex unknown: connect ECONNREFUSED 127.0.0.1:401')
+      );
+      expect(result).not.toContain('Codex authentication');
+      expect(result).not.toContain('codex login');
+    });
+
+    test('does not route "Codex crash:" with an unrelated "401" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(new Error('Codex crash: timeout after 401ms'));
+      expect(result).not.toContain('Codex authentication');
+      expect(result).not.toContain('codex login');
+    });
   });
 
   describe('general authentication errors', () => {

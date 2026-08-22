@@ -48,15 +48,19 @@ export function classifyAndFormatError(error: Error): string {
   // message as auth, so it routes unconditionally instead of being re-tested
   // against a narrower, hand-written substring list — that mismatch is what
   // let real auth errors like "unauthorized" and "invalid token" fall
-  // through (#2509 R1). Every other Codex-side prefix was NOT classified as
-  // auth by the provider: some are a different class (`Codex crash:`),
-  // others are raw and never classified at all (`Codex query failed:`,
+  // through (#2509 R1). That unconditional trust is warranted only because
+  // AUTH_PATTERNS itself requires a real auth word ("unauthorized" /
+  // "authentication" / "invalid token" / "credit balance") and deliberately
+  // excludes a bare "401"/"403" — a stray status-looking digit in unrelated
+  // text (a port, a timeout in ms) does not classify as auth there, so it
+  // never reaches this branch (#2509 R7; see the AUTH_PATTERNS comment in
+  // provider.ts). Every other Codex-side prefix was NOT classified as auth
+  // by the provider: some are a different class (`Codex crash:`), others are
+  // raw and never classified at all (`Codex query failed:`,
   // `codex_turn_failed:`, `codex_stream_incomplete:`), so those still need a
-  // substring check. For these three raw, unclassified prefixes, a bare
-  // "401" is not enough signal — unlike provider-thrown shapes it can appear
-  // in unrelated internal text (e.g. a byte offset, a port, a timeout in
-  // ms), so only the specific word "Unauthorized" counts as a 401-adjacent
-  // auth signal there (#2509 R2).
+  // substring check below — for the same "bare digits aren't enough signal"
+  // reason, that check requires the specific word "unauthorized"
+  // (case-insensitive), not a bare "401" (#2509 R2, R8).
   if (message.startsWith('Codex auth error:')) {
     return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
   }
@@ -71,8 +75,7 @@ export function classifyAndFormatError(error: Error): string {
       message.includes('log out and sign in') ||
       message.includes('OAuth token has expired') ||
       message.includes('sign-in has expired') ||
-      message.includes('Unauthorized') ||
-      (!isCodexRawPrefixed && message.includes('401')))
+      lower.includes('unauthorized'))
   ) {
     return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
   }

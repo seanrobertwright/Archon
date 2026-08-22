@@ -305,17 +305,19 @@ function buildModelAccessMessage(model?: string): string {
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', '429', 'overloaded'];
-const AUTH_PATTERNS = [
-  'credit balance',
-  'unauthorized',
-  'authentication',
-  'invalid token',
-  '401',
-  '403',
-];
+// Deliberately excludes bare '401'/'403': those digits can appear in
+// unrelated text (a port, a byte offset, a millisecond duration) on this
+// classifier's sole call site (the retry loop's catch, `:1132`), which covers
+// every error thrown mid-turn — the most common failure surface in this
+// file. A false 'auth' classification here both misroutes the user-facing
+// message (`error-formatter.ts` trusts `Codex auth error:` unconditionally)
+// and forces `shouldRetry: false` below, denying a transient failure its
+// retry (#2509 R7).
+const AUTH_PATTERNS = ['credit balance', 'unauthorized', 'authentication', 'invalid token'];
 const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'codex exec'];
 
-function classifyCodexError(
+/** Exported for direct unit testing — see provider.test.ts (#2509 R7). */
+export function classifyCodexError(
   errorMessage: string
 ): 'rate_limit' | 'auth' | 'crash' | 'model_access' | 'unknown' {
   if (isModelAccessError(errorMessage)) return 'model_access';
