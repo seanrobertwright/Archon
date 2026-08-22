@@ -945,8 +945,9 @@ binding, producer, and fix named — a binding never silently resolves to `''`.
 **failed** always fails the binding too, whether or not `if_skipped` is declared — a
 `loop_group`'s failure paths in particular can leave real, non-empty output behind (its last
 completed iteration's text), so this is an explicit check, not an accident of empty output.
-Declaring `if_skipped` never papers over a real failure; guard the consumer with `when:`
-instead if it should tolerate that branch.
+There is no way to opt a binding out of this: declaring `if_skipped` never papers over a real
+failure, and `when:` cannot substitute for it either — it reads the same output text, which is
+indistinguishable from a success for a `loop_group` that failed mid-run.
 
 Two guarantees the loader enforces: every bound producer must be reachable through
 `depends_on` (a binding can never race its producer), and two binding names may not fold to
