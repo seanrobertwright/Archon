@@ -941,6 +941,13 @@ is the [constitution's](/reference/workflow-language-constitution/) YAML-coordin
 code-computes split. A skipped producer with **no** `if_skipped` fails the node with the
 binding, producer, and fix named — a binding never silently resolves to `''`.
 
+`if_skipped` only ever covers a producer that **did not run**. A producer that ran and
+**failed** always fails the binding too, whether or not `if_skipped` is declared — a
+`loop_group`'s failure paths in particular can leave real, non-empty output behind (its last
+completed iteration's text), so this is an explicit check, not an accident of empty output.
+Declaring `if_skipped` never papers over a real failure; guard the consumer with `when:`
+instead if it should tolerate that branch.
+
 Two guarantees the loader enforces: every bound producer must be reachable through
 `depends_on` (a binding can never race its producer), and two binding names may not fold to
 the same `INPUTS_*` env key. At runtime, node-local bindings are the **nearest** input
