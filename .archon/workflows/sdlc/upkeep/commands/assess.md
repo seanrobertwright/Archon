@@ -12,7 +12,7 @@ If the block above is empty, the request is the message that started this run:
 
 $ARGUMENTS
 
-It may name a dependency, a version, a security advisory, or a general ask ("update sharp", "address the undici advisory", "get X off the vulnerable range").
+It may name a dependency, a version, a security advisory, or a general ask ("update sharp", "address the undici advisory", "get X off the vulnerable range"). A bare issue or PR reference in the request resolves against THIS repository's tracker unless the request says otherwise — read it there first; upstream projects' trackers are secondary sources for upstream facts only.
 
 ## How to assess
 
