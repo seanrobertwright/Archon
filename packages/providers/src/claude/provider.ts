@@ -226,10 +226,17 @@ export function buildRequestSubprocessEnv(
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
+// Deliberately excludes a bare '429': that digit can appear in unrelated text
+// (a port, a byte count, a millisecond duration) on this classifier's sole
+// call site (the retry-loop catch in classifyAndEnrichError, :1325), which
+// covers every error thrown mid-turn — same "bare digits aren't enough
+// signal" reasoning as AUTH_PATTERNS below (#2715, mirror of #2509 R11
+// applied to Codex in PR #2702). A false 'rate_limit' classification wastes
+// a subprocess retry/backoff cycle before the correct terminal message is
+// shown, but (unlike a false 'auth' hit) does not deny the retry outright.
 const RATE_LIMIT_PATTERNS = [
   'rate limit',
   'too many requests',
-  '429',
   'overloaded',
   // "API Error: 400 due to tool use concurrency issues" — transient server-side
   // rejection of concurrent tool calls; retrying after backoff succeeds (#1341).
