@@ -382,17 +382,23 @@ export type AgentNode = z.infer<typeof agentNodeSchema>;
  * side-by-side read of both, 222 + 323 = 545 lines). The two are not thin
  * wrappers around one shell-out — real, non-superficial differences: output-ref
  * substitution (shell-escaped + artifacts-dir-aware for bash vs. raw splice for
- * script), env-delivered `$LOOP_USER_INPUT`/`deps:`/named-script-file resolution
- * (script-only), and per-runtime error diagnostics. A "merge but keep behavior
- * byte-identical" refactor would relocate rather than remove that complexity,
- * while unifying the ~230 lines of near-identical scaffolding (event
+ * script), `deps:`/named-script-file resolution (script-only), and per-runtime
+ * error diagnostics. `$LOOP_USER_INPUT` delivery is NOT a script-only concept —
+ * both runtimes deliver it via env (#2725); bash additionally gets the literal
+ * `$LOOP_USER_INPUT` token pre-spliced (shell-quoted) into its source by
+ * `applyLoopPrevToBodyNode`, a channel script has no equivalent of. A "merge but
+ * keep behavior byte-identical" refactor would relocate rather than remove that
+ * complexity, while unifying the ~230 lines of near-identical scaffolding (event
  * emission/persistence, retry wiring, error formatting) into one function risks
  * a regression that touches every deterministic node in every workflow at once —
  * today a bug in one runtime's path can't touch the other. Two bugs the read
- * surfaced along the way (`$LOOP_USER_INPUT` never reaching a `bash:` loop_group
- * body node, and `script:` node output never getting the truncation cap `bash:`
- * gets) are real independently-evolved drift, not evidence for merging — they're
- * filed as their own fixes, #2725 and #2726, rather than folded into this call.
+ * surfaced along the way (`executeBashNode`'s own env channel for
+ * `$LOOP_USER_INPUT` was unwired, so a `bash:` loop_group body node reading it
+ * indirectly — `${LOOP_USER_INPUT}`, `printenv`, `env` — always saw an empty
+ * value even though the literal-token splice worked; and `script:` node output
+ * never getting the truncation cap `bash:` gets) are real independently-evolved
+ * drift, not evidence for merging — they're filed as their own fixes, #2725 and
+ * #2726, rather than folded into this call.
  */
 export const execNodeSchema = dagNodeBaseSchema.extend({
   kind: z.literal('exec'),

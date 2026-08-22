@@ -20276,6 +20276,85 @@ describe('executeDagWorkflow -- loop_group node', () => {
     }
   });
 
+  it('delivers $LOOP_USER_INPUT to a resumed body bash node via env (#2725)', async () => {
+    // A body bash node's literal "$LOOP_USER_INPUT" token is already resolved by the
+    // loop_group-level shell-quoted splice (applyLoopPrevToBodyNode) before executeBashNode
+    // ever runs, so a script using that exact literal form is not a regression test for
+    // this fix. This test targets a script that reads the variable WITHOUT that literal
+    // token — `printenv`, matching how `${LOOP_USER_INPUT}` (braced form) or any other
+    // indirect env read behaves — which the splice cannot touch and which previously read
+    // as empty because executeBashNode's subprocess env hardcoded LOOP_USER_INPUT: ''.
+    const feedback = 'looks good, ship it';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'DONE\n', stderr: '' });
+    try {
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('lg-userinput-bash', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'grp',
+            iteration: 0,
+            message: 'Review and provide feedback.',
+          },
+          loop_user_input: feedback,
+          loop_feedback_given: true,
+        },
+      });
+
+      const nodes: DagNode[] = [
+        {
+          id: 'grp',
+          kind: 'loop_group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 3,
+            fresh_context: true,
+            interactive: true,
+            gate_message: 'Review and provide feedback.',
+            nodes: [
+              {
+                id: 'emit',
+                kind: 'exec',
+                script: 'printenv LOOP_USER_INPUT; echo "DONE"',
+                runtime: 'sh',
+                depends_on: [],
+              },
+            ],
+          },
+          depends_on: [],
+        },
+      ];
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-lg-userinput-bash',
+        testDir,
+        { name: 'lg-userinput-bash', nodes },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const bashCall = execSpy.mock.calls.find(
+        c => (c[0] as string) === git.resolveBashPath() && (c[1] as string[])[0] === '-c'
+      ) as [string, string[], { env: NodeJS.ProcessEnv }] | undefined;
+      expect(bashCall).toBeDefined();
+      // The per-iteration feedback reaches the bash node through the environment —
+      // previously always '' regardless of what the reviewer typed at the gate.
+      expect(bashCall?.[2].env.LOOP_USER_INPUT).toBe(feedback);
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
   it('fails the loop_group when max_iterations is exceeded without the until signal', async () => {
     let callCount = 0;
     mockSendQueryDag.mockImplementation(async function* () {
