@@ -92,6 +92,20 @@ function listThroughPipe(target: string): number | null {
   ).status;
 }
 
+/**
+ * Very-slow consumer (1 s before reading). The CLI finishes in ~620 ms; with
+ * the fire-and-forget shim and no exit-path flush, `process.exit()` would
+ * fire while bytes are still queued in the stream buffer and the truncation
+ * described in R1 (review report) returns. `flushPendingWrites()` in
+ * `cli.ts` is what closes that window — do not delete it without re-running
+ * this test.
+ */
+function listThroughVerySlowPipe(target: string): number | null {
+  return runShell(
+    `"${BUN}" "${CLI_ENTRY}" workflow list --cwd "${repoDir}" 2>/dev/null | { sleep 1; cat; } > "${target}"; exit \${PIPESTATUS[0]}`
+  ).status;
+}
+
 beforeAll(() => {
   scratch = mkdtempSync(join(tmpdir(), 'archon-pipe-test-'));
   archonHome = join(scratch, 'home');
@@ -138,4 +152,47 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
       expect(piped.equals(reference)).toBe(true);
     }
   }, 180_000);
+
+  /**
+   * Regression guard for the EPIPE propagation contract
+   * (`safe-console.ts` file comment: "Bun surfaces EPIPE as a process
+   * error, matching the behavior of the original `console.log` when the
+   * reader hangs up"). A defensive `writeStdout(text).catch(() => {})`
+   * regression in the shim would turn `archon … | head -c 100` into a
+   * silent exit 0; the only test above uses `cat` and would not catch it.
+   *
+   * `head -c 100` closes the read end of the pipe after the first 100
+   * bytes, so the writer's next `process.stdout.write` fails with EPIPE.
+   * Bun's default unhandled-rejection-fatal policy then exits non-zero.
+   * We capture `${PIPESTATUS[0]}` (the writer's status) so the surrounding
+   * pipeline cannot mask a non-zero exit with a clean `head`.
+   */
+  it('propagates EPIPE as a non-zero exit when the consumer hangs up early', () => {
+    const result = runShell(
+      `"${BUN}" "${CLI_ENTRY}" workflow list --cwd "${repoDir}" 2>/dev/null | head -c 100 > /dev/null; exit \${PIPESTATUS[0]}`
+    );
+    expect(result.status).not.toBe(0);
+  }, 60_000);
+
+  /**
+   * Regression guard for R1 (review report): the fire-and-forget shim
+   * discards the per-write completion promise, so `process.exit()` would
+   * race the stream drain and re-introduce the silent-exit-0 truncation
+   * the patch is meant to eliminate. The fix is `flushPendingWrites()` in
+   * `cli.ts` (awaited between `main()` and `process.exit()`); this test
+   * sleeps 1 s on the consumer side — longer than the CLI's own runtime —
+   * so without the flush the queued bytes are lost. With the flush in
+   * place the output is byte-identical to the file redirect.
+   */
+  it('delivers the whole document to a very-slow consumer (sleep >= 1 s) without truncating', () => {
+    const referencePath = join(scratch, 'reference.txt');
+    const pipedPath = join(scratch, 'very-slow.txt');
+    const status = listThroughVerySlowPipe(pipedPath);
+    const reference = readFileSync(referencePath);
+    const piped = readFileSync(pipedPath);
+
+    expect(status).toBe(0);
+    expect({ bytes: piped.byteLength }).toEqual({ bytes: reference.byteLength });
+    expect(piped.equals(reference)).toBe(true);
+  }, 120_000);
 });
