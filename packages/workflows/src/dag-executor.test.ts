@@ -1004,6 +1004,28 @@ describe('substituteNodeOutputRefs', () => {
       OutputRefError
     );
   });
+
+  it('failed producer (#2713): whole-text $node.output throws instead of splicing stale output', () => {
+    // Mirrors a loop_group's failure paths: real, non-empty leftover text — not the
+    // '' a plain node's failure usually leaves — must never be spliced into a
+    // consumer's prompt/bash body as though the producer had succeeded.
+    const outputs = new Map([['corrections', makeOutput('failed', 'CORRECTIONS_APPLIED')]]);
+    expect(() => substituteNodeOutputRefs('Result: $corrections.output', outputs)).toThrow();
+  });
+
+  it('failed producer (#2713): fielded $node.output.field throws even on valid JSON leftover output', () => {
+    const outputs = new Map([
+      ['corrections', makeOutput('failed', JSON.stringify({ ready: true }))],
+    ]);
+    let caught: unknown;
+    try {
+      substituteNodeOutputRefs('$corrections.output.ready', outputs);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(OutputRefError);
+    expect((caught as OutputRefError).reason).toBe('producer-failed');
+  });
 });
 
 describe('substituteNodeOutputRefs -- shell escaping', () => {
@@ -11763,6 +11785,12 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
 
+    // #2713: this test's shared consumer.md fixture inlines $producer.output, which
+    // itself now throws when producer is 'failed' (the sibling gap this test
+    // predates) — override it so this test measures ONLY the #2402
+    // staleness-invalidation behavior, not the unrelated #2713 guard.
+    await writeFile(join(testDir, '.archon', 'commands', 'consumer.md'), 'Consumer prompt');
+
     // Consumer is cached (it ran in the prior run). Producer is NOT cached —
     // it failed in the prior run and is being re-attempted this resume. Same
     // shape as test 3 (case 1 with `'completed'`); the producer's FINAL state
@@ -11869,6 +11897,12 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
     const mockDeps = createMockDeps(store);
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
+
+    // #2713: this test's shared consumer.md fixture inlines $producer.output, which
+    // itself now throws when producer is 'failed' (the sibling gap this test
+    // predates) — override it so this test measures ONLY the #2402
+    // staleness-invalidation behavior, not the unrelated #2713 guard.
+    await writeFile(join(testDir, '.archon', 'commands', 'consumer.md'), 'Consumer prompt');
 
     // Producer WAS cached from a prior success with EMPTY output — the exact value
     // its fresh failure also produces. Consumer was cached too.
@@ -27787,5 +27821,68 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
       .join('\n');
     expect(sent).toContain("Node 'gate-ready'");
     expect(sent).toContain("'corrections' failed");
+  });
+
+  // --- sibling gaps to the #2710 binding-directive fix (#2713) ---
+  //
+  // #2710 fixed exactly one reader of a failed producer's output: the `{ from,
+  // if_skipped }` binding directive above. This test proves the sibling it explicitly
+  // deferred — a PLAIN (non-directive) `with:` value, which can never use the directive
+  // form and so never got #2710's protection — now fails the consumer too, using the
+  // same `deliver`-shaped topology and failure mode as the tests above.
+  it("sibling gaps (#2713): a failed group's PLAIN with: value fails the consumer instead of resolving stale output", async () => {
+    const markerPath = join(testDir, 'gate-ready-plain-with-ran.marker');
+
+    const nodes = [
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 1',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: [],
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        script: `require('fs').writeFileSync(${JSON.stringify(markerPath)}, process.env.INPUTS_CORRECTIONS ?? '');`,
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        // Plain whole-ref value — NOT the { from, if_skipped } directive form. This
+        // is resolveWorkflowValue's whole-ref tier, not resolveBindingDirective.
+        with: {
+          corrections: '$corrections.output',
+        },
+      }),
+    ];
+
+    const platform = createMockPlatform();
+    await executeDagWorkflow(
+      createMockDeps(),
+      platform,
+      'conv-lg-binding-plain',
+      testDir,
+      { name: 'lg-binding-plain-with-failed', nodes: nodes as DagNode[] },
+      makeWorkflowRun('lg-binding-plain-with-failed'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // gate-ready's body never executed — no public-write consequence from a failed group.
+    expect(await Bun.file(markerPath).exists()).toBe(false);
+
+    const sent = (platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>).mock.calls
+      .map(c => String(c[1]))
+      .join('\n');
+    expect(sent).toContain("node 'corrections'");
+    expect(sent).toContain('failed');
   });
 });

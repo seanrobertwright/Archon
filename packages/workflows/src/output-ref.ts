@@ -6,6 +6,9 @@
  * — so the contract is identical in both.
  *
  * Resolution table for a known producer:
+ *   0. Producer's `state` is `'failed'` → THROW ('producer-failed', #2713), before any
+ *      of the branches below ever run — a failed producer's leftover output is never
+ *      trusted, however JSON-shaped or non-empty it looks.
  *   1. Producer HAS `declaredFields` (an `output_format` with `properties`) — enforce it:
  *        field ∈ declaredFields, value present      → value
  *        field ∈ declaredFields, value absent/null  → '' (declared-optional / explicit null)
@@ -27,8 +30,14 @@
  *      key is expected; anything else is a drop they must see:
  *        output not a JSON object → THROW ;  key present → value ;  key absent → THROW
  *
- * The whole-text `$node.output` form (no `.field`) is never routed here — it is
- * unchanged and never throws.
+ * The whole-text `$node.output` form (no `.field`) is never routed through THIS
+ * function — but it is no longer unconditionally lenient: each caller (#2713) now
+ * guards it locally, before ever reading the producer's output, for the identical
+ * `state === 'failed'` case this function guards for the fielded form. KEEP IN SYNC:
+ * `wholeRefLogicalValue` and `substituteNodeOutputRefs` in dag-executor.ts,
+ * `resolveOutputRef` in condition-evaluator.ts, and `resolveBindingDirective`'s
+ * pre-existing #2710 guard in dag-executor.ts all assert the same invariant
+ * independently — a change to one should prompt checking the others.
  *
  * The UNKNOWN-node case (`$typo.output.field` where nothing in the outputs map
  * resolves — a typo, or a real node that has not run before the reference) is
@@ -167,6 +176,7 @@ export type OutputRefErrorReason =
   | 'array-aggregate'
   | 'missing-key'
   | 'producer-not-run'
+  | 'producer-failed'
   | 'unknown-node';
 
 export class OutputRefError extends Error {
@@ -201,6 +211,8 @@ export class OutputRefError extends Error {
         return `'${ref}' references field '${field}', but node '${nodeId}'s JSON output has no such key. Emit '${field}' in the output, or fix the reference.`;
       case 'producer-not-run':
         return `'${ref}' references field '${field}', but node '${nodeId}' did not run (skipped or pending), so it has no output to read. Guard this reference with a 'when:' condition, or fix the dependency.`;
+      case 'producer-failed':
+        return `'${ref}' references field '${field}', but node '${nodeId}' failed, so its output cannot be trusted. Guard this reference with a 'when:' condition, or fix the failure.`;
       case 'unknown-node': {
         const hint =
           candidates.length > 0
@@ -300,6 +312,15 @@ export function resolveNodeOutputField(
   // object" error on its empty output.
   if (nodeOutput.state === 'skipped' || nodeOutput.state === 'pending') {
     throw new OutputRefError(nodeId, field, 'producer-not-run');
+  }
+
+  // A failed producer never resolves a field, however JSON-shaped its leftover
+  // output looks (#2713): a loop_group's failure paths carry the last completed
+  // iteration's real, often-valid-JSON text, which would otherwise be read here
+  // as if the group had succeeded — the same class of bug #2696/#2710 fixed for
+  // the `{ from, if_skipped }` binding directive.
+  if (nodeOutput.state === 'failed') {
+    throw new OutputRefError(nodeId, field, 'producer-failed');
   }
 
   const declaredFields = 'declaredFields' in nodeOutput ? nodeOutput.declaredFields : undefined;
