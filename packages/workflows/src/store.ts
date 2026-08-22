@@ -58,6 +58,14 @@ export const WORKFLOW_EVENT_TYPES = [
   'node_failed',
   'node_skipped',
   'node_skipped_prior_success',
+  // #2402 — written when a cached prior-success node is invalidated because a
+  // dependency re-executed during the current resume (e.g. an `always_run: true`
+  // upstream, or any dep that re-ran with fresh output). `data.prior_output` is the
+  // stale cached value being thrown away; `data.invalidating_deps` lists the
+  // upstream node ids whose current output no longer matches the prior snapshot.
+  // The audit counterpart to the resume cache invalidation; absence never implies
+  // the cache was honored — a skipped node only writes `node_skipped_prior_success`.
+  'node_prior_cache_invalidated',
   'node_always_run_reset',
   'loop_iteration_started',
   'loop_iteration_completed',

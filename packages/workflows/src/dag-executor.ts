@@ -7945,6 +7945,115 @@ interface RunLayersContext {
 }
 
 /**
+ * Return the IDs of `node`'s dependencies whose current `nodeOutputs` value no
+ * longer matches their cached `priorCompletedNodes` snapshot (#2402). A
+ * downstream consumer that is being considered for a prior-success skip is
+ * stale — it was last computed against the prior snapshot, not against the
+ * current `nodeOutputs` — when any of its deps is in this set. The set is
+ * built by comparing text output AND structured output so consumers using
+ * `$node.output.field` (the #2637 logical-value surface) are also invalidated
+ * when only the structured form changed.
+ *
+ * A dep currently in `state: 'failed'` is always stale, checked first and
+ * unconditionally — regardless of whether it had a prior cached success. Every
+ * failure arm in the executor returns `output: ''`, so comparing a fresh
+ * failure's value against a prior success's value (cases 2/3 below) can find
+ * them equal and silently miss the failure; a dependency that failed on THIS
+ * resume must never be judged by value equality.
+ *
+ * Past that, three cases surface a dep as "ran fresh this resume":
+ *
+ * 1. The dep was never in `priorCompletedNodes` at all (never completed in the
+ *    prior run, or never reached) and is now `completed` in `nodeOutputs` — it
+ *    re-ran this resume with no prior cache to honour. `'skipped'` is
+ *    intentionally left out: its `output: ''` is semantically equivalent to
+ *    the absent prior, so honouring the cache is safe.
+ * 2. The dep's `prior.output` differs from `nodeOutputs.get(dep).output` —
+ *    either an `always_run` upstream that re-executed, or any dep the engine
+ *    re-ran with new content. The per-layer aggregation is the only writer of
+ *    `nodeOutputs[dep].output` other than the pre-population loop, so a diff is
+ *    proof of fresh execution.
+ * 3. The dep's `prior.structuredOutput` differs from the current one — a
+ *    subtler staleness that only matters for `$dep.output.field` consumers,
+ *    covered here so a fresh structured value can't slip past a text-stable
+ *    cache. JSON.stringify is sufficient: structured outputs are persisted to
+ *    JSONB and therefore JSON-serializable; for `undefined` vs absent values,
+ *    `JSON.stringify` normalises both to a missing key.
+ *
+ * Note: the value-equality comparison (cases 2/3) is conservative in one
+ * direction — a dep that re-ran with text- and structured-identical output
+ * will NOT be flagged. The cached downstream is therefore semantically
+ * equivalent to a fresh execution in that case, which is the safe direction
+ * to err in (over-run vs. stale success is the bug we're closing). The
+ * failed-state check above is not subject to this leniency: a failure is
+ * never treated as equivalent to the prior success it's compared against.
+ */
+function getStaleCachedDependencies(
+  node: DagNode,
+  nodeOutputs: ReadonlyMap<string, NodeOutput>,
+  priorCompletedNodes: ReadonlyMap<string, PersistedNodeOutput>
+): string[] {
+  const deps = node.depends_on ?? [];
+  if (deps.length === 0) return [];
+  const stale: string[] = [];
+  for (const depId of deps) {
+    const prior = priorCompletedNodes.get(depId);
+    const current = nodeOutputs.get(depId);
+    // A dep that failed fresh this resume is always stale, checked before — and
+    // independently of — the prior-cache lookup below. See the docstring above.
+    if (current?.state === 'failed') {
+      stale.push(depId);
+      continue;
+    }
+    // Case 1: dep was never cached; if it is now complete it ran fresh this resume.
+    // Missing-current (the dep is still pending or running) is intentionally left out:
+    // pending/running cannot reach this helper via the resume-skip arm in
+    // executeDagWorkflow (`priorCompletedNodes?.has(node.id)` only fires when the
+    // CONSUMER itself was cached, but its dep would be addressed by case 2/3 once it
+    // finishes).
+    if (prior === undefined) {
+      if (current?.state === 'completed') {
+        stale.push(depId);
+      }
+      continue;
+    }
+    // Case 2: dep's text output differs from the prior snapshot.
+    if (current?.output !== prior.output) {
+      stale.push(depId);
+      continue;
+    }
+    // Case 3: dep's structured value differs even though text did not — only matters
+    // for `$dep.output.field` consumers, but those are exactly the surfaces that would
+    // silently read stale structured data through the cached downstream.
+    const priorStructured = prior.structuredOutput;
+    const currentStructured =
+      current !== undefined && 'structuredOutput' in current ? current.structuredOutput : undefined;
+    if (!structuredOutputsEqual(priorStructured, currentStructured)) {
+      stale.push(depId);
+    }
+  }
+  return stale;
+}
+
+/**
+ * `true` when two structured-output payloads are semantically equal for the
+ * purposes of cache invalidation. JSON.stringify is the comparison because
+ * structured outputs are persisted as JSONB — they are guaranteed JSON-shaped
+ * (objects/arrays/primitives, no cycles, no functions). `undefined` is treated
+ * as the absent payload; an explicit `null` is a real value and is distinct
+ * from absent.
+ */
+function structuredOutputsEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Walk the topological `layers` of a DAG (or subgraph), executing each layer's nodes
  * concurrently, aggregating results into `ctx.nodeOutputs`, and accumulating usage into
  * `ctx`. Stops early (returns) when a between-layer status check sees a non-running run
@@ -8088,50 +8197,101 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 });
               // falls through to re-execute the node
             } else if (composedBoundaryDecision === 'run') {
-              getLog().info({ nodeId: node.id }, 'dag.node_skipped_prior_success');
-              await logNodeSkip(logDir, workflowRun.id, node.id, 'prior_success').catch(
-                (err: Error) => {
-                  getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
-                }
+              // #2402 — a cached prior-success skip is only safe when every
+              // dependency's current value still matches the prior snapshot.
+              // If any dep re-ran during this resume (e.g. an `always_run: true`
+              // upstream forced a re-execution, or any dep produced fresh
+              // output), the cached value reflects the OLD dep output and would
+              // otherwise report success over stale synthesis. Invalidate and
+              // fall through to a fresh execution instead.
+              const staleDeps = getStaleCachedDependencies(
+                node,
+                ctx.nodeOutputs,
+                priorCompletedNodes
               );
-              deps.store
-                .createWorkflowEvent({
-                  workflow_run_id: workflowRun.id,
-                  event_type: 'node_skipped_prior_success',
-                  step_name: stepNamePrefix + node.id,
-                  data: {
-                    reason: 'prior_success',
-                    node_output: priorCompletedNodes.get(node.id)?.output ?? '',
-                    // Copy the logical value forward (#2637) so a SECOND resume's
-                    // snapshot still sees it — this re-emit is that resume's source.
-                    ...(priorCompletedNodes.get(node.id)?.structuredOutput !== undefined
-                      ? { structured_output: priorCompletedNodes.get(node.id)?.structuredOutput }
-                      : {}),
-                  },
-                })
-                .catch((err: Error) => {
-                  getLog().error(
-                    {
-                      err,
-                      workflowRunId: workflowRun.id,
-                      eventType: 'node_skipped_prior_success',
+              if (staleDeps.length > 0) {
+                const priorOutput = priorCompletedNodes.get(node.id)?.output ?? '';
+                getLog().info(
+                  { nodeId: node.id, invalidatingDeps: staleDeps },
+                  'dag.node_prior_cache_invalidated'
+                );
+                deps.store
+                  .createWorkflowEvent({
+                    workflow_run_id: workflowRun.id,
+                    event_type: 'node_prior_cache_invalidated',
+                    step_name: stepNamePrefix + node.id,
+                    data: {
+                      reason: 'stale_dependency',
+                      invalidating_deps: staleDeps,
+                      prior_output: priorOutput,
+                      // Carry the cached logical value too so the audit log shows
+                      // exactly what was thrown away, matching the text channel
+                      // (#2637).
+                      ...(priorCompletedNodes.get(node.id)?.structuredOutput !== undefined
+                        ? {
+                            prior_structured_output: priorCompletedNodes.get(node.id)
+                              ?.structuredOutput,
+                          }
+                        : {}),
                     },
-                    'workflow_event_persist_failed'
-                  );
+                  })
+                  .catch((err: Error) => {
+                    getLog().error(
+                      {
+                        err,
+                        workflowRunId: workflowRun.id,
+                        eventType: 'node_prior_cache_invalidated',
+                      },
+                      'workflow_event_persist_failed'
+                    );
+                  });
+                // falls through to re-execute the node with fresh dep output
+              } else {
+                getLog().info({ nodeId: node.id }, 'dag.node_skipped_prior_success');
+                await logNodeSkip(logDir, workflowRun.id, node.id, 'prior_success').catch(
+                  (err: Error) => {
+                    getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
+                  }
+                );
+                deps.store
+                  .createWorkflowEvent({
+                    workflow_run_id: workflowRun.id,
+                    event_type: 'node_skipped_prior_success',
+                    step_name: stepNamePrefix + node.id,
+                    data: {
+                      reason: 'prior_success',
+                      node_output: priorCompletedNodes.get(node.id)?.output ?? '',
+                      // Copy the logical value forward (#2637) so a SECOND resume's
+                      // snapshot still sees it — this re-emit is that resume's source.
+                      ...(priorCompletedNodes.get(node.id)?.structuredOutput !== undefined
+                        ? { structured_output: priorCompletedNodes.get(node.id)?.structuredOutput }
+                        : {}),
+                    },
+                  })
+                  .catch((err: Error) => {
+                    getLog().error(
+                      {
+                        err,
+                        workflowRunId: workflowRun.id,
+                        eventType: 'node_skipped_prior_success',
+                      },
+                      'workflow_event_persist_failed'
+                    );
+                  });
+                const emitterPrior = getWorkflowEventEmitter();
+                emitterPrior.emit({
+                  type: 'node_skipped',
+                  runId: workflowRun.id,
+                  nodeId: node.id,
+                  nodeName: node.command ?? node.id,
+                  reason: 'prior_success',
                 });
-              const emitterPrior = getWorkflowEventEmitter();
-              emitterPrior.emit({
-                type: 'node_skipped',
-                runId: workflowRun.id,
-                nodeId: node.id,
-                nodeName: node.command ?? node.id,
-                reason: 'prior_success',
-              });
-              // Return the pre-populated output (already in nodeOutputs)
-              return {
-                nodeId: node.id,
-                output: ctx.nodeOutputs.get(node.id) ?? { state: 'skipped' as const, output: '' },
-              };
+                // Return the pre-populated output (already in nodeOutputs)
+                return {
+                  nodeId: node.id,
+                  output: ctx.nodeOutputs.get(node.id) ?? { state: 'skipped' as const, output: '' },
+                };
+              }
             }
           }
 
