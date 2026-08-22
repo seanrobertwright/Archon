@@ -234,7 +234,13 @@ export const workflowDefinitionSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
 });
 
-/** Workflow definition with fully typed nodes (DagNode[]) derived from the schema. */
+/**
+ * Workflow definition with fully typed nodes derived from the schema. `nodes`'
+ * element type is `DagNode | IncludeDirective` (not `DagNode[]` alone) because
+ * `dagNodeSchema` still parses `include:` entries at this pre-expansion stage
+ * (#2486) — `expandWorkflowIncludes` consumes every `IncludeDirective` before
+ * the executor ever sees a `WorkflowDefinition`.
+ */
 export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { prompt?: never };
 
 // ---------------------------------------------------------------------------

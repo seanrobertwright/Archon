@@ -154,7 +154,7 @@ function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefi
   return {
     name: 'test-workflow',
     description: 'Test',
-    nodes: [{ id: 'test', command: 'test' }],
+    nodes: [{ id: 'test', kind: 'agent', source: { kind: 'command', name: 'test' } }],
     ...overrides,
   };
 }

@@ -1,11 +1,10 @@
 import { describe, test, expect } from 'bun:test';
 import {
-  isBashNode,
-  isCancelNode,
-  isScriptNode,
+  isExecNode,
+  isHaltNode,
   isLoopNode,
   isLoopGroupNode,
-  isIncludeNode,
+  isIncludeDirective,
   isTriggerRule,
   TRIGGER_RULES,
   SCRIPT_NODE_AI_FIELDS,
@@ -20,12 +19,10 @@ import {
 } from './schemas';
 import type {
   DagNode,
-  CommandNode,
-  PromptNode,
-  BashNode,
-  CancelNode,
-  ScriptNode,
-  IncludeNode,
+  AgentNode,
+  ExecNode,
+  HaltNode,
+  IncludeDirective,
   TriggerRule,
 } from './schemas';
 
@@ -33,21 +30,35 @@ import type {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const commandNode: CommandNode = { id: 'n1', command: 'build' };
-const promptNode: PromptNode = { id: 'n2', prompt: 'Do this inline.' };
-const bashNode: BashNode = { id: 'n3', bash: 'echo hello' };
-const cancelNode: CancelNode = { id: 'n5', cancel: 'Precondition failed' };
+const commandNode: AgentNode = {
+  id: 'n1',
+  kind: 'agent',
+  source: { kind: 'command', name: 'build' },
+};
+const promptNode: AgentNode = {
+  id: 'n2',
+  kind: 'agent',
+  source: { kind: 'inline', prompt: 'Do this inline.' },
+};
+const bashNode: ExecNode = { id: 'n3', kind: 'exec', runtime: 'sh', script: 'echo hello' };
+const cancelNode: HaltNode = { id: 'n5', kind: 'halt', reason: 'Precondition failed' };
 
 describe('dagNodeSchema — context', () => {
   test('parses scalar and named resume contexts on AI consumers', () => {
-    expect(dagNodeSchema.parse({ id: 'fresh', prompt: 'work', context: 'fresh' }).context).toBe(
-      'fresh'
-    );
-    expect(dagNodeSchema.parse({ id: 'shared', command: 'work', context: 'shared' }).context).toBe(
-      'shared'
-    );
     expect(
-      dagNodeSchema.parse({ id: 'named', prompt: 'work', context: { resume: 'source' } }).context
+      (dagNodeSchema.parse({ id: 'fresh', prompt: 'work', context: 'fresh' }) as DagNode).context
+    ).toBe('fresh');
+    expect(
+      (dagNodeSchema.parse({ id: 'shared', command: 'work', context: 'shared' }) as DagNode).context
+    ).toBe('shared');
+    expect(
+      (
+        dagNodeSchema.parse({
+          id: 'named',
+          prompt: 'work',
+          context: { resume: 'source' },
+        }) as DagNode
+      ).context
     ).toEqual({ resume: 'source' });
   });
 
@@ -67,41 +78,64 @@ describe('dagNodeSchema — context', () => {
 });
 
 // ---------------------------------------------------------------------------
-// isBashNode
+// isExecNode (formerly isBashNode + isScriptNode — bash/script collapsed into
+// one 'exec' kind, distinguished by `runtime`, #2486)
 // ---------------------------------------------------------------------------
 
-describe('isBashNode', () => {
-  test('returns true for a BashNode', () => {
-    expect(isBashNode(bashNode)).toBe(true);
+describe('isExecNode', () => {
+  test('returns true for a sh-runtime (formerly bash) node', () => {
+    expect(isExecNode(bashNode)).toBe(true);
   });
 
-  test('returns true for a BashNode with timeout', () => {
-    const withTimeout: BashNode = { id: 'b', bash: 'npm test', timeout: 60000 };
-    expect(isBashNode(withTimeout)).toBe(true);
+  test('returns true for a sh-runtime node with timeout', () => {
+    const withTimeout: ExecNode = {
+      id: 'b',
+      kind: 'exec',
+      runtime: 'sh',
+      script: 'npm test',
+      timeout: 60000,
+    };
+    expect(isExecNode(withTimeout)).toBe(true);
   });
 
-  test('returns true for a BashNode with depends_on', () => {
-    const withDeps: BashNode = { id: 'b', bash: 'echo done', depends_on: ['n1'] };
-    expect(isBashNode(withDeps)).toBe(true);
+  test('returns true for a sh-runtime node with depends_on', () => {
+    const withDeps: ExecNode = {
+      id: 'b',
+      kind: 'exec',
+      runtime: 'sh',
+      script: 'echo done',
+      depends_on: ['n1'],
+    };
+    expect(isExecNode(withDeps)).toBe(true);
+  });
+
+  test('returns true for a bun-runtime (formerly script) node', () => {
+    const scriptNode: ExecNode = {
+      id: 's1',
+      kind: 'exec',
+      runtime: 'bun',
+      script: 'console.log("hi")',
+    };
+    expect(isExecNode(scriptNode)).toBe(true);
+  });
+
+  test('returns true for a script node with deps', () => {
+    const withDeps: ExecNode = {
+      id: 's',
+      kind: 'exec',
+      runtime: 'bun',
+      script: 'import zod from "zod"',
+      deps: ['zod'],
+    };
+    expect(isExecNode(withDeps)).toBe(true);
   });
 
   test('returns false for a CommandNode', () => {
-    expect(isBashNode(commandNode)).toBe(false);
+    expect(isExecNode(commandNode)).toBe(false);
   });
 
-  test('returns false for a PromptNode', () => {
-    expect(isBashNode(promptNode)).toBe(false);
-  });
-
-  test('returns false when bash field is missing', () => {
-    const noCmd = { id: 'x', command: 'build' } as DagNode;
-    expect(isBashNode(noCmd)).toBe(false);
-  });
-
-  test('returns false when bash is not a string (malformed node)', () => {
-    // Deliberately violate the type to ensure the runtime check catches it
-    const malformed = { id: 'x', bash: 42 } as unknown as DagNode;
-    expect(isBashNode(malformed)).toBe(false);
+  test('returns false for an AgentNode', () => {
+    expect(isExecNode(promptNode)).toBe(false);
   });
 });
 
@@ -109,26 +143,21 @@ describe('isBashNode', () => {
 // isCancelNode
 // ---------------------------------------------------------------------------
 
-describe('isCancelNode', () => {
-  test('returns true for a CancelNode', () => {
-    expect(isCancelNode(cancelNode)).toBe(true);
+describe('isHaltNode', () => {
+  test('returns true for a HaltNode', () => {
+    expect(isHaltNode(cancelNode)).toBe(true);
   });
 
   test('returns false for a CommandNode', () => {
-    expect(isCancelNode(commandNode)).toBe(false);
+    expect(isHaltNode(commandNode)).toBe(false);
   });
 
-  test('returns false for a PromptNode', () => {
-    expect(isCancelNode(promptNode)).toBe(false);
+  test('returns false for an AgentNode', () => {
+    expect(isHaltNode(promptNode)).toBe(false);
   });
 
-  test('returns false for a BashNode', () => {
-    expect(isCancelNode(bashNode)).toBe(false);
-  });
-
-  test('returns false when cancel is not a string (malformed node)', () => {
-    const malformed = { id: 'x', cancel: 42 } as unknown as DagNode;
-    expect(isCancelNode(malformed)).toBe(false);
+  test('returns false for an ExecNode', () => {
+    expect(isHaltNode(bashNode)).toBe(false);
   });
 });
 
@@ -316,7 +345,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
   test('parses effort enum on prompt node', () => {
     const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', effort: 'high' });
     expect(result.success).toBe(true);
-    if (result.success) expect((result.data as PromptNode).effort).toBe('high');
+    if (result.success) expect((result.data as AgentNode).effort).toBe('high');
   });
 
   test('rejects invalid effort value', () => {
@@ -327,13 +356,13 @@ describe('dagNodeSchema — new Claude SDK options', () => {
   test('parses thinking string shorthand: adaptive', () => {
     const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', thinking: 'adaptive' });
     expect(result.success).toBe(true);
-    if (result.success) expect((result.data as PromptNode).thinking).toEqual({ type: 'adaptive' });
+    if (result.success) expect((result.data as AgentNode).thinking).toEqual({ type: 'adaptive' });
   });
 
   test('parses thinking string shorthand: disabled', () => {
     const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', thinking: 'disabled' });
     expect(result.success).toBe(true);
-    if (result.success) expect((result.data as PromptNode).thinking).toEqual({ type: 'disabled' });
+    if (result.success) expect((result.data as AgentNode).thinking).toEqual({ type: 'disabled' });
   });
 
   test('parses thinking object form with budgetTokens', () => {
@@ -344,7 +373,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
     });
     expect(result.success).toBe(true);
     if (result.success)
-      expect((result.data as PromptNode).thinking).toEqual({
+      expect((result.data as AgentNode).thinking).toEqual({
         type: 'enabled',
         budgetTokens: 8000,
       });
@@ -358,7 +387,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
   test('parses maxBudgetUsd as positive number', () => {
     const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', maxBudgetUsd: 2.5 });
     expect(result.success).toBe(true);
-    if (result.success) expect((result.data as PromptNode).maxBudgetUsd).toBe(2.5);
+    if (result.success) expect((result.data as AgentNode).maxBudgetUsd).toBe(2.5);
   });
 
   test('rejects negative maxBudgetUsd', () => {
@@ -378,8 +407,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
       betas: ['context-1m-2025-08-07'],
     });
     expect(result.success).toBe(true);
-    if (result.success)
-      expect((result.data as PromptNode).betas).toEqual(['context-1m-2025-08-07']);
+    if (result.success) expect((result.data as AgentNode).betas).toEqual(['context-1m-2025-08-07']);
   });
 
   test('rejects empty betas array', () => {
@@ -395,7 +423,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect((result.data as PromptNode).sandbox?.enabled).toBe(true);
+      expect((result.data as AgentNode).sandbox?.enabled).toBe(true);
     }
   });
 
@@ -407,7 +435,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
     });
     expect(result.success).toBe(true);
     if (result.success)
-      expect((result.data as PromptNode).systemPrompt).toBe('You are a security reviewer');
+      expect((result.data as AgentNode).systemPrompt).toBe('You are a security reviewer');
   });
 
   test('rejects empty systemPrompt string', () => {
@@ -423,7 +451,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
     });
     expect(result.success).toBe(true);
     if (result.success)
-      expect((result.data as PromptNode).fallbackModel).toBe('claude-haiku-4-5-20251001');
+      expect((result.data as AgentNode).fallbackModel).toBe('claude-haiku-4-5-20251001');
   });
 
   test('parses settingSources array of valid sources', () => {
@@ -433,7 +461,7 @@ describe('dagNodeSchema — new Claude SDK options', () => {
       settingSources: ['project'],
     });
     expect(result.success).toBe(true);
-    if (result.success) expect((result.data as PromptNode).settingSources).toEqual(['project']);
+    if (result.success) expect((result.data as AgentNode).settingSources).toEqual(['project']);
   });
 
   test('rejects settingSources with invalid source value', () => {
@@ -493,7 +521,7 @@ describe('dagNodeSchema — per-node Pi posture (pi:)', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect((result.data as PromptNode).pi).toEqual({
+      expect((result.data as AgentNode).pi).toEqual({
         interactive: true,
         extensionFlags: { plan: true, 'plan-file': 'PLAN.md' },
       });
@@ -510,7 +538,7 @@ describe('dagNodeSchema — per-node Pi posture (pi:)', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(isLoopNode(result.data)).toBe(true);
+      expect(isLoopNode(result.data as DagNode)).toBe(true);
       expect((result.data as DagNode & { pi?: unknown }).pi).toEqual({
         interactive: false,
         extensionFlags: { plan: false },
@@ -549,52 +577,10 @@ describe('dagNodeSchema — per-node Pi posture (pi:)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// isScriptNode
+// dagNodeSchema — ExecNode parsing and validation
 // ---------------------------------------------------------------------------
 
-describe('isScriptNode', () => {
-  const scriptNode: ScriptNode = { id: 's1', script: 'console.log("hi")', runtime: 'bun' };
-  const commandNode: CommandNode = { id: 'n1', command: 'build' };
-  const promptNode: PromptNode = { id: 'n2', prompt: 'Do this inline.' };
-  const bashNode: BashNode = { id: 'n3', bash: 'echo hello' };
-
-  test('returns true for a ScriptNode', () => {
-    expect(isScriptNode(scriptNode)).toBe(true);
-  });
-
-  test('returns true for a ScriptNode with deps', () => {
-    const withDeps: ScriptNode = {
-      id: 's',
-      script: 'import zod from "zod"',
-      runtime: 'bun',
-      deps: ['zod'],
-    };
-    expect(isScriptNode(withDeps)).toBe(true);
-  });
-
-  test('returns false for a CommandNode', () => {
-    expect(isScriptNode(commandNode)).toBe(false);
-  });
-
-  test('returns false for a PromptNode', () => {
-    expect(isScriptNode(promptNode)).toBe(false);
-  });
-
-  test('returns false for a BashNode', () => {
-    expect(isScriptNode(bashNode)).toBe(false);
-  });
-
-  test('returns false when script is not a string (malformed node)', () => {
-    const malformed = { id: 'x', script: 42 } as unknown as DagNode;
-    expect(isScriptNode(malformed)).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// dagNodeSchema — ScriptNode parsing and validation
-// ---------------------------------------------------------------------------
-
-describe('dagNodeSchema — ScriptNode', () => {
+describe('dagNodeSchema — ExecNode', () => {
   test('parses a bun script node with inline script', () => {
     const result = dagNodeSchema.safeParse({
       id: 'fetch',
@@ -603,8 +589,8 @@ describe('dagNodeSchema — ScriptNode', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(isScriptNode(result.data)).toBe(true);
-      const node = result.data as ScriptNode;
+      expect(isExecNode(result.data as DagNode)).toBe(true);
+      const node = result.data as ExecNode;
       expect(node.script).toBe('console.log("hello")');
       expect(node.runtime).toBe('bun');
     }
@@ -618,8 +604,8 @@ describe('dagNodeSchema — ScriptNode', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(isScriptNode(result.data)).toBe(true);
-      const node = result.data as ScriptNode;
+      expect(isExecNode(result.data as DagNode)).toBe(true);
+      const node = result.data as ExecNode;
       expect(node.runtime).toBe('uv');
     }
   });
@@ -633,7 +619,7 @@ describe('dagNodeSchema — ScriptNode', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      const node = result.data as ScriptNode;
+      const node = result.data as ExecNode;
       expect(node.deps).toEqual(['httpx', 'beautifulsoup4']);
     }
   });
@@ -647,7 +633,7 @@ describe('dagNodeSchema — ScriptNode', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      const node = result.data as ScriptNode;
+      const node = result.data as ExecNode;
       expect(node.timeout).toBe(30000);
     }
   });
@@ -661,7 +647,7 @@ describe('dagNodeSchema — ScriptNode', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      const node = result.data as ScriptNode;
+      const node = result.data as ExecNode;
       expect(node.depends_on).toEqual(['prev']);
     }
   });
@@ -710,6 +696,9 @@ describe('dagNodeSchema — ScriptNode', () => {
   });
 
   test('rejects script + bash (mutually exclusive)', () => {
+    // Deliberately authored with BOTH old flat fields — this exercises the
+    // pre-transform (authored) schema's mutual-exclusivity check, unrelated to
+    // the resolved discriminated-union shape (#2486).
     const result = dagNodeSchema.safeParse({
       id: 's',
       script: 'console.log("hi")',
@@ -849,7 +838,7 @@ describe('dagNodeSchema — loop_group', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(isLoopGroupNode(result.data)).toBe(true);
+      expect(isLoopGroupNode(result.data as DagNode)).toBe(true);
       const grp = result.data as { loop_group?: { nodes: unknown[] } };
       expect(grp.loop_group?.nodes).toHaveLength(2);
     }
@@ -875,6 +864,9 @@ describe('dagNodeSchema — loop_group', () => {
       loop_group: { until: 'DONE', max_iterations: 3, nodes: [{ id: 'x', prompt: 'x' }] },
     });
     expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
   });
 
   test('loop_group rejects retry (loop manages its own iteration)', () => {
@@ -1309,8 +1301,8 @@ describe('dagNodeSchema — include', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(isIncludeNode(result.data)).toBe(true);
-      const node = result.data as IncludeNode;
+      expect(isIncludeDirective(result.data)).toBe(true);
+      const node = result.data as IncludeDirective;
       expect(node.include).toBe('archon-review-block');
       expect(node.depends_on).toEqual(['finalize-pr']);
       expect(node.when).toBe('always');
@@ -1322,7 +1314,7 @@ describe('dagNodeSchema — include', () => {
     const result = dagNodeSchema.safeParse({ id: 'r', include: '  archon-review-block  ' });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect((result.data as IncludeNode).include).toBe('archon-review-block');
+      expect((result.data as IncludeDirective).include).toBe('archon-review-block');
     }
   });
 
@@ -1352,7 +1344,7 @@ describe('dagNodeSchema — include', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect((result.data as IncludeNode).with).toEqual({
+      expect((result.data as IncludeDirective).with).toEqual({
         pr: '$create.output',
         base_branch: 'main',
         empty: '',
@@ -1387,7 +1379,7 @@ describe('dagNodeSchema — include', () => {
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect((result.data as IncludeNode).with).toEqual({
+      expect((result.data as IncludeDirective).with).toEqual({
         flag: true,
         count: 3,
         tags: ['a', 'b'],

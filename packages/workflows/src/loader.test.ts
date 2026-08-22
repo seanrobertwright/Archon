@@ -35,14 +35,43 @@ clearRegistry();
 registerBuiltinProviders();
 
 import { discoverWorkflows, discoverWorkflowsWithConfig } from './workflow-discovery';
-import { isBashNode, isCancelNode, isLoopGroupNode, isLoopNode } from './schemas';
+import {
+  isExecNode,
+  isHaltNode,
+  isLoopGroupNode,
+  isLoopNode,
+  isAgentNode,
+  isWorkflowNode,
+} from './schemas';
 import { parseWorkflow, type ParseResult } from './loader';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import { workflowDefinitionSchema } from './schemas/workflow';
 import type { WorkflowDefinition } from './schemas/workflow';
+import type { DagNode, IncludeDirective, BindingDirective } from './schemas';
+import type { JsonValue } from './output-ref';
 import * as bundledDefaults from './defaults/bundled-defaults';
 import { parsePackagedResourceReference } from './packaged-workflow';
 import { discoverScriptsForCwd } from './script-discovery';
+
+/** The inline prompt text of an agent node, or undefined for any other kind
+ * (formerly the bare `'prompt' in node ? node.prompt : ...` idiom, #2486). */
+function inlinePrompt(node: DagNode | IncludeDirective | undefined): string | undefined {
+  return node && 'kind' in node && isAgentNode(node) && node.source.kind === 'inline'
+    ? node.source.prompt
+    : undefined;
+}
+
+/** The `with:` bindings of an agent (command-sourced) or exec node, or undefined
+ * for any other kind (formerly the bare `'with' in node ? node.with : ...` idiom). */
+function nodeWith(
+  node: DagNode | IncludeDirective | undefined
+): Record<string, JsonValue | BindingDirective> | undefined {
+  if (!node || !('kind' in node)) return undefined;
+  if (isExecNode(node)) return node.with;
+  if (isAgentNode(node) && node.source.kind === 'command') return node.source.with;
+  if (isWorkflowNode(node)) return node.with;
+  return undefined;
+}
 
 /**
  * Parse one workflow YAML directly.
@@ -111,7 +140,7 @@ describe('Workflow Loader', () => {
       const workflow = result.workflows.find(entry => entry.workflow.name === 'release')?.workflow;
       expect(workflow).toBeDefined();
       const command = parsePackagedResourceReference(
-        (workflow?.nodes[0] as { command: string }).command
+        (workflow?.nodes[0] as { source: { name: string } }).source.name
       );
       const script = parsePackagedResourceReference(
         (workflow?.nodes[1] as { script: string }).script
@@ -185,9 +214,7 @@ describe('Workflow Loader', () => {
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const parent = result.workflows.find(entry => entry.workflow.name === 'parent')?.workflow;
       const included = parent?.nodes.find(node => node.id === 'review__run');
-      expect(included && 'prompt' in included ? included.prompt : '').toBe(
-        'Package-owned review prompt.'
-      );
+      expect(inlinePrompt(included) ?? '').toBe('Package-owned review prompt.');
     });
 
     it('uses the identical authored structure in home scope', async () => {
@@ -202,7 +229,9 @@ describe('Workflow Loader', () => {
       const workflow = result.workflows.find(entry => entry.workflow.name === 'daily');
       expect(workflow?.source).toBe('global');
       expect(
-        parsePackagedResourceReference((workflow?.workflow.nodes[0] as { command: string }).command)
+        parsePackagedResourceReference(
+          (workflow?.workflow.nodes[0] as { source: { name: string } }).source.name
+        )
       ).toEqual({
         owner: { source: 'global', pack: 'personal-pack', workflow: 'daily' },
         name: 'summarize',
@@ -268,7 +297,9 @@ describe('Workflow Loader', () => {
       const repo = result.workflows.find(entry => entry.workflow.name === 'repo-version');
       expect(repo?.source).toBe('project');
       expect(
-        parsePackagedResourceReference((repo?.workflow.nodes[0] as { command: string }).command)
+        parsePackagedResourceReference(
+          (repo?.workflow.nodes[0] as { source: { name: string } }).source.name
+        )
       ).toEqual({
         owner: { source: 'project', pack: 'repo-pack', workflow: 'flow' },
         name: 'shared',
@@ -809,7 +840,7 @@ nodes:
       expect(result.errors).toEqual([]);
       expect(result.workflows).toHaveLength(1);
 
-      const nodes = result.workflows[0].workflow.nodes;
+      const nodes = result.workflows[0].workflow.nodes as DagNode[];
       expect(nodes.find(n => n.id === 'shallow')?.effort).toBe('minimal');
       expect(nodes.find(n => n.id === 'deep')?.effort).toBe('xhigh');
       expect(result.workflows[0].parseWarnings ?? []).toEqual([]);
@@ -1213,9 +1244,10 @@ nodes:
       const workflows = result.workflows.map(ws => ws.workflow);
 
       expect(workflows).toHaveLength(1);
-      expect(workflows[0].nodes[0].id).toBe('persist');
-      expect(workflows[0].nodes[0].always_run).toBe(true);
-      expect(workflows[0].nodes[1].always_run).toBeUndefined();
+      const alwaysRunNodes = workflows[0].nodes as DagNode[];
+      expect(alwaysRunNodes[0].id).toBe('persist');
+      expect(alwaysRunNodes[0].always_run).toBe(true);
+      expect(alwaysRunNodes[1].always_run).toBeUndefined();
     });
 
     it('preserves an optional description on a node', async () => {
@@ -1877,12 +1909,14 @@ nodes:
       expect(result.workflows).toHaveLength(1);
 
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
 
-      expect(wf.nodes).toHaveLength(2);
-      expect(isBashNode(wf.nodes[0])).toBe(true);
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].bash).toBe('echo hello');
+      expect(nodes).toHaveLength(2);
+      const node0 = nodes[0];
+      expect(isExecNode(node0)).toBe(true);
+      if (isExecNode(node0)) {
+        expect(node0.script).toBe('echo hello');
       }
     });
 
@@ -1905,9 +1939,11 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].timeout).toBe(30000);
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
+      const node0 = nodes[0];
+      if (isExecNode(node0)) {
+        expect(node0.timeout).toBe(30000);
       }
     });
 
@@ -2014,8 +2050,8 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(wf.nodes[0].idle_timeout).toBe(1800000);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      expect((wf.nodes as DagNode[])[0].idle_timeout).toBe(1800000);
     });
 
     it('should parse idle_timeout on prompt node', async () => {
@@ -2037,8 +2073,8 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(wf.nodes[0].idle_timeout).toBe(600000);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      expect((wf.nodes as DagNode[])[0].idle_timeout).toBe(600000);
     });
 
     it('should parse idle_timeout on bash node', async () => {
@@ -2060,9 +2096,9 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].idle_timeout).toBe(900000);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      if (isExecNode((wf.nodes as DagNode[])[0])) {
+        expect((wf.nodes as DagNode[])[0].idle_timeout).toBe(900000);
       }
     });
 
@@ -2154,10 +2190,10 @@ nodes:
       expect(result.workflows).toHaveLength(1);
 
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
+      expect(wf.nodes as DagNode[]).toBeDefined();
       // AI fields should NOT appear on the parsed bash node
-      const node = wf.nodes[0];
-      expect(isBashNode(node)).toBe(true);
+      const node = (wf.nodes as DagNode[])[0];
+      expect(isExecNode(node)).toBe(true);
       expect(node.provider).toBeUndefined();
       expect(node.model).toBeUndefined();
     });
@@ -2187,7 +2223,7 @@ nodes:
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
 
       // model and provider should NOT trigger a warning
@@ -2270,10 +2306,11 @@ nodes:
       expect(aiFieldWarnings).toHaveLength(0);
 
       const wf = result.workflows[0].workflow;
-      expect(isLoopNode(wf.nodes[0])).toBe(true);
-      if (isLoopNode(wf.nodes[0])) {
-        expect(wf.nodes[0].loop.until_field).toBe('done');
-        expect(wf.nodes[0].output_format).toBeDefined();
+      const node0 = (wf.nodes as DagNode[])[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.until_field).toBe('done');
+        expect(node0.output_format).toBeDefined();
       }
     });
 
@@ -2309,7 +2346,7 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
-      expect(isLoopGroupNode(result.workflows[0].workflow.nodes[0])).toBe(true);
+      expect(isLoopGroupNode((result.workflows[0].workflow.nodes as DagNode[])[0])).toBe(true);
 
       const aiFieldWarnings = mockLogger.warn.mock.calls.filter(
         call => typeof call[1] === 'string' && call[1].includes('ai_fields_ignored')
@@ -2352,7 +2389,7 @@ nodes:
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
       expect((node as typeof node & { pi?: unknown }).pi).toEqual({
         interactive: false,
@@ -2530,7 +2567,7 @@ nodes:
         item => item.workflow.name === 'input-output-parent'
       )?.workflow;
       const review = parent?.nodes.find(node => node.id === 'inc__review');
-      expect(review && 'prompt' in review ? review.prompt : undefined).toBe('Review bound-value');
+      expect(inlinePrompt(review)).toBe('Review bound-value');
     });
 
     it('should validate script/cancel/approval.message/until_bash refs at load time', async () => {
@@ -3118,7 +3155,7 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes[0].retry).toEqual({ max_attempts: 2 });
+      expect((wf.nodes as DagNode[])[0].retry).toEqual({ max_attempts: 2 });
     });
 
     it('should parse retry config on DAG bash node', async () => {
@@ -3143,8 +3180,8 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      if (isBashNode(wf.nodes[0])) {
-        expect(wf.nodes[0].retry).toEqual({
+      if (isExecNode((wf.nodes as DagNode[])[0])) {
+        expect((wf.nodes as DagNode[])[0].retry).toEqual({
           max_attempts: 1,
           delay_ms: 2000,
           on_error: 'all',
@@ -3174,7 +3211,7 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes[0].retry).toEqual({
+      expect((wf.nodes as DagNode[])[0].retry).toEqual({
         max_attempts: 2,
         delay_ms: 4000,
         on_error: 'transient',
@@ -3293,9 +3330,9 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes[0].retry).toEqual({ max_attempts: 1 });
-      expect(wf.nodes[0].retry?.delay_ms).toBeUndefined();
-      expect(wf.nodes[0].retry?.on_error).toBeUndefined();
+      expect((wf.nodes as DagNode[])[0].retry).toEqual({ max_attempts: 1 });
+      expect((wf.nodes as DagNode[])[0].retry?.delay_ms).toBeUndefined();
+      expect((wf.nodes as DagNode[])[0].retry?.on_error).toBeUndefined();
     });
   });
 
@@ -3326,17 +3363,19 @@ nodes:
       expect(result.workflows).toHaveLength(1);
 
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
 
-      expect(wf.nodes).toHaveLength(1);
-      expect(isLoopNode(wf.nodes[0])).toBe(true);
-      if (isLoopNode(wf.nodes[0])) {
-        expect(wf.nodes[0].loop.prompt).toContain('Do one task');
-        expect(wf.nodes[0].loop.until).toBe('COMPLETE');
-        expect(wf.nodes[0].loop.max_iterations).toBe(10);
-        expect(wf.nodes[0].loop.fresh_context).toBe(true);
-        expect(wf.nodes[0].loop.until_bash).toBe('test -f done.txt');
-        expect(wf.nodes[0].idle_timeout).toBe(300000);
+      expect(nodes).toHaveLength(1);
+      const node0 = nodes[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.prompt).toContain('Do one task');
+        expect(node0.loop.until).toBe('COMPLETE');
+        expect(node0.loop.max_iterations).toBe(10);
+        expect(node0.loop.fresh_context).toBe(true);
+        expect(node0.loop.until_bash).toBe('test -f done.txt');
+        expect(node0.idle_timeout).toBe(300000);
       }
     });
 
@@ -3361,11 +3400,13 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(isLoopNode(wf.nodes[0])).toBe(true);
-      if (isLoopNode(wf.nodes[0])) {
-        expect(wf.nodes[0].loop.fresh_context).toBe(false);
-        expect(wf.nodes[0].loop.until_bash).toBeUndefined();
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toBeDefined();
+      const node0 = nodes[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.fresh_context).toBe(false);
+        expect(node0.loop.until_bash).toBeUndefined();
       }
     });
 
@@ -3436,10 +3477,11 @@ nodes:
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
       expect(wf.name).toBe('loop-deterministic');
-      expect(isLoopNode(wf.nodes[0])).toBe(true);
-      if (isLoopNode(wf.nodes[0])) {
-        expect(wf.nodes[0].loop.until).toBeUndefined();
-        expect(wf.nodes[0].loop.until_bash).toBe('bun run test');
+      const node0 = (wf.nodes as DagNode[])[0];
+      expect(isLoopNode(node0)).toBe(true);
+      if (isLoopNode(node0)) {
+        expect(node0.loop.until).toBeUndefined();
+        expect(node0.loop.until_bash).toBe('bun run test');
       }
     });
 
@@ -3561,11 +3603,11 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toBeDefined();
-      expect(wf.nodes).toHaveLength(2);
-      expect(isLoopNode(wf.nodes[1])).toBe(true);
-      if (isLoopNode(wf.nodes[1])) {
-        expect(wf.nodes[1].depends_on).toEqual(['setup']);
+      expect(wf.nodes as DagNode[]).toBeDefined();
+      expect(wf.nodes as DagNode[]).toHaveLength(2);
+      expect(isLoopNode((wf.nodes as DagNode[])[1])).toBe(true);
+      if (isLoopNode((wf.nodes as DagNode[])[1])) {
+        expect((wf.nodes as DagNode[])[1].depends_on).toEqual(['setup']);
       }
     });
 
@@ -3593,9 +3635,10 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
-      if (isLoopNode(result.workflows[0].workflow.nodes[0])) {
-        expect(result.workflows[0].workflow.nodes[0].loop.interactive).toBe(true);
-        expect(result.workflows[0].workflow.nodes[0].loop.gate_message).toBe('Review and respond.');
+      const node0 = (result.workflows[0].workflow.nodes as DagNode[])[0];
+      if (isLoopNode(node0)) {
+        expect(node0.loop.interactive).toBe(true);
+        expect(node0.loop.gate_message).toBe('Review and respond.');
       }
     });
 
@@ -3685,7 +3728,7 @@ nodes:
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
       if (isLoopNode(node)) {
         expect(node.loop.command).toBe('my-loop-cmd');
@@ -3829,7 +3872,7 @@ nodes:
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
 
-      const node = result.workflows[0].workflow.nodes[0];
+      const node = (result.workflows[0].workflow.nodes as DagNode[])[0];
       expect(isLoopNode(node)).toBe(true);
       if (isLoopNode(node)) {
         expect(node.loop.command).toBe('my-loop-cmd');
@@ -4244,7 +4287,7 @@ nodes:
       expect(err).toBeUndefined();
       const wf = result.workflows.find(w => w.workflow.name === 'with-accept');
       const node = wf?.workflow.nodes.find(n => n.id === 'sub');
-      expect(node && 'with' in node ? node.with : undefined).toEqual({ foo: 'bar' });
+      expect(nodeWith(node)).toEqual({ foo: 'bar' });
     });
 
     it("rejects 'with:' and 'input:' together on a workflow node (#2470)", async () => {
@@ -4722,7 +4765,7 @@ nodes:
         entry => entry.workflow.name === 'include-in-loop-group'
       )?.workflow;
       expect(workflow).toBeDefined();
-      const group = workflow?.nodes.find(node => node.id === 'grp');
+      const group = (workflow?.nodes as DagNode[] | undefined)?.find(node => node.id === 'grp');
       expect(group && isLoopGroupNode(group)).toBe(true);
       if (!group || !isLoopGroupNode(group)) throw new Error('expected loop_group');
       expect(group.loop_group.nodes.map(node => node.id)).toEqual([
@@ -4734,7 +4777,7 @@ nodes:
       expect(group.loop_group.nodes.some(node => 'include' in node)).toBe(false);
       expect(group.loop_group.until_bash).toBe('test "$review__decide.output.done" = true');
       expect(group.loop_group.nodes.find(node => node.id === 'summarize')).toMatchObject({
-        prompt: 'result=$review__decide.output.done',
+        source: { kind: 'inline', prompt: 'result=$review__decide.output.done' },
         depends_on: ['review__cleanup'],
       });
     });
@@ -5010,9 +5053,7 @@ nodes:
       expect(result.errors.filter(error => error.filename === 'cmd-parent.yaml')).toHaveLength(0);
       const parent = result.workflows.find(w => w.workflow.name === 'cmd-parent')?.workflow;
       const runner = parent?.nodes.find(node => node.id === 'rev__runner');
-      expect(runner && 'prompt' in runner ? runner.prompt : '').toBe(
-        'Summarize $rev__sib.output for the report.'
-      );
+      expect(inlinePrompt(runner) ?? '').toBe('Summarize $rev__sib.output for the report.');
     });
 
     it('should compile a resolved block command file with a declared include input', async () => {
@@ -5055,7 +5096,7 @@ nodes:
         workflow => workflow.workflow.name === 'parameterized-parent'
       )?.workflow;
       const runner = parent?.nodes.find(node => node.id === 'review__runner');
-      expect(runner && 'prompt' in runner ? runner.prompt : '').toBe('Review main.');
+      expect(inlinePrompt(runner) ?? '').toBe('Review main.');
     });
 
     it('should compile block commands from a configured custom command folder', async () => {
@@ -5103,9 +5144,7 @@ nodes:
         workflow => workflow.workflow.name === 'cc-parent'
       )?.workflow;
       const runner = parent?.nodes.find(node => node.id === 'rev__runner');
-      expect(runner && 'prompt' in runner ? runner.prompt : '').toBe(
-        'Summarize $rev__sib.output for the report.'
-      );
+      expect(inlinePrompt(runner) ?? '').toBe('Summarize $rev__sib.output for the report.');
     });
 
     it('should fail closed when a block command file cannot be resolved', async () => {
@@ -5217,10 +5256,12 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       const wf = result.workflows[0].workflow;
-      expect(wf.nodes).toHaveLength(2);
-      expect(isCancelNode(wf.nodes[1])).toBe(true);
-      if (isCancelNode(wf.nodes[1])) {
-        expect(wf.nodes[1].cancel).toBe('Precondition failed');
+      const nodes = wf.nodes as DagNode[];
+      expect(nodes).toHaveLength(2);
+      const node1 = nodes[1];
+      expect(isHaltNode(node1)).toBe(true);
+      if (isHaltNode(node1)) {
+        expect(node1.reason).toBe('Precondition failed');
       }
     });
 
@@ -5360,7 +5401,9 @@ nodes:
       resume: command-source
 `);
       expect(result.error).toBeNull();
-      expect(result.workflow?.nodes.at(-1)?.context).toEqual({ resume: 'command-source' });
+      expect((result.workflow?.nodes as DagNode[] | undefined)?.at(-1)?.context).toEqual({
+        resume: 'command-source',
+      });
     });
 
     for (const [label, sourceNode] of [
@@ -5535,7 +5578,7 @@ nodes:
       expect(result.errors).toEqual([]);
       const expanded = result.workflows[0].workflow;
       expect(expanded.persist_sessions).toBeUndefined();
-      const byId = new Map(expanded.nodes.map(n => [n.id, n]));
+      const byId = new Map((expanded.nodes as DagNode[]).map(n => [n.id, n]));
       expect(byId.get('planner')?.persist_session).toBe(true);
       expect(byId.get('shell')?.persist_session).toBeUndefined();
     });
@@ -5554,12 +5597,12 @@ nodes:
       );
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toEqual([]);
-      const nodes = result.workflows[0].workflow.nodes;
+      const nodes = result.workflows[0].workflow.nodes as DagNode[];
       const group = nodes.find(n => n.id === 'group');
-      expect(group?.loop_group).toBeDefined();
-      const body = group?.loop_group?.nodes[0];
+      expect(group && isLoopGroupNode(group)).toBe(true);
+      const body = group && isLoopGroupNode(group) ? group.loop_group.nodes[0] : undefined;
       expect(body).toBeDefined();
-      expect(body?.persist_session).toBeUndefined();
+      expect((body as DagNode | undefined)?.persist_session).toBeUndefined();
       // The top-level AI node still receives it — only the body is excluded.
       expect(nodes.find(n => n.id === 'after')?.persist_session).toBe(true);
     });
@@ -6772,13 +6815,13 @@ nodes:
       payload: $producer.output
 `);
     const consume = workflow.nodes.find(n => n.id === 'consume');
-    expect(consume && 'with' in consume ? consume.with : undefined).toEqual({
+    expect(nodeWith(consume)).toEqual({
       green: '$producer.output.green',
       typed: 42,
       guarded: { from: '$producer.output.green', if_skipped: false },
     });
     const emit = workflow.nodes.find(n => n.id === 'emit');
-    expect(emit && 'with' in emit ? emit.with : undefined).toEqual({
+    expect(nodeWith(emit)).toEqual({
       payload: '$producer.output',
     });
   });
@@ -6796,7 +6839,7 @@ nodes:
       tags: [a, b]
 `);
     const sub = workflow.nodes.find(n => n.id === 'sub');
-    expect(sub && 'with' in sub ? sub.with : undefined).toEqual({
+    expect(nodeWith(sub)).toEqual({
       flag: true,
       count: 3,
       tags: ['a', 'b'],

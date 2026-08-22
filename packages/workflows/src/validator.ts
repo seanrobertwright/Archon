@@ -39,16 +39,16 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 import {
-  isBashNode,
+  isAgentNode,
+  isExecNode,
   isLoopNode,
   isLoopGroupNode,
-  isScriptNode,
-  isIncludeNode,
+  isIncludeDirective,
   isWorkflowNode,
 } from './schemas';
 import { parseWorkflow } from './loader';
 import { resolveWorkflowName } from './router';
-import type { WorkflowDefinition, DagNode, WorkflowSource } from './schemas';
+import type { WorkflowDefinition, DagNode, IncludeDirective, WorkflowSource } from './schemas';
 import type { ScriptRuntime } from './script-discovery';
 import { discoverScriptsForCwd } from './script-discovery';
 import { isInlineScript } from './executor-shared';
@@ -446,23 +446,24 @@ export async function validateWorkflowResources(
   // loop_groups) so resource checks (commands, mcp, skills, scripts) validate
   // body nodes too. ID-uniqueness/cycle checks are the loader's job; the validator
   // only checks referenced resources exist, so flattening is safe here.
-  const allNodes: DagNode[] = [];
-  const collectNodes = (nodes: readonly DagNode[]): void => {
+  const allNodes: (DagNode | IncludeDirective)[] = [];
+  const collectNodes = (nodes: readonly (DagNode | IncludeDirective)[]): void => {
     for (const n of nodes) {
       allNodes.push(n);
-      if (isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
+      if (!isIncludeDirective(n) && isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
     }
   };
   collectNodes(workflow.nodes);
 
   for (const node of allNodes) {
-    // Include nodes carry no resources to check — the target workflow is resolved and
-    // inlined at DISCOVERY time (see include-expander.ts), so discovery-fed validation
-    // (CLI `validate workflows`) sees the already-expanded nodes and checks their
-    // commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current caller reaches
-    // it with an unexpanded include node (POST /api/workflows/validate only runs
-    // parseWorkflow, not this resource pass). Kept so a future raw caller can't crash here.
-    if (isIncludeNode(node)) continue;
+    // Include directives carry no resources to check — the target workflow is resolved
+    // and inlined at DISCOVERY time (see include-expander.ts), so discovery-fed
+    // validation (CLI `validate workflows`) sees the already-expanded nodes and checks
+    // their commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current
+    // caller reaches it with an unexpanded include (POST /api/workflows/validate only
+    // runs parseWorkflow, not this resource pass). Kept so a future raw caller can't
+    // crash here.
+    if (isIncludeDirective(node)) continue;
 
     const provider = resolveValidationProvider(
       node,
@@ -519,30 +520,31 @@ export async function validateWorkflowResources(
     }
 
     // --- Command nodes: check file exists ---
-    if ('command' in node && typeof node.command === 'string') {
-      if (!isValidCommandName(node.command)) {
+    if (isAgentNode(node) && node.source.kind === 'command') {
+      const commandName = node.source.name;
+      if (!isValidCommandName(commandName)) {
         issues.push({
           level: 'error',
           nodeId: node.id,
           field: 'command',
-          message: `Invalid command name '${node.command}' — must not contain '/', '\\', '..', or start with '.'`,
+          message: `Invalid command name '${commandName}' — must not contain '/', '\\', '..', or start with '.'`,
           hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
         });
         continue;
       }
 
-      const resolved = await resolveCommand(node.command, cwd, config);
+      const resolved = await resolveCommand(commandName, cwd, config);
       if (!resolved) {
-        const similar = findSimilar(node.command, availableCommands);
+        const similar = findSimilar(commandName, availableCommands);
         const issue: ValidationIssue = {
           level: 'error',
           nodeId: node.id,
           field: 'command',
-          message: `Command '${node.command}' not found`,
-          hint: `Create .archon/commands/${node.command}.md or use an existing command name`,
+          message: `Command '${commandName}' not found`,
+          hint: `Create .archon/commands/${commandName}.md or use an existing command name`,
         };
         if (similar.length > 0) {
-          issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${node.command}.md`;
+          issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${commandName}.md`;
           issue.suggestions = similar;
         }
         issues.push(issue);
@@ -815,7 +817,7 @@ export async function validateWorkflowResources(
     }
 
     // --- Script nodes: check named script file exists + runtime available ---
-    if (isScriptNode(node)) {
+    if (isExecNode(node) && node.runtime !== 'sh') {
       const script = node.script;
 
       // Named script: validate file exists in repo or home scope.
@@ -893,7 +895,7 @@ export async function validateWorkflowResources(
         });
       }
     };
-    if (isBashNode(node)) warnDoubleQuoted(node.bash, 'bash');
+    if (isExecNode(node) && node.runtime === 'sh') warnDoubleQuoted(node.script, 'bash');
     if (isLoopNode(node) && node.loop.until_bash) {
       warnDoubleQuoted(node.loop.until_bash, 'loop.until_bash');
     }
