@@ -92,7 +92,7 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
       invalidate(`run:${run.id}`);
       setComment('');
       setText('');
-      setMode('idle');
+      setMode(null);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Response failed.');
     } finally {

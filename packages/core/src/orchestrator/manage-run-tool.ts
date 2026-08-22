@@ -431,11 +431,12 @@ async function handleWrite(
       // respondToWorkflow validates `decision` itself and throws a clear error
       // naming the gate's actual options on a mismatch — caught by the tool's
       // outer try/catch and returned as text, never a silent no-op.
-      const result = await respondToWorkflow(
-        id,
-        decision,
-        message.length > 0 ? message : undefined
-      );
+      // Mirrors the chat/HTTP respond surfaces' default: an empty message on
+      // decision='reject' becomes 'Rejected' rather than reaching a new-mode
+      // gate's structured output as ''.
+      const respondText =
+        message.length > 0 ? message : decision === 'reject' ? 'Rejected' : undefined;
+      const result = await respondToWorkflow(id, decision, respondText);
       if ('cancelled' in result) {
         // decision === 'reject' resolved through the legacy cancel/rework path.
         if (result.cancelled) {
