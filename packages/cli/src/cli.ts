@@ -16,6 +16,21 @@ import '@archon/paths/strip-cwd-env-boot';
 import { loadArchonEnv } from '@archon/paths/env-loader';
 loadArchonEnv(process.cwd());
 
+// Install the pipe-safe `console.log` shim BEFORE any command module imports.
+// `console.log` reaches fd 1 via a non-blocking pipe (pino opens it that way at
+// module load via `@archon/paths/strip-cwd-env-boot` above), and short writes
+// are silently dropped against a slow reader. The shim delegates through
+// `writeStdout` so the stream layer queues short writes and retries `EAGAIN`
+// instead of dropping the tail — but delivery is fire-and-forget, so the
+// patched `console.log` returns synchronously and the exit path below must
+// await `flushPendingWrites()` before `process.exit()`. See
+// `utils/exit-with-drain.ts` (the call site that owns the drain) and
+// `utils/safe-console.ts` for the underlying shim, and #2400 for the full
+// rationale.
+import { installPipeSafeConsole } from './utils/safe-console';
+import { withDrainedExit } from './utils/exit-with-drain';
+installPipeSafeConsole();
+
 import { parseArgs } from 'util';
 import { resolve } from 'path';
 import { existsSync, realpathSync } from 'fs';
@@ -1156,17 +1171,28 @@ async function main(): Promise<number> {
 // Exit explicitly so a lingering handle (DB pool, spawned child, timer) can
 // never leave the CLI hanging after its work is done.
 //
-// This is safe for piped output because every machine-readable payload is
-// emitted through `writeStdout()`/`writeJsonLine()` (src/utils/stdout.ts), which
-// resolves only once the bytes have reached the OS. The #2384 truncation
-// happened inside `console.log` at call time — not at exit — so deferring the
-// exit would not have recovered it.
-main()
-  .then(exitCode => {
-    process.exit(exitCode);
-  })
-  .catch((error: unknown) => {
-    const err = error as Error;
-    console.error('Fatal error:', err.message);
-    process.exit(1);
-  });
+// `flushPendingWrites()` is awaited BEFORE `process.exit()` because every
+// `console.log` written through the pipe-safe shim is fire-and-forget
+// (src/utils/safe-console.ts): the stream callback that resolves the per-
+// write promise fires asynchronously, and `process.exit()` does not drain
+// `process.stdout`'s pending writes. Without this flush a very-slow reader
+// (e.g. `archon … | { sleep 1; cat; }`) would re-introduce the silent-exit-0
+// truncation the shim is meant to eliminate — see R1 in the review report.
+//
+// The `--json` paths do not need this because every JSON emitter already
+// awaits `writeStdout` / `writeJsonLine` at the call site
+// (src/utils/stdout.ts); the shim only adds the fire-and-forget shape that
+// the human-readable call surface requires.
+//
+// The drain runs on BOTH exits — success and fatal — so a `main()` rejection
+// does not get to drop queued stdout bytes just because it is exiting non-
+// zero. Splitting the two arms' exit logic would re-open the R9 latency:
+// a fatal rejection against a slow reader would truncate and exit 1,
+// producing the same silent stdout loss the patch is meant to eliminate.
+// The chain wiring — `main().then(exitWithDrain).catch(...)` — lives in
+// `withDrainedExit` (`./utils/exit-with-drain.ts`) so cli.ts and the R9
+// regression test fixture share a single source of truth. A regression
+// that swaps this call for a direct `process.exit` is caught by the
+// static-contract test in `safe-console.test.ts`, which reads this file
+// as text.
+withDrainedExit(main);
