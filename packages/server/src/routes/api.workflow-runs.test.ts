@@ -1852,7 +1852,7 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(mockUpdateWorkflowRun).not.toHaveBeenCalled();
   });
 
-  test('stores user comment as node_output when captureResponse is true', async () => {
+  test('bare gate with captureResponse but no decisionsAuthored keeps plain-text output (R2 fix — #2707)', async () => {
     mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       id: 'run-capture',
@@ -1880,9 +1880,10 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(nodeCompleted).toMatchObject({
       data: { node_output: 'Looks great, proceed', approval_decision: 'approved' },
     });
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
   });
 
-  test('stores empty node_output when captureResponse is not set', async () => {
+  test('bare gate with no captureResponse set — empty output, unaffected by #2707', async () => {
     mockGetWorkflowRun.mockResolvedValue(MOCK_PAUSED_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
@@ -1899,7 +1900,73 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(nodeCompleted).toMatchObject({
       data: { node_output: '', approval_decision: 'approved' },
     });
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'approved' });
+  });
+
+  test('new-mode gate (decisionsAuthored) produces structured output (#2707)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-new-mode',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-new-mode/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'a comment' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: {
+        node_output: JSON.stringify({ decision: 'approve', text: 'a comment' }),
+        approval_decision: 'approved',
+        structured_output: { decision: 'approve', text: 'a comment' },
+      },
+    });
+  });
+
+  test('legacy on_reject-configured gate keeps plain text output, unaffected by #2707', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-legacy-capture',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          captureResponse: true,
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-legacy-capture/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'Looks great, proceed' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: { node_output: 'Looks great, proceed', approval_decision: 'approved' },
+    });
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
   });
 
   test('passes an absent comment through as no-feedback on an interactive_loop gate (#2074)', async () => {

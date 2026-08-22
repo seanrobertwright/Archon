@@ -2242,7 +2242,9 @@ describe('hydrateResumableRun', () => {
     const candidate = makeRun({
       id: 'paused-loop',
       status: 'paused',
-      metadata: { approval: { type: 'interactive_loop', nodeId: 'loop-1', iteration: 2 } },
+      metadata: {
+        approval: { type: 'interactive_loop', nodeId: 'loop-1', message: 'Iterate?', iteration: 2 },
+      },
     });
     const resumed = makeRun({ id: 'paused-loop', status: 'running' });
     const store = makeStore({
@@ -2258,6 +2260,98 @@ describe('hydrateResumableRun', () => {
     expect(result).not.toBeNull();
     expect(result?.priorCompletedNodes.size).toBe(0);
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-loop');
+  });
+
+  it('#2714 regression: resumes a first-node legacy on_reject gate with a genuinely staged rework, even with zero completed nodes', async () => {
+    // rejectWorkflow's stage-rework path (workflow-operations.ts) never writes
+    // node_completed — it only stamps metadata.approval.resolved/rejection_reason
+    // on the run. Before the reRunsOwnNodeOnResume fix, a first-node gate in
+    // this state was unresumable: priorCompletedNodes.size === 0 and the old
+    // hasReRunGateState check omitted 'approval' entirely.
+    const candidate = makeRun({
+      id: 'paused-first-gate',
+      status: 'paused',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review',
+          message: 'Please review',
+          resolved: 'rejected',
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+        },
+        rejection_reason: 'needs more tests',
+        rejection_count: 1,
+      },
+    });
+    const resumed = makeRun({ id: 'paused-first-gate', status: 'running' });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).not.toBeNull();
+    expect(result?.priorCompletedNodes.size).toBe(0);
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-first-gate');
+  });
+
+  it('#2714: an unresolved (not-yet-rejected) legacy on_reject gate with zero completed nodes is NOT resumable', async () => {
+    // A fresh pause (nobody has rejected it yet) has onRejectPrompt set but no
+    // rejection_reason and resolved !== 'rejected' — there is nothing staged
+    // to re-run, so this must still return null (approve/reject, not resume,
+    // is the correct next action).
+    const candidate = makeRun({
+      id: 'paused-unresolved-gate',
+      status: 'paused',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review',
+          message: 'Please review',
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+        },
+      },
+    });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).toBeNull();
+    expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('#2707 new-mode gate needs no carve-out: resolving it writes node_completed, so priorCompletedNodes already covers resume', async () => {
+    // A new-mode gate (no onRejectPrompt) never stages anything outside a
+    // node_completed event — this is the structural closure argument for
+    // #2714: the bug's mechanism (resolved-but-zero-completed-nodes) cannot
+    // occur for this path. Simulated here via the ORDINARY completed-nodes
+    // route, not the gate-state carve-out.
+    const candidate = makeRun({ id: 'paused-new-mode-gate', status: 'paused' });
+    const resumed = makeRun({ id: 'paused-new-mode-gate', status: 'running' });
+    const priorNodes = new Map([
+      ['review', { output: JSON.stringify({ decision: 'reject', text: 'needs changes' }) }],
+    ]);
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: priorNodes,
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).not.toBeNull();
+    expect(result?.priorCompletedNodes).toBe(priorNodes);
   });
 
   it('propagates DB errors from getDagResumeSnapshot (no silent fallback)', async () => {

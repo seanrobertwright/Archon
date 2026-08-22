@@ -3843,17 +3843,23 @@ export function registerApiRoutes(
         });
       }
 
-      // Auto-resume: dispatch to the orchestrator so the on_reject prompt runs
-      // without requiring the user to re-run the workflow command. Mirrors
-      // what `workflowRejectCommand` does in the CLI. Same cross-adapter
-      // guard as approve — only web parents auto-resume.
+      // Auto-resume: dispatch to the orchestrator so the resolution actually
+      // takes effect (legacy on_reject rework, or #2707 step 1's new-mode
+      // structured resolution) without requiring the user to re-run the
+      // workflow command. Mirrors what `workflowRejectCommand` does in the
+      // CLI. Same cross-adapter guard as approve — only web parents auto-resume.
       const autoResumed = await tryAutoResumeAfterGate(run, 'reject', await resolveWebUserId(c));
+      const resumeHint = `run \`archon workflow resume ${runId}\` from the CLI to trigger it`;
 
       return c.json({
         success: true,
-        message: autoResumed
-          ? `Workflow rejected: ${run.workflow_name}. Running on-reject prompt.`
-          : `Workflow rejected: ${run.workflow_name}. On-reject prompt will run when the run resumes — run \`archon workflow resume ${runId}\` from the CLI to trigger it.`,
+        message: result.newMode
+          ? autoResumed
+            ? `Workflow rejected: ${run.workflow_name}. Continuing.`
+            : `Workflow rejected: ${run.workflow_name}. The run will continue when it resumes — ${resumeHint}.`
+          : autoResumed
+            ? `Workflow rejected: ${run.workflow_name}. Running on-reject prompt.`
+            : `Workflow rejected: ${run.workflow_name}. On-reject prompt will run when the run resumes — ${resumeHint}.`,
       });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_reject_failed');
