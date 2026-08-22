@@ -67,6 +67,7 @@ import type {
   WorkflowRunOutcome,
   NodeArtifactLoopFrame,
   WorkflowRunNodeSession,
+  WorkflowRunStatus,
 } from './schemas';
 import {
   isBashNode,
@@ -874,7 +875,9 @@ const CANCEL_CHECK_INTERVAL_MS = 10_000;
  * - `paused`: a concurrent approval node in the same topological layer has
  *   transitioned the run to paused. The streaming node should finish its own
  *   output; workflow progression is gated by the approval node, not by tearing
- *   down unrelated in-flight streams.
+ *   down unrelated in-flight streams. See the doc comment on
+ *   `workflowRunStatusSchema` (schemas/workflow-run.ts), where this contract is
+ *   also stated on the status type itself.
  * - `null` (run deleted), `cancelled`, `failed`, `completed`, or any other
  *   state → abort the stream.
  *
@@ -882,7 +885,7 @@ const CANCEL_CHECK_INTERVAL_MS = 10_000;
  * `executeNodeInternal` only fires once per 10s (CANCEL_CHECK_INTERVAL_MS), so
  * integration-level coverage of the policy is timing-sensitive and flaky.
  */
-export function shouldContinueStreamingForStatus(status: string | null): boolean {
+export function shouldContinueStreamingForStatus(status: WorkflowRunStatus | null): boolean {
   return status === 'running' || status === 'paused';
 }
 
@@ -6326,32 +6329,45 @@ async function executeLoopNode(
 }
 
 /**
- * Pause the run for a human gate, tolerating a lost CAS when the run was
- * externally transitioned while the gate was being raised — e.g. a killed CLI's
- * signal cleanup marked the run failed mid-pause (#1123), or an operator
+ * Pause the run for a human/system gate — the single persist path for all five
+ * suspend sites (`loop_group`, `loop`, `approval`, `workflow:` child, and the
+ * container write-back gate). By default, tolerates a lost CAS when the run
+ * was externally transitioned while the gate was being raised — e.g. a killed
+ * CLI's signal cleanup marked the run failed mid-pause (#1123), or an operator
  * cancelled it from another surface. `pauseWorkflowRun`'s UPDATE only matches
  * status='running'; when it misses, re-read the status: any non-running status
  * means the pause lost a legitimate external race — log, skip the
- * approval_pending emit, and return so the caller's normal completed-shaped
- * output lets the between-layer status check halt the DAG cleanly (the same
- * path a successful pause takes). On a successful pause, the approval_pending
- * live signal is emitted HERE (from the ApprovalContext's own nodeId/message)
- * so no call site can accidentally emit it after a lost CAS. A store error
- * while the run is still 'running' is a genuine pause failure and rethrows.
+ * approval_pending emit, and return `false` so the caller's normal
+ * completed-shaped output lets the between-layer status check halt the DAG
+ * cleanly (the same path a successful pause takes). On a successful pause, the
+ * approval_pending live signal is emitted HERE (from the ApprovalContext's own
+ * nodeId/message) so no call site can accidentally emit it after a lost CAS. A
+ * store error while the run is still 'running' is a genuine pause failure and
+ * rethrows.
  *
- * Deliberately NOT used by the container write-back gate (raiseWriteBackGate),
- * which must stay fail-closed: a lost pause there may never fall through
- * toward the apply/teardown path — throwing is the safe behavior, and the H2
- * teardown-preserve logic keeps the overlay volume for a retry.
+ * `options.failClosed` inverts the CAS-tolerance for a caller that must never
+ * treat a lost pause as anything but a genuine failure — used by the container
+ * write-back gate, where a lost pause must never fall through toward the
+ * apply/teardown path (throwing is the safe behavior; the H2 teardown-preserve
+ * logic keeps the overlay volume for a retry). `options.extraMetadata` is
+ * forwarded verbatim to `pauseWorkflowRun`'s third argument (the write-back
+ * gate's `pending_writeback` marker, folded into the same atomic write).
+ *
+ * Returns whether the pause actually persisted (`true`) or was skipped due to
+ * a tolerated lost CAS (`false`) — callers with a post-pause side effect (e.g.
+ * notifying a user) should gate it on this so a skipped pause stays silent.
  */
 async function pauseGateRespectingExternalTransition(
   deps: WorkflowDeps,
   runId: string,
-  approvalContext: ApprovalContext
-): Promise<void> {
+  approvalContext: ApprovalContext,
+  options: { extraMetadata?: Record<string, unknown>; failClosed?: boolean } = {}
+): Promise<boolean> {
+  const { extraMetadata, failClosed = false } = options;
   try {
-    await deps.store.pauseWorkflowRun(runId, approvalContext);
+    await deps.store.pauseWorkflowRun(runId, approvalContext, extraMetadata);
   } catch (pauseErr) {
+    if (failClosed) throw pauseErr;
     let status: string | null;
     try {
       status = await deps.store.getWorkflowRunStatus(runId);
@@ -6364,7 +6380,7 @@ async function pauseGateRespectingExternalTransition(
       { workflowRunId: runId, status, err: pauseErr as Error },
       'dag.gate_pause_skipped_external_transition'
     );
-    return;
+    return false;
   }
   getWorkflowEventEmitter().emit({
     type: 'approval_pending',
@@ -6372,6 +6388,7 @@ async function pauseGateRespectingExternalTransition(
     nodeId: approvalContext.nodeId,
     message: approvalContext.message,
   });
+  return true;
 }
 
 /**
@@ -6803,45 +6820,43 @@ async function executeWorkflowNode(
     };
   };
 
-  // Pause the PARENT "blocked on child" — mirrors executeApprovalNode's PAUSE
-  // primitives: pause, emit, return {completed, ''} WITHOUT node_completed so the
-  // node re-runs on the parent's resume (the resume snapshot reads only
-  // node_completed). The RESUME side deliberately differs: an approval gate is
-  // resolved externally by the approve handler, while this node re-runs and
-  // re-inspects its child. Also unlike the approval node, no approval_requested
-  // workflow_event row is persisted here — the block reason lives on the run
-  // itself (metadata.approval), and there is no human decision to audit for a
-  // gate that resolves automatically on child completion.
+  // Pause the PARENT "blocked on child" via the shared pause primitive — mirrors
+  // executeApprovalNode's PAUSE primitives: pause, emit, return {completed, ''}
+  // WITHOUT node_completed so the node re-runs on the parent's resume (the
+  // resume snapshot reads only node_completed). The RESUME side deliberately
+  // differs: an approval gate is resolved externally by the approve handler,
+  // while this node re-runs and re-inspects its child. Also unlike the
+  // approval node, no approval_requested workflow_event row is persisted here
+  // — the block reason lives on the run itself (metadata.approval), and there
+  // is no human decision to audit for a gate that resolves automatically on
+  // child completion.
   const pauseParentOnChild = async (childRunId: string): Promise<NodeExecutionResult> => {
     // KNOWN LIMITATION (#2180): the run has a SINGLE approval-gate slot. If two
     // gate-pausing nodes (two `workflow:` children, or a `workflow:` + an `approval:`)
-    // land in the SAME topological layer, the second pauseWorkflowRun matches 0 rows
-    // (the first already flipped running→paused) and throws — swallowed into a node
-    // failure the paused run then short-circuits past. The loser's child is real but
-    // unmentioned until a later resume re-pauses on it. A retry can't fix this (there
-    // is nowhere to record a second simultaneous block); the real fix is a gate queue
-    // or a load-time reject of multiple gate-pausing nodes per layer — tracked in #2180.
+    // land in the SAME topological layer, the second pause attempt loses the CAS
+    // (the first already flipped running→paused) — the shared helper tolerates this
+    // the same way it does for every other gate type: skip silently, no message, no
+    // node failure. The loser's child is real but unmentioned until a later resume
+    // re-pauses on it. A retry can't fix this (there is nowhere to record a second
+    // simultaneous block); the real fix is a gate queue or a load-time reject of
+    // multiple gate-pausing nodes per layer — tracked in #2180.
     const message =
       `Sub-run \`${node.workflow}\` (run \`${childRunId.slice(0, 8)}\`) is paused awaiting review. ` +
       `Approve it by run id: \`/workflow approve ${childRunId}\``;
-    await deps.store.pauseWorkflowRun(parentRun.id, {
+    const paused = await pauseGateRespectingExternalTransition(deps, parentRun.id, {
       message,
       nodeId: node.id,
       type: 'child_workflow',
       childRunId,
     });
-    getWorkflowEventEmitter().emit({
-      type: 'approval_pending',
-      runId: parentRun.id,
-      nodeId: node.id,
-      message,
-    });
-    await safeSendMessage(
-      platform,
-      conversationId,
-      `⏸ **Blocked on sub-run** \`${node.workflow}\`: ${message}`,
-      msgContext
-    );
+    if (paused) {
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `⏸ **Blocked on sub-run** \`${node.workflow}\`: ${message}`,
+        msgContext
+      );
+    }
     return { state: 'completed', output: '' };
   };
 
@@ -9405,12 +9420,26 @@ async function raiseWriteBackGate(
     ? renderWriteBackSummary(summary)
     : 'Container run finished — review before applying to the live folder.';
   // Fold `pending_writeback` into the SAME pause write so there is no window where the
-  // run is paused-for-writeback without the resume marker (M3): pass it as extra
-  // metadata alongside the approval context, both in one merged write.
-  await deps.store.pauseWorkflowRun(
+  // run is paused-for-writeback without the resume marker (M3): pass it via the shared
+  // pause helper's `extraMetadata`, one merged write. `failClosed: true` preserves this
+  // gate's existing fail-closed contract — a lost pause here must never fall through
+  // toward the apply/teardown path (throwing is the safe behavior, and the H2
+  // teardown-preserve logic keeps the overlay volume for a retry), so it rethrows
+  // instead of tolerating the CAS miss the way the other four gate types do. This also
+  // emits the `approval_pending` live pause signal on success (same event the approval
+  // node emits, so the existing pause UI shows approve/reject) — the lifecycle event
+  // below now fires just after it instead of just before; both are best-effort,
+  // fire-and-forget emits with no ordering contract.
+  await pauseGateRespectingExternalTransition(
+    deps,
     runId,
     { nodeId: WRITEBACK_GATE_NODE_ID, message, type: 'writeback' },
-    { pending_writeback: { envId: containerCtx.envId, ...(summary ? { summary } : {}) } }
+    {
+      extraMetadata: {
+        pending_writeback: { envId: containerCtx.envId, ...(summary ? { summary } : {}) },
+      },
+      failClosed: true,
+    }
   );
   emitContainerLifecycleEvent(
     deps,
@@ -9422,14 +9451,6 @@ async function raiseWriteBackGate(
       total_count: summary?.totalCount ?? 0,
     }
   );
-  // Live pause signal for the CLI progress renderer + console dock (same event the
-  // approval node emits, so the existing pause UI shows approve/reject).
-  getWorkflowEventEmitter().emit({
-    type: 'approval_pending',
-    runId,
-    nodeId: WRITEBACK_GATE_NODE_ID,
-    message,
-  });
   await suspendContainerForPause(deps, platform, conversationId, containerCtx, execContext, runId);
   await safeSendMessage(platform, conversationId, message, { workflowId: runId });
 }

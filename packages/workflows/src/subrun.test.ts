@@ -3844,13 +3844,16 @@ nodes:
     // pauser to lose. A faithful Defect-B test needs a store double that mirrors the
     // compare-and-set.
     //
-    // Note also that the two pause call sites behave DIFFERENTLY on collision, so a
-    // Defect-B test must pick one deliberately:
-    //   • `approval:` / interactive `loop:` gates → `pauseGateRespectingExternalTransition`
-    //     catches the throw, re-reads status, sees 'paused', and returns SUCCESS (the
-    //     collision is misclassified as a legitimate external transition, #1123).
-    //   • `pauseParentOnChild` (workflow: nodes) → bypasses that wrapper, so the throw
-    //     reaches the generic per-node catch and DOES emit node_failed.
+    // Before #2489, the two pause call sites behaved DIFFERENTLY on collision:
+    // `approval:`/interactive `loop:` gates tolerated a lost CAS via
+    // `pauseGateRespectingExternalTransition` (re-read status, see 'paused', return
+    // SUCCESS — the collision misclassified as a legitimate external transition,
+    // #1123), while `pauseParentOnChild` (workflow: nodes) bypassed that wrapper, so
+    // the throw reached the generic per-node catch and emitted node_failed instead.
+    // #2489 routed `pauseParentOnChild` through the same shared helper, so both call
+    // sites now behave the same way on a lost CAS — a faithful Defect-B test still
+    // needs the CAS-aware store double described above, but no longer needs to pick a
+    // gate type deliberately for this reason.
     await writeWorkflow(
       'gating-child',
       `
