@@ -29,6 +29,7 @@ import {
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
   RUN_METADATA_KEYS,
+  readIdentityUnresolved,
   WORKFLOW_SOURCE_METADATA_KEY,
   readWorkflowSourceState,
 } from './schemas';
@@ -2093,14 +2094,22 @@ export async function executeWorkflow(
         'workflow.output_root_not_persisted_identity_faulted'
       );
     } else {
-      await deps.store
-        .updateWorkflowRun(workflowRun.id, { output_root: outputRoot })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, outputRoot },
-            'workflow.output_root_persist_failed'
-          );
-        });
+      const updates: Parameters<typeof deps.store.updateWorkflowRun>[1] = {
+        output_root: outputRoot,
+      };
+      // The faulted arm stamped `identity_unresolved = true`; this is the heal
+      // half of the same write — once a later resume's identity lookup succeeds,
+      // a row that has healed must stop reading as faulted. The `false` rides the
+      // same atomic metadata merge as the faulted arm's `true`.
+      if (readIdentityUnresolved(workflowRun.metadata) === true) {
+        updates.metadata = { [RUN_METADATA_KEYS.identityUnresolved]: false };
+      }
+      await deps.store.updateWorkflowRun(workflowRun.id, updates).catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, outputRoot },
+          'workflow.output_root_persist_failed'
+        );
+      });
     }
   }
 

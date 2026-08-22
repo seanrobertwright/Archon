@@ -1870,6 +1870,100 @@ describe('executeWorkflow', () => {
       );
       expect(flagWrite).toBeUndefined();
     });
+
+    // #2304 — the contract is "Cleared by the same persistence block the moment
+    // a later resume writes a real root". The faulted arm stamps `true`; the
+    // else arm MUST ride the same atomic metadata write with `false` on the
+    // heal, or a row that has resolved leaves the flag set and the
+    // state-preflight gate (#2200) / maintainer-triage read it as still faulted.
+    it('clears metadata.identity_unresolved when a faulted row heals (resolved on resume)', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+        // Simulate a previously-faulted row whose first run left `output_root`
+        // NULL and stamped the flag. The next run arrives on a healthy registry
+        // and hits the else-arm with that pre-existing metadata.
+        createWorkflowRun: mock(async () =>
+          makeRun({
+            metadata: { [RUN_METADATA_KEYS.identityUnresolved]: true },
+          })
+        ),
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const healWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(healWrite).toBeDefined();
+      const patch = (
+        healWrite as unknown as
+          | [unknown, { output_root?: unknown; metadata?: Record<string, unknown> }]
+          | undefined
+      )?.[1];
+      // The output_root write still happens — a row that has resolved
+      // gets a real root, that's the whole point of the resume.
+      expect(typeof patch?.output_root).toBe('string');
+      // AND the metadata flag rides the same write as `false`, not as
+      // the stale `true` from the faulted arm.
+      expect(patch?.metadata).toEqual({ [RUN_METADATA_KEYS.identityUnresolved]: false });
+    });
+
+    // Defensive neighbour: a row that never was faulted must not have its
+    // metadata touched by the else-arm writer. The cleared-flag stamp is
+    // conditional, not unconditional.
+    it('does not touch metadata when the row was never flagged as faulted', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+        createWorkflowRun: mock(async () => makeRun({ metadata: {} })),
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const outputRootWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(outputRootWrite).toBeDefined();
+      const patch = (
+        outputRootWrite as unknown as [unknown, { metadata?: Record<string, unknown> }] | undefined
+      )?.[1];
+      expect(patch?.metadata).toBeUndefined();
+    });
   });
 });
 
