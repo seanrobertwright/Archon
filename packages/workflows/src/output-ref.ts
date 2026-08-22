@@ -34,8 +34,8 @@
  * function — but it is no longer unconditionally lenient: every caller (#2713) now
  * guards it, before ever reading the producer's output, through `assertProducerNotFailed`
  * below — the same `state === 'failed'` case this function guards for the fielded form,
- * enforced by construction (#2722) instead of by an enumeration of independently-worded
- * call sites that each had to remember the check.
+ * as one shared function every caller routes through (#2722), replacing the enumeration
+ * of independently-worded call sites that each had to remember the check.
  *
  * The UNKNOWN-node case (`$typo.output.field` where nothing in the outputs map
  * resolves — a typo, or a real node that has not run before the reference) is
@@ -378,8 +378,11 @@ export function resolveNodeOutputField(
  * iteration's real, often-valid-JSON output text, which must never be read as if the
  * producer had succeeded. Mirrors the `state === 'failed'` guard already built into
  * `resolveNodeOutputField` above for the fielded form, so every whole-text reader
- * routes through one function instead of repeating the check — the invariant holds
- * by construction (#2722) rather than by the KEEP-IN-SYNC enumeration it replaces.
+ * routes through this one function instead of repeating the check (#2722), replacing
+ * the KEEP-IN-SYNC enumeration this module doc used to carry. This is a runtime check,
+ * not a type-level one — nothing stops a future caller from reading `nodeOutput.output`
+ * directly without calling this function first; the value is having one place to route
+ * through, not a compiler-enforced guarantee against bypass.
  *
  * `buildMessage` lets each caller keep its own wording — a binding directive names
  * `if_skipped`, a `when:` guard names the condition, and so on — only the
