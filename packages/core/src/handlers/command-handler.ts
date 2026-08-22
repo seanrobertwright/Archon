@@ -275,9 +275,11 @@ function findWorkflowLoadError(
  *
  * Shared by `/workflow resume`, `/workflow approve` and `/workflow reject`
  * (#2565): a gate decision that does not continue the run leaves it stranded, so
- * all three resolve the same continuation the same way.
+ * all three resolve the same continuation the same way. Also reused by the HTTP
+ * `resumeRunHeadless` fallback (packages/server) for runs with no parent
+ * conversation to dispatch a chat message through (#2008).
  */
-async function resolveRunContinuation(
+export async function resolveRunContinuation(
   runId: string,
   workflowCwd: string
 ): Promise<
