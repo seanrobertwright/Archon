@@ -2234,6 +2234,131 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
   });
 });
 
+// #2707 step 2 — the general drive verb. 'approve'/'reject' produce the exact same
+// resolution as the dedicated routes above; any other decision resolves through the
+// new declared-decision path.
+describe('POST /api/workflows/runs/:runId/respond', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockUpdateWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
+    mockCreateWorkflowEvent.mockReset();
+  });
+
+  test('returns 404 when run not found', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(null);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/missing/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'revise' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(404);
+  });
+
+  test('returns 400 when the body has no decision', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_PAUSED_RUN);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/respond', {
+      method: 'POST',
+      body: JSON.stringify({ text: 'no decision here' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('returns 400 naming the actual options when the decision is not declared', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-respond-invalid',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-respond-invalid/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'escalate' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("does not declare decision 'escalate'");
+    expect(body.error).toContain('approve, revise');
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('resolves a declared non-default decision with the caller-supplied id', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-respond-revise',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-respond-revise/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'revise', text: 'needs more detail' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: {
+        structured_output: { decision: 'revise', text: 'needs more detail' },
+      },
+    });
+  });
+
+  test("'approve' produces the exact same resolution as POST .../approve", async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-respond-approve',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-respond-approve/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'approve', text: 'lgtm' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: { structured_output: { decision: 'approve', text: 'lgtm' } },
+    });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Auto-resume: approve/reject endpoints dispatch to orchestrator when the run
 // has parent_conversation_id set (web-dispatched foreground/interactive

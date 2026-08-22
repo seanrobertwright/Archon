@@ -2899,7 +2899,14 @@ nodes:
     ]);
   });
 
-  it('a fan-out child that pauses at a gate FAILS the node (#2180) and is cancelled', async () => {
+  it('a fan-out target that is interactive-class is refused before any child is created (#2707 step 2, #2474)', async () => {
+    // Superseded by the spawn-time interactive-class preflight: an interactive-class
+    // target (declared `interactive: true`, the simple case #2474 scoped as in-scope) is
+    // now refused before ANY child run row exists, rather than spawning and reactively
+    // cancelling a paused child. The reactive backstop this test used to exercise remains
+    // in place for the cases #2474 named out of scope (a gate nested inside a loop_group
+    // body, or a grandchild `workflow:` node's gate) — see the sibling
+    // 'GAP (#2180 Defect A)' describe block below for that backstop still working.
     await writeWorkflow(
       'fan-child-gated',
       `
@@ -2955,21 +2962,15 @@ nodes:
     // single gate slot (#2180); it fails instead.
     expect((parentRun?.metadata as Record<string, unknown>).approval).toBeUndefined();
 
-    // Every fan-out child that paused was cancelled — tagged `fan_out_gate` so removing
-    // the gate + resuming re-drives it (C2), not a bare cancel.
+    // No child ever gets a row — refused before spawn, not spawned-then-cancelled.
     const children = [...store.runs.values()].filter(r => r.workflow_name === 'fan-child-gated');
-    expect(children.length).toBeGreaterThanOrEqual(1);
-    for (const c of children) {
-      expect(c.status).toBe('cancelled');
-      expect((c.metadata as Record<string, unknown>).cancelled_reason).toBe('fan_out_gate');
-    }
+    expect(children).toHaveLength(0);
+
     const nodeFailed = store.events.find(
       e => e.event_type === 'node_failed' && e.step_name === 'work'
     );
-    // Enriched message (I4): names the offending child index + run id.
-    expect(String(nodeFailed?.data?.error)).toContain('autonomously');
-    expect(String(nodeFailed?.data?.error)).toContain('#2180');
-    expect(String(nodeFailed?.data?.error)).toMatch(/child \d+ \(run [\w-]+\)/);
+    expect(String(nodeFailed?.data?.error)).toContain("'fan-child-gated'");
+    expect(String(nodeFailed?.data?.error)).toContain('interactive-class');
   });
 
   it('a running fan-out child found on resume fails the node WITHOUT cancelling it (C1)', async () => {
@@ -3112,7 +3113,11 @@ nodes:
     );
   });
 
-  it('a fan-out-cancelled gate child is re-driven on resume once the gate is removed (C2)', async () => {
+  it('a fan-out refused for an interactive-class target recovers on resume once the class is removed (#2707 step 2)', async () => {
+    // Superseded by the spawn-time interactive-class preflight (like the sibling test
+    // above): run 1 is now refused BEFORE any child row exists, so there is nothing to
+    // "re-drive in place" — the C2 recovery story becomes a fresh spawn attempt on retry,
+    // once the author fixes the target's class declaration.
     const gatedChild = `
 name: fan-child-recover
 description: has an approval gate on the first pass
@@ -3157,7 +3162,7 @@ nodes:
     const deps = makeDeps(store);
     const parent = await discover('fan-c2-recover');
 
-    // Run 1: the first child pauses at its gate → node fails, that child cancelled (tagged).
+    // Run 1: refused before any child row is created.
     const r1 = await executeWorkflow(
       deps,
       makePlatform(),
@@ -3169,13 +3174,9 @@ nodes:
     );
     expect(r1.success).toBe(false);
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'fan-c2-recover');
-    const child0 = [...store.runs.values()].find(
-      r =>
-        r.workflow_name === 'fan-child-recover' &&
-        (r.metadata as Record<string, unknown>).child_index === 0
-    );
-    expect(child0?.status).toBe('cancelled');
-    expect((child0?.metadata as Record<string, unknown>).cancelled_reason).toBe('fan_out_gate');
+    expect(
+      [...store.runs.values()].filter(r => r.workflow_name === 'fan-child-recover')
+    ).toHaveLength(0);
 
     // Author removes the gate, then resumes the parent.
     await writeWorkflow('fan-child-recover', ungatedChild);
@@ -3197,8 +3198,7 @@ nodes:
 
     expect(r2.success).toBe(true);
     expect((await store.getWorkflowRun(parentRun!.id))?.status).toBe('completed');
-    // The gate-cancelled child was re-driven IN PLACE (same row) → completed; index 1 ran too.
-    expect((await store.getWorkflowRun(child0!.id))?.status).toBe('completed');
+    // Both children spawn fresh on this attempt — no rows existed before it.
     const recovered = [...store.runs.values()].filter(r => r.workflow_name === 'fan-child-recover');
     expect(recovered).toHaveLength(2);
     expect(recovered.every(r => r.status === 'completed')).toBe(true);
@@ -3859,6 +3859,7 @@ nodes:
       `
 name: gating-child
 description: pauses at a gate
+interactive: true
 nodes:
   - id: gate
     approval:

@@ -57,6 +57,8 @@ import {
   type ResolvedContinuation,
 } from '@archon/workflows/executor';
 import {
+  assertComposedGateDriveable,
+  assertInteractiveClassNotBackgrounded,
   assertWorkflowRequirementsMet,
   resolveTopLevelInputs,
 } from '@archon/workflows/utils/workflow-requirements';
@@ -78,17 +80,20 @@ import type {
   WorkflowSource,
   WorkflowWithSource,
 } from '@archon/workflows/schemas/workflow';
+import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import { workflowRunStatusSchema, isApprovalContext } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import {
   approveWorkflow,
   rejectWorkflow,
+  respondToWorkflow,
   resumeWorkflow as resumeWorkflowOp,
   abandonWorkflow,
   getWorkflowStatus,
   resetWorkflowNodeSessions,
   assertApprovable,
   assertRejectable,
+  assertRespondable,
 } from '@archon/core/operations/workflow-operations';
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
@@ -1324,6 +1329,30 @@ async function runWorkflowWithOwnedSource(
   // codebase lookup does happen here — see the folder-detection probe below —
   // to decide folder-vs-repo branch pinning before forking.
   if (options.detach) {
+    // Interactive-class refusal (#2707 step 2): a detached FRESH launch pauses with
+    // nobody watching and nothing to resume it — the exact #1991 hang. Checked here,
+    // synchronously, before the fork and before any worktree/clone/AI cost, mirroring
+    // the requirements gate immediately above. Two checks, like the orchestrator's
+    // shared background-dispatch gate (dispatchBackgroundWorkflowOwned): the
+    // workflow's own declared class, and a gate that arrived via `include:` in a
+    // workflow that omits `interactive: true` (the class declaration alone cannot see
+    // that case — see assertComposedGateDriveable's doc comment).
+    //
+    // Scoped to a genuinely FRESH dispatch (`!isContinuation`) — refusing this at
+    // "launch" only, per the issue's own wording. A run that has ALREADY proved it can
+    // pause (it paused once) is not launching; `resume <id> --detach` and `run --resume
+    // --detach` are legitimate continuation actions that must keep working, since the
+    // whole point of --detach on those is to drive one gate and let a background
+    // process continue to the next. If it pauses again, it sits paused again —
+    // discoverable via `workflow status`/`runs`, not a silent hang nobody knows exists.
+    if (!isContinuation) {
+      assertInteractiveClassNotBackgrounded(workflow);
+      // Already-expanded — discoverWorkflowsWithConfig's output never contains an
+      // IncludeDirective (#2486); the type admits one only for the pre-expansion display
+      // shape (`WorkflowWithSource.declared`), which `workflow` here is not.
+      assertComposedGateDriveable(workflow.nodes as DagNode[]);
+    }
+
     const childConversationId = options.conversationId ?? generateConversationId();
     const extraArgs: string[] = [];
     let pinnedBranch: string | undefined;
@@ -2892,7 +2921,7 @@ async function resolveRunIdArg(
  */
 async function runDetachedControlCommand(
   runId: string,
-  action: 'approve' | 'reject' | 'resume',
+  action: 'approve' | 'reject' | 'respond' | 'resume',
   json: boolean | undefined,
   cwd: string | undefined,
   precheck: () => Promise<WorkflowRun>
@@ -2951,7 +2980,7 @@ async function runDetachedControlCommand(
 async function resolveDiscoveryCwdForCodebase(
   runId: string,
   codebaseId: string,
-  action: 'resume' | 'approve' | 'reject'
+  action: 'resume' | 'approve' | 'reject' | 'respond'
 ): Promise<string> {
   try {
     const codebase = await codebaseDb.getCodebase(codebaseId);
@@ -3400,6 +3429,131 @@ export async function workflowRejectCommand(
     throw new Error(
       `Rejected but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
         `The rejection was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
+    );
+  }
+}
+
+/**
+ * Resolve a paused workflow run with any of its gate's declared decisions (#2707 step 2).
+ * `approve`/`reject` delegate to the existing commands' exact behavior (the general-purpose
+ * function underneath is the same `respondToWorkflow`, which is sugar over
+ * `approveWorkflow`/`rejectWorkflow` for those two ids); any other declared decision always
+ * resolves immediately and auto-resumes, mirroring `approve`'s shape.
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
+ */
+export async function workflowRespondCommand(
+  runId: string,
+  decision: string,
+  text?: string,
+  json?: boolean,
+  cwd?: string,
+  detach?: boolean
+): Promise<void> {
+  if (decision === 'approve') return workflowApproveCommand(runId, text, json, cwd, detach);
+  if (decision === 'reject') return workflowRejectCommand(runId, text, json, cwd, detach);
+
+  // --detach: same shape as approve/reject — the parent validates read-only via the
+  // SAME gate respondToWorkflow enforces, then hands the whole command to a detached
+  // child. See runDetachedControlCommand's doc comment.
+  if (detach) {
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    await runDetachedControlCommand(resolvedId, 'respond', json, cwd, async () => {
+      const run = await workflowDb.getWorkflowRun(resolvedId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${resolvedId}`);
+      }
+      assertRespondable(run, decision);
+      if (!run.working_path) {
+        throw new Error(
+          `Workflow run '${resolvedId}' has no working path recorded.\n` +
+            'Cannot determine where to resume.'
+        );
+      }
+      return run;
+    });
+    return;
+  }
+
+  // JSON mode records the decision and returns a structured ack WITHOUT the inline
+  // auto-resume, mirroring approve/reject — drive it onward with a backgrounded
+  // `resume`/`run --resume`.
+  if (json) {
+    try {
+      const resolvedId = await resolveRunIdArg(runId, cwd);
+      const result = await respondToWorkflow(resolvedId, decision, text);
+      await writeJsonLine({
+        ok: true,
+        runId: resolvedId,
+        action: 'respond',
+        decision,
+        workflowName: result.workflowName,
+        resumable: true,
+      });
+    } catch (error) {
+      await printJsonWriteError(runId, 'respond', error);
+    }
+    return;
+  }
+
+  const resolvedId = await resolveRunIdArg(runId, cwd);
+  const result = await respondToWorkflow(resolvedId, decision, text);
+
+  if (!result.workingPath) {
+    throw new Error(
+      `Workflow run '${resolvedId}' has no working path recorded.\n` +
+        'Cannot determine where to resume.'
+    );
+  }
+  console.log(`Responded '${decision}' to workflow: ${result.workflowName}`);
+  console.log(`Path: ${result.workingPath}`);
+  console.log('');
+  console.log('Resuming workflow...');
+
+  // Look up the original platform conversation ID to keep all messages in one thread
+  let platformConversationId: string | undefined;
+  try {
+    const originalConversation = await conversationDb.getConversationById(result.conversationId);
+    platformConversationId = originalConversation?.platform_conversation_id ?? undefined;
+    if (!originalConversation) {
+      getLog().info(
+        { runId: resolvedId, conversationId: result.conversationId },
+        'cli.workflow_respond_conversation_not_found'
+      );
+    }
+  } catch (error) {
+    const err = error as Error;
+    getLog().warn(
+      { err, runId: resolvedId, conversationId: result.conversationId },
+      'cli.workflow_respond_conversation_lookup_failed'
+    );
+  }
+
+  try {
+    // Use the codebase's source path for workflow YAML discovery so the file is
+    // found even when working_path is a worktree or workspace clone that does
+    // not contain the user's local (often untracked) workflow YAML.
+    const discoveryCwd = result.codebaseId
+      ? await resolveDiscoveryCwdForCodebase(resolvedId, result.codebaseId, 'respond')
+      : undefined;
+
+    await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      continuationRun: (await workflowDb.getWorkflowRun(resolvedId)) ?? undefined,
+      resume: true,
+      codebaseId: result.codebaseId ?? undefined,
+      conversationId: platformConversationId,
+      discoveryCwd,
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, runId: resolvedId, workflowName: result.workflowName },
+      'cli.workflow_respond_resume_failed'
+    );
+    throw new Error(
+      `Response recorded but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
+        `The response was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
     );
   }
 }

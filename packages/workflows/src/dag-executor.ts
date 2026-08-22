@@ -7672,17 +7672,24 @@ async function executeFanOutWorkflowNode(
     return failResult(msg);
   }
 
-  // 5. Shared-checkout preflight (#2180 Defect A). Isolation is explicit-only, so a
-  //    fan-out with no `isolation: worktree` puts N children in the parent's checkout,
-  //    where the path lock cancels every sibling but one — permanently, since resume
-  //    threads a cancelled child as terminal. Caught HERE, before a single child row
-  //    exists: the child target (and therefore its `mutates_checkout`) only resolves at
-  //    spawn time by design (#2200), so load time cannot see it.
+  // 5. Shared-checkout preflight (#2180 Defect A) AND interactive-class preflight (#2707
+  //    step 2, issue #2474). Isolation is explicit-only, so a fan-out with no `isolation:
+  //    worktree` puts N children in the parent's checkout, where the path lock cancels
+  //    every sibling but one — permanently, since resume threads a cancelled child as
+  //    terminal. A fan-out target that can pause has a different, unconditional problem:
+  //    the parent has a SINGLE approval-gate slot, so N children racing to pause cannot
+  //    all be presented — this holds even at `max_parallel: 1` or `isolation: worktree`,
+  //    since it is a governance problem, not a checkout problem. Both are caught HERE,
+  //    before a single child row exists: the child target (and therefore its
+  //    `mutates_checkout`/`interactive`) only resolves at spawn time by design (#2200), so
+  //    load time cannot see either.
   //
-  //    Counted over the indices this attempt will actually DRIVE, not over items.length —
-  //    a resume with one instance left to re-drive has no concurrency and must not be
-  //    blocked from recovering. `max_parallel: 1` is likewise not a collision: the window
-  //    awaits each child, so the previous one's lock is released before the next starts.
+  //    Resolved ONCE, unconditionally — both checks below share the one resolution rather
+  //    than each paying their own discovery scan. #2474's own analysis anticipated walking
+  //    the target's node tree for a gate; the class declaration (#2707 step 2) makes that
+  //    unnecessary — an unattended-class workflow is GUARANTEED gate-free by the load-time
+  //    class-placement check (loader.ts), so "is the target unattended-class" is a
+  //    one-field read, cheaper than the tree walk #2474 originally scoped.
   const pendingCount = items.reduce<number>((n, _item, i) => {
     const existing = existingByIndex.get(i);
     if (existing?.status === 'completed') return n;
@@ -7690,7 +7697,7 @@ async function executeFanOutWorkflowNode(
     return n + 1;
   }, 0);
   const plannedConcurrency = Math.min(fanOut.max_parallel, pendingCount);
-  if (node.isolation !== 'worktree' && plannedConcurrency > 1) {
+  {
     // The fan-out target is a not-yet-started child, so it resolves from the parent's
     // AUTHORING directory (live) rather than the parent's frozen copy — same rule as a
     // 1:1 `workflow:` child. See resolveChildDiscoveryRoot.
@@ -7701,23 +7708,19 @@ async function executeFanOutWorkflowNode(
       await resolveChildDiscoveryRoot(parentRun.metadata)
     );
     if ('unresolved' in resolved) {
-      // Fail CLOSED. Skipping the check here would let the path-lock cascade through
-      // unguarded on the strength of a lookup that did not happen, and the spawn is about
-      // to fail on this same unresolvable target anyway — so the only thing failing open
-      // buys is a worse message. Names the resolution problem, not a collision the author
-      // cannot yet act on.
+      // Fail CLOSED. Skipping the check here would let either hazard through unguarded on
+      // the strength of a lookup that did not happen, and the spawn is about to fail on
+      // this same unresolvable target anyway — so the only thing failing open buys is a
+      // worse message. Names the resolution problem, not a hazard the author cannot yet act on.
       const msg =
-        `fan_out node '${node.id}': cannot verify that ${String(plannedConcurrency)} concurrent ` +
-        `children are safe to share the parent checkout, because '${node.workflow}' could not ` +
-        `be resolved — ${resolved.unresolved}. Fix the target name; if the children really do ` +
-        'run side by side in one checkout, the workflow must also declare ' +
-        '`mutates_checkout: false`.';
+        `fan_out node '${node.id}': cannot verify that the target workflow '${node.workflow}' is ` +
+        `safe to fan out to, because it could not be resolved — ${resolved.unresolved}. Fix the ` +
+        'target name.';
       getLog().warn(
         {
           parentRunId: parentRun.id,
           nodeId: node.id,
           childWorkflow: node.workflow,
-          plannedConcurrency,
           reason: resolved.unresolved,
         },
         'workflow.fan_out_preflight_unresolved'
@@ -7725,7 +7728,25 @@ async function executeFanOutWorkflowNode(
       await notify(`❌ **Fan-out blocked** (node \`${node.id}\`): ${msg}`);
       return failResult(msg);
     }
-    if (resolved.definition.mutates_checkout !== false) {
+    if (resolved.definition.interactive === true) {
+      const msg =
+        `fan_out node '${node.id}': target workflow '${node.workflow}' is interactive-class ` +
+        "('interactive: true') and may pause for human input — a fan-out has a single " +
+        'approval-gate slot for N children, so this is refused before any child is created. ' +
+        `Remove the pause capability from '${node.workflow}', or invoke it as a single ` +
+        "(non-fan-out) 'workflow:' node instead.";
+      getLog().warn(
+        { parentRunId: parentRun.id, nodeId: node.id, childWorkflow: node.workflow },
+        'workflow.fan_out_interactive_target'
+      );
+      await notify(`❌ **Fan-out blocked** (node \`${node.id}\`): ${msg}`);
+      return failResult(msg);
+    }
+    if (
+      node.isolation !== 'worktree' &&
+      plannedConcurrency > 1 &&
+      resolved.definition.mutates_checkout !== false
+    ) {
       const msg = fanOutSharedCheckoutMessage(node, plannedConcurrency);
       getLog().warn(
         {

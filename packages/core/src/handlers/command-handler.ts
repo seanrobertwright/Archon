@@ -32,6 +32,7 @@ import * as workflowDb from '../db/workflows';
 import {
   approveWorkflow,
   rejectWorkflow,
+  respondToWorkflow,
   getWorkflowStatus,
   resumeWorkflow,
   abandonWorkflow,
@@ -388,7 +389,7 @@ async function withRunContinuation(
   runId: string,
   workflowCwd: string,
   headline: string,
-  action: 'approve' | 'reject'
+  action: 'approve' | 'reject' | 'respond'
 ): Promise<CommandResult> {
   let continuation: Awaited<ReturnType<typeof resolveRunContinuation>>;
   try {
@@ -1042,6 +1043,61 @@ async function handleWorkflowCommand(
         const err = error as Error;
         getLog().error({ err, runId }, 'cmd.workflow_reject_failed');
         return { success: false, message: `Failed to reject workflow run: ${err.message}` };
+      }
+    }
+
+    case 'respond': {
+      // General drive verb (#2707 step 2): resolves a paused gate with any of its
+      // author-declared decisions. 'approve'/'reject' behave identically to the
+      // dedicated commands above — respondToWorkflow delegates those two ids to the
+      // exact same approveWorkflow/rejectWorkflow functions — this handler just
+      // formats whichever result shape comes back.
+      const runId = args[1];
+      const decision = args[2];
+      if (!runId || !decision) {
+        return {
+          success: false,
+          message:
+            'Usage: /workflow respond <id> <decision> [text]\n\n' +
+            "Resolves a paused gate with any of its declared decisions ('approve'/'reject' " +
+            'are sugar for the dedicated /workflow approve|reject commands).',
+        };
+      }
+      const rawText = args.slice(3).join(' ');
+      // Mirrors the dedicated /workflow reject command's default: an empty reason
+      // becomes 'Rejected' rather than reaching a new-mode gate's structured
+      // output as ''. Only for decision === 'reject' — respond's other decisions
+      // (including 'approve', which stays optional/undefined) are unaffected.
+      const text = rawText.length > 0 ? rawText : decision === 'reject' ? 'Rejected' : undefined;
+      try {
+        const result = await respondToWorkflow(runId, decision, text);
+        if ('cancelled' in result) {
+          if (result.cancelled) {
+            const suffix = result.maxAttemptsReached ? ' (max attempts reached)' : '';
+            return {
+              success: true,
+              message: `Workflow \`${result.workflowName}\` rejected and cancelled${suffix}.`,
+            };
+          }
+          return await withRunContinuation(
+            runId,
+            workflowCwd,
+            result.newMode
+              ? `Workflow \`${result.workflowName}\` rejected. Continuing...`
+              : `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
+            'respond'
+          );
+        }
+        const pathInfo = result.workingPath ? `\nPath: \`${result.workingPath}\`` : '';
+        const headline =
+          result.type === 'interactive_loop'
+            ? `Workflow \`${result.workflowName}\` loop input received.${pathInfo}`
+            : `Workflow \`${result.workflowName}\` responded '${decision}'.${pathInfo}`;
+        return await withRunContinuation(runId, workflowCwd, headline, 'respond');
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, runId, decision }, 'cmd.workflow_respond_failed');
+        return { success: false, message: `Failed to respond to workflow run: ${err.message}` };
       }
     }
 

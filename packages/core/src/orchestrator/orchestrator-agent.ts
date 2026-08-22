@@ -1352,7 +1352,7 @@ async function dispatchOrchestratorWorkflow(
 /** A human gate the chat agent resolved during a turn, awaiting continuation. */
 interface ResolvedGate {
   run: WorkflowRun;
-  action: 'approve' | 'reject';
+  action: 'approve' | 'reject' | 'respond';
 }
 
 /**
@@ -1380,11 +1380,12 @@ export async function continueResolvedGateRun(
   codebase: Codebase | null,
   workflowsWithSource: readonly WorkflowWithSource[],
   run: WorkflowRun,
-  action: 'approve' | 'reject',
+  action: 'approve' | 'reject' | 'respond',
   isolationHints?: HandleMessageContext['isolationHints'],
   userId?: string
 ): Promise<void> {
-  const decision = action === 'approve' ? 'Approved' : 'Rejected';
+  const decision =
+    action === 'approve' ? 'Approved' : action === 'reject' ? 'Rejected' : 'Responded';
   const notify = async (text: string): Promise<void> => {
     await platform.sendMessage(conversationId, text).catch((sendErr: unknown) => {
       getLog().warn(

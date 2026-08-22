@@ -5,6 +5,8 @@ import {
   assertComposedGateDriveable,
   ComposedApprovalGateError,
   findComposedApprovalGate,
+  assertInteractiveClassNotBackgrounded,
+  InteractiveClassBackgroundError,
   resolveTopLevelInputs,
   WorkflowMissingInputsError,
 } from './workflow-requirements';
@@ -231,5 +233,35 @@ describe('assertComposedGateDriveable', () => {
     const parent = expand([block, wf('parent', [{ id: 'inc', include: 'plain' }])], 'parent');
     expect(findComposedApprovalGate(parent.nodes)).toBeNull();
     expect(() => assertComposedGateDriveable(parent.nodes)).not.toThrow();
+  });
+});
+
+// #2707 step 2 / #1991 — the workflow's own declared class, checked independently at
+// every background-dispatch entrypoint. `dispatchBackgroundWorkflowOwned` (@archon/core)
+// is the shared entrypoint both the web console's default dispatch and the `manage_run`
+// tool's `startWorkflow` funnel through — the actual issue #1991 repro was reached via
+// `manage_run` from a background-capable chat agent. This unit-tests the pure assertion
+// both callers invoke; `packages/cli/src/commands/workflow.test.ts`'s
+// "detach refuses an interactive-class workflow" suite covers the CLI `--detach` entrypoint
+// end to end.
+describe('assertInteractiveClassNotBackgrounded (#2707 step 2 / #1991)', () => {
+  test('passes for an unattended (interactive absent/false) workflow', () => {
+    expect(() => assertInteractiveClassNotBackgrounded({ name: 'ship' })).not.toThrow();
+    expect(() =>
+      assertInteractiveClassNotBackgrounded({ name: 'ship', interactive: false })
+    ).not.toThrow();
+  });
+
+  test('throws InteractiveClassBackgroundError naming the workflow for an interactive-class workflow', () => {
+    let thrown: unknown;
+    try {
+      assertInteractiveClassNotBackgrounded({ name: 'guided', interactive: true });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(InteractiveClassBackgroundError);
+    expect((thrown as InteractiveClassBackgroundError).workflowName).toBe('guided');
+    expect((thrown as Error).message).toContain("Workflow 'guided'");
+    expect((thrown as Error).message).toContain('interactive-class');
   });
 });

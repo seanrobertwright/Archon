@@ -270,6 +270,8 @@ import {
   abandonWorkflow,
   approveWorkflow,
   rejectWorkflow,
+  respondToWorkflow,
+  assertRespondable,
   resetWorkflowNodeSessions,
 } from '@archon/core/operations/workflow-operations';
 import { getAuth, isWebAuthEnabled, getSignupMode, isApiGateEnabled } from '../auth';
@@ -293,6 +295,7 @@ import {
   workflowRunsQuerySchema,
   approveWorkflowRunBodySchema,
   rejectWorkflowRunBodySchema,
+  respondWorkflowRunBodySchema,
   resetWorkflowNodeSessionsParamsSchema,
   resetWorkflowNodeSessionsQuerySchema,
   resetWorkflowNodeSessionsResponseSchema,
@@ -1024,6 +1027,26 @@ const rejectWorkflowRunRoute = createRoute({
     200: {
       content: { 'application/json': { schema: workflowRunActionResponseSchema } },
       description: 'Rejected',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const respondWorkflowRunRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/respond',
+  tags: ['Workflows'],
+  summary: "Resolve a paused workflow run with any of the gate's declared decisions",
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: { content: { 'application/json': { schema: respondWorkflowRunBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowRunActionResponseSchema } },
+      description: 'Responded',
     },
     400: jsonError('Bad request'),
     404: jsonError('Not found'),
@@ -2504,7 +2527,7 @@ export function registerApiRoutes(
    */
   async function tryAutoResumeAfterGate(
     run: WorkflowRun,
-    action: 'approve' | 'reject',
+    action: 'approve' | 'reject' | 'respond',
     // Identity of the user who approved/rejected the gate. The resumed chat
     // turn executes as THIS user (sender-first, #1976/#1982) — without it the
     // dispatch would fall back to the conversation creator's prefs/credentials.
@@ -2525,15 +2548,27 @@ export function registerApiRoutes(
             headlessDispatched: 'api.workflow_approve_auto_resume_headless_dispatched' as const,
             headlessSkipped: 'api.workflow_approve_auto_resume_headless_skipped' as const,
           }
-        : {
-            dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
-            skippedNoPlatformConv:
-              'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
-            skippedNonWebParent: 'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
-            failed: 'api.workflow_reject_auto_resume_failed' as const,
-            headlessDispatched: 'api.workflow_reject_auto_resume_headless_dispatched' as const,
-            headlessSkipped: 'api.workflow_reject_auto_resume_headless_skipped' as const,
-          };
+        : action === 'reject'
+          ? {
+              dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
+              skippedNoPlatformConv:
+                'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
+              skippedNonWebParent:
+                'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
+              failed: 'api.workflow_reject_auto_resume_failed' as const,
+              headlessDispatched: 'api.workflow_reject_auto_resume_headless_dispatched' as const,
+              headlessSkipped: 'api.workflow_reject_auto_resume_headless_skipped' as const,
+            }
+          : {
+              dispatched: 'api.workflow_respond_auto_resume_dispatched' as const,
+              skippedNoPlatformConv:
+                'api.workflow_respond_auto_resume_skipped_no_platform_conv' as const,
+              skippedNonWebParent:
+                'api.workflow_respond_auto_resume_skipped_non_web_parent' as const,
+              failed: 'api.workflow_respond_auto_resume_failed' as const,
+              headlessDispatched: 'api.workflow_respond_auto_resume_headless_dispatched' as const,
+              headlessSkipped: 'api.workflow_respond_auto_resume_headless_skipped' as const,
+            };
     if (!run.parent_conversation_id) {
       // No parent conversation to dispatch a chat message through at all —
       // every CLI-launched run (#2008). Execute directly instead of skipping.
@@ -3864,6 +3899,105 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_reject_failed');
       return apiError(c, 500, 'Failed to reject workflow run');
+    }
+  });
+
+  // POST /api/workflows/runs/:runId/respond - Resolve a paused workflow run with any
+  // declared decision (#2707 step 2). 'approve'/'reject' produce the exact same
+  // resolution as the dedicated routes above — respondToWorkflow delegates those two
+  // ids to the same approveWorkflow/rejectWorkflow functions.
+  registerOpenApiRoute(respondWorkflowRunRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    try {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        return apiError(c, 404, 'Workflow run not found');
+      }
+      if (run.status !== 'paused') {
+        return apiError(c, 400, `Cannot respond to workflow in '${run.status}' status`);
+      }
+      const approvalRaw = run.metadata.approval;
+      const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
+      if (approval?.type === 'child_workflow') {
+        // Mirror of the approve/reject routes' guard — respondToWorkflow throws the
+        // same redirect; map it to a 400 with the child pointer.
+        return apiError(
+          c,
+          400,
+          `Run is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'}. Respond on the child run instead, or abandon this run to discard the whole tree.`
+        );
+      }
+      if (approval && isGateResolved(approval)) {
+        return apiError(
+          c,
+          400,
+          `Workflow run was already ${String(approval.resolved)} — resume in progress`
+        );
+      }
+      const rawBody = await c.req.text();
+      let body: { decision?: string; text?: string } = {};
+      if (rawBody.trim().length > 0) {
+        try {
+          body = JSON.parse(rawBody) as { decision?: string; text?: string };
+        } catch (parseError) {
+          getLog().warn({ err: parseError, runId }, 'api.respond_body_parse_failed');
+          return apiError(
+            c,
+            400,
+            'Request body is not valid JSON — send {"decision": "...", "text": "..."}'
+          );
+        }
+      }
+      if (!body.decision) {
+        return apiError(c, 400, 'Request body must include a non-empty "decision"');
+      }
+      const decision = body.decision;
+
+      // Pre-validate a non-default decision so an undeclared id is a 400 naming the
+      // gate's actual options, not an opaque 500 — mirrors the approve/reject routes'
+      // pre-checks above. 'approve'/'reject' skip this: assertRespondable enforces
+      // decisionsAuthored, which legacy gates (the ones those two ids also serve)
+      // never set — see assertRespondable's doc comment for why it is not consulted
+      // for those two ids.
+      if (decision !== 'approve' && decision !== 'reject') {
+        try {
+          assertRespondable(run, decision);
+        } catch (validationError) {
+          return apiError(c, 400, (validationError as Error).message);
+        }
+      }
+
+      // Mirrors the dedicated /reject route's default: an empty/omitted text becomes
+      // 'Rejected' rather than reaching a new-mode gate's structured output as ''.
+      // Only for decision === 'reject' — every other decision (including 'approve',
+      // which stays optional/undefined) is unaffected.
+      const text = body.text ?? (decision === 'reject' ? 'Rejected' : undefined);
+      const result = await respondToWorkflow(runId, decision, text);
+
+      if ('cancelled' in result && result.cancelled) {
+        return c.json({
+          success: true,
+          message: result.maxAttemptsReached
+            ? `Workflow rejected and cancelled (max attempts reached): ${run.workflow_name}`
+            : `Workflow rejected: ${run.workflow_name}`,
+        });
+      }
+
+      // Auto-resume: dispatch to the orchestrator so the resolution actually takes
+      // effect, mirroring approve/reject. Same cross-adapter guard — only web
+      // parents auto-resume.
+      const autoResumed = await tryAutoResumeAfterGate(run, 'respond', await resolveWebUserId(c));
+      const resumeHint = `run \`archon workflow resume ${runId}\` from the CLI to trigger it`;
+
+      return c.json({
+        success: true,
+        message: autoResumed
+          ? `Workflow responded '${decision}': ${run.workflow_name}. Continuing.`
+          : `Workflow responded '${decision}': ${run.workflow_name}. The run will continue when it resumes — ${resumeHint}.`,
+      });
+    } catch (error) {
+      getLog().error({ err: error, runId }, 'api.workflow_run_respond_failed');
+      return apiError(c, 500, 'Failed to respond to workflow run');
     }
   });
 

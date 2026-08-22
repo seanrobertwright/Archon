@@ -43,7 +43,7 @@ import {
   isAgentNode,
   isWorkflowNode,
 } from './schemas';
-import { parseWorkflow, type ParseResult } from './loader';
+import { parseWorkflow, resetClassPlacementWarningForTests, type ParseResult } from './loader';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import { workflowDefinitionSchema } from './schemas/workflow';
 import type { WorkflowDefinition } from './schemas/workflow';
@@ -3667,7 +3667,10 @@ nodes:
       expect(result.errors[0].error).toContain('gate_message');
     });
 
-    it('should warn when interactive loop node is in a non-interactive workflow', async () => {
+    it('should infer interactive: true (with a warning) when an interactive loop node is in an undeclared workflow (#2707 step 2 / #2736)', async () => {
+      // Grace period (#2736/#2738): this used to be a hard load error. It now loads
+      // successfully with `interactive` coerced to `true`, so #1991's background-dispatch
+      // refusal still protects the run even though the author never declared the class.
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
@@ -3688,14 +3691,16 @@ nodes:
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      // Workflow loads successfully — this is a warning, not an error
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
-      // Logger should have been called with the warning event
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ filename: expect.stringContaining('warn-test') }),
-        'interactive_loop_in_non_interactive_workflow'
-      );
+      expect(result.workflows[0].workflow.interactive).toBe(true);
+      // Also carries the pre-existing "node-level loop interactive: is deprecated"
+      // warning (#2707 step 3) for this same node — unrelated to this check, so
+      // find the class-placement warning by content rather than asserting length.
+      const pw = result.workflows[0].parseWarnings ?? [];
+      const classWarning = pw.find(w => w.includes("Node 'my-loop' is a pause node"));
+      expect(classWarning).toBeDefined();
+      expect(classWarning).toContain('has been applied for this run only');
     });
 
     // -----------------------------------------------------------------------
@@ -4158,7 +4163,8 @@ nodes:
       expect(result.errors[0].error).toContain('shadows a node id in the enclosing DAG');
     });
 
-    it('should warn when an interactive loop_group is in a non-interactive workflow', async () => {
+    it('should infer interactive: true (with a warning) when an interactive loop_group is in an undeclared workflow (#2707 step 2 / #2736)', async () => {
+      // Grace period (#2736/#2738) — see the loop: sibling test above.
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
@@ -4183,10 +4189,145 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(0);
       expect(result.workflows).toHaveLength(1);
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ filename: expect.stringContaining('loop-group-gate-warn') }),
-        'interactive_loop_in_non_interactive_workflow'
+      expect(result.workflows[0].workflow.interactive).toBe(true);
+      // Also carries the pre-existing "node-level loop interactive: is deprecated"
+      // warning (#2707 step 3) for this same node — find by content, not length.
+      const pw = result.workflows[0].parseWarnings ?? [];
+      const classWarning = pw.find(w => w.includes("Node 'grp' is a pause node"));
+      expect(classWarning).toBeDefined();
+    });
+  });
+
+  // A gate-authoring leaf block (a workflow whose only purpose is to be composed via
+  // `include:`, but which directly authors its own native gate) is now covered by the
+  // grace-period inference like any other workflow (#2736/#2738) — it loads with a
+  // warning and `interactive: true` inferred, rather than failing outright, so a
+  // composer of it succeeds too instead of seeing a cascaded failure. Exercised through
+  // the REAL discovery pipeline (discoverWorkflows -> parseWorkflow per file ->
+  // expandWorkflowIncludes), not expandWorkflowIncludes called directly on hand-built
+  // WorkflowDefinition objects — that bypass never reaches parseWorkflow's class check.
+  describe('workflow-class placement — leaf gate-authoring block composed via include: (#2707 step 2 / #2736)', () => {
+    async function writeAndDiscover(files: Record<string, string>) {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      for (const [filename, content] of Object.entries(files)) {
+        await writeFile(join(workflowDir, filename), content);
+      }
+      return discoverWorkflows(testDir, { loadDefaults: false });
+    }
+
+    it('a leaf block with a native gate and no interactive: true loads on its own with interactive inferred', async () => {
+      const result = await writeAndDiscover({
+        'gate-blk.yaml': `
+name: gate-blk
+description: reusable review gate, composed by other workflows
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`,
+      });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.interactive).toBe(true);
+    });
+
+    it('a composer of that leaf block also succeeds — the inference propagates through include: composition', async () => {
+      const result = await writeAndDiscover({
+        'gate-blk.yaml': `
+name: gate-blk
+description: reusable review gate, composed by other workflows
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`,
+        'top.yaml': `
+name: top
+description: composes the review gate
+interactive: true
+nodes:
+  - id: inc
+    include: gate-blk
+`,
+      });
+      expect(result.errors).toHaveLength(0);
+      const names = result.workflows.map(w => w.workflow.name).sort();
+      expect(names).toEqual(['gate-blk', 'top']);
+    });
+
+    it('once the leaf block also declares interactive: true, both it and its composer load correctly with no warning', async () => {
+      const result = await writeAndDiscover({
+        'gate-blk.yaml': `
+name: gate-blk
+description: reusable review gate, composed by other workflows
+interactive: true
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`,
+        'top.yaml': `
+name: top
+description: composes the review gate
+interactive: true
+nodes:
+  - id: inc
+    include: gate-blk
+`,
+      });
+      expect(result.errors).toHaveLength(0);
+      const names = result.workflows.map(w => w.workflow.name).sort();
+      expect(names).toEqual(['gate-blk', 'top']);
+      for (const w of result.workflows) {
+        expect(w.parseWarnings ?? []).toEqual([]);
+      }
+    });
+  });
+
+  describe('workflow-class placement inference — log dedup (#2736/#2738)', () => {
+    beforeEach(() => {
+      resetClassPlacementWarningForTests();
+      mockLogger.warn.mockClear();
+    });
+
+    const undeclaredGateYaml = `
+name: warn-once-test
+description: Non-interactive workflow with a native gate
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`;
+
+    it('warns on the log channel exactly once per filename across repeated parses, but coerces every time', () => {
+      const first = parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+      const second = parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+      const third = parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+
+      for (const result of [first, second, third]) {
+        expect(result.error).toBeNull();
+        expect(result.workflow?.interactive).toBe(true);
+        expect(result.warnings).toHaveLength(1);
+      }
+
+      const warnCalls = mockLogger.warn.mock.calls.filter(
+        call => call[1] === 'workflow_class_placement_inferred'
       );
+      expect(warnCalls).toHaveLength(1);
+    });
+
+    it('warns again for a different filename with the same violation', () => {
+      parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+      parseWorkflow(
+        undeclaredGateYaml.replace('warn-once-test', 'a-different-workflow'),
+        'other.yaml'
+      );
+
+      const warnCalls = mockLogger.warn.mock.calls.filter(
+        call => call[1] === 'workflow_class_placement_inferred'
+      );
+      expect(warnCalls).toHaveLength(2);
     });
   });
 
@@ -5893,6 +6034,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -5908,6 +6050,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6035,6 +6178,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'worktree:',
         '  enabled: true',
         'nodes:',
@@ -6304,6 +6448,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6321,6 +6466,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6334,6 +6480,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6349,6 +6496,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: iterate',
         '    loop:',
@@ -6368,6 +6516,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: outer',
         '    loop_group:',
@@ -6397,6 +6546,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6413,6 +6563,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',

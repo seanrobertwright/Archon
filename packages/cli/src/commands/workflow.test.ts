@@ -22,6 +22,7 @@ import {
   workflowAbandonCommand,
   workflowApproveCommand,
   workflowRejectCommand,
+  workflowRespondCommand,
   workflowEventEmitCommand,
   workflowCleanupCommand,
   workflowResetSessionsCommand,
@@ -5107,6 +5108,110 @@ describe('workflowRunCommand — detach', () => {
   });
 });
 
+// #2707 step 2 / #1991 — an interactive-class workflow dispatched via `--detach` used to
+// hang indefinitely: the detached child paused with nobody watching, exited 0, and nothing
+// ever resumed it. Refused synchronously now, before the fork.
+describe('workflowRunCommand — detach refuses an interactive-class workflow (#2707 step 2 / #1991)', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    jest.useFakeTimers();
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    consoleSpy.mockRestore();
+  });
+
+  it('refuses before the fork, naming the workflow and its class', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'guided', interactive: true }, 'project')],
+      errors: [],
+    });
+
+    const spawnSpy = spyOn(Bun, 'spawn');
+
+    try {
+      await expect(
+        workflowRunCommand('/test/path', 'guided', 'hello', { detach: true })
+      ).rejects.toThrow(/interactive-class/i);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+
+    // Refused before the fork — no child process, no "started" ack.
+    expect(spawnSpy).not.toHaveBeenCalled();
+    const logged = consoleSpy.mock.calls.map(call => String(call[0]));
+    expect(logged).not.toContain("Started 'guided' in the background.");
+  });
+
+  it('allows the same workflow to run in the foreground (no --detach)', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'guided', interactive: true }, 'project')],
+      errors: [],
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-ok',
+    });
+
+    await workflowRunCommand('/test/path', 'guided', 'hello', { noWorktree: true });
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not refuse a continuation (--resume --detach) on an already-paused interactive-class run', async () => {
+    // A continuation is exempt from the launch refusal (isContinuation guard) — proven by
+    // asserting the class error never fires, regardless of what (if anything) an
+    // unrelated missing mock throws afterward. Real timers: this test does not exercise
+    // the fake-timer-gated startup window the sibling tests in this block do.
+    jest.useRealTimers();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { hydrateResumableRun } = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'guided', interactive: true }, 'project')],
+      errors: [],
+    });
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { id: 'run-paused', workflow_name: 'guided' },
+      priorCompletedNodes: new Map(),
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-resume',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-paused',
+      workflow_name: 'guided',
+      working_path: null,
+    });
+    // Real spawn must never actually run — mock it even though this test doesn't assert
+    // on it, since --detach forks if every mock above happens to line up.
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+
+    try {
+      await workflowRunCommand('/test/path', 'guided', 'hello', {
+        resume: true,
+        detach: true,
+      });
+    } catch (error) {
+      expect((error as Error).message).not.toMatch(/interactive-class/i);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+});
+
 describe('workflowApproveCommand / workflowRejectCommand / workflowResumeCommand — detach', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let warnSpy: ReturnType<typeof spyOn>;
@@ -6787,6 +6892,153 @@ describe('workflowRejectCommand', () => {
 
     // No codebase → falls back to working_path (preserves existing behavior)
     expect(discoverSpy).toHaveBeenCalledWith('/tmp/old-worktree', expect.any(Function));
+  });
+});
+
+// #2707 step 2 — the general drive verb. `approve`/`reject` are sugar (delegated
+// directly to the existing commands); any other decision resolves through the new
+// declared-decision path.
+describe('workflowRespondCommand', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  it("delegates 'approve' to the exact same resolution as workflowApproveCommand", async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-approve',
+      workflow_name: 'guided',
+      status: 'paused',
+      user_message: 'go',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+
+    try {
+      await workflowRespondCommand('run-respond-approve', 'approve', 'looks good');
+    } catch {
+      // downstream workflowRunCommand failure is acceptable in this unit test
+    }
+
+    expect(workflowDb.resolveApprovalGate).toHaveBeenCalledWith(
+      'run-respond-approve',
+      expect.objectContaining({
+        approval: expect.objectContaining({ resolved: 'approved' }),
+      }),
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'node_completed',
+          data: expect.objectContaining({
+            structured_output: { decision: 'approve', text: 'looks good' },
+          }),
+        }),
+      ])
+    );
+  });
+
+  it('resolves a declared non-default decision with the caller-supplied id', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-revise',
+      workflow_name: 'guided',
+      status: 'paused',
+      user_message: 'go',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+
+    try {
+      await workflowRespondCommand('run-respond-revise', 'revise', 'needs more detail');
+    } catch {
+      // downstream workflowRunCommand failure is acceptable in this unit test
+    }
+
+    expect(workflowDb.resolveApprovalGate).toHaveBeenCalledWith(
+      'run-respond-revise',
+      expect.objectContaining({ approval_response: 'revise' }),
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'node_completed',
+          data: expect.objectContaining({
+            structured_output: { decision: 'revise', text: 'needs more detail' },
+          }),
+        }),
+      ])
+    );
+  });
+
+  it('rejects a decision the gate does not declare, naming the actual options', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-invalid',
+      workflow_name: 'guided',
+      status: 'paused',
+      user_message: 'go',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const resolveGateSpy = workflowDb.resolveApprovalGate as ReturnType<typeof mock>;
+    resolveGateSpy.mockClear();
+
+    await expect(
+      workflowRespondCommand('run-respond-invalid', 'escalate', 'not sure')
+    ).rejects.toThrow(/does not declare decision 'escalate'.*approve, revise/s);
+
+    expect(resolveGateSpy).not.toHaveBeenCalled();
+  });
+
+  it('--detach validates read-only via assertRespondable before forking', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-detach',
+      workflow_name: 'guided',
+      status: 'completed',
+      working_path: '/repo',
+      metadata: {},
+    });
+    const spawnSpy = spyOn(Bun, 'spawn');
+
+    try {
+      await expect(
+        workflowRespondCommand('run-respond-detach', 'revise', undefined, false, undefined, true)
+      ).rejects.toThrow(/Only paused runs can be approved/);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+    expect(spawnSpy).not.toHaveBeenCalled();
   });
 });
 

@@ -60,7 +60,10 @@ import {
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { loadConfig } from '../config/config-loader';
-import { assertComposedGateDriveable } from '@archon/workflows/utils/workflow-requirements';
+import {
+  assertComposedGateDriveable,
+  assertInteractiveClassNotBackgrounded,
+} from '@archon/workflows/utils/workflow-requirements';
 import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
 import type { DagNode } from '@archon/workflows/schemas/dag-node';
@@ -330,13 +333,18 @@ async function dispatchBackgroundWorkflowOwned(
     prBranch?: string;
   }
 ): Promise<void> {
-  // 0. A backgrounded run cannot present an approval gate inline, and a gate that arrived
-  // through `include:` was written by someone looking at a different file (#1764). Checked
-  // HERE, in the one function that backgrounds a run, rather than at each caller — this has
-  // two entrypoints (the console's default dispatch and the `manage_run` tool's
-  // startWorkflow, which reaches every platform with native tools), and a rule enforced per
-  // caller is a rule that fails open the moment a third appears. Throws before the worker
-  // conversation exists, so a refusal leaves nothing behind.
+  // 0. A backgrounded run cannot present a pause inline. Two checks, covering the two
+  // things the class declaration can and cannot see (#2707 step 2): the workflow's OWN
+  // declared class (`interactive: true` — refused unconditionally, whether or not it
+  // happens to contain a pause node right now) and a gate that arrived through `include:`
+  // in a workflow that omits `interactive: true` — written by someone looking at a
+  // different file (#1764), so the class declaration alone cannot catch it. Checked HERE,
+  // in the one function that backgrounds a run, rather than at each caller — this has two
+  // entrypoints (the console's default dispatch and the `manage_run` tool's startWorkflow,
+  // which reaches every platform with native tools), and a rule enforced per caller is a
+  // rule that fails open the moment a third appears. Throws before the worker conversation
+  // exists, so a refusal leaves nothing behind.
+  assertInteractiveClassNotBackgrounded(workflow);
   // Already-expanded — discoverWorkflowsWithConfig's output never contains an
   // IncludeDirective (#2486).
   assertComposedGateDriveable(workflow.nodes as DagNode[]);
