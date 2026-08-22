@@ -11262,6 +11262,118 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
     expect(data.invalidating_deps).toEqual(['producer']);
   });
 
+  it('invalidates a cached downstream when a dep that re-ran fresh failed (case 1 \"failed\" arm)', async () => {
+    // Pin case 1's `current?.state === 'failed'` arm of getStaleCachedDependencies
+    // (the #2402 bug surface on the failure path). A dep that was not in the prior
+    // snapshot and re-runs this resume is normally stale via case 1's
+    // `'completed'` check. The exact same dep shape on the failure path — producer
+    // re-attempted this resume and crashed — must also be flagged stale: honouring
+    // the cached downstream would silently report success over synthesis built
+    // against the prior run's view of a now-failed dep. Test 3 above pins the
+    // `'completed'` half of case 1; this one pins the `'failed'` half so a future
+    // refactor that drops `|| current?.state === 'failed'` is structurally caught
+    // (the regression is observationally indistinguishable from test 3 without it).
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      if (queryCount === 1) {
+        // Producer's only attempt fails. The catch arm in executeNodeInternal
+        // converts this to { state: 'failed', output: '', error: '...' } and the
+        // layer aggregation writes that into nodeOutputs['producer']. After this,
+        // any prior-cached consumer that depends on producer must be invalidated,
+        // not silently skipped. The error string is intentionally FATAL-class
+        // (matches `classifyError`'s 'auth error' fallback) so the default retry
+        // loop yields immediately — one attempt, no retries — keeping queryCount
+        // deterministic against the assertion.
+        throw new Error('producer crashed: provider auth error');
+      }
+      yield { type: 'assistant', content: 'fresh consumer output' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Consumer is cached (it ran in the prior run). Producer is NOT cached —
+    // it failed in the prior run and is being re-attempted this resume. Same
+    // shape as test 3 (case 1 with `'completed'`); the producer's FINAL state
+    // in nodeOutputs is `'failed'` instead.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['consumer', { output: 'STALE_CACHED_CONSUMER' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-fresh-failed-dep',
+      testDir,
+      {
+        name: 'stale-cache-fresh-failed-dep',
+        nodes: [
+          { id: 'producer', command: 'producer' },
+          // `all_done` (not the default `all_success`) so the consumer's trigger
+          // rule permits re-execution against a failed producer. Without this,
+          // the default rule would silently skip consumer on the failure path —
+          // exercising the staleness arm but never landing the consumer's query,
+          // which would erase the queryCount === 2 discriminator between
+          // AFTER and BEFORE the fix.
+          {
+            id: 'consumer',
+            command: 'consumer',
+            depends_on: ['producer'],
+            trigger_rule: 'all_done',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer failed (1 sendQuery attempt) + consumer was invalidated by the
+    // failed-dep arm and re-ran = 2 sendQuery calls in total. A regression that
+    // drops `|| current?.state === 'failed'` leaves case 1 unable to flag the
+    // failed dep; the consumer is then prior-skipped, sendQuery is only called
+    // for the producer's failed attempt, and queryCount lands at 1 — failing.
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+
+    // The cached-skip arm MUST NOT fire for the consumer. A regression that
+    // drops the `'failed'` arm (or narrows case 1 back to `=== 'completed'`)
+    // lets the prior-completed skip take over and emits
+    // node_skipped_prior_success — this assertion catches that exact fallback.
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeUndefined();
+
+    // The invalidation audit MUST fire for the consumer, naming the failed dep.
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.reason).toBe('stale_dependency');
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_output).toBe('STALE_CACHED_CONSUMER');
+  });
+
   it('invalidates when a dep’s structured output changes even though text is stable', async () => {
     // Case 3 of the staleness check: a `$dep.output.field` consumer must be invalidated
     // when the structured value changes, even if the text form is identical. Otherwise
