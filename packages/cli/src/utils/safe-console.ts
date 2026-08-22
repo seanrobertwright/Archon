@@ -92,7 +92,9 @@ export function flushPendingWrites(): Promise<void> {
  * have reached the OS, retrying short writes and `EAGAIN` through the event
  * loop (no busy-wait). See `utils/stdout.ts` for the underlying primitive.
  * Callers that DO need delivery confirmation before the process exits must
- * await `flushPendingWrites()` — see `cli.ts:1169-1180`.
+ * await `flushPendingWrites()` — see `utils/exit-with-drain.ts` (the helper
+ * `cli.ts`'s top-level `main().then().catch()` chain routes both arms
+ * through) and `cli.ts:1171-1202` (the comment and chain that use it).
  */
 export function installPipeSafeConsole(): void {
   if (installed) return;

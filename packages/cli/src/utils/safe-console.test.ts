@@ -216,17 +216,20 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
     const marker = `R9-MARKER-${Date.now()}`;
     // Mirror the cli.ts exit chain verbatim (with the fix): success and
     // fatal both route through `exitWithDrain`, which awaits
-    // `flushPendingWrites()` before `process.exit()`. If a future change
-    // drops the drain from the `.catch()` arm only, this fixture will not
-    // catch it directly — but the test still pins the safe-console drain
-    // contract for the catch path, and the structural fix in cli.ts is
-    // what makes both arms share the drain.
+    // `flushPendingWrites()` before `process.exit()`. The helper is
+    // imported from the same module `cli.ts` imports it from
+    // (`./utils/exit-with-drain.ts`), so the fixture's drain and cli.ts's
+    // drain cannot drift — a regression that drops the drain from one arm
+    // only would have to land in `exit-with-drain.ts` and would also drop
+    // it from the other arm, which is what we want to catch.
     const fixturePath = join(scratch, 'r9-fixture.ts');
     const shimEntry = join(import.meta.dir, 'safe-console.ts');
+    const exitWithDrainEntry = join(import.meta.dir, 'exit-with-drain.ts');
     writeFileSync(
       fixturePath,
       [
         `import { flushPendingWrites, installPipeSafeConsole } from ${JSON.stringify(shimEntry)};`,
+        `import { exitWithDrain } from ${JSON.stringify(exitWithDrainEntry)};`,
         `installPipeSafeConsole();`,
         `// Emit a large payload FIRST so the pipe buffer (64 KiB on macOS)`,
         `// fills and the marker cannot reach the OS before the catch arm`,
@@ -237,10 +240,6 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
         `console.log(${JSON.stringify(marker)});`,
         `// Simulate a fatal main() rejection.`,
         `async function main(): Promise<number> { throw new Error('simulated fatal'); }`,
-        `const exitWithDrain = async (code: number): Promise<never> => {`,
-        `  await flushPendingWrites();`,
-        `  process.exit(code);`,
-        `};`,
         `main().then(exitWithDrain).catch((error: unknown) => {`,
         `  const err = error as Error;`,
         `  console.error('Fatal error:', err.message);`,

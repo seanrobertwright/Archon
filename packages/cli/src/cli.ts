@@ -24,8 +24,11 @@ loadArchonEnv(process.cwd());
 // instead of dropping the tail — but delivery is fire-and-forget, so the
 // patched `console.log` returns synchronously and the exit path below must
 // await `flushPendingWrites()` before `process.exit()`. See
-// `utils/safe-console.ts` and #2400 for the full rationale.
-import { flushPendingWrites, installPipeSafeConsole } from './utils/safe-console';
+// `utils/exit-with-drain.ts` (the call site that owns the drain) and
+// `utils/safe-console.ts` for the underlying shim, and #2400 for the full
+// rationale.
+import { installPipeSafeConsole } from './utils/safe-console';
+import { exitWithDrain } from './utils/exit-with-drain';
 installPipeSafeConsole();
 
 import { parseArgs } from 'util';
@@ -1186,10 +1189,9 @@ async function main(): Promise<number> {
 // zero. Splitting the two arms' exit logic would re-open the R9 latency:
 // a fatal rejection against a slow reader would truncate and exit 1,
 // producing the same silent stdout loss the patch is meant to eliminate.
-const exitWithDrain = async (code: number): Promise<never> => {
-  await flushPendingWrites();
-  process.exit(code);
-};
+// The drain helper lives in `./utils/exit-with-drain.ts` so the
+// `safe-console.test.ts` R9 regression test imports the same code and a
+// drift between the two arms cannot land without changing that module.
 main()
   .then(exitWithDrain)
   .catch((error: unknown) => {
