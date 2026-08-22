@@ -120,8 +120,10 @@ export function installPipeSafeConsole(): void {
     pendingWrites.add(p);
   }
 
-  // Preserve the original symbol names so logs / stack traces still read
-  // "console.log" / "console.info" rather than "pipeSafeLog".
+  // Preserve the original symbol name so logs / stack traces still read
+  // "log" rather than "pipeSafeLog". (Both console.log and console.info
+  // delegate to the same function and therefore share this name — there is
+  // no separate "info" frame name to preserve.)
   Object.defineProperty(pipeSafeLog, 'name', { value: 'log', configurable: true });
 
   const consoleAny = console as {

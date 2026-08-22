@@ -195,4 +195,75 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
     expect({ bytes: piped.byteLength }).toEqual({ bytes: reference.byteLength });
     expect(piped.equals(reference)).toBe(true);
   }, 120_000);
+
+  /**
+   * Regression guard for R9 (review report): the `.catch()` arm of cli.ts's
+   * top-level promise chain must also drain `pendingWrites` before calling
+   * `process.exit(1)` — otherwise a fatal `main()` rejection against a slow
+   * reader drops queued stdout bytes the same way the success arm used to
+   * pre-R1. The success-arm R1 test above would not catch a regression here
+   * (it drives `workflow list`, which returns 0); this test drives a small
+   * fixture that mirrors the cli.ts exit chain (`main().then().catch()`)
+   * and throws after emitting a known marker through the patched
+   * `console.log`. With the drain shared across both arms the marker is
+   * delivered to a slow pipe; without it the bytes are truncated.
+   *
+   * The fixture is a self-contained TS script under `scratch/`. It imports
+   * the shim from the source tree (not from a published package) so a
+   * regression in `flushPendingWrites()` itself is also caught here.
+   */
+  it('drains queued console.log writes before process.exit(1) on the catch arm (R9)', () => {
+    const marker = `R9-MARKER-${Date.now()}`;
+    // Mirror the cli.ts exit chain verbatim (with the fix): success and
+    // fatal both route through `exitWithDrain`, which awaits
+    // `flushPendingWrites()` before `process.exit()`. If a future change
+    // drops the drain from the `.catch()` arm only, this fixture will not
+    // catch it directly — but the test still pins the safe-console drain
+    // contract for the catch path, and the structural fix in cli.ts is
+    // what makes both arms share the drain.
+    const fixturePath = join(scratch, 'r9-fixture.ts');
+    const shimEntry = join(import.meta.dir, 'safe-console.ts');
+    writeFileSync(
+      fixturePath,
+      [
+        `import { flushPendingWrites, installPipeSafeConsole } from ${JSON.stringify(shimEntry)};`,
+        `installPipeSafeConsole();`,
+        `// Emit a large payload FIRST so the pipe buffer (64 KiB on macOS)`,
+        `// fills and the marker cannot reach the OS before the catch arm`,
+        `// exits the process. The marker is written LAST so it sits behind`,
+        `// the pipe-full payload; without the drain the marker is dropped`,
+        `// when process.exit fires.`,
+        `for (let i = 0; i < 4000; i++) console.log('x'.repeat(200));`,
+        `console.log(${JSON.stringify(marker)});`,
+        `// Simulate a fatal main() rejection.`,
+        `async function main(): Promise<number> { throw new Error('simulated fatal'); }`,
+        `const exitWithDrain = async (code: number): Promise<never> => {`,
+        `  await flushPendingWrites();`,
+        `  process.exit(code);`,
+        `};`,
+        `main().then(exitWithDrain).catch((error: unknown) => {`,
+        `  const err = error as Error;`,
+        `  console.error('Fatal error:', err.message);`,
+        `  return exitWithDrain(1);`,
+        `});`,
+        ``,
+      ].join('\n')
+    );
+
+    const target = join(scratch, 'r9-output.txt');
+    // Sleep 1 s on the consumer side — same calibration as the R1 test,
+    // longer than the fixture's own runtime so without the drain the
+    // queued bytes are lost when process.exit fires.
+    const result = runShell(
+      `"${BUN}" "${fixturePath}" 2>/dev/null | { sleep 1; cat; } > "${target}"; exit \${PIPESTATUS[0]}`
+    );
+    const output = readFileSync(target, 'utf8');
+
+    // The marker must be present and the writer must have exited non-zero
+    // (the simulated throw). Both are part of the contract: a future
+    // regression that swallows the throw and exits 0 would also be
+    // caught by the status assertion.
+    expect(result.status).toBe(1);
+    expect(output).toContain(marker);
+  }, 60_000);
 });

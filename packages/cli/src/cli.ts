@@ -1180,13 +1180,20 @@ async function main(): Promise<number> {
 // awaits `writeStdout` / `writeJsonLine` at the call site
 // (src/utils/stdout.ts); the shim only adds the fire-and-forget shape that
 // the human-readable call surface requires.
+//
+// The drain runs on BOTH exits — success and fatal — so a `main()` rejection
+// does not get to drop queued stdout bytes just because it is exiting non-
+// zero. Splitting the two arms' exit logic would re-open the R9 latency:
+// a fatal rejection against a slow reader would truncate and exit 1,
+// producing the same silent stdout loss the patch is meant to eliminate.
+const exitWithDrain = async (code: number): Promise<never> => {
+  await flushPendingWrites();
+  process.exit(code);
+};
 main()
-  .then(async exitCode => {
-    await flushPendingWrites();
-    process.exit(exitCode);
-  })
+  .then(exitWithDrain)
   .catch((error: unknown) => {
     const err = error as Error;
     console.error('Fatal error:', err.message);
-    process.exit(1);
+    return exitWithDrain(1);
   });
