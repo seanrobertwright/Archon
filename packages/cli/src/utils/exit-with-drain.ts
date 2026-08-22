@@ -18,9 +18,19 @@
  * `safe-console.test.ts` imports the same helper from here. See R9 in the
  * review report.
  */
-import { flushPendingWrites } from './safe-console';
+import { consumeWriteError, flushPendingWrites } from './safe-console';
 
 export const exitWithDrain = async (code: number): Promise<never> => {
   await flushPendingWrites();
+  // Any `process.stdout.write` failure captured by the patched `console.log`
+  // (most commonly EPIPE from `archon … | head -c 100`) must surface as a
+  // non-zero exit regardless of platform. Without this, a Linux CI runner
+  // can schedule the unhandled-rejection handler after `process.exit()` and
+  // silently lose the EPIPE — the writer exits 0 even though the piped
+  // reader hung up before delivery completed.
+  if (consumeWriteError() !== null && code === 0) {
+    process.exit(1);
+    return undefined as never;
+  }
   process.exit(code);
 };

@@ -29,6 +29,16 @@
  * re-introduce the same silent-exit-0 truncation the patch is meant to
  * eliminate.
  *
+ * If a write fails (e.g. EPIPE because a piped reader hung up after `head -c
+ * 100`), the underlying rejection is recorded in `writeError` (see below).
+ * The deterministic exit-code path lives in `consumeWriteError()`, which
+ * `exitWithDrain()` calls after draining the in-flight writes: any captured
+ * error forces a non-zero exit regardless of which platform's runtime
+ * observed the rejection first. We deliberately do NOT re-throw the error
+ * asynchronously — a re-thrown async error still races `process.exit()` on
+ * Linux and would re-introduce the very flakiness the `consumeWriteError()`
+ * path was added to remove.
+ *
  * ## Scope (deliberate)
  *
  * - `console.log` and `console.info` are patched; `console.warn` /
@@ -72,6 +82,27 @@ let installed = false;
 const pendingWrites = new Set<Promise<void>>();
 
 /**
+ * First `process.stdout.write` error observed by the patched `console.log`,
+ * if any. Cleared by `consumeWriteError()` so the exit code only flips once.
+ * EPIPE is the common case (a piped reader like `head -c 100` hangs up after
+ * its slice, then the next write to fd 1 fails with `EPIPE: broken pipe`).
+ *
+ * The shim attaches a `.catch()` to the per-write promise that records the
+ * error here. `exitWithDrain()` reads it back via `consumeWriteError()` and
+ * forces a non-zero exit when it is set — that is what makes the exit code
+ * deterministic across platforms, including the Linux CI runner where Bun
+ * schedules its unhandled-rejection handler after `process.exit()` has
+ * already taken effect and the rejection would otherwise be swallowed.
+ *
+ * The `.catch()` here marks the per-write rejection as handled (so the test
+ * runner does not see it as an unhandled error), but we do NOT re-throw it
+ * elsewhere: a re-thrown async error would still race `process.exit()` on
+ * Linux and re-introduce the very flakiness the `consumeWriteError()` path
+ * was added to remove.
+ */
+let writeError: NodeJS.ErrnoException | null = null;
+
+/**
  * Resolve once every write queued so far has been handed to the OS in full.
  * `cli.ts` calls this between `main()` resolving and `process.exit()` so the
  * fire-and-forget patched `console.log` cannot race the exit and drop the
@@ -79,6 +110,19 @@ const pendingWrites = new Set<Promise<void>>();
  */
 export function flushPendingWrites(): Promise<void> {
   return Promise.allSettled([...pendingWrites]).then(() => undefined);
+}
+
+/**
+ * Pop the first write error observed by the patched `console.log`, if any.
+ * `exitWithDrain()` calls this between draining and `process.exit()` so a
+ * failed write (typically `EPIPE`) deterministically forces a non-zero exit
+ * code, independent of the runtime's unhandled-rejection ordering. Returns
+ * `null` when every write succeeded.
+ */
+export function consumeWriteError(): NodeJS.ErrnoException | null {
+  const err = writeError;
+  writeError = null;
+  return err;
 }
 
 /**
@@ -111,15 +155,22 @@ export function installPipeSafeConsole(): void {
     const text = formatWithOptions({ colors: false, depth: 4 }, ...args) + '\n';
     // Fire-and-forget: keep `void` return so callers don't have to await,
     // and so tests that mock `console.log` with `() => {}` still pass.
-    // Errors from `writeStdout` propagate to `process.stdout`'s uncaught
-    // error handler (Bun surfaces EPIPE as a process error, matching the
-    // behavior of the original `console.log` when the reader hangs up).
+    // Errors from `writeStdout` are recorded in `writeError` and consumed by
+    // `exitWithDrain()` to force a non-zero exit (see the `writeError`
+    // comment). The Linux CI runner schedules Bun's unhandled-rejection
+    // handler after `process.exit()` has taken effect; without the explicit
+    // `writeError` flag the exit code would silently drop to 0 — see the
+    // R5 regression test in `safe-console.test.ts`.
     // The promise is tracked in `pendingWrites` so `flushPendingWrites()`
     // can drain it before `process.exit()`.
     const p = writeStdout(text).finally(() => {
       pendingWrites.delete(p);
     });
     pendingWrites.add(p);
+    p.catch((err: unknown) => {
+      const e = err as NodeJS.ErrnoException;
+      if (writeError === null) writeError = e;
+    });
   }
 
   // Preserve the original symbol name so logs / stack traces still read
