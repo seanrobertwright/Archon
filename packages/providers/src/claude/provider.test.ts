@@ -1032,6 +1032,37 @@ describe('ClaudeProvider', () => {
       ]);
     });
 
+    test('drops hook_progress frames (only emitted for async hooks — none registered) (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_progress',
+          hook_id: 'h-3',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+          stdout: 'still running...',
+          stderr: '',
+          output: '',
+        };
+        yield {
+          type: 'assistant',
+          message: {
+            content: [{ type: 'text', text: 'Real response' }],
+          },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      // The hook_progress frame is intentionally not surfaced: Archon
+      // registers only synchronous hooks, and the hooks guide documents
+      // the carve-out. Only the assistant message reaches the stream.
+      expect(chunks).toEqual([{ type: 'assistant', content: 'Real response' }]);
+    });
+
     test('handles tool_use with empty input', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
