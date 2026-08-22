@@ -418,7 +418,7 @@ describe('classifyAndFormatError', () => {
     });
   });
 
-  describe('non-auth-classified Codex prefixes reject a bare "401"/"403" (#2509 R7)', () => {
+  describe('non-auth-classified Codex prefixes reject a bare "401"/"403" (#2509 R7, R9)', () => {
     // Before the fix, AUTH_PATTERNS's bare "401"/"403" match meant a message
     // containing either digit sequence could never reach classifyCodexError's
     // 'crash'/'unknown' branches — it was always classified 'auth' first and
@@ -427,18 +427,27 @@ describe('classifyAndFormatError', () => {
     // now genuinely reaches the provider's `Codex unknown:`/`Codex crash:`
     // wrap — proving the misroute doesn't just relocate to this branch's own
     // (now-removed) bare-401 fallback.
-    test('does not route "Codex unknown:" with an unrelated "401" to Codex auth guidance', () => {
+    //
+    // Asserting the exact returned string (not just the absence of
+    // Codex-specific phrasing) matters: the general auth branch a few lines
+    // below also used to accept a bare "401" with no prefix gate at all, so
+    // these two inputs used to land on generic-but-still-wrong "check your
+    // API key" guidance instead of the accurate branch two lines further
+    // down (#2509 R9). A negative-only assertion can't tell the difference.
+    test('routes "Codex unknown:" with an unrelated "401" to the ECONNREFUSED/database branch, not any auth guidance', () => {
       const result = classifyAndFormatError(
         new Error('Codex unknown: connect ECONNREFUSED 127.0.0.1:401')
       );
-      expect(result).not.toContain('Codex authentication');
-      expect(result).not.toContain('codex login');
+      expect(result).toBe('⚠️ Database connection issue. Please try again in a moment.');
+      expect(result).not.toContain('authentication');
     });
 
-    test('does not route "Codex crash:" with an unrelated "401" to Codex auth guidance', () => {
+    test('routes "Codex crash:" with an unrelated "401" to the timeout branch, not any auth guidance', () => {
       const result = classifyAndFormatError(new Error('Codex crash: timeout after 401ms'));
-      expect(result).not.toContain('Codex authentication');
-      expect(result).not.toContain('codex login');
+      expect(result).toBe(
+        '⚠️ Request timed out. The AI service may be slow. Try again or use /reset.'
+      );
+      expect(result).not.toContain('authentication');
     });
   });
 
@@ -458,13 +467,16 @@ describe('classifyAndFormatError', () => {
       expect(result).toContain('authentication error');
     });
 
-    test('detects "401" in message', () => {
+    test('does not treat a bare "401" alone as sufficient auth signal (#2509 R9)', () => {
+      // A bare "401" used to be enough on its own — same "bare digits aren't
+      // enough signal" defect already fixed on the Codex-specific checks
+      // above (#2509 R2, R7, R8). This message carries no other auth word
+      // ("API key" / "authentication_error" / "authentication error"), so it
+      // now falls through to the generic fallback instead of the auth
+      // message.
       const result = classifyAndFormatError(new Error('HTTP 401 Unauthorized'));
-      expect(result).toContain('authentication error');
-      // A message with no Codex-side prefix must stay on the general-auth
-      // branch, not the Codex branch above it (#2509 R3 — "authentication
-      // error" is a substring of both, so this guards the boundary directly).
-      expect(result).not.toContain('Codex authentication');
+      expect(result).toBe('⚠️ Error: HTTP 401 Unauthorized. Try /reset if issue persists.');
+      expect(result).not.toContain('authentication error');
     });
 
     test('does not false-positive on generic messages containing "auth"', () => {

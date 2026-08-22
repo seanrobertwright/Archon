@@ -2693,4 +2693,27 @@ describe('classifyCodexError (#2509 R7)', () => {
     // the word carries the signal, not the digits.
     expect(classifyCodexError('exceeded retry limit, last status: 401 Unauthorized')).toBe('auth');
   });
+
+  test('resolves a crash-pattern message carrying a stray digit to the retryable "crash" class, not silently to "unknown" (#2509 R13)', () => {
+    // Not classifying as 'auth' isn't sufficient on its own — shouldRetry =
+    // errorClass === 'rate_limit' || errorClass === 'crash', so a crash-shaped
+    // message must specifically land on 'crash' (retryable), not fall through
+    // to 'unknown' (also non-retryable), or a future reordering of
+    // SUBPROCESS_CRASH_PATTERNS/AUTH_PATTERNS could silently regress retry
+    // eligibility without any test catching it.
+    expect(classifyCodexError('exited with code 401')).toBe('crash');
+  });
+
+  test('does not classify a bare "429" substring as rate_limit (#2509 R11)', () => {
+    expect(classifyCodexError('connect ECONNREFUSED 127.0.0.1:4291')).not.toBe('rate_limit');
+    expect(
+      classifyCodexError('operation timed out after 4293ms while establishing connection')
+    ).not.toBe('rate_limit');
+  });
+
+  test('still classifies genuine rate-limit signals as rate_limit', () => {
+    expect(classifyCodexError('rate limit exceeded')).toBe('rate_limit');
+    expect(classifyCodexError('too many requests, please slow down')).toBe('rate_limit');
+    expect(classifyCodexError('server overloaded')).toBe('rate_limit');
+  });
 });

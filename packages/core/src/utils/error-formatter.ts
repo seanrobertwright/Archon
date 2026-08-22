@@ -106,12 +106,17 @@ export function classifyAndFormatError(error: Error): string {
     return '⚠️ Not logged in to the AI provider. Connect a subscription or API key in Settings → Agents, or set credentials in your environment (e.g. `claude /login` or `CLAUDE_API_KEY`).';
   }
 
-  // General AI/SDK authentication errors
+  // General AI/SDK authentication errors. Deliberately excludes a bare "401":
+  // same "bare digits aren't enough signal" reasoning as the Codex checks
+  // above (#2509 R2, R7, R8) — a stray status-looking digit in unrelated
+  // text (a port, a byte offset, a millisecond duration) is not a reliable
+  // auth indicator on its own, and this function has more accurate branches
+  // for exactly those shapes a few lines below (timeout, ECONNREFUSED). The
+  // three remaining checks already carry the real signal (#2509 R9).
   if (
     message.includes('API key') ||
     message.includes('authentication_error') ||
-    message.includes('authentication error') ||
-    message.includes('401')
+    message.includes('authentication error')
   ) {
     return '⚠️ AI service authentication error. Please check your API key or credentials.';
   }
