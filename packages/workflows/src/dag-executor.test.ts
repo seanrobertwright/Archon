@@ -11343,6 +11343,127 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
     expect(data.invalidating_deps).toEqual(['producer']);
     expect(data.prior_structured_output).toEqual({ stale: true });
   });
+
+  it('invalidates a cached downstream when ONE of its multiple deps re-ran (any-stale triggers re-execution)', async () => {
+    // Pin the "any stale dep invalidates" trigger for cached consumers with >= 2 deps
+    // (#2402). The single-dep cases above can't catch a regression to "re-run only when
+    // ALL deps are stale" (`if (staleDeps.length === deps.length)`), which would
+    // re-introduce the original bug for any cached consumer that has at least one
+    // fresh dep and one stable one. The shape: producer re-runs (always_run, fresh
+    // output) + side stays cached (text-identical to prior) -> consumer is cached
+    // but reads `$producer.output` in its prompt. The fresh producer MUST invalidate
+    // the cached consumer even though side is stable.
+    const seenPrompts: string[] = [];
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      seenPrompts.push(prompt);
+      queryCount++;
+      // queryCount 1: producer re-runs (always_run).
+      // queryCount 2: consumer re-runs after cache invalidation.
+      // Side is in priorCompletedNodes with text-identical-to-prior output, so the
+      // pre-populate loop seeds it and the resume-skip arm fires for it — side is
+      // never sent to sendQuery.
+      yield {
+        type: 'assistant',
+        content: queryCount === 1 ? 'FRESH producer output' : 'consumer result',
+      };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // All three nodes cached in the prior run. Side's cached output matches what its
+    // pre-populated nodeOutputs entry will carry, so case 2 (text diff) reports no
+    // staleness for side. Producer's cached output is the stale value — the fresh
+    // always_run execution will surface case 2 and invalidate consumer.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['producer', { output: 'STALE producer output' }],
+      ['side', { output: 'stable side output' }],
+      ['consumer', { output: 'STALE consumer output' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-multi-dep',
+      testDir,
+      {
+        name: 'stale-cache-multi-dep',
+        nodes: [
+          // always_run forces producer to re-execute this resume (case 2 fires).
+          { id: 'producer', command: 'producer', always_run: true },
+          // Stable dep — text matches prior so case 2 doesn't flag it.
+          { id: 'side', command: 'side' },
+          // Consumer reads producer; its dep list has BOTH producer and side.
+          {
+            id: 'consumer',
+            prompt: 'Use $producer.output and $side.output',
+            depends_on: ['producer', 'side'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Exactly two queries: producer re-runs (always_run), consumer re-runs
+    // (cache invalidated). Side is skipped via the pre-populate prior-success arm,
+    // so it never reaches sendQuery.
+    expect(queryCount).toBe(2);
+
+    // Consumer's prompt must contain the FRESH producer output (not the stale cached
+    // value the resume snapshot carried). Side's stable output is also fine.
+    const consumerPrompt = seenPrompts[1];
+    expect(consumerPrompt).toContain('FRESH producer output');
+    expect(consumerPrompt).not.toContain('STALE producer output');
+    expect(consumerPrompt).toContain('stable side output');
+
+    // Consumer emits node_prior_cache_invalidated naming ONLY the stale dep. If a
+    // future refactor flagged every dep in the list (or stopped pushing after the
+    // first dep), invalidating_deps would either be ['producer','side'] or []
+    // respectively — both would fail this length-1 assertion.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeUndefined();
+
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.reason).toBe('stale_dependency');
+    // Length 1 (not 2) — pinning the "any stale dep invalidates" trigger; pinning
+    // that only the actually-stale dep is reported (not the stable side).
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_output).toBe('STALE consumer output');
+
+    // Side stayed cached, so it should emit node_skipped_prior_success exactly once.
+    const sideSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'side'
+    );
+    expect(sideSkippedEvent).toBeDefined();
+  });
 });
 
 describe('executeDagWorkflow -- break after result (no hang on subprocess exit)', () => {
