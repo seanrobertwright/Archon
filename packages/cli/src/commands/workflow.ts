@@ -3358,7 +3358,8 @@ export async function workflowRejectCommand(
   if (json) {
     try {
       const resolvedId = await resolveRunIdArg(runId, cwd);
-      const result = await rejectWorkflow(resolvedId, reason);
+      const rejectText = reason && reason.length > 0 ? reason : 'Rejected';
+      const result = await rejectWorkflow(resolvedId, rejectText);
       await writeJsonLine({
         ok: true,
         runId: resolvedId,
@@ -3375,7 +3376,8 @@ export async function workflowRejectCommand(
   }
 
   const resolvedId = await resolveRunIdArg(runId, cwd);
-  const result = await rejectWorkflow(resolvedId, reason);
+  const rejectText = reason && reason.length > 0 ? reason : 'Rejected';
+  const result = await rejectWorkflow(resolvedId, rejectText);
 
   if (result.cancelled) {
     const suffix = result.maxAttemptsReached ? ' (max attempts reached)' : '';
