@@ -8,8 +8,15 @@ describe('toWorkflow — source normalization', () => {
     expect(toWorkflow({ workflow: { name: 'a' }, source: 'bundled' }).source).toBe('bundled');
   });
 
-  test('falls back to bundled for an unrecognized source', () => {
-    expect(toWorkflow({ workflow: { name: 'a' }, source: 'something-new' }).source).toBe('bundled');
+  test('surfaces an unrecognised source verbatim rather than collapsing it to bundled (#2578)', () => {
+    // The server emits only the three known sources today, but a misspelled or
+    // future value must not be silently collapsed to 'bundled' — that would
+    // mark the workflow read-only and turn Save into Save-as. The fix mirrors
+    // `groupCommandsBySource` (`packages/web/src/lib/command-groups.ts`, #2570):
+    // surface unknown values rather than hide them.
+    expect(toWorkflow({ workflow: { name: 'a' }, source: 'something-new' }).source).toBe(
+      'something-new'
+    );
   });
 
   test('normalizes a missing description to null', () => {
