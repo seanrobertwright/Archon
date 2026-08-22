@@ -301,10 +301,39 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       // exactly what a fresh run's in-process consumer would have. A missing/unreadable
       // spill degrades to the preview rather than failing resume — this is not a DB
       // error, so it must not propagate as one (see this function's own doc comment).
+      //
+      // The spill file is addressed by a stable, node-scoped filename that a later
+      // execution of the SAME node overwrites in place (by design — see
+      // `formatPersistedNodeOutput`'s doc comment). Its write races this row's own
+      // fire-and-forget insert (`createWorkflowEvent` never awaited, never throws), so a
+      // process crash between "spill file overwritten by a later execution" and "this
+      // row's insert lands" could otherwise leave an older, still-durable row pointing at
+      // a NEWER execution's content. Guard against that by validating the file's actual
+      // byte length against this row's own recorded `node_output_original_bytes` before
+      // trusting it — a mismatch means the file no longer describes this row, so fall
+      // back to the bounded preview exactly like a missing spill would.
       let output = data.node_output;
       if (typeof data.node_output_spill_path === 'string') {
         try {
-          output = await readFile(data.node_output_spill_path, 'utf8');
+          const spilled = await readFile(data.node_output_spill_path, 'utf8');
+          const spilledBytes = Buffer.byteLength(spilled, 'utf8');
+          if (
+            typeof data.node_output_original_bytes === 'number' &&
+            spilledBytes !== data.node_output_original_bytes
+          ) {
+            getLog().warn(
+              {
+                runId: workflowRunId,
+                stepName: row.step_name,
+                spillPath: data.node_output_spill_path,
+                expectedBytes: data.node_output_original_bytes,
+                actualBytes: spilledBytes,
+              },
+              'db.workflow_dag_node_output_spill_stale'
+            );
+          } else {
+            output = spilled;
+          }
         } catch (spillErr) {
           getLog().warn(
             {

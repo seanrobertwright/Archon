@@ -865,6 +865,44 @@ describe('workflow-events', () => {
         );
       });
 
+      test('falls back to the preview when the spill file no longer matches the recorded byte length (#2726)', async () => {
+        // Simulates the crash-window race: the spill file at this path was overwritten by
+        // a LATER execution of the same node (a resume re-execution via always_run or
+        // stale-dependency invalidation), but this row's own event insert is the one that
+        // ended up durable. The spill no longer describes what this row actually recorded.
+        const spillPath = join(spillDir, 'racy-node.nodeoutput');
+        await writeFile(spillPath, 'z'.repeat(12_345)); // a DIFFERENT execution's content
+
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'racy-node',
+              event_type: 'node_completed',
+              data: {
+                node_output: 'preview text' + '\n\n… [truncated; original output was 50000 bytes]',
+                node_output_truncated: true,
+                node_output_original_bytes: 50_000,
+                node_output_spill_path: spillPath,
+              },
+            },
+          ])
+        );
+
+        const snapshot = await getDagResumeSnapshot('run-spill-stale');
+
+        expect(snapshot.completedNodeOutputs.get('racy-node')?.output).toBe(
+          'preview text' + '\n\n… [truncated; original output was 50000 bytes]'
+        );
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            spillPath,
+            expectedBytes: 50_000,
+            actualBytes: 12_345,
+          }),
+          'db.workflow_dag_node_output_spill_stale'
+        );
+      });
+
       test('does not attempt a spill read when no spill path is recorded', async () => {
         mockQuery.mockResolvedValueOnce(
           createQueryResult([
