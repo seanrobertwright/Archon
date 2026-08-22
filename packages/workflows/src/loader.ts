@@ -955,7 +955,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     const parseWarnings: string[] = [];
     const dagNodes = (raw.nodes as unknown[])
       .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors, parseWarnings))
-      .filter((n): n is DagNode => n !== null);
+      .filter((n): n is DagNode | IncludeDirective => n !== null);
 
     if (dagNodes.length !== (raw.nodes as unknown[]).length) {
       getLog().warn({ filename, validationErrors }, 'dag_node_validation_failed');
@@ -1002,6 +1002,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       };
     }
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (node.provider !== undefined && !isRegisteredProvider(node.provider)) {
         return {
           workflow: null,
@@ -1017,10 +1018,11 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     }
 
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (!isNodeContextResume(node.context)) continue;
       const sourceNodeId = node.context.resume;
       const source = dagNodes.find(candidate => candidate.id === sourceNodeId);
-      if (source === undefined) continue; // validateDagStructure already reports this case.
+      if (source === undefined || isIncludeDirective(source)) continue; // validateDagStructure already reports this case.
 
       const consumerProvider = node.provider ?? provider;
       const sourceProvider = source.provider ?? provider;
@@ -1072,6 +1074,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     // in via workflow-level `persist_sessions: true` and contains, e.g., a bash node.
     const workflowPersistSessions = raw.persist_sessions === true;
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (!isPersistableNode(node)) continue;
       if ('context' in node && node.context === 'fresh') continue;
 

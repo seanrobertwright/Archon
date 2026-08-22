@@ -76,7 +76,6 @@ import {
   isGateNode,
   isHaltNode,
   isIncludeDirective,
-  isWorkflowNode,
   isPersistableNode,
   readSubrunMetadata,
   isApprovalContext,
@@ -1931,8 +1930,16 @@ async function executeNodeInternal(
     }
     rawPrompt = promptResult.content;
   } else {
-    // node.source.kind === 'inline' — prompt: string is guaranteed by the discriminated union
-    rawPrompt = node.source.kind === 'inline' ? node.source.prompt : '';
+    // commandName undefined implies node.source.kind === 'inline' by construction
+    // (AgentBody.source is a two-member union) — but the compiler can't correlate
+    // that back across the two independent derivations, so fail loud rather than
+    // silently defaulting if that ever stops being true.
+    if (node.source.kind !== 'inline') {
+      throw new Error(
+        `unreachable: node '${node.id}' has no commandName but source.kind is not 'inline'`
+      );
+    }
+    rawPrompt = node.source.prompt;
   }
 
   // Standard variable substitution
@@ -8472,266 +8479,274 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             }
           }
 
-          // 3. Bash node dispatch — no AI, no session. Opt-in retry only: a
-          // deterministic node retries solely when it declares an explicit
-          // `retry:` block (single attempt otherwise), so side-effectful scripts
-          // aren't silently re-run (#2088).
-          if (isExecNode(node) && node.runtime === 'sh') {
-            const output = await runDeterministicNodeWithRetry(
-              node,
-              platform,
-              conversationId,
-              workflowRun,
-              () =>
-                executeBashNode(
-                  deps,
+          // 3. Non-agent node dispatch. A real `switch (node.kind)` (not a chain of
+          // `isXNode` guards) so the compiler enforces exhaustiveness: the `default`
+          // branch's `never` assignment fails to compile the moment a new `DagNode`
+          // kind is added without a matching `case` here (AC1). Every case below
+          // returns except `'agent'`, which `break`s to fall through to the shared
+          // agent-handling code that follows — `node` narrows to `AgentNode` there.
+          switch (node.kind) {
+            case 'exec': {
+              // Bash/script dispatch — no AI, no session. Opt-in retry only: a
+              // deterministic node retries solely when it declares an explicit
+              // `retry:` block (single attempt otherwise), so side-effectful scripts
+              // aren't silently re-run (#2088).
+              if (node.runtime === 'sh') {
+                const output = await runDeterministicNodeWithRetry(
+                  node,
                   platform,
                   conversationId,
-                  cwd,
                   workflowRun,
-                  node,
-                  artifactsDir,
-                  stateDir,
-                  logDir,
-                  baseBranch,
-                  docsDir,
-                  ctx.nodeOutputs,
-                  issueContext,
-                  config.envVars,
-                  stepNamePrefix,
-                  iteration,
-                  execContext
-                )
-            );
-            return { nodeId: node.id, output };
-          }
-
-          // 3b. Loop node dispatch — manages its own AI sessions and iteration
-          if (isLoopNode(node)) {
-            const {
-              provider: loopProvider,
-              options: loopOptions,
-              model: resolvedLoopModel,
-              tier: resolvedLoopTier,
-              effort: resolvedLoopEffort,
-            } = await resolveNodeProviderAndModel(
-              node,
-              workflowProvider,
-              workflowModel,
-              config,
-              platform,
-              conversationId,
-              workflowRun.id,
-              cwd,
-              workflowLevelOptions,
-              aiProfile,
-              workflowPreset,
-              resolveAiConfigText,
-              ctx.warnedProviderConflicts,
-              execContext
-            );
-
-            const output = await executeLoopNode(
-              deps,
-              platform,
-              conversationId,
-              cwd,
-              workflowRun,
-              node,
-              loopProvider,
-              loopOptions,
-              artifactsDir,
-              stateDir,
-              logDir,
-              baseBranch,
-              docsDir,
-              ctx.nodeOutputs,
-              config,
-              issueContext,
-              configuredCommandFolder,
-              stepNamePrefix,
-              execContext,
-              resolvedLoopModel,
-              resolvedLoopTier,
-              resolvedLoopEffort,
-              checkpointSessionForProvider(loopProvider),
-              ctx.workflowSourceRoots
-            );
-            // Loop nodes run every iteration on the same resolved provider, so the
-            // result session (if any) is attributable to loopProvider — tag it so a
-            // downstream sequential node on a different provider starts fresh (#1992).
-            return { nodeId: node.id, output, sessionProvider: loopProvider };
-          }
-
-          // 3b'. Loop-group node dispatch — manages its own subgraph iteration
-          // (body is a sealed sub-DAG re-executed per iteration; the loop is
-          // encapsulated inside this one node, keeping the outer DAG acyclic).
-          if (isLoopGroupNode(node)) {
-            // Resolve provider for the group (group-level provider/model overrides are
-            // forwarded to body AI nodes; the group itself never calls sendQuery, so
-            // the resolved SendQueryOptions are not needed here).
-            const { provider: loopGroupProvider } = await resolveNodeProviderAndModel(
-              node,
-              workflowProvider,
-              workflowModel,
-              config,
-              platform,
-              conversationId,
-              workflowRun.id,
-              cwd,
-              workflowLevelOptions,
-              aiProfile,
-              workflowPreset,
-              resolveAiConfigText,
-              ctx.warnedProviderConflicts,
-              execContext
-            );
-
-            const output = await executeLoopGroupNode(
-              deps,
-              platform,
-              conversationId,
-              cwd,
-              workflowRun,
-              node,
-              loopGroupProvider,
-              workflowModel,
-              workflowLevelOptions,
-              aiProfile,
-              workflowPreset,
-              artifactsDir,
-              stateDir,
-              logDir,
-              baseBranch,
-              docsDir,
-              ctx.nodeOutputs,
-              config,
-              ctx.warnedProviderConflicts,
-              ctx.loopGroupPath,
-              issueContext,
-              stepNamePrefix,
-              execContext,
-              ctx.runChildWorkflow,
-              ctx.workflowSourceRoots
-            );
-            return { nodeId: node.id, output };
-          }
-
-          // 3c. Approval node dispatch — pauses workflow for human review
-          if (isGateNode(node)) {
-            const output = await executeApprovalNode(
-              node,
-              workflowRun,
-              deps,
-              platform,
-              conversationId,
-              workflowProvider,
-              workflowModel,
-              cwd,
-              artifactsDir,
-              stateDir,
-              logDir,
-              baseBranch,
-              docsDir,
-              ctx.nodeOutputs,
-              config,
-              workflowLevelOptions,
-              configuredCommandFolder,
-              issueContext,
-              aiProfile,
-              workflowPreset,
-              stepNamePrefix,
-              iteration,
-              execContext,
-              ctx.workflowSourceRoots
-            );
-            return { nodeId: node.id, output };
-          }
-
-          // 3d. Cancel node dispatch — terminates the workflow run
-          if (isHaltNode(node)) {
-            const reason = substituteNodeOutputRefs(node.reason, ctx.nodeOutputs);
-            const cancelMsg = `❌ **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
-            await safeSendMessage(platform, conversationId, cancelMsg, {
-              workflowId: workflowRun.id,
-              nodeName: node.id,
-            });
-            deps.store
-              .createWorkflowEvent({
-                workflow_run_id: workflowRun.id,
-                event_type: 'workflow_cancelled',
-                step_name: stepNamePrefix + node.id,
-                data: { reason },
-              })
-              .catch((err: Error) => {
-                getLog().error(
-                  { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
-                  'workflow.event_persist_failed'
+                  () =>
+                    executeBashNode(
+                      deps,
+                      platform,
+                      conversationId,
+                      cwd,
+                      workflowRun,
+                      node,
+                      artifactsDir,
+                      stateDir,
+                      logDir,
+                      baseBranch,
+                      docsDir,
+                      ctx.nodeOutputs,
+                      issueContext,
+                      config.envVars,
+                      stepNamePrefix,
+                      iteration,
+                      execContext
+                    )
                 );
+                return { nodeId: node.id, output };
+              }
+              // Script dispatch — runs via bun or uv. Same opt-in retry rule as bash
+              // (#2088): retries solely when an explicit `retry:` block is declared.
+              const output = await runDeterministicNodeWithRetry(
+                node,
+                platform,
+                conversationId,
+                workflowRun,
+                () =>
+                  executeScriptNode(
+                    deps,
+                    platform,
+                    conversationId,
+                    cwd,
+                    workflowRun,
+                    node,
+                    artifactsDir,
+                    stateDir,
+                    logDir,
+                    baseBranch,
+                    docsDir,
+                    ctx.nodeOutputs,
+                    issueContext,
+                    config.envVars,
+                    stepNamePrefix,
+                    iteration,
+                    ctx.bodyLoopUserInput ?? '',
+                    execContext,
+                    ctx.workflowSourceRoots
+                  )
+              );
+              return { nodeId: node.id, output };
+            }
+
+            case 'loop': {
+              // Loop node dispatch — manages its own AI sessions and iteration
+              const {
+                provider: loopProvider,
+                options: loopOptions,
+                model: resolvedLoopModel,
+                tier: resolvedLoopTier,
+                effort: resolvedLoopEffort,
+              } = await resolveNodeProviderAndModel(
+                node,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions,
+                aiProfile,
+                workflowPreset,
+                resolveAiConfigText,
+                ctx.warnedProviderConflicts,
+                execContext
+              );
+
+              const output = await executeLoopNode(
+                deps,
+                platform,
+                conversationId,
+                cwd,
+                workflowRun,
+                node,
+                loopProvider,
+                loopOptions,
+                artifactsDir,
+                stateDir,
+                logDir,
+                baseBranch,
+                docsDir,
+                ctx.nodeOutputs,
+                config,
+                issueContext,
+                configuredCommandFolder,
+                stepNamePrefix,
+                execContext,
+                resolvedLoopModel,
+                resolvedLoopTier,
+                resolvedLoopEffort,
+                checkpointSessionForProvider(loopProvider),
+                ctx.workflowSourceRoots
+              );
+              // Loop nodes run every iteration on the same resolved provider, so the
+              // result session (if any) is attributable to loopProvider — tag it so a
+              // downstream sequential node on a different provider starts fresh (#1992).
+              return { nodeId: node.id, output, sessionProvider: loopProvider };
+            }
+
+            case 'loop_group': {
+              // Loop-group node dispatch — manages its own subgraph iteration
+              // (body is a sealed sub-DAG re-executed per iteration; the loop is
+              // encapsulated inside this one node, keeping the outer DAG acyclic).
+              // Resolve provider for the group (group-level provider/model overrides are
+              // forwarded to body AI nodes; the group itself never calls sendQuery, so
+              // the resolved SendQueryOptions are not needed here).
+              const { provider: loopGroupProvider } = await resolveNodeProviderAndModel(
+                node,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions,
+                aiProfile,
+                workflowPreset,
+                resolveAiConfigText,
+                ctx.warnedProviderConflicts,
+                execContext
+              );
+
+              const output = await executeLoopGroupNode(
+                deps,
+                platform,
+                conversationId,
+                cwd,
+                workflowRun,
+                node,
+                loopGroupProvider,
+                workflowModel,
+                workflowLevelOptions,
+                aiProfile,
+                workflowPreset,
+                artifactsDir,
+                stateDir,
+                logDir,
+                baseBranch,
+                docsDir,
+                ctx.nodeOutputs,
+                config,
+                ctx.warnedProviderConflicts,
+                ctx.loopGroupPath,
+                issueContext,
+                stepNamePrefix,
+                execContext,
+                ctx.runChildWorkflow,
+                ctx.workflowSourceRoots
+              );
+              return { nodeId: node.id, output };
+            }
+
+            case 'gate': {
+              // Approval node dispatch — pauses workflow for human review
+              const output = await executeApprovalNode(
+                node,
+                workflowRun,
+                deps,
+                platform,
+                conversationId,
+                workflowProvider,
+                workflowModel,
+                cwd,
+                artifactsDir,
+                stateDir,
+                logDir,
+                baseBranch,
+                docsDir,
+                ctx.nodeOutputs,
+                config,
+                workflowLevelOptions,
+                configuredCommandFolder,
+                issueContext,
+                aiProfile,
+                workflowPreset,
+                stepNamePrefix,
+                iteration,
+                execContext,
+                ctx.workflowSourceRoots
+              );
+              return { nodeId: node.id, output };
+            }
+
+            case 'halt': {
+              // Cancel node dispatch — terminates the workflow run
+              const reason = substituteNodeOutputRefs(node.reason, ctx.nodeOutputs);
+              const cancelMsg = `❌ **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
+              await safeSendMessage(platform, conversationId, cancelMsg, {
+                workflowId: workflowRun.id,
+                nodeName: node.id,
               });
-            await deps.store.cancelWorkflowRun(workflowRun.id);
-            getWorkflowEventEmitter().emit({
-              type: 'workflow_cancelled',
-              runId: workflowRun.id,
-              nodeId: node.id,
-              reason,
-            });
-            // Return completed — the between-layer status check will see 'cancelled' and break.
-            return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
-          }
+              deps.store
+                .createWorkflowEvent({
+                  workflow_run_id: workflowRun.id,
+                  event_type: 'workflow_cancelled',
+                  step_name: stepNamePrefix + node.id,
+                  data: { reason },
+                })
+                .catch((err: Error) => {
+                  getLog().error(
+                    { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
+                    'workflow.event_persist_failed'
+                  );
+                });
+              await deps.store.cancelWorkflowRun(workflowRun.id);
+              getWorkflowEventEmitter().emit({
+                type: 'workflow_cancelled',
+                runId: workflowRun.id,
+                nodeId: node.id,
+                reason,
+              });
+              // Return completed — the between-layer status check will see 'cancelled' and break.
+              return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
+            }
 
-          // 3e. Script node dispatch — runs via bun or uv. Opt-in retry only,
-          // same as bash (#2088): retries solely when an explicit `retry:` block
-          // is declared, single attempt otherwise.
-          if (isExecNode(node) && node.runtime !== 'sh') {
-            const output = await runDeterministicNodeWithRetry(
-              node,
-              platform,
-              conversationId,
-              workflowRun,
-              () =>
-                executeScriptNode(
-                  deps,
-                  platform,
-                  conversationId,
-                  cwd,
-                  workflowRun,
-                  node,
-                  artifactsDir,
-                  stateDir,
-                  logDir,
-                  baseBranch,
-                  docsDir,
-                  ctx.nodeOutputs,
-                  issueContext,
-                  config.envVars,
-                  stepNamePrefix,
-                  iteration,
-                  ctx.bodyLoopUserInput ?? '',
-                  execContext,
-                  ctx.workflowSourceRoots
-                )
-            );
-            return { nodeId: node.id, output };
-          }
+            case 'workflow': {
+              // Workflow (sub-run) node dispatch — starts/re-inspects a child run
+              // (#2121 Phase 2). Makes no direct provider call; the closure captured on
+              // ctx.runChildWorkflow drives the child's own executeWorkflow. The
+              // output_type sidecar is handled by the shared completed-node path;
+              // node_completed is written inline by executeWorkflowNode itself (see
+              // asCompleted — only on true completion, never on the paused branch).
+              const output = await executeWorkflowNode(node, ctx);
+              return { nodeId: node.id, output };
+            }
 
-          // 3f. Workflow (sub-run) node dispatch — starts/re-inspects a child run
-          // (#2121 Phase 2). Makes no direct provider call; the closure captured on
-          // ctx.runChildWorkflow drives the child's own executeWorkflow. The
-          // output_type sidecar is handled by the shared completed-node path;
-          // node_completed is written inline by executeWorkflowNode itself (see
-          // asCompleted — only on true completion, never on the paused branch).
-          if (isWorkflowNode(node)) {
-            const output = await executeWorkflowNode(node, ctx);
-            return { nodeId: node.id, output };
-          }
+            case 'agent':
+              break;
 
-          // Every other kind (exec, loop, loop_group, gate, halt, workflow) returned
-          // above — only 'agent' falls through. The two `isExecNode(node) && ...`
-          // branches above split on `node.runtime`, so the compiler cannot itself
-          // prove their union is exhaustive; this makes the elimination explicit.
-          if (!isAgentNode(node)) {
-            throw new Error(`unreachable: node '${node.id}' matched no dispatch branch`);
+            default: {
+              const unreachable: never = node;
+              throw new Error(
+                `unreachable: node '${(unreachable as { id: string }).id}' matched no dispatch branch`
+              );
+            }
           }
 
           // 4. Resolve per-node provider/model/options

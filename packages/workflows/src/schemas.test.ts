@@ -861,13 +861,12 @@ describe('dagNodeSchema — loop_group', () => {
     const result = dagNodeSchema.safeParse({
       id: 'grp',
       loop: { prompt: 'p', until: 'DONE', max_iterations: 3 },
-      loop_group: {
-        until: 'DONE',
-        max_iterations: 3,
-        nodes: [{ id: 'x', kind: 'agent', source: { kind: 'inline', prompt: 'x' } }],
-      },
+      loop_group: { until: 'DONE', max_iterations: 3, nodes: [{ id: 'x', prompt: 'x' }] },
     });
     expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toContain('mutually exclusive');
+    }
   });
 
   test('loop_group rejects retry (loop manages its own iteration)', () => {
