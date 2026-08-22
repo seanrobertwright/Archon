@@ -46,7 +46,7 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after all mock.module calls) ---
 import { executeDagWorkflow } from './dag-executor';
-import type { ScriptNode, WorkflowRun } from './schemas';
+import type { ExecNode, WorkflowRun } from './schemas';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 
@@ -232,8 +232,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('uv inline with deps uses uv run --with flags', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'fetch-data',
+      kind: 'exec',
       script: 'import httpx; print(httpx.get("https://example.com").status_code)',
       runtime: 'uv',
       deps: ['httpx', 'beautifulsoup4'],
@@ -273,8 +274,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('uv inline without deps uses uv run python -c', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'simple-py',
+      kind: 'exec',
       script: 'print("hello")',
       runtime: 'uv',
     };
@@ -305,8 +307,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('uv inline with empty deps array uses uv run python -c (no extra flags)', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'empty-deps-py',
+      kind: 'exec',
       script: 'print("no deps")',
       runtime: 'uv',
       deps: [],
@@ -338,8 +341,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('bun inline with deps uses bun --no-env-file -e (no extra dep flags — bun auto-installs)', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'bun-with-deps',
+      kind: 'exec',
       script: 'import { z } from "zod"; console.log(z.string().parse("hello"))',
       runtime: 'bun',
       deps: ['zod', 'node-fetch'],
@@ -374,8 +378,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('bun inline without deps uses bun --no-env-file -e', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'bun-no-deps',
+      kind: 'exec',
       script: 'console.log("hello")',
       runtime: 'bun',
     };
@@ -412,8 +417,9 @@ describe('script node deps field — command construction', () => {
     const { writeFile } = await import('fs/promises');
     await writeFile(join(scriptsDir, 'analyze.py'), 'import httpx\nprint("ok")');
 
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'run-analyze',
+      kind: 'exec',
       script: 'analyze',
       runtime: 'uv',
       deps: ['httpx'],
@@ -459,8 +465,9 @@ describe('script node deps field — command construction', () => {
     const { writeFile } = await import('fs/promises');
     await writeFile(join(scriptsDir, 'simple.py'), 'print("simple")');
 
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'run-simple',
+      kind: 'exec',
       script: 'simple',
       runtime: 'uv',
     };

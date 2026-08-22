@@ -11,7 +11,7 @@
  */
 import type { WorkflowRequirement, WorkflowInputSpec } from '../schemas/workflow';
 import type { DagNode } from '../schemas/dag-node';
-import { isApprovalNode, isLoopGroupNode } from '../schemas/dag-node';
+import { isGateNode, isLoopGroupNode } from '../schemas/dag-node';
 import { readComposedMeta } from '../compiled-command';
 import { resolveDeclaredInputs, WorkflowInputContractError } from '../workflow-inputs';
 
@@ -79,9 +79,11 @@ export interface ComposedApprovalGate {
 export function findComposedApprovalGate(nodes: readonly DagNode[]): ComposedApprovalGate | null {
   for (const node of nodes) {
     const origin = readComposedMeta(node)?.origin;
-    if (origin !== undefined && isApprovalNode(node)) return { nodeId: node.id, origin };
+    if (origin !== undefined && isGateNode(node)) return { nodeId: node.id, origin };
     if (isLoopGroupNode(node)) {
-      const nested = findComposedApprovalGate(node.loop_group.nodes);
+      // Invoked at run dispatch, against an already-expanded workflow (#2486) — the
+      // body never actually holds an `IncludeDirective` here.
+      const nested = findComposedApprovalGate(node.loop_group.nodes as DagNode[]);
       if (nested !== null) return nested;
     }
   }

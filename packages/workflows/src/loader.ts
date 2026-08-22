@@ -1,18 +1,22 @@
 /**
  * Workflow loader - discovers and parses workflow YAML files
  */
-import type { WorkflowDefinition, WorkflowLoadError, DagNode, WorkflowNodeHooks } from './schemas';
+import type {
+  WorkflowDefinition,
+  WorkflowLoadError,
+  DagNode,
+  IncludeDirective,
+  WorkflowNodeHooks,
+} from './schemas';
 import {
-  isBashNode,
-  isCommandNode,
-  isPromptNode,
+  isExecNode,
+  isAgentNode,
   isLoopNode,
   isLoopGroupNode,
-  isApprovalNode,
-  isCancelNode,
-  isScriptNode,
-  isIncludeNode,
+  isGateNode,
+  isHaltNode,
   isWorkflowNode,
+  isIncludeDirective,
   isPersistableNode,
   isNodeContextResume,
 } from './schemas';
@@ -25,7 +29,6 @@ import {
 import {
   dagNodeSchema,
   BASH_NODE_AI_FIELDS,
-  SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
@@ -155,7 +158,7 @@ export function validateWorkflowOutcomeDeclaration(
   if (selectedNode === undefined) {
     return `Workflow declares returns: '${workflow.returns}' but no top-level node has that id`;
   }
-  if (isIncludeNode(selectedNode)) return null;
+  if (isIncludeDirective(selectedNode)) return null;
   if (isLoopGroupNode(selectedNode)) {
     return `Workflow outcome_field: '${field}' cannot select loop_group node '${workflow.returns}' because loop_group output_format is ignored and its runtime output is raw text; select a schema-enforced collector node instead`;
   }
@@ -343,7 +346,7 @@ function parseDagNode(
   index: number,
   errors: string[],
   warnings: string[]
-): DagNode | null {
+): DagNode | IncludeDirective | null {
   // Extract id early for error messages (may be empty/invalid — schema will catch it)
   const id = nodeIdForMessages(raw, index);
 
@@ -357,12 +360,12 @@ function parseDagNode(
 
   const node = result.data;
 
-  // `mutates_checkout:` on an include node is the fourth launch-only option (#1764), and
+  // `mutates_checkout:` on an include is the fourth launch-only option (#1764), and
   // the only one the schema cannot see: it is workflow-level, so Zod strips it before
   // superRefine runs. An author writes it on an `include:` believing the block declares
   // its own concurrency safety; composition has one checkout and one run, so the
   // declaration belongs to the composing workflow or to a genuinely separate sub-run.
-  if (isIncludeNode(node) && (raw as Record<string, unknown>).mutates_checkout !== undefined) {
+  if (isIncludeDirective(node) && (raw as Record<string, unknown>).mutates_checkout !== undefined) {
     errors.push(
       `Node '${id}': 'mutates_checkout' is not supported on an include node: a composed block shares the run's single checkout, so concurrency safety is the composing workflow's to declare. Set it at workflow level, or use a 'workflow:' node when you want a separate governed run.`
     );
@@ -371,17 +374,17 @@ function parseDagNode(
 
   collectUnknownNodeKeys(raw, id, `Node '${id}'`, warnings);
 
-  // `with:` is live on command/script (node-local bindings, #2637) and include/workflow
-  // (caller inputs). On every other node type Zod strips it silently — surface that
-  // through the parse-warnings channel (#2213) so an author learns the binding never
-  // attached, without rejecting YAML that loaded fine before.
-  if (
-    (raw as Record<string, unknown>).with !== undefined &&
-    !isCommandNode(node) &&
-    !isScriptNode(node) &&
-    !isIncludeNode(node) &&
-    !isWorkflowNode(node)
-  ) {
+  // `with:` is live on an agent node's command-sourced form (node-local bindings,
+  // #2637), on exec (script-runtime only), and on include/workflow (caller inputs).
+  // On every other node type Zod strips it silently — surface that through the
+  // parse-warnings channel (#2213) so an author learns the binding never attached,
+  // without rejecting YAML that loaded fine before.
+  const hasWithSupport =
+    isIncludeDirective(node) ||
+    isWorkflowNode(node) ||
+    (isExecNode(node) && node.runtime !== 'sh') ||
+    (isAgentNode(node) && node.source.kind === 'command');
+  if ((raw as Record<string, unknown>).with !== undefined && !hasWithSupport) {
     warnings.push(
       `Node '${id}': 'with' is only supported on command, script, include, and workflow nodes — it is ignored here`
     );
@@ -390,22 +393,20 @@ function parseDagNode(
 
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
   let nonAiNode: { type: string; fields: readonly string[] } | undefined;
-  if (isCancelNode(node)) {
-    nonAiNode = { type: 'cancel', fields: BASH_NODE_AI_FIELDS };
-  } else if (isIncludeNode(node)) {
+  if (isIncludeDirective(node)) {
     nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
+  } else if (isHaltNode(node)) {
+    nonAiNode = { type: 'cancel', fields: BASH_NODE_AI_FIELDS };
   } else if (isWorkflowNode(node)) {
     nonAiNode = { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
-  } else if (isApprovalNode(node)) {
+  } else if (isGateNode(node)) {
     nonAiNode = { type: 'approval', fields: BASH_NODE_AI_FIELDS };
   } else if (isLoopNode(node)) {
     nonAiNode = { type: 'loop', fields: LOOP_NODE_AI_FIELDS };
   } else if (isLoopGroupNode(node)) {
     nonAiNode = { type: 'loop_group', fields: LOOP_GROUP_NODE_AI_FIELDS };
-  } else if (isScriptNode(node)) {
-    nonAiNode = { type: 'script', fields: SCRIPT_NODE_AI_FIELDS };
-  } else if ('bash' in node && typeof node.bash === 'string') {
-    nonAiNode = { type: 'bash', fields: BASH_NODE_AI_FIELDS };
+  } else if (isExecNode(node)) {
+    nonAiNode = { type: node.runtime === 'sh' ? 'bash' : 'script', fields: BASH_NODE_AI_FIELDS };
   }
   if (nonAiNode) {
     const presentAiFields = nonAiNode.fields.filter(
@@ -464,7 +465,7 @@ function freeFormAiProducerKind(node: DagNode): 'schema-capable' | 'loop-group' 
   // verdict and the same remedy, and there is no longer a separate 'loop' kind. (A
   // `loop_group:` still has none of that: it never calls the provider itself.)
   if (isLoopGroupNode(node)) return 'loop-group';
-  if (!isLoopNode(node) && !isPromptNode(node) && !isCommandNode(node)) return null;
+  if (!isLoopNode(node) && !isAgentNode(node)) return null;
   return node.output_format === undefined ? 'schema-capable' : null;
 }
 
@@ -488,11 +489,11 @@ const GATE_ON_A_SHELL_NODE =
  * the free-form-AI check needs that producer's type and `output_format`.
  */
 export function validateDagStructure(
-  nodes: DagNode[],
-  enclosingNodes?: ReadonlyMap<string, DagNode>
+  nodes: (DagNode | IncludeDirective)[],
+  enclosingNodes?: ReadonlyMap<string, DagNode | IncludeDirective>
 ): string | null {
   // Check ID uniqueness
-  const nodesById = new Map<string, DagNode>();
+  const nodesById = new Map<string, DagNode | IncludeDirective>();
   for (const node of nodes) {
     if (nodesById.has(node.id)) {
       return `Duplicate node id: '${node.id}'`;
@@ -595,81 +596,99 @@ export function validateDagStructure(
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
   const whenRefPattern = new RegExp(WHEN_REF_SOURCE, 'g');
   for (const node of nodes) {
-    const sources: { field: string; text: string; bodyNodes?: readonly DagNode[] }[] = [];
-    if ('prompt' in node && typeof node.prompt === 'string') {
-      sources.push({ field: 'prompt', text: node.prompt });
-    }
-    // Node-level AI configuration, valid on every AI node mode — pushed outside the mode
-    // chain like `when:`. Substituted at run time since #1764, so a dangling ref here
-    // fails at load rather than reaching the provider as literal text.
-    if (node.systemPrompt !== undefined) {
-      sources.push({ field: 'systemPrompt', text: node.systemPrompt });
-    }
-    if (node.agents !== undefined) {
-      for (const [agentId, agent] of Object.entries(node.agents)) {
-        sources.push({ field: `agents.${agentId}.prompt`, text: agent.prompt });
-        sources.push({ field: `agents.${agentId}.description`, text: agent.description });
+    const sources: {
+      field: string;
+      text: string;
+      bodyNodes?: readonly (DagNode | IncludeDirective)[];
+    }[] = [];
+    // An include directive has no execution surface of its own — its `with:`
+    // values were never scanned by this function even before #2486 (they are the
+    // composed workflow's business once inlined). Its `when:` (below) IS still
+    // scanned, unlike its sources here.
+    if (!isIncludeDirective(node)) {
+      if (isAgentNode(node) && node.source.kind === 'inline') {
+        sources.push({ field: 'prompt', text: node.source.prompt });
       }
-    }
-    if (isBashNode(node)) sources.push({ field: 'bash', text: node.bash });
-    if (isScriptNode(node)) sources.push({ field: 'script', text: node.script });
-    // Node-local bindings (#2637): command/script `with:` string values are live ref
-    // surfaces (whole refs and templates), and a directive's `from` is one whole ref.
-    // KEEP IN SYNC item 1 — rewriteNodeOutputRefs and the builder scan walk the same
-    // surface. Non-string literals carry no refs.
-    if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
-      for (const [name, value] of Object.entries(node.with)) {
-        if (typeof value === 'string') {
-          sources.push({ field: `with.${name}`, text: value });
-        } else if (isBindingDirective(value)) {
-          sources.push({ field: `with.${name}.from`, text: value.from });
+      // Node-level AI configuration, valid on every AI node mode — pushed outside the mode
+      // chain like `when:`. Substituted at run time since #1764, so a dangling ref here
+      // fails at load rather than reaching the provider as literal text.
+      if (node.systemPrompt !== undefined) {
+        sources.push({ field: 'systemPrompt', text: node.systemPrompt });
+      }
+      if (node.agents !== undefined) {
+        for (const [agentId, agent] of Object.entries(node.agents)) {
+          sources.push({ field: `agents.${agentId}.prompt`, text: agent.prompt });
+          sources.push({ field: `agents.${agentId}.description`, text: agent.description });
         }
       }
-    }
-    // workflow.input is a live ref surface (a data string), scanned verbatim like
-    // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
-    // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
-    if (isWorkflowNode(node)) {
-      if (node.input) sources.push({ field: 'input', text: node.input });
-      if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
-      // A `workflow:` node's `with:` values (#2470) are live ref surfaces: unlike
-      // an `include:` node's `with:` (inlined by the macro and caught post-expansion
-      // by this same scan), sub-run `with:` values are never inlined — they resolve
-      // at runtime into `$INPUTS.<name>` — so scan them here for dangling refs.
-      // Only strings can carry refs (#2637); typed literals pass through untouched.
-      if (node.with) {
-        for (const [name, value] of Object.entries(node.with)) {
-          if (typeof value === 'string') sources.push({ field: `with.${name}`, text: value });
+      if (isExecNode(node)) {
+        sources.push({ field: node.runtime === 'sh' ? 'bash' : 'script', text: node.script });
+      }
+      // Node-local bindings (#2637): an agent's command-sourced `with:` and an exec
+      // node's `with:` string values are live ref surfaces (whole refs and
+      // templates), and a directive's `from` is one whole ref. KEEP IN SYNC item 1 —
+      // rewriteNodeOutputRefs and the builder scan walk the same surface. Non-string
+      // literals carry no refs.
+      const nodeWith = isExecNode(node)
+        ? node.with
+        : isAgentNode(node) && node.source.kind === 'command'
+          ? node.source.with
+          : undefined;
+      if (nodeWith !== undefined) {
+        for (const [name, value] of Object.entries(nodeWith)) {
+          if (typeof value === 'string') {
+            sources.push({ field: `with.${name}`, text: value });
+          } else if (isBindingDirective(value)) {
+            sources.push({ field: `with.${name}.from`, text: value.from });
+          }
         }
       }
-    }
-    if (isCancelNode(node)) sources.push({ field: 'cancel', text: node.cancel });
-    if (isApprovalNode(node)) {
-      sources.push({ field: 'approval.message', text: node.approval.message });
-      if (node.approval.on_reject !== undefined) {
+      // workflow.input is a live ref surface (a data string), scanned verbatim like
+      // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
+      // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
+      if (isWorkflowNode(node)) {
+        if (node.input) sources.push({ field: 'input', text: node.input });
+        if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
+        // A `workflow:` node's `with:` values (#2470) are live ref surfaces: unlike
+        // an `include:` node's `with:` (inlined by the macro and caught post-expansion
+        // by this same scan), sub-run `with:` values are never inlined — they resolve
+        // at runtime into `$INPUTS.<name>` — so scan them here for dangling refs.
+        // Only strings can carry refs (#2637); typed literals pass through untouched.
+        if (node.with) {
+          for (const [name, value] of Object.entries(node.with)) {
+            if (typeof value === 'string') sources.push({ field: `with.${name}`, text: value });
+          }
+        }
+      }
+      if (isHaltNode(node)) sources.push({ field: 'cancel', text: node.reason });
+      if (isGateNode(node)) {
+        sources.push({ field: 'approval.message', text: node.message });
+        const rework = node.decisions.find(d => d.rework !== undefined)?.rework;
+        if (rework !== undefined) {
+          sources.push({
+            field: 'approval.on_reject.prompt',
+            text: rework.prompt,
+          });
+        }
+      }
+      if (isLoopNode(node)) {
+        if (typeof node.loop.prompt === 'string') {
+          sources.push({ field: 'loop.prompt', text: node.loop.prompt });
+        }
+        if (node.loop.until_bash) {
+          sources.push({ field: 'loop.until_bash', text: node.loop.until_bash });
+        }
+      }
+      if (isLoopGroupNode(node) && node.loop_group.until_bash) {
+        // The group evaluates this field after each body iteration against the same output
+        // map the body populated, so its direct body nodes are visible here in addition to
+        // the current and enclosing DAG scopes.
         sources.push({
-          field: 'approval.on_reject.prompt',
-          text: node.approval.on_reject.prompt,
+          field: 'loop_group.until_bash',
+          text: node.loop_group.until_bash,
+          bodyNodes: node.loop_group.nodes,
         });
       }
-    }
-    if (isLoopNode(node)) {
-      if (typeof node.loop.prompt === 'string') {
-        sources.push({ field: 'loop.prompt', text: node.loop.prompt });
-      }
-      if (node.loop.until_bash) {
-        sources.push({ field: 'loop.until_bash', text: node.loop.until_bash });
-      }
-    }
-    if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-      // The group evaluates this field after each body iteration against the same output
-      // map the body populated, so its direct body nodes are visible here in addition to
-      // the current and enclosing DAG scopes.
-      sources.push({
-        field: 'loop_group.until_bash',
-        text: node.loop_group.until_bash,
-        bodyNodes: node.loop_group.nodes,
-      });
     }
     for (const source of sources) {
       let m: RegExpExecArray | null;
@@ -731,7 +750,7 @@ export function validateDagStructure(
         if (atom?.ref.kind !== 'node' || atom.ref.field !== undefined) continue;
         const producerId = atom.ref.nodeId;
         const producer = nodesById.get(producerId) ?? enclosingNodes?.get(producerId);
-        if (!producer) continue;
+        if (!producer || isIncludeDirective(producer)) continue;
         const kind = freeFormAiProducerKind(producer);
         if (kind === null) continue;
         const problem = `Node '${node.id}' field 'when' compares the whole output of AI node '${producerId}' to a literal ('${atom.expected}'). That output is free-form prose, so the comparison silently fails and '${node.id}' is skipped.`;
@@ -752,6 +771,7 @@ export function validateDagStructure(
   // A named session source must be in the same static scope and complete before its
   // consumer. Runtime validation owns provider/session facts that loading cannot know.
   for (const node of nodes) {
+    if (isIncludeDirective(node)) continue;
     if (!isNodeContextResume(node.context)) continue;
     if (enclosingNodes !== undefined) {
       return `Node '${node.id}' uses context.resume inside a loop_group body, which is not supported`;
@@ -761,7 +781,7 @@ export function validateDagStructure(
     if (source === undefined) {
       return `Node '${node.id}' context.resume references unknown node '${sourceId}'`;
     }
-    if (!isCommandNode(source) && !isPromptNode(source) && !isLoopNode(source)) {
+    if (isIncludeDirective(source) || !(isAgentNode(source) || isLoopNode(source))) {
       return `Node '${node.id}' context.resume source '${sourceId}' is not a session-producing command, prompt, or loop node`;
     }
     if (!transitiveDepsOf(node.id).has(sourceId)) {
@@ -776,7 +796,7 @@ export function validateDagStructure(
   // load time with an actionable message instead. A literal `items` with no `$…output`
   // ref is left to the runtime fail-closed check (it must still parse to an array).
   for (const node of nodes) {
-    if (!isWorkflowNode(node) || !node.fan_out) continue;
+    if (isIncludeDirective(node) || !isWorkflowNode(node) || !node.fan_out) continue;
     const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);
     const producerId = refMatch?.[1];
     if (producerId === undefined) continue; // no ref surface — runtime fail-closed owns it
@@ -791,8 +811,14 @@ export function validateDagStructure(
   // enforced — a loop_group body node may read the enclosing scope, whose outputs are
   // settled before the group starts (existing body-ref semantics).
   for (const node of nodes) {
-    if (!(isCommandNode(node) || isScriptNode(node)) || node.with === undefined) continue;
-    for (const [name, value] of Object.entries(node.with)) {
+    if (isIncludeDirective(node)) continue;
+    const nodeWith = isExecNode(node)
+      ? node.with
+      : isAgentNode(node) && node.source.kind === 'command'
+        ? node.source.with
+        : undefined;
+    if (nodeWith === undefined) continue;
+    for (const [name, value] of Object.entries(nodeWith)) {
       const producerIds: string[] = [];
       if (typeof value === 'string') {
         const refPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
@@ -822,17 +848,22 @@ export function validateDagStructure(
   // Outer-DAG cycle/depends_on checks above operate on the flattened top-level node
   // list and treat each loop_group as one outer node.
   for (const node of nodes) {
-    if (isLoopGroupNode(node)) {
+    if (!isIncludeDirective(node) && isLoopGroupNode(node)) {
       // `workflow:` (sub-run) inside a loop_group body is rejected (bounds the
       // interaction surface — see the plan's NOT Building). This wholesale rejection
       // also covers a fan-out (`fan_out:`) workflow node in a loop_group body (slice 2,
       // PR-C): a fan-out is a `workflow:` node, so nesting it per-iteration is likewise
       // out of scope.
-      const workflowInBody = node.loop_group.nodes.find(isWorkflowNode);
+      const workflowInBody = node.loop_group.nodes.find(
+        n => !isIncludeDirective(n) && isWorkflowNode(n)
+      );
       if (workflowInBody) {
         return `loop_group '${node.id}' body: 'workflow' (sub-run) is not supported inside a loop_group body`;
       }
-      const scopeNodes = new Map<string, DagNode>([...(enclosingNodes ?? []), ...nodesById]);
+      const scopeNodes = new Map<string, DagNode | IncludeDirective>([
+        ...(enclosingNodes ?? []),
+        ...nodesById,
+      ]);
       const bodyError = validateDagStructure(node.loop_group.nodes, scopeNodes);
       if (bodyError) {
         return `loop_group '${node.id}' body: ${bodyError}`;
@@ -924,7 +955,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     const parseWarnings: string[] = [];
     const dagNodes = (raw.nodes as unknown[])
       .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors, parseWarnings))
-      .filter((n): n is DagNode => n !== null);
+      .filter((n): n is DagNode | IncludeDirective => n !== null);
 
     if (dagNodes.length !== (raw.nodes as unknown[]).length) {
       getLog().warn({ filename, validationErrors }, 'dag_node_validation_failed');
@@ -971,6 +1002,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       };
     }
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (node.provider !== undefined && !isRegisteredProvider(node.provider)) {
         return {
           workflow: null,
@@ -986,10 +1018,11 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     }
 
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (!isNodeContextResume(node.context)) continue;
       const sourceNodeId = node.context.resume;
       const source = dagNodes.find(candidate => candidate.id === sourceNodeId);
-      if (source === undefined) continue; // validateDagStructure already reports this case.
+      if (source === undefined || isIncludeDirective(source)) continue; // validateDagStructure already reports this case.
 
       const consumerProvider = node.provider ?? provider;
       const sourceProvider = source.provider ?? provider;
@@ -1041,6 +1074,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     // in via workflow-level `persist_sessions: true` and contains, e.g., a bash node.
     const workflowPersistSessions = raw.persist_sessions === true;
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (!isPersistableNode(node)) continue;
       if ('context' in node && node.context === 'fresh') continue;
 
@@ -1093,12 +1127,13 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     // (approval messages won't reach the user in web background runs)
     if (!interactive) {
       // Covers loop: and loop_group: gates, including loops nested inside loop_group bodies.
-      const hasInteractiveLoop = (ns: DagNode[]): boolean =>
+      const hasInteractiveLoop = (ns: (DagNode | IncludeDirective)[]): boolean =>
         ns.some(
           n =>
-            (isLoopNode(n) && n.loop.interactive === true) ||
-            (isLoopGroupNode(n) &&
-              (n.loop_group.interactive === true || hasInteractiveLoop(n.loop_group.nodes)))
+            !isIncludeDirective(n) &&
+            ((isLoopNode(n) && n.loop.interactive === true) ||
+              (isLoopGroupNode(n) &&
+                (n.loop_group.interactive === true || hasInteractiveLoop(n.loop_group.nodes))))
         );
       if (hasInteractiveLoop(dagNodes)) {
         getLog().warn({ filename }, 'interactive_loop_in_non_interactive_workflow');
@@ -1109,13 +1144,14 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     // only changes interactive-gate behavior — a non-interactive loop already
     // completes on the signal, so the author's intent is likely a missing
     // `interactive: true`. The workflow still loads.
-    const hasSignalCompletesWithoutInteractive = (ns: DagNode[]): boolean =>
+    const hasSignalCompletesWithoutInteractive = (ns: (DagNode | IncludeDirective)[]): boolean =>
       ns.some(
         n =>
-          (isLoopNode(n) && n.loop.signal_completes === true && n.loop.interactive !== true) ||
-          (isLoopGroupNode(n) &&
-            ((n.loop_group.signal_completes === true && n.loop_group.interactive !== true) ||
-              hasSignalCompletesWithoutInteractive(n.loop_group.nodes)))
+          !isIncludeDirective(n) &&
+          ((isLoopNode(n) && n.loop.signal_completes === true && n.loop.interactive !== true) ||
+            (isLoopGroupNode(n) &&
+              ((n.loop_group.signal_completes === true && n.loop_group.interactive !== true) ||
+                hasSignalCompletesWithoutInteractive(n.loop_group.nodes))))
       );
     if (hasSignalCompletesWithoutInteractive(dagNodes)) {
       getLog().warn({ filename }, 'signal_completes_without_interactive_ignored');

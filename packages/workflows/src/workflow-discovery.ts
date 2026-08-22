@@ -26,8 +26,9 @@ import type {
   WorkflowSource,
   DeclaredWorkflowConfig,
   DagNode,
+  IncludeDirective,
 } from './schemas';
-import { isIncludeNode, isLoopGroupNode } from './schemas';
+import { isIncludeDirective, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
 import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 // Re-exported here because this is the module callers already import to discover with.
@@ -518,10 +519,10 @@ async function resolveIncludeBlockCommandContents(
   config: CommandScanConfig
 ): Promise<Map<string, IncludeCommandContent>> {
   const targetNames = new Set<string>();
-  const visitNodes = (nodes: readonly DagNode[]): void => {
+  const visitNodes = (nodes: readonly (DagNode | IncludeDirective)[]): void => {
     for (const node of nodes) {
-      if (isLoopGroupNode(node)) visitNodes(node.loop_group.nodes);
-      if (!isIncludeNode(node) || targetNames.has(node.include)) continue;
+      if (!isIncludeDirective(node) && isLoopGroupNode(node)) visitNodes(node.loop_group.nodes);
+      if (!isIncludeDirective(node) || targetNames.has(node.include)) continue;
       targetNames.add(node.include);
       const target = byName.get(node.include);
       if (target) visit(target);

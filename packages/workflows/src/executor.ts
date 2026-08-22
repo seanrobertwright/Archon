@@ -12,6 +12,7 @@ import { createLogger, captureWorkflowInvoked, captureWorkflowCompleted } from '
 import { getDefaultBranch, toRepoPath } from '@archon/git';
 import type {
   DagNode,
+  IncludeDirective,
   WorkflowDefinition,
   WorkflowRun,
   WorkflowExecutionResult,
@@ -21,9 +22,8 @@ import type {
 import {
   isLoopNode,
   isLoopGroupNode,
-  isApprovalNode,
-  isScriptNode,
-  isBashNode,
+  isGateNode,
+  isExecNode,
   isApprovalContext,
   isRunBlockedOnChild,
   SUBRUN_METADATA_KEYS,
@@ -439,7 +439,11 @@ function composeRunPaths(
  * default behavior unchanged.
  */
 export function resolveScopeArtifactsDir(
-  workflow: { name: string; nodes: readonly DagNode[]; persist_sessions?: boolean },
+  workflow: {
+    name: string;
+    nodes: readonly (DagNode | IncludeDirective)[];
+    persist_sessions?: boolean;
+  },
   conversationId: string | null | undefined,
   artifactsRoot: string
 ): string | undefined {
@@ -2291,25 +2295,29 @@ export async function executeWorkflow(
     // workflows report their real name, custom ones report "custom". No PII —
     // descriptions/prompts/paths are never sent. Machine context + version ride
     // along as super-properties. Opt out: ARCHON_TELEMETRY_DISABLED=1 / DO_NOT_TRACK=1.
+    // Already-expanded — the run is about to execute this workflow, so `workflow.nodes`
+    // never actually holds an `IncludeDirective` here even though the type admits one
+    // for the general pre-expansion case (#2486).
+    const telemetryNodes = workflow.nodes as DagNode[];
     captureWorkflowInvoked({
       workflowName: workflow.name,
       workflowSource: source,
       platform: platform.getPlatformType(),
       provider: resolvedProvider,
       model: resolvedModel,
-      nodeCount: workflow.nodes.length,
-      usesLoop: workflow.nodes.some(isLoopNode),
-      usesLoopGroup: workflow.nodes.some(isLoopGroupNode),
-      usesApproval: workflow.nodes.some(isApprovalNode),
-      usesScript: workflow.nodes.some(isScriptNode),
-      usesBash: workflow.nodes.some(isBashNode),
-      usesOutputFormat: workflow.nodes.some(n => n.output_format !== undefined),
-      usesOutputType: workflow.nodes.some(n => n.output_type !== undefined),
+      nodeCount: telemetryNodes.length,
+      usesLoop: telemetryNodes.some(isLoopNode),
+      usesLoopGroup: telemetryNodes.some(isLoopGroupNode),
+      usesApproval: telemetryNodes.some(isGateNode),
+      usesScript: telemetryNodes.some(n => isExecNode(n) && n.runtime !== 'sh'),
+      usesBash: telemetryNodes.some(n => isExecNode(n) && n.runtime === 'sh'),
+      usesOutputFormat: telemetryNodes.some(n => n.output_format !== undefined),
+      usesOutputType: telemetryNodes.some(n => n.output_type !== undefined),
       usesPersistSession:
-        workflow.persist_sessions === true || workflow.nodes.some(n => n.persist_session === true),
-      usesMcp: workflow.nodes.some(n => n.mcp !== undefined),
-      usesSkills: workflow.nodes.some(n => n.skills !== undefined),
-      usesFreshContext: workflow.nodes.some(n => isLoopNode(n) && n.loop.fresh_context),
+        workflow.persist_sessions === true || telemetryNodes.some(n => n.persist_session === true),
+      usesMcp: telemetryNodes.some(n => n.mcp !== undefined),
+      usesSkills: telemetryNodes.some(n => n.skills !== undefined),
+      usesFreshContext: telemetryNodes.some(n => isLoopNode(n) && n.loop.fresh_context),
       interactive: workflow.interactive ?? false,
       usedIsolation: isolationContext !== undefined,
       isResume: dagPriorCompletedNodes !== undefined,
@@ -2486,13 +2494,15 @@ export async function executeWorkflow(
         }
       : workflowRun;
 
-    // Execute the DAG workflow
+    // Execute the DAG workflow. Already-expanded (see `telemetryNodes` above) — the
+    // executor's own `DagNode[]` parameter type is correctly narrow; this boundary
+    // cast reflects that invariant, not a new one.
     const dagSummary = await executeDagWorkflow(
       deps,
       platform,
       conversationId,
       cwd,
-      workflow,
+      { ...workflow, nodes: telemetryNodes },
       runForDag,
       resolvedProvider,
       resolvedModel,

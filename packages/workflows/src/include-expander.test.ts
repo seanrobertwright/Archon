@@ -29,7 +29,9 @@ function mapOf(...workflows: WorkflowDefinition[]): Map<string, WorkflowDefiniti
 }
 
 function nodeById(w: WorkflowDefinition, id: string): DagNode | undefined {
-  return w.nodes.find(n => n.id === id);
+  // Callers always pass an expandWorkflowIncludes() result, which never contains
+  // an IncludeDirective (#2486).
+  return (w.nodes as DagNode[]).find(n => n.id === id);
 }
 
 function composedMeta(node: DagNode | undefined): ComposedNodeMeta | undefined {
@@ -51,6 +53,31 @@ function composedBoundaries(node: DagNode | undefined): ComposedBlockBoundary[] 
 function compiledLoopPrompt(node: DagNode | undefined): string | undefined {
   if (!node || !('loop' in node)) return undefined;
   return (node.loop as typeof node.loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND]?.prompt;
+}
+
+/** The `loop_group` config of a loop_group node, or undefined for any other kind. */
+function loopGroupOf(
+  node: DagNode | undefined
+): { nodes: DagNode[]; until_bash?: string } | undefined {
+  if (!node || !('loop_group' in node)) return undefined;
+  return { ...node.loop_group, nodes: node.loop_group.nodes as DagNode[] };
+}
+
+/** The body nodes of a `loop_group` node, or undefined for any other kind. */
+function loopGroupNodes(node: DagNode | undefined): DagNode[] | undefined {
+  return loopGroupOf(node)?.nodes;
+}
+
+/** The inline prompt text of an agent node, or undefined for any other kind
+ * or a command-sourced agent node (formerly the bare `'prompt' in node` idiom, #2486). */
+function inlinePrompt(node: DagNode | undefined): string | undefined {
+  return node && 'source' in node && node.source.kind === 'inline' ? node.source.prompt : undefined;
+}
+
+/** The shell script text of a `runtime: 'sh'` exec node, or undefined for any other
+ * kind (formerly the bare `'bash' in node` idiom, #2486). */
+function bashScript(node: DagNode | undefined): string | undefined {
+  return node && 'script' in node && node.runtime === 'sh' ? node.script : undefined;
 }
 
 /** A 3-node review-like block: verify -> scope -> impl (sole sink = impl). */
@@ -137,12 +164,10 @@ describe('expandWorkflowIncludes — namespacing', () => {
     const { workflows } = expandWorkflowIncludes(mapOf(blockWorkflow(), parent));
     const expanded = workflows.get('parent')!;
     const summary = nodeById(expanded, 'summary');
-    expect(summary && 'prompt' in summary ? summary.prompt : '').toBe(
-      'read $review__impl.output here'
-    );
+    expect(inlinePrompt(summary) ?? '').toBe('read $review__impl.output here');
     // Internal block ref ($verify.output inside scope) namespaced too.
     const scope = nodeById(expanded, 'review__scope');
-    expect(scope && 'prompt' in scope ? scope.prompt : '').toBe('scope $review__verify.output');
+    expect(inlinePrompt(scope) ?? '').toBe('scope $review__verify.output');
   });
 
   test("propagates the include node's when/trigger_rule onto entry nodes", () => {
@@ -246,7 +271,7 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const judge = nodeById(workflows.get('parent')!, 'review__judge');
-    expect(judge && 'prompt' in judge ? judge.prompt : '').toBe(
+    expect(inlinePrompt(judge) ?? '').toBe(
       'Plan: $plan.output; scope: $review__gather.output; base: main'
     );
   });
@@ -318,7 +343,7 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     expect(errors).toHaveLength(0);
     const expanded = workflows.get('parent')!;
     expect(nodeById(expanded, 'review__work')).toMatchObject({
-      prompt: 'Main: CLEAN-TEMP-FILES',
+      source: { kind: 'inline', prompt: 'Main: CLEAN-TEMP-FILES' },
       systemPrompt: 'You handle CLEAN-TEMP-FILES',
       agents: {
         helper: {
@@ -328,10 +353,11 @@ describe('expandWorkflowIncludes — with input mapping', () => {
       },
     });
     expect(nodeById(expanded, 'review__gate')).toMatchObject({
-      approval: {
-        message: 'Approve CLEAN-TEMP-FILES?',
-        on_reject: { prompt: 'Retry with CLEAN-TEMP-FILES' },
-      },
+      message: 'Approve CLEAN-TEMP-FILES?',
+      decisions: [
+        { id: 'approve' },
+        { id: 'reject', rework: { prompt: 'Retry with CLEAN-TEMP-FILES' } },
+      ],
     });
   });
 
@@ -389,7 +415,7 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const use = nodeById(workflows.get('parent')!, 'review__use');
-    expect(use && 'prompt' in use ? use.prompt : '').toBe('v=literal-value');
+    expect(inlinePrompt(use) ?? '').toBe('v=literal-value');
   });
 
   test('two callers substitute independently', () => {
@@ -404,8 +430,8 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     const expanded = workflows.get('parent')!;
     const first = nodeById(expanded, 'first__use');
     const second = nodeById(expanded, 'second__use');
-    expect(first && 'prompt' in first ? first.prompt : '').toBe('Use alpha');
-    expect(second && 'prompt' in second ? second.prompt : '').toBe('Use beta');
+    expect(inlinePrompt(first) ?? '').toBe('Use alpha');
+    expect(inlinePrompt(second) ?? '').toBe('Use beta');
   });
 
   test('keeps an injected parent ref parent-scoped when a child id collides', () => {
@@ -430,9 +456,7 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const use = nodeById(workflows.get('parent')!, 'review__use');
-    expect(use && 'prompt' in use ? use.prompt : '').toBe(
-      'Parent: $gather.output; child: $review__gather.output'
-    );
+    expect(inlinePrompt(use) ?? '').toBe('Parent: $gather.output; child: $review__gather.output');
   });
 
   test('forwards an input through a nested include', () => {
@@ -453,7 +477,7 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(leaf, middle, parent));
     expect(errors).toHaveLength(0);
     const use = nodeById(workflows.get('parent')!, 'outer__inner__use');
-    expect(use && 'prompt' in use ? use.prompt : '').toBe('Leaf: $plan.output');
+    expect(inlinePrompt(use) ?? '').toBe('Leaf: $plan.output');
   });
 
   test('substitutes in when expressions and inside fenced text', () => {
@@ -478,7 +502,7 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     expect(errors).toHaveLength(0);
     const use = nodeById(workflows.get('parent')!, 'review__use');
     expect(use?.when).toBe("$gate.output == 'go'");
-    expect(use && 'prompt' in use ? use.prompt : '').toBe('```\nliteral literal\n``` empty=[]');
+    expect(inlinePrompt(use) ?? '').toBe('```\nliteral literal\n``` empty=[]');
   });
 
   test('rejects a when expression made unparseable by input substitution', () => {
@@ -557,13 +581,16 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     const loop = nodeById(expanded, 'review__loop');
     const approval = nodeById(expanded, 'review__approval');
     const group = nodeById(expanded, 'review__group');
-    expect(nodeById(expanded, 'review__shell')).toMatchObject({ bash: 'echo done' });
+    expect(nodeById(expanded, 'review__shell')).toMatchObject({
+      script: 'echo done',
+      runtime: 'sh',
+    });
     expect(nodeById(expanded, 'review__script')).toMatchObject({ script: 'console.log("done")' });
     expect(loop).toMatchObject({
       loop: { prompt: 'Do done', until_bash: 'test "done" = done' },
     });
-    expect(approval).toMatchObject({ approval: { message: 'Approve done?' } });
-    expect(nodeById(expanded, 'review__cancel')).toMatchObject({ cancel: 'Stop: done' });
+    expect(approval).toMatchObject({ message: 'Approve done?' });
+    expect(nodeById(expanded, 'review__cancel')).toMatchObject({ reason: 'Stop: done' });
     expect(nodeById(expanded, 'review__subrun')).toMatchObject({
       input: 'scope=done',
       // fan_out.items is a live data-string surface that rewriteNodeOutputRefs already
@@ -574,7 +601,7 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     expect(group).toMatchObject({
       loop_group: {
         until_bash: 'test "done" = done',
-        nodes: [{ id: 'body', bash: 'echo done' }],
+        nodes: [{ id: 'body', script: 'echo done', runtime: 'sh' }],
       },
     });
   });
@@ -710,7 +737,7 @@ describe('expandWorkflowIncludes — nested', () => {
 
     expect(errors).toHaveLength(0);
     const group = nodeById(workflows.get('parent')!, 'outer__inner__group');
-    const repeat = group?.loop_group?.nodes[0];
+    const repeat = loopGroupNodes(group)?.[0];
     expect(compiledLoopPrompt(repeat)).toBe(
       'Use $outer__inner__seed.output with bound value and continue.'
     );
@@ -788,7 +815,7 @@ describe('expandWorkflowIncludes — refs in Markdown code spans', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const writer = nodeById(workflows.get('parent')!, 'inc__writer');
-    const prompt = writer && 'prompt' in writer ? writer.prompt : '';
+    const prompt = inlinePrompt(writer) ?? '';
     expect(prompt).toContain('Live: $inc__helper.output');
     expect(prompt).toContain('```\nexample: $inc__helper.output\n```');
   });
@@ -801,7 +828,7 @@ describe('expandWorkflowIncludes — refs in Markdown code spans', () => {
     const parent = wf('parent', [{ id: 'inc', include: 'blk' }]);
     const { workflows } = expandWorkflowIncludes(mapOf(block, parent));
     const b = nodeById(workflows.get('parent')!, 'inc__b');
-    expect(b && 'bash' in b ? b.bash : '').toBe('echo $inc__a.output');
+    expect(bashScript(b) ?? '').toBe('echo $inc__a.output');
   });
 
   test('rewrites approval rejection prompts to the included sibling namespace', () => {
@@ -826,8 +853,12 @@ describe('expandWorkflowIncludes — refs in Markdown code spans', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const gate = nodeById(workflows.get('parent')!, 'inc__gate');
-    expect(gate?.approval?.message ?? '').toBe('Approve $inc__plan.output');
-    expect(gate?.approval?.on_reject?.prompt ?? '').toBe('Revise $inc__plan.output');
+    expect(gate && 'message' in gate ? gate.message : '').toBe('Approve $inc__plan.output');
+    expect(
+      (gate && 'decisions' in gate
+        ? gate.decisions.find(d => d.id === 'reject')?.rework?.prompt
+        : undefined) ?? ''
+    ).toBe('Revise $inc__plan.output');
   });
 
   // #2121 Phase 2: a `workflow:` (sub-run) node inside an included block is a live
@@ -896,7 +927,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent), commandContents);
     expect(errors).toHaveLength(0);
     const runner = nodeById(workflows.get('parent')!, 'inc__runner');
-    expect(runner && 'prompt' in runner ? runner.prompt : '').toBe(
+    expect(inlinePrompt(runner) ?? '').toBe(
       'Process the results from $inc__sib.output and summarize.'
     );
     expect(runner && 'command' in runner).toBe(false);
@@ -913,7 +944,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent), commandContents);
     expect(errors).toHaveLength(0);
     const runner = nodeById(workflows.get('parent')!, 'inc__runner');
-    expect(runner && 'prompt' in runner ? runner.prompt : '').toBe('Review scope prod.');
+    expect(inlinePrompt(runner) ?? '').toBe('Review scope prod.');
   });
 
   test('binds a declared include input named output in an ordinary command', () => {
@@ -927,7 +958,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     );
     expect(errors).toHaveLength(0);
     const runner = nodeById(workflows.get('parent')!, 'inc__runner');
-    expect(runner && 'prompt' in runner ? runner.prompt : '').toBe('Review bound value.');
+    expect(inlinePrompt(runner) ?? '').toBe('Review bound value.');
   });
 
   test('keeps a caller ref passed through a command input parent-scoped on id collision', () => {
@@ -951,7 +982,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     );
     expect(errors).toHaveLength(0);
     const runner = nodeById(workflows.get('parent')!, 'inc__runner');
-    expect(runner && 'prompt' in runner ? runner.prompt : '').toBe('Review $gather.output.');
+    expect(inlinePrompt(runner) ?? '').toBe('Review $gather.output.');
   });
 
   test('treats canonical refs inside Markdown code as live and namespaces them', () => {
@@ -962,7 +993,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent), commandContents);
     expect(errors).toHaveLength(0);
     const runner = nodeById(workflows.get('parent')!, 'inc__runner');
-    expect(runner && 'prompt' in runner ? runner.prompt : '').toContain('`$inc__sib.output`');
+    expect(inlinePrompt(runner) ?? '').toContain('`$inc__sib.output`');
   });
 
   test('binds a declared include input inside a fenced block', () => {
@@ -976,7 +1007,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent), commandContents);
     expect(errors).toHaveLength(0);
     const runner = nodeById(workflows.get('parent')!, 'inc__runner');
-    expect(runner && 'prompt' in runner ? runner.prompt : '').toContain('echo "prod"');
+    expect(inlinePrompt(runner) ?? '').toContain('echo "prod"');
   });
 
   test('rejects a command ref outside the included workflow namespace', () => {
@@ -1047,7 +1078,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     expect(errors).toHaveLength(0);
     const repeat = nodeById(workflows.get('parent')!, 'inc__repeat');
     expect(compiledLoopPrompt(repeat)).toBe('Review prod.');
-    expect(repeat?.loop?.command).toBe('loop-cmd');
+    expect(repeat && 'loop' in repeat ? repeat.loop.command : undefined).toBe('loop-cmd');
   });
 
   test('binds a declared include input named output in a loop command', () => {
@@ -1110,7 +1141,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     );
     expect(errors).toHaveLength(0);
     const group = nodeById(workflows.get('parent')!, 'inc__group');
-    const repeat = group?.loop_group?.nodes[0];
+    const repeat = loopGroupNodes(group)?.[0];
     expect(compiledLoopPrompt(repeat)).toBe('Read $inc__seed.output and continue.');
   });
 
@@ -1143,11 +1174,9 @@ describe('expandWorkflowIncludes — included command compilation', () => {
 
     expect(errors).toHaveLength(0);
     const outer = nodeById(workflows.get('parent')!, 'inc__outer');
-    const inner = outer?.loop_group?.nodes[0];
-    const review = inner?.loop_group?.nodes[0];
-    expect(review && 'prompt' in review ? review.prompt : '').toBe(
-      'Read $inc__seed.output and continue.'
-    );
+    const inner = loopGroupNodes(outer)?.[0];
+    const review = loopGroupNodes(inner)?.[0];
+    expect(inlinePrompt(review) ?? '').toBe('Read $inc__seed.output and continue.');
   });
 
   test('binds an include input in a nested loop command', () => {
@@ -1176,7 +1205,7 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     );
     expect(errors).toHaveLength(0);
     const group = nodeById(workflows.get('parent')!, 'inc__group');
-    const repeat = group?.loop_group?.nodes[0];
+    const repeat = loopGroupNodes(group)?.[0];
     expect(compiledLoopPrompt(repeat)).toBe('Review prod.');
   });
 
@@ -1245,15 +1274,12 @@ describe('expandWorkflowIncludes — loop_group in an included block', () => {
     const expanded = workflows.get('parent')!;
     // The loop_group NODE is namespaced; the outer sibling `seed` is too.
     expect(expanded.nodes.map(n => n.id)).toContain('rev__lg');
-    const lg = expanded.nodes.find(n => n.id === 'rev__lg') as {
-      loop_group: { nodes: { id: string; prompt: string }[] };
-    };
+    const lg = nodeById(expanded, 'rev__lg');
+    const body = loopGroupNodes(lg)?.[0];
     // Body node id is NOT renamed (body-local), so its $LOOP_PREV.<bodyId> ref is preserved,
     // while the outer-sibling ref ($seed.output) IS rewritten to the namespaced id.
-    expect(lg.loop_group.nodes[0].id).toBe('inner');
-    expect(lg.loop_group.nodes[0].prompt).toBe(
-      'prev=$LOOP_PREV.inner.output outer=$rev__seed.output'
-    );
+    expect(body?.id).toBe('inner');
+    expect(inlinePrompt(body)).toBe('prev=$LOOP_PREV.inner.output outer=$rev__seed.output');
   });
 
   test('a loop_group body id shadowing a parent top-level id is rejected', () => {
@@ -1493,28 +1519,27 @@ describe('expandWorkflowIncludes — loop_group body composition (#2623)', () =>
     expect(errors).toHaveLength(0);
     const expanded = workflows.get('parent')!;
     const group = nodeById(expanded, 'group');
-    expect(group?.loop_group?.nodes.map(node => node.id)).toEqual([
+    const groupConfig = loopGroupOf(group);
+    expect(groupConfig?.nodes.map(node => node.id)).toEqual([
       'seed',
       'review__decide',
       'review__cleanup',
       'consume',
     ]);
-    expect(group?.loop_group?.nodes.some(node => 'include' in node)).toBe(false);
-    expect(group?.loop_group?.until_bash).toBe('test "$review__decide.output.done" = true');
+    expect(groupConfig?.nodes.some(node => 'include' in node)).toBe(false);
+    expect(groupConfig?.until_bash).toBe('test "$review__decide.output.done" = true');
 
-    const decide = group?.loop_group?.nodes.find(node => node.id === 'review__decide');
-    const cleanup = group?.loop_group?.nodes.find(node => node.id === 'review__cleanup');
-    const consume = group?.loop_group?.nodes.find(node => node.id === 'consume');
+    const decide = groupConfig?.nodes.find(node => node.id === 'review__decide');
+    const cleanup = groupConfig?.nodes.find(node => node.id === 'review__cleanup');
+    const consume = groupConfig?.nodes.find(node => node.id === 'consume');
     expect(decide?.depends_on).toEqual(['seed']);
     expect(cleanup?.depends_on).toEqual(['review__decide']);
-    expect(cleanup && 'bash' in cleanup ? cleanup.bash : '').toBe(
-      'echo $LOOP_PREV.review__decide.output.done'
-    );
+    expect(bashScript(cleanup) ?? '').toBe('echo $LOOP_PREV.review__decide.output.done');
     expect(consume?.depends_on).toEqual(['review__cleanup']);
-    expect(consume && 'prompt' in consume ? consume.prompt : '').toBe(
+    expect(inlinePrompt(consume) ?? '').toBe(
       'done=$review__decide.output.done previous=$LOOP_PREV.review.output'
     );
-    expect(decide && 'prompt' in decide ? decide.prompt : '').toBe('review $seed.output');
+    expect(inlinePrompt(decide) ?? '').toBe('review $seed.output');
     expect(composedOrigin(decide)).toBe('review-block');
     expect(composedInputs(decide)).toEqual({ context: '$seed.output' });
     expect(expanded.requires).toEqual(['github']);
@@ -1549,17 +1574,19 @@ describe('expandWorkflowIncludes — loop_group body composition (#2623)', () =>
 
     expect(errors).toHaveLength(0);
     const outer = nodeById(workflows.get('parent')!, 'outer');
-    expect(outer?.loop_group?.nodes.map(node => node.id)).toEqual([
+    const outerConfig = loopGroupOf(outer);
+    expect(outerConfig?.nodes.map(node => node.id)).toEqual([
       'first__work',
       'second__work',
       'inner',
     ]);
-    expect(outer?.loop_group?.nodes.find(node => node.id === 'second__work')?.depends_on).toEqual([
+    expect(outerConfig?.nodes.find(node => node.id === 'second__work')?.depends_on).toEqual([
       'first__work',
     ]);
-    const inner = outer?.loop_group?.nodes.find(node => node.id === 'inner');
-    expect(inner?.loop_group?.nodes.map(node => node.id)).toEqual(['third__work']);
-    expect(inner?.loop_group?.until_bash).toBe('test -n "$third__work.output"');
+    const inner = outerConfig?.nodes.find(node => node.id === 'inner');
+    const innerConfig = loopGroupOf(inner);
+    expect(innerConfig?.nodes.map(node => node.id)).toEqual(['third__work']);
+    expect(innerConfig?.until_bash).toBe('test -n "$third__work.output"');
   });
 
   test('fails the owning workflow when a body include target is unknown', () => {
@@ -1618,7 +1645,7 @@ describe('expandWorkflowIncludes — returns drives primarySink (#2470)', () => 
     expect(errors).toHaveLength(0);
     const consume = nodeById(workflows.get('parent')!, 'consume')!;
     // $blk.output → the returns node (synthesize), NOT the positional first sink (implement).
-    expect('prompt' in consume ? consume.prompt : '').toBe('result: $blk__synthesize.output');
+    expect(inlinePrompt(consume) ?? '').toBe('result: $blk__synthesize.output');
     // depends_on: [blk] still expands to the block's sink (implement), so the wait is intact.
     expect(consume.depends_on).toContain('blk__implement');
   });
@@ -1646,11 +1673,11 @@ describe('expandWorkflowIncludes — returns drives primarySink (#2470)', () => 
     expect(workflows.get('outer')?.returns).toBe('blk__result');
     // A caller including that outer workflow observes the same return selection.
     const consume = nodeById(workflows.get('parent')!, 'consume')!;
-    expect('prompt' in consume ? consume.prompt : '').toBe('value: $outer__blk__result.output');
+    expect(inlinePrompt(consume) ?? '').toBe('value: $outer__blk__result.output');
   });
 
   test('validates an outer outcome_field against the rebound flattened return node', () => {
-    const resultNode: DagNode = {
+    const resultNode = {
       id: 'result',
       prompt: 'result',
       output_format: {
@@ -1745,7 +1772,7 @@ describe('expandWorkflowIncludes — with vs declared inputs (#2470)', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const work = nodeById(workflows.get('parent')!, 'blk__work')!;
-    expect('prompt' in work ? work.prompt : '').toBe('style: strict');
+    expect(inlinePrompt(work) ?? '').toBe('style: strict');
   });
 
   test('errors on a missing required input', () => {
@@ -1778,7 +1805,7 @@ describe('expandWorkflowIncludes — with vs declared inputs (#2470)', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const work = nodeById(workflows.get('parent')!, 'blk__work')!;
-    expect('prompt' in work ? work.prompt : '').toBe('v: hello');
+    expect(inlinePrompt(work) ?? '').toBe('v: hello');
   });
 });
 
@@ -2057,7 +2084,7 @@ describe('expandWorkflowIncludes — requires: unions instead of dropping (#1764
 
 describe('expandWorkflowIncludes — where a workflow-level model: travels (#1764)', () => {
   const collapse = (w: WorkflowDefinition): DagNode[] =>
-    expandWorkflowIncludes(mapOf(w)).workflows.get(w.name)!.nodes;
+    expandWorkflowIncludes(mapOf(w)).workflows.get(w.name)!.nodes as DagNode[];
 
   test('travels to a node that declares no provider of its own', () => {
     const nodes = collapse({
@@ -2144,9 +2171,9 @@ describe('expandWorkflowIncludes — typed with: values (#2637)', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
     expect(errors).toHaveLength(0);
     const think = nodeById(workflows.get('parent')!, 'use__think');
-    expect(think && 'prompt' in think ? think.prompt : '').toBe('flag=true items=["a","b"]');
+    expect(inlinePrompt(think) ?? '').toBe('flag=true items=["a","b"]');
     const run = nodeById(workflows.get('parent')!, 'use__run');
-    expect(run && 'bash' in run ? run.bash : '').toBe('echo "n=3"');
+    expect(bashScript(run) ?? '').toBe('echo "n=3"');
   });
 
   test('a whole-$INPUTS with: value position forwards the LOGICAL value; templates splice text', () => {
