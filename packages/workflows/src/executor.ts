@@ -2068,11 +2068,16 @@ export async function executeWorkflow(
   //     resolved or unregistered identity is still protected across a #1192
   //     rename — only the empty faulted shape is scoped differently).
   //
-  // A failure here is NOT retried: the guard is `if (!output_root)`, so this run
-  // keeps a NULL pointer for its whole lifetime and permanently stays on the
-  // re-derive path — the exact orphaning #1192 makes possible. It does not
+  // A failure to persist here is NOT retried: the guard is `if (!output_root)`, so
+  // this run keeps a NULL pointer for its whole lifetime and permanently stays on
+  // the re-derive path — the exact orphaning #1192 makes possible. That does not
   // justify failing an otherwise healthy run (re-derivation works today), but it
-  // is a durable per-run degradation, so it logs at ERROR rather than WARN.
+  // is a durable per-run degradation, so the healed-arm persist failure below
+  // (`workflow.output_root_persist_failed`) logs at ERROR rather than WARN. The
+  // faulted arm's two logs stay at WARN by design: the underlying fault was
+  // already logged at ERROR inside `resolveProjectPaths`, so these only report a
+  // secondary bookkeeping failure (stamping the flag, noting the skipped persist),
+  // not the fault itself.
   if (!workflowRun.output_root) {
     if (identityResolution === 'faulted') {
       workflowRun.metadata = {
