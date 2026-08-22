@@ -10931,6 +10931,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       const blockWorkflow = {
         name: 'materialized-loop-block',
         description: 'Command-backed loop block',
+        // Own class declaration (#2707 step 2): this file natively authors the
+        // interactive-loop pause node, independent of whether a composing parent
+        // also declares it.
+        interactive: true,
         nodes: [
           {
             id: 'gated-loop',

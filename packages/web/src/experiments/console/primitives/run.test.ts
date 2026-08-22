@@ -186,7 +186,13 @@ describe('toRun — approval parsing', () => {
         metadata: { approval: { nodeId: 'gate', message: 'Approve?' } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: 'Approve?', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
   });
 
   test('surfaces completionSignaled on a signal-bearing interactive-loop gate (#2074)', () => {
@@ -218,7 +224,13 @@ describe('toRun — approval parsing', () => {
         metadata: { approval: { nodeId: 'gate' } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: '', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: '',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
   });
 
   test('approval is null when absent or malformed (no string nodeId)', () => {
@@ -273,7 +285,13 @@ describe('toRun — resolved gate (approved/rejected awaiting resume)', () => {
         metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: null } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: 'Approve?', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
     expect(r.gateResolved).toBeNull();
   });
 
@@ -286,7 +304,13 @@ describe('toRun — resolved gate (approved/rejected awaiting resume)', () => {
         metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: 'weird' } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: 'Approve?', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
     expect(r.gateResolved).toBeNull();
   });
 });

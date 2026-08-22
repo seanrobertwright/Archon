@@ -176,6 +176,15 @@ export const rejectWorkflowRunBodySchema = z
   .object({ reason: z.string().optional() })
   .openapi('RejectWorkflowRunBody');
 
+/**
+ * POST /api/workflows/runs/:runId/respond request body (#2707 step 2). `decision` must be
+ * one of the paused gate's declared decisions; `approve`/`reject` are sugar for the same
+ * outcome the dedicated routes above produce.
+ */
+export const respondWorkflowRunBodySchema = z
+  .object({ decision: z.string().min(1), text: z.string().optional() })
+  .openapi('RespondWorkflowRunBody');
+
 /** DELETE /api/workflows/:name/node-sessions path params. */
 export const resetWorkflowNodeSessionsParamsSchema = z
   .object({ name: z.string().min(1) })

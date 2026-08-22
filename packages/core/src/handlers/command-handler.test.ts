@@ -2659,6 +2659,115 @@ describe('CommandHandler', () => {
         });
       });
 
+      test('/workflow respond resolves a declared non-default decision (#2707 step 2)', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-respond',
+          workflow_name: 'respond-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+              decisions: [{ id: 'approve' }, { id: 'revise' }, { id: 'escalate' }],
+              decisionsAuthored: true,
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        await handleCommand(baseConversation, '/workflow respond run-respond revise needs work');
+
+        const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<
+          Record<string, unknown>
+        >;
+        const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+        expect(nodeCompleted).toMatchObject({
+          data: {
+            node_output: JSON.stringify({ decision: 'revise', text: 'needs work' }),
+            approval_decision: 'revise',
+            structured_output: { decision: 'revise', text: 'needs work' },
+          },
+        });
+      });
+
+      test('/workflow respond approve delegates to the exact approve resolution', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-respond-approve',
+          workflow_name: 'respond-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+              decisions: [{ id: 'approve' }, { id: 'revise' }],
+              decisionsAuthored: true,
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        await handleCommand(baseConversation, '/workflow respond run-respond-approve approve lgtm');
+
+        const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<
+          Record<string, unknown>
+        >;
+        const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+        expect(nodeCompleted).toMatchObject({
+          data: { structured_output: { decision: 'approve', text: 'lgtm' } },
+        });
+      });
+
+      test('/workflow respond rejects a decision the gate does not declare', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-respond-invalid',
+          workflow_name: 'respond-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+              decisions: [{ id: 'approve' }, { id: 'revise' }],
+              decisionsAuthored: true,
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+        mockResolveApprovalGate.mockClear();
+
+        const result = await handleCommand(
+          baseConversation,
+          '/workflow respond run-respond-invalid nonexistent'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain("does not declare decision 'nonexistent'");
+        expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+      });
+
       test('legacy on_reject-configured gate keeps plain text output, unaffected by #2707', async () => {
         mockGetWorkflowRun.mockResolvedValueOnce({
           id: 'run-legacy-cap',

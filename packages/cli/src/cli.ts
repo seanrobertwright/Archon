@@ -63,6 +63,7 @@ import {
   workflowAbandonCommand,
   workflowApproveCommand,
   workflowRejectCommand,
+  workflowRespondCommand,
   workflowCleanupCommand,
   workflowResetSessionsCommand,
   workflowEventEmitCommand,
@@ -147,6 +148,9 @@ Commands:
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
   workflow resume <run-id>   Resume a failed or paused run from completed nodes
+  workflow respond <run-id> <decision> [text]
+                             Resolve a paused gate with any of its declared decisions
+                             ('approve'/'reject' are sugar for the dedicated commands)
   workflow search [query]    Search the workflow marketplace
   workflow install <slug>    Install a workflow from the marketplace
   isolation list             List all active worktrees/environments
@@ -196,9 +200,9 @@ Options:
   --spawn                    Open setup wizard in a new terminal window (for setup command)
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
-  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/abandon/resume)
+  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/respond/abandon/resume)
   --events                   For verbose JSON status/get: output raw event rows instead of node summaries
-  --detach                   Run 'workflow run'/'approve'/'reject'/'resume' in a detached background child (returns immediately)
+  --detach                   Run 'workflow run'/'approve'/'reject'/'respond'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
   --limit <n>                For 'workflow runs': max rows (default 20)
@@ -331,6 +335,7 @@ async function main(): Promise<number> {
         data: { type: 'string' },
         comment: { type: 'string' },
         reason: { type: 'string' },
+        text: { type: 'string' },
         workflow: { type: 'string' },
         'no-context': { type: 'boolean' },
         port: { type: 'string' },
@@ -797,6 +802,31 @@ async function main(): Promise<number> {
             await workflowRejectCommand(
               rejectRunId,
               rejectReason,
+              jsonFlag,
+              effectiveCwd,
+              detachFlag
+            );
+            break;
+          }
+
+          case 'respond': {
+            const respondRunId = positionals[2];
+            const decision = positionals[3];
+            if (!respondRunId || !decision) {
+              console.error('Usage: archon workflow respond <run-id> <decision> [text]');
+              console.error(
+                "  'approve' and 'reject' are sugar for the equivalent dedicated commands; " +
+                  'any other decision must be one the gate actually declared.'
+              );
+              return 1;
+            }
+            const rawRespondText =
+              (values.text as string | undefined) || positionals.slice(4).join(' ');
+            const respondText = rawRespondText.length > 0 ? rawRespondText : undefined;
+            await workflowRespondCommand(
+              respondRunId,
+              decision,
+              respondText,
               jsonFlag,
               effectiveCwd,
               detachFlag

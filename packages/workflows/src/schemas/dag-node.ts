@@ -471,16 +471,17 @@ export const approvalOnRejectSchema = z.object({
 export type ApprovalOnReject = z.infer<typeof approvalOnRejectSchema>;
 
 /**
- * An author-declared decision on the new `approval.decisions:` surface (#2707
- * step 1). `id` is constrained to the two ids the current drive surfaces
- * (`workflow approve|reject`) can actually produce — a broader vocabulary needs
- * the general `respond <decision>` verb (#2707 step 2) before any operator
- * surface could reach it; shipping unreachable ids would be partial fake
- * support. `label` is purely cosmetic display text; the wire value the gate
- * outputs as `$<id>.output.decision` is always the `id`, never the label.
+ * An author-declared decision on the `approval.decisions:` surface (#2707
+ * step 1). `id` is an open author-chosen identifier — reachable from every
+ * drive surface via `workflow respond <run-id> <decision> [text]` (#2707 step
+ * 2); `approve`/`reject` remain the default-vocabulary sugar every surface's
+ * dedicated approve/reject path still speaks. `decisions` must still include
+ * an `approve` entry (enforced in `dagNodeSchema`'s `superRefine`). `label` is
+ * purely cosmetic display text; the wire value the gate outputs as
+ * `$<id>.output.decision` is always the `id`, never the label.
  */
 export const approvalDecisionConfigSchema = z.object({
-  id: z.enum(['approve', 'reject']),
+  id: z.string().trim().min(1, "'approval.decisions[].id' must not be empty"),
   label: z.string().min(1).optional(),
 });
 

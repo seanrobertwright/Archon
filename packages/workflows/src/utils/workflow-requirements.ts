@@ -129,6 +129,54 @@ export function assertComposedGateDriveable(nodes: readonly DagNode[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Interactive-class background-dispatch refusal (#2707 step 2)
+// ---------------------------------------------------------------------------
+
+/** Minimal shape needed to evaluate the class check — avoids a full WorkflowDefinition dep. */
+export interface ClassBearingWorkflow {
+  name: string;
+  interactive?: boolean;
+}
+
+/**
+ * Thrown when an interactive-class workflow (`interactive: true`) is about to be dispatched
+ * to the background, on any surface. `message` names the workflow and the class, and points
+ * at a foreground alternative — the fix a `requires:` refusal has always given, applied here.
+ */
+export class InteractiveClassBackgroundError extends Error {
+  constructor(public readonly workflowName: string) {
+    super(
+      `Workflow '${workflowName}' is interactive-class ('interactive: true') and may pause for ` +
+        'human input — it cannot be dispatched in the background. Run it in the foreground ' +
+        "instead (the CLI without '--detach', chat, or the web console in foreground mode), " +
+        "or declare 'interactive: false' (or omit the field) if it should never pause."
+    );
+    this.name = 'InteractiveClassBackgroundError';
+  }
+}
+
+/**
+ * Refuse a background dispatch of an interactive-class workflow. Pure and synchronous — no
+ * I/O, unlike `assertWorkflowRequirementsMet` — so every dispatch surface can call it
+ * independently, right before it would otherwise background a run: CLI `workflow run
+ * --detach` (before the fork), and `dispatchBackgroundWorkflowOwned` (@archon/core — the
+ * shared entrypoint reached by both the web console's default dispatch and the `manage_run`
+ * tool's `startWorkflow`, alongside `assertComposedGateDriveable`, which answers the same
+ * "can this backgrounded run present a pause?" question for a gate the class declaration
+ * cannot see: one that arrived via `include:` in a workflow that itself omits `interactive:
+ * true`).
+ *
+ * This is what closes issue #1991: dispatching a workflow shaped like its repro
+ * (`interactive: true`, launched via a background-capable agent or `--detach`) now fails
+ * fast with a class-naming error instead of hanging indefinitely with nothing to resume it.
+ */
+export function assertInteractiveClassNotBackgrounded(workflow: ClassBearingWorkflow): void {
+  if (workflow.interactive === true) {
+    throw new InteractiveClassBackgroundError(workflow.name);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Declared-input resolution for a TOP-LEVEL invocation (#2470, #2554)
 // ---------------------------------------------------------------------------
 

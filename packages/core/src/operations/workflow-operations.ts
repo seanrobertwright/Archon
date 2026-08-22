@@ -744,6 +744,125 @@ export async function rejectWorkflow(
 }
 
 /**
+ * Validate that `decision` is legal for the gate `run` is paused at, WITHOUT
+ * mutating anything (mirrors `assertApprovable`'s read-only-precheck role for
+ * CLI `--detach`). `approve`/`reject` are always legal (delegated to the
+ * existing `approveWorkflow`/`rejectWorkflow` machinery by `respondToWorkflow`
+ * — this function is not consulted for those two ids). Any OTHER decision is
+ * legal only for a plain gate node (`approval`/`undefined` suspend type) whose
+ * author explicitly declared `approval.decisions:` (`decisionsAuthored`) —
+ * `writeback`/`interactive_loop`/`child_workflow` pauses have no author-
+ * declared vocabulary and accept only approve/reject; a legacy gate (no
+ * `decisions:` authored) also only ever has the synthesized approve/reject
+ * pair (#2707 step 2).
+ */
+export function assertRespondable(run: WorkflowRun, decision: string): ApprovalContext {
+  const approval = assertApprovable(run);
+  if (approval.type !== 'approval' && approval.type !== undefined) {
+    throw new Error(
+      `Run ${run.id}'s gate ('${approval.type}') only accepts 'approve' or 'reject' — ` +
+        `'${decision}' is not a valid response here.`
+    );
+  }
+  if (approval.decisionsAuthored !== true) {
+    throw new Error(
+      `Run ${run.id}'s gate only accepts 'approve' or 'reject' — '${decision}' is not one of its ` +
+        'declared decisions. Declare `approval.decisions:` on the gate node to author a broader vocabulary.'
+    );
+  }
+  const declaredIds = (approval.decisions ?? []).map(d => d.id);
+  if (!declaredIds.includes(decision)) {
+    throw new Error(
+      `Run ${run.id}'s gate does not declare decision '${decision}'. Declared decisions: ` +
+        `${declaredIds.join(', ')}.`
+    );
+  }
+  return approval;
+}
+
+/**
+ * Resolve a paused gate with an author-declared decision beyond approve/reject
+ * (#2707 step 2 — the general `workflow respond <id> <decision> [text]` verb).
+ * `approve`/`reject` are NOT handled here — `respondToWorkflow` delegates those
+ * to the existing `approveWorkflow`/`rejectWorkflow` functions unchanged, so
+ * every gate shape that existed before this PR keeps its exact prior behavior
+ * (legacy `on_reject` rework/cancel, `capture_response`, interactive_loop,
+ * writeback). This function only ever resolves a new-mode plain gate node
+ * (`decisionsAuthored: true`) immediately with structured `{decision, text}`
+ * output — the same shape `approveWorkflow`'s new-mode branch writes, just
+ * with a caller-supplied `decision` instead of the literal `'approve'`.
+ */
+async function respondToWorkflowWithDeclaredDecision(
+  runId: string,
+  decision: string,
+  text?: string
+): Promise<ApprovalOperationResult> {
+  const run = await getRunOrThrow(runId, 'operations.workflow_respond_lookup_failed');
+  const approval = assertRespondable(run, decision);
+
+  const structuredOutput = { decision, text: text ?? '' };
+  const events: workflowDb.GateResolutionEvent[] = [
+    {
+      event_type: 'node_completed',
+      step_name: approval.nodeId,
+      data: {
+        node_output: JSON.stringify(structuredOutput),
+        approval_decision: decision,
+        structured_output: structuredOutput,
+      },
+    },
+    {
+      event_type: 'approval_received',
+      step_name: approval.nodeId,
+      data: { decision, comment: text !== undefined && text.trim().length > 0 ? text : decision },
+    },
+  ];
+  const { resolved: won } = await workflowDb.resolveApprovalGate(
+    runId,
+    { approval: { ...approval, resolved: 'approved' }, approval_response: decision },
+    events
+  );
+  if (!won) {
+    throw new Error(`Workflow run ${runId} was already resolved and is awaiting resume.`);
+  }
+
+  // Anonymous telemetry: binary resolution only — no ids/comments/names. A
+  // custom decision still records as 'approved' since it resolved the gate
+  // (as opposed to leaving it open) — mirrors the existing 'approved'/'rejected'
+  // vocabulary rather than adding a third telemetry bucket for one caller.
+  captureApprovalResolved({ resolution: 'approved' });
+  return {
+    workflowName: run.workflow_name,
+    workingPath: run.working_path,
+    userMessage: run.user_message,
+    codebaseId: run.codebase_id,
+    conversationId: run.conversation_id,
+    type: 'approval_gate',
+  };
+}
+
+/**
+ * Resolve a paused gate with any author-declared decision (#2707 step 2's
+ * general drive verb — `workflow respond <run-id> <decision> [text]`).
+ * `approve`/`reject` are sugar: they delegate to the existing
+ * `approveWorkflow`/`rejectWorkflow` functions UNCHANGED, so every gate shape
+ * that existed before this PR (legacy `on_reject`, `capture_response`,
+ * `interactive_loop`, `writeback`, and step-1's new-mode 2-decision gates)
+ * keeps its exact prior behavior byte-for-byte. Any other decision resolves
+ * through `respondToWorkflowWithDeclaredDecision`, which only accepts a
+ * decision the gate actually declared.
+ */
+export async function respondToWorkflow(
+  runId: string,
+  decision: string,
+  text?: string
+): Promise<ApprovalOperationResult | RejectionOperationResult> {
+  if (decision === 'approve') return approveWorkflow(runId, text);
+  if (decision === 'reject') return rejectWorkflow(runId, text);
+  return respondToWorkflowWithDeclaredDecision(runId, decision, text);
+}
+
+/**
  * Reset persisted per-node provider sessions for a workflow.
  *
  * Filter: workflow_name is required; scope_key narrows to one conversation (or

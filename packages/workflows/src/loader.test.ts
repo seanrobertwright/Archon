@@ -3667,7 +3667,10 @@ nodes:
       expect(result.errors[0].error).toContain('gate_message');
     });
 
-    it('should warn when interactive loop node is in a non-interactive workflow', async () => {
+    it('should fail to load when an interactive loop node is in a non-interactive workflow (#2707 step 2)', async () => {
+      // Superseded by the workflow-class placement check: this used to load with a
+      // WARN ('interactive_loop_in_non_interactive_workflow', now deleted as dead
+      // code) — a pause node in an unattended workflow is now a hard load error.
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
@@ -3688,14 +3691,10 @@ nodes:
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      // Workflow loads successfully — this is a warning, not an error
-      expect(result.errors).toHaveLength(0);
-      expect(result.workflows).toHaveLength(1);
-      // Logger should have been called with the warning event
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ filename: expect.stringContaining('warn-test') }),
-        'interactive_loop_in_non_interactive_workflow'
-      );
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("Node 'my-loop' is a pause node");
+      expect(result.errors[0].error).toContain("declare 'interactive: true'");
     });
 
     // -----------------------------------------------------------------------
@@ -4158,7 +4157,8 @@ nodes:
       expect(result.errors[0].error).toContain('shadows a node id in the enclosing DAG');
     });
 
-    it('should warn when an interactive loop_group is in a non-interactive workflow', async () => {
+    it('should fail to load when an interactive loop_group is in a non-interactive workflow (#2707 step 2)', async () => {
+      // Superseded by the workflow-class placement check — see the loop: sibling test above.
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
@@ -4181,12 +4181,10 @@ nodes:
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.errors).toHaveLength(0);
-      expect(result.workflows).toHaveLength(1);
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ filename: expect.stringContaining('loop-group-gate-warn') }),
-        'interactive_loop_in_non_interactive_workflow'
-      );
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("Node 'grp' is a pause node");
+      expect(result.errors[0].error).toContain("declare 'interactive: true'");
     });
   });
 
@@ -5893,6 +5891,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -5908,6 +5907,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6035,6 +6035,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'worktree:',
         '  enabled: true',
         'nodes:',
@@ -6304,6 +6305,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6321,6 +6323,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6334,6 +6337,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6349,6 +6353,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: iterate',
         '    loop:',
@@ -6368,6 +6373,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: outer',
         '    loop_group:',
@@ -6397,6 +6403,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',
@@ -6413,6 +6420,7 @@ nodes:
       const pw = await warningsFor([
         'name: test',
         'description: test',
+        'interactive: true',
         'nodes:',
         '  - id: gate',
         '    approval:',

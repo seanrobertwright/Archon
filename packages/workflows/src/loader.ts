@@ -976,6 +976,75 @@ export function validateDagStructure(
   return null; // valid
 }
 
+/**
+ * Workflow-class placement check (#2707 step 2): a workflow declared
+ * unattended (workflow-level `interactive` not `true`) may not NATIVELY
+ * author a pause node anywhere in its DAG — a gate (`approval:`) node, or a
+ * `loop`/`loop_group` node with node-level `interactive: true`. This is a
+ * hard load error, not a warning: the declaration is the workflow's promise
+ * about the pause nodes IT authors, and the mistake belongs at the author's
+ * desk, not in production (see the class doc comment on
+ * `workflowBaseSchema.interactive`).
+ *
+ * Called ONLY from `parseWorkflow`, against ONE file's own unexpanded node
+ * list — deliberately NOT re-run against the post-`include:`-expansion node
+ * list (see `expandWorkflowIncludes`'s doc comment at its `validateDagStructure`
+ * call site for why): a reusable block can legitimately author a gate without
+ * declaring its own `interactive: true`, since the SAME block may be composed
+ * into an interactive parent, or independently discovered and invoked on its
+ * own — load time cannot tell which discovered workflow will actually own a
+ * given run (mirrors `findComposedApprovalGate`'s "one reader, one file"
+ * reasoning). Composed-gate drivability stays an INVOCATION-time question,
+ * answered by `assertComposedGateDriveable` against the run actually being
+ * dispatched.
+ *
+ * Runs on the same node list `validateDagStructure` walks, recursing into
+ * `loop_group` bodies (a body pause is governed by the SAME enclosing
+ * workflow's class, not a class of its own).
+ *
+ * A `workflow:` node is also deliberately NOT checked here: its target
+ * resolves at spawn, not load (#2200), so whether it can pause is unknowable
+ * at this point — see `resolveFanOutChildDefinition`'s interactive-class
+ * check in dag-executor.ts for the spawn-time equivalent (fan-out only; a 1:1
+ * `workflow:` child is unaffected by design, see #2474's acceptance criteria).
+ */
+export function validateWorkflowClassPlacement(
+  nodes: readonly (DagNode | IncludeDirective)[],
+  interactive: boolean | undefined
+): string | null {
+  if (interactive === true) return null;
+  for (const node of nodes) {
+    if (isIncludeDirective(node)) continue;
+    if (isGateNode(node)) {
+      return (
+        `Node '${node.id}' is a pause node ('approval:'), but this workflow does not declare ` +
+        "'interactive: true'. An unattended workflow may never contain a pause node — declare " +
+        "'interactive: true' at the workflow level, or remove this gate."
+      );
+    }
+    if (isLoopNode(node) && node.loop.interactive === true) {
+      return (
+        `Node '${node.id}' is a pause node ('loop.interactive: true'), but this workflow does not ` +
+        "declare 'interactive: true'. An unattended workflow may never contain a pause node — " +
+        "declare 'interactive: true' at the workflow level, or remove the node-level 'interactive:'."
+      );
+    }
+    if (isLoopGroupNode(node)) {
+      if (node.loop_group.interactive === true) {
+        return (
+          `Node '${node.id}' is a pause node ('loop_group.interactive: true'), but this workflow ` +
+          "does not declare 'interactive: true'. An unattended workflow may never contain a pause " +
+          "node — declare 'interactive: true' at the workflow level, or remove the node-level " +
+          "'interactive:'."
+        );
+      }
+      const bodyError = validateWorkflowClassPlacement(node.loop_group.nodes, interactive);
+      if (bodyError) return bodyError;
+    }
+  }
+  return null;
+}
+
 export type ParseResult =
   | { workflow: WorkflowDefinition; error: null; warnings: string[] }
   | { workflow: null; error: WorkflowLoadError; warnings?: never };
@@ -1077,6 +1146,19 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       return {
         workflow: null,
         error: { filename, error: structureError, errorType: 'validation_error' },
+      };
+    }
+
+    // Workflow-class placement (#2707 step 2). Read raw.interactive directly here
+    // (rather than moving its typed parse earlier) — the same coercion the typed
+    // parse below applies.
+    const rawInteractive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
+    const classError = validateWorkflowClassPlacement(dagNodes, rawInteractive);
+    if (classError) {
+      getLog().warn({ filename, classError }, 'workflow_class_placement_invalid');
+      return {
+        workflow: null,
+        error: { filename, error: classError, errorType: 'validation_error' },
       };
     }
 
@@ -1223,23 +1305,6 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     const interactive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
     if (raw.interactive !== undefined && typeof raw.interactive !== 'boolean') {
       getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
-    }
-
-    // Warn if any interactive loop node exists in a non-interactive workflow
-    // (approval messages won't reach the user in web background runs)
-    if (!interactive) {
-      // Covers loop: and loop_group: gates, including loops nested inside loop_group bodies.
-      const hasInteractiveLoop = (ns: (DagNode | IncludeDirective)[]): boolean =>
-        ns.some(
-          n =>
-            !isIncludeDirective(n) &&
-            ((isLoopNode(n) && n.loop.interactive === true) ||
-              (isLoopGroupNode(n) &&
-                (n.loop_group.interactive === true || hasInteractiveLoop(n.loop_group.nodes))))
-        );
-      if (hasInteractiveLoop(dagNodes)) {
-        getLog().warn({ filename }, 'interactive_loop_in_non_interactive_workflow');
-      }
     }
 
     // Warn (non-blocking) when signal_completes is set without interactive: the flag

@@ -1949,6 +1949,75 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/workflows/runs/{runId}/respond': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Resolve a paused workflow run with any of the gate's declared decisions */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          runId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['RespondWorkflowRunBody'];
+        };
+      };
+      responses: {
+        /** @description Responded */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['WorkflowRunActionResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/workflows/runs/{runId}': {
     parameters: {
       query?: never;
@@ -3360,7 +3429,7 @@ export interface components {
       inputs?: {
         [key: string]: {
           required?: boolean;
-          default?: string;
+          default?: unknown;
           description?: string;
         };
       };
@@ -3647,6 +3716,10 @@ export interface components {
       };
       approval?: {
         message: string;
+        decisions?: {
+          id: string;
+          label?: string;
+        }[];
         capture_response?: boolean;
         on_reject?: {
           prompt: string;
@@ -3744,6 +3817,10 @@ export interface components {
     };
     RejectWorkflowRunBody: {
       reason?: string;
+    };
+    RespondWorkflowRunBody: {
+      decision: string;
+      text?: string;
     };
     ResetWorkflowNodeSessionsResponse: {
       success: boolean;

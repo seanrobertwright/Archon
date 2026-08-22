@@ -164,6 +164,20 @@ export const workflowBaseSchema = z.object({
   model: z.string().optional(),
   modelReasoningEffort: modelReasoningEffortSchema.optional(),
   webSearchMode: webSearchModeSchema.optional(),
+  /**
+   * The workflow's CLASS declaration (#2707 step 2): `true` means this
+   * workflow's tree may pause (contains a gate/`approval:` node, or a
+   * `loop`/`loop_group` with node-level `interactive: true`, anywhere in its
+   * DAG including a `loop_group` body and nodes that arrive via `include:`
+   * composition). Load-time validation rejects a pause node in a workflow that
+   * does not declare `interactive: true` (`loader.ts`'s workflow-class
+   * placement check). Every background-dispatch entry point independently
+   * refuses to background an `interactive: true` workflow — CLI `--detach`,
+   * the `manage_run` native tool, and web's default background dispatch — so
+   * a pause always has a foreground driver watching for it. Absent/`false`
+   * means the workflow is unattended-class and can never contain a pause
+   * node; it is also the class a `fan_out:` target must resolve to.
+   */
   interactive: z.boolean().optional(),
   effort: effortLevelSchema.optional(),
   thinking: thinkingConfigSchema.optional(),
