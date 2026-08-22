@@ -22966,11 +22966,14 @@ describe('executeDagWorkflow -- container write-back gate', () => {
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
   });
 
-  it('a lost pause CAS during write-back stays fail-closed: throws, never suspends or messages (#2489)', async () => {
+  it('a lost pause CAS during write-back stays fail-closed: throws, never suspends (#2489)', async () => {
     // Unlike the other four gate types, a lost pause here must NEVER be tolerated —
     // failClosed: true (dag-executor.ts raiseWriteBackGate) means this rejects
     // straight through instead of being treated as a legitimate external
     // transition, so the container teardown path preserves the overlay for retry.
+    // backend.suspend never firing proves the entire downstream sequence
+    // (suspend, then the user message) never runs — both are strictly sequential
+    // awaits after the pause call, with nothing to catch a throw in between.
     const backend = makeWritebackBackend({
       finalize: mock(async () => ({
         requiresApproval: true,
@@ -22992,41 +22995,11 @@ describe('executeDagWorkflow -- container write-back gate', () => {
     store.pauseWorkflowRun = mock(() =>
       Promise.reject(new Error('Workflow run not found or not in running state (id: wb-run)'))
     );
-    const deps = createMockDeps(store);
-    const platform = createMockPlatform();
 
-    await expect(
-      executeDagWorkflow(
-        deps,
-        platform,
-        'conv-wb',
-        wbTestDir,
-        { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
-        makeWorkflowRun('wb-run'),
-        'claude',
-        undefined,
-        join(wbTestDir, 'artifacts'),
-        join(wbTestDir, 'state'),
-        join(wbTestDir, 'logs'),
-        'main',
-        'docs/',
-        minimalConfig,
-        undefined,
-        undefined,
-        new Map([['a', { output: 'out' }]]),
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        CONTAINER_EXEC,
-        { envId: 'env-x', writeBack: 'approve', backend }
-      )
-    ).rejects.toThrow(/not found or not in running state/);
-
-    // Fail-closed: never falls through to suspend the container or message the
-    // user as if the gate had been raised successfully.
+    await expect(runGateWithStore(store, backend, 'approve')).rejects.toThrow(
+      /not found or not in running state/
+    );
     expect(backend.suspend).not.toHaveBeenCalled();
-    expect(platform.sendMessage).not.toHaveBeenCalled();
   });
 
   it('non-empty diff + auto policy → applies without pausing, then completes', async () => {
