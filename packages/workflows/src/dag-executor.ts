@@ -4289,10 +4289,30 @@ async function executeLoopGroupNode(
   // substituteLoopPrevRefs finds them exactly as it would mid-loop.
   if (isLoopResume) {
     const restoredLoopPrevOutputs = new Map<string, NodeOutput>();
+    const bodyNodesById = new Map((group.nodes as DagNode[]).map(n => [n.id, n]));
     for (const id of directBodyIds) {
       const prior = outerNodeOutputs.get(bodyStepNamePrefix + id);
-      if (prior) restoredLoopPrevOutputs.set(id, prior);
+      if (!prior) continue;
+      // The persisted row's dotted `<groupId>.<bodyId>` step name never matches a
+      // TOP-LEVEL node id, so the pre-population `prior` came from (dag-executor.ts
+      // ~10037-10052) always drops declaredFields for it. Re-derive it from the body
+      // node's OWN current definition — the same source the in-process per-iteration
+      // path uses (~line 3111) — so a resumed $LOOP_PREV.<id>.output.<field> ref keeps
+      // the same schema-typo strictness a live iteration has, instead of silently
+      // degrading to lenient '' for a genuinely undeclared field.
+      const bodyNodeDef = bodyNodesById.get(id);
+      const declaredFields =
+        bodyNodeDef !== undefined && !isLoopGroupNode(bodyNodeDef)
+          ? declaredFieldsFromSchema(bodyNodeDef.output_format)
+          : undefined;
+      restoredLoopPrevOutputs.set(id, {
+        ...prior,
+        ...(declaredFields !== undefined ? { declaredFields } : {}),
+      });
     }
+    // Kept as an empty-map guard for clarity only — substituteLoopPrevRefs reads via
+    // `loopPrevOutputs?.get(id)`, so an empty Map and undefined are indistinguishable
+    // to every consumer; this has no behavioral effect either way.
     if (restoredLoopPrevOutputs.size > 0) loopPrevOutputs = restoredLoopPrevOutputs;
   }
   let lastIterationOutput = '';

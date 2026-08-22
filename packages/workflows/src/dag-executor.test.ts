@@ -22673,6 +22673,110 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(resumePrompt).toContain('USER=ok');
   });
 
+  it('INTERACTIVE resume: re-derives declaredFields so an undeclared $LOOP_PREV field fails the consumer (not-in-schema) (#2748 R1)', async () => {
+    // Mirrors the top-level 're-derives declaredFields on resume...' test (this file,
+    // ~line 5876) at the loop_group body level: a resumed body node's restored NodeOutput
+    // must keep the SAME schema-typo strictness a live in-process iteration has. Without
+    // re-deriving declaredFields from the body node's own current output_format, an
+    // undeclared field silently resolves to '' instead of throwing.
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+
+    // Prior iteration's persisted body output carries an `extra` key the schema does
+    // NOT declare.
+    const priorCompletedNodes = new Map([
+      ['refine.work', { output: '{"type":"BUG","extra":"x"}' }],
+    ]);
+
+    const workflow = {
+      name: 'lg-resume-declared-fields',
+      nodes: [
+        {
+          id: 'refine',
+          kind: 'loop_group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 5,
+            fresh_context: false,
+            interactive: true,
+            gate_message: 'Review.',
+            nodes: [
+              {
+                id: 'work',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'produce json' },
+                output_format: {
+                  type: 'object',
+                  properties: { type: { type: 'string' } },
+                  required: ['type'],
+                },
+                depends_on: [],
+              },
+              {
+                id: 'consumer',
+                kind: 'agent',
+                source: {
+                  kind: 'inline',
+                  prompt: 'extra=[$LOOP_PREV.work.output.extra]',
+                },
+                depends_on: ['work'],
+              },
+            ],
+          },
+          depends_on: [],
+        },
+      ] as DagNode[],
+    };
+
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield { type: 'assistant', content: '{"type":"BUG"}' };
+      yield { type: 'result', sessionId: 'lg-declared-fields-sess' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-lg-declared-fields',
+      testDir,
+      workflow,
+      makeWorkflowRun('lg-resume-declared-fields', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            message: 'Review.',
+          },
+          loop_user_input: '',
+        },
+      }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // The undeclared `extra` field must fail loudly (not-in-schema) on the resumed
+    // iteration — exactly as it would fail an in-process iteration — instead of
+    // silently resolving to '' the way a genuinely schemaless body node's absent
+    // field would.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvent = eventCalls.find((call: unknown[]) => {
+      const event = call[0] as { event_type: string; data?: { error?: string } };
+      return (
+        event.event_type === 'node_failed' && event.data?.error?.includes('is not declared in node')
+      );
+    });
+    expect(failedEvent).toBeDefined();
+  });
+
   it('INTERACTIVE resume: $LOOP_PREV resolves an oversized (>32KB) prior body output via the spill path (#2748)', async () => {
     // Mirrors 'reads oversized $LOOP_PREV output from the run-owned spill directory'
     // (same file, in-process case) but crosses a real pause/resume boundary: a bash
