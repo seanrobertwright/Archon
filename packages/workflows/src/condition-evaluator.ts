@@ -54,11 +54,14 @@ function getLog(): ReturnType<typeof createLogger> {
  *
  * Unknown node: whole-text `$node.output` → '' (warn); `.field` form → THROWS
  * `OutputRefError('unknown-node')` (a typo must fail, not silently resolve to '').
- * Whole-text `$node.output` on a known node → output text ('' for failed nodes).
+ * Whole-text `$node.output` on a known node → output text; a FAILED producer THROWS
+ * instead (#2713) — its stored output is never trusted, even when non-empty (a
+ * `loop_group`'s failure paths leave real, last-completed-iteration text behind).
  * For `$node.output.field`, the no-silent-drop contract (`resolveNodeOutputField`)
  * applies: a declared-optional-absent field resolves to ''; a field not in the
- * producer's schema, or a schemaless node whose output isn't JSON / lacks the key,
- * THROWS an `OutputRefError` that propagates to fail the consuming node (no silent skip).
+ * producer's schema, a schemaless node whose output isn't JSON / lacks the key, or a
+ * failed producer, THROWS an `OutputRefError` that propagates to fail the consuming
+ * node (no silent skip).
  */
 function resolveOutputRef(
   nodeId: string,
@@ -84,8 +87,17 @@ function resolveOutputRef(
     return '';
   }
   if (!field) {
-    // For unfielded ref, structuredOutput shape is opaque — defer to output text (which is
-    // empty for failed nodes, matching the historical fail-closed contract).
+    // A failed producer's stale output is never evaluated (#2713) — a when: condition
+    // joined past a failure via trigger_rule: all_done must branch on a different
+    // node's output, not the failed producer's own leftover text.
+    if (nodeOutput.state === 'failed') {
+      throw new Error(
+        `'$${nodeId}.output' references node '${nodeId}', but it failed (${nodeOutput.error}), ` +
+          "so its output cannot be trusted in a 'when:' condition. A failed producer's stale " +
+          "output is never evaluated — branch on a different node's output instead."
+      );
+    }
+    // For unfielded ref, structuredOutput shape is opaque — defer to output text.
     if (!nodeOutput.output) return '';
     return nodeOutput.output;
   }

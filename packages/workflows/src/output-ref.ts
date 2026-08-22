@@ -167,6 +167,7 @@ export type OutputRefErrorReason =
   | 'array-aggregate'
   | 'missing-key'
   | 'producer-not-run'
+  | 'producer-failed'
   | 'unknown-node';
 
 export class OutputRefError extends Error {
@@ -201,6 +202,8 @@ export class OutputRefError extends Error {
         return `'${ref}' references field '${field}', but node '${nodeId}'s JSON output has no such key. Emit '${field}' in the output, or fix the reference.`;
       case 'producer-not-run':
         return `'${ref}' references field '${field}', but node '${nodeId}' did not run (skipped or pending), so it has no output to read. Guard this reference with a 'when:' condition, or fix the dependency.`;
+      case 'producer-failed':
+        return `'${ref}' references field '${field}', but node '${nodeId}' failed, so its output cannot be trusted. Guard this reference with a 'when:' condition, or fix the failure.`;
       case 'unknown-node': {
         const hint =
           candidates.length > 0
@@ -300,6 +303,15 @@ export function resolveNodeOutputField(
   // object" error on its empty output.
   if (nodeOutput.state === 'skipped' || nodeOutput.state === 'pending') {
     throw new OutputRefError(nodeId, field, 'producer-not-run');
+  }
+
+  // A failed producer never resolves a field, however JSON-shaped its leftover
+  // output looks (#2713): a loop_group's failure paths carry the last completed
+  // iteration's real, often-valid-JSON text, which would otherwise be read here
+  // as if the group had succeeded — the same class of bug #2696/#2710 fixed for
+  // the `{ from, if_skipped }` binding directive.
+  if (nodeOutput.state === 'failed') {
+    throw new OutputRefError(nodeId, field, 'producer-failed');
   }
 
   const declaredFields = 'declaredFields' in nodeOutput ? nodeOutput.declaredFields : undefined;

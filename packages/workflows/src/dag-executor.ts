@@ -267,6 +267,12 @@ function inputEnvVars(node: DagNode, ctx: ShellInputContext): NodeJS.ProcessEnv 
  * producer's parsed structured payload when it has one (else its output text) for
  * the unfielded form, and the raw field value under the strict no-silent-drop
  * contract for the fielded form (declared-optional-absent → '').
+ *
+ * A failed producer never resolves here, fielded or not (#2713): `resolveBindingDirective`
+ * already guards its own call below before reaching this function, so the check below only
+ * ever fires for this function's OTHER caller, `resolveWorkflowValue`'s whole-ref tier — the
+ * plain (non-directive) `with:` value on a script/command node, a `workflow:` node's `with:`,
+ * or `fan_out`'s static `with:`, none of which had #2710's guard.
  */
 function wholeRefLogicalValue(
   producer: NodeOutput,
@@ -274,11 +280,20 @@ function wholeRefLogicalValue(
   field: string | undefined
 ): JsonValue {
   if (field === undefined) {
+    if (producer.state === 'failed') {
+      throw new Error(
+        `Binding value '$${nodeId}.output' references node '${nodeId}', but it failed ` +
+          `(${producer.error}), so its output cannot be trusted. Fix the failure, or guard ` +
+          "the referencing node with a 'when:' condition that excludes the failed branch."
+      );
+    }
     const structured = 'structuredOutput' in producer ? producer.structuredOutput : undefined;
     // Provider payloads are ajv-validated / DB-round-tripped JSON, so the cast
     // asserts what production already guarantees.
     return structured !== undefined ? (structured as JsonValue) : producer.output;
   }
+  // A failed producer's fielded form is rejected inside resolveNodeOutputField itself
+  // (#2713) — the same 'producer-failed' guard as the unfielded branch above.
   const resolution = resolveNodeOutputField(producer, nodeId, field);
   return resolution.kind === 'empty' ? '' : (resolution.value as JsonValue);
 }
@@ -1220,6 +1235,19 @@ export function substituteNodeOutputRefs(
         return escapedForBash ? "''" : '';
       }
       if (!field) {
+        // A failed producer's stale output is never spliced into a consumer's own
+        // prompt/bash/command body (#2713) — matches resolveBindingDirective's #2710
+        // guard for the same class of bug (a loop_group's failure paths leave real,
+        // last-completed-iteration text behind).
+        if (nodeOutput.state === 'failed') {
+          throw new Error(
+            `'$${nodeId}.output' references node '${nodeId}', but it failed ` +
+              `(${nodeOutput.error}), so its output cannot be spliced into this node's ` +
+              "prompt/script — a failed producer's stale output is never trusted. Fix the " +
+              "failure, or guard this node with a 'when:' condition that excludes the " +
+              'failed branch.'
+          );
+        }
         return escapedForBash
           ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, artifactsDir)
           : nodeOutput.output;
