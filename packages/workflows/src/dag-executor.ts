@@ -7958,7 +7958,13 @@ interface RunLayersContext {
  *
  * 1. The dep was never in `priorCompletedNodes` at all (never completed in the
  *    prior run, or never reached) and is now `completed` in `nodeOutputs` — it
- *    re-ran this resume with no prior cache to honour.
+ *    re-ran this resume with no prior cache to honour. A dep that re-ran and
+ *    landed in `state: 'failed'` is treated identically: the cached downstream
+ *    carries synthesis built against the prior run's view, and silently
+ *    consuming it would report success over a fresh failure (the #2402 bug
+ *    surface on the failure path). `'skipped'` is intentionally left out: its
+ *    `output: ''` is semantically equivalent to the absent prior, so honouring
+ *    the cache is safe.
  * 2. The dep's `prior.output` differs from `nodeOutputs.get(dep).output` —
  *    either an `always_run` upstream that re-executed, or any dep the engine
  *    re-ran with new content. The per-layer aggregation is the only writer of
@@ -7988,9 +7994,15 @@ function getStaleCachedDependencies(
   for (const depId of deps) {
     const prior = priorCompletedNodes.get(depId);
     const current = nodeOutputs.get(depId);
-    // Case 1: dep was never cached; if it is now complete it ran fresh this resume.
+    // Case 1: dep was never cached; if it is now complete or failed it ran fresh this
+    // resume. `'skipped'` and missing-current (the dep is still pending or running) are
+    // intentionally left out: skipped has `output: ''` semantically equal to the absent
+    // prior, and pending/running cannot reach this helper via the resume-skip arm in
+    // executeDagWorkflow (`priorCompletedNodes?.has(node.id)` only fires when the
+    // CONSUMER itself was cached, but its dep would be addressed by case 2/3 once it
+    // finishes).
     if (prior === undefined) {
-      if (current?.state === 'completed') {
+      if (current?.state === 'completed' || current?.state === 'failed') {
         stale.push(depId);
       }
       continue;
