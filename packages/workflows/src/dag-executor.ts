@@ -6644,6 +6644,10 @@ async function executeApprovalNode(
     captureResponse: node.captureResponse,
     onRejectPrompt: rework?.prompt,
     onRejectMaxAttempts: rework?.maxAttempts,
+    decisions: node.decisions.map(d => ({
+      id: d.id,
+      ...(d.label !== undefined ? { label: d.label } : {}),
+    })),
   });
 
   // Return completed — the between-layer status check will see 'paused' (or the

@@ -471,28 +471,58 @@ export const approvalOnRejectSchema = z.object({
 export type ApprovalOnReject = z.infer<typeof approvalOnRejectSchema>;
 
 /**
+ * An author-declared decision on the new `approval.decisions:` surface (#2707
+ * step 1). `id` is constrained to the two ids the current drive surfaces
+ * (`workflow approve|reject`) can actually produce — a broader vocabulary needs
+ * the general `respond <decision>` verb (#2707 step 2) before any operator
+ * surface could reach it; shipping unreachable ids would be partial fake
+ * support. `label` is purely cosmetic display text; the wire value the gate
+ * outputs as `$<id>.output.decision` is always the `id`, never the label.
+ */
+export const approvalDecisionConfigSchema = z.object({
+  id: z.enum(['approve', 'reject']),
+  label: z.string().min(1).optional(),
+});
+
+/**
  * Schema for the `approval:` config object. Named (rather than inlined at both
  * use sites) so its shape is reachable for the unknown-key check in the loader.
+ *
+ * `decisions` and `on_reject` are mutually exclusive: `on_reject` is the
+ * deprecated legacy mechanism (a stored rework template with a private
+ * attempt counter, kept working byte-for-byte for backward compatibility —
+ * see `decisionOptionSchema`'s doc); `decisions` is its replacement (ordinary
+ * structured `{decision,text}` output, with any rework/revise flow wired by
+ * the author as an explicit `when:` edge to their own node). Declaring both
+ * would leave it ambiguous which mechanism resolves the gate — validated in
+ * `dagNodeSchema`'s top-level `superRefine` (alongside `hasApproval`), not
+ * here, so this stays a plain `z.object` and keeps its precise `.shape` for
+ * `KNOWN_NODE_NESTED_KEYS`'s compile-time-checked child-key map (a
+ * `.superRefine()`-wrapped schema would erase that precision — see
+ * `loopGroupShape`'s cast at the bottom of this file for what that costs).
  */
 export const approvalConfigSchema = z.object({
   message: z.string().min(1, "'approval.message' must not be empty"),
+  decisions: z
+    .array(approvalDecisionConfigSchema)
+    .min(1, "'approval.decisions' must declare at least one decision")
+    .optional(),
   capture_response: z.boolean().optional(),
   on_reject: approvalOnRejectSchema.optional(),
 });
 
 /**
- * A decision a gate node can resolve to. `rework` carries today's `on_reject`
- * behavior (a rework prompt with a max-attempts counter) as a per-decision
- * continuation rather than a top-level `onReject` field — this is the shape
- * #2707's settled pause-primitive design ("the pause node should ride that
- * shape") builds on, ahead of #2707 itself making `decisions` author-declarable
- * and changing the node's output to structured `{decision, text}`.
- *
- * Not yet author-declarable via YAML (the authored `approval:` schema is
- * unchanged this issue — see `approvalConfigSchema`) — `dagNodeSchema`'s
- * transform always synthesizes the fixed default `[{id:'approve'}, {id:'reject',
- * rework: <on_reject, if configured>}]`, so today's behavior is unchanged, only
- * its resolved shape is.
+ * A decision a resolved gate node can produce. `rework` carries the legacy
+ * `on_reject` behavior (a rework prompt with a max-attempts counter) as a
+ * per-decision continuation — it is populated EXCLUSIVELY by `dagNodeSchema`'s
+ * transform when translating a deprecated `on_reject:` config, and is never
+ * part of the new `approval.decisions:` authoring surface
+ * (`approvalDecisionConfigSchema` has no `rework` field, so an author cannot
+ * write one directly). Its presence on the resolved `reject` decision IS the
+ * signal that distinguishes a legacy gate (byte-for-byte unchanged behavior)
+ * from a new-mode gate (ordinary structured `{decision,text}` output) —
+ * `executeApprovalNode` and `collectContainerIncompatibleProviders` already
+ * branch on exactly this predicate.
  */
 export const decisionOptionSchema = z.object({
   id: z.string().min(1),
@@ -915,6 +945,34 @@ export const dagNodeSchema = dagNodeFlatSchema
           "'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'script', 'include', and 'workflow' are mutually exclusive",
       });
       return z.NEVER;
+    }
+
+    // 'decisions' (#2707 step 1, the new authoring surface) and 'on_reject' (the
+    // deprecated legacy mechanism) are mutually exclusive: mixing them would
+    // leave it ambiguous which mechanism resolves the gate. Validated here
+    // rather than via a superRefine on approvalConfigSchema itself, which would
+    // wrap it in a ZodEffects and erase the precise `.shape` KNOWN_NODE_NESTED_KEYS
+    // relies on for compile-time-checked child keys (see approvalConfigSchema's doc).
+    if (hasApproval && data.approval) {
+      if (data.approval.decisions !== undefined && data.approval.on_reject !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "'approval.decisions' and 'approval.on_reject' are mutually exclusive. " +
+            "'on_reject' is deprecated — wire a rework node with a " +
+            "\"when: \\\"$<this gate's id>.output.decision == 'reject'\\\"\" edge and declare 'decisions' instead.",
+          path: ['approval', 'decisions'],
+        });
+      } else if (data.approval.decisions !== undefined) {
+        const ids = data.approval.decisions.map(d => d.id);
+        if (new Set(ids).size !== ids.length) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "'approval.decisions' ids must be unique",
+            path: ['approval', 'decisions'],
+          });
+        }
+      }
     }
 
     if (isNodeContextResume(data.context) && !hasCommand && !hasPrompt) {
@@ -1413,27 +1471,33 @@ export const dagNodeSchema = dagNodeFlatSchema
       } as ExecNode;
     }
     if (data.approval !== undefined) {
-      // Fixed default vocabulary — 'decisions' is not yet author-declarable via
-      // YAML (the authored 'approval:' schema is unchanged this issue). 'reject'
-      // carries today's on_reject behavior as its 'rework' continuation, so
-      // dag-executor's existing reject-resume path (a synthetic AI re-prompt with
-      // a max-attempts counter) stays byte-identical, reading from a new path.
-      const decisions: DecisionOption[] = [
-        { id: 'approve' },
-        {
-          id: 'reject',
-          ...(data.approval.on_reject !== undefined
-            ? {
+      // Two mechanisms, mutually exclusive (enforced by approvalConfigSchema's
+      // superRefine): legacy 'on_reject' synthesizes a 'reject' decision carrying
+      // a 'rework' continuation — dag-executor's existing reject-resume path (a
+      // synthetic AI re-prompt with a max-attempts counter) stays byte-identical,
+      // reading from this same synthesized shape (#2707 step 1's "grow-then-
+      // deprecate": nothing breaks by rename). A gate with no 'on_reject' uses the
+      // new author-declared 'decisions' (defaulting to the same approve/reject
+      // pair, no 'rework') — its output is ordinary structured {decision,text},
+      // and 'rework' never appears on any of its decisions. Presence of 'rework'
+      // on the resolved 'reject' decision IS the legacy-mode signal the executor
+      // (executeApprovalNode) and container preflight already branch on — no
+      // separate mode flag is added.
+      const decisions: DecisionOption[] =
+        data.approval.on_reject !== undefined
+          ? [
+              { id: 'approve' },
+              {
+                id: 'reject',
                 rework: {
                   prompt: data.approval.on_reject.prompt,
                   ...(data.approval.on_reject.max_attempts !== undefined
                     ? { maxAttempts: data.approval.on_reject.max_attempts }
                     : {}),
                 },
-              }
-            : {}),
-        },
-      ];
+              },
+            ]
+          : (data.approval.decisions ?? [{ id: 'approve' }, { id: 'reject' }]);
       return {
         ...base,
         ...shared,

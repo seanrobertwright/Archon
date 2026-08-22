@@ -337,6 +337,86 @@ function collectUnknownNodeKeys(raw: unknown, id: string, label: string, warning
 }
 
 /**
+ * #2707 step 1 grow-then-deprecate warnings: `approval.capture_response`,
+ * `approval.on_reject`, and node-level loop `interactive:` still parse and
+ * function exactly as before (Migration section — these become load errors
+ * only after #2123), but warn so authors migrate ahead of that. `$REJECTION_REASON`
+ * and `$LOOP_USER_INPUT` are covered as a consequence rather than by a separate
+ * text scan: they are populated ONLY inside `on_reject.prompt` / an interactive
+ * loop body respectively, so warning on the enabling key covers their only
+ * sanctioned usage — any other usage was already a dead (always-empty)
+ * reference before this PR, with no behavior for a new warning to explain.
+ */
+function collectGateAndLoopDeprecationWarnings(
+  node: DagNode | IncludeDirective,
+  raw: unknown,
+  id: string,
+  warnings: string[]
+): void {
+  // An include directive has no gate/loop shape of its own — its expanded
+  // contents are scanned once inlined, like collectUnknownNodeKeys's own
+  // 'with:' handling for include nodes.
+  if (isIncludeDirective(node)) return;
+  if (isGateNode(node) && raw !== null && typeof raw === 'object') {
+    const rawApproval = (raw as Record<string, unknown>).approval;
+    if (rawApproval !== null && typeof rawApproval === 'object') {
+      const approvalObj = rawApproval as Record<string, unknown>;
+      if (approvalObj.capture_response !== undefined) {
+        const message =
+          `Node '${id}': 'approval.capture_response' is deprecated. Gate output is now ` +
+          `always structured as {decision, text} — read '$${id}.output.text' downstream ` +
+          'instead. This field is ignored.';
+        warnings.push(message);
+        getLog().warn({ id, warning: message }, 'node_capture_response_deprecated');
+      }
+      if (approvalObj.on_reject !== undefined) {
+        const message =
+          `Node '${id}': 'approval.on_reject' is deprecated. Declare 'approval.decisions' ` +
+          `and wire a rework node with "when: \\"$${id}.output.decision == 'reject'\\"" ` +
+          'instead (loop it with loop_group if it should iterate). This gate keeps running ' +
+          'via the legacy mechanism until migrated.';
+        warnings.push(message);
+        getLog().warn({ id, warning: message }, 'node_on_reject_deprecated');
+      }
+    }
+  }
+  const interactiveLoop =
+    (isLoopNode(node) && node.loop.interactive === true) ||
+    (isLoopGroupNode(node) && node.loop_group.interactive === true);
+  if (interactiveLoop) {
+    const message =
+      `Node '${id}': node-level loop 'interactive:' is deprecated. A future release ` +
+      're-expresses the interactive loop as a gate + loop_group composition (#2707 step 3). ' +
+      'Continue using it for now.';
+    warnings.push(message);
+    getLog().warn({ id, warning: message }, 'node_loop_interactive_deprecated');
+  }
+
+  // Recurse into a loop_group body — mirrors collectUnknownNodeKeys's own body
+  // recursion. Resolved and raw body arrays share index order (Zod arrays
+  // preserve it), so they're zipped by position rather than by id.
+  if (isLoopGroupNode(node) && raw !== null && typeof raw === 'object') {
+    const rawGroup = (raw as Record<string, unknown>).loop_group;
+    const rawBody =
+      rawGroup !== null && typeof rawGroup === 'object'
+        ? (rawGroup as Record<string, unknown>).nodes
+        : undefined;
+    if (Array.isArray(rawBody)) {
+      // `id` is unused on the IncludeDirective early-return path above, so a
+      // cheap fallback is fine when the body entry isn't a plain DagNode.
+      node.loop_group.nodes.forEach((bodyNode, i) => {
+        collectGateAndLoopDeprecationWarnings(
+          bodyNode,
+          rawBody[i],
+          isIncludeDirective(bodyNode) ? `#${String(i)}` : bodyNode.id,
+          warnings
+        );
+      });
+    }
+  }
+}
+
+/**
  * Validate and parse a single DagNode from raw YAML data.
  * Replaces the former parseDagNode + parseRetryConfig + parseToolList +
  * parseNodeHooks + parseIdleTimeout functions.
@@ -373,6 +453,7 @@ function parseDagNode(
   }
 
   collectUnknownNodeKeys(raw, id, `Node '${id}'`, warnings);
+  collectGateAndLoopDeprecationWarnings(node, raw, id, warnings);
 
   // `with:` is live on an agent node's command-sourced form (node-local bindings,
   // #2637), on exec (script-runtime only), and on include/workflow (caller inputs).

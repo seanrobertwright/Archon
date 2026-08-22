@@ -26,6 +26,7 @@ import {
   isExecNode,
   isApprovalContext,
   isRunBlockedOnChild,
+  reRunsOwnNodeOnResume,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
   WORKFLOW_SOURCE_METADATA_KEY,
@@ -928,14 +929,15 @@ export async function hydrateResumableRun(
   const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
   const priorCompletedNodes = snapshot.completedNodeOutputs;
   // A gate whose node deliberately writes NO node_completed on pause must still be
-  // resumable with zero completed nodes: interactive loops, and a `workflow:` node
-  // blocked on a child (#2121 Phase 2) whose child is the very first node.
-  const approvalType =
-    candidate.metadata?.approval !== undefined
-      ? (candidate.metadata.approval as Record<string, unknown>).type
-      : undefined;
-  const hasReRunGateState =
-    approvalType === 'interactive_loop' || approvalType === 'child_workflow';
+  // resumable with zero completed nodes: interactive loops, a `workflow:` node
+  // blocked on a child (#2121 Phase 2) whose child is the very first node, and a
+  // legacy on_reject gate with a genuinely staged rework (#2714) — see
+  // reRunsOwnNodeOnResume's doc for the exhaustive per-reason breakdown. A
+  // new-mode gate (#2707 step 1) needs no carve-out here: both approve and
+  // reject write node_completed immediately.
+  const rawApproval = candidate.metadata?.approval;
+  const approvalContext = isApprovalContext(rawApproval) ? rawApproval : undefined;
+  const hasReRunGateState = reRunsOwnNodeOnResume(approvalContext, candidate.metadata);
   if (priorCompletedNodes.size === 0 && !hasReRunGateState) {
     getLog().info(
       { resumableRunId: candidate.id },

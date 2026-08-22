@@ -479,12 +479,29 @@ export async function approveWorkflow(
         rejection_reason: '',
         rejection_count: 0,
       };
-      const nodeOutput = approval.captureResponse === true ? approvalComment : '';
+      // Legacy on_reject-configured gates (onRejectPrompt set) keep today's
+      // behavior byte-for-byte: plain text output gated by captureResponse. A
+      // gate with no on_reject — the new #2707 step-1 authoring surface, or the
+      // omitted-config default — always produces structured {decision,text}
+      // output: "the output IS the channel", no flag needed. `text` is the raw
+      // comment (possibly empty), not `approvalComment`'s display default.
+      const isLegacyGate = approval.onRejectPrompt != null;
+      const nodeOutput = isLegacyGate
+        ? approval.captureResponse === true
+          ? approvalComment
+          : ''
+        : JSON.stringify({ decision: 'approve', text: comment ?? '' });
       events = [
         {
           event_type: 'node_completed',
           step_name: approval.nodeId,
-          data: { node_output: nodeOutput, approval_decision: 'approved' },
+          data: {
+            node_output: nodeOutput,
+            approval_decision: 'approved',
+            ...(isLegacyGate
+              ? {}
+              : { structured_output: { decision: 'approve', text: comment ?? '' } }),
+          },
         },
         {
           event_type: 'approval_received',
@@ -621,11 +638,21 @@ export async function rejectWorkflow(
   // `node.approval.on_reject` (dag-executor), which is exactly what is missing.
   const onRejectConfigured = approval?.onRejectPrompt != null;
   const maxAttemptsReached = onRejectConfigured && currentCount + 1 >= maxAttempts;
-  // The on_reject rework is staged (run stays 'paused') only when a prompt is
-  // set AND we're under the attempt cap; every other case cancels the run.
+  // The legacy on_reject rework is staged (run stays 'paused') only when a
+  // prompt is set AND we're under the attempt cap.
   const willStageRework = onRejectConfigured && !maxAttemptsReached;
+  // New mechanism (#2707 step 1): a gate with no on_reject that declares a
+  // 'reject' decision resolves immediately with structured {decision,text}
+  // output — no staging, no attempt counter, the run just stays 'paused'
+  // awaiting resume like any other completed node (see Task 4: this is why
+  // hydrateResumableRun needs no special-casing for it). A gate declaring no
+  // 'reject' decision (an approve-only gate) falls through to the existing
+  // cancel behavior below, preserving today's "no on_reject configured"
+  // semantics for that case.
+  const hasRejectDecision = approval?.decisions?.some(d => d.id === 'reject') ?? false;
+  const willResolveNewMode = !onRejectConfigured && hasRejectDecision;
 
-  // The audit event is identical for all three reject outcomes; the CAS writes it
+  // The audit event is identical for every reject outcome; the CAS writes it
   // in the SAME transaction as the resolution (#2146).
   const rejectionEvent: workflowDb.GateResolutionEvent = {
     event_type: 'approval_received',
@@ -635,26 +662,46 @@ export async function rejectWorkflow(
 
   // Compare-and-swap resolution guard — a concurrent second reject loses here
   // (resolved=false) and throws BEFORE any events, so the gate events can't
-  // duplicate (#2113). Stage-rework stamps the resolution + rework metadata and
-  // keeps the run 'paused' (the approval context is rewritten whole so the resumed
-  // executor still sees nodeId/onRejectPrompt; `...approval` tolerates a malformed
-  // context exactly as the 'unknown' nodeId fallback below). The terminal outcomes
-  // flip paused→'cancelled' in a SINGLE atomic UPDATE, so there is never a
-  // resolved-but-not-cancelled state that a failed second write could strand
-  // (which a reject retry could not self-heal past the guard above). Either way
-  // the audit event rides the same transaction, so a failed event write rolls the
-  // resolution/cancellation back rather than losing the audit trail (#2146).
-  const { resolved: won } = willStageRework
-    ? await workflowDb.resolveApprovalGate(
-        runId,
-        {
-          approval: { ...approval, resolved: 'rejected' },
-          rejection_reason: rejectReason,
-          rejection_count: currentCount + 1,
-        },
-        [rejectionEvent]
-      )
-    : await workflowDb.resolveAndCancelApprovalGate(runId, [rejectionEvent]);
+  // duplicate (#2113). Stage-rework and new-mode resolution both keep the run
+  // 'paused' (the approval context is rewritten whole so a resumed executor
+  // still sees nodeId/onRejectPrompt/decisions; `...approval` tolerates a
+  // malformed context exactly as the 'unknown' nodeId fallback below). The
+  // terminal cancel outcome flips paused→'cancelled' in a SINGLE atomic
+  // UPDATE, so there is never a resolved-but-not-cancelled state that a failed
+  // second write could strand (which a reject retry could not self-heal past
+  // the guard above). Every path's audit event(s) ride the same transaction,
+  // so a failed event write rolls the resolution/cancellation back rather than
+  // losing the audit trail (#2146).
+  let won: boolean;
+  if (willResolveNewMode && approval) {
+    const structuredOutput = { decision: 'reject', text: reason ?? '' };
+    const nodeCompletedEvent: workflowDb.GateResolutionEvent = {
+      event_type: 'node_completed',
+      step_name: approval.nodeId,
+      data: {
+        node_output: JSON.stringify(structuredOutput),
+        approval_decision: 'rejected',
+        structured_output: structuredOutput,
+      },
+    };
+    ({ resolved: won } = await workflowDb.resolveApprovalGate(
+      runId,
+      { approval: { ...approval, resolved: 'rejected' } },
+      [nodeCompletedEvent, rejectionEvent]
+    ));
+  } else if (willStageRework) {
+    ({ resolved: won } = await workflowDb.resolveApprovalGate(
+      runId,
+      {
+        approval: { ...approval, resolved: 'rejected' },
+        rejection_reason: rejectReason,
+        rejection_count: currentCount + 1,
+      },
+      [rejectionEvent]
+    ));
+  } else {
+    ({ resolved: won } = await workflowDb.resolveAndCancelApprovalGate(runId, [rejectionEvent]));
+  }
   if (!won) {
     throw new Error(`Workflow run ${runId} was already resolved and is awaiting resume.`);
   }
@@ -669,7 +716,7 @@ export async function rejectWorkflow(
     userMessage: run.user_message,
     codebaseId: run.codebase_id,
     conversationId: run.conversation_id,
-    cancelled: !willStageRework,
+    cancelled: !willStageRework && !willResolveNewMode,
     maxAttemptsReached,
     writeBack: false,
   };

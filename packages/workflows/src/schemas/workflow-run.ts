@@ -416,12 +416,24 @@ export interface ApprovalContext {
    * node, so the provider is the same by construction.
    */
   sessionProvider?: string | null;
-  /** When true, the user's approval comment is stored as `$nodeId.output`. */
+  /** When true, the user's approval comment is stored as `$nodeId.output`. Legacy-mode gates only (see `onRejectPrompt`). */
   captureResponse?: boolean;
   /** The on_reject prompt template (stored at pause time so reject handlers don't need the workflow def). */
   onRejectPrompt?: string;
   /** Max rejection attempts before cancellation (default 3). */
   onRejectMaxAttempts?: number;
+  /**
+   * The gate's declared decisions (#2707 step 1), snapshotted at pause time so
+   * approve/reject handlers don't need the workflow def to know the vocabulary
+   * — mirrors why `onRejectPrompt` is snapshotted rather than looked up.
+   * `onRejectPrompt !== undefined` (not this field's presence) is what
+   * distinguishes a legacy on_reject gate (byte-for-byte unchanged resolution)
+   * from a new-mode gate (structured `{decision,text}` output): a legacy gate's
+   * `decisions` is still populated (`[{id:'approve'},{id:'reject'}]`), it just
+   * isn't consulted by the resolution path. Absent on gates paused by builds
+   * that predate this field.
+   */
+  decisions?: { id: string; label?: string }[];
   /**
    * Gate resolution marker. Set by approve/reject handlers while the run STAYS
    * 'paused' awaiting auto-resume (#2075): 'approved' = approval recorded,
@@ -522,6 +534,60 @@ export function isApprovalContext(val: unknown): val is ApprovalContext {
     typeof (val as Record<string, unknown>).nodeId === 'string' &&
     typeof (val as Record<string, unknown>).message === 'string'
   );
+}
+
+/**
+ * True when a paused run's gate state, on its own, is worth resuming even with
+ * ZERO completed DAG nodes — i.e. resolving the run left no `node_completed`
+ * row anywhere, but the executor still knows how to make forward progress.
+ * Exhaustively switched over `SuspendReason` (#2714) so a future fifth reason
+ * cannot silently repeat the gap this closes: a plain `approval` gate whose
+ * staged legacy `on_reject` rework was invisible to `hydrateResumableRun`
+ * because `rejectWorkflow`'s stage-rework path never writes `node_completed`
+ * (only `metadata.approval.resolved`/`rejection_reason`/`rejection_count`).
+ *
+ * - `interactive_loop` / `child_workflow` — always true: both kinds are
+ *   re-entered by the node executor's own re-read of `metadata.approval`,
+ *   independent of `priorCompletedNodes` (`executeLoopNode`/
+ *   `executeLoopGroupNode`/`executeWorkflowNode` in dag-executor.ts).
+ * - `writeback` — always false: there is no DAG node behind this gate to
+ *   re-run (`nodeId` is the synthetic `__writeback__`); resolving it flows
+ *   through the container write-back resume path, never a node re-run.
+ * - `approval` / `undefined` — true ONLY for a genuinely staged legacy
+ *   on_reject rework: `resolved === 'rejected'`, a non-empty top-level
+ *   `rejection_reason`, and `onRejectPrompt` still present on the approval
+ *   context (the same legacy-mode signal `executeApprovalNode` itself checks
+ *   before re-running the rework prompt). A new-mode gate (#2707 step 1)
+ *   never needs this carve-out: both approve and reject write
+ *   `node_completed` immediately, so `priorCompletedNodes` already contains
+ *   it by the time this function would be asked.
+ */
+export function reRunsOwnNodeOnResume(
+  approval: ApprovalContext | undefined,
+  metadata: Record<string, unknown> | undefined
+): boolean {
+  if (approval === undefined) return false;
+  switch (approval.type) {
+    case 'interactive_loop':
+    case 'child_workflow':
+      return true;
+    case 'writeback':
+      return false;
+    case 'approval':
+    case undefined: {
+      const rejectionReason = metadata?.rejection_reason;
+      return (
+        approval.resolved === 'rejected' &&
+        approval.onRejectPrompt !== undefined &&
+        typeof rejectionReason === 'string' &&
+        rejectionReason !== ''
+      );
+    }
+    default: {
+      const unreachable: never = approval.type;
+      throw new Error(`reRunsOwnNodeOnResume: unhandled gate type '${String(unreachable)}'`);
+    }
+  }
 }
 
 /**

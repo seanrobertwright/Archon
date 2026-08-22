@@ -117,7 +117,7 @@ describe('approveWorkflow', () => {
     mockFindChildRuns.mockResolvedValue([]);
   });
 
-  test('approves standard approval gate — writes node_completed + approval_received', async () => {
+  test('approves standard (new-mode) approval gate — writes node_completed with structured {decision,text} output (#2707)', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun());
 
     const result = await approveWorkflow('run-1', 'Looks good');
@@ -132,7 +132,10 @@ describe('approveWorkflow', () => {
 
     // Stays 'paused' (no status write) — resolution recorded atomically via the
     // CAS on the approval context + rejection state cleared (#2075/#2113), with the
-    // audit events written in the same transaction (#2146).
+    // audit events written in the same transaction (#2146). No `onRejectPrompt` on
+    // the approval context (makePausedRun's default) means this is a new-mode gate
+    // (#2707 step 1): output is always structured {decision,text}, not gated by
+    // captureResponse.
     expect(mockResolveApprovalGate).toHaveBeenCalledWith(
       'run-1',
       {
@@ -150,7 +153,11 @@ describe('approveWorkflow', () => {
         {
           event_type: 'node_completed',
           step_name: 'review',
-          data: { node_output: '', approval_decision: 'approved' },
+          data: {
+            node_output: JSON.stringify({ decision: 'approve', text: 'Looks good' }),
+            approval_decision: 'approved',
+            structured_output: { decision: 'approve', text: 'Looks good' },
+          },
         },
         {
           event_type: 'approval_received',
@@ -163,6 +170,30 @@ describe('approveWorkflow', () => {
     // Anonymous telemetry: binary resolution captured exactly once
     expect(mockCaptureApprovalResolved).toHaveBeenCalledTimes(1);
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'approved' });
+  });
+
+  test('approves legacy on_reject-configured gate — plain text output, unaffected by #2707', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({
+        metadata: {
+          approval: {
+            nodeId: 'review',
+            message: 'Please review',
+            type: 'approval',
+            onRejectPrompt: 'Please address: $REJECTION_REASON',
+          },
+        },
+      })
+    );
+
+    await approveWorkflow('run-1', 'Looks good');
+
+    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    // No captureResponse set → empty output, exactly as before this PR. No
+    // structured_output field at all on the legacy path.
+    expect((nodeCompleted?.data as Record<string, unknown>).node_output).toBe('');
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
   });
 
   test('approves interactive_loop — writes only approval_received, stores loop_user_input', async () => {
@@ -321,7 +352,10 @@ describe('approveWorkflow', () => {
     expect(mockCaptureApprovalResolved).not.toHaveBeenCalled();
   });
 
-  test('approves with captureResponse — stores comment as node output', async () => {
+  test('new-mode gate ignores a stray captureResponse — output is still structured (#2707)', async () => {
+    // captureResponse with no onRejectPrompt is the deprecated flag on a
+    // new-mode gate — it no longer switches behavior. Output is always
+    // structured (the whole point of "the output IS the channel").
     const run = makePausedRun({
       metadata: {
         approval: {
@@ -339,7 +373,31 @@ describe('approveWorkflow', () => {
     // The node_output rides the CAS events (#2146), not a separate event write.
     const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect((nodeCompleted?.data as Record<string, unknown>).node_output).toBe(
+      JSON.stringify({ decision: 'approve', text: 'My review notes' })
+    );
+  });
+
+  test('legacy gate (onRejectPrompt set) with captureResponse — stores comment as plain node output, unchanged', async () => {
+    const run = makePausedRun({
+      metadata: {
+        approval: {
+          nodeId: 'review',
+          message: 'Review',
+          type: 'approval',
+          captureResponse: true,
+          onRejectPrompt: 'Please address: $REJECTION_REASON',
+        },
+      },
+    });
+    mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+    await approveWorkflow('run-1', 'My review notes');
+
+    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     expect((nodeCompleted?.data as Record<string, unknown>).node_output).toBe('My review notes');
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
   });
 
   test('throws on non-paused run', async () => {
@@ -581,7 +639,10 @@ describe('rejectWorkflow', () => {
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 
-  test('rejects without onRejectPrompt — cancels immediately', async () => {
+  test('rejects without onRejectPrompt and no declared reject decision — cancels immediately (legacy default)', async () => {
+    // makePausedRun()'s approval context has no `decisions` at all (predates
+    // #2707) — absence, not an empty array, so this preserves the exact
+    // pre-#2707 cancel-on-reject-without-on_reject behavior.
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun());
 
     const result = await rejectWorkflow('run-1', 'no good');
@@ -596,6 +657,78 @@ describe('rejectWorkflow', () => {
       },
     ]);
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  test('new-mode gate rejects — writes node_completed with structured {decision,text} output, stays resumable (#2707)', async () => {
+    const run = makePausedRun({
+      metadata: {
+        approval: {
+          nodeId: 'review',
+          message: 'Please review',
+          type: 'approval',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+        },
+      },
+    });
+    mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+    const result = await rejectWorkflow('run-1', 'needs changes');
+
+    // Unlike the legacy on_reject path, there is no staging or attempt cap —
+    // this is an ordinary node completion, so the run stays paused/resumable
+    // exactly like an approve, and no separate cancel path is taken.
+    expect(result.cancelled).toBe(false);
+    expect(result.maxAttemptsReached).toBe(false);
+    expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
+    expect(mockResolveApprovalGate).toHaveBeenCalledWith(
+      'run-1',
+      {
+        approval: {
+          nodeId: 'review',
+          message: 'Please review',
+          type: 'approval',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+          resolved: 'rejected',
+        },
+      },
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'review',
+          data: {
+            node_output: JSON.stringify({ decision: 'reject', text: 'needs changes' }),
+            approval_decision: 'rejected',
+            structured_output: { decision: 'reject', text: 'needs changes' },
+          },
+        },
+        {
+          event_type: 'approval_received',
+          step_name: 'review',
+          data: { decision: 'rejected', reason: 'needs changes' },
+        },
+      ]
+    );
+    expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'rejected' });
+  });
+
+  test('new-mode approve-only gate rejects — no reject decision declared, cancels (no unreachable decision)', async () => {
+    const run = makePausedRun({
+      metadata: {
+        approval: {
+          nodeId: 'review',
+          message: 'Please review',
+          type: 'approval',
+          decisions: [{ id: 'approve' }],
+        },
+      },
+    });
+    mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+    const result = await rejectWorkflow('run-1', 'no good');
+
+    expect(result.cancelled).toBe(true);
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledTimes(1);
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
   });
 
   test('terminal reject concurrent loser (CAS miss) writes NO event or telemetry (#2113)', async () => {

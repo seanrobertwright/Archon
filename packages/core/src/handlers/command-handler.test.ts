@@ -2549,7 +2549,7 @@ describe('CommandHandler', () => {
         updated_at: new Date(),
       };
 
-      test('stores user comment as node_output when captureResponse is true', async () => {
+      test('new-mode gate ignores captureResponse — output is always structured {decision,text} (#2707)', async () => {
         mockGetWorkflowRun.mockResolvedValueOnce({
           id: 'run-cap',
           workflow_name: 'capture-wf',
@@ -2580,11 +2580,15 @@ describe('CommandHandler', () => {
         >;
         const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
         expect(nodeCompleted).toMatchObject({
-          data: { node_output: 'LGTM looks good', approval_decision: 'approved' },
+          data: {
+            node_output: JSON.stringify({ decision: 'approve', text: 'LGTM looks good' }),
+            approval_decision: 'approved',
+            structured_output: { decision: 'approve', text: 'LGTM looks good' },
+          },
         });
       });
 
-      test('stores empty node_output when captureResponse is not set', async () => {
+      test('new-mode gate produces structured output even with no captureResponse set (#2707)', async () => {
         mockGetWorkflowRun.mockResolvedValueOnce({
           id: 'run-nocap',
           workflow_name: 'nocapture-wf',
@@ -2614,8 +2618,48 @@ describe('CommandHandler', () => {
         >;
         const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
         expect(nodeCompleted).toMatchObject({
-          data: { node_output: '', approval_decision: 'approved' },
+          data: {
+            node_output: JSON.stringify({ decision: 'approve', text: 'a comment' }),
+            approval_decision: 'approved',
+            structured_output: { decision: 'approve', text: 'a comment' },
+          },
         });
+      });
+
+      test('legacy on_reject-configured gate keeps plain text output, unaffected by #2707', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-legacy-cap',
+          workflow_name: 'legacy-capture-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+              captureResponse: true,
+              onRejectPrompt: 'Fix: $REJECTION_REASON',
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        await handleCommand(baseConversation, '/workflow approve run-legacy-cap LGTM looks good');
+
+        const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<
+          Record<string, unknown>
+        >;
+        const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+        expect(nodeCompleted).toMatchObject({
+          data: { node_output: 'LGTM looks good', approval_decision: 'approved' },
+        });
+        expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
       });
     });
 

@@ -5916,8 +5916,12 @@ nodes:
         '        prompt: try again',
         '        max_retries: 2', // real field is max_attempts
       ]);
-      expect(pw.length).toBe(1);
-      expect(pw[0]).toContain("unknown key 'approval.on_reject.max_retries'");
+      // Also carries the #2707 step-1 on_reject deprecation warning now — the
+      // unknown-key warning under test is asserted independently of it.
+      const unknownKeyWarnings = pw.filter(w => w.includes('unknown key'));
+      expect(unknownKeyWarnings.length).toBe(1);
+      expect(unknownKeyWarnings[0]).toContain("unknown key 'approval.on_reject.max_retries'");
+      expect(pw.some(w => w.includes("'approval.on_reject' is deprecated"))).toBe(true);
     });
 
     it('should warn on an unknown key inside retry:', async () => {
@@ -6055,7 +6059,17 @@ nodes:
         '        prompt: again',
         '        max_attempts: 2',
       ]);
-      expect(pw).toEqual([]);
+      // Every key used here IS valid — none should trip the unknown-key check
+      // this describe block covers. `loop.interactive`/`capture_response`/
+      // `on_reject` are also deliberately deprecated (#2707 step 1), so this
+      // fixture now legitimately produces THOSE warnings too — asserted
+      // separately below, not conflated with "unknown key" false positives.
+      expect(pw.some(w => w.includes('unknown key'))).toBe(false);
+      expect(pw).toEqual([
+        "Node 'refine': node-level loop 'interactive:' is deprecated. A future release re-expresses the interactive loop as a gate + loop_group composition (#2707 step 3). Continue using it for now.",
+        "Node 'gate': 'approval.capture_response' is deprecated. Gate output is now always structured as {decision, text} — read '$gate.output.text' downstream instead. This field is ignored.",
+        "Node 'gate': 'approval.on_reject' is deprecated. Declare 'approval.decisions' and wire a rework node with \"when: \\\"$gate.output.decision == 'reject'\\\"\" instead (loop it with loop_group if it should iterate). This gate keeps running via the legacy mechanism until migrated.",
+      ]);
     });
 
     it('should not treat free-form output_format keys as unknown', async () => {
@@ -6236,6 +6250,13 @@ nodes:
       // `agent:` at workflow and node level — a real bug, silently dropped since
       // April. Remove from this list when the file is fixed.
       'e2e-opencode-smoke',
+      // #2707 step 1: these bundled workflows use the deprecated legacy
+      // approval.on_reject/capture_response mechanism and (for archon-piv-loop)
+      // node-level loop interactive:. They still run unmodified (grow-then-
+      // deprecate) — the warning is expected here, not a false positive.
+      // Remove from this list once #2123's defaults rewrite migrates them.
+      'archon-interactive-prd',
+      'archon-piv-loop',
     ]);
 
     it('warns only on workflows already known to carry unknown keys', async () => {
@@ -6264,6 +6285,111 @@ nodes:
         if (!KNOWN_BAD.has(result.workflow.name)) unexpected.push(result.workflow.name);
       }
       expect(unexpected).toEqual([]);
+    });
+  });
+
+  describe('#2707 step 1 gate/loop deprecation warnings', () => {
+    /** Write a single workflow and return its parse warnings. */
+    const warningsFor = async (lines: string[]): Promise<string[]> => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(join(workflowDir, 'test.yaml'), lines.join('\n'));
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows.length).toBe(1);
+      return [...(result.workflows[0].parseWarnings ?? [])];
+    };
+
+    it('warns on approval.capture_response', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: gate',
+        '    approval:',
+        '      message: ok?',
+        '      capture_response: true',
+      ]);
+      expect(pw).toHaveLength(1);
+      expect(pw[0]).toContain("Node 'gate': 'approval.capture_response' is deprecated");
+    });
+
+    it('warns on approval.on_reject', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: gate',
+        '    approval:',
+        '      message: ok?',
+        '      on_reject:',
+        '        prompt: fix it',
+      ]);
+      expect(pw).toHaveLength(1);
+      expect(pw[0]).toContain("Node 'gate': 'approval.on_reject' is deprecated");
+    });
+
+    it('warns on node-level loop.interactive', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: iterate',
+        '    loop:',
+        '      prompt: work',
+        '      until: DONE',
+        '      max_iterations: 5',
+        '      interactive: true',
+        '      gate_message: continue?',
+      ]);
+      expect(pw).toHaveLength(1);
+      expect(pw[0]).toContain("Node 'iterate': node-level loop 'interactive:' is deprecated");
+    });
+
+    it('warns on a gate/interactive loop_group nested inside a loop_group body', async () => {
+      // Exercises the recursion into loop_group.nodes — the outer group is
+      // clean, only the inner body nodes carry deprecated fields.
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: outer',
+        '    loop_group:',
+        '      until: DONE',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: inner-gate',
+        '          approval:',
+        '            message: ok?',
+        '            on_reject:',
+        '              prompt: fix it',
+        '        - id: inner-loop',
+        '          loop:',
+        '            prompt: work',
+        '            until: DONE',
+        '            max_iterations: 5',
+        '            interactive: true',
+        '            gate_message: continue?',
+        '          depends_on: [inner-gate]',
+      ]);
+      expect(pw).toHaveLength(2);
+      expect(pw.some(w => w.includes("Node 'inner-gate'") && w.includes('on_reject'))).toBe(true);
+      expect(pw.some(w => w.includes("Node 'inner-loop'") && w.includes('interactive'))).toBe(true);
+    });
+
+    it('produces no deprecation warnings for a new-mode gate with no deprecated fields', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: gate',
+        '    approval:',
+        '      message: ok?',
+        '      decisions:',
+        '        - id: approve',
+        '        - id: reject',
+        '          label: Needs work',
+      ]);
+      expect(pw).toEqual([]);
     });
   });
 });

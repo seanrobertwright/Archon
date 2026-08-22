@@ -141,6 +141,7 @@ export {
   isRunBlockedOnChild,
   suspendReasonSchema,
   isRecognizedSuspendReason,
+  reRunsOwnNodeOnResume,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
   WORKFLOW_SOURCE_METADATA_KEY,
