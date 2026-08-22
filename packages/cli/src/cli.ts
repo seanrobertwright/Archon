@@ -16,6 +16,15 @@ import '@archon/paths/strip-cwd-env-boot';
 import { loadArchonEnv } from '@archon/paths/env-loader';
 loadArchonEnv(process.cwd());
 
+// Install the pipe-safe `console.log` shim BEFORE any command module imports.
+// `console.log` reaches fd 1 via a non-blocking pipe (pino opens it that way at
+// module load via `@archon/paths/strip-cwd-env-boot` above), and short writes
+// are silently dropped against a slow reader. The shim delegates through
+// `writeStdout` so every byte reaches the OS before the call returns. See
+// `utils/safe-console.ts` and #2400 for the full rationale.
+import { installPipeSafeConsole } from './utils/safe-console';
+installPipeSafeConsole();
+
 import { parseArgs } from 'util';
 import { resolve } from 'path';
 import { existsSync, realpathSync } from 'fs';
