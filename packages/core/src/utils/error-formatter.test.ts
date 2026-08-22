@@ -191,11 +191,13 @@ describe('classifyAndFormatError', () => {
       expect(result).toContain('codex login');
     });
 
-    test('detects Codex 401 retry exhaustion via "Codex auth error:" wrapper (provider-enriched shape)', () => {
+    test('detects Codex 401 auth failure via "Codex auth error:" wrapper (provider-enriched shape)', () => {
       // classifyAndEnrichCodexError wraps messages whose AUTH_PATTERNS match
       // (here: "401" and "Unauthorized") as `Codex auth error: <inner>`. This
-      // is the shape the provider actually emits for a 401 retry exhaustion
-      // (#2509 R1), not the synthetic `Codex query failed:` shape.
+      // is the shape the provider actually emits for a 401 auth failure
+      // (#2509 R1) — the `auth` class is excluded from retry and thrown
+      // immediately (provider.ts:856), not the synthetic `Codex query
+      // failed:` shape.
       const result = classifyAndFormatError(
         new Error('Codex auth error: exceeded retry limit, last status: 401 Unauthorized')
       );
@@ -208,6 +210,32 @@ describe('classifyAndFormatError', () => {
       const result = classifyAndFormatError(new Error('Codex query failed: Unauthorized'));
       expect(result).toContain('Codex authentication error');
       expect(result).toContain('codex login');
+    });
+
+    describe('"Codex auth error:" wrapper routes unconditionally (#2509 R1)', () => {
+      // The provider only wraps a message as `Codex auth error:` after its own
+      // AUTH_PATTERNS check already classified it as auth
+      // (packages/providers/src/codex/provider.ts:307-315, 848-851). These
+      // inner phrases don't appear in the formatter's OAuth-refresh substring
+      // list, so before the fix they fell through to a generic message
+      // instead of Codex guidance — the same misdirection #2509 reports, for
+      // different real phrasing the provider already classifies as auth.
+      test.each([
+        ['authentication failed', 'authentication'],
+        ['unauthorized', 'unauthorized'],
+        ['403 Forbidden: insufficient scope', '403'],
+        ['Your credit balance is too low to access the API', 'credit balance'],
+        ['invalid token provided', 'invalid token'],
+      ])('routes "%s" (AUTH_PATTERNS: %s) to Codex auth guidance', inner => {
+        const result = classifyAndFormatError(new Error(`Codex auth error: ${inner}`));
+        expect(result).toContain('Codex authentication error');
+        expect(result).toContain('codex login');
+        expect(result).not.toContain('Claude authentication');
+        // "invalid token provided" contains the word "token", which the
+        // generic fallback's sensitive-data filter used to strip along with
+        // all other detail — the unconditional route must bypass that filter.
+        expect(result).not.toContain('unexpected error occurred');
+      });
     });
   });
 
@@ -332,6 +360,36 @@ describe('classifyAndFormatError', () => {
     });
   });
 
+  describe('raw orchestrator prefixes reject a bare "401" (#2509 R2)', () => {
+    // codex_turn_failed:/codex_stream_incomplete: carry raw upstream text
+    // (orchestrator-agent.ts) that never passes through the provider's own
+    // classifyCodexError/AUTH_PATTERNS check, unlike every `Codex `-prefixed
+    // shape above. A bare "401" in that raw text is not a reliable auth
+    // signal — it can appear in unrelated internal errors — so these two
+    // prefixes require the more specific word "Unauthorized" instead.
+    test('does not route "codex_turn_failed:" with an unrelated "401" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error('codex_turn_failed: internal error at offset 401 while parsing response body')
+      );
+      expect(result).not.toContain('Codex authentication');
+      expect(result).not.toContain('codex login');
+    });
+
+    test('does not route "codex_stream_incomplete:" with an unrelated "401" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error('codex_stream_incomplete: retry counter reached 401 before stream closed')
+      );
+      expect(result).not.toContain('Codex authentication');
+      expect(result).not.toContain('codex login');
+    });
+
+    test('still routes "codex_turn_failed:" carrying "Unauthorized" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(new Error('codex_turn_failed: 401 Unauthorized'));
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
+    });
+  });
+
   describe('general authentication errors', () => {
     test('detects "API key" in message', () => {
       const result = classifyAndFormatError(new Error('Invalid API key provided'));
@@ -351,6 +409,10 @@ describe('classifyAndFormatError', () => {
     test('detects "401" in message', () => {
       const result = classifyAndFormatError(new Error('HTTP 401 Unauthorized'));
       expect(result).toContain('authentication error');
+      // A message with no Codex-side prefix must stay on the general-auth
+      // branch, not the Codex branch above it (#2509 R3 — "authentication
+      // error" is a substring of both, so this guards the boundary directly).
+      expect(result).not.toContain('Codex authentication');
     });
 
     test('does not false-positive on generic messages containing "auth"', () => {

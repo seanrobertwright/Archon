@@ -37,30 +37,38 @@ export function classifyAndFormatError(error: Error): string {
   }
 
   // Codex-specific auth errors — OAuth token refresh failures and 401 retry
-  // exhaustion. The provider wraps streaming/lifecycle errors with several
-  // prefixes — `Codex auth error:`, `Codex unknown:`, `Codex query failed:`,
-  // and the generic `Codex ${errorClass}:` form (see
-  // packages/providers/src/codex/provider.ts: classifyAndEnrichCodexError and
-  // the SDK-lifecycle catches in createCodexClient / startThread /
-  // resumeThread), and the orchestrator's `isError` synthetic-error path
-  // emits `codex_turn_failed:` or `codex_stream_incomplete:` (see
-  // packages/core/src/orchestrator/orchestrator-agent.ts isError handling).
-  // Match any of those Codex-side prefixes so an auth-flavored inner message
-  // routes to Codex guidance (GitHub #2509) instead of falling through to the
-  // Claude-OAuth branch below. The rate-limit branch above has already had a
-  // chance to match, so `Codex rate_limit:` wraps route to usage-cap guidance
-  // first. Recovery: `codex login` in terminal.
+  // exhaustion (GitHub #2509). The rate-limit branch above has already had a
+  // chance to match, so a `Codex rate_limit:` wrap routes to usage-cap
+  // guidance first (only when the inner text literally contains "rate
+  // limit" — see that branch).
+  //
+  // `Codex auth error:` means the provider's own AUTH_PATTERNS
+  // (packages/providers/src/codex/provider.ts) already classified this
+  // message as auth, so it routes unconditionally instead of being re-tested
+  // against a narrower, hand-written substring list — that mismatch is what
+  // let real auth errors like "unauthorized" and "invalid token" fall
+  // through (#2509 R1). Every other Codex-side prefix was NOT classified as
+  // auth by the provider: some are a different class (`Codex crash:`),
+  // others are raw and never classified at all (`Codex query failed:`,
+  // `codex_turn_failed:`, `codex_stream_incomplete:`), so those still need a
+  // substring check. For the two raw orchestrator prefixes, a bare "401" is
+  // not enough signal — unlike provider-thrown shapes it can appear in
+  // unrelated internal text (e.g. a byte offset), so only the specific word
+  // "Unauthorized" counts as a 401-adjacent auth signal there (#2509 R2).
+  if (message.startsWith('Codex auth error:')) {
+    return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
+  }
+  const isCodexRawPrefixed =
+    message.startsWith('codex_turn_failed:') || message.startsWith('codex_stream_incomplete:');
   if (
-    (message.startsWith('Codex ') ||
-      message.startsWith('codex_turn_failed:') ||
-      message.startsWith('codex_stream_incomplete:')) &&
+    (message.startsWith('Codex ') || isCodexRawPrefixed) &&
     (message.includes('refresh token') ||
       message.includes('could not be refreshed') ||
       message.includes('log out and sign in') ||
       message.includes('OAuth token has expired') ||
       message.includes('sign-in has expired') ||
-      message.includes('401') ||
-      message.includes('Unauthorized'))
+      message.includes('Unauthorized') ||
+      (!isCodexRawPrefixed && message.includes('401')))
   ) {
     return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
   }
