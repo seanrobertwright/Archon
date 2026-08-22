@@ -484,7 +484,9 @@ export class SlackWorkflowBridge {
             ? result.maxAttemptsReached
               ? 'cancelled — max reject attempts reached'
               : 'cancelled'
-            : 'recorded — workflow will retry with feedback';
+            : result.newMode
+              ? 'recorded — the run continues'
+              : 'recorded — workflow will retry with feedback';
         }
       } catch (error) {
         const err = error as Error;

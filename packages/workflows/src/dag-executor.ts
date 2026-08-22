@@ -6648,6 +6648,7 @@ async function executeApprovalNode(
       id: d.id,
       ...(d.label !== undefined ? { label: d.label } : {}),
     })),
+    decisionsAuthored: node.decisionsAuthored,
   });
 
   // Return completed — the between-layer status check will see 'paused' (or the

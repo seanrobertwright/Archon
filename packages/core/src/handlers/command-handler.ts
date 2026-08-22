@@ -1026,12 +1026,16 @@ async function handleWorkflowCommand(
             message: `Workflow \`${result.workflowName}\` rejected and cancelled${suffix}.`,
           };
         }
-        // Not cancelled means an on_reject rework is staged — continue the run so
-        // the rework actually happens (#2565).
+        // Not cancelled means either a legacy on_reject rework is staged, or
+        // (#2707 step 1) a new-mode gate resolved with structured output —
+        // continue the run either way so the resolution actually takes effect
+        // (#2565).
         return await withRunContinuation(
           runId,
           workflowCwd,
-          `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
+          result.newMode
+            ? `Workflow \`${result.workflowName}\` rejected. Continuing...`
+            : `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
           'reject'
         );
       } catch (error) {

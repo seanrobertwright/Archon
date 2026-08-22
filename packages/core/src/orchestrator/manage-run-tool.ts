@@ -392,7 +392,9 @@ async function handleWrite(
         return `Rejected and cancelled ${result.workflowName} (${id.slice(0, 8)})${suffix}. Nothing further runs.`;
       }
       const continues = signalGateResolved(ctx, run, 'reject');
-      return `Rejected ${result.workflowName} (${id.slice(0, 8)}). It reworks with your feedback.${continues}`;
+      return result.newMode
+        ? `Rejected ${result.workflowName} (${id.slice(0, 8)}). The run continues.${continues}`
+        : `Rejected ${result.workflowName} (${id.slice(0, 8)}). It reworks with your feedback.${continues}`;
     }
   }
 }

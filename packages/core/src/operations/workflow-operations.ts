@@ -52,9 +52,15 @@ export interface RejectionOperationResult {
   codebaseId: string | null;
   /** Internal DB UUID — resolve via getConversationById() to get platform_conversation_id. */
   conversationId: string;
-  /** true = run cancelled; false = transitioning to failed for retry (has onRejectPrompt) */
+  /**
+   * true = run cancelled; false = staying paused/resumable for one of two
+   * reasons distinguished by `newMode` below — a legacy `on_reject` rework
+   * being staged, or (#2707 step 1) a new-mode gate resolving with structured
+   * output. Callers rendering a message MUST branch on `newMode`, not assume
+   * `cancelled === false` means "a rework prompt is about to run."
+   */
   cancelled: boolean;
-  /** true when cancelled specifically because max rejection attempts were reached */
+  /** true when cancelled specifically because max rejection attempts were reached (legacy on_reject only) */
   maxAttemptsReached: boolean;
   /**
    * true when this was the engine-level container write-back gate (Phase C). The
@@ -63,6 +69,15 @@ export interface RejectionOperationResult {
    * on_reject-rework message.
    */
   writeBack: boolean;
+  /**
+   * true when this rejection resolved a #2707 step-1 new-mode gate (author
+   * explicitly declared `approval.decisions:`) with structured
+   * `{decision:'reject', text}` output rather than staging a legacy
+   * `on_reject` rework. Only meaningful when `cancelled === false` and
+   * `writeBack === false` — distinguishes "resolved, run continues per the
+   * workflow's own `when:` wiring" from "a rework prompt is about to run."
+   */
+  newMode: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -479,18 +494,19 @@ export async function approveWorkflow(
         rejection_reason: '',
         rejection_count: 0,
       };
-      // Legacy on_reject-configured gates (onRejectPrompt set) keep today's
-      // behavior byte-for-byte: plain text output gated by captureResponse. A
-      // gate with no on_reject — the new #2707 step-1 authoring surface, or the
-      // omitted-config default — always produces structured {decision,text}
-      // output: "the output IS the channel", no flag needed. `text` is the raw
-      // comment (possibly empty), not `approvalComment`'s display default.
-      const isLegacyGate = approval.onRejectPrompt != null;
-      const nodeOutput = isLegacyGate
-        ? approval.captureResponse === true
+      // New-mode resolution is opt-in: only a gate whose author explicitly
+      // wrote `approval.decisions:` (decisionsAuthored) — never merely "no
+      // on_reject" — gets structured output. No workflow authored before
+      // #2707 step 1 can have written `decisions:`, so every already-authored
+      // gate (bare, or `capture_response`-only) keeps its exact pre-PR plain-
+      // text/empty output regardless of on_reject. `text` is the raw comment
+      // (possibly empty), not `approvalComment`'s display default.
+      const isNewMode = approval.onRejectPrompt == null && approval.decisionsAuthored === true;
+      const nodeOutput = isNewMode
+        ? JSON.stringify({ decision: 'approve', text: comment ?? '' })
+        : approval.captureResponse === true
           ? approvalComment
-          : ''
-        : JSON.stringify({ decision: 'approve', text: comment ?? '' });
+          : '';
       events = [
         {
           event_type: 'node_completed',
@@ -498,9 +514,9 @@ export async function approveWorkflow(
           data: {
             node_output: nodeOutput,
             approval_decision: 'approved',
-            ...(isLegacyGate
-              ? {}
-              : { structured_output: { decision: 'approve', text: comment ?? '' } }),
+            ...(isNewMode
+              ? { structured_output: { decision: 'approve', text: comment ?? '' } }
+              : {}),
           },
         },
         {
@@ -603,6 +619,7 @@ export async function rejectWorkflow(
           cancelled: false,
           maxAttemptsReached: false,
           writeBack: true,
+          newMode: false,
         };
       }
       case 'child_workflow':
@@ -641,16 +658,19 @@ export async function rejectWorkflow(
   // The legacy on_reject rework is staged (run stays 'paused') only when a
   // prompt is set AND we're under the attempt cap.
   const willStageRework = onRejectConfigured && !maxAttemptsReached;
-  // New mechanism (#2707 step 1): a gate with no on_reject that declares a
-  // 'reject' decision resolves immediately with structured {decision,text}
-  // output — no staging, no attempt counter, the run just stays 'paused'
-  // awaiting resume like any other completed node (see Task 4: this is why
-  // hydrateResumableRun needs no special-casing for it). A gate declaring no
-  // 'reject' decision (an approve-only gate) falls through to the existing
-  // cancel behavior below, preserving today's "no on_reject configured"
-  // semantics for that case.
+  // New mechanism (#2707 step 1): resolves immediately with structured
+  // {decision,text} output — no staging, no attempt counter, the run just
+  // stays 'paused' awaiting resume like any other completed node (see #2714:
+  // this is why hydrateResumableRun needs no special-casing for it). Opt-in
+  // ONLY (mirrors approveWorkflow's isNewMode — see its comment): requires
+  // the author to have explicitly written `approval.decisions:`, not merely
+  // "no on_reject", so an already-authored gate's reject keeps cancelling the
+  // run exactly as before this PR. Within an explicitly-decisions-authored
+  // gate, one declaring no 'reject' id (an approve-only gate) still falls
+  // through to the cancel path below — that vocabulary gap is deliberate.
+  const decisionsAuthored = approval?.decisionsAuthored === true;
   const hasRejectDecision = approval?.decisions?.some(d => d.id === 'reject') ?? false;
-  const willResolveNewMode = !onRejectConfigured && hasRejectDecision;
+  const willResolveNewMode = !onRejectConfigured && decisionsAuthored && hasRejectDecision;
 
   // The audit event is identical for every reject outcome; the CAS writes it
   // in the SAME transaction as the resolution (#2146).
@@ -719,6 +739,7 @@ export async function rejectWorkflow(
     cancelled: !willStageRework && !willResolveNewMode,
     maxAttemptsReached,
     writeBack: false,
+    newMode: willResolveNewMode,
   };
 }
 

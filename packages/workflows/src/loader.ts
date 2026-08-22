@@ -256,6 +256,21 @@ function collectUnknownConfigKeys(
   event: string,
   warnings: string[]
 ): void {
+  if (spec.kind === 'array') {
+    if (!Array.isArray(raw)) return;
+    raw.forEach((entry, i) => {
+      collectUnknownConfigKeys(
+        entry,
+        spec.entry,
+        id,
+        label,
+        `${keyPath}${String(i)}.`,
+        event,
+        warnings
+      );
+    });
+    return;
+  }
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return;
   const obj = raw as Record<string, unknown>;
 
@@ -361,7 +376,13 @@ function collectGateAndLoopDeprecationWarnings(
     const rawApproval = (raw as Record<string, unknown>).approval;
     if (rawApproval !== null && typeof rawApproval === 'object') {
       const approvalObj = rawApproval as Record<string, unknown>;
-      if (approvalObj.capture_response !== undefined) {
+      // capture_response is genuinely ignored ONLY once the gate has also
+      // opted into the new mechanism by authoring 'decisions:' (GateNode.
+      // decisionsAuthored) — combined with 'on_reject', or on a bare gate with
+      // no 'decisions:' authored, it still fully controls whether the
+      // reviewer's comment becomes the node's output, exactly as before this
+      // PR. Warning unconditionally would be false in those cases.
+      if (approvalObj.capture_response !== undefined && node.decisionsAuthored) {
         const message =
           `Node '${id}': 'approval.capture_response' is deprecated. Gate output is now ` +
           `always structured as {decision, text} — read '$${id}.output.text' downstream ` +

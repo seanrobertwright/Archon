@@ -426,14 +426,26 @@ export interface ApprovalContext {
    * The gate's declared decisions (#2707 step 1), snapshotted at pause time so
    * approve/reject handlers don't need the workflow def to know the vocabulary
    * — mirrors why `onRejectPrompt` is snapshotted rather than looked up.
-   * `onRejectPrompt !== undefined` (not this field's presence) is what
-   * distinguishes a legacy on_reject gate (byte-for-byte unchanged resolution)
-   * from a new-mode gate (structured `{decision,text}` output): a legacy gate's
-   * `decisions` is still populated (`[{id:'approve'},{id:'reject'}]`), it just
-   * isn't consulted by the resolution path. Absent on gates paused by builds
-   * that predate this field.
+   * Always populated (synthesized default pair, `on_reject`-translated pair,
+   * or the authored array) regardless of mode — see `decisionsAuthored` for
+   * the actual mode signal. Absent on gates paused by builds that predate
+   * this field.
    */
   decisions?: { id: string; label?: string }[];
+  /**
+   * True only when the author wrote `approval.decisions:` explicitly in YAML
+   * (mirrors `GateNode.decisionsAuthored` — see its doc for the full
+   * rationale). THIS, not `onRejectPrompt`'s absence, is the signal
+   * `approveWorkflow`/`rejectWorkflow` use to pick the new structured-output
+   * resolution path: no workflow authored before #2707 step 1 can have
+   * written `decisions:`, so keying the new behavior on it — rather than on
+   * "no on_reject configured" — guarantees every already-authored gate
+   * (bare, or `capture_response`-only) keeps its exact pre-PR output shape
+   * AND reject-always-cancels behavior, unaffected by this PR. Absent (falsy)
+   * on gates paused by builds that predate this field, which resolves to
+   * legacy behavior — the safe default.
+   */
+  decisionsAuthored?: boolean;
   /**
    * Gate resolution marker. Set by approve/reject handlers while the run STAYS
    * 'paused' awaiting auto-resume (#2075): 'approved' = approval recorded,

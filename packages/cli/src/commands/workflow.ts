@@ -3337,9 +3337,10 @@ export async function workflowRejectCommand(
     return;
   }
 
-  // Not cancelled = either an on_reject rework (DAG approval gate) or a container
-  // write-back reject (discard the overlay). Both auto-resume; the resume drives
-  // the rework / the overlay discard + completion.
+  // Not cancelled = a legacy on_reject rework, a #2707 step-1 new-mode
+  // resolution, or a container write-back reject (discard the overlay). All
+  // three auto-resume; the resume drives the rework / continuation / the
+  // overlay discard + completion.
   if (!result.workingPath) {
     throw new Error(
       `Workflow run '${resolvedId}' has no working path recorded.\n` +
@@ -3350,7 +3351,9 @@ export async function workflowRejectCommand(
   console.log(
     result.writeBack
       ? 'Discarding container changes (live folder left untouched)...'
-      : 'Resuming with on_reject prompt...'
+      : result.newMode
+        ? 'Resuming...'
+        : 'Resuming with on_reject prompt...'
   );
 
   // Look up the original platform conversation ID to keep all messages in one thread

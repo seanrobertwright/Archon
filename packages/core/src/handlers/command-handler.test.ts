@@ -2549,7 +2549,7 @@ describe('CommandHandler', () => {
         updated_at: new Date(),
       };
 
-      test('new-mode gate ignores captureResponse — output is always structured {decision,text} (#2707)', async () => {
+      test('bare gate with captureResponse but no decisionsAuthored keeps plain-text output (R2 fix — #2707)', async () => {
         mockGetWorkflowRun.mockResolvedValueOnce({
           id: 'run-cap',
           workflow_name: 'capture-wf',
@@ -2580,15 +2580,12 @@ describe('CommandHandler', () => {
         >;
         const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
         expect(nodeCompleted).toMatchObject({
-          data: {
-            node_output: JSON.stringify({ decision: 'approve', text: 'LGTM looks good' }),
-            approval_decision: 'approved',
-            structured_output: { decision: 'approve', text: 'LGTM looks good' },
-          },
+          data: { node_output: 'LGTM looks good', approval_decision: 'approved' },
         });
+        expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
       });
 
-      test('new-mode gate produces structured output even with no captureResponse set (#2707)', async () => {
+      test('bare gate with no captureResponse set — empty output, unaffected by #2707', async () => {
         mockGetWorkflowRun.mockResolvedValueOnce({
           id: 'run-nocap',
           workflow_name: 'nocapture-wf',
@@ -2613,6 +2610,42 @@ describe('CommandHandler', () => {
         await handleCommand(baseConversation, '/workflow approve run-nocap a comment');
 
         // node_completed rides the CAS transaction now (#2146), not a direct write.
+        const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<
+          Record<string, unknown>
+        >;
+        const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+        expect(nodeCompleted).toMatchObject({
+          data: { node_output: '', approval_decision: 'approved' },
+        });
+        expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
+      });
+
+      test('new-mode gate (decisionsAuthored) produces structured output (#2707)', async () => {
+        mockGetWorkflowRun.mockResolvedValueOnce({
+          id: 'run-new-mode',
+          workflow_name: 'new-mode-wf',
+          conversation_id: 'conv-approve',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused',
+          user_message: 'start',
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve?',
+              decisions: [{ id: 'approve' }, { id: 'reject' }],
+              decisionsAuthored: true,
+            },
+          },
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: new Date(),
+          working_path: '/repo',
+        });
+
+        await handleCommand(baseConversation, '/workflow approve run-new-mode a comment');
+
         const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<
           Record<string, unknown>
         >;

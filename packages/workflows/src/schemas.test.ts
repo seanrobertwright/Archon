@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
   isExecNode,
+  isGateNode,
   isHaltNode,
   isLoopNode,
   isLoopGroupNode,
@@ -282,6 +283,94 @@ describe('approvalOnRejectSchema', () => {
 
   test('rejects max_attempts: 11', () => {
     const result = approvalOnRejectSchema.safeParse({ prompt: 'Fix it', max_attempts: 11 });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// approval.decisions — new authoring surface (#2707 step 1)
+// ---------------------------------------------------------------------------
+
+describe('approval.decisions — new authoring surface (#2707)', () => {
+  test('parses a valid explicit decisions array, marking decisionsAuthored', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate',
+      approval: {
+        message: 'ok?',
+        decisions: [{ id: 'approve', label: 'Ship it' }, { id: 'reject' }],
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success && !isIncludeDirective(result.data) && isGateNode(result.data)) {
+      expect(result.data.decisionsAuthored).toBe(true);
+      expect(result.data.decisions).toEqual([
+        { id: 'approve', label: 'Ship it' },
+        { id: 'reject' },
+      ]);
+    }
+  });
+
+  test('omitted decisions synthesizes the default pair with decisionsAuthored: false', () => {
+    const result = dagNodeSchema.safeParse({ id: 'gate', approval: { message: 'ok?' } });
+    expect(result.success).toBe(true);
+    if (result.success && !isIncludeDirective(result.data) && isGateNode(result.data)) {
+      expect(result.data.decisionsAuthored).toBe(false);
+      expect(result.data.decisions).toEqual([{ id: 'approve' }, { id: 'reject' }]);
+    }
+  });
+
+  test('rejects an id outside {approve, reject}', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate',
+      approval: { message: 'ok?', decisions: [{ id: 'escalate' }] },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  test('rejects duplicate ids', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate',
+      approval: { message: 'ok?', decisions: [{ id: 'approve' }, { id: 'approve' }] },
+    });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).toContain('unique');
+  });
+
+  test('rejects decisions with no approve entry (R3 fix)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate',
+      approval: { message: 'ok?', decisions: [{ id: 'reject' }] },
+    });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).toContain('approve');
+  });
+
+  test('accepts an approve-only decisions array (acknowledge gate, reject optional)', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate',
+      approval: { message: 'ok?', decisions: [{ id: 'approve' }] },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test('rejects decisions combined with on_reject — mutually exclusive', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate',
+      approval: {
+        message: 'ok?',
+        decisions: [{ id: 'approve' }, { id: 'reject' }],
+        on_reject: { prompt: 'fix it' },
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).toContain('mutually exclusive');
+  });
+
+  test('rejects an empty decisions array', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'gate',
+      approval: { message: 'ok?', decisions: [] },
+    });
     expect(result.success).toBe(false);
   });
 });
