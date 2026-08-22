@@ -21,7 +21,8 @@ export const getStaticPaths: GetStaticPaths = async () => {
     if (doc.data.draft) return false;
     // Skip MDX files — they may contain JSX that can't be raw-dumped
     // (e.g., docs.mdx imports <Card> components)
-    if (doc.id.endsWith('.mdx')) return false;
+    // Note: Use filePath for detection because docsLoader strips extensions from id
+    if (doc.filePath?.endsWith('.mdx')) return false;
     return true;
   });
 
