@@ -43,13 +43,12 @@ import {
 } from '@archon/providers';
 import type {
   DagNode,
-  ApprovalNode,
-  BashNode,
-  CommandNode,
-  PromptNode,
+  IncludeDirective,
+  GateNode,
+  ExecNode,
+  AgentNode,
   LoopNode,
   LoopGroupNode,
-  ScriptNode,
   WorkflowNode,
   FanOutConfig,
   NodeOutput,
@@ -70,14 +69,13 @@ import type {
   WorkflowRunStatus,
 } from './schemas';
 import {
-  isBashNode,
-  isCommandNode,
+  isExecNode,
+  isAgentNode,
   isLoopNode,
   isLoopGroupNode,
-  isApprovalNode,
-  isCancelNode,
-  isScriptNode,
-  isIncludeNode,
+  isGateNode,
+  isHaltNode,
+  isIncludeDirective,
   isWorkflowNode,
   isPersistableNode,
   readSubrunMetadata,
@@ -159,14 +157,21 @@ import {
  * misclassification, not a privacy issue) — extend this when adding node types.
  */
 function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
-  if (isBashNode(node)) return 'bash';
-  if (isScriptNode(node)) return 'script';
+  if (isExecNode(node)) return node.runtime === 'sh' ? 'bash' : 'script';
   if (isLoopNode(node)) return 'loop';
   if (isLoopGroupNode(node)) return 'loop_group';
-  if (isApprovalNode(node)) return 'approval';
-  if (isCancelNode(node)) return 'cancel';
-  if ('command' in node) return 'command';
+  if (isGateNode(node)) return 'approval';
+  if (isHaltNode(node)) return 'cancel';
+  if (isAgentNode(node) && node.source.kind === 'command') return 'command';
   return 'prompt';
+}
+
+/**
+ * Display name for a node in user-facing events: a command node's file name (matching
+ * today's `node.command ?? node.id` convention), otherwise the node's own id.
+ */
+function nodeDisplayName(node: DagNode): string {
+  return isAgentNode(node) && node.source.kind === 'command' ? node.source.name : node.id;
 }
 
 /**
@@ -252,7 +257,7 @@ function inputEnvVars(node: DagNode, ctx: ShellInputContext): NodeJS.ProcessEnv 
   // upstream outputs. Third and NEAREST source: the node's own file is the nearest
   // contract, so it wins over composed and run inputs (extends the documented order
   // above). Resolution failures throw and fail the node — never a silent ''.
-  if (isScriptNode(node) && node.with !== undefined) {
+  if (isExecNode(node) && node.runtime !== 'sh' && node.with !== undefined) {
     for (const [name, value] of Object.entries(
       resolveNodeBindings(node.id, node.with, ctx, runInputs)
     )) {
@@ -1260,12 +1265,13 @@ export function substituteNodeOutputRefs(
  * such real-but-empty refs lenient while still catching ids that exist nowhere.
  */
 function collectLoopBodyNodeIds(
-  nodes: readonly DagNode[],
+  nodes: readonly (DagNode | IncludeDirective)[],
   into: Set<string> = new Set<string>()
 ): Set<string> {
   for (const n of nodes) {
     into.add(n.id);
-    if (isLoopGroupNode(n)) collectLoopBodyNodeIds(n.loop_group.nodes, into);
+    if (!isIncludeDirective(n) && isLoopGroupNode(n))
+      collectLoopBodyNodeIds(n.loop_group.nodes, into);
   }
   return into;
 }
@@ -1803,7 +1809,7 @@ async function executeNodeInternal(
   conversationId: string,
   cwd: string,
   workflowRun: WorkflowRun,
-  node: CommandNode | PromptNode,
+  node: AgentNode,
   provider: string,
   nodeOptions: SendQueryOptions | undefined,
   artifactsDir: string,
@@ -1826,6 +1832,10 @@ async function executeNodeInternal(
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
+  // Command file name when this agent node is command-sourced, undefined for an
+  // inline prompt — replaces the old `node.command` field access throughout.
+  const commandName = node.source.kind === 'command' ? node.source.name : undefined;
+  const nodeWith = node.source.kind === 'command' ? node.source.with : undefined;
   // Persisted step_name is namespaced ('<groupId>.' prefix) for loop_group bodies;
   // '' for the top-level DAG → identical to node.id. The in-process emitter payloads
   // below stay raw (node.id) — live SSE/CLI consumers key off those. See #2090.
@@ -1847,7 +1857,7 @@ async function executeNodeInternal(
   const configuredMcpNames = await loadConfiguredMcpServerNames(node.mcp, cwd);
 
   getLog().info({ nodeId: node.id, provider }, 'dag_node_started');
-  await logNodeStart(logDir, workflowRun.id, node.id, node.command ?? '<inline>');
+  await logNodeStart(logDir, workflowRun.id, node.id, commandName ?? '<inline>');
 
   deps.store
     .createWorkflowEvent({
@@ -1855,7 +1865,7 @@ async function executeNodeInternal(
       event_type: 'node_started',
       step_name: stepName,
       data: {
-        command: node.command ?? null,
+        command: commandName ?? null,
         provider,
         model: resolvedModel,
         tier: resolvedTier,
@@ -1876,7 +1886,7 @@ async function executeNodeInternal(
     type: 'node_started',
     runId: workflowRun.id,
     nodeId: node.id,
-    nodeName: node.command ?? node.id,
+    nodeName: commandName ?? node.id,
     provider,
     model: resolvedModel,
     tier: resolvedTier,
@@ -1885,11 +1895,11 @@ async function executeNodeInternal(
 
   // Load prompt
   let rawPrompt: string;
-  if (node.command !== undefined) {
+  if (commandName !== undefined) {
     const promptResult = await loadCommandPrompt(
       deps,
       cwd,
-      node.command,
+      commandName,
       configuredCommandFolder,
       workflowSourceRoots
     );
@@ -1914,15 +1924,15 @@ async function executeNodeInternal(
         type: 'node_failed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.command,
+        nodeName: commandName,
         error: errMsg,
       });
       return { state: 'failed', output: '', error: errMsg };
     }
     rawPrompt = promptResult.content;
   } else {
-    // node is PromptNode — prompt: string is guaranteed by the discriminated union
-    rawPrompt = node.prompt;
+    // node.source.kind === 'inline' — prompt: string is guaranteed by the discriminated union
+    rawPrompt = node.source.kind === 'inline' ? node.source.prompt : '';
   }
 
   // Standard variable substitution
@@ -1934,10 +1944,10 @@ async function executeNodeInternal(
     // that cannot be satisfied throws here and fails the node via the catch below.
     const runInputs = resolveRunInputs(workflowRun);
     const nodeBindings =
-      node.command !== undefined && node.with !== undefined
+      nodeWith !== undefined
         ? resolveNodeBindings(
             node.id,
-            node.with,
+            nodeWith,
             {
               workflowRun,
               artifactsDir,
@@ -1988,7 +1998,7 @@ async function executeNodeInternal(
       type: 'node_failed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.command ?? node.id,
+      nodeName: commandName ?? node.id,
       error: err.message,
     });
     await safeSendMessage(
@@ -2845,7 +2855,7 @@ async function executeNodeInternal(
         type: 'node_failed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.command ?? node.id,
+        nodeName: commandName ?? node.id,
         error: 'Cancelled by user',
       });
 
@@ -2896,7 +2906,7 @@ async function executeNodeInternal(
         type: 'node_failed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.command ?? node.id,
+        nodeName: commandName ?? node.id,
         error: creditError,
       });
 
@@ -2944,7 +2954,7 @@ async function executeNodeInternal(
         type: 'node_failed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.command ?? node.id,
+        nodeName: commandName ?? node.id,
         error: emptyError,
       });
 
@@ -2984,7 +2994,7 @@ async function executeNodeInternal(
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
-    await logNodeComplete(logDir, workflowRun.id, node.id, node.command ?? '<inline>', {
+    await logNodeComplete(logDir, workflowRun.id, node.id, commandName ?? '<inline>', {
       durationMs: duration,
       ...nodeUsageEventData(),
     });
@@ -3032,7 +3042,7 @@ async function executeNodeInternal(
       type: 'node_completed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.command ?? node.id,
+      nodeName: commandName ?? node.id,
       duration,
       ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
@@ -3099,7 +3109,7 @@ async function executeNodeInternal(
       type: 'node_failed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.command ?? node.id,
+      nodeName: commandName ?? node.id,
       error: failureMessage,
     });
 
@@ -3242,7 +3252,7 @@ async function executeBashNode(
   conversationId: string,
   cwd: string,
   workflowRun: WorkflowRun,
-  node: BashNode,
+  node: ExecNode,
   artifactsDir: string,
   stateDir: string,
   logDir: string,
@@ -3288,7 +3298,7 @@ async function executeBashNode(
 
   // Variable substitution on script
   const { prompt: substitutedScript } = substituteWorkflowVariables(
-    node.bash,
+    node.script,
     workflowRun.id,
     workflowRun.user_message,
     artifactsDir,
@@ -3478,7 +3488,7 @@ const SCRIPT_USER_VAR_PATTERN =
  * pre-node-output string so an expanded `$nodeId.output` value can't false-positive.
  */
 async function warnOnLiteralUserVars(
-  node: ScriptNode,
+  node: ExecNode,
   script: string,
   platform: IWorkflowPlatform,
   conversationId: string,
@@ -3515,7 +3525,7 @@ async function executeScriptNode(
   conversationId: string,
   cwd: string,
   workflowRun: WorkflowRun,
-  node: ScriptNode,
+  node: ExecNode,
   artifactsDir: string,
   stateDir: string,
   logDir: string,
@@ -4222,7 +4232,9 @@ async function executeLoopGroupNode(
     // iteration of an interactive loop.
     const prevSnapshot = loopPrevOutputs;
     const userInputForIter = isLoopResume && i === startIteration ? loopUserInput : '';
-    const iterBodyNodes = group.nodes.map(n =>
+    // The executor only ever receives already-expanded nodes (see the justification at
+    // the other `applyLoopPrevToBodyNode` call site above), so the body is include-free.
+    const iterBodyNodes = (group.nodes as DagNode[]).map(n =>
       applyLoopPrevToBodyNode(
         n,
         prevSnapshot,
@@ -4843,7 +4855,11 @@ export function applyLoopPrevToBodyNode(
         ...(substitutedNode.loop_group.until_bash !== undefined
           ? { until_bash: sub(substitutedNode.loop_group.until_bash, true) }
           : {}),
-        nodes: substitutedNode.loop_group.nodes.map(n =>
+        // The executor only ever receives already-expanded nodes (runLayers throws on any
+        // surviving IncludeDirective before node execution begins), so a loop_group body
+        // here is always include-free even though the type admits IncludeDirective for
+        // the general pre-expansion case (#2486).
+        nodes: (substitutedNode.loop_group.nodes as DagNode[]).map(n =>
           applyLoopPrevToBodyNode(
             n,
             loopPrevOutputs,
@@ -4856,46 +4872,50 @@ export function applyLoopPrevToBodyNode(
       },
     };
   }
-  if (isApprovalNode(substitutedNode)) {
+  if (isGateNode(substitutedNode)) {
     return {
       ...substitutedNode,
-      approval: {
-        ...substitutedNode.approval,
-        message: sub(substitutedNode.approval.message),
-        ...(substitutedNode.approval.on_reject !== undefined
-          ? {
-              on_reject: {
-                ...substitutedNode.approval.on_reject,
-                prompt: sub(substitutedNode.approval.on_reject.prompt),
-              },
-            }
-          : {}),
-      },
+      message: sub(substitutedNode.message),
+      decisions: substitutedNode.decisions.map(decision =>
+        decision.rework !== undefined
+          ? { ...decision, rework: { ...decision.rework, prompt: sub(decision.rework.prompt) } }
+          : decision
+      ),
     };
   }
-  if (isBashNode(substitutedNode))
-    return { ...substitutedNode, bash: sub(substitutedNode.bash, true) };
+  // Bash never passes through a shell escape hazard-free path — escapedForBash=true
+  // shell-quotes $LOOP_PREV/$LOOP_USER_INPUT before splicing into the `bash -c` body.
   // Scripts never pass through a shell (execFile argv) — bash-quoting would inject
   // literal quote artifacts into TS/Python source. $LOOP_PREV.* refs are spliced raw
   // (mirroring executeScriptNode's substituteNodeOutputRefs(..., false)); $LOOP_USER_INPUT
   // is skipped here (skipUserInput) and delivered via env by executeScriptNode (#2115).
-  if (isScriptNode(substitutedNode))
+  if (isExecNode(substitutedNode)) {
+    return substitutedNode.runtime === 'sh'
+      ? { ...substitutedNode, script: sub(substitutedNode.script, true) }
+      : {
+          ...substitutedNode,
+          script: sub(substitutedNode.script, false, true),
+          ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
+        };
+  }
+  // Halt reason is display text, never executed — mirrors the normal-path default.
+  if (isHaltNode(substitutedNode))
+    return { ...substitutedNode, reason: sub(substitutedNode.reason) };
+  if (isAgentNode(substitutedNode)) {
     return {
       ...substitutedNode,
-      script: sub(substitutedNode.script, false, true),
-      ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
+      source:
+        substitutedNode.source.kind === 'command'
+          ? {
+              ...substitutedNode.source,
+              name: sub(substitutedNode.source.name),
+              ...(substitutedNode.source.with !== undefined
+                ? { with: subWithMap(substitutedNode.source.with) }
+                : {}),
+            }
+          : { ...substitutedNode.source, prompt: sub(substitutedNode.source.prompt) },
     };
-  // Cancel reason is display text, never executed — mirrors the normal-path default.
-  if (isCancelNode(substitutedNode))
-    return { ...substitutedNode, cancel: sub(substitutedNode.cancel) };
-  if (isCommandNode(substitutedNode))
-    return {
-      ...substitutedNode,
-      command: sub(substitutedNode.command),
-      ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
-    };
-  if ('prompt' in substitutedNode && typeof substitutedNode.prompt === 'string')
-    return { ...substitutedNode, prompt: sub(substitutedNode.prompt) };
+  }
   return substitutedNode;
 }
 
@@ -6411,7 +6431,7 @@ async function pauseGateRespectingExternalTransition(
  * then re-pauses at the approval gate. After max_attempts rejections, cancels normally.
  */
 async function executeApprovalNode(
-  node: ApprovalNode,
+  node: GateNode,
   workflowRun: WorkflowRun,
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
@@ -6457,9 +6477,11 @@ async function executeApprovalNode(
       ? rawRejection
       : '';
 
-  // On rejection resume with on_reject configured: run the on_reject prompt via AI
-  if (rejectionReason !== '' && node.approval.on_reject) {
-    const maxAttempts = node.approval.on_reject.max_attempts ?? 3;
+  // On rejection resume with a rework continuation configured: run its prompt via AI
+  const rejectDecision = node.decisions.find(d => d.id === 'reject');
+  const rework = rejectDecision?.rework;
+  if (rejectionReason !== '' && rework) {
+    const maxAttempts = rework.maxAttempts ?? 3;
     const rejectionCount = (workflowRun.metadata?.rejection_count as number | undefined) ?? 0;
 
     // Check if max attempts exhausted
@@ -6489,9 +6511,9 @@ async function executeApprovalNode(
       return { state: 'completed' as const, output: '' };
     }
 
-    // Run the on_reject prompt via AI
+    // Run the rework prompt via AI
     const { prompt: substitutedPrompt } = substituteWorkflowVariables(
-      node.approval.on_reject.prompt,
+      rework.prompt,
       workflowRun.id,
       workflowRun.user_message ?? '',
       artifactsDir,
@@ -6517,9 +6539,10 @@ async function executeApprovalNode(
     // execution view during an on_reject cycle. This is cosmetic-only — the approval gate
     // still re-presents correctly and the human gate contract is preserved. A follow-up can
     // filter synthetic `:on_reject` IDs from the UI's nodeMap if needed.
-    const syntheticNode: PromptNode = {
+    const syntheticNode: AgentNode = {
       id: `${node.id}:on_reject`,
-      prompt: substituteNodeOutputRefs(substitutedPrompt, nodeOutputs),
+      kind: 'agent',
+      source: { kind: 'inline', prompt: substituteNodeOutputRefs(substitutedPrompt, nodeOutputs) },
       ...(node.depends_on ? { depends_on: node.depends_on } : {}),
       ...(node.idle_timeout ? { idle_timeout: node.idle_timeout } : {}),
     };
@@ -6586,7 +6609,7 @@ async function executeApprovalNode(
   // Standard approval gate — send message and pause.
   // Resolve $nodeId.output[.field] references so the human sees concrete values
   // (parity with prompt/bash/loop/cancel nodes, which all run the same substitution).
-  const renderedMessage = substituteNodeOutputRefs(node.approval.message, nodeOutputs);
+  const renderedMessage = substituteNodeOutputRefs(node.message, nodeOutputs);
   const approvalMsg =
     `⏸ **Approval required**: ${renderedMessage}\n\n` +
     `Run ID: \`${workflowRun.id}\`\n` +
@@ -6611,9 +6634,9 @@ async function executeApprovalNode(
     message: renderedMessage,
     nodeId: node.id,
     type: 'approval',
-    captureResponse: node.approval.capture_response,
-    onRejectPrompt: node.approval.on_reject?.prompt,
-    onRejectMaxAttempts: node.approval.on_reject?.max_attempts,
+    captureResponse: node.captureResponse,
+    onRejectPrompt: rework?.prompt,
+    onRejectMaxAttempts: rework?.maxAttempts,
   });
 
   // Return completed — the between-layer status check will see 'paused' (or the
@@ -8152,7 +8175,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // cannot slip through by matching a prior-completed entry, a false `when:`, or a
           // failing trigger rule. If one gets here, discovery was bypassed; fail loud rather
           // than silently accepting an invalid runtime DAG.
-          if (isIncludeNode(node)) {
+          if (isIncludeDirective(node)) {
             throw new Error(
               `Internal error: include node '${node.id}' reached the executor unexpanded. ` +
                 'Include nodes must be resolved by expandWorkflowIncludes() during discovery.'
@@ -8316,7 +8339,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   type: 'node_skipped',
                   runId: workflowRun.id,
                   nodeId: node.id,
-                  nodeName: node.command ?? node.id,
+                  nodeName: nodeDisplayName(node),
                   reason: 'prior_success',
                 });
                 // Return the pre-populated output (already in nodeOutputs)
@@ -8356,7 +8379,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               type: 'node_skipped',
               runId: workflowRun.id,
               nodeId: node.id,
-              nodeName: node.command ?? node.id,
+              nodeName: nodeDisplayName(node),
               reason: 'trigger_rule',
             });
             return { nodeId: node.id, output: { state: 'skipped' as const, output: '' } };
@@ -8409,7 +8432,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 type: 'node_skipped',
                 runId: workflowRun.id,
                 nodeId: node.id,
-                nodeName: node.command ?? node.id,
+                nodeName: nodeDisplayName(node),
                 reason: 'when_condition_parse_error',
               });
               return { nodeId: node.id, output: { state: 'skipped' as const, output: '' } };
@@ -8439,7 +8462,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 type: 'node_skipped',
                 runId: workflowRun.id,
                 nodeId: node.id,
-                nodeName: node.command ?? node.id,
+                nodeName: nodeDisplayName(node),
                 reason: 'when_condition',
               });
               return {
@@ -8453,7 +8476,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // deterministic node retries solely when it declares an explicit
           // `retry:` block (single attempt otherwise), so side-effectful scripts
           // aren't silently re-run (#2088).
-          if (isBashNode(node)) {
+          if (isExecNode(node) && node.runtime === 'sh') {
             const output = await runDeterministicNodeWithRetry(
               node,
               platform,
@@ -8595,7 +8618,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           }
 
           // 3c. Approval node dispatch — pauses workflow for human review
-          if (isApprovalNode(node)) {
+          if (isGateNode(node)) {
             const output = await executeApprovalNode(
               node,
               workflowRun,
@@ -8626,8 +8649,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           }
 
           // 3d. Cancel node dispatch — terminates the workflow run
-          if (isCancelNode(node)) {
-            const reason = substituteNodeOutputRefs(node.cancel, ctx.nodeOutputs);
+          if (isHaltNode(node)) {
+            const reason = substituteNodeOutputRefs(node.reason, ctx.nodeOutputs);
             const cancelMsg = `❌ **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
             await safeSendMessage(platform, conversationId, cancelMsg, {
               workflowId: workflowRun.id,
@@ -8660,7 +8683,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // 3e. Script node dispatch — runs via bun or uv. Opt-in retry only,
           // same as bash (#2088): retries solely when an explicit `retry:` block
           // is declared, single attempt otherwise.
-          if (isScriptNode(node)) {
+          if (isExecNode(node) && node.runtime !== 'sh') {
             const output = await runDeterministicNodeWithRetry(
               node,
               platform,
@@ -8701,6 +8724,14 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           if (isWorkflowNode(node)) {
             const output = await executeWorkflowNode(node, ctx);
             return { nodeId: node.id, output };
+          }
+
+          // Every other kind (exec, loop, loop_group, gate, halt, workflow) returned
+          // above — only 'agent' falls through. The two `isExecNode(node) && ...`
+          // branches above split on `node.runtime`, so the compiler cannot itself
+          // prove their union is exhaustive; this makes the elimination explicit.
+          if (!isAgentNode(node)) {
+            throw new Error(`unreachable: node '${node.id}' matched no dispatch branch`);
           }
 
           // 4. Resolve per-node provider/model/options
@@ -9028,7 +9059,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             type: 'node_failed',
             runId: workflowRun.id,
             nodeId: node.id,
-            nodeName: node.command ?? node.id,
+            nodeName: nodeDisplayName(node),
             error: err.message,
           });
           await safeSendMessage(
@@ -9231,21 +9262,21 @@ export function collectContainerIncompatibleProviders(
     if (!isRegisteredProvider(provider)) return;
     if (!getProviderCapabilities(provider).containerExec) incompatible.add(provider);
   };
-  const visit = (ns: readonly DagNode[]): void => {
+  const visit = (ns: readonly (DagNode | IncludeDirective)[]): void => {
     for (const node of ns) {
-      if (isBashNode(node) || isScriptNode(node) || isCancelNode(node)) continue;
+      if (isIncludeDirective(node) || isExecNode(node) || isHaltNode(node)) continue;
       if (isLoopGroupNode(node)) {
         check(resolveNodeProviderForPreflight(node, workflowProvider, aiProfile));
         visit(node.loop_group.nodes);
         continue;
       }
-      if (isApprovalNode(node)) {
-        if (node.approval.on_reject) {
+      if (isGateNode(node)) {
+        if (node.decisions.some(d => d.rework !== undefined)) {
           check(resolveNodeProviderForPreflight(node, workflowProvider, aiProfile));
         }
         continue;
       }
-      // command / prompt / loop → AI node
+      // agent / loop → AI node
       check(resolveNodeProviderForPreflight(node, workflowProvider, aiProfile));
     }
   };

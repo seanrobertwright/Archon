@@ -233,7 +233,7 @@ function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefi
   return {
     name: 'test-workflow',
     description: 'Test',
-    nodes: [{ id: 'node1', prompt: 'Do something' }],
+    nodes: [{ id: 'node1', kind: 'agent', source: { kind: 'inline', prompt: 'Do something' } }],
     ...overrides,
   };
 }
@@ -1393,7 +1393,16 @@ describe('executeWorkflow', () => {
         makePlatform(),
         'conv-1',
         '/tmp',
-        makeWorkflow({ nodes: [{ id: 'node1', prompt: 'Do something', persist_session: true }] }),
+        makeWorkflow({
+          nodes: [
+            {
+              id: 'node1',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'Do something' },
+              persist_session: true,
+            },
+          ],
+        }),
         'test message',
         'db-conv-1'
       );
@@ -1869,13 +1878,26 @@ describe('telemetry wiring', () => {
     const workflow = makeWorkflow({
       persist_sessions: true,
       nodes: [
-        { id: 'gen', prompt: 'Generate.', output_format: { type: 'object' }, mcp: 'mcp.json' },
+        {
+          id: 'gen',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'Generate.' },
+          output_format: { type: 'object' },
+          mcp: 'mcp.json',
+        },
         {
           id: 'iterate',
           depends_on: ['gen'],
+          kind: 'loop',
           loop: { prompt: 'Iterate.', until: 'DONE', fresh_context: true },
         },
-        { id: 'summarize', depends_on: ['iterate'], prompt: 'Summarize.', output_type: 'report' },
+        {
+          id: 'summarize',
+          depends_on: ['iterate'],
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'Summarize.' },
+          output_type: 'report',
+        },
       ],
     } as Partial<WorkflowDefinition>);
 
@@ -2504,7 +2526,12 @@ describe('resolveScopeArtifactsDir', () => {
     const workflow = {
       name: 'feature-dev',
       nodes: [
-        { id: 'planner', prompt: 'plan', persist_session: true },
+        {
+          id: 'planner',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'plan' },
+          persist_session: true,
+        },
       ] as WorkflowDefinition['nodes'],
     };
     expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBe(
@@ -2516,7 +2543,9 @@ describe('resolveScopeArtifactsDir', () => {
     const workflow = {
       name: 'feature-dev',
       persist_sessions: true,
-      nodes: [{ id: 'planner', prompt: 'plan' }] as WorkflowDefinition['nodes'],
+      nodes: [
+        { id: 'planner', kind: 'agent', source: { kind: 'inline', prompt: 'plan' } },
+      ] as WorkflowDefinition['nodes'],
     };
     expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBe(
       scopeDir('feature-dev', 'conv-1')
@@ -2526,7 +2555,9 @@ describe('resolveScopeArtifactsDir', () => {
   it('returns undefined when the workflow uses no session persistence (opt-in)', () => {
     const workflow = {
       name: 'plain',
-      nodes: [{ id: 'a', prompt: 'x' }] as WorkflowDefinition['nodes'],
+      nodes: [
+        { id: 'a', kind: 'agent', source: { kind: 'inline', prompt: 'x' } },
+      ] as WorkflowDefinition['nodes'],
     };
     expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBeUndefined();
   });

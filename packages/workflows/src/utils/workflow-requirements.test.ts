@@ -11,7 +11,7 @@ import {
 import { WorkflowInputContractError } from '../workflow-inputs';
 import { expandWorkflowIncludes } from '../include-expander';
 import { dagNodeSchema } from '../schemas';
-import type { WorkflowDefinition } from '../schemas';
+import type { WorkflowDefinition, DagNode } from '../schemas';
 
 describe('assertWorkflowRequirementsMet', () => {
   test('passes when there are no requirements', () => {
@@ -141,7 +141,12 @@ describe('assertComposedGateDriveable', () => {
   const gateBlock = (): WorkflowDefinition => ({
     name: 'gate-blk',
     description: 'gate-blk',
-    nodes: [dagNodeSchema.parse({ id: 'gate', approval: { message: 'Approve?' } })],
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'gate',
+        approval: { message: 'Approve?', capture_response: false },
+      }),
+    ],
   });
 
   const wf = (name: string, nodes: unknown[], extra: object = {}): WorkflowDefinition =>
@@ -152,10 +157,16 @@ describe('assertComposedGateDriveable', () => {
       ...extra,
     }) as WorkflowDefinition;
 
-  function expand(defs: readonly WorkflowDefinition[], name: string): WorkflowDefinition {
+  function expand(
+    defs: readonly WorkflowDefinition[],
+    name: string
+  ): Omit<WorkflowDefinition, 'nodes'> & { nodes: DagNode[] } {
     const { workflows, errors } = expandWorkflowIncludes(new Map(defs.map(d => [d.name, d])));
     expect(errors).toEqual([]);
-    return workflows.get(name)!;
+    const workflow = workflows.get(name)!;
+    // Already-expanded — expandWorkflowIncludes' output never contains an
+    // `IncludeDirective` (#2486).
+    return { ...workflow, nodes: workflow.nodes as DagNode[] };
   }
 
   test('refuses a composed gate, naming the block, the gate and the fix', () => {
@@ -191,7 +202,9 @@ describe('assertComposedGateDriveable', () => {
   });
 
   test("a workflow's OWN approval node is never refused", () => {
-    const own = wf('own', [{ id: 'gate', approval: { message: 'Approve?' } }]);
+    const own = wf('own', [
+      { id: 'gate', approval: { message: 'Approve?', capture_response: false } },
+    ]);
     expect(() => assertComposedGateDriveable(expand([own], 'own').nodes)).not.toThrow();
   });
 
@@ -202,7 +215,7 @@ describe('assertComposedGateDriveable', () => {
         loop_group: {
           until: 'DONE',
           max_iterations: 2,
-          nodes: [{ id: 'gate', approval: { message: 'Approve?' } }],
+          nodes: [{ id: 'gate', approval: { message: 'Approve?', capture_response: false } }],
         },
       },
     ]);

@@ -330,86 +330,67 @@ export function isBindingDirective(value: unknown): value is BindingDirective {
   );
 }
 
-export const commandNodeSchema = dagNodeBaseSchema.extend({
-  command: z.string(),
-  // Node-local named bindings (#2637): values delivered to the command file's
-  // `$INPUTS.<name>` surface. Strings may hold refs/templates; a whole
-  // `$node.output[.field]` ref passes the logical value; objects are binding
-  // directives ({ from, if_skipped }) — validated in dagNodeSchema's superRefine.
-  with: z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema])).optional(),
-});
+/**
+ * Where an agent node's prompt text comes from — inline in the YAML, or a named
+ * command file resolved at execution time (`loadCommandPrompt`, dag-executor.ts).
+ * A real nested discriminated union rather than two optional sibling fields: it is
+ * what makes `with:` on an inline-sourced node a TYPE ERROR instead of a value that
+ * silently parses and is dropped (#2478) — `with:` only exists on the 'command'
+ * variant, because only a command file has a `$INPUTS.<name>` surface for it to bind
+ * into. Precedent for this shape: `nodeContextSchema` above.
+ */
+export const promptSourceSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('inline'), prompt: z.string() }),
+  z.object({
+    kind: z.literal('command'),
+    name: z.string(),
+    // Node-local named bindings (#2637): values delivered to the command file's
+    // `$INPUTS.<name>` surface. Strings may hold refs/templates; a whole
+    // `$node.output[.field]` ref passes the logical value; objects are binding
+    // directives ({ from, if_skipped }) — validated in dagNodeSchema's superRefine.
+    with: z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema])).optional(),
+  }),
+]);
 
-/** DAG node that runs a named command from .archon/commands/ */
-export type CommandNode = z.infer<typeof commandNodeSchema> & {
-  prompt?: never;
-  bash?: never;
-  loop?: never;
-  loop_group?: never;
-  approval?: never;
-  cancel?: never;
-  script?: never;
-};
-
-export const promptNodeSchema = dagNodeBaseSchema.extend({
-  prompt: z.string(),
-});
-
-/** DAG node with an inline prompt (no command file) */
-export type PromptNode = z.infer<typeof promptNodeSchema> & {
-  command?: never;
-  bash?: never;
-  loop?: never;
-  loop_group?: never;
-  approval?: never;
-  cancel?: never;
-  script?: never;
-};
+export type PromptSource = z.infer<typeof promptSourceSchema>;
 
 /**
- * Bash node schema — extends base with `bash` (shell script) and `timeout` (ms).
- * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
+ * `command:` + `prompt:` collapsed into one body kind (#2486). Both land in the
+ * same execution dispatch (`executeAgentNode`, formerly `executeNodeInternal`) —
+ * the only divergence between them is where the prompt text comes from, which
+ * `source` now expresses directly instead of via which top-level field is set.
  */
-export const bashNodeSchema = dagNodeBaseSchema.extend({
-  bash: z.string(),
-  timeout: z.number().optional(),
+export const agentNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('agent'),
+  source: promptSourceSchema,
 });
 
-/** DAG node that runs a shell script without AI */
-export type BashNode = z.infer<typeof bashNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  loop?: never;
-  loop_group?: never;
-  approval?: never;
-  cancel?: never;
-  script?: never;
-};
+/** DAG node that runs an AI prompt — inline, or loaded from a named command file */
+export type AgentNode = z.infer<typeof agentNodeSchema>;
 
 /**
- * Script node schema — extends base with `script` (inline code or named script),
- * `runtime` ('bun' or 'uv'), `deps` (dependency list), and `timeout` (ms).
+ * `bash:` + `script:` collapsed into one body kind (#2486) — 327 and 354 lines of
+ * near-duplicate subprocess handling in dag-executor.ts differing only by
+ * interpreter and a dependency-install step, both expressible as fields. `bash:`
+ * becomes `runtime: 'sh'`; `deps`/`with` are only ever populated by the transform
+ * for a `script:` input (a `bash:` input never sets them, matching today's
+ * `BashNode` behavior — see `dagNodeSchema`'s transform).
  * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
  */
-export const scriptNodeSchema = dagNodeBaseSchema.extend({
+export const execNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('exec'),
   script: z.string().min(1, 'script cannot be empty'),
-  runtime: z.enum(['bun', 'uv']),
+  runtime: z.enum(['sh', 'bun', 'uv']),
   deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
   timeout: z.number().optional(),
-  // Node-local named bindings (#2637): delivered as INPUTS_<UPPER_SNAKE> env vars —
-  // the only channel a NAMED script file has. Same value grammar as command nodes.
+  // Node-local named bindings (#2637): delivered as INPUTS_<UPPER_SNAKE> env vars.
+  // Same value grammar as an agent node's command-sourced `with:`. Only meaningful
+  // (and only ever populated) when `runtime !== 'sh'`.
   with: z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema])).optional(),
 });
 
-/** DAG node that runs a TypeScript or Python script via bun or uv */
-export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  bash?: never;
-  loop?: never;
-  loop_group?: never;
-  approval?: never;
-  cancel?: never;
-};
+/** DAG node that runs a shell script, or a TypeScript/Python script via bun or uv, without AI */
+export type ExecNode = z.infer<typeof execNodeSchema>;
 
 /**
  * Loop node schema — extends base with `loop` config.
@@ -417,19 +398,12 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
  * retry is not supported on loop nodes (enforced at parse time).
  */
 export const loopNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('loop'),
   loop: loopNodeConfigSchema,
 });
 
 /** DAG node that runs an AI prompt in a loop until a completion condition is met */
-export type LoopNode = z.infer<typeof loopNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  bash?: never;
-  loop_group?: never;
-  approval?: never;
-  cancel?: never;
-  script?: never;
-};
+export type LoopNode = z.infer<typeof loopNodeSchema>;
 
 /**
  * Loop-group node config — iteration control (`loopControlSchema`) plus a `nodes:` sub-DAG
@@ -446,8 +420,14 @@ export type LoopNode = z.infer<typeof loopNodeSchema> & {
  * as real DagNodes — including nested loop_groups.
  */
 export type LoopGroupNodeConfig = LoopControl & {
-  /** Sub-DAG body re-executed in full each iteration. At least one node required. */
-  nodes: DagNode[];
+  /**
+   * Sub-DAG body re-executed in full each iteration. At least one node required.
+   * Widened to admit `IncludeDirective` because `dagNodeSchema` (below) parses to
+   * `DagNode | IncludeDirective` at this pre-expansion stage — a loop_group body
+   * may itself contain an `include:` directive, expanded away by the same
+   * `expandWorkflowIncludes` pass that handles top-level nodes (#2486).
+   */
+  nodes: (DagNode | IncludeDirective)[];
 };
 export const loopGroupNodeConfigSchema: z.ZodType<LoopGroupNodeConfig> = loopControlSchema
   .extend({
@@ -475,19 +455,12 @@ export const loopGroupNodeConfigSchema: z.ZodType<LoopGroupNodeConfig> = loopCon
  * to body AI nodes unless overridden per-node (same forwarding `loop:` uses).
  */
 export const loopGroupNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('loop_group'),
   loop_group: loopGroupNodeConfigSchema,
 });
 
 /** DAG node that runs a multi-node sub-DAG in a loop until a completion condition is met */
-export type LoopGroupNode = z.infer<typeof loopGroupNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  bash?: never;
-  loop?: never;
-  approval?: never;
-  cancel?: never;
-  script?: never;
-};
+export type LoopGroupNode = z.infer<typeof loopGroupNodeSchema>;
 
 /** Schema for the `on_reject` sub-object on approval nodes. */
 export const approvalOnRejectSchema = z.object({
@@ -508,42 +481,57 @@ export const approvalConfigSchema = z.object({
 });
 
 /**
- * Approval node schema — pauses the workflow for human review.
+ * A decision a gate node can resolve to. `rework` carries today's `on_reject`
+ * behavior (a rework prompt with a max-attempts counter) as a per-decision
+ * continuation rather than a top-level `onReject` field — this is the shape
+ * #2707's settled pause-primitive design ("the pause node should ride that
+ * shape") builds on, ahead of #2707 itself making `decisions` author-declarable
+ * and changing the node's output to structured `{decision, text}`.
+ *
+ * Not yet author-declarable via YAML (the authored `approval:` schema is
+ * unchanged this issue — see `approvalConfigSchema`) — `dagNodeSchema`'s
+ * transform always synthesizes the fixed default `[{id:'approve'}, {id:'reject',
+ * rework: <on_reject, if configured>}]`, so today's behavior is unchanged, only
+ * its resolved shape is.
+ */
+export const decisionOptionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().optional(),
+  rework: z
+    .object({
+      prompt: z.string().min(1),
+      maxAttempts: z.number().int().min(1).max(10).optional(),
+    })
+    .optional(),
+});
+
+export type DecisionOption = z.infer<typeof decisionOptionSchema>;
+
+/**
+ * Gate node schema (formerly `approval:`) — pauses the workflow for human review.
  * Extends full base for type compatibility; AI-specific fields are ignored at runtime.
  */
-export const approvalNodeSchema = dagNodeBaseSchema.extend({
-  approval: approvalConfigSchema,
+export const gateNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('gate'),
+  message: z.string(),
+  decisions: z.array(decisionOptionSchema),
+  captureResponse: z.boolean(),
 });
 
 /** DAG node that pauses workflow execution for human approval */
-export type ApprovalNode = z.infer<typeof approvalNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  bash?: never;
-  loop?: never;
-  loop_group?: never;
-  cancel?: never;
-  script?: never;
-};
+export type GateNode = z.infer<typeof gateNodeSchema>;
 
 /**
- * Cancel node schema — terminates the workflow run with a reason string.
+ * Halt node schema (formerly `cancel:`) — terminates the workflow run with a reason string.
  * Extends full base for type compatibility; AI-specific fields are ignored at runtime.
  */
-export const cancelNodeSchema = dagNodeBaseSchema.extend({
-  cancel: z.string().min(1, "'cancel' reason must not be empty"),
+export const haltNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('halt'),
+  reason: z.string().min(1, "'cancel' reason must not be empty"),
 });
 
 /** DAG node that cancels the workflow run with a reason string */
-export type CancelNode = z.infer<typeof cancelNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  bash?: never;
-  loop?: never;
-  loop_group?: never;
-  approval?: never;
-  script?: never;
-};
+export type HaltNode = z.infer<typeof haltNodeSchema>;
 
 /**
  * Identifier grammar for an include input name.
@@ -585,25 +573,34 @@ export function inputEnvKey(name: string): string {
  * WorkflowDefinition reaches the executor, every include node has been replaced
  * by its flattened, namespaced sub-DAG — the executor never sees one.
  */
-export const includeNodeSchema = dagNodeBaseSchema.extend({
-  include: z.string().min(1, "'include' must be a non-empty workflow name"),
-  // JSON-compatible input values (#2637): strings splice into text surfaces via
-  // the load-time macro; non-string values keep their logical type through the
-  // declared-input contract and canonicalize to JSON text where spliced.
-  with: z.record(z.string(), jsonValueSchema).optional(),
-});
+/**
+ * Include directive schema — a load-time-only graph-construction directive, not a
+ * `DagNode` (#2486). It carries no execution surface of its own: `include` is the
+ * target workflow name, `with` is its load-time input mapping, and the structural
+ * graph fields (id / depends_on / when / trigger_rule) attach the expanded sub-DAG.
+ * `expandWorkflowIncludes` (include-expander.ts) consumes every `IncludeDirective`
+ * at discovery time; by the time a `WorkflowDefinition` reaches the executor, none
+ * survive — `dag-executor.ts` asserts this defensively rather than dispatching on it,
+ * since `IncludeDirective` is not a member of the `DagNode` union it type-checks against.
+ */
+export const includeDirectiveSchema = dagNodeBaseSchema
+  .pick({
+    id: true,
+    description: true,
+    depends_on: true,
+    when: true,
+    trigger_rule: true,
+  })
+  .extend({
+    include: z.string().min(1, "'include' must be a non-empty workflow name"),
+    // JSON-compatible input values (#2637): strings splice into text surfaces via
+    // the load-time macro; non-string values keep their logical type through the
+    // declared-input contract and canonicalize to JSON text where spliced.
+    with: z.record(z.string(), jsonValueSchema).optional(),
+  });
 
-/** DAG node that inlines another workflow's nodes at discovery time (load-time expansion) */
-export type IncludeNode = z.infer<typeof includeNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  bash?: never;
-  loop?: never;
-  loop_group?: never;
-  approval?: never;
-  cancel?: never;
-  script?: never;
-};
+/** Load-time-only graph-construction directive — inlines another workflow's nodes at discovery time */
+export type IncludeDirective = z.infer<typeof includeDirectiveSchema>;
 
 /**
  * Dynamic fan-out config for a `workflow:` node (#2121 slice 2, PR-C). Expands the
@@ -673,6 +670,7 @@ export type FanOutConfig = z.infer<typeof fanOutConfigSchema>;
  * field-accessible when a schema is declared and the child emits JSON).
  */
 export const workflowNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('workflow'),
   workflow: z.string().min(1, "'workflow' must be a non-empty workflow name"),
   input: z.string().optional(),
   // Named inputs passed to the child sub-run as `$INPUTS.<name>` (#2470). Mutually
@@ -684,28 +682,22 @@ export const workflowNodeSchema = dagNodeBaseSchema.extend({
 });
 
 /** DAG node that runs another workflow as a governed child sub-run at execution time */
-export type WorkflowNode = z.infer<typeof workflowNodeSchema> & {
-  command?: never;
-  prompt?: never;
-  bash?: never;
-  loop?: never;
-  loop_group?: never;
-  approval?: never;
-  cancel?: never;
-  script?: never;
-};
+export type WorkflowNode = z.infer<typeof workflowNodeSchema>;
 
-/** A single node in a DAG workflow. command, prompt, bash, loop, loop_group, approval, cancel, script, include, and workflow are mutually exclusive. */
+/**
+ * A single executable node in a DAG workflow, discriminated on `kind` (#2486).
+ * `command:`/`prompt:` collapse into `'agent'`; `bash:`/`script:` collapse into
+ * `'exec'`. `include:` is NOT a member — it has no execution surface and is fully
+ * expanded away by `expandWorkflowIncludes` before a `DagNode[]` reaches the
+ * executor (see `IncludeDirective`).
+ */
 export type DagNode =
-  | CommandNode
-  | PromptNode
-  | BashNode
+  | AgentNode
+  | ExecNode
+  | GateNode
+  | HaltNode
   | LoopNode
   | LoopGroupNode
-  | ApprovalNode
-  | CancelNode
-  | ScriptNode
-  | IncludeNode
   | WorkflowNode;
 
 // ---------------------------------------------------------------------------
@@ -1313,7 +1305,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       });
     }
   })
-  .transform((data): DagNode => {
+  .transform((data): DagNode | IncludeDirective => {
     const id = data.id.trim();
 
     // Structural graph fields present on every node — including the execution-less
@@ -1379,20 +1371,32 @@ export const dagNodeSchema = dagNodeFlatSchema
         ...base,
         ...shared,
         ...aiOnly,
-        command: data.command.trim(),
-        ...nodeBindings,
-      } as CommandNode;
+        kind: 'agent',
+        source: {
+          kind: 'command',
+          name: data.command.trim(),
+          ...nodeBindings,
+        },
+      } as AgentNode;
     }
     if (data.prompt !== undefined && data.prompt.trim().length > 0) {
-      return { ...base, ...shared, ...aiOnly, prompt: data.prompt.trim() } as PromptNode;
+      return {
+        ...base,
+        ...shared,
+        ...aiOnly,
+        kind: 'agent',
+        source: { kind: 'inline', prompt: data.prompt.trim() },
+      } as AgentNode;
     }
     if (data.bash !== undefined && data.bash.trim().length > 0) {
       return {
         ...base,
         ...shared,
-        bash: data.bash.trim(),
+        kind: 'exec',
+        script: data.bash.trim(),
+        runtime: 'sh',
         ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
-      } as BashNode;
+      } as ExecNode;
     }
     if (data.script !== undefined && data.script.trim().length > 0) {
       // runtime is guaranteed by superRefine to be defined at this point
@@ -1400,21 +1404,50 @@ export const dagNodeSchema = dagNodeFlatSchema
       return {
         ...base,
         ...shared,
+        kind: 'exec',
         script: data.script.trim(),
         runtime: data.runtime,
         ...(data.deps !== undefined ? { deps: data.deps } : {}),
         ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
         ...nodeBindings,
-      } as ScriptNode;
+      } as ExecNode;
     }
     if (data.approval !== undefined) {
-      return { ...base, ...shared, approval: data.approval } as ApprovalNode;
+      // Fixed default vocabulary — 'decisions' is not yet author-declarable via
+      // YAML (the authored 'approval:' schema is unchanged this issue). 'reject'
+      // carries today's on_reject behavior as its 'rework' continuation, so
+      // dag-executor's existing reject-resume path (a synthetic AI re-prompt with
+      // a max-attempts counter) stays byte-identical, reading from a new path.
+      const decisions: DecisionOption[] = [
+        { id: 'approve' },
+        {
+          id: 'reject',
+          ...(data.approval.on_reject !== undefined
+            ? {
+                rework: {
+                  prompt: data.approval.on_reject.prompt,
+                  ...(data.approval.on_reject.max_attempts !== undefined
+                    ? { maxAttempts: data.approval.on_reject.max_attempts }
+                    : {}),
+                },
+              }
+            : {}),
+        },
+      ];
+      return {
+        ...base,
+        ...shared,
+        kind: 'gate',
+        message: data.approval.message,
+        decisions,
+        captureResponse: data.approval.capture_response ?? false,
+      } as GateNode;
     }
     if (data.cancel !== undefined && data.cancel.trim().length > 0) {
-      return { ...base, ...shared, cancel: data.cancel.trim() } as CancelNode;
+      return { ...base, ...shared, kind: 'halt', reason: data.cancel.trim() } as HaltNode;
     }
     if (data.include !== undefined && data.include.trim().length > 0) {
-      // An include node is a load-time directive, not an executable node. It carries the
+      // An include is a load-time directive, not an executable node. It carries the
       // structural graph fields, target name, and optional load-time input mapping. The
       // expander reads those fields to attach and parameterize the sub-DAG (description just
       // rides along). aiOnly / shared (retry) and the exec-only base fields (always_run /
@@ -1424,7 +1457,7 @@ export const dagNodeSchema = dagNodeFlatSchema
         ...structuralBase,
         include: data.include.trim(),
         ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
-      } as IncludeNode;
+      } as IncludeDirective;
     }
     if (data.workflow !== undefined && data.workflow.trim().length > 0) {
       // A workflow (sub-run) node makes no direct provider call, so it carries only
@@ -1435,6 +1468,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       // warns about them via WORKFLOW_NODE_IGNORED_FIELDS.
       return {
         ...structuralBase,
+        kind: 'workflow',
         ...(data.output_type !== undefined ? { output_type: data.output_type } : {}),
         ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
         workflow: data.workflow.trim(),
@@ -1459,7 +1493,12 @@ export const dagNodeSchema = dagNodeFlatSchema
     // fields are the ones LOOP_GROUP_NODE_AI_FIELDS declares unsupported: they ride along
     // here but the loader warns about and ignores them at runtime.
     if (data.loop_group !== undefined) {
-      return { ...base, ...aiOnly, loop_group: data.loop_group } as LoopGroupNode;
+      return {
+        ...base,
+        ...aiOnly,
+        kind: 'loop_group',
+        loop_group: data.loop_group,
+      } as LoopGroupNode;
     }
     // loop — guaranteed by superRefine to be defined at this point.
     // Unlike the rest of aiOnly (dropped for loops — model/provider inherit from
@@ -1470,6 +1509,7 @@ export const dagNodeSchema = dagNodeFlatSchema
     if (!data.loop) throw new Error('unreachable: loop must be defined after superRefine');
     return {
       ...base,
+      kind: 'loop',
       ...(data.pi !== undefined ? { pi: data.pi } : {}),
       // Kept for the same reason as `pi`: a loop: node runs its own sendQuery, so
       // the schema reaches the provider and each iteration's payload is validated
@@ -1485,60 +1525,48 @@ export const dagNodeSchema = dagNodeFlatSchema
 // Type guards (preserved from original types.ts)
 // ---------------------------------------------------------------------------
 
-/** Type guard: check if a DAG node is a command (named command file) node */
-export function isCommandNode(node: DagNode): node is CommandNode {
-  return 'command' in node && typeof node.command === 'string';
+/** Type guard: check if a DAG node is an agent (command-file or inline-prompt) node */
+export function isAgentNode(node: DagNode): node is AgentNode {
+  return node.kind === 'agent';
 }
 
-/**
- * Type guard: check if a DAG node is an inline-prompt node.
- *
- * Every other member of the union declares `prompt?: never`, so the presence of a
- * string `prompt` identifies this variant on its own (a loop's prompt lives at
- * `loop.prompt`, not here).
- */
-export function isPromptNode(node: DagNode): node is PromptNode {
-  return 'prompt' in node && typeof node.prompt === 'string';
+/** Type guard: check if a DAG node is an exec (bash or script) node */
+export function isExecNode(node: DagNode): node is ExecNode {
+  return node.kind === 'exec';
 }
 
-/** Type guard: check if a DAG node is a bash (shell script) node */
-export function isBashNode(node: DagNode): node is BashNode {
-  return 'bash' in node && typeof node.bash === 'string';
+/** Type guard: check if a DAG node is a gate (human-in-the-loop) node */
+export function isGateNode(node: DagNode): node is GateNode {
+  return node.kind === 'gate';
+}
+
+/** Type guard: check if a DAG node is a halt (workflow termination) node */
+export function isHaltNode(node: DagNode): node is HaltNode {
+  return node.kind === 'halt';
 }
 
 /** Type guard: check if a DAG node is a loop (iterative) node */
 export function isLoopNode(node: DagNode): node is LoopNode {
-  return 'loop' in node && typeof node.loop === 'object' && node.loop !== null;
+  return node.kind === 'loop';
 }
 
 /** Type guard: check if a DAG node is a loop_group (cross-node iterative subgraph) node */
 export function isLoopGroupNode(node: DagNode): node is LoopGroupNode {
-  return 'loop_group' in node && typeof node.loop_group === 'object' && node.loop_group !== null;
-}
-
-/** Type guard: check if a DAG node is an approval (human-in-the-loop) node */
-export function isApprovalNode(node: DagNode): node is ApprovalNode {
-  return 'approval' in node && typeof node.approval === 'object' && node.approval !== null;
-}
-
-/** Type guard: check if a DAG node is a cancel (workflow termination) node */
-export function isCancelNode(node: DagNode): node is CancelNode {
-  return 'cancel' in node && typeof node.cancel === 'string';
-}
-
-/** Type guard: check if a DAG node is a script node */
-export function isScriptNode(node: DagNode): node is ScriptNode {
-  return 'script' in node && typeof node.script === 'string';
-}
-
-/** Type guard: check if a DAG node is an include (load-time inlining) node */
-export function isIncludeNode(node: DagNode): node is IncludeNode {
-  return 'include' in node && typeof node.include === 'string';
+  return node.kind === 'loop_group';
 }
 
 /** Type guard: check if a DAG node is a workflow (runtime sub-run) node */
 export function isWorkflowNode(node: DagNode): node is WorkflowNode {
-  return 'workflow' in node && typeof node.workflow === 'string';
+  return node.kind === 'workflow';
+}
+
+/**
+ * Type guard: check if a pre-expansion graph entry is an include directive rather
+ * than an executable `DagNode`. `IncludeDirective` is not a `DagNode` union member
+ * (#2486) — it has no `kind` field, so this checks for the one field only it carries.
+ */
+export function isIncludeDirective(node: DagNode | IncludeDirective): node is IncludeDirective {
+  return !('kind' in node) && 'include' in node && typeof node.include === 'string';
 }
 
 /** Type guard: validates a value is a known TriggerRule */
@@ -1548,23 +1576,14 @@ export function isTriggerRule(value: unknown): value is TriggerRule {
 
 /**
  * True for node types that invoke a provider and therefore participate in cross-run
- * session persistence (`persist_session`). bash, script, approval, cancel, loop,
- * loop_group, and include nodes are excluded — they either make no provider call, manage
- * their own per-iteration sessions, or (include) are expanded away before execution.
- * Shared by the loader's load-time capability gate and any other caller that needs to
- * reason about persistence eligibility, so the exclusion list lives in one place.
+ * session persistence (`persist_session`). exec, gate, halt, loop, and loop_group
+ * nodes are excluded — they either make no provider call or manage their own
+ * per-iteration sessions. Shared by the loader's load-time capability gate and any
+ * other caller that needs to reason about persistence eligibility, so the
+ * exclusion list lives in one place.
  */
 export function isPersistableNode(node: DagNode): boolean {
-  return (
-    !isLoopNode(node) &&
-    !isLoopGroupNode(node) &&
-    !isApprovalNode(node) &&
-    !isCancelNode(node) &&
-    !isScriptNode(node) &&
-    !isBashNode(node) &&
-    !isIncludeNode(node) &&
-    !isWorkflowNode(node)
-  );
+  return node.kind === 'agent';
 }
 
 // ---------------------------------------------------------------------------

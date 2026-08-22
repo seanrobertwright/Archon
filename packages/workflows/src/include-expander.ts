@@ -36,19 +36,18 @@ import type {
   WorkflowLoadError,
   DagNode,
   DagNodeBase,
-  IncludeNode,
+  IncludeDirective,
   WorkflowBase,
   WorkflowRequirement,
 } from './schemas';
 import {
-  isIncludeNode,
-  isCommandNode,
+  isIncludeDirective,
+  isAgentNode,
   isLoopNode,
   isLoopGroupNode,
-  isApprovalNode,
-  isCancelNode,
-  isBashNode,
-  isScriptNode,
+  isGateNode,
+  isHaltNode,
+  isExecNode,
   isWorkflowNode,
   isPersistableNode,
   isNodeContextResume,
@@ -214,7 +213,9 @@ function markComposedNode(node: DagNode, patch: ComposedNodeMeta): void {
           }
         : {}),
     };
-    for (const body of node.loop_group.nodes) markComposedNode(body, inherited);
+    for (const body of node.loop_group.nodes) {
+      if (!isIncludeDirective(body)) markComposedNode(body, inherited);
+    }
   }
 }
 
@@ -292,13 +293,13 @@ function workflowModelTravelsTo(scope: Record<string, unknown>, node: DagNode): 
  */
 function pushWorkflowScopeOntoNodes(
   scope: Record<string, unknown>,
-  nodes: DagNode[],
+  nodes: (DagNode | IncludeDirective)[],
   insideLoopGroup = false
 ): void {
   for (const node of nodes) {
-    // An include node carries no execution surface of its own — its target's nodes are
-    // collapsed against THEIR file, and inlining happens after this pass.
-    if (!isIncludeNode(node)) {
+    // An include directive carries no execution surface of its own — its target's
+    // nodes are collapsed against THEIR file, and inlining happens after this pass.
+    if (!isIncludeDirective(node)) {
       const target = node as unknown as Record<string, unknown>;
       for (const [wfKey, nodeKey] of NODE_AFFECTING_WORKFLOW_FIELDS) {
         const value = scope[wfKey];
@@ -313,7 +314,9 @@ function pushWorkflowScopeOntoNodes(
         target[nodeKey] = value;
       }
     }
-    if (isLoopGroupNode(node)) pushWorkflowScopeOntoNodes(scope, node.loop_group.nodes, true);
+    if (!isIncludeDirective(node) && isLoopGroupNode(node)) {
+      pushWorkflowScopeOntoNodes(scope, node.loop_group.nodes, true);
+    }
   }
 }
 
@@ -431,16 +434,16 @@ function rewriteNodeOutputRefs(
       node.loop_group.until_bash = code(node.loop_group.until_bash);
     }
     for (const body of node.loop_group.nodes) {
-      rewriteNodeOutputRefs(body, renameOutputRef, expandDependency, renameLoopPrevRef);
+      if (!isIncludeDirective(body)) {
+        rewriteNodeOutputRefs(body, renameOutputRef, expandDependency, renameLoopPrevRef);
+      }
     }
-  } else if (isApprovalNode(node)) {
-    node.approval.message = code(node.approval.message);
-    if (node.approval.on_reject !== undefined) {
-      node.approval.on_reject.prompt = code(node.approval.on_reject.prompt);
+  } else if (isGateNode(node)) {
+    node.message = code(node.message);
+    for (const decision of node.decisions) {
+      if (decision.rework !== undefined) decision.rework.prompt = code(decision.rework.prompt);
     }
-  } else if (isBashNode(node)) {
-    node.bash = code(node.bash);
-  } else if (isScriptNode(node)) {
+  } else if (isExecNode(node)) {
     node.script = code(node.script);
   } else if (isWorkflowNode(node)) {
     // workflow.input, workflow.with values and workflow.fan_out.items are live
@@ -453,19 +456,25 @@ function rewriteNodeOutputRefs(
       }
     }
     if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
-  } else if (isCancelNode(node)) {
-    node.cancel = code(node.cancel);
-  } else if ('prompt' in node && typeof node.prompt === 'string') {
-    node.prompt = code(node.prompt);
+  } else if (isHaltNode(node)) {
+    node.reason = code(node.reason);
+  } else if (isAgentNode(node) && node.source.kind === 'inline') {
+    node.source.prompt = code(node.source.prompt);
   }
 
-  // Node-local bindings (#2637) — command/script `with:` string values and directive
-  // `from` refs are live ref surfaces (KEEP IN SYNC item 2), so an included block's
-  // bindings follow its nodes' namespace rename. Outside the mode chain above because
-  // command nodes have no other inline text surface of their own.
-  if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
-    for (const [key, value] of Object.entries(node.with)) {
-      if (typeof value === 'string') node.with[key] = code(value);
+  // Node-local bindings (#2637) — an agent's command-sourced `with:` and an exec node's
+  // `with:` string values, plus directive `from` refs, are live ref surfaces (KEEP IN
+  // SYNC item 2), so an included block's bindings follow its nodes' namespace rename.
+  // Outside the mode chain above because a command-sourced agent node has no other
+  // inline text surface of its own.
+  const nodeWith = isExecNode(node)
+    ? node.with
+    : isAgentNode(node) && node.source.kind === 'command'
+      ? node.source.with
+      : undefined;
+  if (nodeWith !== undefined) {
+    for (const [key, value] of Object.entries(nodeWith)) {
+      if (typeof value === 'string') nodeWith[key] = code(value);
       else if (isBindingDirective(value)) value.from = code(value.from);
     }
   }
@@ -500,7 +509,7 @@ function applyInputsMacro(
   node: DagNode,
   args: Record<string, JsonValue>,
   missing: Set<string>,
-  includeNode: IncludeNode
+  includeNode: IncludeDirective
 ): void {
   const substitute = (text: string): string =>
     text.replace(INPUTS_REF, (match, name: string) => {
@@ -584,15 +593,16 @@ function applyInputsMacro(
     if (node.loop_group.until_bash !== undefined) {
       node.loop_group.until_bash = substitute(node.loop_group.until_bash);
     }
-    for (const body of node.loop_group.nodes) applyInputsMacro(body, args, missing, includeNode);
-  } else if (isApprovalNode(node)) {
-    node.approval.message = substitute(node.approval.message);
-    if (node.approval.on_reject !== undefined) {
-      node.approval.on_reject.prompt = substitute(node.approval.on_reject.prompt);
+    for (const body of node.loop_group.nodes) {
+      if (!isIncludeDirective(body)) applyInputsMacro(body, args, missing, includeNode);
     }
-  } else if (isBashNode(node)) {
-    node.bash = substitute(node.bash);
-  } else if (isScriptNode(node)) {
+  } else if (isGateNode(node)) {
+    node.message = substitute(node.message);
+    for (const decision of node.decisions) {
+      if (decision.rework !== undefined)
+        decision.rework.prompt = substitute(decision.rework.prompt);
+    }
+  } else if (isExecNode(node)) {
     node.script = substitute(node.script);
   } else if (isWorkflowNode(node)) {
     // `input:` is the child's $ARGUMENTS — a TEXT channel by construction, so a typed
@@ -604,26 +614,33 @@ function applyInputsMacro(
       }
     }
     if (node.fan_out !== undefined) node.fan_out.items = substitute(node.fan_out.items);
-  } else if (isCancelNode(node)) {
-    node.cancel = substitute(node.cancel);
-  } else if ('prompt' in node && typeof node.prompt === 'string') {
-    node.prompt = substitute(node.prompt);
+  } else if (isHaltNode(node)) {
+    node.reason = substitute(node.reason);
+  } else if (isAgentNode(node) && node.source.kind === 'inline') {
+    node.source.prompt = substitute(node.source.prompt);
   }
 
-  // Node-local bindings (#2637): command/script `with:` value positions accept block
-  // inputs like every other with map; a directive's `from` is a node ref (never an
-  // input), while a string `if_skipped` default may carry the macro.
+  // Node-local bindings (#2637): an agent's command-sourced `with:` and an exec node's
+  // `with:` value positions accept block inputs like every other with map; a
+  // directive's `from` is a node ref (never an input), while a string `if_skipped`
+  // default may carry the macro.
   //
   // Re-validate what substitution could have broken (the same pass substituteWhen
-  // runs for `when:` grammar): the schema promises that on command/script nodes an
-  // object `with:` value is a load error unless it is a binding directive, and only
-  // substitution can put an object here after that check ran — a caller forwarding
-  // an object through a whole-`$INPUTS.<name>` value. Letting it through would turn
-  // the promised load error into a mid-run node failure after every upstream node
-  // has already spent its cost; and treating a directive-SHAPED caller object as a
-  // live directive would let data inject reference semantics the block never wrote.
-  if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
-    for (const [key, value] of Object.entries(node.with)) {
+  // runs for `when:` grammar): the schema promises that on a command-sourced agent or
+  // exec node an object `with:` value is a load error unless it is a binding
+  // directive, and only substitution can put an object here after that check ran — a
+  // caller forwarding an object through a whole-`$INPUTS.<name>` value. Letting it
+  // through would turn the promised load error into a mid-run node failure after
+  // every upstream node has already spent its cost; and treating a directive-SHAPED
+  // caller object as a live directive would let data inject reference semantics the
+  // block never wrote.
+  const nodeWith = isExecNode(node)
+    ? node.with
+    : isAgentNode(node) && node.source.kind === 'command'
+      ? node.source.with
+      : undefined;
+  if (nodeWith !== undefined) {
+    for (const [key, value] of Object.entries(nodeWith)) {
       if (isBindingDirective(value)) {
         if (typeof value.if_skipped === 'string') {
           value.if_skipped = substituteValue(value.if_skipped);
@@ -639,7 +656,7 @@ function applyInputsMacro(
             `Node '${includeNode.id}': input substitution supplied an OBJECT to binding '${key}' of included node '${node.id}' (value '${canonicalValueText(value)}'). Command/script binding values must be strings, numbers, booleans, null, or arrays; a binding directive must be authored in the block itself, never forwarded through an input.`
           );
         }
-        node.with[key] = substituted;
+        nodeWith[key] = substituted;
       }
     }
   }
@@ -662,7 +679,7 @@ interface ExpandedInclude {
  * input, and errors on a caller `with:` key the block doesn't declare.
  */
 function resolveIncludeInputs(
-  includeNode: IncludeNode,
+  includeNode: IncludeDirective,
   child: WorkflowDefinition
 ): Record<string, JsonValue> {
   try {
@@ -684,9 +701,13 @@ function resolveIncludeInputs(
  * per-node payload (compiled loop commands, the composition record) while cloning a
  * reusable child for another include level. A payload missed here works at one nesting
  * level and silently vanishes at two. */
-function cloneNodeForInclude(node: DagNode): DagNode {
+function cloneNodeForInclude<T extends DagNode | IncludeDirective>(node: T): T {
   const clone = structuredClone(node);
-  const preserveEngineMetadata = (source: DagNode, target: DagNode): void => {
+  const preserveEngineMetadata = (
+    source: DagNode | IncludeDirective,
+    target: DagNode | IncludeDirective
+  ): void => {
+    if (isIncludeDirective(source) || isIncludeDirective(target)) return;
     const meta = readComposedMeta(source);
     if (meta !== undefined) {
       (target as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = structuredClone(meta);
@@ -717,7 +738,7 @@ function cloneNodeForInclude(node: DagNode): DagNode {
  * shared by two parents is namespaced independently.
  */
 function inlineInclude(
-  includeNode: IncludeNode,
+  includeNode: IncludeDirective,
   child: WorkflowDefinition,
   commandContents: ReadonlyMap<string, IncludeCommandContent>
 ): ExpandedInclude {
@@ -730,7 +751,13 @@ function inlineInclude(
       `Node '${includeNode.id}': included workflow '${child.name}' is not hermetic: ${childStructureError}`
     );
   }
-  const childNodes = child.nodes;
+  // `child` is the result of `expandOne`, which fully expands its own includes before
+  // returning (the function's own documented invariant: "Output workflows contain
+  // ZERO include nodes") — so `child.nodes` never actually holds an `IncludeDirective`
+  // here, even though `WorkflowDefinition.nodes`'s type admits one for the general
+  // pre-expansion case (#2486; splitting an authored-vs-resolved `WorkflowDefinition`
+  // type is #2487's job, not this one's).
+  const childNodes = child.nodes as DagNode[];
   const prefix = `${includeNode.id}__`;
   const childTopLevelIds = new Set(childNodes.map(n => n.id));
   const rename = (id: string): string => (childTopLevelIds.has(id) ? prefix + id : id);
@@ -905,7 +932,10 @@ const SAFETY_WORKFLOW_KEYS: ReadonlySet<string> = new Set(['mutates_checkout']);
  * no node-level counterpart to land on (#2556) — so it is named explicitly rather than
  * left to read as a run-level decision it is not.
  */
-function warnDroppedWorkflowLevelFields(includeNode: IncludeNode, child: WorkflowDefinition): void {
+function warnDroppedWorkflowLevelFields(
+  includeNode: IncludeDirective,
+  child: WorkflowDefinition
+): void {
   const childRecord = child as Record<string, unknown>;
   const droppedFields = Object.keys(child)
     .filter(key => !NON_DROPPED_WORKFLOW_KEYS.has(key) && childRecord[key] !== undefined)
@@ -949,7 +979,7 @@ function warnDroppedWorkflowLevelFields(includeNode: IncludeNode, child: Workflo
  */
 function materializeBlockCommandPrompts(
   node: DagNode,
-  includeNode: IncludeNode,
+  includeNode: IncludeDirective,
   child: WorkflowDefinition,
   commandContents: ReadonlyMap<string, IncludeCommandContent>,
   currentIds: ReadonlySet<string>,
@@ -997,12 +1027,14 @@ function materializeBlockCommandPrompts(
     return { prompt: content };
   };
 
-  if (isCommandNode(node)) {
-    const compiled = compile(node.command);
+  if (isAgentNode(node) && node.source.kind === 'command') {
+    const compiled = compile(node.source.name);
     if (compiled.error !== undefined) throw new IncludeExpansionError(compiled.error);
-    const { command, ...base } = node;
-    void command;
-    return { ...base, prompt: compiled.prompt };
+    // `with:` on a command node is already inert past this point at runtime today —
+    // `executeNodeInternal`'s binding resolution gates on the node still carrying a
+    // `command` reference (dag-executor.ts), which a materialized node no longer
+    // does — so dropping it here is behavior-preserving, not a regression.
+    return { ...node, source: { kind: 'inline', prompt: compiled.prompt } };
   }
 
   if (isLoopNode(node) && node.loop.command !== undefined) {
@@ -1016,13 +1048,16 @@ function materializeBlockCommandPrompts(
   }
 
   if (isLoopGroupNode(node)) {
-    const bodyIds = new Set(node.loop_group.nodes.map(body => body.id));
+    // A loop_group body is expanded (include-free) by the same recursive invariant
+    // as the top-level `childNodes` this function is ultimately called against.
+    const bodyNodes = node.loop_group.nodes as DagNode[];
+    const bodyIds = new Set(bodyNodes.map(body => body.id));
     const bodyEnclosingIds = new Set([...enclosingIds, ...currentIds]);
     return {
       ...node,
       loop_group: {
         ...node.loop_group,
-        nodes: node.loop_group.nodes.map(body =>
+        nodes: bodyNodes.map(body =>
           materializeBlockCommandPrompts(
             body,
             includeNode,
@@ -1080,7 +1115,7 @@ export function expandWorkflowIncludes(
    * `$include.output` refs bind only to directives in that list.
    */
   function expandNodeList(
-    nodes: DagNode[],
+    nodes: (DagNode | IncludeDirective)[],
     workflowName: string,
     stack: string[]
   ): ExpandedNodeList {
@@ -1089,7 +1124,7 @@ export function expandWorkflowIncludes(
     const includedRequirements: WorkflowRequirement[] = [];
 
     for (const node of nodes) {
-      if (isIncludeNode(node)) {
+      if (isIncludeDirective(node)) {
         let child: WorkflowDefinition;
         try {
           child = expandOne(node.include, [...stack, workflowName]);

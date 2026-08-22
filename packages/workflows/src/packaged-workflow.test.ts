@@ -14,15 +14,20 @@ describe('packaged workflow resource qualification (#2527)', () => {
       name: 'test',
       description: 'test',
       nodes: [
-        { id: 'command', command: 'review' },
-        { id: 'loop', loop: { prompt: 'again', command: 'iterate', max_iterations: 2 } },
+        { id: 'command', kind: 'agent', source: { kind: 'command', name: 'review' } },
+        {
+          id: 'loop',
+          kind: 'loop',
+          loop: { prompt: 'again', command: 'iterate', max_iterations: 2 },
+        },
         {
           id: 'group',
+          kind: 'loop_group',
           loop_group: {
             control: { max_iterations: 2 },
             nodes: [
-              { id: 'child-command', command: 'child' },
-              { id: 'child-script', script: 'transform', runtime: 'bun' },
+              { id: 'child-command', kind: 'agent', source: { kind: 'command', name: 'child' } },
+              { id: 'child-script', kind: 'exec', script: 'transform', runtime: 'bun' },
             ],
           },
         },
@@ -30,14 +35,14 @@ describe('packaged workflow resource qualification (#2527)', () => {
     } as unknown as WorkflowDefinition;
 
     qualifyWorkflowResources(workflow, owner);
-    const command = workflow.nodes[0] as { command: string };
+    const command = workflow.nodes[0] as { source: { name: string } };
     const loop = workflow.nodes[1] as { loop: { command: string } };
     const group = workflow.nodes[2] as {
-      loop_group: { nodes: Array<{ command?: string; script?: string }> };
+      loop_group: { nodes: Array<{ source?: { name: string }; script?: string }> };
     };
-    expect(parsePackagedResourceReference(command.command)?.name).toBe('review');
+    expect(parsePackagedResourceReference(command.source.name)?.name).toBe('review');
     expect(parsePackagedResourceReference(loop.loop.command)?.name).toBe('iterate');
-    expect(parsePackagedResourceReference(group.loop_group.nodes[0].command ?? '')?.name).toBe(
+    expect(parsePackagedResourceReference(group.loop_group.nodes[0].source?.name ?? '')?.name).toBe(
       'child'
     );
     expect(parsePackagedResourceReference(group.loop_group.nodes[1].script ?? '')?.name).toBe(
@@ -49,7 +54,7 @@ describe('packaged workflow resource qualification (#2527)', () => {
     const workflow = {
       name: 'test',
       description: 'test',
-      nodes: [{ id: 'script', script: 'console.log("inline")', runtime: 'bun' }],
+      nodes: [{ id: 'script', kind: 'exec', script: 'console.log("inline")', runtime: 'bun' }],
     } as unknown as WorkflowDefinition;
 
     qualifyWorkflowResources(workflow, owner);

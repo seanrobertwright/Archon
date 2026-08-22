@@ -37,14 +37,12 @@ import type { WorkflowConfig } from './deps';
 import { defaultRunInputs } from './workflow-inputs';
 import {
   inputEnvKey,
-  isApprovalNode,
-  isBashNode,
-  isCancelNode,
-  isCommandNode,
-  isIncludeNode,
+  isGateNode,
+  isExecNode,
+  isHaltNode,
+  isAgentNode,
   isLoopGroupNode,
   isLoopNode,
-  isScriptNode,
   isWorkflowNode,
   type DagNode,
   type NodeOutput,
@@ -188,13 +186,8 @@ function stubSatisfiesNode(node: DagNode, stub: DryRunStubValue): boolean {
 }
 
 function collectsStub(node: DagNode): boolean {
-  return !(
-    isApprovalNode(node) ||
-    isCancelNode(node) ||
-    isIncludeNode(node) ||
-    isWorkflowNode(node) ||
-    isLoopGroupNode(node)
-  );
+  // `include:` is no longer a DagNode member (#2486) — it never reaches this function.
+  return !(isGateNode(node) || isHaltNode(node) || isWorkflowNode(node) || isLoopGroupNode(node));
 }
 
 /** Build the complete static stub map for an already-expanded workflow definition. */
@@ -212,10 +205,14 @@ export function createDryRunStubScaffold(workflow: WorkflowDefinition): DryRunSt
           existing.consumers.push(node);
         }
       }
-      if (isLoopGroupNode(node)) visit(node.loop_group.nodes);
+      if (isLoopGroupNode(node)) visit(node.loop_group.nodes as DagNode[]);
     }
   };
-  visit(workflow.nodes);
+  // "Already-expanded" per this function's own docblock — dry-run always simulates a
+  // fully-expanded WorkflowDefinition, so `workflow.nodes` never actually holds an
+  // `IncludeDirective` here even though the type admits one for the general
+  // pre-expansion case (#2486).
+  visit(workflow.nodes as DagNode[]);
   return Object.fromEntries(
     [...stubs].map(([id, entry]) => {
       const value = entry.candidates.find(candidate =>
@@ -370,14 +367,13 @@ export async function loadDryRunStubs(path?: string): Promise<DryRunStubs> {
 }
 
 function nodeType(node: DagNode): z.infer<typeof dryRunNodeTypeSchema> {
-  if (isCommandNode(node)) return 'command';
-  if (isBashNode(node)) return 'bash';
-  if (isScriptNode(node)) return 'script';
+  // `include:` is no longer a DagNode member (#2486) — it never reaches this function.
+  if (isAgentNode(node) && node.source.kind === 'command') return 'command';
+  if (isExecNode(node)) return node.runtime === 'sh' ? 'bash' : 'script';
   if (isLoopNode(node)) return 'loop';
   if (isLoopGroupNode(node)) return 'loop_group';
-  if (isApprovalNode(node)) return 'approval';
-  if (isCancelNode(node)) return 'cancel';
-  if (isIncludeNode(node)) return 'include';
+  if (isGateNode(node)) return 'approval';
+  if (isHaltNode(node)) return 'cancel';
   if (isWorkflowNode(node)) return 'workflow';
   return 'prompt';
 }
@@ -586,35 +582,27 @@ async function executeCodeNode(
   try {
     let command: string;
     let args: string[];
-    if (isBashNode(node)) {
+    if (!isExecNode(node)) {
+      return { error: `Node '${node.id}' is not executable code` };
+    } else if (node.runtime === 'sh') {
       command = resolveBashPath();
       args = ['-c', code];
-    } else if (isScriptNode(node)) {
-      if (isInlineScript(code)) {
-        if (node.runtime === 'bun') {
-          command = 'bun';
-          args = ['--no-env-file', '-e', code];
-        } else {
-          command = 'uv';
-          args = [
-            'run',
-            ...(node.deps ?? []).flatMap(dep => ['--with', dep]),
-            'python',
-            '-c',
-            code,
-          ];
-        }
+    } else if (isInlineScript(code)) {
+      if (node.runtime === 'bun') {
+        command = 'bun';
+        args = ['--no-env-file', '-e', code];
       } else {
-        const script = (await discoverScriptsForCwd(ctx.cwd)).get(code);
-        if (!script) return { error: `Named script '${code}' was not found` };
-        command = script.runtime === 'bun' ? 'bun' : 'uv';
-        args =
-          script.runtime === 'bun'
-            ? ['--no-env-file', 'run', script.path]
-            : ['run', ...(node.deps ?? []).flatMap(dep => ['--with', dep]), script.path];
+        command = 'uv';
+        args = ['run', ...(node.deps ?? []).flatMap(dep => ['--with', dep]), 'python', '-c', code];
       }
     } else {
-      return { error: `Node '${node.id}' is not executable code` };
+      const script = (await discoverScriptsForCwd(ctx.cwd)).get(code);
+      if (!script) return { error: `Named script '${code}' was not found` };
+      command = script.runtime === 'bun' ? 'bun' : 'uv';
+      args =
+        script.runtime === 'bun'
+          ? ['--no-env-file', 'run', script.path]
+          : ['run', ...(node.deps ?? []).flatMap(dep => ['--with', dep]), script.path];
     }
     // Run-level inputs and node-local bindings ride the env bag as
     // `INPUTS_<UPPER_SNAKE>`, never text substitution — the outer tiers of a real
@@ -657,7 +645,7 @@ function stubFor(node: DagNode, ctx: DryRunContext): DryRunStubValue | undefined
     ctx.consumedStubs.add(node.id);
     return ctx.stubs[node.id];
   }
-  if (ctx.defaultStubs && !((isBashNode(node) || isScriptNode(node)) && ctx.execCode)) {
+  if (ctx.defaultStubs && !(isExecNode(node) && ctx.execCode)) {
     return generatedStubFor(node);
   }
   return undefined;
@@ -822,10 +810,13 @@ async function simulateLoopGroup(
   iteration?: number
 ): Promise<void> {
   if (!isLoopGroupNode(node)) return;
+  // Already-expanded (see createDryRunStubScaffold's justification above) — never
+  // actually holds an `IncludeDirective` here.
+  const bodyNodes = node.loop_group.nodes as DagNode[];
   let lastOutput = '';
   for (let current = 1; current <= node.loop_group.max_iterations; current++) {
     const bodyOutputs = new Map(outputs);
-    await simulateNodes(node.loop_group.nodes, bodyOutputs, ctx, current);
+    await simulateNodes(bodyNodes, bodyOutputs, ctx, current);
     const bodyDependencies = new Set(node.loop_group.nodes.flatMap(body => body.depends_on ?? []));
     lastOutput =
       node.loop_group.nodes
@@ -912,8 +903,8 @@ async function simulateNode(
       await simulateLoopGroup(node, outputs, ctx, iteration);
       return;
     }
-    if (isApprovalNode(node)) {
-      const resolvedText = resolveText(node.approval.message, ctx, outputs);
+    if (isGateNode(node)) {
+      const resolvedText = resolveText(node.message, ctx, outputs);
       if (ctx.pauseAtGates) {
         outputs.set(node.id, { state: 'pending', output: '' });
         ctx.trace.push({
@@ -939,8 +930,8 @@ async function simulateNode(
       }
       return;
     }
-    if (isCancelNode(node)) {
-      const resolvedText = resolveText(node.cancel, ctx, outputs);
+    if (isHaltNode(node)) {
+      const resolvedText = resolveText(node.reason, ctx, outputs);
       outputs.set(node.id, { state: 'completed', output: resolvedText });
       ctx.trace.push({
         nodeId: node.id,
@@ -954,7 +945,7 @@ async function simulateNode(
       ctx.halted = 'cancelled';
       return;
     }
-    if (isIncludeNode(node) || isWorkflowNode(node)) {
+    if (isWorkflowNode(node)) {
       recordFailed(
         node,
         outputs,
@@ -966,29 +957,44 @@ async function simulateNode(
       return;
     }
 
-    const sourceText = isCommandNode(node)
-      ? await loadDryRunCommand(ctx.cwd, node.command)
-      : isBashNode(node)
-        ? node.bash
-        : isScriptNode(node)
-          ? node.script
-          : node.prompt;
+    const isCommandSourced = isAgentNode(node) && node.source.kind === 'command';
+    const sourceText = isAgentNode(node)
+      ? node.source.kind === 'command'
+        ? await loadDryRunCommand(ctx.cwd, node.source.name)
+        : node.source.prompt
+      : isExecNode(node)
+        ? node.script
+        : '';
     // Node-local `with:` bindings (#2637) resolve BEFORE the stub check, exactly as
     // the executor resolves them before execution — a binding a real run would fail
     // on (unknown producer, skipped without if_skipped) fails the simulated node
     // with the executor's own error, via the catch below. Command bindings merge
     // over run inputs into the `$INPUTS` bag; script bindings ride the exec env.
+    const nodeWith = isExecNode(node)
+      ? node.with
+      : isCommandSourced && isAgentNode(node) && node.source.kind === 'command'
+        ? node.source.with
+        : undefined;
     const nodeBindings =
-      (isCommandNode(node) || isScriptNode(node)) && node.with !== undefined
-        ? resolveNodeBindings(node.id, node.with, bindingShellContext(ctx, outputs), ctx.inputs)
+      nodeWith !== undefined
+        ? resolveNodeBindings(node.id, nodeWith, bindingShellContext(ctx, outputs), ctx.inputs)
         : undefined;
     const commandInputs =
-      isCommandNode(node) && nodeBindings !== undefined
+      isCommandSourced && nodeBindings !== undefined
         ? { ...(ctx.inputs ?? {}), ...nodeBindings }
         : undefined;
-    const resolvedText = isScriptNode(node)
-      ? resolveText(sourceText, ctx, outputs, true, '', false)
-      : resolveText(sourceText, ctx, outputs, isBashNode(node), '', undefined, commandInputs);
+    const resolvedText =
+      isExecNode(node) && node.runtime !== 'sh'
+        ? resolveText(sourceText, ctx, outputs, true, '', false)
+        : resolveText(
+            sourceText,
+            ctx,
+            outputs,
+            isExecNode(node) && node.runtime === 'sh',
+            '',
+            undefined,
+            commandInputs
+          );
     const stub = stubFor(node, ctx);
     if (stub !== undefined) {
       const hydrated = completedOutput(node, stub);
@@ -1004,7 +1010,7 @@ async function simulateNode(
       });
       return;
     }
-    if ((isBashNode(node) || isScriptNode(node)) && ctx.execCode) {
+    if (isExecNode(node) && ctx.execCode) {
       const executed = await executeCodeNode(node, resolvedText, ctx, nodeBindings);
       if ('error' in executed) {
         recordFailed(node, outputs, ctx, executed.error, resolvedText, iteration);
@@ -1107,7 +1113,8 @@ export async function dryRunWorkflow(options: {
   };
   const outputs = new Map<string, NodeOutput>();
   try {
-    await simulateNodes(options.workflow.nodes, outputs, ctx);
+    // Already-expanded (see createDryRunStubScaffold's justification above).
+    await simulateNodes(options.workflow.nodes as DagNode[], outputs, ctx);
   } finally {
     // Simulations are throwaway: whatever exec'd nodes wrote is discarded with the
     // per-run root (`force: true` makes the nothing-executed case a no-op). A cleanup

@@ -63,6 +63,7 @@ import { loadConfig } from '../config/config-loader';
 import { assertComposedGateDriveable } from '@archon/workflows/utils/workflow-requirements';
 import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
+import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import {
@@ -336,7 +337,9 @@ async function dispatchBackgroundWorkflowOwned(
   // startWorkflow, which reaches every platform with native tools), and a rule enforced per
   // caller is a rule that fails open the moment a third appears. Throws before the worker
   // conversation exists, so a refusal leaves nothing behind.
-  assertComposedGateDriveable(workflow.nodes);
+  // Already-expanded — discoverWorkflowsWithConfig's output never contains an
+  // IncludeDirective (#2486).
+  assertComposedGateDriveable(workflow.nodes as DagNode[]);
 
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
