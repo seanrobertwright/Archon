@@ -8530,6 +8530,11 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               // deterministic node retries solely when it declares an explicit
               // `retry:` block (single attempt otherwise), so side-effectful scripts
               // aren't silently re-run (#2088).
+              //
+              // `executeBashNode`/`executeScriptNode` stay two separate functions
+              // rather than one `executeExecNode(node.runtime)` — deliberate, not an
+              // oversight (#2718). See the rationale on `execNodeSchema` in
+              // schemas/dag-node.ts.
               if (node.runtime === 'sh') {
                 const output = await runDeterministicNodeWithRetry(
                   node,
