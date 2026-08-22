@@ -27833,7 +27833,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
   it("sibling gaps (#2713): a failed group's PLAIN with: value fails the consumer instead of resolving stale output", async () => {
     const markerPath = join(testDir, 'gate-ready-plain-with-ran.marker');
 
-    const nodes: DagNode[] = [
+    const nodes = [
       dagNodeSchema.parse({
         id: 'corrections',
         loop_group: {
@@ -27864,7 +27864,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
       platform,
       'conv-lg-binding-plain',
       testDir,
-      { name: 'lg-binding-plain-with-failed', nodes },
+      { name: 'lg-binding-plain-with-failed', nodes: nodes as DagNode[] },
       makeWorkflowRun('lg-binding-plain-with-failed'),
       'claude',
       undefined,
