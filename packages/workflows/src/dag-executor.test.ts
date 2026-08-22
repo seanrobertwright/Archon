@@ -19803,7 +19803,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       );
 
       const bashCall = execSpy.mock.calls.find(
-        c => (c[0] as string) === 'bash' && (c[1] as string[])[0] === '-c'
+        c => (c[0] as string) === git.resolveBashPath() && (c[1] as string[])[0] === '-c'
       ) as [string, string[], { env: NodeJS.ProcessEnv }] | undefined;
       expect(bashCall).toBeDefined();
       // The per-iteration feedback reaches the bash node through the environment —
