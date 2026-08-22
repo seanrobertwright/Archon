@@ -31,11 +31,18 @@ const mockReject = mock((_id: string, _r?: string) =>
   Promise.resolve({ workflowName: 'wf', cancelled: true, maxAttemptsReached: false })
 );
 const mockResume = mock((_id: string) => Promise.resolve({ id: 'r1abcdef', workflow_name: 'wf' }));
+// #2707 step 2 — respondToWorkflow can return either result shape depending on
+// `decision`; each test sets its own resolved/rejected value explicitly (mockReset()
+// in beforeEach clears any per-test override, same as every other mock here).
+const mockRespond = mock((_id: string, _decision: string, _text?: string) =>
+  Promise.resolve({ workflowName: 'wf', type: 'approval_gate' as const })
+);
 
 mock.module('../operations/workflow-operations', () => ({
   abandonWorkflow: mockAbandon,
   approveWorkflow: mockApprove,
   rejectWorkflow: mockReject,
+  respondToWorkflow: mockRespond,
   resumeWorkflow: mockResume,
 }));
 
@@ -76,6 +83,7 @@ beforeEach(() => {
     mockAbandon,
     mockApprove,
     mockReject,
+    mockRespond,
     mockResume,
   ]) {
     m.mockReset();
@@ -429,6 +437,84 @@ describe('manage_run — destructive confirmation gate', () => {
     expect(out).toContain('rework');
     expect(out).not.toContain('cancelled');
   });
+
+  // #2707 step 2 — the general drive verb, extended to manage_run so an agent's only
+  // "not this" affordance on a gate declaring decisions beyond approve/reject isn't a
+  // full cancel it never asked for.
+  test('respond without confirm previews the human gate and does NOT mutate', async () => {
+    mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
+    const out = await tool.handler({ action: 'respond', runId: 'r1abcdef', decision: 'revise' });
+    expect(out).toContain('confirm: true');
+    expect(out).toContain('human gate');
+    expect(mockRespond).not.toHaveBeenCalled();
+  });
+
+  test('respond requires a decision even with confirm:true', async () => {
+    mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
+    const out = await tool.handler({ action: 'respond', runId: 'r1abcdef', confirm: true });
+    expect(out).toContain('requires a decision');
+    expect(mockRespond).not.toHaveBeenCalled();
+  });
+
+  test('respond with a non-default decision resolves through respondToWorkflow, not a cancel', async () => {
+    mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
+    mockRespond.mockResolvedValue({ workflowName: 'wf', type: 'approval_gate' });
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
+    const out = await tool.handler({
+      action: 'respond',
+      runId: 'r1abcdef',
+      decision: 'revise',
+      confirm: true,
+      message: 'needs more detail',
+    });
+    expect(mockRespond).toHaveBeenCalledWith('r1abcdef-1234', 'revise', 'needs more detail');
+    expect(out).toContain("Responded 'revise'");
+    expect(out).not.toContain('cancel');
+  });
+
+  test('respond with decision=reject still cancels — sugar produces the same outcome shape as action=reject', async () => {
+    // respondToWorkflow('reject', ...) delegates internally to rejectWorkflow — from
+    // the tool's perspective this is just the RejectionOperationResult shape coming
+    // back through respondToWorkflow instead of rejectWorkflow directly.
+    mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
+    mockRespond.mockResolvedValue({
+      workflowName: 'wf',
+      cancelled: true,
+      maxAttemptsReached: false,
+    });
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
+    const out = await tool.handler({
+      action: 'respond',
+      runId: 'r1abcdef',
+      decision: 'reject',
+      confirm: true,
+      message: 'no',
+    });
+    expect(out).toContain('Rejected and cancelled');
+    expect(mockRespond).toHaveBeenCalledWith('r1abcdef-1234', 'reject', 'no');
+  });
+
+  test('an undeclared decision surfaces as an error, never a silent cancel', async () => {
+    mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
+    mockRespond.mockImplementation(() =>
+      Promise.reject(
+        new Error(
+          "Run r1abcdef-1234's gate does not declare decision 'bogus'. Declared decisions: approve, revise."
+        )
+      )
+    );
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
+    const out = await tool.handler({
+      action: 'respond',
+      runId: 'r1abcdef',
+      decision: 'bogus',
+      confirm: true,
+    });
+    expect(out).toContain("does not declare decision 'bogus'");
+    expect(out).toContain('Declared decisions: approve, revise');
+  });
 });
 
 // Resolving a gate and continuing the run are two halves of one action (#2565).
@@ -436,12 +522,12 @@ describe('manage_run — destructive confirmation gate', () => {
 describe('manage_run — gate continuation', () => {
   /** `accepts: false` models an orchestrator that already has a run queued. */
   function makeCtx(accepts = true) {
-    const resolved: { run: WorkflowRun; action: 'approve' | 'reject' }[] = [];
+    const resolved: { run: WorkflowRun; action: 'approve' | 'reject' | 'respond' }[] = [];
     return {
       resolved,
       ctx: {
         codebaseId: CODEBASE_ID,
-        onGateResolved: (run: WorkflowRun, action: 'approve' | 'reject') => {
+        onGateResolved: (run: WorkflowRun, action: 'approve' | 'reject' | 'respond') => {
           resolved.push({ run, action });
           return accepts;
         },

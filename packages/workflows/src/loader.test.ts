@@ -4188,6 +4188,96 @@ nodes:
     });
   });
 
+  // A gate-authoring leaf block (a workflow whose only purpose is to be composed via
+  // `include:`, but which directly authors its own native gate) must ALSO declare
+  // `interactive: true` on itself — its own gate is unambiguously its own file's
+  // promise, "one reader, one file", same as any other workflow. Exercised through the
+  // REAL discovery pipeline (discoverWorkflows -> parseWorkflow per file ->
+  // expandWorkflowIncludes), not expandWorkflowIncludes called directly on hand-built
+  // WorkflowDefinition objects — that bypass never reaches parseWorkflow's class check
+  // and so cannot prove this path works end to end.
+  describe('workflow-class placement — leaf gate-authoring block composed via include: (#2707 step 2)', () => {
+    async function writeAndDiscover(files: Record<string, string>) {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      for (const [filename, content] of Object.entries(files)) {
+        await writeFile(join(workflowDir, filename), content);
+      }
+      return discoverWorkflows(testDir, { loadDefaults: false });
+    }
+
+    it('a leaf block with a native gate and no interactive: true fails to load on its own', async () => {
+      const result = await writeAndDiscover({
+        'gate-blk.yaml': `
+name: gate-blk
+description: reusable review gate, composed by other workflows
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`,
+      });
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("Node 'gate' is a pause node");
+    });
+
+    it("a composer of that broken leaf block gets the REAL cause, not a misleading 'not found'", async () => {
+      const result = await writeAndDiscover({
+        'gate-blk.yaml': `
+name: gate-blk
+description: reusable review gate, composed by other workflows
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`,
+        'top.yaml': `
+name: top
+description: composes the review gate
+interactive: true
+nodes:
+  - id: inc
+    include: gate-blk
+`,
+      });
+      expect(result.workflows).toHaveLength(0);
+      // 'gate-blk' itself fails (asserted above); 'top' fails to expand because its
+      // include target is broken — its error must name gate-blk's REAL cause, not
+      // read as a typo'd/missing workflow name.
+      const topError = result.errors.find(e => e.filename === 'top.yaml');
+      expect(topError).toBeDefined();
+      expect(topError?.error).toContain("include target 'gate-blk' failed to load");
+      expect(topError?.error).toContain("Node 'gate' is a pause node");
+      expect(topError?.error).not.toContain('not found');
+    });
+
+    it('once the leaf block also declares interactive: true, both it and its composer load correctly', async () => {
+      const result = await writeAndDiscover({
+        'gate-blk.yaml': `
+name: gate-blk
+description: reusable review gate, composed by other workflows
+interactive: true
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`,
+        'top.yaml': `
+name: top
+description: composes the review gate
+interactive: true
+nodes:
+  - id: inc
+    include: gate-blk
+`,
+      });
+      expect(result.errors).toHaveLength(0);
+      const names = result.workflows.map(w => w.workflow.name).sort();
+      expect(names).toEqual(['gate-blk', 'top']);
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Include nodes (load-time inlining)
   // -------------------------------------------------------------------------

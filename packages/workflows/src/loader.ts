@@ -1158,7 +1158,9 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, classError }, 'workflow_class_placement_invalid');
       return {
         workflow: null,
-        error: { filename, error: classError, errorType: 'validation_error' },
+        // `name: raw.name` lets a composer's "include target not found" surface the
+        // real cause instead — see WorkflowLoadError.name's doc comment.
+        error: { filename, error: classError, errorType: 'validation_error', name: raw.name },
       };
     }
 

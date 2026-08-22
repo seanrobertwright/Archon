@@ -166,17 +166,22 @@ export const workflowBaseSchema = z.object({
   webSearchMode: webSearchModeSchema.optional(),
   /**
    * The workflow's CLASS declaration (#2707 step 2): `true` means this
-   * workflow's tree may pause (contains a gate/`approval:` node, or a
-   * `loop`/`loop_group` with node-level `interactive: true`, anywhere in its
-   * DAG including a `loop_group` body and nodes that arrive via `include:`
-   * composition). Load-time validation rejects a pause node in a workflow that
-   * does not declare `interactive: true` (`loader.ts`'s workflow-class
-   * placement check). Every background-dispatch entry point independently
-   * refuses to background an `interactive: true` workflow — CLI `--detach`,
-   * the `manage_run` native tool, and web's default background dispatch — so
-   * a pause always has a foreground driver watching for it. Absent/`false`
-   * means the workflow is unattended-class and can never contain a pause
-   * node; it is also the class a `fan_out:` target must resolve to.
+   * workflow's tree may pause. Every background-dispatch entry point
+   * independently refuses to background an `interactive: true` workflow —
+   * CLI `--detach`, the `manage_run` native tool, and web's default
+   * background dispatch — so a pause always has a foreground driver watching
+   * for it. Absent/`false` means the workflow is unattended-class; it is
+   * also the class a `fan_out:` target must resolve to.
+   *
+   * See `validateWorkflowClassPlacement`'s doc comment in `loader.ts` for the
+   * precise load-time enforcement scope — it is narrower than "no pause node
+   * anywhere": a NATIVE gate/interactive-loop authored directly in this
+   * workflow's own DAG is a load error without `interactive: true`, but a
+   * gate that arrives via `include:` composition is deliberately NOT covered
+   * here (`assertComposedGateDriveable` remains the invocation-time check for
+   * that case — the same reusable block can be legitimately composed by
+   * different parents, so load time cannot always tell which workflow will
+   * own a given run).
    */
   interactive: z.boolean().optional(),
   effort: effortLevelSchema.optional(),
@@ -395,6 +400,15 @@ export interface WorkflowLoadError {
   readonly filename: string;
   readonly error: string;
   readonly errorType: 'read_error' | 'parse_error' | 'validation_error';
+  /**
+   * The workflow's own declared `name:`, when parsing got far enough to read it before
+   * failing (#2707 step 2). Lets `expandWorkflowIncludes` distinguish "this include target
+   * genuinely doesn't exist" from "this name exists but its file failed to load" — see
+   * `validateWorkflowClassPlacement`'s failure mode, where a gate-authoring leaf block
+   * that fails its own class check would otherwise surface as a misleading "not found" at
+   * every workflow that composes it.
+   */
+  readonly name?: string;
 }
 
 /**

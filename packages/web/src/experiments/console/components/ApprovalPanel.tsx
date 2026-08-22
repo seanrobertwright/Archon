@@ -1,4 +1,5 @@
 import {
+  useEffect,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
@@ -12,8 +13,8 @@ interface ApprovalPanelProps {
   run: Run;
 }
 
-/** 'idle' (nothing being answered) or the id of the non-default decision being answered. */
-type Mode = 'idle' | { decisionId: string };
+/** `null` (nothing being answered) or the id of the non-default decision being answered. */
+type Mode = string | null;
 
 function decisionLabel(id: string, label: string | undefined): string {
   if (label !== undefined && label.length > 0) return label;
@@ -43,10 +44,27 @@ function decisionLabel(id: string, label: string | undefined): string {
 export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
   const [comment, setComment] = useState('');
   const [text, setText] = useState('');
-  const [mode, setMode] = useState<Mode>('idle');
+  const [mode, setMode] = useState<Mode>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isDemo = run.id.startsWith('demo-');
+  const gateNodeId = run.approval?.nodeId;
+
+  // Reset local state when the paused gate's identity changes — a re-pause of the
+  // same run (resolved by another surface, or by a second browser tab) must not
+  // leave a stale in-flight decision selected against a DIFFERENT gate. Without
+  // this, submitting a half-picked non-default decision after the underlying gate
+  // changed could silently resolve the new gate with a decision the user never
+  // chose for it (only caught server-side when the new gate happens not to declare
+  // the same decision id).
+  useEffect(() => {
+    setMode(null);
+    setComment('');
+    setText('');
+    setError(null);
+    // Deliberately keyed on gate identity ONLY — this must fire when the paused
+    // node changes, not on every busy/error state change mid-submit.
+  }, [gateNodeId]);
   // Signal-bearing interactive-loop gate (#2074): a bare approve finalizes the
   // node from the already-computed output (no re-run); a comment runs another
   // iteration. Same respond call either way — the backend derives
@@ -97,14 +115,14 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
     stopPropagation(e);
     if (e.key === 'Escape') {
       e.preventDefault();
-      setMode('idle');
+      setMode(null);
       setText('');
       setError(null);
       return;
     }
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && mode !== 'idle') {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && mode !== null) {
       e.preventDefault();
-      if (text.trim().length > 0) void respond(mode.decisionId, text);
+      if (text.trim().length > 0) void respond(mode, text);
     }
   };
 
@@ -120,7 +138,7 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
         </p>
       ) : null}
 
-      {mode === 'idle' ? (
+      {mode === null ? (
         <div className="flex items-stretch gap-2">
           <input
             type="text"
@@ -162,7 +180,7 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
               type="button"
               data-keymap-reject={d.id === 'reject' ? true : undefined}
               onClick={() => {
-                setMode({ decisionId: d.id });
+                setMode(d.id);
                 setError(null);
               }}
               disabled={busy}
@@ -176,11 +194,8 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
       ) : (
         <div className="flex flex-col gap-2">
           <label className="font-mono text-[10px] uppercase tracking-[0.14em] text-error">
-            {decisionLabel(
-              mode.decisionId,
-              secondaryDecisions.find(d => d.id === mode.decisionId)?.label
-            )}{' '}
-            — text required
+            {decisionLabel(mode, secondaryDecisions.find(d => d.id === mode)?.label)} — text
+            required
           </label>
           <textarea
             value={text}
@@ -203,7 +218,7 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
               <button
                 type="button"
                 onClick={() => {
-                  setMode('idle');
+                  setMode(null);
                   setText('');
                   setError(null);
                 }}
@@ -215,14 +230,14 @@ export function ApprovalPanel({ run }: ApprovalPanelProps): ReactElement {
               <button
                 type="button"
                 onClick={() => {
-                  if (text.trim().length > 0) void respond(mode.decisionId, text);
+                  if (text.trim().length > 0) void respond(mode, text);
                 }}
                 disabled={busy || text.trim().length === 0}
                 className="flex items-center gap-1 rounded border border-error/40 bg-error/15 px-3 py-1 text-[12px] font-medium text-error transition-colors hover:bg-error/25 disabled:opacity-40"
               >
                 {busy
                   ? 'Sending…'
-                  : `${decisionLabel(mode.decisionId, secondaryDecisions.find(d => d.id === mode.decisionId)?.label)} run`}
+                  : `${decisionLabel(mode, secondaryDecisions.find(d => d.id === mode)?.label)} run`}
                 <span aria-hidden className="font-mono text-[10px] opacity-70">
                   ⌘↵
                 </span>

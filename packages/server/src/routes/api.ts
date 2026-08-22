@@ -3967,7 +3967,12 @@ export function registerApiRoutes(
         }
       }
 
-      const result = await respondToWorkflow(runId, decision, body.text);
+      // Mirrors the dedicated /reject route's default: an empty/omitted text becomes
+      // 'Rejected' rather than reaching a new-mode gate's structured output as ''.
+      // Only for decision === 'reject' — every other decision (including 'approve',
+      // which stays optional/undefined) is unaffected.
+      const text = body.text ?? (decision === 'reject' ? 'Rejected' : undefined);
+      const result = await respondToWorkflow(runId, decision, text);
 
       if ('cancelled' in result && result.cancelled) {
         return c.json({

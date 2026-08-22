@@ -1064,7 +1064,11 @@ async function handleWorkflowCommand(
         };
       }
       const rawText = args.slice(3).join(' ');
-      const text = rawText.length > 0 ? rawText : undefined;
+      // Mirrors the dedicated /workflow reject command's default: an empty reason
+      // becomes 'Rejected' rather than reaching a new-mode gate's structured
+      // output as ''. Only for decision === 'reject' — respond's other decisions
+      // (including 'approve', which stays optional/undefined) are unaffected.
+      const text = rawText.length > 0 ? rawText : decision === 'reject' ? 'Rejected' : undefined;
       try {
         const result = await respondToWorkflow(runId, decision, text);
         if ('cancelled' in result) {

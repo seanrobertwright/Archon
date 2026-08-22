@@ -645,9 +645,18 @@ export async function discoverWorkflows(
       commandFolder: options?.commandFolder,
       loadDefaultCommands: options?.loadDefaultCommands,
     });
+    // Names that exist on disk but failed their OWN parse (e.g. a gate-authoring leaf
+    // block that omits `interactive: true`, #2707 step 2) — passed through so a composer
+    // of a broken include target gets the real reason, not a misleading "not found".
+    const failedNames = new Map<string, string>();
+    for (const err of allErrors) {
+      if (err.name !== undefined && !failedNames.has(err.name))
+        failedNames.set(err.name, err.error);
+    }
     const { workflows: expandedByName, errors: expansionErrors } = expandWorkflowIncludes(
       rawByName,
-      commandContents
+      commandContents,
+      failedNames
     );
     // Re-key expansion errors from workflow name to the includer's real filename.
     allErrors.push(
