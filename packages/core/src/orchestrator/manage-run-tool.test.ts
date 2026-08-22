@@ -412,6 +412,18 @@ describe('manage_run — destructive confirmation gate', () => {
     expect(mockReject).toHaveBeenCalledWith('r1abcdef-1234', 'no');
   });
 
+  test('reject with no message defaults the rejection text to "Rejected"', async () => {
+    mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
+    mockReject.mockResolvedValue({
+      workflowName: 'wf',
+      cancelled: true,
+      maxAttemptsReached: false,
+    });
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
+    await tool.handler({ action: 'reject', runId: 'r1abcdef', confirm: true });
+    expect(mockReject).toHaveBeenCalledWith('r1abcdef-1234', 'Rejected');
+  });
+
   test('reject with confirm and an on-reject prompt reports rework, not cancellation', async () => {
     mockFindByPrefix.mockResolvedValue([makeRun({ status: 'paused' })]);
     mockReject.mockResolvedValue({
