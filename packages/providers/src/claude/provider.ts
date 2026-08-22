@@ -844,6 +844,12 @@ function buildBaseClaudeOptions(
     // Per-node override wins over the assistant-level default; the final
     // fallback stays ['project', 'user'] (the SDK-loading default Archon ships).
     settingSources,
+    // Opt into the SDK's hook lifecycle frames so that tool-scoped hooks
+    // (PreToolUse / PostToolUse / Stop / etc.) reach the workflow audit
+    // stream as `hook_activity` (#2324). SessionStart and Setup remain
+    // emitted regardless. The downstream `hook_started` / `hook_response`
+    // normalization already handles every frame this enables.
+    includeHookEvents: true,
     hooks: buildToolCaptureHooks(toolResultQueue),
     stderr: (data: string): void => {
       const output = data.trim();
