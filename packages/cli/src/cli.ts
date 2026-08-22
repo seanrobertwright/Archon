@@ -28,7 +28,7 @@ loadArchonEnv(process.cwd());
 // `utils/safe-console.ts` for the underlying shim, and #2400 for the full
 // rationale.
 import { installPipeSafeConsole } from './utils/safe-console';
-import { exitWithDrain } from './utils/exit-with-drain';
+import { withDrainedExit } from './utils/exit-with-drain';
 installPipeSafeConsole();
 
 import { parseArgs } from 'util';
@@ -1189,13 +1189,9 @@ async function main(): Promise<number> {
 // zero. Splitting the two arms' exit logic would re-open the R9 latency:
 // a fatal rejection against a slow reader would truncate and exit 1,
 // producing the same silent stdout loss the patch is meant to eliminate.
-// The drain helper lives in `./utils/exit-with-drain.ts` so the
-// `safe-console.test.ts` R9 regression test imports the same code and a
-// drift between the two arms cannot land without changing that module.
-main()
-  .then(exitWithDrain)
-  .catch((error: unknown) => {
-    const err = error as Error;
-    console.error('Fatal error:', err.message);
-    return exitWithDrain(1);
-  });
+// The chain wiring — `main().then(exitWithDrain).catch(...)` — lives in
+// `withDrainedExit` (`./utils/exit-with-drain.ts`) so cli.ts and the R9
+// regression test fixture share a single source of truth, and a regression
+// that bypasses `exitWithDrain` at this call site would also have to land
+// in that module.
+withDrainedExit(main);

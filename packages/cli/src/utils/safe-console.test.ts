@@ -211,33 +211,36 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
    * reader drops queued stdout bytes the same way the success arm used to
    * pre-R1. The success-arm R1 test above would not catch a regression here
    * (it drives `workflow list`, which returns 0); this test drives a small
-   * fixture that mirrors the cli.ts exit chain (`main().then().catch()`)
-   * and throws after emitting a known marker through the patched
+   * fixture that throws after emitting a known marker through the patched
    * `console.log`. With the drain shared across both arms the marker is
    * delivered to a slow pipe; without it the bytes are truncated.
    *
    * The fixture is a self-contained TS script under `scratch/`. It imports
    * the shim from the source tree (not from a published package) so a
-   * regression in `flushPendingWrites()` itself is also caught here.
+   * regression in `flushPendingWrites()` itself is also caught here. It
+   * also imports `withDrainedExit` from the same module cli.ts imports it
+   * from (`./utils/exit-with-drain.ts`), so the chain wiring is a single
+   * source of truth: a regression that bypasses `exitWithDrain` at the
+   * cli.ts call site has to land in `withDrainedExit` and would also
+   * drop the drain from this fixture's chain.
    */
   it('drains queued console.log writes before process.exit(1) on the catch arm (R9)', () => {
     const marker = `R9-MARKER-${Date.now()}`;
-    // Mirror the cli.ts exit chain verbatim (with the fix): success and
+    // Mirror the cli.ts exit chain via the shared helper: success and
     // fatal both route through `exitWithDrain`, which awaits
-    // `flushPendingWrites()` before `process.exit()`. The helper is
-    // imported from the same module `cli.ts` imports it from
-    // (`./utils/exit-with-drain.ts`), so the fixture's drain and cli.ts's
-    // drain cannot drift — a regression that drops the drain from one arm
-    // only would have to land in `exit-with-drain.ts` and would also drop
-    // it from the other arm, which is what we want to catch.
+    // `flushPendingWrites()` before `process.exit()`. The chain wiring
+    // lives in `withDrainedExit` (`./utils/exit-with-drain.ts`), imported
+    // from the same module cli.ts imports it from, so a regression that
+    // bypasses `exitWithDrain` at the cli.ts call site has to land in
+    // that helper — the same module this fixture imports from.
     const fixturePath = join(scratch, 'r9-fixture.ts');
     const shimEntry = join(import.meta.dir, 'safe-console.ts');
     const exitWithDrainEntry = join(import.meta.dir, 'exit-with-drain.ts');
     writeFileSync(
       fixturePath,
       [
-        `import { flushPendingWrites, installPipeSafeConsole } from ${JSON.stringify(shimEntry)};`,
-        `import { exitWithDrain } from ${JSON.stringify(exitWithDrainEntry)};`,
+        `import { installPipeSafeConsole } from ${JSON.stringify(shimEntry)};`,
+        `import { withDrainedExit } from ${JSON.stringify(exitWithDrainEntry)};`,
         `installPipeSafeConsole();`,
         `// Emit a large payload FIRST so the pipe buffer (64 KiB on macOS)`,
         `// fills and the marker cannot reach the OS before the catch arm`,
@@ -248,11 +251,7 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
         `console.log(${JSON.stringify(marker)});`,
         `// Simulate a fatal main() rejection.`,
         `async function main(): Promise<number> { throw new Error('simulated fatal'); }`,
-        `main().then(exitWithDrain).catch((error: unknown) => {`,
-        `  const err = error as Error;`,
-        `  console.error('Fatal error:', err.message);`,
-        `  return exitWithDrain(1);`,
-        `});`,
+        `withDrainedExit(main);`,
         ``,
       ].join('\n')
     );
@@ -273,6 +272,40 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
     expect(result.status).toBe(1);
     expect(output).toContain(marker);
   }, 60_000);
+
+  /**
+   * Static-contract test for R12 (review report): even with the chain
+   * wiring extracted to `withDrainedExit`, a regression that bypasses
+   * the helper at the cli.ts call site (e.g. replacing
+   * `withDrainedExit(main)` with `main().then((c) => process.exit(c))`)
+   * is not caught by the R9 pipe test above — the fixture is a self-
+   * contained TS script that does not import cli.ts, so its own chain
+   * stays correct even when cli.ts drifts. Read cli.ts as a string and
+   * assert the call site is the shared helper, so a cli.ts bypass lands
+   * here.
+   */
+  it('routes cli.ts through withDrainedExit — no direct process.exit chain', () => {
+    const cliSrc = readFileSync(join(import.meta.dir, '..', 'cli.ts'), 'utf8');
+    // Strip line comments so a regression that comments out the import
+    // is still caught — `cliSrc.toMatch(/.../)` would still see the
+    // text inside the comment and pass falsely otherwise.
+    const codeLines = cliSrc.split('\n').filter(line => !line.trimStart().startsWith('//'));
+    const codeOnly = codeLines.join('\n');
+    // Must import the helper from the module that owns the chain shape.
+    expect(codeOnly).toMatch(
+      /import\s*\{\s*withDrainedExit\s*\}\s*from\s*['"]\.\/utils\/exit-with-drain['"]/
+    );
+    // Must invoke it at the top level, with main as the argument. Anchor
+    // on `withDrainedExit(` so a future alias import or wrap-in-helper
+    // regression is still caught.
+    expect(codeOnly).toMatch(/withDrainedExit\s*\(\s*main\s*\)/);
+    // Must NOT carry a parallel exit chain. The only legitimate
+    // `process.exit` mentions in cli.ts are comments — the filter above
+    // already stripped them, so any remaining line with `process.exit`
+    // is a regression.
+    const offendingExit = codeLines.filter(line => /process\.exit\b/.test(line));
+    expect(offendingExit).toEqual([]);
+  });
 });
 
 /**
