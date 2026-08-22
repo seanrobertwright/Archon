@@ -95,6 +95,7 @@ import type {
   WorkflowRun,
   WorkflowRunNodeSession,
   WorkflowDefinition,
+  WorkflowRunStatus,
 } from './schemas';
 import { dagNodeSchema, workflowDefinitionSchema } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
@@ -16190,7 +16191,10 @@ describe('shouldContinueStreamingForStatus', () => {
   it('aborts on any unrecognized state', async () => {
     const { shouldContinueStreamingForStatus } = await import('./dag-executor');
     expect(shouldContinueStreamingForStatus('pending')).toBe(false);
-    expect(shouldContinueStreamingForStatus('invalid-status')).toBe(false);
+    // Simulates a corrupted/unexpected DB status value — the column isn't compile-time
+    // checked, so the runtime fallback-to-abort still matters even though the
+    // parameter type is now WorkflowRunStatus | null.
+    expect(shouldContinueStreamingForStatus('invalid-status' as WorkflowRunStatus)).toBe(false);
   });
 });
 
@@ -23634,6 +23638,42 @@ describe('executeDagWorkflow -- container write-back gate', () => {
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it('a lost pause CAS during write-back stays fail-closed: throws, never suspends (#2489)', async () => {
+    // Unlike the other four gate types, a lost pause here must NEVER be tolerated —
+    // failClosed: true (dag-executor.ts raiseWriteBackGate) means this rejects
+    // straight through instead of being treated as a legitimate external
+    // transition, so the container teardown path preserves the overlay for retry.
+    // backend.suspend never firing proves the entire downstream sequence
+    // (suspend, then the user message) never runs — both are strictly sequential
+    // awaits after the pause call, with nothing to catch a throw in between.
+    const backend = makeWritebackBackend({
+      finalize: mock(async () => ({
+        requiresApproval: true,
+        changeSummary: {
+          added: ['x.md'],
+          modified: [],
+          deleted: [],
+          symlinks: [],
+          skipped: [],
+          totalCount: 1,
+          truncated: false,
+        },
+      })),
+    });
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(() => Promise.resolve('running' as const));
+    store.getWorkflowRun = mock(() => Promise.resolve(makeWorkflowRun('wb-run', { metadata: {} })));
+    store.claimWriteback = mock(() => Promise.resolve({ claimed: true }));
+    store.pauseWorkflowRun = mock(() =>
+      Promise.reject(new Error('Workflow run not found or not in running state (id: wb-run)'))
+    );
+
+    await expect(runGateWithStore(store, backend, 'approve')).rejects.toThrow(
+      /not found or not in running state/
+    );
+    expect(backend.suspend).not.toHaveBeenCalled();
+  });
+
   it('non-empty diff + auto policy → applies without pausing, then completes', async () => {
     const backend = makeWritebackBackend({
       finalize: mock(async () => ({
@@ -24087,6 +24127,86 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
     }
 
     expect(emitted).not.toContain('approval_pending');
+    const events = (
+      store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
+    ).mock.calls.map((c: unknown[]) => (c[0] as { event_type: string }).event_type);
+    expect(events).not.toContain('node_failed');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('workflow: child-pause gate that loses the pause CAS halts cleanly (#2489)', async () => {
+    // Unlike the other three gate types, this one never calls ctx.runChildWorkflow —
+    // findChildRuns already reports an existing PAUSED child, so executeWorkflowNode
+    // re-pauses the parent directly via pauseParentOnChild. Before #2489 this call site
+    // bypassed pauseGateRespectingExternalTransition, so a lost CAS here threw straight
+    // into a node_failed instead of tolerating the external transition like the other
+    // three sites. This proves the unification: the same tolerant outcome now holds.
+    const store = createExternallyFailedStore();
+    store.findChildRuns = mock(() =>
+      Promise.resolve([
+        makeWorkflowRun('child-run-id', {
+          workflow_name: 'child-wf',
+          status: 'paused',
+          metadata: { parent_node_id: 'sub' },
+        }),
+      ])
+    );
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const emitted: string[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe((event: WorkflowEmitterEvent) => {
+      if ('runId' in event && event.runId === workflowRun.id) emitted.push(event.type);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-pause-race-child',
+        testDir,
+        {
+          name: 'pause-race-child',
+          nodes: [{ id: 'sub', workflow: 'child-wf' } as DagNode],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        async () => {
+          throw new Error(
+            'runChildWorkflow should not be called — an existing paused child was found'
+          );
+        }
+      );
+    } finally {
+      unsubscribe();
+    }
+
+    // The re-pause never actually landed — no approval_pending signal to live UIs, and
+    // no stale "Blocked on sub-run" chat notification (gated on the pause having
+    // succeeded) — unlike the run-stopped notice below, which is unrelated to this
+    // gate and fires generically whenever the between-layer status check observes the
+    // run already left 'running'.
+    expect(emitted).not.toContain('approval_pending');
+    const sentMessages = platform.sendMessage.mock.calls.map(([, message]) => message);
+    expect(sentMessages.some(message => message.includes('Blocked on sub-run'))).toBe(false);
     const events = (
       store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
     ).mock.calls.map((c: unknown[]) => (c[0] as { event_type: string }).event_type);

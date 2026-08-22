@@ -419,6 +419,26 @@ describe('approveWorkflow', () => {
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
     expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
   });
+
+  test('an unrecognized gate type fails loudly instead of resolving as a plain approval (#2489)', async () => {
+    const run = makePausedRun({
+      metadata: {
+        approval: {
+          nodeId: 'review',
+          message: 'Please review',
+          // Simulates a future/corrupted reason value assertApprovable's shared
+          // precondition gate must reject rather than silently letting the generic
+          // approval branch resolve it — the SAME check the CLI --detach precheck
+          // runs, so a passing precheck can never diverge from the real resolution.
+          type: 'bogus-reason',
+        },
+      },
+    });
+    mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+    await expect(approveWorkflow('run-1')).rejects.toThrow(/unrecognized gate type 'bogus-reason'/);
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
 });
 
 describe('rejectWorkflow', () => {
@@ -652,6 +672,29 @@ describe('rejectWorkflow', () => {
       /waiting on sub-run child-run-9.*reject child-run-9/i
     );
     // A fall-through would cancel the parent and silently orphan the paused child.
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+    expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
+    expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  test('an unrecognized gate type fails loudly instead of resolving as a plain rework/cancel (#2489)', async () => {
+    const run = makePausedRun({
+      metadata: {
+        approval: {
+          nodeId: 'review',
+          message: 'Please review',
+          // Simulates a future/corrupted reason value assertRejectable's shared
+          // precondition gate must reject rather than silently letting the generic
+          // rework/cancel branch resolve it — the SAME check the CLI --detach
+          // precheck runs, so a passing precheck can never diverge from the real
+          // resolution.
+          type: 'bogus-reason',
+        },
+      },
+    });
+    mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+    await expect(rejectWorkflow('run-1')).rejects.toThrow(/unrecognized gate type 'bogus-reason'/);
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
     expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
