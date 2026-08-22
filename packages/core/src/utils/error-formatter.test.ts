@@ -361,12 +361,21 @@ describe('classifyAndFormatError', () => {
   });
 
   describe('raw orchestrator prefixes reject a bare "401" (#2509 R2)', () => {
-    // codex_turn_failed:/codex_stream_incomplete: carry raw upstream text
-    // (orchestrator-agent.ts) that never passes through the provider's own
-    // classifyCodexError/AUTH_PATTERNS check, unlike every `Codex `-prefixed
-    // shape above. A bare "401" in that raw text is not a reliable auth
-    // signal — it can appear in unrelated internal errors — so these two
-    // prefixes require the more specific word "Unauthorized" instead.
+    // Codex query failed:/codex_turn_failed:/codex_stream_incomplete: carry
+    // raw upstream text (provider.ts / orchestrator-agent.ts) that never
+    // passes through the provider's own classifyCodexError/AUTH_PATTERNS
+    // check, unlike every `Codex auth error:`-classified shape above. A bare
+    // "401" in that raw text is not a reliable auth signal — it can appear
+    // in unrelated internal errors like a port or a byte offset — so these
+    // three prefixes require the more specific word "Unauthorized" instead.
+    test('does not route "Codex query failed:" with an unrelated "401" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error('Codex query failed: connect ECONNREFUSED 127.0.0.1:401')
+      );
+      expect(result).not.toContain('Codex authentication');
+      expect(result).not.toContain('codex login');
+    });
+
     test('does not route "codex_turn_failed:" with an unrelated "401" to Codex auth guidance', () => {
       const result = classifyAndFormatError(
         new Error('codex_turn_failed: internal error at offset 401 while parsing response body')
@@ -381,6 +390,14 @@ describe('classifyAndFormatError', () => {
       );
       expect(result).not.toContain('Codex authentication');
       expect(result).not.toContain('codex login');
+    });
+
+    test('still routes "Codex query failed:" carrying "Unauthorized" to Codex auth guidance', () => {
+      const result = classifyAndFormatError(
+        new Error('Codex query failed: connect refused, 401 Unauthorized')
+      );
+      expect(result).toContain('Codex authentication error');
+      expect(result).toContain('codex login');
     });
 
     test('still routes "codex_turn_failed:" carrying "Unauthorized" to Codex auth guidance', () => {

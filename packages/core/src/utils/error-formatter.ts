@@ -39,8 +39,9 @@ export function classifyAndFormatError(error: Error): string {
   // Codex-specific auth errors — OAuth token refresh failures and 401 retry
   // exhaustion (GitHub #2509). The rate-limit branch above has already had a
   // chance to match, so a `Codex rate_limit:` wrap routes to usage-cap
-  // guidance first (only when the inner text literally contains "rate
-  // limit" — see that branch).
+  // guidance first (only when the inner text matches that branch's own
+  // substring list: "rate limit" / "hit your limit" / "usage limit" /
+  // "session limit").
   //
   // `Codex auth error:` means the provider's own AUTH_PATTERNS
   // (packages/providers/src/codex/provider.ts) already classified this
@@ -51,15 +52,18 @@ export function classifyAndFormatError(error: Error): string {
   // auth by the provider: some are a different class (`Codex crash:`),
   // others are raw and never classified at all (`Codex query failed:`,
   // `codex_turn_failed:`, `codex_stream_incomplete:`), so those still need a
-  // substring check. For the two raw orchestrator prefixes, a bare "401" is
-  // not enough signal — unlike provider-thrown shapes it can appear in
-  // unrelated internal text (e.g. a byte offset), so only the specific word
-  // "Unauthorized" counts as a 401-adjacent auth signal there (#2509 R2).
+  // substring check. For these three raw, unclassified prefixes, a bare
+  // "401" is not enough signal — unlike provider-thrown shapes it can appear
+  // in unrelated internal text (e.g. a byte offset, a port, a timeout in
+  // ms), so only the specific word "Unauthorized" counts as a 401-adjacent
+  // auth signal there (#2509 R2).
   if (message.startsWith('Codex auth error:')) {
     return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
   }
   const isCodexRawPrefixed =
-    message.startsWith('codex_turn_failed:') || message.startsWith('codex_stream_incomplete:');
+    message.startsWith('Codex query failed:') ||
+    message.startsWith('codex_turn_failed:') ||
+    message.startsWith('codex_stream_incomplete:');
   if (
     (message.startsWith('Codex ') || isCodexRawPrefixed) &&
     (message.includes('refresh token') ||
