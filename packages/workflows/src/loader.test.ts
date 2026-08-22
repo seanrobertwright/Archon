@@ -43,7 +43,7 @@ import {
   isAgentNode,
   isWorkflowNode,
 } from './schemas';
-import { parseWorkflow, type ParseResult } from './loader';
+import { parseWorkflow, resetClassPlacementWarningForTests, type ParseResult } from './loader';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
 import { workflowDefinitionSchema } from './schemas/workflow';
 import type { WorkflowDefinition } from './schemas/workflow';
@@ -3667,10 +3667,10 @@ nodes:
       expect(result.errors[0].error).toContain('gate_message');
     });
 
-    it('should fail to load when an interactive loop node is in a non-interactive workflow (#2707 step 2)', async () => {
-      // Superseded by the workflow-class placement check: this used to load with a
-      // WARN ('interactive_loop_in_non_interactive_workflow', now deleted as dead
-      // code) — a pause node in an unattended workflow is now a hard load error.
+    it('should infer interactive: true (with a warning) when an interactive loop node is in an undeclared workflow (#2707 step 2 / #2736)', async () => {
+      // Grace period (#2736/#2738): this used to be a hard load error. It now loads
+      // successfully with `interactive` coerced to `true`, so #1991's background-dispatch
+      // refusal still protects the run even though the author never declared the class.
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
@@ -3691,10 +3691,16 @@ nodes:
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.workflows).toHaveLength(0);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0].error).toContain("Node 'my-loop' is a pause node");
-      expect(result.errors[0].error).toContain("declare 'interactive: true'");
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.interactive).toBe(true);
+      // Also carries the pre-existing "node-level loop interactive: is deprecated"
+      // warning (#2707 step 3) for this same node — unrelated to this check, so
+      // find the class-placement warning by content rather than asserting length.
+      const pw = result.workflows[0].parseWarnings ?? [];
+      const classWarning = pw.find(w => w.includes("Node 'my-loop' is a pause node"));
+      expect(classWarning).toBeDefined();
+      expect(classWarning).toContain('has been applied for this run only');
     });
 
     // -----------------------------------------------------------------------
@@ -4157,8 +4163,8 @@ nodes:
       expect(result.errors[0].error).toContain('shadows a node id in the enclosing DAG');
     });
 
-    it('should fail to load when an interactive loop_group is in a non-interactive workflow (#2707 step 2)', async () => {
-      // Superseded by the workflow-class placement check — see the loop: sibling test above.
+    it('should infer interactive: true (with a warning) when an interactive loop_group is in an undeclared workflow (#2707 step 2 / #2736)', async () => {
+      // Grace period (#2736/#2738) — see the loop: sibling test above.
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
 
@@ -4181,22 +4187,26 @@ nodes:
       );
 
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      expect(result.workflows).toHaveLength(0);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0].error).toContain("Node 'grp' is a pause node");
-      expect(result.errors[0].error).toContain("declare 'interactive: true'");
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.interactive).toBe(true);
+      // Also carries the pre-existing "node-level loop interactive: is deprecated"
+      // warning (#2707 step 3) for this same node — find by content, not length.
+      const pw = result.workflows[0].parseWarnings ?? [];
+      const classWarning = pw.find(w => w.includes("Node 'grp' is a pause node"));
+      expect(classWarning).toBeDefined();
     });
   });
 
   // A gate-authoring leaf block (a workflow whose only purpose is to be composed via
-  // `include:`, but which directly authors its own native gate) must ALSO declare
-  // `interactive: true` on itself — its own gate is unambiguously its own file's
-  // promise, "one reader, one file", same as any other workflow. Exercised through the
-  // REAL discovery pipeline (discoverWorkflows -> parseWorkflow per file ->
+  // `include:`, but which directly authors its own native gate) is now covered by the
+  // grace-period inference like any other workflow (#2736/#2738) — it loads with a
+  // warning and `interactive: true` inferred, rather than failing outright, so a
+  // composer of it succeeds too instead of seeing a cascaded failure. Exercised through
+  // the REAL discovery pipeline (discoverWorkflows -> parseWorkflow per file ->
   // expandWorkflowIncludes), not expandWorkflowIncludes called directly on hand-built
-  // WorkflowDefinition objects — that bypass never reaches parseWorkflow's class check
-  // and so cannot prove this path works end to end.
-  describe('workflow-class placement — leaf gate-authoring block composed via include: (#2707 step 2)', () => {
+  // WorkflowDefinition objects — that bypass never reaches parseWorkflow's class check.
+  describe('workflow-class placement — leaf gate-authoring block composed via include: (#2707 step 2 / #2736)', () => {
     async function writeAndDiscover(files: Record<string, string>) {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
@@ -4206,7 +4216,7 @@ nodes:
       return discoverWorkflows(testDir, { loadDefaults: false });
     }
 
-    it('a leaf block with a native gate and no interactive: true fails to load on its own', async () => {
+    it('a leaf block with a native gate and no interactive: true loads on its own with interactive inferred', async () => {
       const result = await writeAndDiscover({
         'gate-blk.yaml': `
 name: gate-blk
@@ -4217,12 +4227,12 @@ nodes:
       message: "Review?"
 `,
       });
-      expect(result.workflows).toHaveLength(0);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0].error).toContain("Node 'gate' is a pause node");
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.interactive).toBe(true);
     });
 
-    it("a composer of that broken leaf block gets the REAL cause, not a misleading 'not found'", async () => {
+    it('a composer of that leaf block also succeeds — the inference propagates through include: composition', async () => {
       const result = await writeAndDiscover({
         'gate-blk.yaml': `
 name: gate-blk
@@ -4241,18 +4251,12 @@ nodes:
     include: gate-blk
 `,
       });
-      expect(result.workflows).toHaveLength(0);
-      // 'gate-blk' itself fails (asserted above); 'top' fails to expand because its
-      // include target is broken — its error must name gate-blk's REAL cause, not
-      // read as a typo'd/missing workflow name.
-      const topError = result.errors.find(e => e.filename === 'top.yaml');
-      expect(topError).toBeDefined();
-      expect(topError?.error).toContain("include target 'gate-blk' failed to load");
-      expect(topError?.error).toContain("Node 'gate' is a pause node");
-      expect(topError?.error).not.toContain('not found');
+      expect(result.errors).toHaveLength(0);
+      const names = result.workflows.map(w => w.workflow.name).sort();
+      expect(names).toEqual(['gate-blk', 'top']);
     });
 
-    it('once the leaf block also declares interactive: true, both it and its composer load correctly', async () => {
+    it('once the leaf block also declares interactive: true, both it and its composer load correctly with no warning', async () => {
       const result = await writeAndDiscover({
         'gate-blk.yaml': `
 name: gate-blk
@@ -4275,6 +4279,55 @@ nodes:
       expect(result.errors).toHaveLength(0);
       const names = result.workflows.map(w => w.workflow.name).sort();
       expect(names).toEqual(['gate-blk', 'top']);
+      for (const w of result.workflows) {
+        expect(w.parseWarnings ?? []).toEqual([]);
+      }
+    });
+  });
+
+  describe('workflow-class placement inference — log dedup (#2736/#2738)', () => {
+    beforeEach(() => {
+      resetClassPlacementWarningForTests();
+      mockLogger.warn.mockClear();
+    });
+
+    const undeclaredGateYaml = `
+name: warn-once-test
+description: Non-interactive workflow with a native gate
+nodes:
+  - id: gate
+    approval:
+      message: "Review?"
+`;
+
+    it('warns on the log channel exactly once per filename across repeated parses, but coerces every time', () => {
+      const first = parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+      const second = parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+      const third = parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+
+      for (const result of [first, second, third]) {
+        expect(result.error).toBeNull();
+        expect(result.workflow?.interactive).toBe(true);
+        expect(result.warnings).toHaveLength(1);
+      }
+
+      const warnCalls = mockLogger.warn.mock.calls.filter(
+        call => call[1] === 'workflow_class_placement_inferred'
+      );
+      expect(warnCalls).toHaveLength(1);
+    });
+
+    it('warns again for a different filename with the same violation', () => {
+      parseWorkflow(undeclaredGateYaml, 'warn-once-test.yaml');
+      parseWorkflow(
+        undeclaredGateYaml.replace('warn-once-test', 'a-different-workflow'),
+        'other.yaml'
+      );
+
+      const warnCalls = mockLogger.warn.mock.calls.filter(
+        call => call[1] === 'workflow_class_placement_inferred'
+      );
+      expect(warnCalls).toHaveLength(2);
     });
   });
 

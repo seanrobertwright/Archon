@@ -176,12 +176,13 @@ export const workflowBaseSchema = z.object({
    * See `validateWorkflowClassPlacement`'s doc comment in `loader.ts` for the
    * precise load-time enforcement scope — it is narrower than "no pause node
    * anywhere": a NATIVE gate/interactive-loop authored directly in this
-   * workflow's own DAG is a load error without `interactive: true`, but a
-   * gate that arrives via `include:` composition is deliberately NOT covered
-   * here (`assertComposedGateDriveable` remains the invocation-time check for
-   * that case — the same reusable block can be legitimately composed by
-   * different parents, so load time cannot always tell which workflow will
-   * own a given run).
+   * workflow's own DAG without `interactive: true` is inferred as
+   * `interactive: true` with a one-time WARN during a grace period (#2736/
+   * #2738), not a load error. A gate that arrives via `include:` composition
+   * is deliberately NOT covered here (`assertComposedGateDriveable` remains
+   * the invocation-time check for that case — the same reusable block can be
+   * legitimately composed by different parents, so load time cannot always
+   * tell which workflow will own a given run).
    */
   interactive: z.boolean().optional(),
   effort: effortLevelSchema.optional(),
@@ -400,15 +401,6 @@ export interface WorkflowLoadError {
   readonly filename: string;
   readonly error: string;
   readonly errorType: 'read_error' | 'parse_error' | 'validation_error';
-  /**
-   * The workflow's own declared `name:`, when parsing got far enough to read it before
-   * failing (#2707 step 2). Lets `expandWorkflowIncludes` distinguish "this include target
-   * genuinely doesn't exist" from "this name exists but its file failed to load" — see
-   * `validateWorkflowClassPlacement`'s failure mode, where a gate-authoring leaf block
-   * that fails its own class check would otherwise surface as a misleading "not found" at
-   * every workflow that composes it.
-   */
-  readonly name?: string;
 }
 
 /**

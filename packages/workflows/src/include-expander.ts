@@ -1094,15 +1094,7 @@ function materializeBlockCommandPrompts(
  */
 export function expandWorkflowIncludes(
   rawByName: Map<string, WorkflowDefinition>,
-  commandContents?: ReadonlyMap<string, IncludeCommandContent>,
-  /**
-   * Workflow names that exist on disk but failed to parse on their own (keyed by their
-   * own declared `name:`, value is the reason) — e.g. a gate-authoring leaf block that
-   * fails its own workflow-class placement check (#2707 step 2). When an include target
-   * isn't in `rawByName`, checked here first so the composer's error names the REAL
-   * cause instead of a misleading "not found", which would otherwise read as a typo.
-   */
-  failedNames?: ReadonlyMap<string, string>
+  commandContents?: ReadonlyMap<string, IncludeCommandContent>
 ): {
   workflows: Map<string, WorkflowDefinition>;
   errors: WorkflowLoadError[];
@@ -1216,15 +1208,7 @@ export function expandWorkflowIncludes(
     const raw = rawByName.get(name);
     if (!raw) {
       // Top-level names always exist (they come from rawByName.keys()); this only
-      // fires when the name was reached as an unresolvable include TARGET. A name that
-      // exists on disk but failed its OWN load (e.g. a gate-authoring leaf block that
-      // omits `interactive: true`, #2707 step 2) gets its real reason surfaced here —
-      // otherwise every composer of a broken block sees a misleading "not found" that
-      // reads as a typo rather than the fixable class-placement error it actually is.
-      const knownFailure = failedNames?.get(name);
-      if (knownFailure !== undefined) {
-        throw new IncludeExpansionError(`include target '${name}' failed to load: ${knownFailure}`);
-      }
+      // fires when the name was reached as an unresolvable include TARGET.
       throw new IncludeExpansionError(`include target '${name}' not found`);
     }
 

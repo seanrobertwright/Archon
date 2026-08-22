@@ -71,6 +71,26 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
+ * Filenames already warned about an inferred workflow-class declaration this process
+ * (#2736/#2738's grace period on `validateWorkflowClassPlacement`). `parseWorkflow` runs
+ * on every `/workflow list`, chat turn, and CLI invocation — a permanent process-wide
+ * latch keeps the WARN a one-time nudge to the author instead of log spam on a
+ * long-running server. Mirrors `hasWarnedLegacyHomePath` in `workflow-discovery.ts`: a
+ * plain latch (no in-flight-probe dance) is correct here because `parseWorkflow` is fully
+ * synchronous, so no concurrent caller can interleave mid-check. Keyed by the bare
+ * filename `parseWorkflow` receives (not a scope-qualified path), so two files sharing a
+ * basename across bundled/global/project scopes could under-warn on this channel — a
+ * cosmetic log-noise tradeoff only, since `parseWarnings` (the channel the workflow's
+ * actual author sees, via `/api/workflows` and `/workflow list`) is pushed unconditionally
+ * on every parse regardless of this Set.
+ */
+const warnedClassPlacementFiles = new Set<string>();
+/** Exported for tests that need to observe the warning fire more than once per process. */
+export function resetClassPlacementWarningForTests(): void {
+  warnedClassPlacementFiles.clear();
+}
+
+/**
  * Parse an optional, schema-validated workflow field with warn-and-drop
  * semantics: a present-but-invalid value is logged and dropped (returns
  * undefined) rather than rejecting the whole workflow, so a typo in one field
@@ -978,13 +998,25 @@ export function validateDagStructure(
 
 /**
  * Workflow-class placement check (#2707 step 2): a workflow declared
- * unattended (workflow-level `interactive` not `true`) may not NATIVELY
+ * unattended (workflow-level `interactive` not `true`) should not NATIVELY
  * author a pause node anywhere in its DAG — a gate (`approval:`) node, or a
- * `loop`/`loop_group` node with node-level `interactive: true`. This is a
- * hard load error, not a warning: the declaration is the workflow's promise
- * about the pause nodes IT authors, and the mistake belongs at the author's
- * desk, not in production (see the class doc comment on
- * `workflowBaseSchema.interactive`).
+ * `loop`/`loop_group` node with node-level `interactive: true`. The
+ * declaration is the workflow's promise about the pause nodes IT authors.
+ *
+ * GRACE PERIOD (#2736): a violation here does NOT reject the file. Rejecting
+ * outright broke every workflow written before the class declaration
+ * existed, including ones that only ever ran in the foreground and were
+ * never actually unsafe — the hard error had no transition. `parseWorkflow`
+ * instead coerces `interactive` to `true` for the rest of this parse and
+ * warns once per file (see `warnedClassPlacementFiles`), which closes #1991
+ * for these workflows immediately: every dispatch surface reads the SAME
+ * parsed `interactive` value this function's result feeds
+ * (`assertInteractiveClassNotBackgrounded`, the fan-out spawn check, the web
+ * console's own background-vs-foreground branch), so the coercion protects
+ * them without waiting for the author to add the declaration. TODO(#2738):
+ * once the grace period ends, delete the coercion in `parseWorkflow` and
+ * restore the hard error — this function's return value already carries the
+ * exact message that error used to return, unchanged.
  *
  * Called ONLY from `parseWorkflow`, against ONE file's own unexpanded node
  * list — deliberately NOT re-run against the post-`include:`-expansion node
@@ -1149,19 +1181,30 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       };
     }
 
-    // Workflow-class placement (#2707 step 2). Read raw.interactive directly here
-    // (rather than moving its typed parse earlier) — the same coercion the typed
-    // parse below applies.
+    // Workflow-class placement (#2707 step 2) + the typed `interactive` field share
+    // one raw-value coercion, computed here so the class check and the field the
+    // engine actually reads can never disagree.
     const rawInteractive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
+    if (raw.interactive !== undefined && typeof raw.interactive !== 'boolean') {
+      getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
+    }
     const classError = validateWorkflowClassPlacement(dagNodes, rawInteractive);
+    // Grace period (#2736/#2738) — see this check's doc comment above `validateWorkflowClassPlacement`.
+    const interactive = classError ? true : rawInteractive;
     if (classError) {
-      getLog().warn({ filename, classError }, 'workflow_class_placement_invalid');
-      return {
-        workflow: null,
-        // `name: raw.name` lets a composer's "include target not found" surface the
-        // real cause instead — see WorkflowLoadError.name's doc comment.
-        error: { filename, error: classError, errorType: 'validation_error', name: raw.name },
-      };
+      const classWarning =
+        `Workflow '${raw.name}': ${classError} 'interactive: true' has been applied for this run only ` +
+        '(this grace period ends in a future release — see #2738); add the declaration to the file to ' +
+        'silence this warning.';
+      parseWarnings.push(classWarning);
+      if (!warnedClassPlacementFiles.has(filename)) {
+        warnedClassPlacementFiles.add(filename);
+        // Carry the prose, not just the payload, so the warning is legible on both
+        // channels: the log stream, and `parseWarnings` — which `executeWorkflow`
+        // persists verbatim as a `workflow_parse_warnings` event (#2213) and
+        // `/api/workflows` surfaces per-workflow to the author (see AGENTS.md).
+        getLog().warn({ filename, warning: classWarning }, 'workflow_class_placement_inferred');
+      }
     }
 
     // Parse workflow-level fields using WorkflowBaseSchema for validation
@@ -1303,11 +1346,6 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       'invalid_web_search_mode',
       { valid: webSearchModeSchema.options }
     );
-
-    const interactive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
-    if (raw.interactive !== undefined && typeof raw.interactive !== 'boolean') {
-      getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
-    }
 
     // Warn (non-blocking) when signal_completes is set without interactive: the flag
     // only changes interactive-gate behavior — a non-interactive loop already
