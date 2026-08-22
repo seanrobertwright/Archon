@@ -36,6 +36,7 @@ import type { NodeOutput } from './schemas';
 import { createLogger } from '@archon/paths';
 import {
   resolveNodeOutputField,
+  assertProducerNotFailed,
   OutputRefError,
   similarNodeIds,
   canonicalValueText,
@@ -90,16 +91,16 @@ function resolveOutputRef(
   if (!field) {
     // A failed producer's stale output is never evaluated (#2713) — a when: condition
     // joined past a failure via trigger_rule: all_done must branch on a different
-    // node's output, not the failed producer's own leftover text. KEEP IN SYNC: see
-    // the module doc of resolveNodeOutputField in output-ref.ts for the full list of
-    // guards asserting this same invariant.
-    if (nodeOutput.state === 'failed') {
-      throw new Error(
-        `'$${nodeId}.output' references node '${nodeId}', but it failed (${nodeOutput.error}), ` +
-          "so its output cannot be trusted in a 'when:' condition. A failed producer's stale " +
-          "output is never evaluated — branch on a different node's output instead."
-      );
-    }
+    // node's output, not the failed producer's own leftover text. Routes through
+    // `assertProducerNotFailed` in output-ref.ts (#2722), which every whole-text reader
+    // of nodeOutputs shares.
+    assertProducerNotFailed(
+      nodeOutput,
+      failed =>
+        `'$${nodeId}.output' references node '${nodeId}', but it failed (${failed.error}), ` +
+        "so its output cannot be trusted in a 'when:' condition. A failed producer's stale " +
+        "output is never evaluated — branch on a different node's output instead."
+    );
     // For unfielded ref, structuredOutput shape is opaque — defer to output text.
     if (!nodeOutput.output) return '';
     return nodeOutput.output;

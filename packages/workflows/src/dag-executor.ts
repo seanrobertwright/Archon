@@ -94,6 +94,7 @@ import { evaluateCondition } from './condition-evaluator';
 import {
   declaredFieldsFromSchema,
   resolveNodeOutputField,
+  assertProducerNotFailed,
   OutputRefError,
   similarNodeIds,
   canonicalValueText,
@@ -276,9 +277,9 @@ function inputEnvVars(node: DagNode, ctx: ShellInputContext): NodeJS.ProcessEnv 
  * already guards its own call below before reaching this function, so the check below only
  * ever fires for this function's OTHER caller, `resolveWorkflowValue`'s whole-ref tier — the
  * plain (non-directive) `with:` value on a script/command node, a `workflow:` node's `with:`,
- * or `fan_out`'s static `with:`, none of which had #2710's guard. KEEP IN SYNC: see the
- * module doc of `resolveNodeOutputField` in output-ref.ts for the full list of guards
- * asserting this same invariant.
+ * or `fan_out`'s static `with:`, none of which had #2710's guard. Routes through
+ * `assertProducerNotFailed` in output-ref.ts (#2722), which every other whole-text reader
+ * of `nodeOutputs` shares.
  */
 function wholeRefLogicalValue(
   producer: NodeOutput,
@@ -286,13 +287,13 @@ function wholeRefLogicalValue(
   field: string | undefined
 ): JsonValue {
   if (field === undefined) {
-    if (producer.state === 'failed') {
-      throw new Error(
+    assertProducerNotFailed(
+      producer,
+      failed =>
         `Binding value '$${nodeId}.output' references node '${nodeId}', but it failed ` +
-          `(${producer.error}), so its output cannot be trusted. Fix the failure, or guard ` +
-          "the referencing node with a 'when:' condition that excludes the failed branch."
-      );
-    }
+        `(${failed.error}), so its output cannot be trusted. Fix the failure, or guard ` +
+        "the referencing node with a 'when:' condition that excludes the failed branch."
+    );
     const structured = 'structuredOutput' in producer ? producer.structuredOutput : undefined;
     // Provider payloads are ajv-validated / DB-round-tripped JSON, so the cast
     // asserts what production already guarantees.
@@ -455,18 +456,18 @@ function resolveBindingDirective(
   // a branch that legitimately didn't run, not for a run that ran and produced a result
   // that can't be trusted (a loop_group's failure paths carry the last completed
   // iteration's real output text — non-empty, often valid JSON — which would otherwise
-  // resolve here as if the group had succeeded). KEEP IN SYNC: see the module doc of
-  // resolveNodeOutputField in output-ref.ts for the full list of guards (#2713 extended
-  // this one, the original, to every other reader of nodeOutputs).
-  if (producer.state === 'failed') {
-    throw new Error(
+  // resolve here as if the group had succeeded). Routes through `assertProducerNotFailed`
+  // in output-ref.ts (#2722, extending #2710's original guard to every whole-text reader
+  // of nodeOutputs through one shared function).
+  assertProducerNotFailed(
+    producer,
+    failed =>
       `Node '${consumerId}' binding '${name}' reads '${directive.from}', but node ` +
-        `'${ref.nodeId}' failed (${producer.error}), so its output cannot be trusted. ` +
-        "A binding never falls back to 'if_skipped' for a failed producer — fix the " +
-        `failure, or guard '${consumerId}' with a 'when:' condition that excludes the ` +
-        'failed branch.'
-    );
-  }
+      `'${ref.nodeId}' failed (${failed.error}), so its output cannot be trusted. ` +
+      "A binding never falls back to 'if_skipped' for a failed producer — fix the " +
+      `failure, or guard '${consumerId}' with a 'when:' condition that excludes the ` +
+      'failed branch.'
+  );
   return wholeRefLogicalValue(producer, ref.nodeId, ref.field);
 }
 
@@ -1246,18 +1247,17 @@ export function substituteNodeOutputRefs(
         // A failed producer's stale output is never spliced into a consumer's own
         // prompt/bash/command body (#2713) — matches resolveBindingDirective's #2710
         // guard for the same class of bug (a loop_group's failure paths leave real,
-        // last-completed-iteration text behind). KEEP IN SYNC: see the module doc of
-        // resolveNodeOutputField in output-ref.ts for the full list of guards
-        // asserting this same invariant.
-        if (nodeOutput.state === 'failed') {
-          throw new Error(
+        // last-completed-iteration text behind). Routes through `assertProducerNotFailed`
+        // in output-ref.ts (#2722), which every whole-text reader of nodeOutputs shares.
+        assertProducerNotFailed(
+          nodeOutput,
+          failed =>
             `'$${nodeId}.output' references node '${nodeId}', but it failed ` +
-              `(${nodeOutput.error}), so its output cannot be spliced into this node's ` +
-              "prompt/script — a failed producer's stale output is never trusted. Fix the " +
-              "failure, or guard this node with a 'when:' condition that excludes the " +
-              'failed branch.'
-          );
-        }
+            `(${failed.error}), so its output cannot be spliced into this node's ` +
+            "prompt/script — a failed producer's stale output is never trusted. Fix the " +
+            "failure, or guard this node with a 'when:' condition that excludes the " +
+            'failed branch.'
+        );
         return escapedForBash
           ? shellQuoteOrFile(nodeOutput.output, nodeId, undefined, artifactsDir)
           : nodeOutput.output;
