@@ -429,6 +429,20 @@ function resolveBindingDirective(
         `guard '${consumerId}' with a 'when:' condition.`
     );
   }
+  // A failed producer never falls back to `if_skipped` (#2696): that default exists for
+  // a branch that legitimately didn't run, not for a run that ran and produced a result
+  // that can't be trusted (a loop_group's failure paths carry the last completed
+  // iteration's real output text — non-empty, often valid JSON — which would otherwise
+  // resolve here as if the group had succeeded).
+  if (producer.state === 'failed') {
+    throw new Error(
+      `Node '${consumerId}' binding '${name}' reads '${directive.from}', but node ` +
+        `'${ref.nodeId}' failed (${producer.error}), so its output cannot be trusted. ` +
+        "A binding never falls back to 'if_skipped' for a failed producer — fix the " +
+        `failure, or guard '${consumerId}' with a 'when:' condition that excludes the ` +
+        'failed branch.'
+    );
+  }
   return wholeRefLogicalValue(producer, ref.nodeId, ref.field);
 }
 

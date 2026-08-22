@@ -26099,4 +26099,168 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
     await runDag(deliverWorkflow('iteration'), 'transport-deliver-iteration');
     expect(checkPrompts).toEqual(['joined [initial=false|iteration=true]']);
   });
+
+  // --- loop_group producer bindings, the real deliver topology (#2696) ---
+  //
+  // `deliver`'s `gate-ready` binds `{ from: '$corrections.output', if_skipped: null }`
+  // on a `loop_group` (not a plain node), joined via `trigger_rule: all_done`. Three
+  // cases: the group completes, the group is skipped, and the group fails. All three
+  // build the same shape — a bash-only `corrections` loop_group feeding a `gate-ready`
+  // script node — so each test constructs its own `nodes` array inline rather than a
+  // shared builder, keeping every producer state (completed/skipped/failed) visible at
+  // its call site.
+
+  it("loop_group binding (#2696): a completed group's output resolves through an all_done join, not the if_skipped default", async () => {
+    const nodes: DagNode[] = [
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 0',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: [],
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        script: 'console.log(process.env.INPUTS_CORRECTIONS);',
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        with: {
+          corrections: { from: '$corrections.output', if_skipped: 'NO_CORRECTIONS_RAN' },
+        },
+      }),
+    ];
+
+    const result = await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-lg-binding',
+      testDir,
+      { name: 'lg-binding-completed', nodes },
+      makeWorkflowRun('lg-binding-completed'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The group's real whole-ref output resolved — the `if_skipped` default never fired.
+    expect(result).toBe('CORRECTIONS_APPLIED');
+  });
+
+  it("loop_group binding (#2696): a skipped group's binding takes if_skipped", async () => {
+    const nodes: DagNode[] = [
+      dagNodeSchema.parse({ id: 'gate', bash: "printf 'skip'", depends_on: [] }),
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 0',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: ['gate'],
+        when: "$gate.output == 'run'",
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        script: 'console.log(process.env.INPUTS_CORRECTIONS);',
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        with: {
+          corrections: { from: '$corrections.output', if_skipped: 'NO_CORRECTIONS_RAN' },
+        },
+      }),
+    ];
+
+    const result = await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-lg-binding',
+      testDir,
+      { name: 'lg-binding-skipped', nodes },
+      makeWorkflowRun('lg-binding-skipped'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The group never ran — the binding took its declared default, unchanged by #2696.
+    expect(result).toBe('NO_CORRECTIONS_RAN');
+  });
+
+  it("loop_group binding (#2696): a failed group's binding fails the consumer instead of resolving stale output", async () => {
+    // Reproduces run 6607bf20 (issue #2696): the group fails via max_iterations
+    // exhaustion, but its one completed iteration left real, non-empty output behind
+    // (captured as `lastIterationOutput` before the completion check that then failed).
+    // Before the fix, `gate-ready` would resolve that stale text as if the group had
+    // succeeded and run its own body on it — the split-brain that flipped PR #2705.
+    const markerPath = join(testDir, 'gate-ready-ran.marker');
+
+    const nodes: DagNode[] = [
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 1',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: [],
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        // A stand-in for `flip-ready`'s real public write: proves whether the
+        // consumer's own body ever ran, independent of the run's overall status.
+        script: `require('fs').writeFileSync(${JSON.stringify(markerPath)}, process.env.INPUTS_CORRECTIONS ?? '');`,
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        with: {
+          corrections: { from: '$corrections.output', if_skipped: null },
+        },
+      }),
+    ];
+
+    const platform = createMockPlatform();
+    await executeDagWorkflow(
+      createMockDeps(),
+      platform,
+      'conv-lg-binding',
+      testDir,
+      { name: 'lg-binding-failed', nodes },
+      makeWorkflowRun('lg-binding-failed'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // gate-ready's body never executed — no public-write consequence from a failed group.
+    expect(await Bun.file(markerPath).exists()).toBe(false);
+
+    // The failure names both the failed producer and the node whose binding rejected it.
+    const sent = (platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>).mock.calls
+      .map(c => String(c[1]))
+      .join('\n');
+    expect(sent).toContain("Node 'gate-ready'");
+    expect(sent).toContain("'corrections' failed");
+  });
 });

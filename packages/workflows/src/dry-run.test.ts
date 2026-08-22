@@ -1459,6 +1459,38 @@ describe('dryRunWorkflow — node-local with: bindings (#2637)', () => {
     expect(result.outcome).toBe('completed');
     expect(result.trace.find(t => t.nodeId === 'gate')?.output).toBe('ready=false');
   });
+
+  test('a directive on a failed producer fails the consumer, never taking if_skipped (#2696)', async () => {
+    // Preview and the real run share resolveNodeBindings (see this file's docblock),
+    // so the failed-producer guard added for #2696 must behave identically here.
+    const workflow = makeTestWorkflow({
+      name: 'binding-failed',
+      nodes: [
+        { id: 'corrections', bash: 'echo boom >&2; exit 1' },
+        {
+          id: 'gate-ready',
+          script: 'console.log(`ready=${process.env.INPUTS_READY ?? "unset"}`)',
+          runtime: 'bun' as const,
+          depends_on: ['corrections'],
+          trigger_rule: 'all_done' as const,
+          with: { ready: { from: '$corrections.output', if_skipped: 'default' } },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      execCode: true,
+    });
+
+    expect(result.outcome).toBe('failed');
+    const gate = result.trace.find(t => t.nodeId === 'gate-ready');
+    // The binding rejected the failed producer outright — it never took if_skipped's default.
+    expect(gate?.state).toBe('failed');
+    expect(gate?.reason).toContain("'corrections' failed");
+  });
 });
 
 describe('dryRunWorkflow — effective provider/model per node', () => {
