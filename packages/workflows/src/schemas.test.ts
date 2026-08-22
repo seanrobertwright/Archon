@@ -17,6 +17,8 @@ import {
   dagNodeSchema,
   inputEnvKey,
   readSubrunMetadata,
+  RUN_METADATA_KEYS,
+  readIdentityUnresolved,
 } from './schemas';
 import type {
   DagNode,
@@ -1564,5 +1566,35 @@ describe('readSubrunMetadata — inputs (#2470)', () => {
     expect(readSubrunMetadata({ inputs: ['a'] }).inputs).toBeUndefined();
     expect(readSubrunMetadata({}).inputs).toBeUndefined();
     expect(readSubrunMetadata(undefined).inputs).toBeUndefined();
+  });
+});
+
+// #2304: a row-level marker that distinguishes "unregistered project" from "identity
+// could not be resolved". The reader is defensive the same way `readSubrunMetadata`
+// is: a non-boolean value (corrupt, hand edit, future format) reads as `undefined`
+// rather than as `false`, so a row never silently downgrades to a 'resolved' posture.
+describe('readIdentityUnresolved (#2304)', () => {
+  test('reads a true stamp', () => {
+    expect(readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: true })).toBe(true);
+  });
+
+  test('reads a false stamp', () => {
+    expect(readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: false })).toBe(false);
+  });
+
+  test('treats a missing key as undefined', () => {
+    expect(readIdentityUnresolved({})).toBeUndefined();
+    expect(readIdentityUnresolved(undefined)).toBeUndefined();
+  });
+
+  test('treats a non-boolean value as undefined (defensive)', () => {
+    expect(
+      readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: 'yes' })
+    ).toBeUndefined();
+    expect(readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: 1 })).toBeUndefined();
+    expect(
+      readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: null })
+    ).toBeUndefined();
+    expect(readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: {} })).toBeUndefined();
   });
 });

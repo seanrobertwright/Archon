@@ -249,6 +249,38 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
 }
 
 /**
+ * Keys the run-lifecycle machinery writes into a row's untyped `metadata` JSONB, and the
+ * shape of each value. `metadata` is `Record<string, unknown>`, so a typo in a string
+ * literal at either end silently no-ops — the write lands under a key nobody reads, or the
+ * read returns undefined and the row looks like it was never stamped. Naming them once
+ * gives the compiler the only handle it can have on an untyped column: writer and reader
+ * now share a symbol instead of agreeing by luck.
+ *
+ * `identity_unresolved` — TRUE on a fresh run whose `output_root` was deliberately NOT
+ *                       written because `resolveProjectPaths` returned the `_cwd/<basename>`
+ *                       fallback AFTER `getCodebase` threw on both retry attempts (#2304).
+ *                       Distinguishes "this run is on the cwd fallback because the codebase
+ *                       had no owner/repo or `_local` identity" (legitimate, the WARN arm
+ *                       of the same function) from "this run is on the cwd fallback
+ *                       because we couldn't reach the registry at all" (the ERROR arm).
+ *                       Absent on every other run — the existing `output_root` write-once
+ *                       invariant is preserved for them. Cleared by the same persistence
+ *                       block the moment a later resume writes a real root, so a row that
+ *                       heals stops reading as faulted.
+ */
+export const RUN_METADATA_KEYS = {
+  identityUnresolved: 'identity_unresolved',
+} as const;
+
+/** Typed view of the run-lifecycle keys on a run's metadata; undefined when unset. */
+export function readIdentityUnresolved(
+  metadata: Record<string, unknown> | undefined
+): boolean | undefined {
+  const raw = metadata?.[RUN_METADATA_KEYS.identityUnresolved];
+  return typeof raw === 'boolean' ? raw : undefined;
+}
+
+/**
  * Key under which a run records the executable SOURCE it was started from.
  *
  * A run reads its workflows, commands, and scripts from one directory and acts on
