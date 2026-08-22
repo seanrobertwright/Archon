@@ -11512,8 +11512,18 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
       {
         name: 'stale-cache-always-run',
         nodes: [
-          { id: 'producer', command: 'producer', always_run: true },
-          { id: 'consumer', command: 'consumer', depends_on: ['producer'] },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
         ],
       },
       workflowRun,
@@ -11601,8 +11611,18 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
       {
         name: 'stale-cache-identical',
         nodes: [
-          { id: 'producer', command: 'producer', always_run: true },
-          { id: 'consumer', command: 'consumer', depends_on: ['producer'] },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
         ],
       },
       workflowRun,
@@ -11672,8 +11692,13 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
       {
         name: 'stale-cache-uncached-dep',
         nodes: [
-          { id: 'producer', command: 'producer' },
-          { id: 'consumer', command: 'consumer', depends_on: ['producer'] },
+          { id: 'producer', kind: 'agent', source: { kind: 'command', name: 'producer' } },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
         ],
       },
       workflowRun,
@@ -11754,7 +11779,7 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
       {
         name: 'stale-cache-fresh-failed-dep',
         nodes: [
-          { id: 'producer', command: 'producer' },
+          { id: 'producer', kind: 'agent', source: { kind: 'command', name: 'producer' } },
           // `all_done` (not the default `all_success`) so the consumer's trigger
           // rule permits re-execution against a failed producer. Without this,
           // the default rule would silently skip consumer on the failure path —
@@ -11763,7 +11788,8 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
           // AFTER and BEFORE the fix.
           {
             id: 'consumer',
-            command: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
             depends_on: ['producer'],
             trigger_rule: 'all_done',
           },
@@ -11859,10 +11885,16 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
       {
         name: 'stale-cache-cached-dep-fresh-fail',
         nodes: [
-          { id: 'producer', command: 'producer', always_run: true },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
           {
             id: 'consumer',
-            command: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
             depends_on: ['producer'],
             trigger_rule: 'all_done',
           },
@@ -11955,8 +11987,18 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
         name: 'stale-cache-structured',
         nodes: [
           // always_run forces the producer re-execution that surfaces case 3.
-          { id: 'producer', prompt: 'Run producer', always_run: true },
-          { id: 'consumer', prompt: 'Use $producer.output.status', depends_on: ['producer'] },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Run producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Use $producer.output.status' },
+            depends_on: ['producer'],
+          },
         ],
       },
       workflowRun,
@@ -12039,13 +12081,19 @@ describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execut
         name: 'stale-cache-multi-dep',
         nodes: [
           // always_run forces producer to re-execute this resume (case 2 fires).
-          { id: 'producer', command: 'producer', always_run: true },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
           // Stable dep — text matches prior so case 2 doesn't flag it.
-          { id: 'side', command: 'side' },
+          { id: 'side', kind: 'agent', source: { kind: 'command', name: 'side' } },
           // Consumer reads producer; its dep list has BOTH producer and side.
           {
             id: 'consumer',
-            prompt: 'Use $producer.output and $side.output',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Use $producer.output and $side.output' },
             depends_on: ['producer', 'side'],
           },
         ],
@@ -25494,7 +25542,7 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
         testDir,
         {
           name: 'pause-race-child',
-          nodes: [{ id: 'sub', workflow: 'child-wf' } as DagNode],
+          nodes: [{ id: 'sub', kind: 'workflow', workflow: 'child-wf' } as DagNode],
         },
         workflowRun,
         'claude',
@@ -27588,7 +27636,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
   // its call site.
 
   it("loop_group binding (#2696): a completed group's output resolves through an all_done join, not the if_skipped default", async () => {
-    const nodes: DagNode[] = [
+    const nodes = [
       dagNodeSchema.parse({
         id: 'corrections',
         loop_group: {
@@ -27616,7 +27664,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
       createMockPlatform(),
       'conv-lg-binding',
       testDir,
-      { name: 'lg-binding-completed', nodes },
+      { name: 'lg-binding-completed', nodes: nodes as DagNode[] },
       makeWorkflowRun('lg-binding-completed'),
       'claude',
       undefined,
@@ -27633,7 +27681,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
   });
 
   it("loop_group binding (#2696): a skipped group's binding takes if_skipped", async () => {
-    const nodes: DagNode[] = [
+    const nodes = [
       dagNodeSchema.parse({ id: 'gate', bash: "printf 'skip'", depends_on: [] }),
       dagNodeSchema.parse({
         id: 'corrections',
@@ -27663,7 +27711,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
       createMockPlatform(),
       'conv-lg-binding',
       testDir,
-      { name: 'lg-binding-skipped', nodes },
+      { name: 'lg-binding-skipped', nodes: nodes as DagNode[] },
       makeWorkflowRun('lg-binding-skipped'),
       'claude',
       undefined,
@@ -27687,7 +27735,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
     // succeeded and run its own body on it — the split-brain that flipped PR #2705.
     const markerPath = join(testDir, 'gate-ready-ran.marker');
 
-    const nodes: DagNode[] = [
+    const nodes = [
       dagNodeSchema.parse({
         id: 'corrections',
         loop_group: {
@@ -27718,7 +27766,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
       platform,
       'conv-lg-binding',
       testDir,
-      { name: 'lg-binding-failed', nodes },
+      { name: 'lg-binding-failed', nodes: nodes as DagNode[] },
       makeWorkflowRun('lg-binding-failed'),
       'claude',
       undefined,
