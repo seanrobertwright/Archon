@@ -1169,6 +1169,27 @@ function shellQuote(value: string): string {
 }
 
 /**
+ * Write `value` to `<dir>/<filename>`, creating `dir` as needed. Returns the full
+ * path on success, or `undefined` after logging on any failure (permission, disk
+ * space, etc.) — callers own their own fallback; this never throws.
+ */
+function writeSpillFile(dir: string, filename: string, value: string): string | undefined {
+  const filePath = joinPath(dir, filename);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(filePath, value);
+    return filePath;
+  } catch (fileErr) {
+    const err = fileErr as Error;
+    getLog().error(
+      { err, dir, filename, valueSize: value.length, filePath },
+      'dag.spill_file_write_failed'
+    );
+    return undefined;
+  }
+}
+
+/**
  * Shell-quote a value for bash, or write it under the run artifact directory's
  * engine-owned spill child and return a $(cat ...) reference when the value exceeds
  * the inline size threshold.
@@ -1182,19 +1203,9 @@ function shellQuoteOrFile(
   if (artifactsDir && value.length > NODE_OUTPUT_FILE_THRESHOLD) {
     const spillDir = joinPath(artifactsDir, '.archon', 'node-output-spills');
     const filename = field ? `${nodeId}.${field}.nodeoutput` : `${nodeId}.nodeoutput`;
-    const filePath = joinPath(spillDir, filename);
-    try {
-      mkdirSync(spillDir, { recursive: true });
-      writeFileSync(filePath, value);
-      return `$(cat ${shellQuote(filePath)})`;
-    } catch (fileErr) {
-      const err = fileErr as Error;
-      getLog().error(
-        { err, nodeId, field, valueSize: value.length, filePath },
-        'dag.large_output_file_write_failed'
-      );
-      return shellQuote(value); // fallback: inline (pre-file-spill behavior)
-    }
+    const filePath = writeSpillFile(spillDir, filename, value);
+    if (filePath) return `$(cat ${shellQuote(filePath)})`;
+    return shellQuote(value); // fallback: inline (pre-file-spill behavior)
   }
   return shellQuote(value);
 }
@@ -3239,8 +3250,8 @@ async function runSubprocess(
  *  instead of inlined as bash -c arguments, to avoid silent data corruption. */
 const NODE_OUTPUT_FILE_THRESHOLD = 32_768;
 
-/** Maximum UTF-8 bytes retained for successful bash stdout in workflow events. */
-const PERSISTED_BASH_OUTPUT_MAX_BYTES = 32 * 1024;
+/** Maximum UTF-8 bytes retained for a successful exec node's stdout in workflow events. */
+const PERSISTED_NODE_OUTPUT_MAX_BYTES = 32 * 1024;
 
 function utf8SequenceLength(leadByte: number): number {
   if (leadByte < 0x80) return 1;
@@ -3249,19 +3260,45 @@ function utf8SequenceLength(leadByte: number): number {
   return 4;
 }
 
-function formatPersistedBashOutput(output: string): {
+/**
+ * Cap `output` to a bounded preview for persistence, and — when it exceeds the cap —
+ * ALSO spill the full, untruncated bytes under the run's artifacts directory so a
+ * resumed run can rehydrate the complete value instead of the preview (#2726).
+ *
+ * `spillKey` should be the row's own `step_name` (`stepNamePrefix + node.id`), matching
+ * exactly what `getDagResumeSnapshot` keys `completedNodeOutputs` by. A loop_group body
+ * node's `step_name` is the SAME across every iteration (only `data.iteration` differs
+ * per row), and `completedNodeOutputs` is already last-write-wins per `step_name` — so
+ * the spill file being overwritten each iteration is correct: it always holds exactly
+ * what the next resume's snapshot will resolve to for that key, never a stale iteration.
+ *
+ * A spill write failure never fails the node — it degrades to preview-only persistence,
+ * matching `shellQuoteOrFile`'s existing fallback behavior for the same class of error.
+ *
+ * Because the spill filename is reused (see above), the returned `originalBytes` is
+ * also this write's identity token: `getDagResumeSnapshot` (packages/core) validates a
+ * spill's actual byte length against the row's own recorded `originalBytes` before
+ * trusting it, so a spill overwritten by a LATER execution racing an unlanded
+ * fire-and-forget event insert is detected as stale rather than silently trusted.
+ */
+function formatPersistedNodeOutput(
+  output: string,
+  artifactsDir: string,
+  spillKey: string
+): {
   nodeOutput: string;
   truncated: boolean;
   originalBytes?: number;
+  spillPath?: string;
 } {
   const outputBytes = Buffer.from(output, 'utf8');
-  if (outputBytes.byteLength <= PERSISTED_BASH_OUTPUT_MAX_BYTES) {
+  if (outputBytes.byteLength <= PERSISTED_NODE_OUTPUT_MAX_BYTES) {
     return { nodeOutput: output, truncated: false };
   }
 
   const marker = buildTruncationMarker(outputBytes.byteLength);
   const markerBytes = Buffer.byteLength(marker, 'utf8');
-  let headEnd = PERSISTED_BASH_OUTPUT_MAX_BYTES - markerBytes;
+  let headEnd = PERSISTED_NODE_OUTPUT_MAX_BYTES - markerBytes;
 
   // The byte cap can land inside a multi-byte code point. Inspect the final
   // sequence in the prefix and drop it when it is incomplete before decoding.
@@ -3275,10 +3312,41 @@ function formatPersistedBashOutput(output: string): {
     if (headEnd - sequenceStart < expectedLength) headEnd = sequenceStart;
   }
 
+  const spillDir = joinPath(artifactsDir, '.archon', 'node-output-spills', 'persisted');
+  const spillPath = writeSpillFile(spillDir, `${spillKey}.nodeoutput`, output);
+
   return {
     nodeOutput: outputBytes.subarray(0, headEnd).toString('utf8') + marker,
     truncated: true,
     originalBytes: outputBytes.byteLength,
+    ...(spillPath ? { spillPath } : {}),
+  };
+}
+
+/**
+ * Build the `data` fragment for a persisted event carrying a `formatPersistedNodeOutput`
+ * result: the (possibly capped) text under `fieldName`, plus the conditional
+ * `<fieldName>_truncated`/`_original_bytes`/`_spill_path` metadata when it was capped.
+ * `fieldName` differs by event type (`node_output` for `node_completed`/
+ * `node_skipped_prior_success`; `prior_output` for the `node_always_run_reset`/
+ * `node_prior_cache_invalidated` audit events) — shared here so all five persist sites
+ * stay in sync instead of repeating the same conditional spread independently.
+ */
+function persistedOutputEventFields(
+  persistedOutput: ReturnType<typeof formatPersistedNodeOutput>,
+  fieldName: 'node_output' | 'prior_output'
+): Record<string, unknown> {
+  return {
+    [fieldName]: persistedOutput.nodeOutput,
+    ...(persistedOutput.truncated
+      ? {
+          [`${fieldName}_truncated`]: true,
+          [`${fieldName}_original_bytes`]: persistedOutput.originalBytes,
+          ...(persistedOutput.spillPath
+            ? { [`${fieldName}_spill_path`]: persistedOutput.spillPath }
+            : {}),
+        }
+      : {}),
   };
 }
 
@@ -3420,7 +3488,7 @@ async function executeBashNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
-    const persistedOutput = formatPersistedBashOutput(output);
+    const persistedOutput = formatPersistedNodeOutput(output, artifactsDir, stepName);
 
     deps.store
       .createWorkflowEvent({
@@ -3430,13 +3498,7 @@ async function executeBashNode(
         data: {
           duration_ms: duration,
           type: 'bash',
-          node_output: persistedOutput.nodeOutput,
-          ...(persistedOutput.truncated
-            ? {
-                node_output_truncated: true,
-                node_output_original_bytes: persistedOutput.originalBytes,
-              }
-            : {}),
+          ...persistedOutputEventFields(persistedOutput, 'node_output'),
           ...iterationData,
         },
       })
@@ -3810,12 +3872,19 @@ async function executeScriptNode(
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
 
+    const persistedOutput = formatPersistedNodeOutput(output, artifactsDir, stepName);
+
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'node_completed',
         step_name: stepName,
-        data: { duration_ms: duration, type: 'script', node_output: output, ...iterationData },
+        data: {
+          duration_ms: duration,
+          type: 'script',
+          ...persistedOutputEventFields(persistedOutput, 'node_output'),
+          ...iterationData,
+        },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -8282,14 +8351,32 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // unless its composed boundary is now inactive. `always_run: true` opts the
           // node out of resume caching and re-executes it.
           if (priorCompletedNodes?.has(node.id)) {
+            // Three sites below (always_run reset, cache invalidation, and the
+            // prior-success skip re-emit) all persist THIS node's prior output through
+            // the same bounded-preview+spill helper, keyed by its own step_name (#2726)
+            // — captured once here rather than repeating the lookup at each call site.
+            const formatThisNodesPriorOutput = (
+              stepName: string
+            ): ReturnType<typeof formatPersistedNodeOutput> =>
+              formatPersistedNodeOutput(
+                priorCompletedNodes.get(node.id)?.output ?? '',
+                artifactsDir,
+                stepName
+              );
             if (node.always_run) {
               getLog().info({ nodeId: node.id }, 'dag.node_always_run_resume_forced');
+              const alwaysRunStepName = stepNamePrefix + node.id;
+              // The prior value being reset can be arbitrarily large — getDagResumeSnapshot
+              // prefers the full spilled text over the bounded preview (#2726), so this
+              // audit row must go through the same bounded-preview+spill helper as the
+              // primary node_completed/node_skipped_prior_success writers, not the raw text.
+              const alwaysRunPriorOutput = formatThisNodesPriorOutput(alwaysRunStepName);
               deps.store
                 .createWorkflowEvent({
                   workflow_run_id: workflowRun.id,
                   event_type: 'node_always_run_reset',
-                  step_name: stepNamePrefix + node.id,
-                  data: { prior_output: priorCompletedNodes.get(node.id)?.output ?? '' },
+                  step_name: alwaysRunStepName,
+                  data: persistedOutputEventFields(alwaysRunPriorOutput, 'prior_output'),
                 })
                 .catch((err: Error) => {
                   getLog().error(
@@ -8312,7 +8399,10 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 priorCompletedNodes
               );
               if (staleDeps.length > 0) {
-                const priorOutput = priorCompletedNodes.get(node.id)?.output ?? '';
+                const invalidatedStepName = stepNamePrefix + node.id;
+                // Same rationale as the always_run reset above: prior.output can now be
+                // the full spilled text, so this audit row needs the same bounding (#2726).
+                const invalidatedPriorOutput = formatThisNodesPriorOutput(invalidatedStepName);
                 getLog().info(
                   { nodeId: node.id, invalidatingDeps: staleDeps },
                   'dag.node_prior_cache_invalidated'
@@ -8321,11 +8411,11 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   .createWorkflowEvent({
                     workflow_run_id: workflowRun.id,
                     event_type: 'node_prior_cache_invalidated',
-                    step_name: stepNamePrefix + node.id,
+                    step_name: invalidatedStepName,
                     data: {
                       reason: 'stale_dependency',
                       invalidating_deps: staleDeps,
-                      prior_output: priorOutput,
+                      ...persistedOutputEventFields(invalidatedPriorOutput, 'prior_output'),
                       // Carry the cached logical value too so the audit log shows
                       // exactly what was thrown away, matching the text channel
                       // (#2637).
@@ -8355,16 +8445,22 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                     getLog().warn({ err, nodeId: node.id }, 'dag.node_skip_log_write_failed');
                   }
                 );
+                const skipStepName = stepNamePrefix + node.id;
+                // Copy the logical value forward (#2637) so a SECOND resume's snapshot
+                // still sees it — this re-emit is that resume's source. `prior.output` is
+                // already the FULL value (getDagResumeSnapshot prefers the spill over the
+                // truncated preview when one exists, #2726), so it must go back through the
+                // same bounded-preview+spill helper here or this row would re-introduce an
+                // unbounded write on every subsequent resume pass.
+                const priorSkipOutput = formatThisNodesPriorOutput(skipStepName);
                 deps.store
                   .createWorkflowEvent({
                     workflow_run_id: workflowRun.id,
                     event_type: 'node_skipped_prior_success',
-                    step_name: stepNamePrefix + node.id,
+                    step_name: skipStepName,
                     data: {
                       reason: 'prior_success',
-                      node_output: priorCompletedNodes.get(node.id)?.output ?? '',
-                      // Copy the logical value forward (#2637) so a SECOND resume's
-                      // snapshot still sees it — this re-emit is that resume's source.
+                      ...persistedOutputEventFields(priorSkipOutput, 'node_output'),
                       ...(priorCompletedNodes.get(node.id)?.structuredOutput !== undefined
                         ? { structured_output: priorCompletedNodes.get(node.id)?.structuredOutput }
                         : {}),
