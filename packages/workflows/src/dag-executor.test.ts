@@ -5359,6 +5359,73 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(skippedEvent[0].data.node_output).toBe('prior output');
   });
 
+  it('bounds a large prior output when re-emitting node_skipped_prior_success (#2726)', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('resume-run-id-large-skip');
+    const artifactsDir = join(testDir, 'artifacts');
+
+    // Simulates what a fixed getDagResumeSnapshot now hands the executor: the FULL,
+    // untruncated value (read back from a spill by a prior resume), not a preview.
+    // Without the fix, re-emitting this verbatim would write an unbounded row again.
+    const largeOutput = 'y'.repeat(40_000);
+    const priorCompletedNodes = new Map([['step1', { output: largeOutput }]]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-resume-large-skip',
+      testDir,
+      {
+        name: 'two-step',
+        nodes: [
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'command', name: 'step2' },
+            depends_on: ['step1'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const skippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'step1'
+    );
+    expect(skippedEvent).toBeDefined();
+    if (!skippedEvent) throw new Error('Expected prior-success skip event');
+    const data = skippedEvent[0].data as {
+      node_output: string;
+      node_output_truncated: boolean;
+      node_output_original_bytes: number;
+      node_output_spill_path: string;
+    };
+    expect(Buffer.byteLength(data.node_output, 'utf8')).toBeLessThanOrEqual(32_768);
+    expect(data.node_output_truncated).toBe(true);
+    expect(data.node_output_original_bytes).toBe(40_000);
+    expect(data.node_output_spill_path).toBe(
+      join(artifactsDir, '.archon', 'node-output-spills', 'persisted', 'step1.nodeoutput')
+    );
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe(largeOutput);
+  });
+
   it('emits node_skipped_prior_success with empty output when node ID not in map', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
@@ -6004,6 +6071,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           node_output: string;
           node_output_truncated: boolean;
           node_output_original_bytes: number;
+          node_output_spill_path: string;
         };
       }
     ).data;
@@ -6011,8 +6079,19 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(data.node_output).toEndWith('\n\n… [truncated; original output was 32769 bytes]');
     expect(data.node_output_truncated).toBe(true);
     expect(data.node_output_original_bytes).toBe(32_769);
-    // Resume deliberately rehydrates this bounded node_output preview; preserving
-    // complete cross-process output requires a separately managed artifact.
+    // The full bytes are spilled alongside the bounded preview (#2726) so a resumed run
+    // rehydrates the same value a fresh run's in-process consumer would have seen.
+    expect(data.node_output_spill_path).toBe(
+      join(
+        testDir,
+        'artifacts',
+        '.archon',
+        'node-output-spills',
+        'persisted',
+        'over-cap.nodeoutput'
+      )
+    );
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe('x'.repeat(32_769));
   });
 
   it('keeps a persisted UTF-8 preview valid when the byte cap splits a code point', async () => {
@@ -6053,10 +6132,133 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         (call[0] as { event_type: string }).event_type === 'node_completed' &&
         (call[0] as { step_name: string }).step_name === 'utf8-cap'
     );
-    const data = (completedEvent![0] as { data: { node_output: string } }).data;
+    const data = (
+      completedEvent![0] as { data: { node_output: string; node_output_spill_path: string } }
+    ).data;
     expect(Buffer.byteLength(data.node_output, 'utf8')).toBeLessThanOrEqual(32_768);
     expect(data.node_output).not.toContain('\ufffd');
     expect(data.node_output).toEndWith('\n\n… [truncated; original output was 32772 bytes]');
+    // The spilled full copy needs no boundary splitting -- it round-trips byte-for-byte.
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe('🙂'.repeat(8193));
+  });
+
+  it('persists script output at or below the byte cap unchanged without truncation metadata (#2726)', async () => {
+    for (const [nodeId, byteCount] of [
+      ['script-below-cap', 32_767],
+      ['script-exact-cap', 32_768],
+    ] as const) {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const workflowRun = makeWorkflowRun(`script-output-${nodeId}`);
+
+      await executeDagWorkflow(
+        mockDeps,
+        createMockPlatform(),
+        `conv-${nodeId}`,
+        testDir,
+        {
+          name: `script-output-${nodeId}`,
+          nodes: [
+            {
+              id: nodeId,
+              kind: 'exec',
+              runtime: 'bun',
+              script: `process.stdout.write('x'.repeat(${String(byteCount)}))`,
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completedEvent = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as { event_type: string }).event_type === 'node_completed' &&
+          (call[0] as { step_name: string }).step_name === nodeId
+      );
+      const data = (
+        completedEvent![0] as {
+          data: Record<string, unknown> & { node_output: string };
+        }
+      ).data;
+      expect(data.node_output).toBe('x'.repeat(byteCount));
+      expect(data.node_output_truncated).toBeUndefined();
+      expect(data.node_output_original_bytes).toBeUndefined();
+      expect(data.node_output_spill_path).toBeUndefined();
+    }
+  });
+
+  it('caps over-limit persisted script output with a marker, byte metadata, and a spill file (#2726)', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const workflowRun = makeWorkflowRun('script-output-over-cap');
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-script-over-cap',
+      testDir,
+      {
+        name: 'script-output-over-cap',
+        nodes: [
+          {
+            id: 'script-over-cap',
+            kind: 'exec',
+            runtime: 'bun',
+            script: `process.stdout.write('x'.repeat(32769))`,
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'script-over-cap'
+    );
+    const data = (
+      completedEvent![0] as {
+        data: {
+          node_output: string;
+          node_output_truncated: boolean;
+          node_output_original_bytes: number;
+          node_output_spill_path: string;
+        };
+      }
+    ).data;
+    expect(Buffer.byteLength(data.node_output, 'utf8')).toBeLessThanOrEqual(32_768);
+    expect(data.node_output).toEndWith('\n\n… [truncated; original output was 32769 bytes]');
+    expect(data.node_output_truncated).toBe(true);
+    expect(data.node_output_original_bytes).toBe(32_769);
+    expect(data.node_output_spill_path).toBe(
+      join(
+        testDir,
+        'artifacts',
+        '.archon',
+        'node-output-spills',
+        'persisted',
+        'script-over-cap.nodeoutput'
+      )
+    );
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe('x'.repeat(32_769));
   });
 
   it('uses full bash output for same-run when and downstream substitution despite persistence cap', async () => {
@@ -6128,6 +6330,75 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       )
     ).toBe(producerOutput);
     expect(await Bun.file(join(logDir, 'producer.nodeoutput')).exists()).toBe(false);
+  });
+
+  it('resolves $node.output.field on a resumed exec node whose prior output is a large JSON blob (#2726)', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const paddingBytes = 40_000;
+    // Simulates a fixed getDagResumeSnapshot: the FULL text read back from the spill,
+    // not the 32KB-truncated preview a resumed run saw before this fix. Truncated JSON
+    // here would not parse, and the consumer's `when:` field access would throw
+    // (OutputRefError) instead of resolving -- exactly the naive-fix regression #2726
+    // warns against.
+    const producerOutput = `{"status":"PASS","padding":"${'z'.repeat(paddingBytes)}"}`;
+    const priorCompletedNodes = new Map([['producer', { output: producerOutput }]]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-resume-large-field',
+      testDir,
+      {
+        name: 'resume-large-field',
+        nodes: [
+          { id: 'producer', kind: 'exec', runtime: 'sh', script: 'echo unused' },
+          {
+            id: 'consumer',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'value=$producer.output; printf %s "${#value}"',
+            depends_on: ['producer'],
+            when: "$producer.output.status == 'PASS'",
+          },
+        ],
+      },
+      makeWorkflowRun('resume-large-field'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    // producer was resumed (skipped), so it must never re-execute.
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    const producerSkipped = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'producer'
+    );
+    expect(producerSkipped).toBeDefined();
+    // The consumer's `when:` needed .field access on the full resumed value to
+    // evaluate true and run at all -- had it thrown, no node_completed event for
+    // 'consumer' would exist.
+    const consumerEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerEvent).toBeDefined();
+    if (!consumerEvent) throw new Error('Expected consumer to run after resolving .field access');
+    expect((consumerEvent[0] as { data: { node_output: string } }).data.node_output).toBe(
+      String(producerOutput.length)
+    );
   });
 
   it('stores node_output in node_completed event data for AI nodes', async () => {

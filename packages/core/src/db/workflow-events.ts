@@ -13,6 +13,7 @@ import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
 import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
+import { readFile } from 'node:fs/promises';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -294,8 +295,30 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       // reported as a cached success again on a subsequent resume.
       completedNodeOutputs.delete(row.step_name);
     } else if (typeof data.node_output === 'string') {
+      // A bash/script node's persisted text is a bounded preview once it exceeded the
+      // truncation cap; the full bytes were spilled to `node_output_spill_path` at write
+      // time (#2726). Prefer the spill so a resumed run's `$node.output`/`.field` sees
+      // exactly what a fresh run's in-process consumer would have. A missing/unreadable
+      // spill degrades to the preview rather than failing resume — this is not a DB
+      // error, so it must not propagate as one (see this function's own doc comment).
+      let output = data.node_output;
+      if (typeof data.node_output_spill_path === 'string') {
+        try {
+          output = await readFile(data.node_output_spill_path, 'utf8');
+        } catch (spillErr) {
+          getLog().warn(
+            {
+              err: spillErr as Error,
+              runId: workflowRunId,
+              stepName: row.step_name,
+              spillPath: data.node_output_spill_path,
+            },
+            'db.workflow_dag_node_output_spill_read_failed'
+          );
+        }
+      }
       completedNodeOutputs.set(row.step_name, {
-        output: data.node_output,
+        output,
         // The node's logical value (#2637), persisted beside its text by the emit
         // sites (and copied forward by node_skipped_prior_success re-emits). Absent
         // on pre-#2637 rows — the executor then falls back to text re-parsing.

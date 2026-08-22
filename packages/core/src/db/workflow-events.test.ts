@@ -1,9 +1,12 @@
-import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
 import { AXIS_SPECIMEN } from '../test/token-usage-axes';
 import { mergeTokenUsage } from '@archon/providers/types';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = createMockLogger();
@@ -794,6 +797,90 @@ describe('workflow-events', () => {
       // than re-running the whole group.
       expect(result.completedNodeOutputs.get('group')).toEqual({ output: 'last iteration' });
       expect(result.completedNodeOutputs.get('group.body')).toEqual({ output: 'iteration 1' });
+    });
+
+    describe('node_output_spill_path preference (#2726)', () => {
+      let spillDir: string;
+
+      beforeEach(async () => {
+        spillDir = await mkdtemp(join(tmpdir(), 'archon-resume-snapshot-spill-'));
+      });
+
+      afterEach(async () => {
+        await rm(spillDir, { recursive: true, force: true });
+      });
+
+      test('reads the full spilled content instead of the truncated preview', async () => {
+        const fullOutput = 'x'.repeat(50_000);
+        const spillPath = join(spillDir, 'big-node.nodeoutput');
+        await writeFile(spillPath, fullOutput);
+
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'big-node',
+              event_type: 'node_completed',
+              data: {
+                node_output: 'x'.repeat(100) + '\n\n… [truncated; original output was 50000 bytes]',
+                node_output_truncated: true,
+                node_output_original_bytes: 50_000,
+                node_output_spill_path: spillPath,
+              },
+            },
+          ])
+        );
+
+        const result = await getDagResumeSnapshot('run-spill');
+
+        expect(result.completedNodeOutputs.get('big-node')?.output).toBe(fullOutput);
+        expect(result.completedNodeOutputs.get('big-node')?.output.length).toBe(50_000);
+      });
+
+      test('falls back to the preview when the spill file is missing, without throwing', async () => {
+        const missingPath = join(spillDir, 'does-not-exist.nodeoutput');
+
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'orphaned-node',
+              event_type: 'node_completed',
+              data: {
+                node_output: 'preview text' + '\n\n… [truncated; original output was 99999 bytes]',
+                node_output_truncated: true,
+                node_output_original_bytes: 99_999,
+                node_output_spill_path: missingPath,
+              },
+            },
+          ])
+        );
+
+        const snapshot = await getDagResumeSnapshot('run-spill-missing');
+
+        expect(snapshot.completedNodeOutputs.get('orphaned-node')?.output).toBe(
+          'preview text' + '\n\n… [truncated; original output was 99999 bytes]'
+        );
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ spillPath: missingPath }),
+          'db.workflow_dag_node_output_spill_read_failed'
+        );
+      });
+
+      test('does not attempt a spill read when no spill path is recorded', async () => {
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'small-node',
+              event_type: 'node_completed',
+              data: { node_output: 'small output' },
+            },
+          ])
+        );
+
+        const result = await getDagResumeSnapshot('run-no-spill');
+
+        expect(result.completedNodeOutputs.get('small-node')).toEqual({ output: 'small output' });
+        expect(mockLogger.warn).not.toHaveBeenCalled();
+      });
     });
 
     test('returns an empty snapshot when no events exist', async () => {
