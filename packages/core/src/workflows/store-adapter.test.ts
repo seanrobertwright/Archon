@@ -15,6 +15,11 @@ const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
+// Backs createWorkflowStore()'s rewriteApprovalContext (#2707 step 3 pause
+// escalation) — per AGENTS.md's mock.module rule, an export the factory omits
+// keeps its REAL implementation, so this must be listed even though no test
+// here calls rewriteApprovalContext yet.
+const mockResolveApprovalGate = mock(() => Promise.resolve({ resolved: true }));
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
@@ -30,6 +35,7 @@ mock.module('../db/workflows', () => ({
   failWorkflowRun: mockFailWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
+  resolveApprovalGate: mockResolveApprovalGate,
   claimWriteback: mock(() => Promise.resolve({ claimed: true })),
   releaseWritebackClaim: mock(() => Promise.resolve()),
 }));

@@ -197,6 +197,24 @@ async function getRunOrThrow(runId: string, logEvent: string): Promise<WorkflowR
  * Returns the validated context so callers keep today's narrowing — `nodeId` is a
  * required field on ApprovalContext, so no intersection type is needed.
  */
+/**
+ * The `step_name` a gate resolution's `node_completed` event should be written
+ * under. Ordinarily just `approval.nodeId`. On an ESCALATED body-terminal-gate
+ * pause (#2707 step 3), `nodeId` holds the ENCLOSING loop_group's id instead —
+ * required so the top-level DAG's resume walk finds it — and `bodyGateId`
+ * carries the actual gate's own id. Namespacing the write as `<nodeId>.
+ * <bodyGateId>` matches the exact `<groupId>.<bodyId>` step name #2748's
+ * `outerNodeOutputs` pre-population already keys on, so the gate's own
+ * resolved decision is findable again after a resume the same way any other
+ * body node's output is. Every other pause kind has no `bodyGateId`, so this
+ * is a no-op there.
+ */
+function resolvedNodeCompletedStepName(approval: ApprovalContext): string {
+  return approval.bodyGateId !== undefined
+    ? `${approval.nodeId}.${approval.bodyGateId}`
+    : approval.nodeId;
+}
+
 export function assertApprovable(run: WorkflowRun): ApprovalContext {
   if (run.status !== 'paused') {
     throw new Error(
@@ -510,7 +528,7 @@ export async function approveWorkflow(
       events = [
         {
           event_type: 'node_completed',
-          step_name: approval.nodeId,
+          step_name: resolvedNodeCompletedStepName(approval),
           data: {
             node_output: nodeOutput,
             approval_decision: 'approved',
@@ -697,7 +715,7 @@ export async function rejectWorkflow(
     const structuredOutput = { decision: 'reject', text: reason ?? '' };
     const nodeCompletedEvent: workflowDb.GateResolutionEvent = {
       event_type: 'node_completed',
-      step_name: approval.nodeId,
+      step_name: resolvedNodeCompletedStepName(approval),
       data: {
         node_output: JSON.stringify(structuredOutput),
         approval_decision: 'rejected',
@@ -804,7 +822,7 @@ async function respondToWorkflowWithDeclaredDecision(
   const events: workflowDb.GateResolutionEvent[] = [
     {
       event_type: 'node_completed',
-      step_name: approval.nodeId,
+      step_name: resolvedNodeCompletedStepName(approval),
       data: {
         node_output: JSON.stringify(structuredOutput),
         approval_decision: decision,
