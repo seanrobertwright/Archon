@@ -287,7 +287,13 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       );
       continue;
     }
-    if (row.event_type !== 'node_failed' && typeof data.node_output === 'string') {
+    if (row.event_type === 'node_failed') {
+      // A later failure for this step supersedes any earlier node_completed /
+      // node_skipped_prior_success entry (#2705 R2) — otherwise a node the engine's own
+      // prior-cache invalidation re-executed, and which then genuinely failed, is
+      // reported as a cached success again on a subsequent resume.
+      completedNodeOutputs.delete(row.step_name);
+    } else if (typeof data.node_output === 'string') {
       completedNodeOutputs.set(row.step_name, {
         output: data.node_output,
         // The node's logical value (#2637), persisted beside its text by the emit

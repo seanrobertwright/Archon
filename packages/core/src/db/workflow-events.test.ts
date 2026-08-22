@@ -401,6 +401,63 @@ describe('workflow-events', () => {
       ]);
     });
 
+    test('a later node_failed row supersedes an earlier node_completed row for the same step (#2705 R2)', async () => {
+      // Before #2705, a non-always_run node that once completed could never be
+      // re-attempted, so a node_completed → node_failed sequence for the same
+      // step_name was impossible. #2705's own invalidate-and-re-execute
+      // mechanism is the first thing that can produce that sequence: a cached
+      // node gets invalidated, re-executes, and the fresh attempt fails. If the
+      // earlier node_completed entry survives in the map, the NEXT resume's
+      // cache-eligibility check sees a stale success instead of the node's own
+      // most recent (failed) outcome.
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'flaky',
+            event_type: 'node_completed',
+            data: { node_output: 'first attempt succeeded' },
+          },
+          {
+            step_name: 'flaky',
+            event_type: 'node_failed',
+            data: { error: 'second attempt (re-executed via invalidation) crashed' },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-completed-then-failed');
+
+      // The failed row is the step's most recent real outcome; the stale
+      // node_completed entry must not survive the chronological walk.
+      expect(result.completedNodeOutputs.has('flaky')).toBe(false);
+    });
+
+    test('a node_completed row after a node_failed row for the same step re-adds it (chronological order wins)', async () => {
+      // Symmetric check: if the node later succeeds (a subsequent resume re-runs
+      // it and this time it completes), that success must be honoured — the
+      // delete on node_failed must not leave a permanent tombstone.
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'flaky',
+            event_type: 'node_failed',
+            data: { error: 'first attempt crashed' },
+          },
+          {
+            step_name: 'flaky',
+            event_type: 'node_completed',
+            data: { node_output: 'second attempt succeeded' },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-failed-then-completed');
+
+      expect(result.completedNodeOutputs.get('flaky')).toEqual({
+        output: 'second attempt succeeded',
+      });
+    });
+
     test('sums cache axes reported by a failed node into the resumed total', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
