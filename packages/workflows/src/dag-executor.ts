@@ -3304,6 +3304,10 @@ async function executeBashNode(
   envVars?: Record<string, string>,
   stepNamePrefix = '',
   iteration?: number,
+  // Per-iteration $LOOP_USER_INPUT free-text for loop_group body bash nodes, delivered via
+  // env (never spliced into source — #2115). '' for top-level bash nodes and non-first
+  // iterations (mirrors executeScriptNode, #2725).
+  loopUserInput = '',
   execContext: ExecutionContext = { kind: 'host' }
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
@@ -3387,7 +3391,7 @@ async function executeBashNode(
     BASE_BRANCH: baseBranch,
     USER_MESSAGE: workflowRun.user_message,
     ARGUMENTS: workflowRun.user_message,
-    LOOP_USER_INPUT: '',
+    LOOP_USER_INPUT: loopUserInput,
     LOOP_PREV_OUTPUT: '',
     REJECTION_REASON: '',
     CONTEXT: issueContext ?? '',
@@ -8559,6 +8563,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                       config.envVars,
                       stepNamePrefix,
                       iteration,
+                      ctx.bodyLoopUserInput ?? '',
                       execContext
                     )
                 );
