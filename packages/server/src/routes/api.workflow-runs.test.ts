@@ -310,6 +310,42 @@ mock.module('@archon/core/utils/commands', () => ({
   findMarkdownFilesRecursive: mock(async () => []),
 }));
 
+// resumeRunHeadless (#2008) — the direct in-process resume fallback used when
+// a run has no parent conversation to dispatch a chat message through.
+type MockContinuationResult =
+  | { ok: true; workflowName: string; workflow: { definition: unknown } }
+  | { ok: false; message: string };
+const mockResolveRunContinuation = mock(
+  async (_runId: string, _cwd: string): Promise<MockContinuationResult> => ({
+    ok: true,
+    workflowName: 'deploy',
+    workflow: { definition: { name: 'deploy', nodes: [] } },
+  })
+);
+mock.module('@archon/core/handlers', () => ({
+  resolveRunContinuation: mockResolveRunContinuation,
+}));
+
+type MockHydrated = {
+  preCreatedRun: unknown;
+  priorCompletedNodes: Map<string, unknown>;
+  priorUsage: { costUsd: number };
+  priorNodeSessions: unknown[];
+} | null;
+const mockHydrateResumableRun = mock(
+  async (_deps: unknown, run: MockWorkflowRun): Promise<MockHydrated> => ({
+    preCreatedRun: { ...run, status: 'running' },
+    priorCompletedNodes: new Map(),
+    priorUsage: { costUsd: 0 },
+    priorNodeSessions: [],
+  })
+);
+const mockExecuteWorkflow = mock(async () => ({}) as unknown);
+mock.module('@archon/workflows/executor', () => ({
+  hydrateResumableRun: mockHydrateResumableRun,
+  executeWorkflow: mockExecuteWorkflow,
+}));
+
 import { registerApiRoutes } from './api';
 
 // ---------------------------------------------------------------------------
@@ -1416,6 +1452,9 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     mockGetWorkflowRun.mockReset();
     mockGetConversationById.mockReset();
     mockHandleMessage.mockReset();
+    mockResolveRunContinuation.mockClear();
+    mockHydrateResumableRun.mockClear();
+    mockExecuteWorkflow.mockClear();
   });
 
   test('returns 404 when run not found', async () => {
@@ -1438,12 +1477,42 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     expect(body.error).toContain('Cannot resume');
   });
 
-  test('returns 400 with CLI hint when run has no parent_conversation_id', async () => {
-    // CLI-created runs cannot be resumed from the web dashboard — the API
-    // surfaces the equivalent CLI command rather than silently doing nothing.
+  test('resumes headlessly (no dispatch) when run has no parent_conversation_id (#2008)', async () => {
+    // A CLI-launched run has no parent conversation to dispatch a chat
+    // message through — it now resumes directly, in-process, instead of
+    // being stranded until someone runs the CLI.
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_FAILED_RUN,
       parent_conversation_id: null,
+      working_path: '/tmp/worktrees/run-uuid-4',
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-4/resume', {
+      method: 'POST',
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { success: boolean; message: string };
+    expect(body.success).toBe(true);
+    expect(body.message).toContain('Resuming workflow');
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockGetConversationById).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    const [, , , cwd] = mockExecuteWorkflow.mock.calls[0] as [unknown, unknown, unknown, string];
+    expect(cwd).toBe('/tmp/worktrees/run-uuid-4');
+  });
+
+  test('returns 400 with CLI hint when the run has no parent conversation and cannot be resolved headlessly', async () => {
+    // Safe degrade: the workflow source is unresolvable (e.g. deleted) —
+    // falls back to the existing CLI-hint response instead of a silent 500.
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_FAILED_RUN,
+      parent_conversation_id: null,
+      working_path: '/tmp/worktrees/run-uuid-4',
+    });
+    mockResolveRunContinuation.mockResolvedValueOnce({
+      ok: false,
+      message: 'workflow deleted',
     });
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-uuid-4/resume', {
@@ -1453,6 +1522,7 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('archon workflow resume run-uuid-4');
     expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
   });
 
   test('returns 400 when parent conversation no longer exists', async () => {
@@ -2014,7 +2084,9 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { success: boolean; message: string };
     expect(body.success).toBe(true);
-    expect(body.message).toContain('On-reject prompt');
+    // This fixture has no parent_conversation_id, so the on-reject prompt now
+    // resumes headlessly (#2008) instead of surfacing the old CLI-hint text.
+    expect(body.message).toContain('Running on-reject prompt');
     expect(mockResolveApprovalGate).toHaveBeenCalledWith(
       'run-on-reject',
       {
@@ -2095,6 +2167,9 @@ describe('approve/reject auto-resume', () => {
     mockGetConversationById.mockReset();
     mockHandleMessage.mockReset();
     mockCancelWorkflowRun.mockReset();
+    mockResolveRunContinuation.mockClear();
+    mockHydrateResumableRun.mockClear();
+    mockExecuteWorkflow.mockClear();
   });
 
   test('approve: dispatches resume when parent_conversation_id is set', async () => {
@@ -2132,7 +2207,7 @@ describe('approve/reject auto-resume', () => {
     expect(dispatchedMessage).toBe('/workflow resume run-auto-resume-approve');
   });
 
-  test('approve: skips dispatch when parent_conversation_id is null (CLI-dispatched run)', async () => {
+  test('approve: resumes headlessly when parent_conversation_id is null (CLI-dispatched run, #2008)', async () => {
     mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       parent_conversation_id: null,
@@ -2147,9 +2222,65 @@ describe('approve/reject auto-resume', () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as { message: string };
-    expect(body.message).toContain('archon workflow resume run-paused-1');
+    expect(body.message).toContain('Resuming workflow');
+    // No chat message to dispatch through — resumed directly instead.
     expect(mockHandleMessage).not.toHaveBeenCalled();
     expect(mockGetConversationById).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test('approve: falls back to the CLI-hint response when headless resume cannot resolve the workflow', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      parent_conversation_id: null,
+    });
+    mockResolveRunContinuation.mockResolvedValueOnce({ ok: false, message: 'workflow deleted' });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { message: string };
+    expect(body.message).toContain('archon workflow resume run-paused-1');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('reject: resumes headlessly when parent_conversation_id is null (CLI-dispatched run, #2008)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-reject-headless',
+      parent_conversation_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Approve?',
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+          onRejectMaxAttempts: 3,
+        },
+        rejection_count: 0,
+      },
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-reject-headless/reject', {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'tests missing' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { message: string };
+    expect(body.message).toContain('Running on-reject prompt');
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockGetConversationById).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
   });
 
   test('approve: skips dispatch when parent conversation no longer exists', async () => {
