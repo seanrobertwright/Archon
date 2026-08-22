@@ -31,13 +31,11 @@
  *        output not a JSON object → THROW ;  key present → value ;  key absent → THROW
  *
  * The whole-text `$node.output` form (no `.field`) is never routed through THIS
- * function — but it is no longer unconditionally lenient: each caller (#2713) now
- * guards it locally, before ever reading the producer's output, for the identical
- * `state === 'failed'` case this function guards for the fielded form. KEEP IN SYNC:
- * `wholeRefLogicalValue` and `substituteNodeOutputRefs` in dag-executor.ts,
- * `resolveOutputRef` in condition-evaluator.ts, and `resolveBindingDirective`'s
- * pre-existing #2710 guard in dag-executor.ts all assert the same invariant
- * independently — a change to one should prompt checking the others.
+ * function — but it is no longer unconditionally lenient: every caller (#2713) now
+ * guards it, before ever reading the producer's output, through `assertProducerNotFailed`
+ * below — the same `state === 'failed'` case this function guards for the fielded form,
+ * enforced by construction (#2722) instead of by an enumeration of independently-worded
+ * call sites that each had to remember the check.
  *
  * The UNKNOWN-node case (`$typo.output.field` where nothing in the outputs map
  * resolves — a typo, or a real node that has not run before the reference) is
@@ -372,4 +370,26 @@ export function resolveNodeOutputField(
   }
   if (!(field in obj)) throw new OutputRefError(nodeId, field, 'missing-key');
   return { kind: 'value', value: obj[field] };
+}
+
+/**
+ * Guard the whole-text `$node.output` form against a failed producer's stale output
+ * (#2696/#2710/#2713): a `loop_group`'s failure paths carry the last completed
+ * iteration's real, often-valid-JSON output text, which must never be read as if the
+ * producer had succeeded. Mirrors the `state === 'failed'` guard already built into
+ * `resolveNodeOutputField` above for the fielded form, so every whole-text reader
+ * routes through one function instead of repeating the check — the invariant holds
+ * by construction (#2722) rather than by the KEEP-IN-SYNC enumeration it replaces.
+ *
+ * `buildMessage` lets each caller keep its own wording — a binding directive names
+ * `if_skipped`, a `when:` guard names the condition, and so on — only the
+ * check-and-throw mechanism is shared.
+ */
+export function assertProducerNotFailed(
+  nodeOutput: NodeOutput,
+  buildMessage: (failed: Extract<NodeOutput, { state: 'failed' }>) => string
+): void {
+  if (nodeOutput.state === 'failed') {
+    throw new Error(buildMessage(nodeOutput));
+  }
 }
