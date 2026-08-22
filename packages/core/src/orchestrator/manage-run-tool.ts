@@ -386,7 +386,8 @@ async function handleWrite(
         : `Feedback recorded for ${result.workflowName} (${id.slice(0, 8)}); the loop runs another iteration with it.${continues}`;
     }
     case 'reject': {
-      const result = await rejectWorkflow(id, message.length > 0 ? message : undefined);
+      const rejectText = message.length > 0 ? message : 'Rejected';
+      const result = await rejectWorkflow(id, rejectText);
       if (result.cancelled) {
         const suffix = result.maxAttemptsReached ? ' (max attempts reached)' : '';
         return `Rejected and cancelled ${result.workflowName} (${id.slice(0, 8)})${suffix}. Nothing further runs.`;
