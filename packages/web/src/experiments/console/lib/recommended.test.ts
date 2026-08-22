@@ -52,4 +52,18 @@ describe('orderWithRecommended', () => {
     expect(ordered.map(w => w.name)).toEqual(['beta', 'alpha', 'gamma']);
     expect(ordered.filter(w => w.name === 'beta')).toHaveLength(1);
   });
+
+  test('an unrecognised source ranks after the three known sources (#2578)', () => {
+    // Mirrors `toWorkflow`'s verbatim-passthrough contract: a misspelled or
+    // future source must not collapse to 'bundled' (or any known value), and
+    // the picker must place it deterministically rather than indexing an
+    // undeclared key on the rank map.
+    const workflows = [
+      wf('z-bundled', 'bundled'),
+      wf('a-unknown', 'something-new'),
+      wf('m-project', 'project'),
+    ];
+    const { ordered } = orderWithRecommended(workflows, []);
+    expect(ordered.map(w => w.name)).toEqual(['m-project', 'z-bundled', 'a-unknown']);
+  });
 });
