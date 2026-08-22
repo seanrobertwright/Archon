@@ -7954,17 +7954,20 @@ interface RunLayersContext {
  * `$node.output.field` (the #2637 logical-value surface) are also invalidated
  * when only the structured form changed.
  *
- * Three cases surface a dep as "ran fresh this resume":
+ * A dep currently in `state: 'failed'` is always stale, checked first and
+ * unconditionally — regardless of whether it had a prior cached success. Every
+ * failure arm in the executor returns `output: ''`, so comparing a fresh
+ * failure's value against a prior success's value (cases 2/3 below) can find
+ * them equal and silently miss the failure; a dependency that failed on THIS
+ * resume must never be judged by value equality.
+ *
+ * Past that, three cases surface a dep as "ran fresh this resume":
  *
  * 1. The dep was never in `priorCompletedNodes` at all (never completed in the
  *    prior run, or never reached) and is now `completed` in `nodeOutputs` — it
- *    re-ran this resume with no prior cache to honour. A dep that re-ran and
- *    landed in `state: 'failed'` is treated identically: the cached downstream
- *    carries synthesis built against the prior run's view, and silently
- *    consuming it would report success over a fresh failure (the #2402 bug
- *    surface on the failure path). `'skipped'` is intentionally left out: its
- *    `output: ''` is semantically equivalent to the absent prior, so honouring
- *    the cache is safe.
+ *    re-ran this resume with no prior cache to honour. `'skipped'` is
+ *    intentionally left out: its `output: ''` is semantically equivalent to
+ *    the absent prior, so honouring the cache is safe.
  * 2. The dep's `prior.output` differs from `nodeOutputs.get(dep).output` —
  *    either an `always_run` upstream that re-executed, or any dep the engine
  *    re-ran with new content. The per-layer aggregation is the only writer of
@@ -7977,11 +7980,13 @@ interface RunLayersContext {
  *    JSONB and therefore JSON-serializable; for `undefined` vs absent values,
  *    `JSON.stringify` normalises both to a missing key.
  *
- * Note: the comparison is conservative in one direction — a dep that re-ran
- * with text- and structured-identical output will NOT be flagged. The cached
- * downstream is therefore semantically equivalent to a fresh execution in
- * that case, which is the safe direction to err in (over-run vs. stale
- * success is the bug we're closing).
+ * Note: the value-equality comparison (cases 2/3) is conservative in one
+ * direction — a dep that re-ran with text- and structured-identical output
+ * will NOT be flagged. The cached downstream is therefore semantically
+ * equivalent to a fresh execution in that case, which is the safe direction
+ * to err in (over-run vs. stale success is the bug we're closing). The
+ * failed-state check above is not subject to this leniency: a failure is
+ * never treated as equivalent to the prior success it's compared against.
  */
 function getStaleCachedDependencies(
   node: DagNode,
@@ -7994,15 +7999,20 @@ function getStaleCachedDependencies(
   for (const depId of deps) {
     const prior = priorCompletedNodes.get(depId);
     const current = nodeOutputs.get(depId);
-    // Case 1: dep was never cached; if it is now complete or failed it ran fresh this
-    // resume. `'skipped'` and missing-current (the dep is still pending or running) are
-    // intentionally left out: skipped has `output: ''` semantically equal to the absent
-    // prior, and pending/running cannot reach this helper via the resume-skip arm in
+    // A dep that failed fresh this resume is always stale, checked before — and
+    // independently of — the prior-cache lookup below. See the docstring above.
+    if (current?.state === 'failed') {
+      stale.push(depId);
+      continue;
+    }
+    // Case 1: dep was never cached; if it is now complete it ran fresh this resume.
+    // Missing-current (the dep is still pending or running) is intentionally left out:
+    // pending/running cannot reach this helper via the resume-skip arm in
     // executeDagWorkflow (`priorCompletedNodes?.has(node.id)` only fires when the
     // CONSUMER itself was cached, but its dep would be addressed by case 2/3 once it
     // finishes).
     if (prior === undefined) {
-      if (current?.state === 'completed' || current?.state === 'failed') {
+      if (current?.state === 'completed') {
         stale.push(depId);
       }
       continue;
