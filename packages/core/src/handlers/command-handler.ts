@@ -1348,11 +1348,16 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       // user most needs to know that N runs were already cancelled.
       let abandoned = 0;
       let abandonFailures = 0;
+      let abandonCascadeFailures = 0;
+      let abandonBlockedParentRunId: string | null = null;
       let abandonError: string | null = null;
       try {
-        ({ abandoned, failures: abandonFailures } = await abandonResumableRunsForConversation(
-          conversation.id
-        ));
+        ({
+          abandoned,
+          failures: abandonFailures,
+          cascadeFailures: abandonCascadeFailures,
+          blockedParentRunId: abandonBlockedParentRunId,
+        } = await abandonResumableRunsForConversation(conversation.id));
       } catch (error) {
         const err = error as Error;
         getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_abandon_failed');
@@ -1380,6 +1385,20 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       if (abandonFailures > 0) {
         parts.push(
           `⚠️ ${String(abandonFailures)} run(s) could not be abandoned — check /workflow status.`
+        );
+      }
+      // Cascade + stranded-parent warnings mirror what `/workflow abandon <id>`
+      // reports (#2731 R1): the abandon op surfaced them, `/reset` must too,
+      // otherwise a partial-cascade can be read as "everything starts fresh"
+      // while part of the run tree is still alive / blocked.
+      if (abandonCascadeFailures > 0) {
+        parts.push(
+          `⚠️ ${String(abandonCascadeFailures)} sub-run(s) could not be cancelled and may still be running — check /workflow status.`
+        );
+      }
+      if (abandonBlockedParentRunId !== null) {
+        parts.push(
+          `⚠️ Parent run ${abandonBlockedParentRunId} was blocked on an abandoned sub-run and stays paused. Resume it to fail the node cleanly, or abandon it too.`
         );
       }
       if (abandonError !== null) {
