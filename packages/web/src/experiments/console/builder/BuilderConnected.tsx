@@ -49,13 +49,13 @@ import {
   validateWorkflow,
   listWorkflows,
   type LoadedWorkflow,
-  type WorkflowSource,
 } from '../skills/workflows';
 import { listProjects, type WorkflowListResult } from '../skills';
 import { useEntity, invalidate } from '../store/cache';
 import { K } from '../store/keys';
 import { HttpError } from '../lib/http';
 import type { Project } from '../primitives/project';
+import type { Workflow } from '../primitives/workflow';
 
 /** Router navigation state carried into the connected route. */
 interface BuilderNavState {
@@ -127,7 +127,10 @@ export function BuilderConnected(): ReactElement {
   // Resolve the workflow under edit (seed in create mode, else the server load).
   // Memoized on stable inputs (location-state seed, cache object) so it does NOT
   // produce a fresh identity every render — that would thrash the reset effect.
-  const loadedSource: WorkflowSource = isCreateMode
+  // Widened to `Workflow['source']` (#2578) so an unrecognised wire value passes
+  // through to `effectiveSource` (and the downstream `isReadOnlySource` /
+  // `saveTargetFor` helpers) without a cast at this seam.
+  const loadedSource: Workflow['source'] = isCreateMode
     ? 'project'
     : (loadView.data?.source ?? 'project');
 
@@ -144,7 +147,10 @@ export function BuilderConnected(): ReactElement {
   const [dirty, setDirty] = useState(false);
   const [serverIssues, setServerIssues] = useState<Issue[]>([]);
   // Source can flip after a bundled Save-as (bundled → project override).
-  const [sourceOverride, setSourceOverride] = useState<WorkflowSource | null>(null);
+  // Widened to `Workflow['source']` (#2578) to match `loadedSource` /
+  // `LoadedWorkflow.source` — `saveWorkflow` returns whatever the server put on
+  // the response, which is `Workflow['source']`-typed.
+  const [sourceOverride, setSourceOverride] = useState<Workflow['source'] | null>(null);
   const [busy, setBusy] = useState(false);
 
   const effectiveSource = sourceOverride ?? loadedSource;
