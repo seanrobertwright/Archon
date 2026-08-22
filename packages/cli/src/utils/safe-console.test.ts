@@ -219,10 +219,13 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
    * the shim from the source tree (not from a published package) so a
    * regression in `flushPendingWrites()` itself is also caught here. It
    * also imports `withDrainedExit` from the same module cli.ts imports it
-   * from (`./utils/exit-with-drain.ts`), so the chain wiring is a single
-   * source of truth: a regression that bypasses `exitWithDrain` at the
-   * cli.ts call site has to land in `withDrainedExit` and would also
-   * drop the drain from this fixture's chain.
+   * from (`./utils/exit-with-drain.ts`), so a regression inside
+   * `withDrainedExit`/`exitWithDrain` itself (e.g. dropping the
+   * `flushPendingWrites()` await) is caught here too. A regression that
+   * instead bypasses `withDrainedExit` at the cli.ts call site — swapping
+   * it for a direct `process.exit` — is NOT caught by this fixture, since
+   * the fixture never imports cli.ts; that case is caught by the separate
+   * static-contract test below.
    */
   it('drains queued console.log writes before process.exit(1) on the catch arm (R9)', () => {
     const marker = `R9-MARKER-${Date.now()}`;
@@ -230,9 +233,10 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
     // fatal both route through `exitWithDrain`, which awaits
     // `flushPendingWrites()` before `process.exit()`. The chain wiring
     // lives in `withDrainedExit` (`./utils/exit-with-drain.ts`), imported
-    // from the same module cli.ts imports it from, so a regression that
-    // bypasses `exitWithDrain` at the cli.ts call site has to land in
-    // that helper — the same module this fixture imports from.
+    // from the same module cli.ts imports it from, so a regression inside
+    // that shared module is caught here too. A bypass of `withDrainedExit`
+    // specifically at the cli.ts call site is NOT caught by this fixture
+    // (see the static-contract test below).
     const fixturePath = join(scratch, 'r9-fixture.ts');
     const shimEntry = join(import.meta.dir, 'safe-console.ts');
     const exitWithDrainEntry = join(import.meta.dir, 'exit-with-drain.ts');
@@ -272,6 +276,35 @@ describePosix('CLI human-readable console.log over a real pipe (#2400)', () => {
     expect(result.status).toBe(1);
     expect(output).toContain(marker);
   }, 60_000);
+
+  /**
+   * R20 (review report): `withDrainedExit`'s default fatal-error handler
+   * prints `Fatal error: <message>` to stderr — the only diagnostic a user
+   * sees on an uncaught `main()` rejection. The R9 fixture above redirects
+   * stderr to `/dev/null`, so this content has never been captured or
+   * asserted by any test. This variant redirects stderr to a file instead
+   * and asserts the message survives.
+   */
+  it('withDrainedExit logs the fatal rejection message to stderr (R20)', () => {
+    const fixturePath = join(scratch, 'r20-fixture.ts');
+    const exitWithDrainEntry = join(import.meta.dir, 'exit-with-drain.ts');
+    writeFileSync(
+      fixturePath,
+      [
+        `import { withDrainedExit } from ${JSON.stringify(exitWithDrainEntry)};`,
+        `async function main(): Promise<number> { throw new Error('r20 simulated fatal'); }`,
+        `withDrainedExit(main);`,
+        ``,
+      ].join('\n')
+    );
+
+    const stderrTarget = join(scratch, 'r20-stderr.txt');
+    const result = runShell(`"${BUN}" "${fixturePath}" > /dev/null 2> "${stderrTarget}"`);
+    const stderr = readFileSync(stderrTarget, 'utf8');
+
+    expect(result.status).toBe(1);
+    expect(stderr).toContain('Fatal error: r20 simulated fatal');
+  }, 30_000);
 
   /**
    * Static-contract test for R12 (review report): even with the chain
@@ -496,6 +529,71 @@ describe('safe-console + exit-with-drain — EPIPE unit contract (R5)', () => {
           ) => never;
           (process.stdout as unknown as { write: typeof process.stdout.write }).write =
             originalWrite as typeof process.stdout.write;
+          restoreConsole();
+          resolve();
+        }
+      });
+    });
+  }, 30_000);
+
+  /**
+   * R19 (review report): every EPIPE fixture above uses `code: 'EPIPE'` —
+   * the exit-code-flip logic has no EPIPE-specific branch, but nothing
+   * proved that until now. A non-EPIPE write failure (e.g. `ENOSPC`) must
+   * still force `exitWithDrain(0)` to exit 1, and — per R17 — must also be
+   * logged, since it carries no other diagnostic trail (the patched
+   * `console.log` is fire-and-forget and never re-throws).
+   */
+  it('exitWithDrain(0) still exits 1 and logs a non-EPIPE write failure', () => {
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write =
+      originalWrite as typeof process.stdout.write;
+
+    const enospc = Object.assign(new Error('ENOSPC: no space left on device, write'), {
+      code: 'ENOSPC' as const,
+    });
+    (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((
+      _chunk: unknown,
+      ...args: unknown[]
+    ) => {
+      const callback =
+        typeof args[0] === 'function' ? (args[0] as (err?: Error | null) => void) : args[1];
+      if (typeof callback === 'function') callback(enospc);
+      return true;
+    }) as typeof process.stdout.write;
+
+    const originalExit = process.exit.bind(process);
+    let observed: number | undefined;
+    (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
+      observed = code;
+      throw new Error('observed exit');
+    }) as (code?: number) => never;
+
+    const originalError = console.error;
+    let loggedArgs: unknown[] | undefined;
+    console.error = ((...args: unknown[]) => {
+      loggedArgs = args;
+    }) as typeof console.error;
+
+    try {
+      installPipeSafeConsole();
+      console.log('this will fail with ENOSPC');
+      void exitWithDrain(0).catch(() => {});
+    } catch {
+      // installPipeSafeConsole does not throw.
+    }
+
+    return new Promise<void>(resolve => {
+      setImmediate(() => {
+        try {
+          expect(observed).toBe(1);
+          expect(loggedArgs?.join(' ')).toContain('ENOSPC: no space left on device, write');
+        } finally {
+          (process as unknown as { exit: (code?: number) => never }).exit = originalExit as (
+            code?: number
+          ) => never;
+          (process.stdout as unknown as { write: typeof process.stdout.write }).write =
+            originalWrite as typeof process.stdout.write;
+          console.error = originalError;
           restoreConsole();
           resolve();
         }

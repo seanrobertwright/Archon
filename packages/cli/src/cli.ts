@@ -1191,7 +1191,8 @@ async function main(): Promise<number> {
 // producing the same silent stdout loss the patch is meant to eliminate.
 // The chain wiring — `main().then(exitWithDrain).catch(...)` — lives in
 // `withDrainedExit` (`./utils/exit-with-drain.ts`) so cli.ts and the R9
-// regression test fixture share a single source of truth, and a regression
-// that bypasses `exitWithDrain` at this call site would also have to land
-// in that module.
+// regression test fixture share a single source of truth. A regression
+// that swaps this call for a direct `process.exit` is caught by the
+// static-contract test in `safe-console.test.ts`, which reads this file
+// as text.
 withDrainedExit(main);

@@ -12,24 +12,39 @@
  *
  * Both `exitWithDrain` and `withDrainedExit` live here so `cli.ts`'s
  * top-level `main().then().catch()` chain and the `safe-console.test.ts`
- * R9 regression test fixture can share them: a regression that bypasses
- * `exitWithDrain` at the cli.ts call site (e.g. replacing `withDrainedExit`
- * with a direct `process.exit`) is caught by the fixture, which calls the
- * same helper from this module. See R9 / R12 in the review report.
+ * R9 regression test fixture can share them: a regression that drops the
+ * drain from `withDrainedExit` itself (e.g. removing the `flushPendingWrites()`
+ * await) is caught by the fixture, since it calls this same helper. A
+ * regression that instead bypasses `withDrainedExit` at the cli.ts call site
+ * (e.g. swapping it for a direct `process.exit`) is caught by the separate
+ * static-contract test, which reads `cli.ts` as text. See R9 / R12 in the
+ * review report.
  */
 import { consumeWriteError, flushPendingWrites } from './safe-console';
 
 export const exitWithDrain = async (code: number): Promise<never> => {
   await flushPendingWrites();
-  // Any `process.stdout.write` failure captured by the patched `console.log`
-  // (most commonly EPIPE from `archon … | head -c 100`) must surface as a
-  // non-zero exit regardless of platform. Without this, a Linux CI runner
-  // can schedule the unhandled-rejection handler after `process.exit()` and
-  // silently lose the EPIPE — the writer exits 0 even though the piped
-  // reader hung up before delivery completed.
-  if (consumeWriteError() !== null && code === 0) {
-    process.exit(1);
-    return undefined as never;
+  const writeError = consumeWriteError();
+  if (writeError !== null) {
+    // EPIPE (a reader that hung up, e.g. `archon … | head -c 100`) is
+    // expected and needs no extra trail — the non-zero exit code below is
+    // the correct signal. Any other write failure (e.g. ENOSPC) is
+    // genuinely unexpected and would otherwise leave zero diagnostic trail,
+    // since the patched `console.log` is fire-and-forget and never
+    // re-throws — log it here, BEFORE the forced exit below, since
+    // `process.exit()` terminates the process synchronously and nothing
+    // after it runs. See R17 in the review report.
+    if (writeError.code !== 'EPIPE') {
+      console.error('Fatal error: failed to write output:', writeError.message);
+    }
+    // Any `process.stdout.write` failure captured by the patched `console.log`
+    // must surface as a non-zero exit regardless of platform. Without this, a
+    // Linux CI runner can schedule the unhandled-rejection handler after
+    // `process.exit()` and silently lose the EPIPE — the writer exits 0 even
+    // though the piped reader hung up before delivery completed.
+    if (code === 0) {
+      process.exit(1);
+    }
   }
   process.exit(code);
 };
@@ -49,16 +64,14 @@ export const exitWithDrain = async (code: number): Promise<never> => {
  * `process.exit(1)` — impossible without changing this module, which is
  * what the R9 test now catches. See R12 in the review report.
  */
-export function withDrainedExit(
-  main: () => Promise<number>,
-  logFatal: (error: Error) => void = (error): void => {
-    console.error('Fatal error:', error.message);
-  }
-): Promise<never> {
+export function withDrainedExit(main: () => Promise<number>): Promise<never> {
   return main()
     .then(exitWithDrain)
     .catch(async (error: unknown) => {
-      logFatal(error as Error);
+      // `main()` can reject with anything JS allows (not only `Error`
+      // instances), so normalize before reading `.message`.
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('Fatal error:', message);
       return exitWithDrain(1);
     });
 }

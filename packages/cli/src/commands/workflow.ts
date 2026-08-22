@@ -101,6 +101,7 @@ import * as userDb from '@archon/core/db/users';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
 import { writeJsonLine, writeStdout } from '../utils/stdout';
+import { exitWithDrain } from '../utils/exit-with-drain';
 import { resolveCliUserId } from './auth';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -2016,7 +2017,7 @@ async function runWorkflowWithOwnedSource(
         );
       })
       // Destroy the isolation container so Ctrl-C / SIGTERM doesn't orphan a
-      // PRIVILEGED container — `process.exit(1)` below bypasses the teardown
+      // PRIVILEGED container — the forced exit below bypasses the teardown
       // `finally`, so we must tear it down explicitly here first.
       .then(async () => {
         if (containerBackend && containerEnvId) {
@@ -2032,9 +2033,10 @@ async function runWorkflowWithOwnedSource(
         }
       })
       // Reclaim the staged capture for the same reason the container is destroyed above:
-      // `process.exit(1)` never returns up the stack, so the ownership `finally` — whose
-      // whole premise is "whichever way we leave" — never runs. Ctrl-C during isolation
-      // resolution or worktree creation would otherwise strand a complete frozen tree.
+      // the forced exit below never returns up the stack, so the ownership `finally` —
+      // whose whole premise is "whichever way we leave" — never runs. Ctrl-C during
+      // isolation resolution or worktree creation would otherwise strand a complete
+      // frozen tree.
       .then(async () => {
         if (preparedSource && !sourceAdopted) {
           await disposeWorkflowSource(preparedSource).catch(() => undefined);
@@ -2042,7 +2044,13 @@ async function runWorkflowWithOwnedSource(
       })
       .catch(() => undefined)
       .finally(() => {
-        process.exit(1);
+        // Route through the same drain helper cli.ts's top-level exit chain
+        // uses so queued `console.log` output (this command streams progress
+        // through 101 call sites) reaches a slow reader before the process
+        // exits — a bare `process.exit(1)` here would reopen #2400's
+        // truncation on Ctrl-C/SIGTERM specifically. See R16 in the review
+        // report.
+        void exitWithDrain(1);
       });
   };
   const sigtermHandler = (): void => {

@@ -136,9 +136,9 @@ export function consumeWriteError(): NodeJS.ErrnoException | null {
  * have reached the OS, retrying short writes and `EAGAIN` through the event
  * loop (no busy-wait). See `utils/stdout.ts` for the underlying primitive.
  * Callers that DO need delivery confirmation before the process exits must
- * await `flushPendingWrites()` — see `utils/exit-with-drain.ts` (the helper
- * `cli.ts`'s top-level `main().then().catch()` chain routes both arms
- * through) and `cli.ts:1171-1202` (the comment and chain that use it).
+ * await `flushPendingWrites()` — see `utils/exit-with-drain.ts` (the
+ * `withDrainedExit` helper that owns this) and the `withDrainedExit(main)`
+ * call at the end of `cli.ts`.
  */
 export function installPipeSafeConsole(): void {
   if (installed) return;
@@ -191,6 +191,10 @@ export function installPipeSafeConsole(): void {
 export function restoreConsole(): void {
   if (!installed) return;
   installed = false;
+  // Reset alongside `installed` so a caller that restores without consuming
+  // a pending write error (via `consumeWriteError()`) doesn't leave it to be
+  // read by a later, unrelated `exitWithDrain()` call after reinstalling.
+  writeError = null;
   const consoleAny = console as {
     log: (...args: unknown[]) => void;
     info: (...args: unknown[]) => void;
