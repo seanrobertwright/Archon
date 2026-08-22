@@ -11003,6 +11003,348 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
   });
 });
 
+describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execution (#2402)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-2402-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(testDir, '.archon', 'commands', 'producer.md'), 'Producer prompt');
+    await writeFile(
+      join(testDir, '.archon', 'commands', 'consumer.md'),
+      'Consumer prompt $producer.output'
+    );
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('invalidates a cached downstream when an always_run dep re-runs with fresh output', async () => {
+    // Bug shape from #2402: producer is `always_run` so it re-executes on resume; consumer
+    // is also cached from the prior run. The naive resume used to skip consumer and read
+    // the stale cached value, reporting success over synthesis made against the OLD
+    // producer. After the fix, consumer must re-execute against the fresh producer.
+    const seenPrompts: string[] = [];
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      seenPrompts.push(prompt);
+      queryCount++;
+      yield {
+        type: 'assistant',
+        content: queryCount === 1 ? 'fresh producer output' : 'consumer result',
+      };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Both producer and consumer were completed in the prior run — this is the
+    // scenario the bug report describes.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['producer', { output: 'STALE_CACHED_PRODUCER' }],
+      ['consumer', { output: 'STALE_CACHED_CONSUMER' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-always-run',
+      testDir,
+      {
+        name: 'stale-cache-always-run',
+        nodes: [
+          { id: 'producer', command: 'producer', always_run: true },
+          { id: 'consumer', command: 'consumer', depends_on: ['producer'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer re-runs (always_run) AND consumer re-runs (cache invalidated by dep) —
+    // before the fix, consumer was skipped and only 1 sendQuery call happened.
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+
+    // Consumer's prompt must contain the FRESH producer output, not the stale cached
+    // value the resume snapshot carried.
+    const consumerPrompt = seenPrompts[1];
+    expect(consumerPrompt).toContain('fresh producer output');
+    expect(consumerPrompt).not.toContain('STALE_CACHED_PRODUCER');
+
+    // Audit: producer emits node_always_run_reset; consumer emits
+    // node_prior_cache_invalidated naming producer as the invalidating dep.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeUndefined();
+
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.reason).toBe('stale_dependency');
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_output).toBe('STALE_CACHED_CONSUMER');
+  });
+
+  it('does NOT invalidate when a cached dep ran but produced text-identical output', async () => {
+    // The comparison is conservative: a dep that re-ran with byte-identical text
+    // and structured output is NOT flagged as stale. The cached downstream's value
+    // is semantically equivalent, so honouring the cache is correct (and avoids an
+    // unnecessary re-execution). This pins that contract for #2402.
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      yield { type: 'assistant', content: 'identical output' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Producer was completed in the prior run with output "identical output". It is NOT
+    // `always_run`, so the resume pre-populates nodeOutputs["producer"] = "identical
+    // output". When this resume runs, the comparison finds the values match and the
+    // cache is honoured. Only producer would execute on a fresh start — but here
+    // producer is also in priorCompletedNodes, so it is skipped entirely.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['producer', { output: 'identical output' }],
+      ['consumer', { output: 'cached consumer output' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-identical',
+      testDir,
+      {
+        name: 'stale-cache-identical',
+        nodes: [
+          { id: 'producer', command: 'producer' },
+          { id: 'consumer', command: 'consumer', depends_on: ['producer'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Neither node ran fresh: producer skipped (cached), consumer skipped (cached
+    // AND its dep did not invalidate). sendQuery was never called.
+    expect(queryCount).toBe(0);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated'
+    );
+    expect(invalidatedEvent).toBeUndefined();
+
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeDefined();
+  });
+
+  it('invalidates a cached downstream when a dep that was never cached completes fresh this resume', async () => {
+    // A dep can be missing from priorCompletedNodes for two reasons: it never completed
+    // in the prior run, or it completed but its row was lost. The pre-populate loop
+    // never seeds nodeOutputs for such a dep, so case 1 of the staleness check fires:
+    // "dep missing from prior + nodeOutputs now completed => ran fresh this resume".
+    // Pin that contract — it can otherwise regress into the same staleness class.
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      yield { type: 'assistant', content: queryCount === 1 ? 'fresh producer' : 'fresh consumer' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Consumer is cached; producer is NOT cached (e.g. it failed in the prior run and
+    // is being re-attempted this resume).
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['consumer', { output: 'stale consumer output' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-uncached-dep',
+      testDir,
+      {
+        name: 'stale-cache-uncached-dep',
+        nodes: [
+          { id: 'producer', command: 'producer' },
+          { id: 'consumer', command: 'consumer', depends_on: ['producer'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer ran fresh + consumer was invalidated and re-ran = 2 sendQuery calls.
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.invalidating_deps).toEqual(['producer']);
+  });
+
+  it('invalidates when a dep’s structured output changes even though text is stable', async () => {
+    // Case 3 of the staleness check: a `$dep.output.field` consumer must be invalidated
+    // when the structured value changes, even if the text form is identical. Otherwise
+    // the #2637 logical-value surface would silently read stale data through the cache.
+    // The dep must actually re-run for the comparison to fire — `always_run: true`
+    // forces that without contaminating the case with text-staleness.
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      yield {
+        type: 'assistant',
+        content: queryCount === 1 ? 'producer text' : 'consumer result',
+      };
+      yield {
+        type: 'result',
+        sessionId: 'session-id',
+        // Simulate a provider that attaches a logical value alongside the text.
+        // Producer: same text as the cache, different structured payload. This is
+        // the case-3 trigger — the dep's nodeOutputs entry will have the new
+        // structuredOutput even though its text is identical.
+        structuredOutput: queryCount === 1 ? { status: 'PASS_NEW', count: 7 } : { ok: true },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      // Text matches the new producer run, but the structured payload is the OLD
+      // shape — a `$producer.output.status` consumer would read the stale
+      // string "PASS_OLD" through the cache.
+      ['producer', { output: 'producer text', structuredOutput: { status: 'PASS_OLD', count: 3 } }],
+      // The consumer's own cached value also carries a structured payload so the
+      // audit log can record what was thrown away on the invalidated side too.
+      ['consumer', { output: 'cached consumer', structuredOutput: { stale: true } }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-structured',
+      testDir,
+      {
+        name: 'stale-cache-structured',
+        nodes: [
+          // always_run forces the producer re-execution that surfaces case 3.
+          { id: 'producer', prompt: 'Run producer', always_run: true },
+          { id: 'consumer', prompt: 'Use $producer.output.status', depends_on: ['producer'] },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer re-ran (always_run) + consumer was invalidated (text-stable but
+    // structured-output differs) = 2 sendQuery calls.
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_structured_output).toEqual({ stale: true });
+  });
+});
+
 describe('executeDagWorkflow -- break after result (no hang on subprocess exit)', () => {
   let testDir: string;
 
