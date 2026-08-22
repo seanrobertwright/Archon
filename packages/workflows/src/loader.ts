@@ -1016,7 +1016,12 @@ export function validateDagStructure(
  * them without waiting for the author to add the declaration. TODO(#2738):
  * once the grace period ends, delete the coercion in `parseWorkflow` and
  * restore the hard error — this function's return value already carries the
- * exact message that error used to return, unchanged.
+ * exact message that error used to return, unchanged. Restoring the hard
+ * error also means a leaf gate-authoring block reachable only via `include:`
+ * can fail its OWN class check again, so #2738 must also resurrect the
+ * `WorkflowLoadError.name`/`failedNames` mechanism this grace-period commit
+ * removed (see its git history) — without it, every composer of that block
+ * regresses to a misleading "not found" instead of the real cause.
  *
  * Called ONLY from `parseWorkflow`, against ONE file's own unexpanded node
  * list — deliberately NOT re-run against the post-`include:`-expansion node
