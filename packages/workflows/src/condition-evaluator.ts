@@ -28,8 +28,9 @@
  *     not a silent skip. That covers `$node.output.field` (field not in the
  *     producer's declared schema, or a schemaless node whose output isn't JSON /
  *     lacks the key) via `OutputRefError`, and an undeclared `$INPUTS.<name>` via
- *     `InputRefError`. (Declared-optional fields and whole-text `$node.output`
- *     still resolve to '' and never throw.)
+ *     `InputRefError`. (A declared-optional-absent field still resolves to '' and
+ *     never throws — but a FAILED producer always throws, fielded or whole-text,
+ *     #2713 — see `resolveOutputRef` below.)
  */
 import type { NodeOutput } from './schemas';
 import { createLogger } from '@archon/paths';
@@ -89,7 +90,9 @@ function resolveOutputRef(
   if (!field) {
     // A failed producer's stale output is never evaluated (#2713) — a when: condition
     // joined past a failure via trigger_rule: all_done must branch on a different
-    // node's output, not the failed producer's own leftover text.
+    // node's output, not the failed producer's own leftover text. KEEP IN SYNC: see
+    // the module doc of resolveNodeOutputField in output-ref.ts for the full list of
+    // guards asserting this same invariant.
     if (nodeOutput.state === 'failed') {
       throw new Error(
         `'$${nodeId}.output' references node '${nodeId}', but it failed (${nodeOutput.error}), ` +

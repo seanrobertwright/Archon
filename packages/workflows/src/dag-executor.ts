@@ -272,7 +272,9 @@ function inputEnvVars(node: DagNode, ctx: ShellInputContext): NodeJS.ProcessEnv 
  * already guards its own call below before reaching this function, so the check below only
  * ever fires for this function's OTHER caller, `resolveWorkflowValue`'s whole-ref tier — the
  * plain (non-directive) `with:` value on a script/command node, a `workflow:` node's `with:`,
- * or `fan_out`'s static `with:`, none of which had #2710's guard.
+ * or `fan_out`'s static `with:`, none of which had #2710's guard. KEEP IN SYNC: see the
+ * module doc of `resolveNodeOutputField` in output-ref.ts for the full list of guards
+ * asserting this same invariant.
  */
 function wholeRefLogicalValue(
   producer: NodeOutput,
@@ -449,7 +451,9 @@ function resolveBindingDirective(
   // a branch that legitimately didn't run, not for a run that ran and produced a result
   // that can't be trusted (a loop_group's failure paths carry the last completed
   // iteration's real output text — non-empty, often valid JSON — which would otherwise
-  // resolve here as if the group had succeeded).
+  // resolve here as if the group had succeeded). KEEP IN SYNC: see the module doc of
+  // resolveNodeOutputField in output-ref.ts for the full list of guards (#2713 extended
+  // this one, the original, to every other reader of nodeOutputs).
   if (producer.state === 'failed') {
     throw new Error(
       `Node '${consumerId}' binding '${name}' reads '${directive.from}', but node ` +
@@ -1238,7 +1242,9 @@ export function substituteNodeOutputRefs(
         // A failed producer's stale output is never spliced into a consumer's own
         // prompt/bash/command body (#2713) — matches resolveBindingDirective's #2710
         // guard for the same class of bug (a loop_group's failure paths leave real,
-        // last-completed-iteration text behind).
+        // last-completed-iteration text behind). KEEP IN SYNC: see the module doc of
+        // resolveNodeOutputField in output-ref.ts for the full list of guards
+        // asserting this same invariant.
         if (nodeOutput.state === 'failed') {
           throw new Error(
             `'$${nodeId}.output' references node '${nodeId}', but it failed ` +

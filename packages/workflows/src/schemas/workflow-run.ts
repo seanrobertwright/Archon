@@ -83,7 +83,11 @@ export type NodeState = z.infer<typeof nodeStateSchema>;
 /**
  * Captured output from a completed DAG node.
  * `output` is the concatenated assistant text (or JSON-encoded string from the SDK
- * when output_format is set). Empty string for failed/skipped nodes.
+ * when output_format is set). Empty string for a skipped/pending node; for a FAILED
+ * node it is usually empty too, but not always — a `loop_group`'s failure paths
+ * (body-node failure, `max_iterations` exhaustion, cancellation) deliberately carry
+ * the last completed iteration's real, non-empty output. No reader of a 'failed'
+ * node's `output` may treat it as trustworthy regardless of content (#2713).
  * `error` is required when state is 'failed', absent on all other states.
  * `structuredOutput` carries the provider's parsed structured payload (set by Pi/Codex/Claude
  * when the result chunk includes one). Downstream `$nodeId.output.field` substitution and
