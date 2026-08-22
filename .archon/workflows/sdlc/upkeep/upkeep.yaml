@@ -117,7 +117,10 @@ nodes:
         bump breaks, validate with the project's own checks, and if reality
         contradicts the assessment (version unavailable, an unlisted peer
         conflict), stop honestly with green false and the contradiction in your
-        summary rather than improvising a different version. Original request:
+        summary rather than improvising a different version. Carry the
+        assessment's chosen mechanism, its blast radius, and the alternative it
+        rejected into your report — the reviewer must be able to judge that
+        trade-off from the pull request. Original request:
         $INPUTS.target
     depends_on: [gate-update]
 
