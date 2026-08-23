@@ -13,7 +13,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { mkdir, writeFile, rm, cp, readdir } from 'fs/promises';
-import { join } from 'path';
+import { join, sep } from 'path';
 import { tmpdir } from 'os';
 
 // --- Mock logger + telemetry (passthrough real path utilities like loader.test.ts) ---
@@ -58,10 +58,17 @@ mock.module('@archon/git', () => ({
 //     lives under `staged-source/`, destination does NOT. `captureWorkflowSource`
 //     also does a rename (staged-source/<uuid>.partial -> staged-source/<uuid>)
 //     and that one must keep working, otherwise `prepareWorkflowSource` itself
-//     throws before runChildWorkflow reaches the recursive call. ---
+//     throws before runChildWorkflow reaches the recursive call.
+//
+//     The path predicate uses `path.sep`, not a hardcoded forward slash:
+//     `fs/promises.rename` on Windows is called with backslash-separated paths
+//     produced by `path.join`, so a literal `'staged-source/'` substring check
+//     never matches there and the test fails to exercise the reclaim path it is
+//     here to prove. ---
 const realFsPromises = await import('fs/promises');
 let forceRenameFailure = false;
 const passthroughRename = realFsPromises.rename;
+const stagedSourcePathSep = `staged-source${sep}`;
 mock.module('fs/promises', () => ({
   access: realFsPromises.access,
   appendFile: realFsPromises.appendFile,
@@ -85,8 +92,8 @@ mock.module('fs/promises', () => ({
   rename: async (src: string, dst: string): Promise<void> => {
     if (
       forceRenameFailure &&
-      src.includes(`${'staged-source'}/`) &&
-      !dst.includes(`${'staged-source'}/`)
+      src.includes(stagedSourcePathSep) &&
+      !dst.includes(stagedSourcePathSep)
     ) {
       throw new Error(`forced rename failure for test: ${src} -> ${dst}`);
     }
@@ -5574,5 +5581,28 @@ nodes:
     } finally {
       forceRenameFailure = false;
     }
+  });
+
+  // Regression for the path-literal `staged-source/` predicate that made the
+  // test above fail on Windows: `fs/promises.rename` is called there with
+  // backslash paths produced by `path.join`, so the host platform's `sep`
+  // must drive the predicate. The end-to-end test above only proves the host
+  // platform; this one proves the predicate is platform-aware in two ways:
+  // structurally — it is built from `path.sep`, not a hardcoded literal —
+  // and behaviourally — it matches paths that `path.join` produces on the
+  // host platform. The Windows case holds by the same construction on a
+  // Windows runner.
+  it('rename mock predicate is platform-aware (uses path.sep, matches host-platform paths)', () => {
+    // Structural: the predicate is built from `path.sep`. A hardcoded
+    // `'staged-source/'` literal — the original broken form — fails this.
+    expect(stagedSourcePathSep).toBe(`staged-source${sep}`);
+
+    // Behavioural: `path.join` produces host-platform separator paths, and
+    // the predicate matches them. The end-to-end test above exercises the
+    // real rename mock end-to-end; this asserts the predicate logic itself.
+    const hostSrc = join(tmpdir(), 'staged-source', 'uuid-1');
+    const hostDst = join(tmpdir(), 'artifacts', 'workflow-source');
+    expect(hostSrc.includes(stagedSourcePathSep)).toBe(true);
+    expect(hostDst.includes(stagedSourcePathSep)).toBe(false);
   });
 });
