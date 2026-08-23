@@ -4728,11 +4728,15 @@ async function executeLoopGroupNode(
           };
         }
         // A human resolved the ORIGINAL bare-gate pause before the rewrite landed
-        // (an astronomically narrow race) — fall through to the normal per-
-        // iteration path below, which observes whatever state that resolution
-        // left and behaves correctly for it, same as any other externally-
-        // resolved gate. (The postBodyStatus tolerance above already let a
-        // 'paused' status through; nothing here re-checks it.)
+        // (an astronomically narrow race) — fall through rather than error or
+        // corrupt state. This does NOT behave the same as a normal resolved gate,
+        // though: the resolution was written under the bare gate id, with
+        // bodyGateId still unset, so it's unreachable by the namespaced restore
+        // path this mechanism depends on — the loop proceeds toward
+        // max_iterations instead of honoring the human's answer. Accepted for
+        // this race's vanishingly narrow window rather than built out further.
+        // (The postBodyStatus tolerance above already let a 'paused' status
+        // through; nothing here re-checks it.)
       }
     }
 
