@@ -435,6 +435,21 @@ export interface ApprovalContext {
    * child of the same parent can't trigger the wrong re-entry.
    */
   childRunId?: string;
+  /**
+   * Set only on an ESCALATED pause: a `gate:` node that is the sole terminal sink
+   * of a `loop_group` body (#2707 step 3), still `type: 'approval'`. The enclosing
+   * loop_group's own id occupies `nodeId` — required for the top-level DAG's
+   * resume walk to find it (it only knows top-level node ids, never a nested body
+   * id) — so this field carries the body gate's own bare id, the one piece the
+   * rewrite would otherwise lose. `approveWorkflow`/`rejectWorkflow`/
+   * `respondToWorkflowWithDeclaredDecision` read it to namespace the resolution's
+   * `node_completed` event as `<nodeId>.<bodyGateId>` instead of bare `nodeId` —
+   * the exact `<groupId>.<bodyId>` step name #2748's `outerNodeOutputs`
+   * pre-population already keys on, so the gate's own resolved decision is
+   * findable again after a resume the same way any other body node's output is.
+   * Absent for every other pause kind, including an ordinary top-level gate.
+   */
+  bodyGateId?: string;
   /** Current loop iteration when paused (interactive loops only). */
   iteration?: number;
   /**

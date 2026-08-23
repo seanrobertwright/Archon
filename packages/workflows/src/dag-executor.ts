@@ -4151,6 +4151,24 @@ async function finalizeLoopFromSignal(
 }
 
 /**
+ * The body's designated pause node for #2707 step 3's gate-terminated pattern: a
+ * `gate:` node that is the body's SOLE terminal sink (nothing depends on it, and
+ * it is the only node nothing else depends on) — mirrors the placement rule
+ * `loader.ts`'s `collectGateAndLoopDeprecationWarnings` already checks at load
+ * time. Returns `undefined` for a body with no gate, or one that is misplaced
+ * (mid-body, or co-terminal with another sink) — 3a already warns on that at
+ * load time; this runtime code makes no special attempt to handle it, and such
+ * a gate simply keeps behaving as it does today (silently ignored for
+ * escalation purposes, since there is no unambiguous single pause node to
+ * escalate).
+ */
+function findLoopGroupTerminalGate(bodyNodes: readonly DagNode[]): GateNode | undefined {
+  const dependedOn = new Set(bodyNodes.flatMap(n => n.depends_on ?? []));
+  const sinks = bodyNodes.filter(n => !dependedOn.has(n.id));
+  return sinks.length === 1 && isGateNode(sinks[0]) ? sinks[0] : undefined;
+}
+
+/**
  * Execute a loop-group node — runs a multi-node sub-DAG body repeatedly until a
  * completion condition (`until` signal in the body's terminal-node output, and/or
  * `until_bash` exit code) or `max_iterations`.
@@ -4232,13 +4250,29 @@ async function executeLoopGroupNode(
   const knownBodyIds = collectLoopBodyNodeIds(group.nodes);
   const directBodyIds = new Set(group.nodes.map(n => n.id));
 
-  // Detect interactive loop resume (mirrors executeLoopNode).
+  // Detect loop resume (mirrors executeLoopNode). Two shapes recognized:
+  //  - the ORIGINAL interactive_loop gate (group.interactive + gate_message).
+  //  - the #2707 step 3 ESCALATED shape — a gate node that is the body's sole
+  //    terminal sink paused generically as an ordinary 'approval' gate, then
+  //    rewritten (see the post-runLayers escalation below) so nodeId points at
+  //    THIS group and bodyGateId carries the gate's own id. `$LOOP_USER_INPUT`
+  //    does not apply to this shape — the human's text flows via the ordinary
+  //    $LOOP_PREV.<gateId>.output.text channel instead, like any other body
+  //    node's output — so `loopUserInput` below stays scoped to the legacy shape.
   const rawApproval = workflowRun.metadata?.approval;
   const loopGateMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
-  const isLoopResume = loopGateMeta?.type === 'interactive_loop' && loopGateMeta.nodeId === node.id;
+  const isLegacyInteractiveLoopResume =
+    loopGateMeta?.type === 'interactive_loop' && loopGateMeta.nodeId === node.id;
+  const isEscalatedGateResume =
+    loopGateMeta?.type === 'approval' &&
+    loopGateMeta.nodeId === node.id &&
+    loopGateMeta.bodyGateId !== undefined;
+  const isLoopResume = isLegacyInteractiveLoopResume || isEscalatedGateResume;
   const startIteration = isLoopResume ? (loopGateMeta.iteration ?? 0) + 1 : 1;
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
-  const loopUserInput = isLoopResume ? (loopGateRunMeta.loop_user_input ?? '') : '';
+  const loopUserInput = isLegacyInteractiveLoopResume
+    ? (loopGateRunMeta.loop_user_input ?? '')
+    : '';
 
   // Finalize-on-approve (#2074): mirrors executeLoopNode — a completion-bearing gate
   // resumed WITHOUT feedback completes the group from the persisted output instead
@@ -4315,6 +4349,158 @@ async function executeLoopGroupNode(
     // to every consumer; this has no behavioral effect either way.
     if (restoredLoopPrevOutputs.size > 0) loopPrevOutputs = restoredLoopPrevOutputs;
   }
+
+  // #2707 step 3: an escalated gate-terminated-body resume might already be
+  // "done" — the human's answer, just reconstructed above (the SAME restoration
+  // #2748 built for $LOOP_PREV, now also finding the gate's own resolution
+  // thanks to the namespaced write-path fix), may satisfy the group's own
+  // until_bash. The legacy interactive_loop resume always advances blindly to
+  // iteration+1; that would be WRONG here — it would silently start a whole new
+  // iteration (re-running the body's pre-gate work) while ignoring an answer
+  // that already meant "stop". Re-run the same completion check the normal
+  // per-iteration path runs below, fed from the reconstructed data instead of a
+  // fresh runLayers call — decision (b) settled that resume re-enters at the
+  // iteration boundary, so the pre-gate body nodes' already-produced outputs are
+  // safe to reuse as-is; only the gate's own answer needed reconstructing.
+  if (isEscalatedGateResume && loopPrevOutputs !== undefined) {
+    const terminalGate = findLoopGroupTerminalGate(group.nodes as DagNode[]);
+    const terminalSink = terminalGate ? loopPrevOutputs.get(terminalGate.id) : undefined;
+    if (terminalSink !== undefined) {
+      const resumedIteration = loopGateMeta.iteration ?? 0;
+      const rawIterationOutput = terminalSink.output;
+      const resumedSignalDetected =
+        group.until !== undefined && detectCompletionSignal(rawIterationOutput, group.until);
+      let resumedBashComplete = false;
+      if (group.until_bash && !resumedSignalDetected) {
+        // No $LOOP_PREV history survives a resume beyond the single reconstructed
+        // iteration above — #2748 restores only the LATEST persisted body outputs,
+        // not a full history — so an until_bash referencing $LOOP_PREV from the
+        // iteration BEFORE this one resolves empty here, same as a fresh
+        // iteration 1. Not expected to matter in practice: Design A's canonical
+        // pattern reads only $<gateId>.output inside until_bash, never $LOOP_PREV.
+        const { prompt: resumedBashPrompt } = substituteWorkflowVariables(
+          group.until_bash,
+          workflowRun.id,
+          workflowRun.user_message,
+          artifactsDir,
+          baseBranch,
+          docsDir,
+          issueContext,
+          undefined,
+          undefined,
+          undefined,
+          { shellSafe: true, stateDir }
+        );
+        // Merge outer-DAG outputs underneath the reconstructed body outputs —
+        // mirrors how a normal (non-resumed) iteration seeds scopedNodeOutputs
+        // (`new Map(outerNodeOutputs)`, then overwritten by this iteration's own
+        // body results) — so an until_bash combining an outer-scope ref with the
+        // gate's own decision resolves the outer ref correctly on resume too,
+        // not just mid-loop. outerNodeOutputs is already an in-scope parameter;
+        // no new reconstruction needed.
+        const resumedScope = new Map([...outerNodeOutputs, ...loopPrevOutputs]);
+        const resumedSubstitutedBash = substituteNodeOutputRefs(
+          resumedBashPrompt,
+          resumedScope,
+          true, // escapedForBash
+          artifactsDir
+        );
+        const resumedBashPath = resolveBashPath();
+        try {
+          await runSubprocess(execContext, resumedBashPath, ['-c', resumedSubstitutedBash], {
+            cwd,
+            timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+            env: {
+              ...(config.envVars ?? {}),
+              USER_MESSAGE: workflowRun.user_message,
+              ARGUMENTS: workflowRun.user_message,
+              LOOP_USER_INPUT: '',
+              LOOP_PREV_OUTPUT: '',
+              REJECTION_REASON: '',
+              CONTEXT: issueContext ?? '',
+              EXTERNAL_CONTEXT: issueContext ?? '',
+              ISSUE_CONTEXT: issueContext ?? '',
+            },
+          });
+          resumedBashComplete = true;
+        } catch (e) {
+          const bashErr = e as NodeJS.ErrnoException;
+          if (
+            bashErr.code === 'ENOENT' ||
+            bashErr.code === 'EACCES' ||
+            bashErr.code === 'ENOTDIR'
+          ) {
+            getLog().error(
+              { err: bashErr, nodeId: node.id, iteration: resumedIteration },
+              'loop_group.until_bash_failed'
+            );
+            throw new Error(
+              `Loop group '${node.id}' until_bash failed: cannot execute bash at ` +
+                `'${resumedBashPath}' (${bashErr.code}). Set ARCHON_BASH_PATH if Git Bash ` +
+                'is installed elsewhere.'
+            );
+          }
+          if (typeof bashErr.code !== 'number') {
+            getLog().error(
+              { err: bashErr, nodeId: node.id, iteration: resumedIteration },
+              'loop_group.until_bash_unexpected_error'
+            );
+            throw bashErr;
+          }
+          resumedBashComplete = false;
+        }
+      }
+      if (resumedSignalDetected || resumedBashComplete) {
+        const resumedOutput = stripCompletionTags(rawIterationOutput, group.until);
+        const resumedStructuredOutput =
+          'structuredOutput' in terminalSink ? terminalSink.structuredOutput : undefined;
+        await safeSendMessage(
+          platform,
+          conversationId,
+          `Loop-group node '${node.id}' completed after ${String(resumedIteration)} iteration${resumedIteration > 1 ? 's' : ''}`,
+          msgContext
+        );
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'node_completed',
+            step_name: stepName,
+            data: {
+              node_output: resumedOutput,
+              ...(resumedStructuredOutput !== undefined
+                ? { structured_output: resumedStructuredOutput }
+                : {}),
+              aggregate: true,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'node_completed' },
+              'workflow_event_persist_failed'
+            );
+          });
+        getWorkflowEventEmitter().emit({
+          type: 'node_completed',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          nodeName: node.id,
+          duration: 0,
+        });
+        return {
+          state: 'completed',
+          output: resumedOutput,
+          loopIterations: resumedIteration,
+          ...(resumedStructuredOutput !== undefined
+            ? { structuredOutput: resumedStructuredOutput }
+            : {}),
+        };
+      }
+      // Not complete — fall through. startIteration is already iteration+1 (set
+      // above from loopGateMeta.iteration), so the for loop below proceeds into a
+      // genuinely fresh iteration, exactly as it would for any other resume.
+    }
+  }
+
   let lastIterationOutput = '';
   // The terminal sink's structured payload for the same iteration (#2637) — tracked
   // beside the text so the group's completed NodeOutput carries the logical value
@@ -4474,6 +4660,7 @@ async function executeLoopGroupNode(
       bodyLoopUserInput: userInputForIter,
     };
     await runLayers(iterCtx);
+
     // A body approval/cancel node may have paused or cancelled the run mid-iteration.
     // `paused` is tolerated (a sibling gate in the same iteration layer) — mirror
     // executeLoopNode's between-iteration tolerance — but a terminal/cancelled state
@@ -4496,6 +4683,61 @@ async function executeLoopGroupNode(
         [...(loopTotalTokens !== undefined ? [loopTotalTokens] : []), iterCtx.totalTokens],
         { nodeId: node.id, iteration: i }
       );
+    }
+
+    // #2707 step 3: pause escalation. A gate node that is the body's sole terminal
+    // sink pauses generically via executeApprovalNode (called through runLayers,
+    // like any other body node) — that pause alone does NOT stop this loop: the
+    // `paused` tolerance above (needed for a genuinely unrelated sibling gate
+    // pausing in the same layer) would otherwise let the loop barrel straight into
+    // the next iteration, immediately re-pausing and burning cost every time. This
+    // detects THAT specific pause and escalates it: rewrite the ApprovalContext so
+    // it points at THIS group (the top-level DAG only knows top-level node ids,
+    // never a nested body id — mirrors exactly how the interactive_loop gate below
+    // already works) and return the same "paused" shape that path uses. Placed
+    // AFTER the usage accumulation above (not right after runLayers) so this
+    // iteration's own spend — the 'work' node plus the gate check that just ran —
+    // is already folded into loopTotalCostUsd/loopTotalTokens by the time the
+    // escalation return reads them; reading them any earlier would silently drop
+    // this iteration's cost from the run's live totals for the whole pause window.
+    const terminalGate = findLoopGroupTerminalGate(iterBodyNodes);
+    if (terminalGate && postBodyStatus === 'paused') {
+      // Fresh read — workflowRun is this call's stale snapshot from before
+      // runLayers ran; the gate's own pause just wrote metadata.approval.
+      const freshRun = await deps.store.getWorkflowRun(workflowRun.id);
+      const freshApproval = isApprovalContext(freshRun?.metadata?.approval)
+        ? freshRun.metadata.approval
+        : undefined;
+      if (freshApproval?.nodeId === terminalGate.id) {
+        const rewritten: ApprovalContext = {
+          ...freshApproval,
+          nodeId: node.id,
+          bodyGateId: terminalGate.id,
+          iteration: i,
+          sessionId: loopLastSequentialSession?.sessionId ?? null,
+          sessionProvider: loopLastSequentialSession?.provider ?? null,
+        };
+        const { resolved } = await deps.store.rewriteApprovalContext(workflowRun.id, rewritten);
+        if (resolved) {
+          return {
+            state: 'completed',
+            output: lastIterationOutput,
+            costUsd: loopTotalCostUsd,
+            ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+            loopIterations: i,
+          };
+        }
+        // A human resolved the ORIGINAL bare-gate pause before the rewrite landed
+        // (an astronomically narrow race) — fall through rather than error or
+        // corrupt state. This does NOT behave the same as a normal resolved gate,
+        // though: the resolution was written under the bare gate id, with
+        // bodyGateId still unset, so it's unreachable by the namespaced restore
+        // path this mechanism depends on — the loop proceeds toward
+        // max_iterations instead of honoring the human's answer. Accepted for
+        // this race's vanishingly narrow window rather than built out further.
+        // (The postBodyStatus tolerance above already let a 'paused' status
+        // through; nothing here re-checks it.)
+      }
     }
 
     // A failed body node fails the group immediately — mirrors the top-level DAG

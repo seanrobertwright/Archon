@@ -64,6 +64,7 @@ mock.module('@archon/paths', () => ({
 const {
   approveWorkflow,
   rejectWorkflow,
+  respondToWorkflow,
   getWorkflowStatus,
   resumeWorkflow,
   abandonWorkflow,
@@ -193,6 +194,37 @@ describe('approveWorkflow', () => {
         structured_output: { decision: 'approve', text: 'Looks good' },
       },
     });
+  });
+
+  test('approves an escalated body-terminal-gate pause — node_completed lands under the namespaced <nodeId>.<bodyGateId> step_name (#2707 step 3)', async () => {
+    // nodeId is the enclosing loop_group's own id (so top-level resume routing
+    // finds it); bodyGateId carries the gate's own id — the namespaced write is
+    // what #2748's outerNodeOutputs pre-population keys on to find this decision
+    // again after a resume.
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({
+        metadata: {
+          approval: {
+            nodeId: 'grp',
+            message: 'Continue?',
+            type: 'approval',
+            bodyGateId: 'check',
+            decisions: [{ id: 'approve' }, { id: 'revise' }],
+            decisionsAuthored: true,
+          },
+        },
+      })
+    );
+
+    await approveWorkflow('run-1', 'looks good');
+
+    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({ step_name: 'grp.check' });
+    // The OTHER audit event (approval_received) is untouched — only node_completed,
+    // the one #2748's pre-population reads, needs the namespaced form.
+    const approvalReceived = casEvents.find(e => e.event_type === 'approval_received');
+    expect(approvalReceived).toMatchObject({ step_name: 'grp' });
   });
 
   test('approves legacy on_reject-configured gate — plain text output, unaffected by #2707', async () => {
@@ -792,6 +824,30 @@ describe('rejectWorkflow', () => {
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'rejected' });
   });
 
+  test('rejects an escalated body-terminal-gate pause — node_completed lands under the namespaced <nodeId>.<bodyGateId> step_name (#2707 step 3)', async () => {
+    const run = makePausedRun({
+      metadata: {
+        approval: {
+          nodeId: 'grp',
+          message: 'Continue?',
+          type: 'approval',
+          bodyGateId: 'check',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    mockGetWorkflowRun.mockResolvedValueOnce(run);
+
+    await rejectWorkflow('run-1', 'needs changes');
+
+    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({ step_name: 'grp.check' });
+    const approvalReceived = casEvents.find(e => e.event_type === 'approval_received');
+    expect(approvalReceived).toMatchObject({ step_name: 'grp' });
+  });
+
   test('new-mode approve-only gate rejects — no reject decision declared, cancels (no unreachable decision)', async () => {
     const run = makePausedRun({
       metadata: {
@@ -913,6 +969,60 @@ describe('rejectWorkflow', () => {
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
     expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
+describe('respondToWorkflow', () => {
+  beforeEach(() => {
+    mockCaptureApprovalResolved.mockClear();
+    mockGetWorkflowRun.mockClear();
+    mockResolveApprovalGate.mockClear();
+    mockResolveApprovalGate.mockResolvedValue({ resolved: true });
+  });
+
+  test('resolves a custom decision on an escalated body-terminal-gate pause — node_completed lands under the namespaced <nodeId>.<bodyGateId> step_name (#2707 step 3)', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({
+        metadata: {
+          approval: {
+            nodeId: 'grp',
+            message: 'Continue?',
+            type: 'approval',
+            bodyGateId: 'check',
+            decisions: [{ id: 'approve' }, { id: 'revise' }],
+            decisionsAuthored: true,
+          },
+        },
+      })
+    );
+
+    await respondToWorkflow('run-1', 'revise', 'please improve X');
+
+    const [, metadataPayload, events] = mockResolveApprovalGate.mock.calls[0] as [
+      string,
+      Record<string, unknown>,
+      Array<Record<string, unknown>>,
+    ];
+    expect(metadataPayload).toMatchObject({
+      approval: { nodeId: 'grp', bodyGateId: 'check', resolved: 'approved' },
+    });
+    const nodeCompleted = events.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      step_name: 'grp.check',
+      data: {
+        node_output: JSON.stringify({ decision: 'revise', text: 'please improve X' }),
+        structured_output: { decision: 'revise', text: 'please improve X' },
+      },
+    });
+    const approvalReceived = events.find(e => e.event_type === 'approval_received');
+    expect(approvalReceived).toMatchObject({ step_name: 'grp' });
+  });
+
+  test('delegates approve/reject to the dedicated functions unchanged', async () => {
+    mockGetWorkflowRun.mockResolvedValue(makePausedRun());
+    await respondToWorkflow('run-1', 'approve', 'looks good');
+    expect(mockResolveApprovalGate).toHaveBeenCalledTimes(1);
+    expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'approved' });
   });
 });
 
