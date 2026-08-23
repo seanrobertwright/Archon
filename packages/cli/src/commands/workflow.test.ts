@@ -142,20 +142,35 @@ mock.module('@archon/workflows/executor', () => ({
   }),
   hydrateResumableRun: mock(() => Promise.resolve(null)),
   withCapturedSource: mock(
-    (
+    async (
       body: (owner: {
         hold: (prepared: { captureRoot: string }) => void;
         adopt: () => void;
       }) => Promise<unknown>
-    ) =>
-      body({
-        hold: prepared => {
-          capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
-        },
-        adopt: () => {
-          capturedSourceOwnerCalls.push('adopt');
-        },
-      })
+    ) => {
+      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim.
+      // Mirrors the orchestrator/isolation mocks (orchestrator-agent.test.ts:202-231,
+      // orchestrator-isolation.test.ts:204-233): a stub that swallowed the owner would
+      // let a dropped adopt() through, and one that recorded only hold/adopt would
+      // still miss an adopt that arrives after the body returns — by which time the
+      // real wrapper has already deleted the capture a live run is executing from.
+      let held: string | undefined;
+      let adopted = false;
+      try {
+        return await body({
+          hold: prepared => {
+            held = prepared.captureRoot;
+            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
+          },
+          adopt: () => {
+            adopted = true;
+            capturedSourceOwnerCalls.push('adopt');
+          },
+        });
+      } finally {
+        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
+      }
+    }
   ),
   // Every resume form reaches this now, including `run <name> --resume`. Default: the run
   // predates captures, so the caller keeps live discovery — what the resume tests below
@@ -1368,7 +1383,7 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
     await expect(
       workflowRunCommand('/repo/root', 'assist', 'go', { noWorktree: true })
     ).rejects.toThrow('No workflows found');
-    expect(capturedSourceOwnerCalls).toEqual(['hold:/test/capture']);
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/test/capture', 'reclaim:/test/capture']);
   });
 });
 

@@ -37,6 +37,7 @@ import {
 } from '@archon/paths';
 import { isAbsolute, join } from 'node:path';
 import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
@@ -44,7 +45,6 @@ import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-chec
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
-  disposeWorkflowSource,
   executeWorkflow,
   finalizeWorkflowSource,
   hydrateResumableRun,
@@ -1004,6 +1004,15 @@ async function runWorkflowWithOwnedSource(
   const isContinuation = options.resume === true || continuationRun !== undefined;
 
   let preparedSource: PreparedWorkflowSource | undefined;
+  // Pinned at the moment of prepare so the SIGINT/SIGTERM cleanup never rm's a
+  // path a live run is reading from. For `--container` folder-codebase runs,
+  // `finalizeWorkflowSource` (workflow.ts:1749) reassigns `preparedSource` to a
+  // new object whose `captureRoot` is the LIVE artifacts directory the run
+  // executes from — rm-ing `preparedSource.captureRoot` on Ctrl-C mid-run would
+  // destroy the run's source. The original staged path is renamed away by
+  // either `finalizeWorkflowSource` (container) or `executeWorkflow`'s rename
+  // (everything else), so an `rm` against it is a no-op once prep has moved it.
+  let originalStagedRoot: string | undefined;
   if (!isContinuation && !options.dryRun && !options.stubsInitPath) {
     try {
       preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
@@ -1011,6 +1020,7 @@ async function runWorkflowWithOwnedSource(
       });
       // From here the owner reclaims it unless a run adopts it, whichever way we leave.
       owner.hold(preparedSource);
+      originalStagedRoot = preparedSource.captureRoot;
     } catch (error) {
       throw new Error(
         `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
@@ -2062,11 +2072,16 @@ async function runWorkflowWithOwnedSource(
       // the forced exit below never returns up the stack, so the ownership `finally` —
       // whose whole premise is "whichever way we leave" — never runs. Ctrl-C during
       // isolation resolution or worktree creation would otherwise strand a complete
-      // frozen tree. `rm -rf` on the now-renamed capture root is a no-op once
-      // `executeWorkflow` has adopted it, so no separate guard is needed (#2690).
+      // frozen tree.
+      //
+      // The rm targets the ORIGINAL staged path pinned at prepare time, not
+      // `preparedSource.captureRoot` (see `originalStagedRoot`'s note above).
+      // For container runs that path was renamed away by `finalizeWorkflowSource`
+      // and `preparedSource.captureRoot` is now the LIVE artifacts directory —
+      // rm-ing it mid-execution would destroy the run's source.
       .then(async () => {
-        if (preparedSource) {
-          await disposeWorkflowSource(preparedSource).catch(() => undefined);
+        if (originalStagedRoot) {
+          await rm(originalStagedRoot, { recursive: true, force: true }).catch(() => undefined);
         }
       })
       .catch(() => undefined)
