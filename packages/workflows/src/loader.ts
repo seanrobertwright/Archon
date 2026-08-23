@@ -378,10 +378,14 @@ function collectUnknownNodeKeys(raw: unknown, id: string, label: string, warning
  * enclosing loop_group, but that escalation is bounded to that one level) or
  * transitively (a `loop:` node with `interactive: true`, the legacy mechanism,
  * or a `loop_group:` node that is itself `interactive: true` or whose own sole
- * terminal sink recurses into this same case, at any nesting depth). Mirrors
- * `findLoopGroupTerminalGate`'s doc comment (dag-executor.ts:4153-4164): the
- * runtime has no unambiguous way to escalate a pause through a sink that isn't
- * a bare gate, so this only makes that gap visible at load time.
+ * terminal sink recurses into this same case, following a chain of well-formed
+ * sole-terminal-sink nesting to any depth). A gate that is mid-body or
+ * co-terminal with another sink breaks the chain here too — the placement
+ * check in `collectGateAndLoopDeprecationWarnings` below already warns about
+ * that misplacement on its own. Mirrors `findLoopGroupTerminalGate`'s doc comment
+ * (dag-executor.ts:4153-4164): the runtime has no unambiguous way to escalate
+ * a pause through a sink that isn't a bare gate, so this only makes that gap
+ * visible at load time.
  */
 function isUnescalatableInteractiveSink(node: DagNode | IncludeDirective): boolean {
   if (isIncludeDirective(node)) return false;
@@ -557,7 +561,7 @@ function collectGateAndLoopDeprecationWarnings(
         const message =
           `Node '${id}': this loop_group's terminal sink ('${sink.id}') is itself an ` +
           'interactive loop/loop_group — a pause inside it does not escalate to stop ' +
-          `'${id}''s own iteration (#2753). The outer loop can run further iterations ` +
+          "this loop_group's own iteration (#2753). The outer loop can run further iterations " +
           "while a human's answer to the inner pause is still pending. Only a gate node " +
           'directly as the terminal sink correctly stops the enclosing loop_group ' +
           '(#2707 step 3).';
