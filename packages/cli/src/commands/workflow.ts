@@ -970,6 +970,9 @@ async function runWorkflowWithOwnedSource(
   if (detachedProcessOwner) Reflect.deleteProperty(process.env, DETACHED_RUN_OWNER_ENV);
   if (detachedProcessOwner) assertDetachedRunProcessOwner();
   const effectiveDiscoveryCwd = options.discoveryCwd ?? cwd;
+  const modelOverrides = options.modelAssignments
+    ? parseRunModelAssignments(options.modelAssignments)
+    : undefined;
 
   // Freeze the source BEFORE discovering, then discover from the frozen copy. Discovering
   // first and capturing after would leave a window where the YAML this run executes and
@@ -1112,9 +1115,6 @@ async function runWorkflowWithOwnedSource(
       '--resume and --model are mutually exclusive. A resumed run keeps its original model bindings.'
     );
   }
-  const modelOverrides = options.modelAssignments
-    ? parseRunModelAssignments(options.modelAssignments)
-    : undefined;
 
   const dryRunOnlyOptions = [
     ['--stubs', options.stubsPath !== undefined],

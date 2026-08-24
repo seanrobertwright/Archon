@@ -1344,8 +1344,8 @@ describe('workflowRunCommand — sparse model bindings (#2481)', () => {
   });
 
   it('rejects bare and duplicate mappings before execution', async () => {
-    const { executeWorkflow } = await import('@archon/workflows/executor');
-    await stubWorkflow();
+    const { executeWorkflow, prepareWorkflowSource } = await import('@archon/workflows/executor');
+    const prepareCallsBefore = (prepareWorkflowSource as ReturnType<typeof mock>).mock.calls.length;
     await expect(
       workflowRunCommand('/repo/root', 'bench', 'go', {
         noWorktree: true,
@@ -1353,8 +1353,10 @@ describe('workflowRunCommand — sparse model bindings (#2481)', () => {
       })
     ).rejects.toThrow(/Expected/);
     expect(executeWorkflow).not.toHaveBeenCalled();
+    expect((prepareWorkflowSource as ReturnType<typeof mock>).mock.calls).toHaveLength(
+      prepareCallsBefore
+    );
 
-    await stubWorkflow();
     await expect(
       workflowRunCommand('/repo/root', 'bench', 'go', {
         noWorktree: true,
