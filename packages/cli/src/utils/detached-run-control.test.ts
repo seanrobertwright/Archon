@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { createConnection } from 'node:net';
+import { rmSync } from 'node:fs';
+import { createConnection, createServer } from 'node:net';
 import {
   detachedRunControlPath,
   DetachedRunOwnerUnavailableError,
@@ -41,5 +42,34 @@ describe('detached run control', () => {
     await expect(requestDetachedRunStop(runId)).rejects.toBeInstanceOf(
       DetachedRunOwnerUnavailableError
     );
+  });
+
+  it('fails when the owner closes before committing termination', async () => {
+    const runId = `close-before-ready-${crypto.randomUUID()}`;
+    const path = detachedRunControlPath(runId);
+    const server = createServer(socket => {
+      socket.setEncoding('utf8');
+      let request = '';
+      socket.on('data', chunk => {
+        request += chunk;
+        if (request.includes('stop\n')) {
+          socket.write(`${JSON.stringify({ pid: 12345 })}\n`);
+          request = request.replace('stop\n', '');
+        }
+        if (request.includes('terminate\n')) socket.end();
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(path, resolve);
+    });
+
+    try {
+      const target = await requestDetachedRunStop(runId);
+      await expect(target.stop()).rejects.toThrow(/closed before committing termination/);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
   });
 });

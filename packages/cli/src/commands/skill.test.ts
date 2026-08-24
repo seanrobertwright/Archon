@@ -66,6 +66,8 @@ describe('copyArchonSkill', () => {
       expect(content).toContain('archon workflow cancel <run-id>');
       expect(content).not.toContain('there is no `archon workflow cancel` CLI subcommand');
       expect(content).not.toContain('There is no separate `cancel` verb');
+      expect(content).not.toContain('cancel via reject');
+      expect(content).not.toContain('Reject (cancels the workflow)');
     }
   });
 

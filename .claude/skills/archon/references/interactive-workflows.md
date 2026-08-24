@@ -95,7 +95,7 @@ When the workflow finishes (status becomes `completed` or `failed`), report the 
 # Approve with feedback (interactive loops)
 archon workflow approve <run-id> "your feedback or answers here"
 
-# Reject (cancels the workflow)
+# Reject an approval gate (cancels or queues its on_reject rework path)
 archon workflow reject <run-id> "reason for rejection"
 ```
 

@@ -84,8 +84,8 @@ archon workflow approve <run-id> "ship it" --json   # records the approval (resu
 archon workflow resume <run-id>                      # execute it — run this as a BACKGROUND task
 archon workflow get <run-id> --json                  # poll until completed/failed
 ```
-If you only need to record the decision (e.g. cancel via reject) and don't need to
-drive the run forward, the `--json` step alone is enough. To approve **and** continue
+If you only need to record a gate decision and don't need to drive the resulting
+cancel-or-rework path forward, the `--json` step alone is enough. To approve **and** continue
 in one blocking call, drop `--json`: `archon workflow approve <run-id> "ship it"`
 auto-resumes (run it as a background task).
 
