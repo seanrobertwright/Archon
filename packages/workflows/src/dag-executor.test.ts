@@ -25977,6 +25977,7 @@ describe('subprocess credential redaction', () => {
         'docs/',
         {
           ...minimalConfig,
+          // Secret-suffixed keys redact automatically; BASE_BRANCH is the visible control.
           envVars: {
             OPENAI_API_KEY: openAiSecret,
             CUSTOM_AUTH: otherInjectedSecret,
