@@ -125,7 +125,12 @@ nodes:
         assessment prescribes the decoupling; if reality contradicts it (the
         coupling cannot be removed as prescribed), stop honestly with green
         false and the contradiction in your summary rather than substituting
-        an alarm-disarming shim. Meet the assessment's proof bar before
+        an alarm-disarming shim. One authorized exception: if your own
+        instrumented evidence PROVES the prescribed layer cannot produce the
+        required outcome, implement the fix at the layer your proof identifies
+        — state the escalation, its blast radius, and the proof in your report
+        so the reviewer judges the trade-off in the pull request. Alarm-
+        disarming shims stay forbidden at every layer. Meet the assessment's proof bar before
         declaring green: demonstrate the flake is dead (repeated runs under
         the triggering condition, the named coupling demonstrably gone) and,
         where the assessment demands it, that the test still fails on the
