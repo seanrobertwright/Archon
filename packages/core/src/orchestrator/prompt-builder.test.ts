@@ -160,12 +160,15 @@ describe('buildRunManagementSection', () => {
       'archon workflow approve',
       'archon workflow reject',
       'archon workflow resume',
+      'archon workflow cancel',
       'archon workflow abandon',
     ]) {
       expect(section).toContain(verb);
     }
     expect(section).toContain('--json');
     expect(section).toContain('--detach');
+    expect(section).toContain('actively stop');
+    expect(section).toContain('state-only cancellation');
   });
 
   test('tells the CLI-path providers to pass the user’s own words', () => {

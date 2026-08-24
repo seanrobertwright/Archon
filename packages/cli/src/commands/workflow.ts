@@ -111,7 +111,6 @@ import {
   DETACHED_RUN_OWNER_ENV,
   requestDetachedRunStop,
   startDetachedRunControlServer,
-  terminateDetachedProcessTree,
 } from '../utils/detached-run-control';
 import { resolveCliUserId } from './auth';
 
@@ -2026,15 +2025,12 @@ async function runWorkflowWithOwnedSource(
   // don't stack handlers).
   let ownedRunId: string | undefined =
     resumable?.id ?? (detachedProcessOwner ? preparedSource?.runId : undefined);
-  let operatorStopRequested = false;
   let detachedRunControl: Awaited<ReturnType<typeof startDetachedRunControlServer>> | undefined;
   if (detachedProcessOwner) {
     if (ownedRunId === undefined) {
       throw new Error('Detached workflow owner has no resolved run ID');
     }
-    detachedRunControl = await startDetachedRunControlServer(ownedRunId, requested => {
-      operatorStopRequested = requested;
-    });
+    detachedRunControl = await startDetachedRunControlServer(ownedRunId);
   }
   let terminating = false;
   const cleanup = (signal: string): void => {
@@ -2052,7 +2048,7 @@ async function runWorkflowWithOwnedSource(
         );
         return;
       }
-      if (operatorStopRequested) {
+      if (detachedRunControl?.isStopRequested()) {
         // The exact-run controller has proved ownership and is terminating this
         // process tree. It records `cancelled` only after termination succeeds;
         // do not race it by translating the operator's stop into generic failure.
@@ -3250,11 +3246,7 @@ export async function workflowCancelCommand(
     }
 
     const target = await requestDetachedRunStop(resolvedId);
-    try {
-      await terminateDetachedProcessTree(target.pid);
-    } finally {
-      target.close();
-    }
+    await target.stop();
 
     const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
     return {

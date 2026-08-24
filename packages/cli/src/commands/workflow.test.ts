@@ -45,25 +45,24 @@ const mockLogger = {
   child: mock(() => mockLogger),
 };
 
-const mockDetachedTargetClose = mock(() => undefined);
+const mockDetachedTargetStop = mock(() => Promise.resolve());
+const mockDetachedTargetRelease = mock(() => undefined);
 const mockRequestDetachedRunStop = mock(() =>
-  Promise.resolve({ pid: 43_210, close: mockDetachedTargetClose })
+  Promise.resolve({ stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
 );
-const mockTerminateDetachedProcessTree = mock(() => Promise.resolve());
 const mockDetachedControlClose = mock(() => Promise.resolve());
-let capturedDetachedStopRequest: ((requested: boolean) => void) | undefined;
-const mockStartDetachedRunControlServer = mock(
-  (_runId: string, onStopRequestChanged: (requested: boolean) => void) => {
-    capturedDetachedStopRequest = onStopRequestChanged;
-    return Promise.resolve({ close: mockDetachedControlClose });
-  }
+let mockDetachedStopRequested = false;
+const mockStartDetachedRunControlServer = mock((_runId: string) =>
+  Promise.resolve({
+    close: mockDetachedControlClose,
+    isStopRequested: () => mockDetachedStopRequested,
+  })
 );
 
 mock.module('../utils/detached-run-control', () => ({
   DETACHED_RUN_OWNER_ENV: 'ARCHON_DETACHED_RUN_OWNER',
   requestDetachedRunStop: mockRequestDetachedRunStop,
   startDetachedRunControlServer: mockStartDetachedRunControlServer,
-  terminateDetachedProcessTree: mockTerminateDetachedProcessTree,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -6538,10 +6537,13 @@ describe('workflowCancelCommand', () => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
     stdoutSpy = spyOnJsonStdout();
     mockRequestDetachedRunStop.mockReset();
-    mockRequestDetachedRunStop.mockResolvedValue({ pid: 43_210, close: mockDetachedTargetClose });
-    mockTerminateDetachedProcessTree.mockReset();
-    mockTerminateDetachedProcessTree.mockResolvedValue();
-    mockDetachedTargetClose.mockClear();
+    mockRequestDetachedRunStop.mockResolvedValue({
+      stop: mockDetachedTargetStop,
+      release: mockDetachedTargetRelease,
+    });
+    mockDetachedTargetStop.mockReset();
+    mockDetachedTargetStop.mockResolvedValue();
+    mockDetachedTargetRelease.mockClear();
 
     const workflowDb = require('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockReset();
@@ -6565,10 +6567,12 @@ describe('workflowCancelCommand', () => {
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue(row);
     mockRequestDetachedRunStop.mockImplementation(async () => {
       order.push('owner');
-      return { pid: 43_210, close: mockDetachedTargetClose };
-    });
-    mockTerminateDetachedProcessTree.mockImplementation(async () => {
-      order.push('terminate');
+      return {
+        stop: async () => {
+          order.push('terminate');
+        },
+        release: mockDetachedTargetRelease,
+      };
     });
     (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockImplementation(async () => {
       order.push('cancel-state');
@@ -6579,8 +6583,6 @@ describe('workflowCancelCommand', () => {
 
     expect(order).toEqual(['owner', 'terminate', 'cancel-state']);
     expect(mockRequestDetachedRunStop).toHaveBeenCalledWith(runId);
-    expect(mockTerminateDetachedProcessTree).toHaveBeenCalledWith(43_210);
-    expect(mockDetachedTargetClose).toHaveBeenCalledTimes(1);
     expect(consoleSpy).toHaveBeenCalledWith(
       'Host process tree stopped before run state was changed.'
     );
@@ -6599,7 +6601,7 @@ describe('workflowCancelCommand', () => {
 
     await workflowCancelCommand(runId, true);
 
-    expect(mockTerminateDetachedProcessTree).not.toHaveBeenCalled();
+    expect(mockDetachedTargetStop).not.toHaveBeenCalled();
     expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
     expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
       ok: false,
@@ -6616,11 +6618,10 @@ describe('workflowCancelCommand', () => {
       workflow_name: 'implement',
       status: 'running',
     });
-    mockTerminateDetachedProcessTree.mockRejectedValue(new Error('process still exists'));
+    mockDetachedTargetStop.mockRejectedValue(new Error('process still exists'));
 
     await workflowCancelCommand(runId, true);
 
-    expect(mockDetachedTargetClose).toHaveBeenCalledTimes(1);
     expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
     expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
       ok: false,
@@ -7412,7 +7413,7 @@ describe('workflowRunCommand — progress rendering', () => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
     stderrSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
     capturedSubscribeHandler = null;
-    capturedDetachedStopRequest = undefined;
+    mockDetachedStopRequested = false;
     mockUnsubscribe.mockClear();
     mockStartDetachedRunControlServer.mockClear();
     mockDetachedControlClose.mockClear();
@@ -7842,6 +7843,9 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
     // handler in-process doesn't kill the test runner.
     exitSpy = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     capturedSubscribeHandler = null;
+    mockDetachedStopRequested = false;
+    mockStartDetachedRunControlServer.mockClear();
+    mockDetachedControlClose.mockClear();
     mockUnsubscribe.mockClear();
 
     const workflowsDb = require('@archon/core/db/workflows');
@@ -7957,8 +7961,7 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
     const sigtermBefore = process.listeners('SIGTERM');
     const { executeWorkflow } = require('@archon/workflows/executor');
     (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce(async () => {
-      expect(capturedDetachedStopRequest).toBeDefined();
-      capturedDetachedStopRequest?.(true);
+      mockDetachedStopRequested = true;
       const [handler] = addedSigtermListeners(sigtermBefore);
       expect(handler).toBeDefined();
       handler();
@@ -7971,10 +7974,7 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
       'Workflow failed'
     );
 
-    expect(mockStartDetachedRunControlServer).toHaveBeenCalledWith(
-      'test-run-id',
-      expect.any(Function)
-    );
+    expect(mockStartDetachedRunControlServer).toHaveBeenCalledWith('test-run-id');
     expect(workflowsDb.getWorkflowRunStatus).not.toHaveBeenCalled();
     expect(workflowsDb.failWorkflowRun).not.toHaveBeenCalled();
     expect(exitSpy).toHaveBeenCalledWith(1);

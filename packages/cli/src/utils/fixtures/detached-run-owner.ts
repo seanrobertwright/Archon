@@ -19,6 +19,6 @@ leakWriter.on('error', error => {
   throw error;
 });
 
-await startDetachedRunControlServer(runId, () => undefined);
+await startDetachedRunControlServer(runId);
 writeFileSync(readyPath, String(process.pid));
 setInterval(() => undefined, 1_000);

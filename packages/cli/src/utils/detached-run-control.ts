@@ -19,11 +19,12 @@ const execFileAsync = promisify(execFile);
 
 export interface DetachedRunControlServer {
   close(): Promise<void>;
+  isStopRequested(): boolean;
 }
 
 export interface DetachedRunStopTarget {
-  pid: number;
-  close(): void;
+  stop(): Promise<void>;
+  release(): void;
 }
 
 export class DetachedRunOwnerUnavailableError extends Error {
@@ -160,14 +161,14 @@ function releaseOwnerLock(lockPath: string, lockFd: number): void {
  * A connection alone is only a liveness probe; the explicit `stop` frame is the mutation request.
  */
 export async function startDetachedRunControlServer(
-  runId: string,
-  onStopRequestChanged: (requested: boolean) => void
+  runId: string
 ): Promise<DetachedRunControlServer> {
   const path = detachedRunControlPath(runId);
   const lockPath = detachedRunControlLockPath(runId);
   const lockFd = await acquireOwnerLock(runId, path);
   const sockets = new Set<Socket>();
   const stopSockets = new Set<Socket>();
+  const stopReleaseWaiters = new Set<() => void>();
   const server = createServer(socket => {
     sockets.add(socket);
     socket.setEncoding('utf8');
@@ -191,7 +192,6 @@ export async function startDetachedRunControlServer(
       }
 
       stopSockets.add(socket);
-      onStopRequestChanged(true);
       socket.setTimeout(0);
       socket.write(`${JSON.stringify({ pid: process.pid })}\n`);
       // Keep this connection open through process-tree termination. It is the
@@ -200,7 +200,8 @@ export async function startDetachedRunControlServer(
     socket.once('close', () => {
       sockets.delete(socket);
       if (stopSockets.delete(socket) && stopSockets.size === 0) {
-        onStopRequestChanged(false);
+        for (const resolve of stopReleaseWaiters) resolve();
+        stopReleaseWaiters.clear();
       }
     });
   });
@@ -212,22 +213,30 @@ export async function startDetachedRunControlServer(
     throw error;
   }
 
-  let closed = false;
+  let closePromise: Promise<void> | undefined;
   return {
     close: async (): Promise<void> => {
-      if (closed) return;
-      closed = true;
-      for (const socket of sockets) socket.destroy();
-      if (server.listening) {
-        await new Promise<void>(resolve =>
-          server.close(() => {
-            resolve();
-          })
-        );
-      }
-      if (process.platform !== 'win32') rmSync(path, { force: true });
-      releaseOwnerLock(lockPath, lockFd);
+      if (closePromise) return closePromise;
+      closePromise = (async (): Promise<void> => {
+        if (stopSockets.size > 0) {
+          await new Promise<void>(resolve => {
+            stopReleaseWaiters.add(resolve);
+          });
+        }
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>(resolve =>
+            server.close(() => {
+              resolve();
+            })
+          );
+        }
+        if (process.platform !== 'win32') rmSync(path, { force: true });
+        releaseOwnerLock(lockPath, lockFd);
+      })();
+      return closePromise;
     },
+    isStopRequested: (): boolean => stopSockets.size > 0,
   };
 }
 
@@ -251,7 +260,7 @@ function parseOwnerResponse(runId: string, raw: string): number {
   return parsed.pid;
 }
 
-/** Ask the live exact-run owner to prepare for termination and retain the proof connection. */
+/** Ask the live exact-run owner for an opaque termination lease. */
 export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTarget> {
   const path = detachedRunControlPath(runId);
   return new Promise((resolve, reject) => {
@@ -288,11 +297,21 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
         const pid = parseOwnerResponse(runId, response.slice(0, newline));
         settled = true;
         socket.setTimeout(0);
+        let released = false;
+        const release = (): void => {
+          if (released) return;
+          released = true;
+          socket.destroy();
+        };
         resolve({
-          pid,
-          close: () => {
-            socket.destroy();
+          stop: async (): Promise<void> => {
+            try {
+              await terminateDetachedProcessTree(pid, () => !released && !socket.destroyed);
+            } finally {
+              release();
+            }
           },
+          release,
         });
       } catch (error) {
         socket.destroy();
@@ -329,21 +348,26 @@ async function waitUntilGone(exists: () => boolean, timeoutMs: number): Promise<
   return true;
 }
 
-/** Terminate only the process tree proved by the live run-control handshake. */
-export async function terminateDetachedProcessTree(pid: number): Promise<void> {
+/** Terminate the process tree while its exact-run owner holds the IPC lease open. */
+async function terminateDetachedProcessTree(
+  pid: number,
+  ownsLiveLease: () => boolean
+): Promise<void> {
   if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
     throw new Error(`Refusing to terminate invalid detached owner PID ${String(pid)}`);
   }
+  if (!ownsLiveLease()) {
+    throw new Error(`Detached workflow owner ${String(pid)} released its termination lease`);
+  }
 
   if (process.platform === 'win32') {
-    try {
-      await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
-        timeout: TERMINATION_GRACE_MS,
-        windowsHide: true,
-      });
-    } catch (error) {
-      if (processExists(pid)) throw error;
-    }
+    // A zero exit from taskkill /T is the platform's positive tree-termination
+    // result. Never translate a timeout or partial failure into success merely
+    // because the root disappeared; descendants are part of this contract.
+    await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      timeout: TERMINATION_GRACE_MS,
+      windowsHide: true,
+    });
     if (!(await waitUntilGone(() => processExists(pid), TERMINATION_CONFIRM_MS))) {
       throw new Error(`Detached workflow process tree ${String(pid)} is still running`);
     }

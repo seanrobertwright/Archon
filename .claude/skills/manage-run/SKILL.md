@@ -46,9 +46,8 @@ workflows, setup, or config, use the broader **`archon`** skill instead.
 | **Approve** a paused gate | `archon workflow approve <run-id> "looks good" --json` |
 | **Accept & complete** a loop gate with a completed condition | `archon workflow approve <run-id> --json` (NO comment) |
 | **Reject** a paused gate | `archon workflow reject <run-id> "fix X first" --json` |
-| **Cancel** a non-terminal run | `archon workflow abandon <run-id> --json` |
-
-> There is no separate `cancel` verb — `abandon` cancels a non-terminal run by id.
+| **Actively stop** a running CLI `--detach` run | `archon workflow cancel <run-id> --json` |
+| Mark a paused or verified-orphan run cancelled without stopping host work | `archon workflow abandon <run-id> --json` |
 
 ## Patterns
 

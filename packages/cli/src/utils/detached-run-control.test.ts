@@ -9,7 +9,6 @@ import {
   DetachedRunOwnerUnavailableError,
   requestDetachedRunStop,
   startDetachedRunControlServer,
-  terminateDetachedProcessTree,
 } from './detached-run-control';
 
 const cleanupPaths: string[] = [];
@@ -43,10 +42,7 @@ function waitForExit(child: ChildProcess): Promise<void> {
 describe('detached run control', () => {
   it('treats a connection as a harmless probe and refuses to replace a live owner', async () => {
     const runId = `probe-${crypto.randomUUID()}`;
-    let stopRequested = false;
-    const owner = await startDetachedRunControlServer(runId, requested => {
-      stopRequested = requested;
-    });
+    const owner = await startDetachedRunControlServer(runId);
 
     const probe = createConnection(detachedRunControlPath(runId));
     await new Promise<void>((resolve, reject) => {
@@ -55,15 +51,21 @@ describe('detached run control', () => {
     });
     probe.destroy();
 
-    expect(stopRequested).toBe(false);
-    await expect(startDetachedRunControlServer(runId, () => undefined)).rejects.toThrow(
-      /already owned/
-    );
+    expect(owner.isStopRequested()).toBe(false);
+    await expect(startDetachedRunControlServer(runId)).rejects.toThrow(/already owned/);
     const target = await requestDetachedRunStop(runId);
-    expect(stopRequested).toBe(true);
-    target.close();
-    await waitFor(() => !stopRequested);
-    await owner.close();
+    expect(owner.isStopRequested()).toBe(true);
+
+    let closed = false;
+    const closing = owner.close().then(() => {
+      closed = true;
+    });
+    await new Promise<void>(resolve => setTimeout(resolve, 25));
+    expect(closed).toBe(false);
+
+    target.release();
+    await closing;
+    expect(owner.isStopRequested()).toBe(false);
   });
 
   it('fails explicitly when no live owner is reachable', async () => {
@@ -90,19 +92,15 @@ describe('detached run control', () => {
     try {
       await waitFor(() => existsSync(readyPath));
       const target = await requestDetachedRunStop(runId);
-      expect(target.pid).toBe(owner.pid);
-      try {
-        await terminateDetachedProcessTree(target.pid);
-      } finally {
-        target.close();
-      }
+      await target.stop();
       await exited;
       await new Promise<void>(resolve => setTimeout(resolve, 1_300));
       expect(existsSync(leakPath)).toBe(false);
     } finally {
       if (owner.exitCode === null && owner.signalCode === null) {
         try {
-          await terminateDetachedProcessTree(owner.pid);
+          if (process.platform === 'win32') owner.kill();
+          else process.kill(-owner.pid, 'SIGKILL');
         } catch {
           // The primary assertion reports failures; cleanup is best-effort for an already-gone fixture.
         }

@@ -52,6 +52,23 @@ describe('copyArchonSkill', () => {
     }
   });
 
+  it('installs active cancel guidance without the obsolete abandon mapping', async () => {
+    await copyArchonSkill(tempDir);
+
+    const guidance = [
+      join(tempDir, '.agents', 'skills', 'manage-run', 'SKILL.md'),
+      join(tempDir, '.agents', 'skills', 'manage-run', 'references', 'commands.md'),
+      join(tempDir, '.agents', 'skills', 'archon', 'references', 'interactive-workflows.md'),
+      join(tempDir, '.agents', 'skills', 'archon', 'references', 'troubleshooting.md'),
+    ].map(path => readFileSync(path, 'utf-8'));
+
+    for (const content of guidance) {
+      expect(content).toContain('archon workflow cancel <run-id>');
+      expect(content).not.toContain('there is no `archon workflow cancel` CLI subcommand');
+      expect(content).not.toContain('There is no separate `cancel` verb');
+    }
+  });
+
   it('overwrites pre-existing skill files with bundled content', async () => {
     const skillRoot = join(tempDir, '.claude', 'skills', 'archon');
     const skillMdPath = join(skillRoot, 'SKILL.md');
