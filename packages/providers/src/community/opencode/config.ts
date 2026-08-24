@@ -1,4 +1,5 @@
 import type { OpencodeProviderDefaults } from '../../types';
+import { InvalidProviderRunConfigError } from '../../errors';
 import { assertKnownRunConfigKeys, invalidRunConfigValue } from '../../shared/run-config';
 
 export type { OpencodeProviderDefaults };
@@ -31,8 +32,9 @@ export function parseOpencodeConfig(raw: Record<string, unknown>): OpencodeProvi
     result.baseUrl = raw.baseUrl;
   }
 
-  if (typeof raw.agent === 'string') {
-    result.agent = raw.agent;
+  const opencodeConfig = raw.opencode as Record<string, unknown> | undefined;
+  if (typeof opencodeConfig?.agent === 'string') {
+    result.agent = opencodeConfig.agent;
   }
 
   return result;
@@ -41,9 +43,20 @@ export function parseOpencodeConfig(raw: Record<string, unknown>): OpencodeProvi
 /** Strict counterpart used only for an explicitly selected per-run layer. */
 export function parseOpencodeRunConfig(raw: Record<string, unknown>): OpencodeProviderDefaults {
   assertKnownRunConfigKeys(raw, ['model', 'baseUrl', 'agent']);
-  for (const key of ['model', 'baseUrl', 'agent'] as const) {
-    if (raw[key] !== undefined && typeof raw[key] !== 'string') {
-      invalidRunConfigValue(key, 'a string');
+  if (raw.model !== undefined) {
+    if (typeof raw.model !== 'string') invalidRunConfigValue('model', 'a string');
+    if (parseModelRef(raw.model) === null) {
+      invalidRunConfigValue('model', "'<provider>/<model>'");
+    }
+  }
+  for (const key of ['baseUrl', 'agent'] as const) {
+    if (Object.hasOwn(raw, key)) {
+      throw new InvalidProviderRunConfigError(
+        key,
+        key === 'baseUrl'
+          ? 'external OpenCode runtimes are not supported'
+          : 'default OpenCode agents are not consumed by workflow runs'
+      );
     }
   }
   return parseOpencodeConfig(raw);

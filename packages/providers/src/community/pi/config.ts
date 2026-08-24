@@ -192,8 +192,6 @@ export function parsePiRunConfig(raw: Record<string, unknown>): ParsedPiConfig {
     'enableExtensions',
     'interactive',
     'extensionFlags',
-    'env',
-    'maxConcurrent',
     'nodes',
   ]);
   if (raw.model !== undefined && typeof raw.model !== 'string') {
@@ -206,22 +204,6 @@ export function parsePiRunConfig(raw: Record<string, unknown>): ParsedPiConfig {
         .map(key => [key, raw[key]])
     )
   );
-  if (raw.env !== undefined) {
-    if (!isConfigRecord(raw.env)) {
-      invalidRunConfigValue('env', 'an object of string values');
-    }
-    for (const [key, value] of Object.entries(raw.env)) {
-      if (typeof value !== 'string') invalidRunConfigValue(`env.${key}`, 'a string');
-    }
-  }
-  if (
-    raw.maxConcurrent !== undefined &&
-    (typeof raw.maxConcurrent !== 'number' ||
-      !Number.isInteger(raw.maxConcurrent) ||
-      raw.maxConcurrent <= 0)
-  ) {
-    invalidRunConfigValue('maxConcurrent', 'a positive integer');
-  }
   if (raw.nodes !== undefined) {
     if (!isConfigRecord(raw.nodes)) {
       invalidRunConfigValue('nodes', 'an object of per-node settings');

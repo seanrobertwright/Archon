@@ -111,17 +111,6 @@ function normalizeRunConfigSemantics(layer: WorkflowRunConfigLayer): WorkflowRun
   const assistants: Record<string, Record<string, unknown>> = {};
   for (const [provider, defaults] of Object.entries(layer.assistants ?? {})) {
     assertRegisteredProvider(provider, `assistants.${provider}`);
-    try {
-      assistants[provider] = getRegistration(provider).parseRunConfig(defaults);
-    } catch (error) {
-      if (error instanceof InvalidProviderRunConfigError) {
-        const suffix = error.fieldPath ? `.${error.fieldPath}` : '';
-        throw new Error(
-          `Invalid run config at 'assistants.${provider}${suffix}': ${error.message}.`
-        );
-      }
-      throw error;
-    }
     if (provider === 'pi' && Object.hasOwn(defaults, 'env')) {
       throw new Error(
         "Run config key 'assistants.pi.env' cannot apply: Pi extension environment mutates " +
@@ -133,6 +122,17 @@ function normalizeRunConfigSemantics(layer: WorkflowRunConfigLayer): WorkflowRun
         "Run config key 'assistants.pi.maxConcurrent' cannot apply: Pi concurrency is " +
           'initialized once for the process lifetime.'
       );
+    }
+    try {
+      assistants[provider] = getRegistration(provider).parseRunConfig(defaults);
+    } catch (error) {
+      if (error instanceof InvalidProviderRunConfigError) {
+        const suffix = error.fieldPath ? `.${error.fieldPath}` : '';
+        throw new Error(
+          `Invalid run config at 'assistants.${provider}${suffix}': ${error.message}.`
+        );
+      }
+      throw error;
     }
   }
   for (const [tier, preset] of Object.entries(layer.tiers ?? {})) {

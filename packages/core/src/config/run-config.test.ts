@@ -137,6 +137,9 @@ describe('workflow run config', () => {
       ['codex', { typo: true }, 'assistants.codex.typo'],
       ['claude', { settingSources: 'project' }, 'assistants.claude.settingSources'],
       ['pi', { apiKey: 'secret' }, 'assistants.pi.apiKey'],
+      ['opencode', { model: 'gpt-5' }, 'assistants.opencode.model'],
+      ['opencode', { baseUrl: 'http://localhost:4096' }, 'assistants.opencode.baseUrl'],
+      ['opencode', { agent: 'general' }, 'assistants.opencode.agent'],
     ] as const) {
       expect(() =>
         parseWorkflowRunConfig(
@@ -156,10 +159,10 @@ describe('workflow run config', () => {
     expect(parsed.layer.assistants?.copilot).toEqual({ modelReasoningEffort: 'xhigh' });
     expect(
       parseWorkflowRunConfig(
-        { assistants: { opencode: { agent: 'general' } } },
+        { assistants: { opencode: { model: 'anthropic/claude-sonnet-4-5' } } },
         { kind: 'http', label: 'inline' }
       ).layer.assistants?.opencode
-    ).toEqual({ agent: 'general' });
+    ).toEqual({ model: 'anthropic/claude-sonnet-4-5' });
   });
 
   it('seals secrets for replay while exposing only attribution and key paths', () => {
