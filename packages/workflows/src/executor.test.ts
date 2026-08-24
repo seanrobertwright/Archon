@@ -900,6 +900,52 @@ describe('executeWorkflow', () => {
       ).rejects.toThrow(/Cannot supply model overrides when resuming/);
     });
 
+    it('resumes a persisted no-op effort accepted by the provider', async () => {
+      const preCreatedRun = makeRun({
+        id: 'resume-opencode-effort-run',
+        status: 'running',
+        metadata: {
+          model_bindings: {
+            overrides: {
+              tiers: {
+                large: {
+                  provider: 'opencode',
+                  model: 'anthropic/claude-sonnet-4-6',
+                  effort: 'ultra',
+                },
+              },
+            },
+            effective: {
+              defaultProvider: 'claude',
+              aliases: {
+                small: { provider: 'claude', model: 'haiku' },
+                medium: { provider: 'claude', model: 'sonnet' },
+                large: {
+                  provider: 'opencode',
+                  model: 'anthropic/claude-sonnet-4-6',
+                  effort: 'ultra',
+                },
+              },
+            },
+          },
+        },
+      });
+
+      await executeWorkflow(
+        makeDeps(makeStore()),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun, priorCompletedNodes: new Map() }
+      );
+
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('opencode');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('anthropic/claude-sonnet-4-6');
+    });
+
     it('fails a pre-created row when a semantic binding error stops startup', async () => {
       const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preCreatedRun = makeRun({ id: 'invalid-model-run', status: 'pending', metadata: {} });

@@ -133,7 +133,7 @@ function assertValidPersistedPreset(name: string, entry: unknown): asserts entry
   if (record.effort !== undefined) {
     if (
       typeof record.effort !== 'string' ||
-      !EFFORT_LEVELS.some(effort => effort === record.effort)
+      !isEffortValidForProvider(record.provider as string, record.effort)
     ) {
       throw new Error(`Model binding '${name}' has an invalid effort.`);
     }

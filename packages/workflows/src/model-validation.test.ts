@@ -448,7 +448,7 @@ describe('per-run model bindings', () => {
               medium: {
                 provider: 'opencode',
                 model: 'anthropic/claude-sonnet-4-6',
-                effort: 'high',
+                effort: 'ultra',
               },
             },
           },
