@@ -15,8 +15,8 @@ export const prerender = true;
  * Generate static paths for all pure-markdown documentation pages.
  * Excludes .mdx files since their JSX components can't be serialized to raw markdown.
  */
-export const getStaticPaths: GetStaticPaths = async () => {
-  const docs = await getCollection('docs', (doc) => {
+export const getStaticPaths = (async () => {
+  const docs = await getCollection('docs', doc => {
     // Skip drafts
     if (doc.data.draft) return false;
     // Skip MDX files — they may contain JSX that can't be raw-dumped
@@ -26,11 +26,11 @@ export const getStaticPaths: GetStaticPaths = async () => {
     return true;
   });
 
-  return docs.map((doc) => ({
+  return docs.map(doc => ({
     params: { slug: doc.id },
     props: { entry: doc },
   }));
-};
+}) satisfies GetStaticPaths;
 
 /**
  * Render the documentation entry to markdown.
@@ -51,7 +51,7 @@ export const GET: APIRoute<InferGetStaticPropsType<typeof getStaticPaths>> = asy
       entry.data.description
         .split(/\r?\n/)
         .map((line: string) => `> ${line}`)
-        .join('\n'),
+        .join('\n')
     );
   }
 
