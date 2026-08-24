@@ -2454,6 +2454,117 @@ nodes:
       expect(result.errors[0].error).toContain('analyize');
     });
 
+    it('rejects unknown and non-upstream output refs in wait conditions', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'bad-wait-ref.yaml'),
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: schedule
+    bash: echo 2026-08-25T22:00:00Z
+  - id: wait-for-window
+    wait:
+      until: "$schedule.output"
+`
+      );
+
+      let result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain('not an upstream dependency');
+
+      await writeFile(
+        join(workflowDir, 'bad-wait-ref.yaml'),
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: wait-for-checks
+    wait:
+      event: "$missing.output"
+      deadline_ms: 60000
+`
+      );
+
+      result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("unknown node '$missing.output'");
+    });
+
+    it('rejects suspension nodes that can run concurrently', () => {
+      const suspensionNodes = [
+        `  - id: review
+    approval:
+      message: Review this`,
+        `  - id: refine
+    loop:
+      prompt: Iterate.
+      until: DONE
+      max_iterations: 2
+      interactive: true
+      gate_message: Review.`,
+        `  - id: child
+    workflow: child-workflow`,
+        `  - id: refine-group
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 2
+      interactive: true
+      gate_message: Review.
+      nodes:
+        - id: refine-step
+          bash: echo refine`,
+      ];
+      for (const suspensionNode of suspensionNodes) {
+        const result = parseWorkflow(
+          `
+name: parallel-suspensions
+description: Two nodes cannot own the run cursor together
+nodes:
+  - id: wait-for-time
+    wait:
+      duration_ms: 60000
+${suspensionNode}
+`,
+          'parallel-suspensions.yaml'
+        );
+
+        expect(result.workflow).toBeNull();
+        expect(result.error?.error).toContain("Suspending nodes 'wait-for-time'");
+      }
+    });
+
+    it('rejects waits nested below more than one loop_group boundary', () => {
+      const result = parseWorkflow(
+        `
+name: nested-wait
+description: nested wait
+nodes:
+  - id: outer
+    loop_group:
+      max_iterations: 2
+      until_bash: exit 0
+      nodes:
+        - id: inner
+          loop_group:
+            max_iterations: 2
+            until_bash: exit 0
+            nodes:
+              - id: delay
+                wait:
+                  duration_ms: 1000
+`,
+        '/tmp/nested-wait.yaml'
+      );
+
+      expect(result.error?.error).toContain(
+        'wait nodes nested below another loop_group are not supported'
+      );
+    });
+
     it('should accept a workflow where output refs use valid existing node IDs', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });

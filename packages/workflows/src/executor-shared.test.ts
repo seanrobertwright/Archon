@@ -29,6 +29,8 @@ import {
   isInlineScript,
   formatSubprocessFailure,
   classifyError,
+  isQuotaExhaustionError,
+  extractQuotaResetAt,
   toTelemetryErrorClass,
   safeSendMessage,
   type UnknownErrorTracker,
@@ -838,6 +840,26 @@ describe('classifyError', () => {
     // CLI-only quota string: not producible by detectCreditExhaustion, so the
     // drift guard below cannot cover it.
     expect(classifyError(new Error('Claude AI usage limit reached|1751234567'))).toBe('FATAL');
+  });
+
+  it('distinguishes MiniMax plan exhaustion from transient limit/load errors', () => {
+    const exhausted = '429 Token Plan usage limit reached: purchase Credits (2056)';
+    expect(classifyError(new Error(exhausted))).toBe('FATAL');
+    expect(isQuotaExhaustionError(exhausted)).toBe(true);
+    expect(classifyError(new Error('429 Token Plan rate limit reached (2062)'))).toBe('TRANSIENT');
+    expect(classifyError(new Error('MiniMax overloaded/high load (2064)'))).toBe('TRANSIENT');
+  });
+
+  it('parses only unambiguous quota reset timestamps', () => {
+    const now = new Date('2026-08-24T10:00:00.000Z');
+    expect(extractQuotaResetAt('usage limit reached|1787569200', now)?.toISOString()).toBe(
+      '2026-08-24T11:00:00.000Z'
+    );
+    expect(extractQuotaResetAt('session limit reached — resets in 2h', now)?.toISOString()).toBe(
+      '2026-08-24T12:00:00.000Z'
+    );
+    expect(extractQuotaResetAt('session limit reached — resets in 2400000001h', now)).toBeNull();
+    expect(extractQuotaResetAt('Token Plan usage limit reached (2056)', now)).toBeNull();
   });
 
   it('session-limit stays FATAL even when the message also matches a TRANSIENT pattern', () => {

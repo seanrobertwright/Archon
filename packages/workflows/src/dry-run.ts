@@ -43,6 +43,7 @@ import {
   isAgentNode,
   isLoopGroupNode,
   isLoopNode,
+  isWaitNode,
   isWorkflowNode,
   type DagNode,
   type NodeOutput,
@@ -187,7 +188,13 @@ function stubSatisfiesNode(node: DagNode, stub: DryRunStubValue): boolean {
 
 function collectsStub(node: DagNode): boolean {
   // `include:` is no longer a DagNode member (#2486) — it never reaches this function.
-  return !(isGateNode(node) || isHaltNode(node) || isWorkflowNode(node) || isLoopGroupNode(node));
+  return !(
+    isGateNode(node) ||
+    isWaitNode(node) ||
+    isHaltNode(node) ||
+    isWorkflowNode(node) ||
+    isLoopGroupNode(node)
+  );
 }
 
 /** Build the complete static stub map for an already-expanded workflow definition. */
@@ -259,6 +266,7 @@ const dryRunNodeTypeSchema = z.enum([
   'loop',
   'loop_group',
   'approval',
+  'wait',
   'cancel',
   'include',
   'workflow',
@@ -373,6 +381,7 @@ function nodeType(node: DagNode): z.infer<typeof dryRunNodeTypeSchema> {
   if (isLoopNode(node)) return 'loop';
   if (isLoopGroupNode(node)) return 'loop_group';
   if (isGateNode(node)) return 'approval';
+  if (isWaitNode(node)) return 'wait';
   if (isHaltNode(node)) return 'cancel';
   if (isWorkflowNode(node)) return 'workflow';
   return 'prompt';
@@ -901,6 +910,18 @@ async function simulateNode(
     }
     if (isLoopGroupNode(node)) {
       await simulateLoopGroup(node, outputs, ctx, iteration);
+      return;
+    }
+    if (isWaitNode(node)) {
+      outputs.set(node.id, { state: 'pending', output: '' });
+      ctx.trace.push({
+        nodeId: node.id,
+        nodeType: 'wait',
+        state: 'paused',
+        reason: 'durable wait',
+        ...(iteration ? { iteration } : {}),
+      });
+      ctx.halted = 'paused';
       return;
     }
     if (isGateNode(node)) {

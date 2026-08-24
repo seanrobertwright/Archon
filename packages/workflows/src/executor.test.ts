@@ -197,6 +197,8 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     updateWorkflowActivity: mock(async () => {}),
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
+    pauseWorkflowRunForWait: mock(async () => {}),
+    clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
@@ -304,6 +306,31 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('container resume guard', () => {
+    it('rejects a fresh container workflow with a durable wait before creating a run', async () => {
+      const workflow = workflowDefinitionSchema.parse({
+        name: 'container-wait',
+        description: 'unsupported durable wait in container isolation',
+        nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+      });
+      const store = makeStore();
+
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          workflow,
+          'msg',
+          'db-conv-1',
+          { execContext: { kind: 'container', containerId: 'cid' } }
+        )
+      ).rejects.toThrow('durable wait, which is not supported in container isolation');
+
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
     it('fails a container run resumed without a container context, pointing at the CLI', async () => {
       const failSpy = mock(async () => {});
       const store = makeStore({ failWorkflowRun: failSpy });
@@ -2886,6 +2913,53 @@ describe('hydrateResumableRun', () => {
     expect(result).not.toBeNull();
     expect(result?.priorCompletedNodes.size).toBe(0);
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-loop');
+  });
+
+  it.each([
+    [
+      'first-node wait',
+      'paused',
+      {
+        wait: {
+          owner: 'node',
+          nodeId: 'delay',
+          kind: 'time',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-24T11:00:00.000Z',
+        },
+      },
+    ],
+    [
+      'first-node quota continuation',
+      'failed',
+      {
+        scheduled_resume: {
+          reason: 'quota',
+          resumeAt: '2026-08-24T11:00:00.000Z',
+          deadlineAt: '2026-08-25T11:00:00.000Z',
+          attempt: 1,
+          maxAttempts: 1,
+          error: 'usage limit reached',
+        },
+      },
+    ],
+  ] as const)('hydrates a %s with zero completed nodes', async (_label, status, metadata) => {
+    const candidate = makeRun({ id: 'first-node-continuation', status, metadata });
+    const resumed = makeRun({ id: 'first-node-continuation', status: 'running', metadata });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+
+    const result = await hydrateResumableRun(makeDeps(store), candidate);
+
+    expect(result).not.toBeNull();
+    expect(result?.priorCompletedNodes.size).toBe(0);
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('first-node-continuation');
   });
 
   it('#2714 regression: resumes a first-node legacy on_reject gate with a genuinely staged rework, even with zero completed nodes', async () => {

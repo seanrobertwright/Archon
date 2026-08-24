@@ -28,6 +28,9 @@ import {
   isApprovalContext,
   isRunBlockedOnChild,
   reRunsOwnNodeOnResume,
+  isWorkflowWaitContext,
+  isScheduledWorkflowResume,
+  isWaitNode,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
   RUN_METADATA_KEYS,
@@ -50,7 +53,7 @@ import {
 } from './workflow-source';
 import { executeDagWorkflow, childOutcomeFromRun } from './dag-executor';
 import type { RunChildWorkflowArgs, ChildWorkflowOutcome, PriorRunUsage } from './dag-executor';
-import type { PersistedNodeOutput } from './store';
+import type { PersistedNodeOutput, WorkflowResumeCursor } from './store';
 import { canonicalValueText, type JsonValue } from './output-ref';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
 import type { WorkflowWithSource, WorkflowLoadError } from './schemas';
@@ -1007,7 +1010,8 @@ export async function prepareWorkflowSource(
  */
 export async function hydrateResumableRun(
   deps: WorkflowDeps,
-  candidate: WorkflowRun
+  candidate: WorkflowRun,
+  cursor?: WorkflowResumeCursor
 ): Promise<{
   preCreatedRun: WorkflowRun;
   priorCompletedNodes: Map<string, PersistedNodeOutput>;
@@ -1026,7 +1030,14 @@ export async function hydrateResumableRun(
   const rawApproval = candidate.metadata?.approval;
   const approvalContext = isApprovalContext(rawApproval) ? rawApproval : undefined;
   const hasReRunGateState = reRunsOwnNodeOnResume(approvalContext, candidate.metadata);
-  if (priorCompletedNodes.size === 0 && !hasReRunGateState) {
+  const hasWaitState = isWorkflowWaitContext(candidate.metadata?.wait);
+  const hasScheduledResume = isScheduledWorkflowResume(candidate.metadata?.scheduled_resume);
+  if (
+    priorCompletedNodes.size === 0 &&
+    !hasReRunGateState &&
+    !hasWaitState &&
+    !hasScheduledResume
+  ) {
     getLog().info(
       { resumableRunId: candidate.id },
       'workflow.dag_resume_skipped_no_completed_nodes'
@@ -1037,7 +1048,10 @@ export async function hydrateResumableRun(
   const priorNodeSessions = (await deps.store.listWorkflowRunNodeSessions(candidate.id)).filter(
     row => completedNodeIds.has(row.node_id)
   );
-  const preCreatedRun = await deps.store.resumeWorkflowRun(candidate.id);
+  const preCreatedRun =
+    cursor === undefined
+      ? await deps.store.resumeWorkflowRun(candidate.id)
+      : await deps.store.resumeWorkflowRun(candidate.id, cursor);
   getLog().info(
     { workflowRunId: preCreatedRun.id, priorCompletedCount: priorCompletedNodes.size },
     'workflow.dag_resuming'
@@ -1717,6 +1731,22 @@ export async function executeWorkflow(
     (priorCompletedNodes !== undefined || preCreatedRun.status !== 'pending');
   if (isContinuation && modelOverrides !== undefined) {
     throw new Error('Cannot supply model overrides when resuming an existing workflow run.');
+  }
+
+  const containsWait = (nodes: readonly (DagNode | IncludeDirective)[]): boolean =>
+    nodes.some(node => {
+      if (!('kind' in node)) return false;
+      if (isWaitNode(node)) return true;
+      return isLoopGroupNode(node) && containsWait(node.loop_group.nodes);
+    });
+  if (
+    preCreatedRun === undefined &&
+    execContext.kind === 'container' &&
+    containsWait(workflow.nodes)
+  ) {
+    throw new Error(
+      `Workflow '${workflow.name}' contains a durable wait, which is not supported in container isolation because server continuation cannot rewire the container. Run it without container isolation.`
+    );
   }
 
   if (preCreatedRun !== undefined) {

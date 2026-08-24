@@ -792,6 +792,33 @@ describe('dryRunWorkflow', () => {
     expect(paused.unusedStubs).toEqual(['after']);
   });
 
+  test('reports a durable wait as a pause without AI resolution', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'wait',
+      nodes: [{ id: 'delay', wait: { duration_ms: 60_000 } }],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: {},
+    });
+
+    expect(result.outcome).toBe('paused');
+    expect(createDryRunStubScaffold(workflow)).toEqual({});
+    expect(result.trace).toEqual([
+      {
+        nodeId: 'delay',
+        nodeType: 'wait',
+        state: 'paused',
+        reason: 'durable wait',
+      },
+    ]);
+    expect(result.missingStubs).toEqual([]);
+    expect(result.unusedStubs).toEqual([]);
+  });
+
   test('simulates loop completion and max-iteration failure', async () => {
     const completing = makeTestWorkflow({
       name: 'loop-ok',

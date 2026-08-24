@@ -4189,6 +4189,55 @@ describe('workflowGetCommand', () => {
     );
   });
 
+  it('prints durable wait and scheduled quota continuation state', async (): Promise<void> => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>)
+      .mockResolvedValueOnce({
+        id: 'run-wait-human',
+        workflow_name: 'validate',
+        status: 'paused',
+        working_path: '/tmp/wt',
+        started_at: new Date(),
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'checks',
+            kind: 'event',
+            event: 'checks.complete',
+            waitingSince: '2026-08-24T10:00:00.000Z',
+            resumeAt: '2026-08-25T10:00:00.000Z',
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        id: 'run-quota-human',
+        workflow_name: 'deliver',
+        status: 'failed',
+        working_path: '/tmp/wt',
+        started_at: new Date(),
+        metadata: {
+          scheduled_resume: {
+            reason: 'quota',
+            resumeAt: '2026-08-25T11:00:00.000Z',
+            deadlineAt: '2026-08-26T10:00:00.000Z',
+            attempt: 1,
+            maxAttempts: 2,
+            error: 'usage limit reached',
+          },
+        },
+      });
+
+    await workflowGetCommand('run-wait-human');
+    await workflowGetCommand('run-quota-human');
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      "  Wait:   event 'checks.complete' until 2026-08-25T10:00:00.000Z"
+    );
+    expect(consoleSpy).toHaveBeenCalledWith(
+      '  Resume: scheduled for 2026-08-25T11:00:00.000Z (attempt 1/2)'
+    );
+  });
+
   it('emits the same shared node summaries in verbose JSON by default', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const eventsDb = await import('@archon/core/db/workflow-events');

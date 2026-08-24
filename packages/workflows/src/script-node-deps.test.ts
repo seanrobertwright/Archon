@@ -106,6 +106,8 @@ function createMockStore(): IWorkflowStore {
     completeWorkflowRun: mock(() => Promise.resolve()),
     failWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRun: mock(() => Promise.resolve()),
+    pauseWorkflowRunForWait: mock(() => Promise.resolve()),
+    clearWorkflowWaitContext: mock(() => Promise.resolve({ cleared: true })),
     rewriteApprovalContext: mock(() => Promise.resolve({ resolved: true })),
     claimWriteback: mock(() => Promise.resolve({ claimed: true })),
     releaseWritebackClaim: mock(() => Promise.resolve()),

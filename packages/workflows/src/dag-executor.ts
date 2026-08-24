@@ -45,6 +45,7 @@ import type {
   DagNode,
   IncludeDirective,
   GateNode,
+  WaitNode,
   ExecNode,
   AgentNode,
   LoopNode,
@@ -67,6 +68,8 @@ import type {
   NodeArtifactLoopFrame,
   WorkflowRunNodeSession,
   WorkflowRunStatus,
+  WorkflowWaitContext,
+  ScheduledWorkflowResume,
 } from './schemas';
 import {
   isExecNode,
@@ -74,6 +77,9 @@ import {
   isLoopNode,
   isLoopGroupNode,
   isGateNode,
+  isWaitNode,
+  isWorkflowWaitContext,
+  isScheduledWorkflowResume,
   isHaltNode,
   isIncludeDirective,
   isPersistableNode,
@@ -83,6 +89,9 @@ import {
   isNodeContextResume,
   isBindingDirective,
   SUBRUN_METADATA_KEYS,
+  WAIT_NODE_OUTPUT_FORMAT,
+  waitUntilTimestampSchema,
+  waitCondition,
 } from './schemas';
 import type { BindingDirective } from './schemas';
 import type { PersistedNodeOutput } from './store';
@@ -100,6 +109,7 @@ import {
   canonicalValueText,
   parseWholeOutputRef,
   parseWholeInputsRef,
+  substituteInputRefs,
   type JsonValue,
 } from './output-ref';
 import { buildTruncationMarker } from './utils/output-truncation';
@@ -129,6 +139,8 @@ import {
   classifyError,
   toTelemetryErrorClass,
   detectCreditExhaustion,
+  isQuotaExhaustionError,
+  extractQuotaResetAt,
   loadCommandPrompt,
   substituteWorkflowVariables,
   buildPromptWithContext,
@@ -152,18 +164,30 @@ import {
 
 /**
  * Closed-set node type for telemetry — mirrors the DagNode discriminators.
- * The final `'prompt'` arm is the fallthrough: a future node type added to
- * the schema without a guard here would be reported as `'prompt'` (a metrics
- * misclassification, not a privacy issue) — extend this when adding node types.
  */
 function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
-  if (isExecNode(node)) return node.runtime === 'sh' ? 'bash' : 'script';
-  if (isLoopNode(node)) return 'loop';
-  if (isLoopGroupNode(node)) return 'loop_group';
-  if (isGateNode(node)) return 'approval';
-  if (isHaltNode(node)) return 'cancel';
-  if (isAgentNode(node) && node.source.kind === 'command') return 'command';
-  return 'prompt';
+  switch (node.kind) {
+    case 'agent':
+      return node.source.kind === 'command' ? 'command' : 'prompt';
+    case 'exec':
+      return node.runtime === 'sh' ? 'bash' : 'script';
+    case 'loop':
+      return 'loop';
+    case 'loop_group':
+      return 'loop_group';
+    case 'gate':
+      return 'approval';
+    case 'wait':
+      return 'wait';
+    case 'halt':
+      return 'cancel';
+    case 'workflow':
+      return 'workflow';
+    default: {
+      const exhaustive: never = node;
+      return exhaustive;
+    }
+  }
 }
 
 /**
@@ -4265,10 +4289,14 @@ async function finalizeLoopFromSignal(
  * escalation purposes, since there is no unambiguous single pause node to
  * escalate).
  */
-function findLoopGroupTerminalGate(bodyNodes: readonly DagNode[]): GateNode | undefined {
+function findLoopGroupTerminalSuspendNode(
+  bodyNodes: readonly DagNode[]
+): GateNode | WaitNode | undefined {
   const dependedOn = new Set(bodyNodes.flatMap(n => n.depends_on ?? []));
   const sinks = bodyNodes.filter(n => !dependedOn.has(n.id));
-  return sinks.length === 1 && isGateNode(sinks[0]) ? sinks[0] : undefined;
+  return sinks.length === 1 && (isGateNode(sinks[0]) || sinks[0]?.kind === 'wait')
+    ? sinks[0]
+    : undefined;
 }
 
 /**
@@ -4364,14 +4392,20 @@ async function executeLoopGroupNode(
   //    node's output — so `loopUserInput` below stays scoped to the legacy shape.
   const rawApproval = workflowRun.metadata?.approval;
   const loopGateMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
+  const rawWait = workflowRun.metadata?.wait;
+  const loopWaitMeta = isWorkflowWaitContext(rawWait) ? rawWait : undefined;
+  const loopOwnedWaitMeta = loopWaitMeta?.owner === 'loop_group' ? loopWaitMeta : undefined;
   const isLegacyInteractiveLoopResume =
     loopGateMeta?.type === 'interactive_loop' && loopGateMeta.nodeId === node.id;
   const isEscalatedGateResume =
     loopGateMeta?.type === 'approval' &&
     loopGateMeta.nodeId === node.id &&
     loopGateMeta.bodyGateId !== undefined;
-  const isLoopResume = isLegacyInteractiveLoopResume || isEscalatedGateResume;
-  const startIteration = isLoopResume ? (loopGateMeta.iteration ?? 0) + 1 : 1;
+  const isEscalatedWaitResume = loopOwnedWaitMeta?.nodeId === node.id;
+  const isLoopResume =
+    isLegacyInteractiveLoopResume || isEscalatedGateResume || isEscalatedWaitResume;
+  const resumeIteration = loopGateMeta?.iteration ?? loopOwnedWaitMeta?.iteration ?? 0;
+  const startIteration = isLoopResume ? resumeIteration + 1 : 1;
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLegacyInteractiveLoopResume
     ? (loopGateRunMeta.loop_user_input ?? '')
@@ -4413,6 +4447,31 @@ async function executeLoopGroupNode(
       output: finalizeOutput,
       ...(finalizeStructured !== null ? { structuredOutput: finalizeStructured } : {}),
     };
+  }
+
+  if (isEscalatedWaitResume) {
+    const terminalNode = findLoopGroupTerminalSuspendNode(group.nodes as DagNode[]);
+    if (terminalNode?.kind !== 'wait') {
+      throw new Error(`Loop group '${node.id}' resumed with wait state but has no terminal wait`);
+    }
+    const waitOutput = await executeWaitNode(
+      terminalNode,
+      workflowRun,
+      deps,
+      outerNodeOutputs,
+      bodyStepNamePrefix,
+      {
+        groupId: node.id,
+        iteration: resumeIteration,
+        sessionId: loopOwnedWaitMeta?.sessionId ?? null,
+        sessionProvider: loopOwnedWaitMeta?.sessionProvider ?? null,
+      }
+    );
+    const status = await deps.store.getWorkflowRunStatus(workflowRun.id);
+    if (status === 'paused') {
+      return { state: 'completed', output: '', loopIterations: resumeIteration };
+    }
+    outerNodeOutputs.set(bodyStepNamePrefix + terminalNode.id, waitOutput);
   }
 
   let loopPrevOutputs: Map<string, NodeOutput> | undefined; // undefined on iteration 1
@@ -4465,11 +4524,11 @@ async function executeLoopGroupNode(
   // fresh runLayers call — decision (b) settled that resume re-enters at the
   // iteration boundary, so the pre-gate body nodes' already-produced outputs are
   // safe to reuse as-is; only the gate's own answer needed reconstructing.
-  if (isEscalatedGateResume && loopPrevOutputs !== undefined) {
-    const terminalGate = findLoopGroupTerminalGate(group.nodes as DagNode[]);
-    const terminalSink = terminalGate ? loopPrevOutputs.get(terminalGate.id) : undefined;
+  if ((isEscalatedGateResume || isEscalatedWaitResume) && loopPrevOutputs !== undefined) {
+    const terminalNode = findLoopGroupTerminalSuspendNode(group.nodes as DagNode[]);
+    const terminalSink = terminalNode ? loopPrevOutputs.get(terminalNode.id) : undefined;
     if (terminalSink !== undefined) {
-      const resumedIteration = loopGateMeta.iteration ?? 0;
+      const resumedIteration = resumeIteration;
       const rawIterationOutput = terminalSink.output;
       const resumedSignalDetected =
         group.until !== undefined && detectCompletionSignal(rawIterationOutput, group.until);
@@ -4621,11 +4680,17 @@ async function executeLoopGroupNode(
   // The provider tag must be restored WITH the session id (#1992) — metadata from a
   // pre-tag pause lacks it, and restoring an untagged cursor could thread the session
   // into a different provider on resume, so those legacy pauses restore fresh instead.
+  const resumedLoopSessionId = loopGateMeta?.sessionId ?? loopOwnedWaitMeta?.sessionId;
+  const resumedLoopSessionProvider =
+    loopGateMeta?.sessionProvider ?? loopOwnedWaitMeta?.sessionProvider;
   let loopLastSequentialSession: SequentialSessionCursor | undefined =
     isLoopResume &&
-    typeof loopGateMeta.sessionId === 'string' &&
-    typeof loopGateMeta.sessionProvider === 'string'
-      ? { sessionId: loopGateMeta.sessionId, provider: loopGateMeta.sessionProvider }
+    typeof resumedLoopSessionId === 'string' &&
+    typeof resumedLoopSessionProvider === 'string'
+      ? {
+          sessionId: resumedLoopSessionId,
+          provider: resumedLoopSessionProvider,
+        }
       : undefined;
 
   const logEventStoreError = (err: Error, iteration: number): void => {
@@ -4805,19 +4870,19 @@ async function executeLoopGroupNode(
     // is already folded into loopTotalCostUsd/loopTotalTokens by the time the
     // escalation return reads them; reading them any earlier would silently drop
     // this iteration's cost from the run's live totals for the whole pause window.
-    const terminalGate = findLoopGroupTerminalGate(iterBodyNodes);
-    if (terminalGate && postBodyStatus === 'paused') {
+    const terminalSuspendNode = findLoopGroupTerminalSuspendNode(iterBodyNodes);
+    if (terminalSuspendNode && postBodyStatus === 'paused') {
       // Fresh read — workflowRun is this call's stale snapshot from before
       // runLayers ran; the gate's own pause just wrote metadata.approval.
       const freshRun = await deps.store.getWorkflowRun(workflowRun.id);
       const freshApproval = isApprovalContext(freshRun?.metadata?.approval)
         ? freshRun.metadata.approval
         : undefined;
-      if (freshApproval?.nodeId === terminalGate.id) {
+      if (isGateNode(terminalSuspendNode) && freshApproval?.nodeId === terminalSuspendNode.id) {
         const rewritten: ApprovalContext = {
           ...freshApproval,
           nodeId: node.id,
-          bodyGateId: terminalGate.id,
+          bodyGateId: terminalSuspendNode.id,
           iteration: i,
           sessionId: loopLastSequentialSession?.sessionId ?? null,
           sessionProvider: loopLastSequentialSession?.provider ?? null,
@@ -4842,6 +4907,24 @@ async function executeLoopGroupNode(
         // this race's vanishingly narrow window rather than built out further.
         // (The postBodyStatus tolerance above already let a 'paused' status
         // through; nothing here re-checks it.)
+      }
+      const freshWait = isWorkflowWaitContext(freshRun?.metadata?.wait)
+        ? freshRun.metadata.wait
+        : undefined;
+      if (
+        terminalSuspendNode.kind === 'wait' &&
+        freshWait?.owner === 'loop_group' &&
+        freshWait.nodeId === node.id &&
+        freshWait.bodyWaitId === terminalSuspendNode.id &&
+        freshWait.iteration === i
+      ) {
+        return {
+          state: 'completed',
+          output: lastIterationOutput,
+          costUsd: loopTotalCostUsd,
+          ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+          loopIterations: i,
+        };
       }
     }
 
@@ -5391,6 +5474,16 @@ export function applyLoopPrevToBodyNode(
           : decision
       ),
     };
+  }
+  if (isWaitNode(substitutedNode)) {
+    const condition = waitCondition(substitutedNode.wait);
+    if (condition.kind === 'duration') return substitutedNode;
+    return condition.kind === 'until'
+      ? { ...substitutedNode, wait: { until: sub(condition.timestamp) } }
+      : {
+          ...substitutedNode,
+          wait: { event: sub(condition.event), deadline_ms: condition.deadlineMs },
+        };
   }
   // Bash never passes through a shell escape hazard-free path — escapedForBash=true
   // shell-quotes $LOOP_PREV/$LOOP_USER_INPUT before splicing into the `bash -c` body.
@@ -6934,6 +7027,175 @@ async function pauseGateRespectingExternalTransition(
     message: approvalContext.message,
   });
   return true;
+}
+
+/** Execute a durable wait without holding a subprocess or provider slot. */
+interface WaitLoopOwner {
+  groupId: string;
+  iteration: number;
+  sessionId: string | null;
+  sessionProvider: string | null;
+}
+
+async function executeWaitNode(
+  node: WaitNode,
+  workflowRun: WorkflowRun,
+  deps: WorkflowDeps,
+  nodeOutputs: Map<string, NodeOutput>,
+  stepNamePrefix = '',
+  loopOwner?: WaitLoopOwner
+): Promise<NodeOutput> {
+  const now = new Date();
+  const rawPersisted = workflowRun.metadata?.wait;
+  const persisted =
+    isWorkflowWaitContext(rawPersisted) &&
+    (loopOwner === undefined
+      ? rawPersisted.owner === 'node' && rawPersisted.nodeId === node.id
+      : rawPersisted.owner === 'loop_group' &&
+        rawPersisted.nodeId === loopOwner.groupId &&
+        rawPersisted.bodyWaitId === node.id &&
+        rawPersisted.iteration === loopOwner.iteration)
+      ? rawPersisted
+      : undefined;
+
+  const owner =
+    loopOwner === undefined
+      ? ({ owner: 'node', nodeId: node.id } as const)
+      : ({
+          owner: 'loop_group',
+          nodeId: loopOwner.groupId,
+          bodyWaitId: node.id,
+          iteration: loopOwner.iteration,
+          sessionId: loopOwner.sessionId,
+          sessionProvider: loopOwner.sessionProvider,
+        } as const);
+  const condition = waitCondition(node.wait);
+  let context: WorkflowWaitContext;
+  if (persisted !== undefined) {
+    context = persisted;
+  } else if (condition.kind === 'duration') {
+    context = {
+      ...owner,
+      kind: 'time',
+      waitingSince: now.toISOString(),
+      resumeAt: new Date(now.getTime() + condition.durationMs).toISOString(),
+    };
+  } else if (condition.kind === 'until') {
+    const inputsName = parseWholeInputsRef(condition.timestamp);
+    let rawUntil = condition.timestamp;
+    if (inputsName !== undefined) {
+      const runInputs = resolveRunInputs(workflowRun);
+      if (!runInputs || !Object.hasOwn(runInputs, inputsName)) {
+        throw new Error(`Wait node '${node.id}' references unknown input '$INPUTS.${inputsName}'`);
+      }
+      rawUntil = canonicalValueText(runInputs[inputsName]);
+    }
+    const rendered = substituteNodeOutputRefs(rawUntil, nodeOutputs);
+    if (!waitUntilTimestampSchema.safeParse(rendered).success) {
+      throw new Error(
+        `Wait node '${node.id}' has an invalid 'until' timestamp after substitution: '${rendered}'`
+      );
+    }
+    const resumeAtMs = Date.parse(rendered);
+    context = {
+      ...owner,
+      kind: 'time',
+      waitingSince: now.toISOString(),
+      resumeAt: new Date(resumeAtMs).toISOString(),
+    };
+  } else {
+    const event = substituteNodeOutputRefs(
+      substituteInputRefs(condition.event, resolveRunInputs(workflowRun)),
+      nodeOutputs
+    ).trim();
+    if (event === '') {
+      throw new Error(`Wait node '${node.id}' resolved 'event' to an empty string`);
+    }
+    context = {
+      ...owner,
+      kind: 'event',
+      event,
+      waitingSince: now.toISOString(),
+      resumeAt: new Date(now.getTime() + condition.deadlineMs).toISOString(),
+    };
+  }
+
+  const resumeAtMs = Date.parse(context.resumeAt);
+  const isSignaled = context.kind === 'event' && context.signaledAt !== undefined;
+  const isDue = now.getTime() >= resumeAtMs;
+  if (!isSignaled && !isDue) {
+    try {
+      await deps.store.pauseWorkflowRunForWait(
+        workflowRun.id,
+        context,
+        persisted === undefined
+          ? { kind: 'started', stepName: stepNamePrefix + node.id }
+          : { kind: 'continued' }
+      );
+    } catch (pauseError) {
+      const status = await deps.store.getWorkflowRunStatus(workflowRun.id);
+      if (status === 'running') throw pauseError;
+      getLog().warn(
+        { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
+        'dag.wait_pause_skipped_external_transition'
+      );
+    }
+    return { state: 'completed', output: '' };
+  }
+
+  const status = context.kind === 'event' && !isSignaled ? 'expired' : 'satisfied';
+  const result = {
+    status,
+    waited_ms: Math.max(0, now.getTime() - Date.parse(context.waitingSince)),
+    ...(context.kind === 'event'
+      ? {
+          event: context.event,
+          ...(context.payload !== undefined ? { payload: context.payload } : {}),
+        }
+      : {}),
+  } as const;
+  const output = JSON.stringify(result);
+  const stepName = stepNamePrefix + node.id;
+  if (persisted !== undefined) {
+    const { cleared } = await deps.store.clearWorkflowWaitContext(workflowRun.id, context, {
+      stepName,
+      result,
+    });
+    if (!cleared) {
+      throw new Error(`Wait node '${node.id}' lost ownership of its persisted wait cursor`);
+    }
+  } else {
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: status === 'expired' ? 'wait_expired' : 'wait_completed',
+      step_name: stepName,
+      data: result,
+    });
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'node_completed',
+      step_name: stepName,
+      data: {
+        type: 'wait',
+        duration_ms: result.waited_ms,
+        node_output: output,
+        structured_output: result,
+      },
+    });
+  }
+  getWorkflowEventEmitter().emit({
+    type: 'node_completed',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+    duration: result.waited_ms,
+  });
+  return {
+    state: 'completed',
+    output,
+    structuredOutput: result,
+    declaredFields: declaredFieldsFromSchema(WAIT_NODE_OUTPUT_FORMAT),
+  };
 }
 
 /**
@@ -9266,6 +9528,26 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               return { nodeId: node.id, output };
             }
 
+            case 'wait': {
+              const loopFrame = loopGroupPath.at(-1);
+              const output = await executeWaitNode(
+                node,
+                workflowRun,
+                deps,
+                ctx.nodeOutputs,
+                stepNamePrefix,
+                loopFrame === undefined
+                  ? undefined
+                  : {
+                      groupId: loopFrame.groupId,
+                      iteration: loopFrame.iteration,
+                      sessionId: ctx.lastSequentialSession?.sessionId ?? null,
+                      sessionProvider: ctx.lastSequentialSession?.provider ?? null,
+                    }
+              );
+              return { nodeId: node.id, output };
+            }
+
             case 'halt': {
               // Cancel node dispatch — terminates the workflow run
               const reason = substituteNodeOutputRefs(node.reason, ctx.nodeOutputs);
@@ -10609,6 +10891,71 @@ export async function executeDagWorkflow(
       });
   };
 
+  const scheduleQuotaResume = async (): Promise<ScheduledWorkflowResume | undefined> => {
+    const policy = config.workflows;
+    if (policy?.autoResumeOnQuotaReset !== true) return undefined;
+    if (execContext.kind === 'container') {
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'quota_resume_skipped',
+        data: { reason: 'container_unsupported' },
+      });
+      return undefined;
+    }
+    const prior = isScheduledWorkflowResume(workflowRun.metadata?.scheduled_resume)
+      ? workflowRun.metadata.scheduled_resume
+      : undefined;
+    const quotaFailure = [...runCtx.nodeOutputs.values()].find(
+      (output): output is Extract<NodeOutput, { state: 'failed' }> =>
+        output.state === 'failed' && isQuotaExhaustionError(output.error)
+    );
+    if (quotaFailure === undefined) return undefined;
+    const now = new Date();
+    const maxAttempts = policy.quotaMaxAttempts;
+    const attempt = (prior?.attempt ?? 0) + 1;
+    const deadlineMs = policy.quotaDeadlineMs;
+    const deadlineAt = prior?.deadlineAt ?? new Date(now.getTime() + deadlineMs).toISOString();
+    if (attempt > maxAttempts) {
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'quota_resume_exhausted',
+        data: { attempt, max_attempts: maxAttempts },
+      });
+      return undefined;
+    }
+
+    let resumeAt = extractQuotaResetAt(quotaFailure.error, now);
+    if (resumeAt === null || resumeAt.getTime() <= now.getTime()) {
+      const fallback = policy.quotaFallbackDelayMs;
+      resumeAt = fallback !== undefined ? new Date(now.getTime() + fallback) : null;
+    }
+    if (resumeAt === null) {
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'quota_resume_skipped',
+        data: { reason: 'reset_unavailable' },
+      });
+      return undefined;
+    }
+    if (resumeAt.getTime() > Date.parse(deadlineAt)) {
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'quota_resume_exhausted',
+        data: { reason: 'deadline', deadline_at: deadlineAt },
+      });
+      return undefined;
+    }
+
+    const scheduled: ScheduledWorkflowResume = {
+      reason: 'quota',
+      resumeAt: resumeAt.toISOString(),
+      deadlineAt,
+      attempt,
+      maxAttempts,
+    };
+    return scheduled;
+  };
+
   await persistAuthoredOutcome();
   try {
     await runLayers(runCtx);
@@ -10739,9 +11086,15 @@ export async function executeDagWorkflow(
     // Note: nodeCounts not stored for failed runs — failWorkflowRun only stores { error }.
     // Frontend guards with isValidNodeCounts so missing node_counts is safe. (Usage IS
     // stored: persistRunUsage wrote it at the run tail, before this branch — #2469.)
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
-      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
+    const scheduledResume = await scheduleQuotaResume().catch((dbErr: Error) => {
+      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
+      return undefined;
     });
+    await deps.store
+      .failWorkflowRun(workflowRun.id, failMsg, scheduledResume)
+      .catch((dbErr: Error) => {
+        getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
+      });
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -10785,9 +11138,15 @@ export async function executeDagWorkflow(
       ...failureTaxonomy,
       ...runUsageProps,
     });
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
-      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
+    const scheduledResume = await scheduleQuotaResume().catch((dbErr: Error) => {
+      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
+      return undefined;
     });
+    await deps.store
+      .failWorkflowRun(workflowRun.id, failMsg, scheduledResume)
+      .catch((dbErr: Error) => {
+        getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
+      });
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },

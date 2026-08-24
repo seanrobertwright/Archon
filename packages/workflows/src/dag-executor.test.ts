@@ -98,6 +98,7 @@ import type {
   WorkflowDefinition,
   WorkflowRunStatus,
   ApprovalContext,
+  WorkflowWaitContext,
 } from './schemas';
 import { dagNodeSchema, workflowDefinitionSchema } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
@@ -172,6 +173,12 @@ function createMockStore(): MockWorkflowStore {
     failWorkflowRun: mock<IWorkflowStore['failWorkflowRun']>(async (_id, _error) => {}),
     pauseWorkflowRun: mock<IWorkflowStore['pauseWorkflowRun']>(
       async (_id, _approvalContext, _extraMetadata) => {}
+    ),
+    pauseWorkflowRunForWait: mock<NonNullable<IWorkflowStore['pauseWorkflowRunForWait']>>(
+      async (_id, _waitContext) => {}
+    ),
+    clearWorkflowWaitContext: mock<IWorkflowStore['clearWorkflowWaitContext']>(
+      async (_id, _waitContext) => ({ cleared: true })
     ),
     rewriteApprovalContext: mock<IWorkflowStore['rewriteApprovalContext']>(
       async (_id, _approvalContext) => ({ resolved: true })
@@ -14257,7 +14264,426 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     // Overall workflow should be marked failed
     expect(store.failWorkflowRun).toHaveBeenCalled();
   });
+
+  it('uses the bounded fallback when provider-relative reset text overflows Date', async () => {
+    const creditExhaustedQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
+      async function* () {
+        yield {
+          type: 'assistant',
+          content: "You're out of extra usage · resets in 2400000001h",
+        };
+        yield { type: 'result', sessionId: 'dag-session-credit' };
+      }
+    );
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: creditExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-credit',
+      testDir,
+      {
+        name: 'credit-resume-test',
+        nodes: [
+          {
+            id: 'investigate',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Investigate the issue' },
+          },
+        ],
+      },
+      makeWorkflowRun('credit-resume-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      {
+        ...minimalConfig,
+        workflows: {
+          autoResumeOnQuotaReset: true,
+          quotaFallbackDelayMs: 60_000,
+          quotaMaxAttempts: 1,
+          quotaDeadlineMs: 3_600_000,
+        },
+      }
+    );
+
+    const failRun = store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>;
+    expect(failRun).toHaveBeenCalledTimes(1);
+    expect(failRun.mock.calls[0]?.[2]).toMatchObject({
+      reason: 'quota',
+      attempt: 1,
+      maxAttempts: 1,
+    });
+    expect(
+      store.createWorkflowEvent.mock.calls.some(
+        call => call[0].event_type === 'quota_resume_scheduled'
+      )
+    ).toBe(false);
+  });
+
+  it('records that quota continuation is unavailable when reset text overflows without a fallback', async () => {
+    const creditExhaustedQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
+      async function* () {
+        yield {
+          type: 'assistant',
+          content: "You're out of extra usage · resets in 2400000001h",
+        };
+        yield { type: 'result', sessionId: 'dag-session-credit' };
+      }
+    );
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: creditExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-credit',
+      testDir,
+      {
+        name: 'credit-resume-test',
+        nodes: [
+          {
+            id: 'investigate',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Investigate the issue' },
+          },
+        ],
+      },
+      makeWorkflowRun('credit-resume-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      {
+        ...minimalConfig,
+        workflows: {
+          autoResumeOnQuotaReset: true,
+          quotaMaxAttempts: 1,
+          quotaDeadlineMs: 3_600_000,
+        },
+      }
+    );
+
+    const failRun = store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>;
+    expect(failRun).toHaveBeenCalledTimes(1);
+    expect(failRun.mock.calls[0]?.[2]).toBeUndefined();
+    expect(store.createWorkflowEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'quota_resume_skipped',
+        data: { reason: 'reset_unavailable' },
+      })
+    );
+  });
+
+  it('does not promise automatic quota continuation for a container run', async () => {
+    const creditExhaustedQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
+      async function* () {
+        yield { type: 'assistant', content: "You're out of extra usage" };
+        yield { type: 'result', sessionId: 'dag-session-credit' };
+      }
+    );
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: creditExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-credit',
+      testDir,
+      {
+        name: 'container-credit-resume-test',
+        nodes: [
+          {
+            id: 'investigate',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Investigate the issue' },
+          },
+        ],
+      },
+      makeWorkflowRun('container-credit-resume-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      {
+        ...minimalConfig,
+        workflows: {
+          autoResumeOnQuotaReset: true,
+          quotaFallbackDelayMs: 60_000,
+          quotaMaxAttempts: 1,
+          quotaDeadlineMs: 3_600_000,
+        },
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { kind: 'container', containerId: 'container-1' }
+    );
+
+    const failRun = store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>;
+    expect(failRun.mock.calls[0]?.[2]).toBeUndefined();
+    expect(
+      store.createWorkflowEvent.mock.calls.some(
+        call =>
+          call[0].event_type === 'quota_resume_skipped' &&
+          call[0].data?.reason === 'container_unsupported'
+      )
+    ).toBe(true);
+  });
 });
+
+describe('executeDagWorkflow -- durable wait node', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-wait-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it('persists a future wait and returns without invoking a provider', async () => {
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-wait',
+      testDir,
+      {
+        name: 'wait-test',
+        nodes: [{ id: 'delay', kind: 'wait', wait: { duration_ms: 60_000 } }],
+      },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledTimes(1);
+    const context = (store.pauseWorkflowRunForWait as ReturnType<typeof mock>).mock.calls[0]?.[1];
+    expect(context).toMatchObject({ nodeId: 'delay', kind: 'time' });
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+  });
+
+  it('resolves a child workflow input used as an absolute wait timestamp', async () => {
+    const store = createMockStore();
+    const resumeAt = '2099-08-24T11:00:00.000Z';
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-wait-input',
+      testDir,
+      {
+        name: 'wait-input-test',
+        nodes: [{ id: 'delay', kind: 'wait', wait: { until: '$INPUTS.resume_at' } }],
+      },
+      makeWorkflowRun('wait-input', { metadata: { inputs: { resume_at: resumeAt } } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledWith(
+      'wait-input',
+      expect.objectContaining({ owner: 'node', nodeId: 'delay', resumeAt }),
+      { kind: 'started', stepName: 'delay' }
+    );
+  });
+
+  it('resolves a child workflow input embedded in an event name', async () => {
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-wait-input',
+      testDir,
+      {
+        name: 'wait-event-input-test',
+        nodes: [
+          {
+            id: 'deploy',
+            kind: 'wait',
+            wait: { event: 'deploy:$INPUTS.channel', deadline_ms: 60_000 },
+          },
+        ],
+      },
+      makeWorkflowRun('wait-event-input', { metadata: { inputs: { channel: 'prod' } } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledWith(
+      'wait-event-input',
+      expect.objectContaining({ owner: 'node', nodeId: 'deploy', event: 'deploy:prod' }),
+      { kind: 'started', stepName: 'deploy' }
+    );
+  });
+
+  it('completes an expired event wait with typed output on resume', async () => {
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const workflowRun = makeWorkflowRun('wait-resume', {
+      metadata: {
+        wait: {
+          owner: 'node',
+          nodeId: 'ci',
+          kind: 'event',
+          event: 'checks.complete',
+          waitingSince: '2026-08-23T00:00:00.000Z',
+          resumeAt: '2026-08-24T00:00:00.000Z',
+        },
+      },
+    });
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-wait',
+      testDir,
+      {
+        name: 'wait-expiry-test',
+        nodes: [
+          { id: 'ci', kind: 'wait', wait: { event: 'checks.complete', deadline_ms: 60_000 } },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
+    expect(store.clearWorkflowWaitContext).toHaveBeenCalledWith(
+      'wait-resume',
+      workflowRun.metadata.wait,
+      expect.objectContaining({
+        stepName: 'ci',
+        result: expect.objectContaining({ status: 'expired' }),
+      })
+    );
+  });
+
+  it('re-pauses an early manual resume against the original absolute time', async () => {
+    const store = createMockStore();
+    const persisted: WorkflowWaitContext = {
+      owner: 'node',
+      nodeId: 'delay',
+      kind: 'time',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      resumeAt: '2099-08-24T11:00:00.000Z',
+    };
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-wait',
+      testDir,
+      {
+        name: 'wait-early-resume-test',
+        nodes: [{ id: 'delay', kind: 'wait', wait: { duration_ms: 60_000 } }],
+      },
+      makeWorkflowRun('wait-early-resume', { metadata: { wait: persisted } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledWith('wait-early-resume', persisted, {
+      kind: 'continued',
+    });
+  });
+
+  it('tolerates cancellation that wins the wait pause CAS', async () => {
+    const store = createMockStore();
+    let pauseAttempted = false;
+    store.pauseWorkflowRunForWait = mock(async () => {
+      pauseAttempted = true;
+      throw new Error('Workflow run not found or not in running state');
+    });
+    store.getWorkflowRunStatus = mock(async () => (pauseAttempted ? 'cancelled' : 'running'));
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-wait-cancelled',
+      testDir,
+      {
+        name: 'wait-cancelled-race',
+        nodes: [{ id: 'delay', kind: 'wait', wait: { duration_ms: 60_000 } }],
+      },
+      makeWorkflowRun('wait-cancelled'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = store.createWorkflowEvent.mock.calls.map(call => call[0].event_type);
+    expect(events).not.toContain('node_failed');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
 describe('executeDagWorkflow -- approval node', () => {
   let testDir: string;
 
@@ -17848,7 +18274,8 @@ describe('executeDagWorkflow -- final status derivation', () => {
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
       expect.anything(),
-      expect.stringContaining('fail')
+      expect.stringContaining('fail'),
+      undefined
     );
 
     // Confirm the failure message names the failing node
@@ -17892,7 +18319,8 @@ describe('executeDagWorkflow -- final status derivation', () => {
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
       expect.anything(),
-      expect.stringContaining('fail')
+      expect.stringContaining('fail'),
+      undefined
     );
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
@@ -17944,7 +18372,8 @@ describe('executeDagWorkflow -- final status derivation', () => {
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     expect(mockStore.failWorkflowRun).toHaveBeenCalledWith(
       expect.anything(),
-      expect.stringContaining('b')
+      expect.stringContaining('b'),
+      undefined
     );
   });
 });
@@ -21469,6 +21898,17 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(substitutedGate.decisions.find(d => d.id === 'reject')?.rework?.prompt).toBe(
       'retry=PRIOR'
     );
+
+    const wait = dagNodeSchema.parse({
+      id: 'wait',
+      wait: { event: ref, deadline_ms: 60_000 },
+      depends_on: [],
+    });
+    const substitutedWait = applyLoopPrevToBodyNode(wait as DagNode, prev, '');
+    if (!('kind' in substitutedWait) || substitutedWait.kind !== 'wait') {
+      throw new Error('expected wait node');
+    }
+    expect('event' in substitutedWait.wait ? substitutedWait.wait.event : undefined).toBe('PRIOR');
 
     const script = dagNodeSchema.parse({
       id: 'script',
@@ -29119,7 +29559,10 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
  * under test reads status/metadata BACK after the body gate's own generic pause,
  * which the file's default static mocks (always 'running') can never satisfy.
  */
-function createEscalationStore(runId: string): MockWorkflowStore & {
+function createEscalationStore(
+  runId: string,
+  onWaitPaused?: (wait: WorkflowWaitContext) => WorkflowWaitContext
+): MockWorkflowStore & {
   getState: () => { status: WorkflowRunStatus; metadata: Record<string, unknown> };
 } {
   const base = createMockStore();
@@ -29137,6 +29580,15 @@ function createEscalationStore(runId: string): MockWorkflowStore & {
       async (_id, approvalContext, extraMetadata) => {
         status = 'paused';
         metadata = { ...metadata, ...(extraMetadata ?? {}), approval: { ...approvalContext } };
+      }
+    ),
+    pauseWorkflowRunForWait: mock<NonNullable<IWorkflowStore['pauseWorkflowRunForWait']>>(
+      async (_id, waitContext) => {
+        status = 'paused';
+        metadata = {
+          ...metadata,
+          wait: { ...(onWaitPaused?.(waitContext) ?? waitContext) },
+        };
       }
     ),
     rewriteApprovalContext: mock<IWorkflowStore['rewriteApprovalContext']>(
@@ -29178,6 +29630,62 @@ function gateTerminatedLoopGroupWorkflow(): WorkflowDefinition {
                 message: 'Continue?',
                 decisions: [{ id: 'approve' }, { id: 'revise' }],
               },
+            },
+          ],
+        },
+      }),
+    ],
+  };
+}
+
+function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
+  return {
+    name: 'wait-terminated-loop-group',
+    description: 'wait escalation shape',
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'grp',
+        loop_group: {
+          until_bash: '[ $delay.output.status = "satisfied" ]',
+          max_iterations: 2,
+          nodes: [{ id: 'delay', wait: { duration_ms: 60_000 } }],
+        },
+      }),
+    ],
+  };
+}
+
+function repeatingWaitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
+  return {
+    name: 'repeating-wait-terminated-loop-group',
+    description: 'wait escalation must create a fresh cursor per iteration',
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'grp',
+        loop_group: {
+          until_bash: '[ $delay.output.status = "expired" ]',
+          max_iterations: 2,
+          nodes: [{ id: 'delay', wait: { duration_ms: 60_000 } }],
+        },
+      }),
+    ],
+  };
+}
+
+function eventWaitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
+  return {
+    name: 'event-wait-terminated-loop-group',
+    description: 'event wait ownership must be final at first visibility',
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'grp',
+        loop_group: {
+          until_bash: '[ $await.output.status = "satisfied" ]',
+          max_iterations: 2,
+          nodes: [
+            {
+              id: 'await',
+              wait: { event: 'checks.complete', deadline_ms: 60_000 },
             },
           ],
         },
@@ -29250,6 +29758,141 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
       iteration: 1,
     });
     expect(store.getState().status).toBe('paused');
+  });
+
+  it('escalates a terminal wait and completes it from the persisted deadline on resume', async () => {
+    const store = createEscalationStore('run-wait-escalation');
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-dag',
+      testDir,
+      ready(waitTerminatedLoopGroupWorkflow()),
+      makeWorkflowRun('run-wait-escalation'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const paused = store.getState();
+    expect(paused.status).toBe('paused');
+    expect(paused.metadata.wait).toMatchObject({
+      nodeId: 'grp',
+      bodyWaitId: 'delay',
+      iteration: 1,
+    });
+
+    const expiredWait = {
+      ...(paused.metadata.wait as WorkflowWaitContext),
+      waitingSince: '2026-08-23T00:00:00.000Z',
+      resumeAt: '2026-08-23T00:01:00.000Z',
+    };
+    const resumeRun = makeWorkflowRun('run-wait-escalation', {
+      metadata: { wait: expiredWait },
+    });
+    const resumedStore = createEscalationStore('run-wait-escalation');
+
+    await executeDagWorkflow(
+      createMockDeps(resumedStore),
+      platform,
+      'conv-dag',
+      testDir,
+      ready(waitTerminatedLoopGroupWorkflow()),
+      resumeRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(resumedStore.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(resumedStore.pauseWorkflowRunForWait).not.toHaveBeenCalled();
+  });
+
+  it('starts a fresh wait cursor when a resumed loop advances to another iteration', async () => {
+    const expiredWait: WorkflowWaitContext = {
+      owner: 'loop_group',
+      nodeId: 'grp',
+      bodyWaitId: 'delay',
+      iteration: 1,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'time',
+      waitingSince: '2026-08-23T00:00:00.000Z',
+      resumeAt: '2026-08-23T00:01:00.000Z',
+    };
+    const store = createEscalationStore('run-repeating-wait');
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      ready(repeatingWaitTerminatedLoopGroupWorkflow()),
+      makeWorkflowRun('run-repeating-wait', { metadata: { wait: expiredWait } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.getState().status).toBe('paused');
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledTimes(1);
+    expect(store.getState().metadata.wait).toMatchObject({
+      owner: 'loop_group',
+      nodeId: 'grp',
+      bodyWaitId: 'delay',
+      iteration: 2,
+    });
+  });
+
+  it('keeps loop ownership when an event signal lands before the pause call returns', async () => {
+    const store = createEscalationStore('run-immediate-signal', wait => ({
+      ...wait,
+      signaledAt: new Date().toISOString(),
+    }));
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      ready(eventWaitTerminatedLoopGroupWorkflow()),
+      makeWorkflowRun('run-immediate-signal'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledTimes(1);
+    expect(store.getState().metadata.wait).toMatchObject({
+      owner: 'loop_group',
+      nodeId: 'grp',
+      bodyWaitId: 'await',
+      iteration: 1,
+      signaledAt: expect.any(String),
+    });
   });
 
   it('resuming after "approve" completes the group without re-running the body', async () => {

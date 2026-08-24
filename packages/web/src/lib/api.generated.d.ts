@@ -1746,6 +1746,79 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/workflows/runs/{runId}/signal': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Signal the exact external event awaited by a paused workflow run */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          runId: string;
+        };
+        cookie?: never;
+      };
+      requestBody: {
+        content: {
+          'application/json': {
+            event: string;
+            resumeAt: string;
+            payload?: unknown;
+          };
+        };
+      };
+      responses: {
+        /** @description Signal accepted; the scheduler will resume the workflow shortly */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['WorkflowRunActionResponse'];
+          };
+        };
+        /** @description Run is not waiting on this event */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/workflows/runs/{runId}/abandon': {
     parameters: {
       query?: never;
@@ -3726,6 +3799,17 @@ export interface components {
           max_attempts?: number;
         };
       };
+      wait?:
+        | {
+            duration_ms: number;
+          }
+        | {
+            until: string;
+          }
+        | {
+            event: string;
+            deadline_ms: number;
+          };
       cancel?: string;
       include?: string;
       workflow?: string;

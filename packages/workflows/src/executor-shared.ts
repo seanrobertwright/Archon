@@ -14,18 +14,8 @@ import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import type { LoadCommandResult } from './schemas';
-import { INPUT_NAME_SOURCE } from './schemas/dag-node';
-import { similarNodeIds, canonicalValueText, type JsonValue } from './output-ref';
+import { substituteInputRefs, type JsonValue } from './output-ref';
 import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
-
-/**
- * Runtime `$INPUTS.<name>` reference — the sub-run twin of the include-expander's
- * load-time INPUTS_REF, built from the same identifier grammar so a name that
- * validates as a `with:` key can never fail to match here. Resolved only for
- * `workflow:` sub-runs (child runs get `metadata.inputs`), and only into non-shell
- * surfaces (shell nodes get `INPUTS_<UPPER_SNAKE>` env vars instead — see #2470).
- */
-const INPUTS_RUNTIME_REF = new RegExp(String.raw`\$INPUTS\.(${INPUT_NAME_SOURCE})`, 'g');
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -39,11 +29,14 @@ function getLog(): ReturnType<typeof createLogger> {
 /** Result of error classification */
 export type ErrorType = 'TRANSIENT' | 'FATAL' | 'UNKNOWN';
 
-/**
- * Fatal error patterns - errors that won't resolve with retry: authentication/
- * authorization failures and provider quota/limit-window exhaustion (a retry
- * inside the same limit window is guaranteed to fail — see #2177).
- */
+const QUOTA_EXHAUSTION_PATTERNS = [
+  'session limit',
+  'usage limit reached',
+  'credit exhaustion',
+  'credit balance',
+] as const;
+
+/** Fatal errors: authentication/authorization failures plus quota exhaustion. */
 export const FATAL_PATTERNS = [
   'unauthorized',
   'forbidden',
@@ -52,10 +45,7 @@ export const FATAL_PATTERNS = [
   'permission denied',
   '401',
   '403',
-  'credit balance',
-  'session limit', // Claude subscription 5h window — covers every detectCreditExhaustion session variant
-  'usage limit reached', // Claude CLI quota string, e.g. "Claude AI usage limit reached|<ts>"
-  'credit exhaustion', // synthesized "Credit exhaustion detected — resume when credits reset"
+  ...QUOTA_EXHAUSTION_PATTERNS,
 ];
 
 /** Ambiguous fatal patterns that yield to concrete transient evidence. */
@@ -108,6 +98,30 @@ export function classifyError(error: Error): ErrorType {
     return 'FATAL';
   }
   return 'UNKNOWN';
+}
+
+export function isQuotaExhaustionError(error: string): boolean {
+  const message = error.toLowerCase();
+  return QUOTA_EXHAUSTION_PATTERNS.some(pattern => message.includes(pattern));
+}
+
+/** Parse only provider reset forms that carry an unambiguous instant/duration. */
+export function extractQuotaResetAt(error: string, now = new Date()): Date | null {
+  const epoch = /usage limit reached\|(\d{10,13})/i.exec(error)?.[1];
+  if (epoch !== undefined) {
+    const raw = Number(epoch);
+    const millis = epoch.length === 10 ? raw * 1000 : raw;
+    const parsed = new Date(millis);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  const relative = /resets\s+in\s+(\d+(?:\.\d+)?)\s*(m(?:in(?:ute)?s?)?|h(?:ours?)?)/i.exec(error);
+  if (relative?.[1] !== undefined && relative[2] !== undefined) {
+    const amount = Number(relative[1]);
+    const multiplier = relative[2].toLowerCase().startsWith('h') ? 60 * 60 * 1000 : 60 * 1000;
+    const parsed = new Date(now.getTime() + amount * multiplier);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  return null;
 }
 
 /**
@@ -613,21 +627,7 @@ export function substituteWorkflowVariables(
     // source (#2115). Bash/script bodies read INPUTS_<UPPER_SNAKE> env vars instead.
     // An unknown name THROWS (mirrors $node.output.field strictness) rather than
     // substituting '' — a typo'd input silently emptying is worse than a load-visible error.
-    const inputs = options?.inputs;
-    result = result.replace(INPUTS_RUNTIME_REF, (_match, name: string) => {
-      // Canonical text (#2637): a typed input splices as its one deterministic
-      // representation — strings raw, everything else canonical JSON text.
-      if (inputs && Object.hasOwn(inputs, name)) return canonicalValueText(inputs[name]);
-      const known = inputs ? Object.keys(inputs) : [];
-      const hint = similarNodeIds(name, known);
-      const suffix =
-        hint.length > 0
-          ? ` Did you mean ${hint.map(h => `$INPUTS.${h}`).join(', ')}?`
-          : known.length > 0
-            ? ` Available inputs: ${known.map(k => `$INPUTS.${k}`).join(', ')}.`
-            : ' This run has no declared inputs.';
-      throw new Error(`Unknown input '$INPUTS.${name}'.${suffix}`);
-    });
+    result = substituteInputRefs(result, options?.inputs);
   }
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
