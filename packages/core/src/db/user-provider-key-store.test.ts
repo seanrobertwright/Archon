@@ -320,6 +320,7 @@ describe('user-provider-key-store', () => {
 
     test('openai oauth row → null on malformed expires, no mint attempt', async (): Promise<void> => {
       const malformedExpires = [
+        { label: 'null payload', raw: 'null', type: 'undefined' },
         { label: 'missing', raw: '{"access":"oa"}', type: 'undefined' },
         { label: 'non-numeric', raw: '{"access":"oa","expires":"soon"}', type: 'string' },
         { label: 'non-finite', raw: '{"access":"oa","expires":1e400}', type: 'number' },
