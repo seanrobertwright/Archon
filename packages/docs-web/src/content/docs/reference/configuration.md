@@ -111,6 +111,8 @@ aliases:
 
 The `tiers:` block above is no longer hand-edit-only -- you can also set the `small`/`medium`/`large` presets from the console **AI Settings** -> **Model Tiers** panel, or from the CLI with [`archon ai tier set`](/reference/cli/#ai). Connecting your own provider API key or subscription is covered in [Per-user credentials and AI Settings](/getting-started/ai-assistants/#per-user-credentials-and-ai-settings).
 
+These files are persistent layers. For one invocation, use repeatable [`workflow run --model <name>=<spec>`](/reference/cli/#workflow-run-name-message) or the run API's `tiers` / `aliases` maps. A per-run map is sparse and sits above user, repository, global, and built-in values without editing any config file. Loading a separate config file for one run is tracked separately in [#2482](https://github.com/coleam00/Archon/issues/2482).
+
 ## Repository Configuration
 
 Create `.archon/config.yaml` in any repository for project-specific settings:

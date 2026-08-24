@@ -149,9 +149,14 @@ mock.module('./event-emitter', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks) ---
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  clearRegistry,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
+registerCommunityProviders();
 
 // --- Import after mocks ---
 import {
@@ -729,6 +734,340 @@ describe('executeWorkflow', () => {
           'db-conv-1'
         )
       ).rejects.toThrow(/unknown provider 'claud'/);
+    });
+  });
+
+  describe('run-scoped model bindings (#2481)', () => {
+    it('rebinding large changes only large and records the effective profile', async () => {
+      const createRun = mock<IWorkflowStore['createWorkflowRun']>(async () => makeRun());
+      const store = makeStore({ createWorkflowRun: createRun });
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        {
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { tiers: { large: 'openai/gpt-5.6' } },
+          },
+        }
+      );
+
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('pi');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('openai/gpt-5.6');
+      const profile = mockExecuteDagWorkflow.mock.calls[0]?.[18];
+      expect(profile?.aliases.large).toEqual({ provider: 'pi', model: 'openai/gpt-5.6' });
+      expect(profile?.aliases.small?.provider).toBe('claude');
+      expect(profile?.aliases.medium?.provider).toBe('claude');
+      expect(
+        (mockLogFn.mock.calls as unknown[][]).some(
+          call =>
+            call[1] === 'workflow_provider_resolved' &&
+            (call[0] as { providerSource?: string }).providerSource === 'run-override'
+        )
+      ).toBe(true);
+
+      const created = createRun.mock.calls[0]?.[0];
+      expect(created?.metadata?.model_bindings).toMatchObject({
+        overrides: { tiers: { large: { provider: 'pi', model: 'openai/gpt-5.6' } } },
+        effective: { aliases: { large: { provider: 'pi', model: 'openai/gpt-5.6' } } },
+      });
+    });
+
+    it('merges effective bindings onto a pre-created fresh run before DAG execution', async () => {
+      const updateRun = mock<IWorkflowStore['updateWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({ id: 'pending-run', status: 'pending', metadata: {} });
+      const store = makeStore({ updateWorkflowRun: updateRun });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun,
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+          },
+        }
+      );
+
+      expect(updateRun).toHaveBeenCalledWith(
+        'pending-run',
+        expect.objectContaining({
+          metadata: expect.objectContaining({ model_bindings: expect.any(Object) }),
+        })
+      );
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+    });
+
+    it('fails a pre-created run when its effective bindings cannot be recorded', async () => {
+      const updateRun = mock<IWorkflowStore['updateWorkflowRun']>(async () => {
+        throw new Error('database unavailable');
+      });
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({ id: 'pending-run', status: 'pending', metadata: {} });
+
+      const result = await executeWorkflow(
+        makeDeps(makeStore({ updateWorkflowRun: updateRun, failWorkflowRun: failRun })),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun,
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+          },
+        }
+      );
+
+      expect(result).toEqual({
+        success: false,
+        workflowRunId: 'pending-run',
+        error: 'Database error recording workflow model bindings',
+      });
+      expect(failRun).toHaveBeenCalledWith(
+        'pending-run',
+        'Database error recording workflow model bindings'
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('restores the persisted sparse layer on resume and refuses a new one', async () => {
+      const preCreatedRun = makeRun({
+        id: 'resume-model-run',
+        status: 'running',
+        metadata: {
+          model_bindings: {
+            overrides: {
+              tiers: { large: { provider: 'pi', model: 'openai/gpt-5.6' } },
+            },
+            effective: {
+              defaultProvider: 'claude',
+              aliases: {
+                small: { provider: 'claude', model: 'haiku' },
+                medium: { provider: 'claude', model: 'sonnet' },
+                large: { provider: 'pi', model: 'openai/gpt-5.6' },
+              },
+            },
+          },
+        },
+      });
+
+      await executeWorkflow(
+        makeDeps(makeStore()),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun, priorCompletedNodes: new Map() }
+      );
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('pi');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('openai/gpt-5.6');
+
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore()),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow({ model: 'large' }),
+          'msg',
+          'db-conv-1',
+          {
+            preCreatedRun,
+            priorCompletedNodes: new Map(),
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+            },
+          }
+        )
+      ).rejects.toThrow(/Cannot supply model overrides when resuming/);
+    });
+
+    it('resumes a persisted no-op effort accepted by the provider', async () => {
+      const preCreatedRun = makeRun({
+        id: 'resume-opencode-effort-run',
+        status: 'running',
+        metadata: {
+          model_bindings: {
+            overrides: {
+              tiers: {
+                large: {
+                  provider: 'opencode',
+                  model: 'anthropic/claude-sonnet-4-6',
+                  effort: 'ultra',
+                },
+              },
+            },
+            effective: {
+              defaultProvider: 'claude',
+              aliases: {
+                small: { provider: 'claude', model: 'haiku' },
+                medium: { provider: 'claude', model: 'sonnet' },
+                large: {
+                  provider: 'opencode',
+                  model: 'anthropic/claude-sonnet-4-6',
+                  effort: 'ultra',
+                },
+              },
+            },
+          },
+        },
+      });
+
+      await executeWorkflow(
+        makeDeps(makeStore()),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun, priorCompletedNodes: new Map() }
+      );
+
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('opencode');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('anthropic/claude-sonnet-4-6');
+    });
+
+    it('terminalizes a resumed run with an invalid persisted alias key', async () => {
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({
+        id: 'resume-invalid-alias-run',
+        status: 'running',
+        metadata: {
+          model_bindings: {
+            overrides: {
+              aliases: { planner: { provider: 'claude', model: 'opus' } },
+            },
+            effective: {
+              defaultProvider: 'claude',
+              aliases: {},
+            },
+          },
+        },
+      });
+
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore({ failWorkflowRun: failRun })),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow({ model: 'large' }),
+          'msg',
+          'db-conv-1',
+          { preCreatedRun, priorCompletedNodes: new Map() }
+        )
+      ).rejects.toThrow(/invalid model_bindings aliases/);
+
+      expect(failRun).toHaveBeenCalledWith(
+        'resume-invalid-alias-run',
+        expect.stringContaining('invalid model_bindings aliases')
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('fails a pre-created row when a semantic binding error stops startup', async () => {
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({ id: 'invalid-model-run', status: 'pending', metadata: {} });
+
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore({ failWorkflowRun: failRun })),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow({ model: 'large' }),
+          'msg',
+          'db-conv-1',
+          {
+            preCreatedRun,
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { aliases: { '@missing': 'codex/gpt-5.6-sol' } },
+            },
+          }
+        )
+      ).rejects.toThrow(/unknown alias '@missing'/);
+      expect(failRun).toHaveBeenCalledWith(
+        'invalid-model-run',
+        expect.stringContaining("unknown alias '@missing'")
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('keeps concurrent profiles isolated and leaves no residue', async () => {
+      const workflow = makeWorkflow({ model: 'large', mutates_checkout: false });
+      await Promise.all([
+        executeWorkflow(
+          makeDeps(makeStore({ createWorkflowRun: mock(async () => makeRun({ id: 'run-a' })) })),
+          makePlatform(),
+          'conv-a',
+          '/tmp',
+          workflow,
+          'a',
+          'db-a',
+          {
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { tiers: { large: 'openai/gpt-5.6' } },
+            },
+          }
+        ),
+        executeWorkflow(
+          makeDeps(makeStore({ createWorkflowRun: mock(async () => makeRun({ id: 'run-b' })) })),
+          makePlatform(),
+          'conv-b',
+          '/tmp',
+          workflow,
+          'b',
+          'db-b',
+          {
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+            },
+          }
+        ),
+      ]);
+
+      const concurrent = mockExecuteDagWorkflow.mock.calls.slice(0, 2).map(call => ({
+        provider: call[6],
+        model: call[7],
+      }));
+      expect(concurrent).toContainEqual({ provider: 'pi', model: 'openai/gpt-5.6' });
+      expect(concurrent).toContainEqual({ provider: 'codex', model: 'gpt-5.6-sol' });
+
+      await executeWorkflow(
+        makeDeps(makeStore({ createWorkflowRun: mock(async () => makeRun({ id: 'run-c' })) })),
+        makePlatform(),
+        'conv-c',
+        '/tmp',
+        workflow,
+        'c',
+        'db-c'
+      );
+      const cleanCall = mockExecuteDagWorkflow.mock.calls[2];
+      expect(cleanCall?.[6]).toBe('claude');
+      expect(cleanCall?.[7]).not.toBe('openai/gpt-5.6');
+      expect(cleanCall?.[7]).not.toBe('gpt-5.6-sol');
     });
   });
 

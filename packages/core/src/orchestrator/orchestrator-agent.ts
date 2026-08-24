@@ -99,6 +99,7 @@ import {
   resolveTierWithFallback,
   resolvePresetEffort,
   type ModelAliasPreset,
+  type RunModelOverrides,
   type TierName,
 } from '@archon/workflows/model-validation';
 
@@ -660,6 +661,8 @@ interface WorkflowDispatchOptions {
    * Validated at the dispatch gate before any worktree/clone/AI cost.
    */
   inputs?: Readonly<Record<string, string>>;
+  /** Sparse tier/@alias rebindings supplied by this run invocation (#2481). */
+  modelOverrides?: RunModelOverrides;
 }
 
 const FAILED_RUN_PROMPT_PREVIEW_MAX = 160;
@@ -679,6 +682,10 @@ function formatPriorRunPromptPreview(message: string | null): string {
   return `${normalized.slice(0, FAILED_RUN_PROMPT_PREVIEW_MAX)}…`;
 }
 
+function formatResumableRunState(status: WorkflowRun['status']): string {
+  return status === 'running' ? 'interrupted' : status;
+}
+
 function buildFailedRunResumePrompt(
   workflowName: string,
   resumableRun: WorkflowRun,
@@ -690,7 +697,7 @@ function buildFailedRunResumePrompt(
   // This prompt fires for any non-paused resumable run — that includes a stale
   // 'running' orphan (started but never finished), not only 'failed' runs, so
   // the wording must track the actual status rather than hardcoding "failed".
-  const stateLabel = resumableRun.status === 'running' ? 'interrupted' : resumableRun.status;
+  const stateLabel = formatResumableRunState(resumableRun.status);
 
   return [
     '---',
@@ -710,7 +717,7 @@ function buildFailedRunResumePrompt(
     `/workflow resume ${resumableRun.id}`,
     '```',
     '',
-    '**2. Discard the failed run, then start fresh with your current message:**',
+    `**2. Discard the ${stateLabel} run, then start fresh with your current message:**`,
     '```',
     `/workflow abandon ${resumableRun.id}`,
     '```',
@@ -719,7 +726,7 @@ function buildFailedRunResumePrompt(
     `${baseCommand} "${escapedMessage}"`,
     '```',
     '',
-    '**3. Start fresh with your current message, leave the failed run as-is** (skips the resume check):',
+    `**3. Start fresh with your current message, leave the ${stateLabel} run as-is** (skips the resume check):`,
     '```',
     `${baseCommand} --force "${escapedMessage}"`,
     '```',
@@ -1074,6 +1081,11 @@ async function dispatchOrchestratorWorkflowOwned(
       throw err;
     }
     if (prepared) {
+      const resumeStateLabel = formatResumableRunState(resumableRun.status);
+      const suppliedModelBindingNames = [
+        ...Object.keys(options?.modelOverrides?.tiers ?? {}),
+        ...Object.keys(options?.modelOverrides?.aliases ?? {}),
+      ].sort();
       // A resume replays the inputs stamped on its own row; values supplied on THIS
       // call cannot reach it (the row already exists, so the executor's stamp never
       // fires). Say so rather than accepting them and quietly running something else.
@@ -1085,10 +1097,27 @@ async function dispatchOrchestratorWorkflowOwned(
         );
         await platform.sendMessage(
           conversationId,
-          `▶️ Resuming the paused run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
+          `▶️ Resuming the ${resumeStateLabel} run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
             `keeps the inputs it started with — the values you supplied now (${ignored}) were ` +
             'not applied. To run fresh with them instead, abandon that run first ' +
             `(\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
+        );
+      }
+      if (suppliedModelBindingNames.length > 0) {
+        getLog().info(
+          {
+            workflowName: workflow.name,
+            resumableRunId: resumableRun.id,
+            ignoredBindings: suppliedModelBindingNames,
+          },
+          'orchestrator.resume_ignored_model_bindings'
+        );
+        await platform.sendMessage(
+          conversationId,
+          `▶️ Resuming the ${resumeStateLabel} run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
+            'keeps the model bindings it started with — the bindings you supplied now ' +
+            `(${suppliedModelBindingNames.join(', ')}) were not applied. To run fresh with them ` +
+            `instead, abandon that run first (\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
         );
       }
       // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
@@ -1160,6 +1189,14 @@ async function dispatchOrchestratorWorkflowOwned(
           // This branch creates a FRESH run row (the prior run had nothing to resume),
           // so the supplied inputs still need stamping.
           inputs: resolvedInputs,
+          ...(options?.modelOverrides
+            ? {
+                modelOverrideLayer: {
+                  kind: 'raw' as const,
+                  overrides: options.modelOverrides,
+                },
+              }
+            : {}),
         }
       );
     }
@@ -1185,6 +1222,7 @@ async function dispatchOrchestratorWorkflowOwned(
           source,
           parseWarnings: options?.parseWarnings,
           inputs: resolvedInputs,
+          modelOverrides: options?.modelOverrides,
         },
         workflow
       );
@@ -1236,6 +1274,11 @@ async function dispatchOrchestratorWorkflowOwned(
         resolveChildIsolation,
         capturedSourceOwner: owner,
         inputs: resolvedInputs,
+        ...(options?.modelOverrides
+          ? {
+              modelOverrideLayer: { kind: 'raw' as const, overrides: options.modelOverrides },
+            }
+          : {}),
       }
     );
   }
@@ -1818,6 +1861,7 @@ export async function handleMessage(
               // Declared inputs (#2554) arrive on the request context, not in the
               // command text — the run route is the only caller that sets them.
               inputs: context?.workflowInputs,
+              modelOverrides: context?.workflowModelOverrides,
             }
           );
         }

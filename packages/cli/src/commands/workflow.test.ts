@@ -764,6 +764,48 @@ describe('workflowRunCommand — dry-run', () => {
     expect(consoleSpy).not.toHaveBeenCalled();
   });
 
+  it('layers acting-user preferences before resolving dry-run model bindings', async () => {
+    const previousUserId = process.env.ARCHON_USER_ID;
+    process.env.ARCHON_USER_ID = 'dry-run-user';
+    try {
+      const core = await import('@archon/core');
+      const dryRun = await import('@archon/workflows/dry-run');
+      (core.loadConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        assistant: 'claude',
+        tiers: {},
+        aliases: {},
+      });
+      (core.getUserAiPrefs as ReturnType<typeof mock>).mockResolvedValueOnce({
+        defaultProvider: 'codex',
+        aliases: {
+          '@personal': { provider: 'claude', model: 'opus' },
+          '@planner': { provider: 'pi', model: 'openai/gpt-5.6' },
+        },
+      });
+
+      await workflowRunCommand('/test/path', 'plan', 'hello', {
+        dryRun: true,
+        modelAssignments: ['large=@personal', '@planner=next-model'],
+      });
+
+      const options = (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+        aiProfile: {
+          defaultProvider: string;
+          aliases: Record<string, { provider: string; model: string }>;
+        };
+      };
+      expect(options.aiProfile.defaultProvider).toBe('codex');
+      expect(options.aiProfile.aliases.large).toEqual({ provider: 'claude', model: 'opus' });
+      expect(options.aiProfile.aliases['@planner']).toEqual({
+        provider: 'pi',
+        model: 'next-model',
+      });
+    } finally {
+      if (previousUserId === undefined) Reflect.deleteProperty(process.env, 'ARCHON_USER_ID');
+      else process.env.ARCHON_USER_ID = previousUserId;
+    }
+  });
+
   it('writes a scaffold from the discovered workflow and exits before simulation', async () => {
     const { executeWorkflow } = await import('@archon/workflows/executor');
     const dryRun = await import('@archon/workflows/dry-run');
@@ -1297,6 +1339,96 @@ describe('workflowRunCommand — --input declared inputs (#2554)', () => {
     ).rejects.toThrow(/--resume and --input are mutually exclusive/);
 
     expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+describe('workflowRunCommand — sparse model bindings (#2481)', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  async function stubWorkflow(): Promise<void> {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'bench' }, 'project')],
+      errors: [],
+    });
+  }
+
+  it('passes one sparse tier and alias map to the executor', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    await stubWorkflow();
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-models',
+    });
+
+    await workflowRunCommand('/repo/root', 'bench', 'go', {
+      noWorktree: true,
+      modelAssignments: ['large=openai/gpt-5.6', '@planner=codex/gpt-5.6-sol'],
+    });
+
+    const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][7] as {
+      modelOverrideLayer?: unknown;
+    };
+    expect(opts.modelOverrideLayer).toEqual({
+      kind: 'raw',
+      overrides: {
+        tiers: { large: 'openai/gpt-5.6' },
+        aliases: { '@planner': 'codex/gpt-5.6-sol' },
+      },
+    });
+  });
+
+  it('rejects bare and duplicate mappings before execution', async () => {
+    const { executeWorkflow, prepareWorkflowSource } = await import('@archon/workflows/executor');
+    const prepareCallsBefore = (prepareWorkflowSource as ReturnType<typeof mock>).mock.calls.length;
+    await expect(
+      workflowRunCommand('/repo/root', 'bench', 'go', {
+        noWorktree: true,
+        modelAssignments: ['openai/gpt-5.6'],
+      })
+    ).rejects.toThrow(/Expected/);
+    expect(executeWorkflow).not.toHaveBeenCalled();
+    expect((prepareWorkflowSource as ReturnType<typeof mock>).mock.calls).toHaveLength(
+      prepareCallsBefore
+    );
+
+    await expect(
+      workflowRunCommand('/repo/root', 'bench', 'go', {
+        noWorktree: true,
+        modelAssignments: ['large=   '],
+      })
+    ).rejects.toThrow(/Expected/);
+    expect((prepareWorkflowSource as ReturnType<typeof mock>).mock.calls).toHaveLength(
+      prepareCallsBefore
+    );
+
+    await expect(
+      workflowRunCommand('/repo/root', 'bench', 'go', {
+        noWorktree: true,
+        modelAssignments: ['large=x', 'large=y'],
+      })
+    ).rejects.toThrow(/Duplicate/);
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('refuses new model bindings on resume', async () => {
+    await stubWorkflow();
+    await expect(
+      workflowRunCommand('/repo/root', 'bench', 'go', {
+        resume: true,
+        modelAssignments: ['large=openai/gpt-5.6'],
+      })
+    ).rejects.toThrow(/--resume and --model/);
   });
 });
 

@@ -850,6 +850,76 @@ describe('POST /api/workflows/:name/run', () => {
     expect(response.status).toBe(400);
     expect(mockHandleMessage).not.toHaveBeenCalled();
   });
+
+  test('forwards sparse JSON tier and alias bindings as structured context', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async () => {});
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/bench/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Go',
+        tiers: { large: 'openai/gpt-5.6' },
+        aliases: { '@planner': 'codex/gpt-5.6-sol' },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      '/workflow run bench Go',
+      expect.objectContaining({
+        workflowModelOverrides: {
+          tiers: { large: 'openai/gpt-5.6' },
+          aliases: { '@planner': 'codex/gpt-5.6-sol' },
+        },
+      })
+    );
+  });
+
+  test('accepts multipart tier and alias maps as JSON object fields', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async () => {});
+    const form = new FormData();
+    form.append('conversationId', 'web-test-abc');
+    form.append('message', 'Go');
+    form.append('tiers', JSON.stringify({ large: 'openai/gpt-5.6' }));
+    form.append('aliases', JSON.stringify({ '@planner': 'codex/gpt-5.6-sol' }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/bench/run', {
+      method: 'POST',
+      body: form,
+    });
+
+    expect(response.status).toBe(200);
+    const context = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    expect(context.workflowModelOverrides).toEqual({
+      tiers: { large: 'openai/gpt-5.6' },
+      aliases: { '@planner': 'codex/gpt-5.6-sol' },
+    });
+  });
+
+  test('rejects malformed model binding maps before dispatch', async () => {
+    const { app } = makeApp();
+    for (const payload of [
+      { tiers: { tiny: 'x' } },
+      { tiers: { large: 5 } },
+      { aliases: { planner: 'x' } },
+      { aliases: ['@planner=x'] },
+    ]) {
+      const response = await app.request('/api/workflows/bench/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go', ...payload }),
+      });
+      expect(response.status).toBe(400);
+    }
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

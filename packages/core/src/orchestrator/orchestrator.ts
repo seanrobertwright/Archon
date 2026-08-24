@@ -67,6 +67,7 @@ import {
 import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
 import type { DagNode } from '@archon/workflows/schemas/dag-node';
+import type { RunModelOverrides } from '@archon/workflows/model-validation';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import {
@@ -315,6 +316,8 @@ export interface WorkflowRoutingContext {
    * path where pre-creation failed and the executor creates the row itself.
    */
   readonly inputs?: Readonly<Record<string, string>>;
+  /** Sparse tier/@alias rebindings supplied by this invocation (#2481). */
+  readonly modelOverrides?: RunModelOverrides;
 }
 
 /**
@@ -578,6 +581,9 @@ async function dispatchBackgroundWorkflowOwned(
             // the executor creates the row itself); otherwise the row above already
             // carries them.
             inputs: ctx.inputs,
+            ...(ctx.modelOverrides
+              ? { modelOverrideLayer: { kind: 'raw' as const, overrides: ctx.modelOverrides } }
+              : {}),
           }
         );
         // Surface workflow output to parent conversation as a result card

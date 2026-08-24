@@ -25,6 +25,29 @@ export {
 } from './hooks';
 export type { WorkflowHookEvent, WorkflowHookMatcher, WorkflowNodeHooks } from './hooks';
 
+// Model binding profiles and durable run metadata
+export {
+  TIER_NAMES,
+  tierNameSchema,
+  modelAliasPresetSchema,
+  rawAliasesConfigSchema,
+  runAliasesConfigSchema,
+  rawTiersConfigSchema,
+  resolvedRunModelOverridesSchema,
+  resolvedAiProfileSchema,
+  runModelBindingsMetadataSchema,
+} from './model-binding';
+export type {
+  TierName,
+  ModelAliasPreset,
+  RawAliasEntry,
+  RawAliasesConfig,
+  RawTiersConfig,
+  ResolvedRunModelOverrides,
+  ResolvedAiProfile,
+  RunModelBindingsMetadata,
+} from './model-binding';
+
 // DAG node types
 export {
   triggerRuleSchema,

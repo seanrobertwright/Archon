@@ -2045,9 +2045,17 @@ describe('workflow dispatch routing — interactive flag', () => {
       'conv-1',
       expect.stringContaining('Found a prior interrupted run of **test-workflow**')
     );
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Discard the interrupted run')
+    );
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('leave the interrupted run as-is')
+    );
     expect(platform.sendMessage).not.toHaveBeenCalledWith(
       'conv-1',
-      expect.stringContaining('Found a prior failed run')
+      expect.stringContaining('failed run')
     );
   });
 
@@ -2471,6 +2479,37 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(ctx.inputs).toEqual({ diff: 'D1' });
   });
 
+  test('threads context.workflowModelOverrides into a fresh foreground run', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
+      workflowModelOverrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
+
+    const opts = mockExecuteWorkflow.mock.calls[0][7] as { modelOverrideLayer?: unknown };
+    expect(opts.modelOverrideLayer).toEqual({
+      kind: 'raw',
+      overrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
+  });
+
+  test('threads context.workflowModelOverrides into the console background path', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
+      workflowModelOverrides: { aliases: { '@planner': 'codex/gpt-5.6-sol' } },
+    });
+
+    const ctx = mockDispatchBackgroundWorkflow.mock.calls[0][0] as { modelOverrides?: unknown };
+    expect(ctx.modelOverrides).toEqual({
+      aliases: { '@planner': 'codex/gpt-5.6-sol' },
+    });
+  });
+
   test('refuses a required-input workflow when nothing is supplied, starting nothing', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
@@ -2613,6 +2652,58 @@ describe('workflow dispatch routing — interactive flag', () => {
     // Names only — a supplied value is user content and must never be echoed back.
     expect(sent).not.toContain('D-new');
     // The resume still proceeds; the run holds real work and a worktree.
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+  });
+
+  test('tells the caller when model bindings could not be applied to an auto-resumed run', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve({
+        id: 'implicit-model-resume',
+        workflow_name: 'test-workflow',
+        working_path: '/repos/test-repo/worktrees/paused',
+        parent_conversation_id: 'conv-1',
+        status: 'paused',
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
+      workflowModelOverrides: {
+        tiers: { large: 'openai/gpt-5.6' },
+        aliases: { '@planner': 'codex/gpt-5.6-sol' },
+      },
+    });
+
+    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+    expect(sent).toContain('were not applied');
+    expect(sent).toContain('@planner, large');
+    expect(sent).toContain('implicit-model-resume');
+    expect(sent).not.toContain('openai/gpt-5.6');
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.modelOverrideLayer).toBeUndefined();
+  });
+
+  test('uses the actual state when explicit resume ignores supplied model bindings', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve(makeWorkflowResult(true, { resumeRunId: 'failed-model-resume' }))
+    );
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(makeResumableRun({ id: 'failed-model-resume', status: 'failed' }))
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow resume failed-model-resume', {
+      workflowModelOverrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
+
+    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+    expect(sent).toContain('Resuming the failed run');
+    expect(sent).not.toContain('Resuming the paused run');
     expect(mockExecuteWorkflow).toHaveBeenCalled();
   });
 

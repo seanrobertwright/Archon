@@ -594,6 +594,65 @@ nodes:
     expect(child?.conversation_id).toBe('conv-db');
   });
 
+  it('propagates sparse model bindings into a child run and its effective profile', async () => {
+    await writeWorkflow(
+      'child-model-binding',
+      `
+name: child-model-binding
+description: child using the large tier
+nodes:
+  - id: child-work
+    prompt: "child work"
+    model: large
+`
+    );
+    await writeWorkflow(
+      'parent-model-binding',
+      `
+name: parent-model-binding
+description: parent composing a child with the same run binding
+nodes:
+  - id: sub
+    workflow: child-model-binding
+`
+    );
+
+    const store = new InMemoryStore();
+    const parent = await discover('parent-model-binding');
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      {
+        modelOverrideLayer: {
+          kind: 'raw',
+          overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+        },
+      }
+    );
+
+    expect(result.success).toBe(true);
+    const parentRun = [...store.runs.values()].find(
+      run => run.workflow_name === 'parent-model-binding'
+    );
+    const childRun = [...store.runs.values()].find(
+      run => run.workflow_name === 'child-model-binding'
+    );
+    expect(childRun?.parent_run_id).toBe(parentRun?.id);
+    expect(childRun?.metadata.model_bindings).toMatchObject({
+      overrides: {
+        tiers: { large: { provider: 'codex', model: 'gpt-5.6-sol' } },
+      },
+      effective: {
+        aliases: { large: { provider: 'codex', model: 'gpt-5.6-sol' } },
+      },
+    });
+  });
+
   it('child gate → parent pauses blocked-on-child → approve child → parent auto-resumes → output threads', async () => {
     await writeWorkflow(
       'child-gated',
