@@ -1,0 +1,20 @@
+# Sparse dry-run fixture: the assessment proves a real flake with a prescribed
+# decoupling, so the full delivery tail runs and the outcome node verifies the
+# result. Run with --default-stubs.
+record-state: '{"state":"recorded"}'
+assess:
+  action: fix
+  summary: "stub: bimodal profile at the 5000 ms bound — an undeclared real database open stalls the mocked test; fix order stubs the module and removes the bound collision"
+assert-intact: '{"intact":"true"}'
+gate-fix: '{"gate":"fix"}'
+deliver__impl__implement:
+  done: true
+  green: true
+  summary: "stub: coupling removed, 20 consecutive runs green under the trigger condition, test still fails on its planted fault"
+deliver__review__synthesize:
+  ready: true
+  findings_summary: "stub: no open findings"
+deliver__validate__validate:
+  green: true
+  summary: "stub: project gate green"
+outcome: "https://github.com/example/repo/pull/9"
