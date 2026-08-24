@@ -317,6 +317,12 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
       socket.destroy();
       reject(new DetachedRunOwnerUnavailableError(runId, detail));
     };
+    const onEnd = (): void => {
+      fail('owner ended before identifying itself');
+    };
+    const onClose = (): void => {
+      fail('owner closed before identifying itself');
+    };
 
     socket.setEncoding('utf8');
     socket.setTimeout(IPC_TIMEOUT_MS, () => {
@@ -325,6 +331,8 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
     socket.once('error', error => {
       fail((error as NodeJS.ErrnoException).code ?? error.message);
     });
+    socket.once('end', onEnd);
+    socket.once('close', onClose);
     socket.once('connect', () => {
       socket.write(STOP_REQUEST);
     });
@@ -340,6 +348,8 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
       try {
         const pid = parseOwnerResponse(runId, response.slice(0, newline));
         settled = true;
+        socket.off('end', onEnd);
+        socket.off('close', onClose);
         socket.setTimeout(0);
         let released = false;
         let stopping = false;
@@ -351,6 +361,9 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
         resolve({
           stop: async (): Promise<void> => {
             if (stopping) throw new Error('Detached workflow termination already started');
+            if (released || socket.destroyed || socket.readableEnded) {
+              throw new Error('Detached workflow owner ended before termination started');
+            }
             stopping = true;
             try {
               await new Promise<void>((ready, rejectReady) => {

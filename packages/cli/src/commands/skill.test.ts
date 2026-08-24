@@ -69,6 +69,7 @@ describe('copyArchonSkill', () => {
       expect(content).not.toContain('cancel via reject');
       expect(content).not.toContain('Reject (cancels the workflow)');
     }
+    expect(guidance[0]).toContain('approve/reject/cancel/abandon/resume');
   });
 
   it('overwrites pre-existing skill files with bundled content', async () => {

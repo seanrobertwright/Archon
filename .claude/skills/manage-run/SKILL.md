@@ -8,7 +8,7 @@ description: |
   Triggers (control): "approve the plan", "approve run <id>", "reject that run", "cancel that run",
             "abandon run <id>", "resume run <id>", "continue that run".
   Triggers (start): "start <workflow> in the background", "kick off <workflow> detached".
-  Capability: Drives `archon workflow runs/get/status/run --detach/approve/reject/abandon/resume`
+  Capability: Drives `archon workflow runs/get/status/run --detach/approve/reject/cancel/abandon/resume`
             with machine-readable `--json` output, scoped to the current project by cwd.
   NOT for: Authoring workflows/commands, or Archon setup/config — use the broader `archon` skill.
 argument-hint: "[run-id or workflow] [comment]"

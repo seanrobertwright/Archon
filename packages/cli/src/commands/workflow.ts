@@ -41,6 +41,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
 import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
+import { reclaimContainerEnv } from '@archon/core/services/cleanup-service';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
@@ -3247,8 +3248,34 @@ export async function workflowCancelCommand(
       );
     }
 
+    const isolationEnvId = current.metadata?.isolation_env_id;
+    const containerEnvId =
+      current.metadata?.isolation === 'container' && typeof isolationEnvId === 'string'
+        ? isolationEnvId
+        : undefined;
+    if (containerEnvId) {
+      const containerEnv = await isolationDb.getById(containerEnvId);
+      if (containerEnv?.provider !== 'container') {
+        throw new Error(
+          `Cannot confirm the isolation container owned by run ${resolvedId}. ` +
+            'The run was not changed; inspect the managed containers before retrying or abandoning it.'
+        );
+      }
+    }
+
     const target = await requestDetachedRunStop(resolvedId);
     await target.stop();
+
+    if (containerEnvId) {
+      try {
+        await reclaimContainerEnv(containerEnvId);
+      } catch (error) {
+        throw new Error(
+          'Detached owner process stopped, but the isolation container could not be confirmed stopped. ' +
+            `Run state was not changed. ${(error as Error).message}`
+        );
+      }
+    }
 
     const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
     return {

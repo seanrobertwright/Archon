@@ -44,6 +44,27 @@ describe('detached run control', () => {
     );
   });
 
+  it('fails when the owner closes before identifying itself', async () => {
+    const runId = `close-before-pid-${crypto.randomUUID()}`;
+    const path = detachedRunControlPath(runId);
+    const server = createServer(socket => {
+      socket.once('data', () => socket.end());
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(path, resolve);
+    });
+
+    try {
+      await expect(requestDetachedRunStop(runId)).rejects.toThrow(
+        /owner (?:ended|closed) before identifying itself/
+      );
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
+  });
+
   it('fails when the owner closes before committing termination', async () => {
     const runId = `close-before-ready-${crypto.randomUUID()}`;
     const path = detachedRunControlPath(runId);
