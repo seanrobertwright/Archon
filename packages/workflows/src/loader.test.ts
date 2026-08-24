@@ -5758,6 +5758,120 @@ nodes:
     });
   });
 
+  describe('scalar shared session context', () => {
+    function parseSessionContext(yaml: string): ParseResult {
+      return parseWorkflow(yaml, 'session-context.yaml');
+    }
+
+    it('rejects scalar shared on a node in a structurally parallel layer', () => {
+      const result = parseSessionContext(`
+name: parallel-shared
+description: parallel shared
+nodes:
+  - id: source
+    prompt: source
+  - id: shared
+    prompt: continue
+    depends_on: [source]
+    context: shared
+  - id: sibling
+    prompt: independent
+    depends_on: [source]
+`);
+
+      expect(result.error?.error).toContain(
+        "Node 'shared' uses scalar context: 'shared' in a structurally parallel layer"
+      );
+      expect(result.error?.error).toContain('context: { resume: <upstream-node-id> }');
+      expect(result.error?.error).toContain('depends_on');
+    });
+
+    it('rejects scalar shared when parallel sibling conditions appear mutually exclusive', () => {
+      const result = parseSessionContext(`
+name: conditional-parallel-shared
+description: conditional parallel shared
+nodes:
+  - id: choice
+    bash: echo left
+  - id: left
+    prompt: continue left
+    depends_on: [choice]
+    when: "$choice.output == 'left'"
+    context: shared
+  - id: right
+    prompt: start right
+    depends_on: [choice]
+    when: "$choice.output == 'right'"
+`);
+
+      expect(result.error?.error).toContain(
+        "Node 'left' uses scalar context: 'shared' in a structurally parallel layer"
+      );
+    });
+
+    it('accepts scalar shared in a sequential chain', () => {
+      const result = parseSessionContext(`
+name: sequential-shared
+description: sequential shared
+nodes:
+  - id: source
+    prompt: source
+  - id: continuation
+    prompt: continue
+    depends_on: [source]
+    context: shared
+`);
+
+      expect(result.error).toBeNull();
+    });
+
+    it('accepts named resume in a structurally parallel layer', () => {
+      const result = parseSessionContext(`
+name: parallel-named-resume
+description: parallel named resume
+provider: claude
+nodes:
+  - id: source
+    prompt: source
+  - id: continuation
+    prompt: continue
+    depends_on: [source]
+    context: { resume: source }
+  - id: sibling
+    prompt: independent
+    depends_on: [source]
+`);
+
+      expect(result.error).toBeNull();
+    });
+
+    it('rejects scalar shared in a structurally parallel loop_group body', () => {
+      const result = parseSessionContext(`
+name: loop-group-parallel-shared
+description: loop group parallel shared
+nodes:
+  - id: group
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: source
+          prompt: source
+        - id: shared
+          prompt: continue
+          depends_on: [source]
+          context: shared
+        - id: sibling
+          prompt: independent
+          depends_on: [source]
+`);
+
+      expect(result.error?.error).toContain("loop_group 'group' body: Node 'shared'");
+      expect(result.error?.error).toContain('context.resume is not supported');
+      expect(result.error?.error).toContain('depends_on');
+    });
+  });
+
   describe('addressable session resume', () => {
     function parseAddressable(yaml: string): ParseResult {
       return parseWorkflow(yaml, 'addressable.yaml');

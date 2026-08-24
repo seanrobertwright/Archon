@@ -791,23 +791,50 @@ export function validateDagStructure(
     }
   }
 
-  const queue = nodes.filter(n => (inDegree.get(n.id) ?? 0) === 0).map(n => n.id);
+  let ready = nodes.filter(n => (inDegree.get(n.id) ?? 0) === 0).map(n => n.id);
+  const layers: string[][] = [];
   let visited = 0;
 
-  while (queue.length > 0) {
-    const nodeId = queue.shift();
-    if (nodeId === undefined) break;
-    visited++;
-    for (const dep of dependents.get(nodeId) ?? []) {
-      const newDegree = (inDegree.get(dep) ?? 0) - 1;
-      inDegree.set(dep, newDegree);
-      if (newDegree === 0) queue.push(dep);
+  while (ready.length > 0) {
+    layers.push(ready);
+    const nextIds: string[] = [];
+    for (const nodeId of ready) {
+      visited++;
+      for (const dep of dependents.get(nodeId) ?? []) {
+        const newDegree = (inDegree.get(dep) ?? 0) - 1;
+        inDegree.set(dep, newDegree);
+        if (newDegree === 0) nextIds.push(dep);
+      }
     }
+    ready = nextIds;
   }
 
   if (visited < nodes.length) {
     const cycleNodes = nodes.filter(n => (inDegree.get(n.id) ?? 0) > 0).map(n => n.id);
     return `Cycle detected among nodes: ${cycleNodes.join(', ')}`;
+  }
+
+  // Scalar `shared` inherits one ambient sequential cursor. A multi-node ready set is
+  // the executor's exact definition of a parallel layer; it clears that cursor before
+  // evaluating `when:` or dispatching either sibling. Reject the otherwise silent no-op
+  // here, while the graph is still being loaded. Explicit named resume owns deliberate
+  // parallel ancestry (#2099/#2643).
+  for (const layer of layers) {
+    if (layer.length < 2) continue;
+    const sharedNode = layer
+      .map(nodeId => nodesById.get(nodeId))
+      .find(
+        (node): node is DagNode =>
+          node !== undefined &&
+          !isIncludeDirective(node) &&
+          isAgentNode(node) &&
+          node.context === 'shared'
+      );
+    if (sharedNode === undefined) continue;
+    if (enclosingNodes !== undefined) {
+      return `Node '${sharedNode.id}' uses scalar context: 'shared' in a structurally parallel loop_group body. Scalar 'shared' only inherits the ambient session in sequential layers. Serialize the body nodes with 'depends_on' or use fresh context; context.resume is not supported inside loop_group bodies`;
+    }
+    return `Node '${sharedNode.id}' uses scalar context: 'shared' in a structurally parallel layer. Scalar 'shared' only inherits the ambient session in sequential layers. Use 'context: { resume: <upstream-node-id> }' to fork an exact upstream session, or serialize the nodes with 'depends_on'`;
   }
 
   const directDeps = new Map<string, string[]>(nodes.map(n => [n.id, n.depends_on ?? []]));
