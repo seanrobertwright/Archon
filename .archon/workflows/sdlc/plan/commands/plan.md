@@ -22,7 +22,7 @@ When a prior report is provided, treat its claims like any inherited analysis: v
 
 ## Decide, don't defer
 
-Name the design decisions the work actually contains, choose, and record why — including the strongest alternative and the concrete reason it lost. A plan that defers its central decision is not a plan. Prefer the smallest coherent approach: no speculative abstraction, no capability without a current caller, and a rewrite over a patch when it is clearly simpler and no riskier. If the path grows complicated while you plan it, step back and reconsider the approach rather than elaborating the first idea.
+Name the design decisions the work actually contains, choose, and record why — including the strongest alternative and the concrete reason it lost. A plan that defers its central decision is not a plan. Prefer the smallest coherent approach: no speculative abstraction, no capability without a current caller, deletion of superseded machinery over addition beside it, and a rewrite over a patch when it is clearly simpler and no riskier. If the path grows complicated while you plan it, step back and reconsider the approach rather than elaborating the first idea.
 
 The one thing you do not decide is missing intent. When the work genuinely cannot be planned without information only its owner has — a product choice, an unstated constraint — stop there: declare `ready: false` and name exactly what is missing. Never fill an intent gap with a guess.
 
@@ -38,6 +38,8 @@ Write `$ARTIFACTS_DIR/plan.md`:
 - **Out of scope** — what this plan deliberately does not do, so the implementer does not helpfully do it.
 
 Omit a section that does not apply; never write a placeholder to preserve one.
+
+No one is watching this run: the plan file and your declared fields are all that survive it. Write the plan for the implementer who was not present.
 
 ## Not your job
 

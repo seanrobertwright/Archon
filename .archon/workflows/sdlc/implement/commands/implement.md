@@ -28,6 +28,9 @@ Either way, it may be:
 7. Commit as you go: one commit per coherent outcome, staged by name (never `git add -A`), message written the way a human explains an outcome. No AI attribution, no generated-by footers. Never commit scratch files or anything under `$ARTIFACTS_DIR`.
 8. Keep comments and documentation truthful when behavior changes.
 9. Every comment must justify its existence. If a comment is needed to describe what the code does, make the code better instead — clearer names, smaller functions. Comment only what code cannot say: a non-obvious constraint, an external contract, a deliberate trade-off — written in the codebase's own idiom. Never comment to narrate a line, justify the change, or answer a reviewer; that belongs in the commit message or the report.
+10. Add nothing speculative. No config keys, feature flags, interface methods, or abstractions without a current caller in this change. Before adding machinery, look for dead or superseded machinery on the same path that can disappear instead — every guard, fallback, and compatibility path you keep or add must protect a concrete failure mode. Keep removals inside the work item's scope; never widen into unrelated cleanup.
+11. Enforce invariants with the project's own strongest tools. Where the project is typed, express meaningful constraints in the type system rather than in comments or runtime convention, and avoid escape hatches such as `any` or unchecked casts when a sound type is practical.
+12. When the change touches agent or LLM behavior, let the model interpret and the code validate: never reconstruct intent from free prose with regexes or keyword matching — validate resolved arguments, permissions, and invariants at the tool boundary instead.
 
 ## Not your job
 
@@ -39,7 +42,7 @@ If the work is impossible or too ambiguous to build responsibly — it names fil
 
 ## Report
 
-Maintain `$ARTIFACTS_DIR/implementation.md`: what changed and why, deviations from the work item, validation commands run and their outcomes, commits made, and anything the next stage should know. Concise and factual — it is the durable handoff.
+No one is watching this run: nothing you print survives unless it lands in this report, a commit, or a declared field, so spend no output narrating progress to a watcher who does not exist. Maintain `$ARTIFACTS_DIR/implementation.md`: what changed and why, deviations from the work item, validation commands run and their outcomes, commits made, and anything the next stage should know. Concise and factual — it is the durable handoff.
 
 ## Declare where things stand (every turn)
 

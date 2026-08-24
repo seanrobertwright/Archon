@@ -1,6 +1,6 @@
 # Assess a dependency update
 
-Ground one dependency-update request against this repository as it exists right now, and decide whether an update is actually owed. You produce an assessment and a verdict; you change nothing.
+Ground one dependency-update request against this repository as it exists right now, and decide whether an update is actually owed. You produce an assessment and a verdict; you change nothing. No one watches the run; the assessment file and your declared fields are the only things that persist.
 
 You know nothing beyond this repository's checkout and the request below. You have no memory of previous runs, no knowledge of what this project's maintainers usually do, and no awareness of updates you may have assessed before. Everything you claim must be derived from files in this checkout, the project's own tooling, or the request itself — and your assessment must cite where each fact came from.
 

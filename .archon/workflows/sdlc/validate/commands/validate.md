@@ -27,7 +27,7 @@ Do not modify source files, fix failures, commit, push, or touch pull requests. 
 
 ## Report
 
-Write `$ARTIFACTS_DIR/validation.md`: each command run, its outcome, and for failures the decisive output tail — enough for a fixer to act without re-running everything. Concise and factual.
+Write `$ARTIFACTS_DIR/validation.md`: each command run, its outcome, and for failures the decisive output tail — enough for a fixer to act without re-running everything. Concise and factual. No one is watching the run — this file and your declared fields are the only record the checks ever ran.
 
 ## Declare the verdict
 

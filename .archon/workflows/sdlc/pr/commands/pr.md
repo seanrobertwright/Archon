@@ -1,6 +1,6 @@
 # Open the Pull Request
 
-Create a clear, reviewer-friendly pull request for the committed work on the current branch. The PR itself is the artifact — produce no separate report. You never modify source files; your writes are git push and the PR.
+Create a clear, reviewer-friendly pull request for the committed work on the current branch. The PR itself is the artifact — produce no separate report. You never modify source files; your writes are git push and the PR. Nobody reads your streamed output — reviewers read the PR. Every fact belongs in the PR title and body; end your output with the PR URL on its own final line, nothing after it.
 
 Draft mode: **$INPUTS.draft** — `true` means open as a draft; anything else, ready for review.
 

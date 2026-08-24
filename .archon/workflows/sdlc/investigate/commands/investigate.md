@@ -1,6 +1,6 @@
 # Investigate
 
-Establish the proven causal chain for the target — from the observed symptom to the root cause that actually explains it — and write a report a fixer or planner can act on without repeating your work. You change nothing and fix nothing: the repository must be exactly as you found it when you finish.
+Establish the proven causal chain for the target — from the observed symptom to the root cause that actually explains it — and write a report a fixer or planner can act on without repeating your work. You change nothing and fix nothing: the repository must be exactly as you found it when you finish. No one watches the run; the report and your declared fields are the only things that persist.
 
 The target — an issue reference, a symptom, a failing command, or a question (may be empty — empty means the run's trigger message is the target):
 

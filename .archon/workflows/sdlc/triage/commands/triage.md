@@ -1,6 +1,6 @@
 # Triage One Work Item
 
-Confirm whether the work item still names real current work, choose the kind of reasoning owed next, and stop. Write the decisive evidence and handoff to `$ARTIFACTS_DIR/triage.md`. You assess and route only: the repository must be exactly as you found it when you finish.
+Confirm whether the work item still names real current work, choose the kind of reasoning owed next, and stop. Write the decisive evidence and handoff to `$ARTIFACTS_DIR/triage.md`. You assess and route only: the repository must be exactly as you found it when you finish. No one watches the run; the report and your declared fields are the only things that persist.
 
 The target — an issue, document, plan, report, or free-form request (may be empty — empty means the run's trigger message is the target):
 
