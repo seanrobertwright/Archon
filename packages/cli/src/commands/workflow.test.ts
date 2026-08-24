@@ -13,7 +13,7 @@ import {
   jest,
 } from 'bun:test';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
 import {
@@ -6400,6 +6400,12 @@ describe('resolveDetachedRunEncryptionEnv', () => {
       TOKEN_ENCRYPTION_KEY: 'install-key',
       ARCHON_HOME: '/parent/repo/relative-home',
     });
+    expect(resolveDetachedRunEncryptionEnv({ ARCHON_HOME: '~/.archon-custom' }, '/parent')).toEqual(
+      {
+        TOKEN_ENCRYPTION_KEY: '',
+        ARCHON_HOME: join(homedir(), '.archon-custom'),
+      }
+    );
   });
 });
 

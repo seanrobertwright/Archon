@@ -43,6 +43,7 @@ import {
   BUNDLED_VERSION,
   readTierNoticeState,
   markTierNoticeShown,
+  expandTilde,
 } from '@archon/paths';
 import { isAbsolute, join, resolve } from 'node:path';
 import { applyWorkflowRunConfigLayer } from '@archon/workflows/run-config';
@@ -443,7 +444,7 @@ export function resolveDetachedRunEncryptionEnv(
 ): { TOKEN_ENCRYPTION_KEY: string; ARCHON_HOME: string } {
   return {
     TOKEN_ENCRYPTION_KEY: env.TOKEN_ENCRYPTION_KEY ?? '',
-    ARCHON_HOME: env.ARCHON_HOME ? resolve(cwd, env.ARCHON_HOME) : '',
+    ARCHON_HOME: env.ARCHON_HOME ? resolve(cwd, expandTilde(env.ARCHON_HOME)) : '',
   };
 }
 
