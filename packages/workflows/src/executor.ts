@@ -1741,11 +1741,7 @@ export async function executeWorkflow(
     // the per-user policy scrub the corresponding key via the subprocess merge.
     envVars: { ...fileConfig.envVars, ...dbEnvVars, ...botGitHubEnv, ...userGitHubEnv },
   };
-  const protectedEnvKeys = new Set([
-    ...Object.keys(dbEnvVars),
-    ...Object.keys(botGitHubEnv),
-    ...Object.keys(userGitHubEnv),
-  ]);
+  const protectedEnvKeys = new Set([...Object.keys(botGitHubEnv), ...Object.keys(userGitHubEnv)]);
   if (protectedEnvKeys.size > 0) {
     config.protectedEnvKeys = [...protectedEnvKeys];
   }
@@ -2435,8 +2431,14 @@ export async function executeWorkflow(
   if (protectedEnvKeys.size > 0) {
     config.protectedEnvKeys = [...protectedEnvKeys];
   }
-  if (protectedValues.length > 0) {
-    config.protectedCredentialValues = protectedValues;
+  const effectiveDbCredentialValues = Object.entries(dbEnvVars).flatMap(([key, value]) =>
+    config.envVars?.[key] === value ? [value] : []
+  );
+  const protectedCredentialValues = [
+    ...new Set([...effectiveDbCredentialValues, ...protectedValues]),
+  ];
+  if (protectedCredentialValues.length > 0) {
+    config.protectedCredentialValues = protectedCredentialValues;
   }
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error.

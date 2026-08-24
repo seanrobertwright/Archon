@@ -1575,7 +1575,11 @@ describe('executeWorkflow', () => {
 
     it('merges user provider env LAST so it overrides DB env', async () => {
       const store = makeStore({
-        getCodebaseEnvVars: mock(async () => ({ DATABASE_URL: 'db_val', SHARED_KEY: 'db' })),
+        getCodebaseEnvVars: mock(async () => ({
+          DATABASE_URL: 'db_val',
+          BASE_BRANCH: 'reserved-db-secret',
+          SHARED_KEY: 'db',
+        })),
       });
       const getUserProviderEnv = mock(async () => ({
         env: { SHARED_KEY: 'user_wins', USER_KEY: 'u_val' },
@@ -1600,11 +1604,17 @@ describe('executeWorkflow', () => {
       const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
       expect(configArg?.envVars).toMatchObject({
         DATABASE_URL: 'db_val',
+        BASE_BRANCH: 'reserved-db-secret',
         SHARED_KEY: 'user_wins',
         USER_KEY: 'u_val',
       });
-      expect(configArg?.protectedEnvKeys).toEqual(['DATABASE_URL', 'SHARED_KEY', 'USER_KEY']);
-      expect(configArg?.protectedCredentialValues).toEqual(['user_wins', 'u_val']);
+      expect(configArg?.protectedEnvKeys).toEqual(['SHARED_KEY', 'USER_KEY']);
+      expect(configArg?.protectedCredentialValues).toEqual([
+        'db_val',
+        'reserved-db-secret',
+        'user_wins',
+        'u_val',
+      ]);
     });
 
     it('protects bot and per-user GitHub credentials beside provider credentials', async () => {
