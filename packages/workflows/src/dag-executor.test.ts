@@ -25903,6 +25903,255 @@ describe('buildSubprocessDockerArgs — bash/script env isolation', () => {
   });
 });
 
+describe('subprocess credential redaction', () => {
+  const execContext = { kind: 'container' as const, containerId: 'cid-redaction' };
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-container-redaction-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it('removes exact injected credentials from every rejection field before persistence', async () => {
+    const openAiSecret = 'sk-openai-not-shaped';
+    const otherInjectedSecret = 'credential-with-no-known-shape';
+    const projectSecret = 'project-secret-with-no-known-shape';
+    const databaseUrl = 'postgres://user:password@db.internal/archon';
+    const fileDeliveredSecret = 'oauth-token-only-present-in-auth-file';
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('container-redaction-run', {
+      workflow_name: 'container-redaction',
+      conversation_id: 'conv-container-redaction',
+    });
+    const store = createMockStore();
+    const platform = createMockPlatform();
+    let rejection:
+      | (Error & {
+          code: number;
+          killed: boolean;
+          cmd: string;
+          spawnargs: string[];
+          stdout: string;
+          stderr: string;
+        })
+      | undefined;
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (command: string, args: string[]) => {
+        const commandLine = [command, ...args].join(' ');
+        rejection = Object.assign(
+          new Error(`Command failed: ${commandLine}\nmessage echoed ${openAiSecret}`),
+          {
+            code: 1,
+            killed: false,
+            cmd: commandLine,
+            spawnargs: args,
+            stdout: `stdout echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, ${databaseUrl}, and ${fileDeliveredSecret}`,
+            stderr: `stderr echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, ${databaseUrl}, and ${fileDeliveredSecret}`,
+          }
+        );
+        throw rejection;
+      }
+    );
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        workflowRun.conversation_id,
+        testDir,
+        {
+          name: workflowRun.workflow_name,
+          nodes: [{ id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        logDir,
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          // Secret-suffixed keys redact automatically; BASE_BRANCH is the visible control.
+          envVars: {
+            OPENAI_API_KEY: openAiSecret,
+            CUSTOM_AUTH: otherInjectedSecret,
+            PROJECT_SECRET: projectSecret,
+            DATABASE_URL: databaseUrl,
+            BASE_BRANCH: 'main',
+          },
+          protectedEnvKeys: ['OPENAI_API_KEY', 'CUSTOM_AUTH', 'DATABASE_URL'],
+          protectedCredentialValues: [fileDeliveredSecret],
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        execContext
+      );
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      const dockerArgs = execSpy.mock.calls[0]?.[1] as string[];
+      expect(dockerArgs.join(' ')).toContain(openAiSecret);
+      expect(dockerArgs.join(' ')).toContain(otherInjectedSecret);
+      expect(dockerArgs.join(' ')).toContain(projectSecret);
+      expect(dockerArgs.join(' ')).toContain(databaseUrl);
+
+      expect(rejection).toBeDefined();
+      expect(rejection?.code).toBe(1);
+      expect(rejection?.killed).toBe(false);
+      const rejectionText = [
+        rejection?.message,
+        rejection?.stack,
+        rejection?.cmd,
+        rejection?.spawnargs.join(' '),
+        rejection?.stdout,
+        rejection?.stderr,
+      ].join('\n');
+      expect(rejectionText).not.toContain(openAiSecret);
+      expect(rejectionText).not.toContain(otherInjectedSecret);
+      expect(rejectionText).not.toContain(projectSecret);
+      expect(rejectionText).not.toContain(databaseUrl);
+      expect(rejectionText).not.toContain(fileDeliveredSecret);
+      expect(rejection?.cmd).toContain('OPENAI_API_KEY=[REDACTED]');
+      expect(rejection?.cmd).toContain('CUSTOM_AUTH=[REDACTED]');
+      expect(rejection?.cmd).toContain('PROJECT_SECRET=[REDACTED]');
+      expect(rejection?.cmd).toContain('DATABASE_URL=[REDACTED]');
+      expect(rejection?.cmd).toContain('BASE_BRANCH=main');
+      expect(rejection?.spawnargs.join(' ')).toContain('OPENAI_API_KEY=[REDACTED]');
+      expect(rejection?.spawnargs.join(' ')).toContain('DATABASE_URL=[REDACTED]');
+      expect(rejection?.spawnargs.join(' ')).toContain('BASE_BRANCH=main');
+
+      const durableEventText = JSON.stringify(
+        (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls
+      );
+      const durableMessageText = JSON.stringify(platform.sendMessage.mock.calls);
+      const durableLogText = await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8');
+      for (const durableText of [durableEventText, durableMessageText, durableLogText]) {
+        expect(durableText).not.toContain(openAiSecret);
+        expect(durableText).not.toContain(otherInjectedSecret);
+        expect(durableText).not.toContain(projectSecret);
+        expect(durableText).not.toContain(databaseUrl);
+        expect(durableText).not.toContain(fileDeliveredSecret);
+      }
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('removes a protected credential echoed by a failed host subprocess', async () => {
+    const protectedSecret = 'host-file-delivered-oauth-secret';
+    const ambientSecret = 'host-ambient-anthropic-secret';
+    const ambientDatabaseUrl = 'postgres://ambient:password@db.internal/archon';
+    const originalAmbientSecret = process.env.ANTHROPIC_API_KEY;
+    const originalAmbientDatabaseUrl = process.env.DATABASE_URL;
+    process.env.ANTHROPIC_API_KEY = ambientSecret;
+    process.env.DATABASE_URL = ambientDatabaseUrl;
+    const logDir = join(testDir, 'host-logs');
+    const workflowRun = makeWorkflowRun('host-redaction-run', {
+      workflow_name: 'host-redaction',
+      conversation_id: 'conv-host-redaction',
+    });
+    const store = createMockStore();
+    const platform = createMockPlatform();
+    let rejection:
+      | (Error & { code: number; killed: boolean; cmd: string; stdout: string; stderr: string })
+      | undefined;
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (command: string, args: string[]) => {
+        const commandLine = [command, ...args].join(' ');
+        rejection = Object.assign(
+          new Error(
+            `Command failed: ${commandLine}\nmessage echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`
+          ),
+          {
+            code: 1,
+            killed: false,
+            cmd: commandLine,
+            stdout: `stdout echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`,
+            stderr: `stderr echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`,
+          }
+        );
+        throw rejection;
+      }
+    );
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        workflowRun.conversation_id,
+        testDir,
+        {
+          name: workflowRun.workflow_name,
+          nodes: [{ id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'host-artifacts'),
+        join(testDir, 'host-state'),
+        logDir,
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          envVars: { CODEX_HOME: '/run/codex-home', BASE_BRANCH: 'main' },
+          protectedEnvKeys: ['CODEX_HOME'],
+          protectedCredentialValues: [protectedSecret],
+        }
+      );
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      expect(execSpy.mock.calls[0]?.[0]).not.toBe('docker');
+      const rejectionText = [
+        rejection?.message,
+        rejection?.stack,
+        rejection?.cmd,
+        rejection?.stdout,
+        rejection?.stderr,
+      ].join('\n');
+      expect(rejectionText).not.toContain(protectedSecret);
+      expect(rejectionText).not.toContain(ambientSecret);
+      expect(rejectionText).not.toContain(ambientDatabaseUrl);
+
+      const durableEventText = JSON.stringify(
+        (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls
+      );
+      const durableMessageText = JSON.stringify(platform.sendMessage.mock.calls);
+      const durableLogText = await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8');
+      for (const durableText of [durableEventText, durableMessageText, durableLogText]) {
+        expect(durableText).not.toContain(protectedSecret);
+        expect(durableText).not.toContain(ambientSecret);
+        expect(durableText).not.toContain(ambientDatabaseUrl);
+      }
+    } finally {
+      execSpy.mockRestore();
+      if (originalAmbientSecret === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAmbientSecret;
+      }
+      if (originalAmbientDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = originalAmbientDatabaseUrl;
+      }
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Container write-back gate + suspend-on-pause (Phase C)
 // ---------------------------------------------------------------------------

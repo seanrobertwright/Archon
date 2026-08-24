@@ -3226,24 +3226,119 @@ export function buildSubprocessDockerArgs(
   return dockerArgs;
 }
 
+/** The shape `execFile` rejects with: argv-bearing fields plus the classifier fields. */
+type RawSubprocessRejection = Error & {
+  stdout?: string;
+  stderr?: string;
+  cmd?: string;
+  spawnargs?: string[];
+};
+
+const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
+const CREDENTIAL_ENV_KEYS = new Set(['DATABASE_URL']);
+
+function collectSubprocessCredentialValues(
+  env: NodeJS.ProcessEnv,
+  protectedEnvKeys: readonly string[] | undefined,
+  protectedCredentialValues: readonly string[] | undefined
+): string[] {
+  const explicitlyProtected = new Set(protectedEnvKeys);
+  const values = Object.entries(env).flatMap(([key, value]) =>
+    value &&
+    (explicitlyProtected.has(key) ||
+      CREDENTIAL_ENV_KEYS.has(key) ||
+      CREDENTIAL_ENV_KEY_SUFFIX.test(key))
+      ? [value]
+      : []
+  );
+  return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
+    .filter(value => value.length > 0)
+    .sort((a, b) => b.length - a.length);
+}
+
+function redactCredentialValues(input: string, credentialValues: readonly string[]): string {
+  let result = input;
+  for (const value of credentialValues) {
+    result = result.replaceAll(value, '[REDACTED]');
+  }
+  return result;
+}
+
+/**
+ * Scrub credentials from every subprocess rejection field that can carry
+ * subprocess text. The exact values come from the engine's injected-credential
+ * provenance plus secret-named project env entries, so provider credentials are
+ * removed even when the failed process echoes them without their env key.
+ *
+ * Mutates in place rather than returning a fresh Error: callers classify the
+ * rejection by reading `killed` (timeout) and `code`/`message` (ENOENT/EACCES) off
+ * the original object, and a replacement would silently drop those and turn every
+ * timeout into a generic failure.
+ *
+ * `cmd` and `spawnargs` are not redundant with `message`. They can be the only
+ * carriers when the rejection
+ * is not a non-zero exit: a maxBuffer overflow rejects with `message` = 'stdout
+ * maxBuffer length exceeded' — no argv at all — so the credentials survive solely
+ * in `cmd`. Pino serializes every enumerable `err` property, so an unredacted `cmd`
+ * writes the token to the detached-run log even when `message` is already clean.
+ */
+function redactSubprocessError(
+  e: RawSubprocessRejection,
+  credentialValues: readonly string[]
+): RawSubprocessRejection {
+  e.message = redactCredentialValues(e.message, credentialValues);
+  if (e.stack) e.stack = redactCredentialValues(e.stack, credentialValues);
+  if (typeof e.stdout === 'string') {
+    e.stdout = redactCredentialValues(e.stdout, credentialValues);
+  }
+  if (typeof e.stderr === 'string') {
+    e.stderr = redactCredentialValues(e.stderr, credentialValues);
+  }
+  if (typeof e.cmd === 'string') e.cmd = redactCredentialValues(e.cmd, credentialValues);
+  if (Array.isArray(e.spawnargs)) {
+    e.spawnargs = e.spawnargs.map(arg => redactCredentialValues(arg, credentialValues));
+  }
+  return e;
+}
+
 async function runSubprocess(
   execContext: ExecutionContext,
   cmd: string,
   args: string[],
-  options: { cwd: string; timeout: number; env: NodeJS.ProcessEnv }
-): Promise<{ stdout: string; stderr: string }> {
-  if (execContext.kind === 'container') {
-    const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
-      cwd: options.cwd,
-      env: options.env,
-    });
-    return execFileAsync('docker', dockerArgs, { timeout: options.timeout });
+  options: {
+    cwd: string;
+    timeout: number;
+    env: NodeJS.ProcessEnv;
+    protectedEnvKeys?: readonly string[];
+    protectedCredentialValues?: readonly string[];
   }
-  return execFileAsync(cmd, args, {
-    cwd: options.cwd,
-    timeout: options.timeout,
-    env: { ...process.env, ...options.env },
-  });
+): Promise<{ stdout: string; stderr: string }> {
+  const subprocessEnv =
+    execContext.kind === 'container' ? options.env : { ...process.env, ...options.env };
+  try {
+    if (execContext.kind === 'container') {
+      const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
+        cwd: options.cwd,
+        env: options.env,
+      });
+      // Container env is delivered in argv, while either execution mode can echo a
+      // credential in output. Sanitize at the shared throw boundary so every
+      // downstream reader receives the same safe rejection.
+      return await execFileAsync('docker', dockerArgs, { timeout: options.timeout });
+    }
+    return await execFileAsync(cmd, args, {
+      cwd: options.cwd,
+      timeout: options.timeout,
+      env: subprocessEnv,
+    });
+  } catch (err) {
+    const credentialValues = collectSubprocessCredentialValues(
+      subprocessEnv,
+      options.protectedEnvKeys,
+      options.protectedCredentialValues
+    );
+    throw redactSubprocessError(err as RawSubprocessRejection, credentialValues);
+  }
 }
 
 /** Threshold (bytes) above which $nodeId.output values are written to a temp file
@@ -3370,6 +3465,8 @@ async function executeBashNode(
   nodeOutputs: Map<string, NodeOutput>,
   issueContext?: string,
   envVars?: Record<string, string>,
+  protectedEnvKeys?: readonly string[],
+  protectedCredentialValues?: readonly string[],
   stepNamePrefix = '',
   iteration?: number,
   // Per-iteration $LOOP_USER_INPUT free-text for loop_group body bash nodes, delivered via
@@ -3476,6 +3573,8 @@ async function executeBashNode(
       cwd,
       timeout,
       env: subprocessEnv,
+      protectedEnvKeys,
+      protectedCredentialValues,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -3644,6 +3743,8 @@ async function executeScriptNode(
   nodeOutputs: Map<string, NodeOutput>,
   issueContext?: string,
   envVars?: Record<string, string>,
+  protectedEnvKeys?: readonly string[],
+  protectedCredentialValues?: readonly string[],
   stepNamePrefix = '',
   iteration?: number,
   // Per-iteration $LOOP_USER_INPUT free-text for loop_group body scripts, delivered via
@@ -3863,6 +3964,8 @@ async function executeScriptNode(
       cwd,
       timeout,
       env: subprocessEnv,
+      protectedEnvKeys,
+      protectedCredentialValues,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -4410,6 +4513,8 @@ async function executeLoopGroupNode(
           await runSubprocess(execContext, resumedBashPath, ['-c', resumedSubstitutedBash], {
             cwd,
             timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+            protectedEnvKeys: config.protectedEnvKeys,
+            protectedCredentialValues: config.protectedCredentialValues,
             env: {
               ...(config.envVars ?? {}),
               USER_MESSAGE: workflowRun.user_message,
@@ -4852,6 +4957,8 @@ async function executeLoopGroupNode(
         await runSubprocess(execContext, groupBashPath, ['-c', substitutedBash], {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+          protectedEnvKeys: config.protectedEnvKeys,
+          protectedCredentialValues: config.protectedCredentialValues,
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env spreads FIRST so the reserved
@@ -6486,6 +6593,8 @@ async function executeLoopNode(
         await runSubprocess(execContext, loopBashPath, ['-c', substitutedBash], {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+          protectedEnvKeys: config.protectedEnvKeys,
+          protectedCredentialValues: config.protectedCredentialValues,
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env (managed per-project vars +
@@ -8970,6 +9079,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                       ctx.nodeOutputs,
                       issueContext,
                       config.envVars,
+                      config.protectedEnvKeys,
+                      config.protectedCredentialValues,
                       stepNamePrefix,
                       iteration,
                       ctx.bodyLoopUserInput ?? '',
@@ -9001,6 +9112,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                     ctx.nodeOutputs,
                     issueContext,
                     config.envVars,
+                    config.protectedEnvKeys,
+                    config.protectedCredentialValues,
                     stepNamePrefix,
                     iteration,
                     ctx.bodyLoopUserInput ?? '',

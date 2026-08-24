@@ -4,7 +4,9 @@
  * that the inner dag-executor.test.ts cannot reach.
  */
 import { describe, it, expect, mock, beforeEach, spyOn } from 'bun:test';
-import { join } from 'path';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'path';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -1524,7 +1526,11 @@ describe('executeWorkflow', () => {
 
   describe('user provider env injection', () => {
     it('skips injection when isPerUserProviderKeysEnabled returns false', async () => {
-      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const getUserProviderEnv = mock(async () => ({
+        env: { SHOULD_NOT_APPEAR: '1' },
+        files: [],
+        protectedValues: ['1'],
+      }));
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => false,
@@ -1544,7 +1550,11 @@ describe('executeWorkflow', () => {
     });
 
     it('skips injection when userId is absent even if feature is enabled', async () => {
-      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const getUserProviderEnv = mock(async () => ({
+        env: { SHOULD_NOT_APPEAR: '1' },
+        files: [],
+        protectedValues: ['1'],
+      }));
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => true,
@@ -1565,11 +1575,16 @@ describe('executeWorkflow', () => {
 
     it('merges user provider env LAST so it overrides DB env', async () => {
       const store = makeStore({
-        getCodebaseEnvVars: mock(async () => ({ DB_KEY: 'db_val', SHARED_KEY: 'db' })),
+        getCodebaseEnvVars: mock(async () => ({
+          DATABASE_URL: 'db_val',
+          BASE_BRANCH: 'reserved-db-secret',
+          SHARED_KEY: 'db',
+        })),
       });
       const getUserProviderEnv = mock(async () => ({
         env: { SHARED_KEY: 'user_wins', USER_KEY: 'u_val' },
         files: [] as { path: string; contents: string }[],
+        protectedValues: ['user_wins', 'u_val'],
       }));
       const deps: WorkflowDeps = {
         ...makeDeps(store),
@@ -1588,11 +1603,18 @@ describe('executeWorkflow', () => {
       );
       const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
       expect(configArg?.envVars).toMatchObject({
-        DB_KEY: 'db_val',
+        DATABASE_URL: 'db_val',
+        BASE_BRANCH: 'reserved-db-secret',
         SHARED_KEY: 'user_wins',
         USER_KEY: 'u_val',
       });
       expect(configArg?.protectedEnvKeys).toEqual(['SHARED_KEY', 'USER_KEY']);
+      expect(configArg?.protectedCredentialValues).toEqual([
+        'db_val',
+        'reserved-db-secret',
+        'user_wins',
+        'u_val',
+      ]);
     });
 
     it('protects bot and per-user GitHub credentials beside provider credentials', async () => {
@@ -1614,6 +1636,7 @@ describe('executeWorkflow', () => {
         getUserProviderEnv: mock(async () => ({
           env: { ANTHROPIC_API_KEY: 'provider-token' },
           files: [],
+          protectedValues: ['provider-token'],
         })),
       };
 
@@ -1641,9 +1664,17 @@ describe('executeWorkflow', () => {
         'COPILOT_GITHUB_TOKEN',
         'ANTHROPIC_API_KEY',
       ]);
+      expect(configArg?.protectedCredentialValues).toEqual(['provider-token']);
     });
 
-    it('returns {} and does not throw when getUserProviderEnv rejects', async () => {
+    it('removes stale credential files before a credential refresh failure', async () => {
+      const artifactsDir = wsPath('_cwd', 'tmp', 'artifacts', 'runs', 'run-123');
+      const codexAuthPath = join(artifactsDir, 'codex-home', 'auth.json');
+      const piAuthPath = join(artifactsDir, 'pi-home', 'auth.json');
+      await mkdir(dirname(codexAuthPath), { recursive: true });
+      await mkdir(dirname(piAuthPath), { recursive: true });
+      await writeFile(codexAuthPath, 'stale-codex-secret');
+      await writeFile(piAuthPath, 'stale-pi-secret');
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => true,
@@ -1651,11 +1682,83 @@ describe('executeWorkflow', () => {
           throw new Error('network down');
         }),
       };
-      await expect(
-        executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
-          userId: 'u-1',
-        })
-      ).resolves.toBeDefined();
+      try {
+        await expect(
+          executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
+            userId: 'u-1',
+          })
+        ).resolves.toBeDefined();
+        await expect(readFile(codexAuthPath, 'utf8')).rejects.toThrow();
+        await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+      } finally {
+        await rm(join(artifactsDir, 'codex-home'), { recursive: true, force: true });
+        await rm(join(artifactsDir, 'pi-home'), { recursive: true, force: true });
+      }
+    });
+
+    it('retains protected values when a later credential file write fails', async () => {
+      const credentialValue = 'oauth-partial-write-secret';
+      const deliveryRoot = await mkdtemp(join(tmpdir(), 'archon-provider-delivery-'));
+      const firstFile = join(deliveryRoot, 'codex-auth.json');
+      const impossibleSecondFile = join(firstFile, 'pi-auth.json');
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async () => ({
+          env: { CODEX_HOME: deliveryRoot },
+          files: [
+            { path: firstFile, contents: credentialValue },
+            { path: impossibleSecondFile, contents: credentialValue },
+          ],
+          protectedValues: [credentialValue],
+        })),
+      };
+
+      try {
+        await expect(
+          executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
+            userId: 'u-1',
+          })
+        ).resolves.toBeDefined();
+
+        const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+        expect(await readFile(firstFile, 'utf8')).toBe(credentialValue);
+        expect(configArg?.envVars).not.toHaveProperty('CODEX_HOME');
+        expect(configArg?.protectedCredentialValues).toEqual([credentialValue]);
+      } finally {
+        await rm(deliveryRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('uses the persisted user identity to rebuild credential provenance on resume', async () => {
+      const getUserProviderEnv = mock(async () => ({
+        env: { CODEX_HOME: '/run/codex-home' },
+        files: [],
+        protectedValues: ['persisted-user-token'],
+      }));
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv,
+      };
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-c1',
+        {
+          preCreatedRun: makeRun({ user_id: 'persisted-user' }),
+          userId: 'transient-resumer',
+        }
+      );
+
+      expect(getUserProviderEnv).toHaveBeenCalledWith('persisted-user', expect.any(String));
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      expect(configArg?.protectedCredentialValues).toEqual(['persisted-user-token']);
     });
   });
 
