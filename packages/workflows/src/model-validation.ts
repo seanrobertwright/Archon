@@ -338,6 +338,11 @@ export function parseRunModelAssignments(assignments: readonly string[]): RunMod
     }
     const name = assignment.slice(0, equals).trim();
     const spec = assignment.slice(equals + 1).trim();
+    if (name.length === 0 || spec.length === 0) {
+      throw new Error(
+        `Invalid --model '${assignment}'. Expected <small|medium|large|@alias>=<model>.`
+      );
+    }
     if (seen.has(name)) throw new Error(`Duplicate --model binding '${name}'.`);
     seen.add(name);
 

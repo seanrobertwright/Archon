@@ -1405,6 +1405,16 @@ describe('workflowRunCommand — sparse model bindings (#2481)', () => {
     await expect(
       workflowRunCommand('/repo/root', 'bench', 'go', {
         noWorktree: true,
+        modelAssignments: ['large=   '],
+      })
+    ).rejects.toThrow(/Expected/);
+    expect((prepareWorkflowSource as ReturnType<typeof mock>).mock.calls).toHaveLength(
+      prepareCallsBefore
+    );
+
+    await expect(
+      workflowRunCommand('/repo/root', 'bench', 'go', {
+        noWorktree: true,
         modelAssignments: ['large=x', 'large=y'],
       })
     ).rejects.toThrow(/Duplicate/);

@@ -327,6 +327,7 @@ describe('per-run model bindings', () => {
   test('rejects bare, malformed, and duplicate assignments', () => {
     expect(() => parseRunModelAssignments(['openai/gpt-5.6'])).toThrow(/Expected/);
     expect(() => parseRunModelAssignments(['large='])).toThrow(/Expected/);
+    expect(() => parseRunModelAssignments(['large=   '])).toThrow(/Expected/);
     expect(() => parseRunModelAssignments(['tiny=x'])).toThrow(/must start with '@'/);
     expect(() => parseRunModelAssignments(['large=x', 'large=y'])).toThrow(/Duplicate/);
   });
