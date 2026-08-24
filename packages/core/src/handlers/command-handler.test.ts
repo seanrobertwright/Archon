@@ -1018,7 +1018,7 @@ describe('CommandHandler', () => {
         const result = await handleCommand(baseConversation, '/reset');
 
         expect(result.success).toBe(true);
-        expect(result.message).toContain('Abandoned 1 resumable run(s).');
+        expect(result.message).toContain('Abandoned 2 resumable run(s).');
         expect(result.message).not.toContain('run(s) could not be abandoned');
         expect(result.message).not.toContain('Parent run parent was blocked');
         expect(result.message).not.toContain('sub-run(s) could not be cancelled');

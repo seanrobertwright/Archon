@@ -103,10 +103,11 @@ type CancelWorkflowRun = (runId: string) => Promise<{ cancelled: boolean }>;
 async function cascadeCancelChildren(
   rootId: string,
   cancelRun: CancelWorkflowRun
-): Promise<{ failures: number }> {
+): Promise<{ cancelled: number; failures: number }> {
   const queue: string[] = [rootId];
   const seen = new Set<string>([rootId]);
   let processed = 0;
+  let cancelled = 0;
   let failures = 0;
   while (queue.length > 0 && processed < MAX_CASCADE_RUNS) {
     const parentId = queue.shift();
@@ -126,7 +127,8 @@ async function cascadeCancelChildren(
       queue.push(child.id); // traverse deeper even under an already-terminal child
       if (child.status === 'completed' || child.status === 'cancelled') continue;
       try {
-        await cancelRun(child.id);
+        const result = await cancelRun(child.id);
+        if (result.cancelled) cancelled++;
       } catch (err) {
         getLog().warn(
           { err, childId: child.id },
@@ -147,7 +149,7 @@ async function cascadeCancelChildren(
     );
     failures += queue.length;
   }
-  return { failures };
+  return { cancelled, failures };
 }
 
 /**
@@ -345,6 +347,7 @@ export interface AbandonWorkflowResult {
 
 interface AbandonAttemptResult extends AbandonWorkflowResult {
   cancelled: boolean;
+  cancelledDescendants: number;
 }
 
 async function cancelRunAndCleanup(
@@ -366,8 +369,12 @@ async function cancelRunAndCleanup(
   // The same cancellation policy applies to descendants. This keeps `/reset`'s
   // resumable-only ownership boundary intact through the complete run tree.
   let cascadeFailures = 0;
+  let cancelledDescendants = 0;
   if (cancelled) {
-    ({ failures: cascadeFailures } = await cascadeCancelChildren(run.id, cancelRun));
+    ({ cancelled: cancelledDescendants, failures: cascadeFailures } = await cascadeCancelChildren(
+      run.id,
+      cancelRun
+    ));
   }
   const blockedParentRunId = cancelled ? await findParentBlockedOn(run) : null;
 
@@ -385,7 +392,7 @@ async function cancelRunAndCleanup(
       getLog().warn({ err, runId: run.id }, 'operations.workflow_abandon_container_reclaim_failed');
     }
   }
-  return { run, cancelled, cascadeFailures, blockedParentRunId };
+  return { run, cancelled, cancelledDescendants, cascadeFailures, blockedParentRunId };
 }
 
 /**
@@ -441,7 +448,9 @@ export interface AbandonConversationRunsResult {
  *
  * Operates once per selected run tree. Descendants whose selected parent is
  * also resumable are handled by that root's cascade, so intermediate
- * blocked-parent and cascade diagnostics cannot leak into the final result.
+ * blocked-parent and cascade diagnostics cannot leak into the final result. If
+ * a root transfers ownership before its cancellation CAS, its selected children
+ * become roots so a paused/failed descendant cannot be silently left resumable.
  *
  * Only 'paused'/'failed' rows are selected, and the same predicate is repeated
  * atomically by every root/descendant cancellation. A row concurrently resumed
@@ -455,11 +464,29 @@ export async function abandonResumableRunsForConversation(
   const runs = await workflowDb.findResumableRunsForConversation(conversationId);
   const selectedIds = new Set(runs.map(run => run.id));
   const roots = runs.filter(run => !run.parent_run_id || !selectedIds.has(run.parent_run_id));
+  const selectedChildren = new Map<string, typeof runs>();
+  for (const run of runs) {
+    if (!run.parent_run_id || !selectedIds.has(run.parent_run_id)) continue;
+    const siblings = selectedChildren.get(run.parent_run_id) ?? [];
+    siblings.push(run);
+    selectedChildren.set(run.parent_run_id, siblings);
+  }
+  const queue = [...roots];
+  const queuedIds = new Set(roots.map(run => run.id));
+  const queueSelectedChildren = (parentId: string): void => {
+    for (const child of selectedChildren.get(parentId) ?? []) {
+      if (queuedIds.has(child.id)) continue;
+      queuedIds.add(child.id);
+      queue.push(child);
+    }
+  };
   let abandoned = 0;
   let failures = 0;
   let cascadeFailures = 0;
   let blockedParentRunId: string | null = null;
-  for (const root of roots) {
+  while (queue.length > 0) {
+    const root = queue.shift();
+    if (!root) break;
     let run: WorkflowRun | null;
     try {
       run = await workflowDb.getWorkflowRun(root.id);
@@ -469,16 +496,24 @@ export async function abandonResumableRunsForConversation(
         'operations.workflow_abandon_for_conversation_lookup_failed'
       );
       failures++;
+      queueSelectedChildren(root.id);
       continue;
     }
-    if (!run) continue;
+    if (!run) {
+      queueSelectedChildren(root.id);
+      continue;
+    }
     if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
+      queueSelectedChildren(root.id);
       continue;
     }
     try {
       const result = await cancelRunAndCleanup(run, workflowDb.cancelResumableWorkflowRun);
-      if (!result.cancelled) continue;
-      abandoned += 1;
+      if (!result.cancelled) {
+        queueSelectedChildren(root.id);
+        continue;
+      }
+      abandoned += 1 + result.cancelledDescendants;
       const { cascadeFailures: runCascade, blockedParentRunId: blocked } = result;
       cascadeFailures += runCascade;
       if (blockedParentRunId === null) blockedParentRunId = blocked;
@@ -488,6 +523,7 @@ export async function abandonResumableRunsForConversation(
         'operations.workflow_abandon_for_conversation_failed'
       );
       failures++;
+      queueSelectedChildren(root.id);
     }
   }
   if (abandoned > 0 || failures > 0) {

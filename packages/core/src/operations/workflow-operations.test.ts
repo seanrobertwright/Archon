@@ -1311,7 +1311,7 @@ describe('abandonResumableRunsForConversation', () => {
     const result = await abandonResumableRunsForConversation('conv-1');
 
     expect(result).toEqual({
-      abandoned: 2,
+      abandoned: 3,
       failures: 0,
       cascadeFailures: 0,
       blockedParentRunId: null,
@@ -1342,6 +1342,35 @@ describe('abandonResumableRunsForConversation', () => {
     });
     expect(mockCancelResumableWorkflowRun).toHaveBeenCalledWith('run-resumed');
     expect(mockFindChildRuns).not.toHaveBeenCalled();
+  });
+
+  test('still abandons a selected child when its parent CAS transfers ownership (#2731 R1)', async () => {
+    mockFindResumableRunsForConversation.mockImplementation(() =>
+      Promise.resolve([
+        { id: 'parent-resumed', parent_run_id: null },
+        { id: 'child-paused', parent_run_id: 'parent-resumed' },
+      ])
+    );
+    mockGetWorkflowRun
+      .mockResolvedValueOnce(makePausedRun({ id: 'parent-resumed' }))
+      .mockResolvedValueOnce(makePausedRun({ id: 'child-paused', parent_run_id: 'parent-resumed' }))
+      .mockResolvedValueOnce(makePausedRun({ id: 'parent-resumed', status: 'running' }));
+    mockCancelResumableWorkflowRun.mockImplementation((id: unknown) =>
+      Promise.resolve({ cancelled: id === 'child-paused' })
+    );
+
+    const result = await abandonResumableRunsForConversation('conv-1');
+
+    expect(result).toEqual({
+      abandoned: 1,
+      failures: 0,
+      cascadeFailures: 0,
+      blockedParentRunId: null,
+    });
+    expect(mockCancelResumableWorkflowRun.mock.calls.map(c => c[0])).toEqual([
+      'parent-resumed',
+      'child-paused',
+    ]);
   });
 
   test('skips a row already resumed before its current-state read', async () => {
@@ -1472,7 +1501,7 @@ describe('abandonResumableRunsForConversation', () => {
     const result = await abandonResumableRunsForConversation('conv-1');
 
     expect(result).toEqual({
-      abandoned: 1,
+      abandoned: 2,
       failures: 0,
       cascadeFailures: 0,
       blockedParentRunId: null,
