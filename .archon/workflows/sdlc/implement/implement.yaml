@@ -1,4 +1,4 @@
-name: implement
+name: archon-implement
 description: |
   Implement a change and keep working until it is complete and the project's own
   checks pass. Commits as it goes; opens no PR. The input is anything intent-shaped:

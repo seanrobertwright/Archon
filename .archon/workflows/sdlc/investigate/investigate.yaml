@@ -1,4 +1,4 @@
-name: investigate
+name: archon-investigate
 description: |
   Establish the proven causal chain for a bug, unexplained behavior, or open
   question — to the root cause whose fix prevents the symptom, never the first

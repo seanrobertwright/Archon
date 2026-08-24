@@ -1,4 +1,4 @@
-name: validate
+name: archon-validate
 description: |
   Discover and run the project's own checks — types, lint, tests, build,
   whatever the repository itself defines — and report a structured verdict.

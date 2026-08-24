@@ -1,4 +1,4 @@
-name: fix
+name: archon-fix
 description: |
   Ground an issue or request against the current repository before spending on
   it, then take the least speculative path: investigate an unknown cause, plan
@@ -45,12 +45,12 @@ nodes:
   # The source is history, not a work order. Triage checks it against current
   # code and direction before deciding which kind of reasoning is still owed.
   - id: triage
-    include: triage
+    include: archon-triage
     with:
       target: "$INPUTS.target"
 
   - id: inv
-    include: investigate
+    include: archon-investigate
     with:
       target: >-
         Investigate the unresolved causal question recorded in
@@ -75,7 +75,7 @@ nodes:
     when: "$inv.output.rooted == 'true'"
 
   - id: planned
-    include: plan
+    include: archon-plan
     with:
       work: >-
         Plan the current work item from $ARTIFACTS_DIR/triage.md. Read that
@@ -91,7 +91,7 @@ nodes:
     when: "$planned.output.ready == 'true'"
 
   - id: deliver
-    include: deliver
+    include: archon-deliver
     with:
       tests: "$INPUTS.tests"
       errors: "$INPUTS.errors"

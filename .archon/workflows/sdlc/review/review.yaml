@@ -1,4 +1,4 @@
-name: review
+name: archon-review
 description: |
   Review a change through parallel specialist lenses and produce one evidence-based
   verdict. The code and seams lenses always run; the other lenses are opt-in

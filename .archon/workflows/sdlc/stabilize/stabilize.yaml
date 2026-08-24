@@ -1,4 +1,4 @@
-name: stabilize
+name: archon-stabilize
 description: |
   Eliminate one flaky or unsound test: ground the complaint against the
   repository and its CI evidence (healthy baseline first, then the failure
@@ -107,7 +107,7 @@ nodes:
   # alarm never gets disarmed. A fix that cannot be delivered as prescribed
   # stops honestly rather than substituting a timeout bump.
   - id: deliver
-    include: deliver
+    include: archon-deliver
     with:
       tests: "$INPUTS.tests"
       errors: "$INPUTS.errors"

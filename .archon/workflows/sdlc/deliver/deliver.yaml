@@ -1,4 +1,4 @@
-name: deliver
+name: archon-deliver
 description: |
   The delivery tail, end to end and autonomous: implement the work, gate on
   green, open a draft PR, review it, correct and close the findings, validate,
@@ -52,7 +52,7 @@ returns: pr
 
 nodes:
   - id: impl
-    include: implement
+    include: archon-implement
     with:
       work: "$INPUTS.work"
 
@@ -70,7 +70,7 @@ nodes:
     depends_on: [impl]
 
   - id: pr
-    include: pr
+    include: archon-pr
     with:
       draft: "true"
     depends_on: [gate-green]
@@ -79,7 +79,7 @@ nodes:
   # the caller passes the previous run's report (adjudications carry across
   # runs instead of being relitigated).
   - id: review
-    include: review
+    include: archon-review
     with:
       scope: ""
       prior_report: "$INPUTS.prior_report"
@@ -104,7 +104,7 @@ nodes:
       fresh_context: true
       nodes:
         - id: fix
-          include: implement
+          include: archon-implement
           with:
             work: >-
               Fix every open Critical and Important finding recorded in
@@ -124,7 +124,7 @@ nodes:
           depends_on: [fix]
 
         - id: recheck
-          include: review
+          include: archon-review
           with:
             scope: ""
             prior_report: "$ARTIFACTS_DIR/review/report.md"
@@ -169,7 +169,7 @@ nodes:
   # package. Uniform on every path — and when CI is maintainer-gated (fork
   # PRs), this is the only validation before the flip.
   - id: validate
-    include: validate
+    include: archon-validate
     depends_on: [gate-ready]
 
   - id: gate-validated

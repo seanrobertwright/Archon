@@ -1,4 +1,4 @@
-name: upkeep
+name: archon-upkeep
 description: |
   Keep one dependency current: ground the update request against the repository
   as it exists (locked version, blast radius, breaking changes that touch real
@@ -96,7 +96,7 @@ nodes:
   # that rule explicitly (non-goals are transferable by the work item) while
   # keeping it in force for every other dependency.
   - id: deliver
-    include: deliver
+    include: archon-deliver
     with:
       tests: "$INPUTS.tests"
       errors: "$INPUTS.errors"

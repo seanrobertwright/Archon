@@ -1,4 +1,4 @@
-name: pr
+name: archon-pr
 description: |
   Open a pull request for the committed work on the current branch — draft by
   default when composed, template-aware, with the body built from the run's
