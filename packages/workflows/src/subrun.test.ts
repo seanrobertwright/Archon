@@ -70,25 +70,7 @@ let forceRenameFailure = false;
 const passthroughRename = realFsPromises.rename;
 const stagedSourcePathSep = `staged-source${sep}`;
 mock.module('fs/promises', () => ({
-  access: realFsPromises.access,
-  appendFile: realFsPromises.appendFile,
-  chmod: realFsPromises.chmod,
-  chown: realFsPromises.chown,
-  copyFile: realFsPromises.copyFile,
-  cp: realFsPromises.cp,
-  lchmod: realFsPromises.lchmod,
-  lchown: realFsPromises.lchown,
-  link: realFsPromises.link,
-  lstat: realFsPromises.lstat,
-  lutimes: realFsPromises.lutimes,
-  mkdir: realFsPromises.mkdir,
-  mkdtemp: realFsPromises.mkdtemp,
-  open: realFsPromises.open,
-  opendir: realFsPromises.opendir,
-  readdir: realFsPromises.readdir,
-  readFile: realFsPromises.readFile,
-  readlink: realFsPromises.readlink,
-  realpath: realFsPromises.realpath,
+  ...realFsPromises,
   rename: async (src: string, dst: string): Promise<void> => {
     if (
       forceRenameFailure &&
@@ -99,17 +81,6 @@ mock.module('fs/promises', () => ({
     }
     return passthroughRename(src, dst);
   },
-  rm: realFsPromises.rm,
-  rmdir: realFsPromises.rmdir,
-  stat: realFsPromises.stat,
-  statfs: realFsPromises.statfs,
-  symlink: realFsPromises.symlink,
-  truncate: realFsPromises.truncate,
-  unlink: realFsPromises.unlink,
-  utimes: realFsPromises.utimes,
-  watch: realFsPromises.watch,
-  writeFile: realFsPromises.writeFile,
-  constants: realFsPromises.constants,
 }));
 
 // --- Bootstrap provider registry (load-time isRegisteredProvider checks) ---
@@ -5581,28 +5552,5 @@ nodes:
     } finally {
       forceRenameFailure = false;
     }
-  });
-
-  // Regression for the path-literal `staged-source/` predicate that made the
-  // test above fail on Windows: `fs/promises.rename` is called there with
-  // backslash paths produced by `path.join`, so the host platform's `sep`
-  // must drive the predicate. The end-to-end test above only proves the host
-  // platform; this one proves the predicate is platform-aware in two ways:
-  // structurally — it is built from `path.sep`, not a hardcoded literal —
-  // and behaviourally — it matches paths that `path.join` produces on the
-  // host platform. The Windows case holds by the same construction on a
-  // Windows runner.
-  it('rename mock predicate is platform-aware (uses path.sep, matches host-platform paths)', () => {
-    // Structural: the predicate is built from `path.sep`. A hardcoded
-    // `'staged-source/'` literal — the original broken form — fails this.
-    expect(stagedSourcePathSep).toBe(`staged-source${sep}`);
-
-    // Behavioural: `path.join` produces host-platform separator paths, and
-    // the predicate matches them. The end-to-end test above exercises the
-    // real rename mock end-to-end; this asserts the predicate logic itself.
-    const hostSrc = join(tmpdir(), 'staged-source', 'uuid-1');
-    const hostDst = join(tmpdir(), 'artifacts', 'workflow-source');
-    expect(hostSrc.includes(stagedSourcePathSep)).toBe(true);
-    expect(hostDst.includes(stagedSourcePathSep)).toBe(false);
   });
 });

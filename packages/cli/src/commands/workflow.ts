@@ -37,7 +37,6 @@ import {
 } from '@archon/paths';
 import { isAbsolute, join } from 'node:path';
 import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
@@ -46,6 +45,7 @@ import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discover
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
   executeWorkflow,
+  disposeWorkflowSource,
   finalizeWorkflowSource,
   hydrateResumableRun,
   prepareWorkflowSource,
@@ -1762,6 +1762,10 @@ async function runWorkflowWithOwnedSource(
               cwd: folderCodebase.defaultCwd,
               codebaseId: folderCodebase.id,
             });
+            // Finalization moved the capture, so keep ownership on the path that now
+            // exists. If container preparation fails below, the wrap reclaims the
+            // finalized capture instead of the already-renamed staging path.
+            owner.hold(preparedSource);
           }
           prepared = await backend.prepare({
             codebase: folderCodebase,
@@ -2081,7 +2085,7 @@ async function runWorkflowWithOwnedSource(
       // rm-ing it mid-execution would destroy the run's source.
       .then(async () => {
         if (originalStagedRoot) {
-          await rm(originalStagedRoot, { recursive: true, force: true }).catch(() => undefined);
+          await disposeWorkflowSource({ captureRoot: originalStagedRoot });
         }
       })
       .catch(() => undefined)
