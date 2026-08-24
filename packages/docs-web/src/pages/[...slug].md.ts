@@ -8,6 +8,7 @@
  */
 import type { APIRoute, GetStaticPaths, InferGetStaticPropsType } from 'astro';
 import { getCollection } from 'astro:content';
+import { hasRawMarkdownMirror } from '../raw-markdown';
 
 export const prerender = true;
 
@@ -22,8 +23,7 @@ export const getStaticPaths = (async () => {
     // Skip MDX files — they may contain JSX that can't be raw-dumped
     // (e.g., docs.mdx imports <Card> components)
     // Note: Use filePath for detection because docsLoader strips extensions from id
-    if (doc.filePath?.endsWith('.mdx')) return false;
-    return true;
+    return hasRawMarkdownMirror(doc.filePath);
   });
 
   return docs.map(doc => ({

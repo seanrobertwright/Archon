@@ -1,4 +1,5 @@
 import { defineRouteMiddleware } from '@astrojs/starlight/route-data';
+import { hasRawMarkdownMirror } from './raw-markdown';
 
 export const onRequest = defineRouteMiddleware(async (context, next) => {
   await next();
@@ -31,7 +32,7 @@ export const onRequest = defineRouteMiddleware(async (context, next) => {
     content: JSON.stringify(jsonLd).replace(/</g, '\\u003c'),
   });
 
-  if (!entry.filePath.endsWith('.md')) return;
+  if (!hasRawMarkdownMirror(entry.filePath)) return;
 
   const pathname = context.url.pathname;
   const markdownPath =
