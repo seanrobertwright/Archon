@@ -14,7 +14,11 @@
 
 import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
-import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
+import {
+  makeTestWorkflow,
+  makeTestWorkflowWithSource,
+  withObservableCapturedSource,
+} from '@archon/workflows/test-utils';
 import type { Codebase, Conversation, IPlatformAdapter } from '../types';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
@@ -40,7 +44,24 @@ const mockGetDefaultRemote = mock(() => Promise.resolve('origin' as string | nul
 const mockLoadRepoConfig = mock(() => Promise.resolve({} as Record<string, unknown>));
 const mockGetOrCreateConversation = mock(() => Promise.resolve(null as unknown));
 const mockGetCodebase = mock(() => Promise.resolve(null as unknown));
-const mockExecuteWorkflow = mock(() => Promise.resolve());
+// Simulates the rename-then-adopt order real `executeWorkflow` runs (#2690): adoption
+// happens INSIDE the executor at the rename success site, not from the caller. The
+// rename (and therefore the adopt) only runs for a non-continuation with a prepared
+// source — a continuation re-uses the capture its own row recorded and never re-adopts
+// here. Tests that observe `capturedSourceOwnerCalls` see the wrap finally behave the
+// same way the real one would.
+const mockExecuteWorkflow = mock((...args: unknown[]) => {
+  const opts = args[7] as
+    | {
+        preparedSource?: unknown;
+        capturedSourceOwner?: { adopt: () => void };
+      }
+    | undefined;
+  if (opts?.preparedSource) {
+    opts.capturedSourceOwner?.adopt();
+  }
+  return Promise.resolve();
+});
 const mockHandleCommand = mock(() =>
   Promise.resolve({ success: true, message: 'ok', workflow: undefined })
 );
@@ -182,35 +203,8 @@ mock.module('@archon/workflows/executor', () => ({
   recordSelectedWorkflow: mock(() => Promise.resolve()),
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
-  withCapturedSource: mock(
-    async (
-      body: (owner: {
-        hold: (prepared: { captureRoot: string }) => void;
-        adopt: () => void;
-      }) => Promise<unknown>
-    ) => {
-      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim. A stub
-      // that swallowed the owner would let a dropped adopt() through, and one that
-      // recorded only hold/adopt would still miss an adopt that arrives after the body
-      // returns — by which time the real wrapper has already deleted the capture a live
-      // run is executing from. Recording the reclaim in order is what distinguishes them.
-      let held: string | undefined;
-      let adopted = false;
-      try {
-        return await body({
-          hold: prepared => {
-            held = prepared.captureRoot;
-            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
-          },
-          adopt: () => {
-            adopted = true;
-            capturedSourceOwnerCalls.push('adopt');
-          },
-        });
-      } finally {
-        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
-      }
-    }
+  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
+    withObservableCapturedSource(capturedSourceOwnerCalls, body)
   ),
 }));
 

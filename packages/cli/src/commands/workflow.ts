@@ -44,8 +44,8 @@ import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-chec
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
-  disposeWorkflowSource,
   executeWorkflow,
+  disposeWorkflowSource,
   finalizeWorkflowSource,
   hydrateResumableRun,
   prepareWorkflowSource,
@@ -1004,9 +1004,15 @@ async function runWorkflowWithOwnedSource(
   const isContinuation = options.resume === true || continuationRun !== undefined;
 
   let preparedSource: PreparedWorkflowSource | undefined;
-  // Mirrors the owner's own flag, readable from the signal handler — which exits the
-  // process rather than returning, so it cannot consult the owner's closure.
-  let sourceAdopted = false;
+  // Pinned at the moment of prepare so the SIGINT/SIGTERM cleanup never rm's a
+  // path a live run is reading from. For `--container` folder-codebase runs,
+  // `finalizeWorkflowSource` (workflow.ts:1749) reassigns `preparedSource` to a
+  // new object whose `captureRoot` is the LIVE artifacts directory the run
+  // executes from — rm-ing `preparedSource.captureRoot` on Ctrl-C mid-run would
+  // destroy the run's source. The original staged path is renamed away by
+  // either `finalizeWorkflowSource` (container) or `executeWorkflow`'s rename
+  // (everything else), so an `rm` against it is a no-op once prep has moved it.
+  let originalStagedRoot: string | undefined;
   if (!isContinuation && !options.dryRun && !options.stubsInitPath) {
     try {
       preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
@@ -1014,6 +1020,7 @@ async function runWorkflowWithOwnedSource(
       });
       // From here the owner reclaims it unless a run adopts it, whichever way we leave.
       owner.hold(preparedSource);
+      originalStagedRoot = preparedSource.captureRoot;
     } catch (error) {
       throw new Error(
         `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
@@ -1755,6 +1762,10 @@ async function runWorkflowWithOwnedSource(
               cwd: folderCodebase.defaultCwd,
               codebaseId: folderCodebase.id,
             });
+            // Finalization moved the capture, so keep ownership on the path that now
+            // exists. If container preparation fails below, the wrap reclaims the
+            // finalized capture instead of the already-renamed staging path.
+            owner.hold(preparedSource);
           }
           prepared = await backend.prepare({
             codebase: folderCodebase,
@@ -2066,9 +2077,15 @@ async function runWorkflowWithOwnedSource(
       // whose whole premise is "whichever way we leave" — never runs. Ctrl-C during
       // isolation resolution or worktree creation would otherwise strand a complete
       // frozen tree.
+      //
+      // The rm targets the ORIGINAL staged path pinned at prepare time, not
+      // `preparedSource.captureRoot` (see `originalStagedRoot`'s note above).
+      // For container runs that path was renamed away by `finalizeWorkflowSource`
+      // and `preparedSource.captureRoot` is now the LIVE artifacts directory —
+      // rm-ing it mid-execution would destroy the run's source.
       .then(async () => {
-        if (preparedSource && !sourceAdopted) {
-          await disposeWorkflowSource(preparedSource).catch(() => undefined);
+        if (originalStagedRoot) {
+          await disposeWorkflowSource({ captureRoot: originalStagedRoot });
         }
       })
       .catch(() => undefined)
@@ -2218,12 +2235,12 @@ async function runWorkflowWithOwnedSource(
           // The frozen source this run executes, captured before the workflow was even
           // selected. A resume ignores it and loads the source recorded on its own row.
           preparedSource,
+          // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+          // executor adopts for us there (see #2690). Until then a rename failure
+          // leaves the staged directory un-adopted so the wrap reclaims it on the
+          // way out.
+          capturedSourceOwner: owner,
         };
-    // Handing the capture to a run: it now owns the bytes and their lifetime.
-    if (preparedSource) {
-      owner.adopt();
-      sourceAdopted = true;
-    }
     result = await executeWorkflow(
       deps,
       adapter,

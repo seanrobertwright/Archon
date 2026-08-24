@@ -5,7 +5,11 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import { createMockLogger } from '../test/mocks/logger';
-import { makeTestWorkflow, makeTestWorkflowList } from '@archon/workflows/test-utils';
+import {
+  makeTestWorkflow,
+  makeTestWorkflowList,
+  withObservableCapturedSource,
+} from '@archon/workflows/test-utils';
 import type { Conversation, Codebase, Session } from '../types';
 import { ConversationNotFoundError } from '../types';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
@@ -238,35 +242,8 @@ mock.module('@archon/workflows/executor', () => ({
   recordSelectedWorkflow: mock(() => Promise.resolve()),
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
-  withCapturedSource: mock(
-    async (
-      body: (owner: {
-        hold: (prepared: { captureRoot: string }) => void;
-        adopt: () => void;
-      }) => Promise<unknown>
-    ) => {
-      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim. A stub
-      // that swallowed the owner would let a dropped adopt() through, and one that
-      // recorded only hold/adopt would still miss an adopt that arrives after the body
-      // returns — by which time the real wrapper has already deleted the capture a live
-      // run is executing from. Recording the reclaim in order is what distinguishes them.
-      let held: string | undefined;
-      let adopted = false;
-      try {
-        return await body({
-          hold: prepared => {
-            held = prepared.captureRoot;
-            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
-          },
-          adopt: () => {
-            adopted = true;
-            capturedSourceOwnerCalls.push('adopt');
-          },
-        });
-      } finally {
-        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
-      }
-    }
+  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
+    withObservableCapturedSource(capturedSourceOwnerCalls, body)
   ),
 }));
 mock.module('@archon/workflows/router', () => ({

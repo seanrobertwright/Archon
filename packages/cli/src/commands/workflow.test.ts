@@ -10,6 +10,7 @@ import {
   makeTestComposedWorkflow,
   makeTestWorkflow,
   makeTestWorkflowWithSource,
+  withObservableCapturedSource,
 } from '@archon/workflows/test-utils';
 import type { WorkflowEventRow } from '@archon/core/schemas/workflow-event';
 import {
@@ -44,6 +45,20 @@ const mockLogger = {
 };
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockFolderBackendPrepare = mock(() =>
+  Promise.resolve({
+    cwd: '/test/path',
+    execContext: { kind: 'host' as const },
+    envId: 'container-env-1',
+    overlayMode: 'volume-copy' as const,
+  })
+);
+const mockFolderBackendDestroy = mock(() => Promise.resolve());
+const mockResolveFolderBackend = mock(() => ({
+  prepare: mockFolderBackendPrepare,
+  resumeEnv: mockFolderBackendPrepare,
+  destroy: mockFolderBackendDestroy,
+}));
 
 // Mock @archon/paths (createLogger moved here from @archon/core)
 mock.module('@archon/paths', () => ({
@@ -59,6 +74,7 @@ mock.module('@archon/paths', () => ({
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
 mock.module('@archon/isolation', () => ({
   configureIsolation: mock(() => undefined),
+  classifyIsolationError: (error: Error) => error.message,
   getIsolationProvider: mock(() => ({
     create: mock(() =>
       Promise.resolve({
@@ -73,6 +89,7 @@ mock.module('@archon/isolation', () => ({
     ),
     healthCheck: mock(() => Promise.resolve(true)),
   })),
+  resolveFolderBackend: mockResolveFolderBackend,
 }));
 
 // Mock the @archon/core modules
@@ -127,23 +144,22 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 const capturedSourceOwnerCalls: string[] = [];
 
 mock.module('@archon/workflows/executor', () => ({
-  executeWorkflow: mock(() => Promise.resolve({ success: true, workflowRunId: 'test-run-id' })),
+  // Mirrors the real executor's adopt site (#2690): rename happens, then the wrap's
+  // `capturedSourceOwner.adopt()` is called. For a continuation (no `preparedSource`)
+  // the executor takes the legacy branch and does not adopt, so the wrap reclaims.
+  executeWorkflow: mock((...args: unknown[]) => {
+    const opts = args[7] as
+      | {
+          preparedSource?: unknown;
+          capturedSourceOwner?: { adopt: () => void };
+        }
+      | undefined;
+    if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
+    return Promise.resolve({ success: true, workflowRunId: 'test-run-id' });
+  }),
   hydrateResumableRun: mock(() => Promise.resolve(null)),
-  withCapturedSource: mock(
-    (
-      body: (owner: {
-        hold: (prepared: { captureRoot: string }) => void;
-        adopt: () => void;
-      }) => Promise<unknown>
-    ) =>
-      body({
-        hold: prepared => {
-          capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
-        },
-        adopt: () => {
-          capturedSourceOwnerCalls.push('adopt');
-        },
-      })
+  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
+    withObservableCapturedSource(capturedSourceOwnerCalls, body)
   ),
   // Every resume form reaches this now, including `run <name> --resume`. Default: the run
   // predates captures, so the caller keeps live discovery — what the resume tests below
@@ -264,6 +280,7 @@ mock.module('@archon/core/db/codebases', () => ({
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({
+  createIsolationStore: mock(() => ({})),
   findActiveByWorkflow: mock(() => Promise.resolve(null)),
   create: mock(() => Promise.resolve({ id: 'iso-123' })),
   // Reached only by the --resume path. mock.module() MERGES over the real
@@ -1323,7 +1340,9 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
   it('hands the capture to the run that starts, and keeps holding it when none does', async () => {
     // The wrapper only protects anything if the run path actually calls its owner. Assert
     // both edges: a dropped `adopt()` deletes a live run's source, and a missing `hold()`
-    // strands a full frozen tree under staged-source on every refusal.
+    // strands a full frozen tree under staged-source on every refusal. Under #2690 the
+    // run path passes `capturedSourceOwner` through and the (mocked) executor adopts;
+    // the implementation override below mirrors that.
     const { executeWorkflow } = await import('@archon/workflows/executor');
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
 
@@ -1331,9 +1350,15 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
       workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
       errors: [],
     });
-    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
-      success: true,
-      workflowRunId: 'run-ok',
+    (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce((...args: unknown[]) => {
+      const opts = args[7] as
+        | {
+            preparedSource?: unknown;
+            capturedSourceOwner?: { adopt: () => void };
+          }
+        | undefined;
+      if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
+      return Promise.resolve({ success: true, workflowRunId: 'run-ok' });
     });
 
     await workflowRunCommand('/repo/root', 'assist', 'go', { noWorktree: true });
@@ -1348,7 +1373,58 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
     await expect(
       workflowRunCommand('/repo/root', 'assist', 'go', { noWorktree: true })
     ).rejects.toThrow('No workflows found');
-    expect(capturedSourceOwnerCalls).toEqual(['hold:/test/capture']);
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/test/capture', 'reclaim:/test/capture']);
+  });
+
+  it('reclaims the finalized container capture when backend preparation fails', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { finalizeWorkflowSource } = await import('@archon/workflows/executor');
+    const codebaseDb = await import('@archon/core/db/codebases');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: '/test/path',
+      default_branch: null,
+      kind: 'folder',
+    });
+    (finalizeWorkflowSource as ReturnType<typeof mock>).mockResolvedValueOnce({
+      runId: 'test-run-id',
+      captureRoot: '/test/finalized/workflow-source',
+      origin: '/test/path',
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/test/path',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/test/finalized/workflow-source/project',
+        globalWorkflows: '/test/finalized/workflow-source/global/workflows',
+        globalCommands: '/test/finalized/workflow-source/global/commands',
+        globalScripts: '/test/finalized/workflow-source/global/scripts',
+        bundledWorkflows: '/test/finalized/workflow-source/bundled',
+      },
+    });
+    mockFolderBackendPrepare.mockRejectedValueOnce(new Error('container unavailable'));
+
+    await expect(
+      workflowRunCommand('/test/path', 'assist', 'go', { container: true })
+    ).rejects.toThrow('container unavailable');
+
+    expect(capturedSourceOwnerCalls).toEqual([
+      'hold:/test/capture',
+      'hold:/test/finalized/workflow-source',
+      'reclaim:/test/finalized/workflow-source',
+    ]);
   });
 });
 

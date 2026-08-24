@@ -541,12 +541,18 @@ async function dispatchBackgroundWorkflowOwned(
     // Non-fatal: executeWorkflow will create its own row as fallback
   }
 
-  // 8. Fire-and-forget: run workflow in background
-  void (async (): Promise<void> => {
+  // 8. Fire-and-forget: transfer the capture into a second ownership scope whose
+  // lifetime encloses the detached execution. `withCapturedSource` invokes its body
+  // synchronously, so the new owner holds the capture before the dispatch owner adopts
+  // and returns. The detached scope then reclaims on any pre-rename failure or stops
+  // tracking only when executeWorkflow adopts after the rename succeeds.
+  const backgroundExecution = withCapturedSource(async backgroundOwner => {
+    backgroundOwner.hold(preparedSource);
     try {
       try {
-        // Handing the capture to a run: it owns the bytes and their lifetime now.
-        if (preparedSource) owner.adopt();
+        // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+        // executor adopts for us there (see #2690). Until then a rename failure leaves
+        // the staged directory un-adopted so the wrap reclaims it on the way out.
         const result = await executeWorkflow(
           workflowDeps,
           ctx.platform,
@@ -567,6 +573,7 @@ async function dispatchBackgroundWorkflowOwned(
             baseBranch: codebaseBaseBranch,
             resolveChildIsolation,
             preparedSource,
+            capturedSourceOwner: backgroundOwner,
             // Only consumed when `preCreatedRun` is undefined (pre-creation failed and
             // the executor creates the row itself); otherwise the row above already
             // carries them.
@@ -656,7 +663,9 @@ async function dispatchBackgroundWorkflowOwned(
     } catch (outerError) {
       getLog().error({ err: toError(outerError) }, 'background_workflow_unhandled_error');
     }
-  })();
+  });
+  owner.adopt();
+  void backgroundExecution;
 }
 
 /**

@@ -7,7 +7,11 @@ import type { IsolationEnvironmentRow } from '@archon/isolation';
 // (or the workflow engine) before the mock.module() calls below take effect.
 import type { WorkflowRoutingContext } from './orchestrator';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
-import { makeTestComposedWorkflow, makeTestWorkflow } from '@archon/workflows/test-utils';
+import {
+  makeTestComposedWorkflow,
+  makeTestWorkflow,
+  withObservableCapturedSource,
+} from '@archon/workflows/test-utils';
 
 // ─── Mock setup (BEFORE importing module under test) ─────────────────────────
 
@@ -153,7 +157,26 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 }));
 // Resolves to a paused result so dispatchBackgroundWorkflow's fire-and-forget
 // tail is a no-op (no result card is surfaced to the parent conversation).
-const mockExecuteWorkflow = mock(() => Promise.resolve({ paused: true }));
+// Mirrors the real executor's adopt site (#2690): setup awaits happen before rename,
+// then `capturedSourceOwner.adopt()` is called. One regression test holds that await
+// open to prove the background dispatch does not reclaim before adoption.
+let deferExecuteWorkflowAdoption = false;
+let releaseExecuteWorkflowAdoption: (() => void) | undefined;
+const mockExecuteWorkflow = mock(async (...args: unknown[]) => {
+  const opts = args[7] as
+    | {
+        preparedSource?: unknown;
+        capturedSourceOwner?: { adopt: () => void };
+      }
+    | undefined;
+  if (deferExecuteWorkflowAdoption) {
+    await new Promise<void>(resolve => {
+      releaseExecuteWorkflowAdoption = resolve;
+    });
+  }
+  if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
+  return { paused: true };
+});
 /** Ownership calls the dispatch path makes on its capture, in order. */
 const capturedSourceOwnerCalls: string[] = [];
 
@@ -189,35 +212,8 @@ mock.module('@archon/workflows/executor', () => ({
   recordSelectedWorkflow: mock(() => Promise.resolve()),
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
-  withCapturedSource: mock(
-    async (
-      body: (owner: {
-        hold: (prepared: { captureRoot: string }) => void;
-        adopt: () => void;
-      }) => Promise<unknown>
-    ) => {
-      // Faithful pass-through with an OBSERVABLE owner, INCLUDING the reclaim. A stub
-      // that swallowed the owner would let a dropped adopt() through, and one that
-      // recorded only hold/adopt would still miss an adopt that arrives after the body
-      // returns — by which time the real wrapper has already deleted the capture a live
-      // run is executing from. Recording the reclaim in order is what distinguishes them.
-      let held: string | undefined;
-      let adopted = false;
-      try {
-        return await body({
-          hold: prepared => {
-            held = prepared.captureRoot;
-            capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
-          },
-          adopt: () => {
-            adopted = true;
-            capturedSourceOwnerCalls.push('adopt');
-          },
-        });
-      } finally {
-        if (held && !adopted) capturedSourceOwnerCalls.push(`reclaim:${held}`);
-      }
-    }
+  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
+    withObservableCapturedSource(capturedSourceOwnerCalls, body)
   ),
 }));
 mock.module('@archon/workflows/router', () => ({
@@ -417,6 +413,9 @@ describe('dispatchBackgroundWorkflow', () => {
 
   beforeEach(() => {
     platform = new MockPlatformAdapter();
+    deferExecuteWorkflowAdoption = false;
+    releaseExecuteWorkflowAdoption?.();
+    releaseExecuteWorkflowAdoption = undefined;
     capturedSourceOwnerCalls.length = 0;
     mockResolve.mockClear();
     mockUpdateConversation.mockClear();
@@ -486,19 +485,32 @@ describe('dispatchBackgroundWorkflow', () => {
     await flushBackgroundExecution();
   });
 
-  test('adopts the capture BEFORE returning, not inside the fire-and-forget tail', async () => {
-    // The wrapper reclaims whatever is still held the moment this function returns, and
-    // execution here is fire-and-forget — so `adopt()` has to run synchronously, ahead of
-    // the first await inside that tail. Push an await in front of it and the wrapper
-    // deletes the capture a live run is executing from. Asserting BEFORE the flush is the
-    // whole point: after it, an adopt that came too late looks identical to one on time.
+  test('transfers capture ownership before returning while executor adoption is deferred', async () => {
+    // Production awaits setup before its rename/adopt site. Hold that boundary open: the
+    // dispatch must return without either ownership scope reclaiming the staged source.
     const workflow = makeWorkflow({ worktree: { enabled: false } });
+    deferExecuteWorkflowAdoption = true;
 
-    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+    try {
+      await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
 
-    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'adopt']);
+      // Outer dispatch owner holds, detached owner synchronously takes over, then the
+      // outer owner adopts. The detached owner remains live across the unresolved await.
+      expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'hold:/capture', 'adopt']);
 
-    await flushBackgroundExecution();
+      releaseExecuteWorkflowAdoption?.();
+      await flushBackgroundExecution();
+      expect(capturedSourceOwnerCalls).toEqual([
+        'hold:/capture',
+        'hold:/capture',
+        'adopt',
+        'adopt',
+      ]);
+    } finally {
+      deferExecuteWorkflowAdoption = false;
+      releaseExecuteWorkflowAdoption?.();
+      releaseExecuteWorkflowAdoption = undefined;
+    }
   });
 
   test('keeps holding the capture when the dispatch gives up after taking it', async () => {
