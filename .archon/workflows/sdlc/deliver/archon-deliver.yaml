@@ -194,7 +194,13 @@ nodes:
   - id: await-checks
     loop_group:
       max_iterations: 13
-      until_bash: test "$ci-probe.output.state" != "pending"
+      # Completion computed EXTERNALLY (gh state), never from body-node output
+      # substitution: the resumed-wait completion recheck does not evaluate
+      # until_bash against the iteration's outputs (#2794 — seen flipping a PR
+      # with CI still running). Red counts as done here; the next iteration's
+      # probe is what turns red into a loud body failure, and flip-ready's
+      # preflight refuses any non-green state that slips through regardless.
+      until_bash: '! gh pr checks --json bucket --jq ".[].bucket" 2>/dev/null | grep -q "^pending$"'
       nodes:
         - id: ci-probe
           script: check-ci
@@ -219,6 +225,17 @@ nodes:
       BRANCH=$(git branch --show-current)
       if [ -z "$BRANCH" ]; then
         echo "flip-ready: detached HEAD — cannot resolve the PR branch." >&2
+        exit 1
+      fi
+      # Public-surface preflight (#2794): the flip is the one irreversible
+      # step, so it re-verifies CI itself instead of trusting the loop above —
+      # any pending or non-green check refuses the flip loudly. An empty result
+      # (no CI configured, or gated checks that never started) proceeds,
+      # matching the probe's permission-agnostic skip.
+      NOT_GREEN=$(gh pr checks "$BRANCH" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>/dev/null)
+      if [ -n "$NOT_GREEN" ]; then
+        echo "flip-ready: refusing to flip with non-green checks:" >&2
+        echo "$NOT_GREEN" >&2
         exit 1
       fi
       gh pr ready "$BRANCH" --repo "$ORIGIN_REPO"
