@@ -296,6 +296,7 @@ describe('createWorkflowDeps', () => {
             kind: 'oauth',
             oauthApiKey: 'derived-bearer',
             rawCreds: {
+              type: 'oauth',
               access: 'access-token',
               refresh: 'refresh-token',
               id_token: 'id-token',
@@ -316,6 +317,7 @@ describe('createWorkflowDeps', () => {
         'account-id',
         'nested-token',
       ]);
+      expect(result?.protectedValues).not.toContain('oauth');
     });
   });
 });

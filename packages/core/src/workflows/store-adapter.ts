@@ -43,17 +43,20 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-function collectStringValues(value: unknown, values: Set<string>): void {
+function collectCredentialStringValues(value: unknown, values: Set<string>): void {
   if (typeof value === 'string') {
     if (value.length > 0) values.add(value);
     return;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectStringValues(item, values);
+    for (const item of value) collectCredentialStringValues(item, values);
     return;
   }
   if (value && typeof value === 'object') {
-    for (const item of Object.values(value)) collectStringValues(item, values);
+    for (const [key, item] of Object.entries(value)) {
+      // Pi tags OAuth blobs with a public `type: "oauth"` discriminator.
+      if (key !== 'type') collectCredentialStringValues(item, values);
+    }
   }
 }
 
@@ -189,7 +192,7 @@ export function createWorkflowDeps(): WorkflowDeps {
               protectedValues.add(cred.apiKey);
             } else {
               protectedValues.add(cred.oauthApiKey);
-              collectStringValues(cred.rawCreds, protectedValues);
+              collectCredentialStringValues(cred.rawCreds, protectedValues);
             }
           } catch (err) {
             // Unknown provider / shape mismatch — log at ERROR (no per-credential
