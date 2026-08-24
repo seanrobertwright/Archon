@@ -4189,7 +4189,7 @@ describe('workflowGetCommand', () => {
     );
   });
 
-  it('prints durable wait and scheduled quota continuation state', async () => {
+  it('prints durable wait and scheduled quota continuation state', async (): Promise<void> => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>)
       .mockResolvedValueOnce({

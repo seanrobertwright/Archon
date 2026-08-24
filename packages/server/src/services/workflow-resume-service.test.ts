@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { IWorkflowPlatform } from '@archon/workflows/deps';
+import type { resolveRunContinuation } from '@archon/core/handlers';
+
+type RunContinuationResult = Awaited<ReturnType<typeof resolveRunContinuation>>;
 
 const mockListDueWorkflowContinuations = mock(async () => [] as WorkflowRun[]);
 const mockDeferWorkflowContinuation = mock(async () => undefined);
-const mockResolveRunContinuation = mock(async () => ({ ok: false as const, message: 'unused' }));
+const mockResolveRunContinuation = mock(
+  async (): Promise<RunContinuationResult> => ({ ok: false, message: 'unused' })
+);
 const mockHydrateResumableRun = mock(async () => null as null | Record<string, unknown>);
 const mockExecuteWorkflow = mock(async () => ({
   success: true as const,

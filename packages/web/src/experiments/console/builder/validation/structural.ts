@@ -7,7 +7,7 @@ import type { BuilderNode, BuilderWorkflow, Issue } from '../types';
 import { OUTPUT_REF_SOURCE } from '@/lib/node-ref';
 import { makeIssue } from './make-issue';
 
-const waitTimestampPattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
+const waitTimestampPattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?Z$/;
 const wholeInputsRefPattern = /^\$INPUTS\.[a-zA-Z_][a-zA-Z0-9_-]*$/;
 
 function isValidWaitTimestamp(value: string): boolean {
@@ -24,7 +24,7 @@ function isValidWaitTimestamp(value: string): boolean {
     parsed.getUTCDate() === Number(match[3]) &&
     parsed.getUTCHours() === Number(match[4]) &&
     parsed.getUTCMinutes() === Number(match[5]) &&
-    parsed.getUTCSeconds() === Number(match[6])
+    parsed.getUTCSeconds() === Number(match[6] ?? 0)
   );
 }
 

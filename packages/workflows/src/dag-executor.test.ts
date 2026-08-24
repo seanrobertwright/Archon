@@ -14438,6 +14438,36 @@ describe('executeDagWorkflow -- durable wait node', () => {
     expect(mockSendQueryDag).not.toHaveBeenCalled();
   });
 
+  it('resolves a child workflow input used as an absolute wait timestamp', async () => {
+    const store = createMockStore();
+    const resumeAt = '2099-08-24T11:00:00.000Z';
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-wait-input',
+      testDir,
+      {
+        name: 'wait-input-test',
+        nodes: [{ id: 'delay', kind: 'wait', wait: { until: '$INPUTS.resume_at' } }],
+      },
+      makeWorkflowRun('wait-input', { metadata: { inputs: { resume_at: resumeAt } } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledWith(
+      'wait-input',
+      expect.objectContaining({ nodeId: 'delay', resumeAt })
+    );
+  });
+
   it('completes an expired event wait with typed output on resume', async () => {
     const store = createMockStore();
     const deps = createMockDeps(store);

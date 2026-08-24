@@ -2508,6 +2508,15 @@ nodes:
       gate_message: Review.`,
         `  - id: child
     workflow: child-workflow`,
+        `  - id: refine-group
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 2
+      interactive: true
+      gate_message: Review.
+      nodes:
+        - id: refine-step
+          bash: echo refine`,
       ];
       for (const suspensionNode of suspensionNodes) {
         const result = parseWorkflow(

@@ -7048,7 +7048,16 @@ async function executeWaitNode(
       ...(iteration !== undefined ? { iteration } : {}),
     };
   } else if (node.wait.until !== undefined) {
-    const rendered = substituteNodeOutputRefs(node.wait.until, nodeOutputs);
+    const inputsName = parseWholeInputsRef(node.wait.until);
+    let rawUntil = node.wait.until;
+    if (inputsName !== undefined) {
+      const runInputs = resolveRunInputs(workflowRun);
+      if (!runInputs || !Object.hasOwn(runInputs, inputsName)) {
+        throw new Error(`Wait node '${node.id}' references unknown input '$INPUTS.${inputsName}'`);
+      }
+      rawUntil = canonicalValueText(runInputs[inputsName]);
+    }
+    const rendered = substituteNodeOutputRefs(rawUntil, nodeOutputs);
     if (!waitUntilTimestampSchema.safeParse(rendered).success) {
       throw new Error(
         `Wait node '${node.id}' has an invalid 'until' timestamp after substitution: '${rendered}'`

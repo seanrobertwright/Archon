@@ -863,7 +863,10 @@ export function validateDagStructure(
     if (isIncludeDirective(node)) return false;
     if (isGateNode(node) || isWaitNode(node) || isWorkflowNode(node)) return true;
     if (isLoopNode(node) && node.loop.interactive) return true;
-    return isLoopGroupNode(node) && node.loop_group.nodes.some(canSuspend);
+    return (
+      isLoopGroupNode(node) &&
+      (node.loop_group.interactive === true || node.loop_group.nodes.some(canSuspend))
+    );
   };
   const suspensionNodes = nodes.filter(canSuspend);
   for (let index = 0; index < suspensionNodes.length; index++) {
@@ -895,7 +898,7 @@ export function validateDagStructure(
   //      before this scan ever runs. It is a separate package and cannot import from here,
   //      so it is the copy most likely to fall behind; a miss there is a silent UX gap
   //      rather than a wrong run, since (1) still rejects the workflow. It covers the
-  //      surfaces of the 7 node variants the builder can author — `workflow:` and
+  //      surfaces of the 8 node variants the builder can author — `workflow:` and
   //      `loop_group:` are not authorable there, so their surfaces are out of its scope
   //      rather than missing from it.
   // Adding a substituted field to one means updating all four. Included loop-command

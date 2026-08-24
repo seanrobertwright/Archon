@@ -1001,7 +1001,7 @@ const signalWorkflowWaitRoute = createRoute({
   responses: {
     200: {
       content: { 'application/json': { schema: workflowRunActionResponseSchema } },
-      description: 'Signal accepted and continuation dispatched',
+      description: 'Signal accepted; the scheduler will resume the workflow shortly',
     },
     400: jsonError('Run is not waiting on this event'),
     404: jsonError('Not found'),

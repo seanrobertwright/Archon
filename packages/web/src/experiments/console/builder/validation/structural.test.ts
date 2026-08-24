@@ -185,6 +185,7 @@ describe('validateStructural', () => {
     for (const [until, shouldPass] of [
       ['2026-08-25T22:00:00Z', true],
       ['2026-08-25T22:00:00.000Z', true],
+      ['2026-08-25T22:00Z', true],
       ['$clock.output.resume_at', true],
       ['$INPUTS.resume_at', true],
       ['tomorrow', false],
