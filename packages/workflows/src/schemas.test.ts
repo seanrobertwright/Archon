@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   isExecNode,
   isGateNode,
+  isWaitNode,
   isHaltNode,
   isLoopNode,
   isLoopGroupNode,
@@ -45,6 +46,47 @@ const promptNode: AgentNode = {
 };
 const bashNode: ExecNode = { id: 'n3', kind: 'exec', runtime: 'sh', script: 'echo hello' };
 const cancelNode: HaltNode = { id: 'n5', kind: 'halt', reason: 'Precondition failed' };
+
+describe('dagNodeSchema — durable wait', () => {
+  test('normalizes duration, until, and bounded event waits', () => {
+    const duration = dagNodeSchema.parse({ id: 'later', wait: { duration_ms: 5000 } });
+    const until = dagNodeSchema.parse({
+      id: 'clock',
+      wait: { until: '2026-08-25T10:00:00Z' },
+    });
+    const event = dagNodeSchema.parse({
+      id: 'ci',
+      wait: { event: 'checks.complete', deadline_ms: 60_000 },
+    });
+    expect(isWaitNode(duration as DagNode)).toBe(true);
+    expect((until as DagNode).kind).toBe('wait');
+    expect((event as DagNode).kind).toBe('wait');
+    expect((event as DagNode).output_format?.required).toEqual(['status', 'waited_ms']);
+  });
+
+  test('rejects ambiguous and unbounded waits', () => {
+    expect(
+      dagNodeSchema.safeParse({ id: 'mixed', wait: { duration_ms: 1, until: 'later' } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({ id: 'event', wait: { event: 'checks.complete' } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({ id: 'duration', wait: { duration_ms: 1, deadline_ms: 2 } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'custom-output',
+        wait: { duration_ms: 1 },
+        output_format: { type: 'string' },
+      }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({ id: 'repeating', wait: { duration_ms: 1 }, always_run: true })
+        .success
+    ).toBe(false);
+  });
+});
 
 describe('dagNodeSchema — context', () => {
   test('parses scalar and named resume contexts on AI consumers', () => {

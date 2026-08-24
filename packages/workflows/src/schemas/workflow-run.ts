@@ -41,6 +41,41 @@ export const workflowRunOutcomeSchema = z.enum(['succeeded', 'failed']);
 
 export type WorkflowRunOutcome = z.infer<typeof workflowRunOutcomeSchema>;
 
+/** Persisted reason a run is waiting on the outside world rather than a person. */
+export const workflowWaitContextSchema = z.object({
+  nodeId: z.string().min(1),
+  kind: z.enum(['time', 'event']),
+  waitingSince: z.string().datetime(),
+  resumeAt: z.string().datetime(),
+  event: z.string().min(1).optional(),
+  signaledAt: z.string().datetime().optional(),
+  payload: z.unknown().optional(),
+  bodyWaitId: z.string().min(1).optional(),
+  iteration: z.number().int().positive().optional(),
+  sessionId: z.string().nullable().optional(),
+  sessionProvider: z.string().nullable().optional(),
+});
+export type WorkflowWaitContext = z.infer<typeof workflowWaitContextSchema>;
+
+export function isWorkflowWaitContext(value: unknown): value is WorkflowWaitContext {
+  return workflowWaitContextSchema.safeParse(value).success;
+}
+
+export const scheduledWorkflowResumeSchema = z.object({
+  reason: z.literal('quota'),
+  resumeAt: z.string().datetime(),
+  deadlineAt: z.string().datetime(),
+  attempt: z.number().int().positive(),
+  maxAttempts: z.number().int().positive(),
+  error: z.string().min(1),
+  triggeredAt: z.string().datetime().optional(),
+});
+export type ScheduledWorkflowResume = z.infer<typeof scheduledWorkflowResumeSchema>;
+
+export function isScheduledWorkflowResume(value: unknown): value is ScheduledWorkflowResume {
+  return scheduledWorkflowResumeSchema.safeParse(value).success;
+}
+
 /** Statuses that indicate a run has finished and cannot transition further. */
 export const TERMINAL_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
   'completed',

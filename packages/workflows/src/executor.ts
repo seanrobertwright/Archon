@@ -28,6 +28,8 @@ import {
   isApprovalContext,
   isRunBlockedOnChild,
   reRunsOwnNodeOnResume,
+  isWorkflowWaitContext,
+  isScheduledWorkflowResume,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
   RUN_METADATA_KEYS,
@@ -1026,7 +1028,14 @@ export async function hydrateResumableRun(
   const rawApproval = candidate.metadata?.approval;
   const approvalContext = isApprovalContext(rawApproval) ? rawApproval : undefined;
   const hasReRunGateState = reRunsOwnNodeOnResume(approvalContext, candidate.metadata);
-  if (priorCompletedNodes.size === 0 && !hasReRunGateState) {
+  const hasWaitState = isWorkflowWaitContext(candidate.metadata?.wait);
+  const hasScheduledResume = isScheduledWorkflowResume(candidate.metadata?.scheduled_resume);
+  if (
+    priorCompletedNodes.size === 0 &&
+    !hasReRunGateState &&
+    !hasWaitState &&
+    !hasScheduledResume
+  ) {
     getLog().info(
       { resumableRunId: candidate.id },
       'workflow.dag_resume_skipped_no_completed_nodes'

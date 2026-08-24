@@ -611,6 +611,7 @@ export type WorkflowNodeType =
   | 'loop'
   | 'loop_group'
   | 'approval'
+  | 'wait'
   | 'cancel';
 
 /**

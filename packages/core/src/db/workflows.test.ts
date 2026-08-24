@@ -34,6 +34,11 @@ import {
   cancelResumableRunsForConversation,
   resumeWorkflowRun,
   pauseWorkflowRun,
+  pauseWorkflowRunForWait,
+  listDueWorkflowContinuations,
+  signalWorkflowWait,
+  claimScheduledWorkflowResume,
+  setScheduledWorkflowResume,
   cancelWorkflowRun,
   failOrphanedRuns,
   findChildRuns,
@@ -426,6 +431,100 @@ describe('workflows database', () => {
       await expect(
         pauseWorkflowRun('workflow-run-123', { nodeId: 'review', message: 'Please review' })
       ).rejects.toThrow('not found or not in running state');
+    });
+  });
+
+  describe('durable workflow waits', () => {
+    const wait = {
+      nodeId: 'await-ci',
+      kind: 'event' as const,
+      event: 'checks.complete',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      resumeAt: '2026-08-25T10:00:00.000Z',
+    };
+
+    test('pauses a running run with a distinct wait envelope', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      await pauseWorkflowRunForWait('workflow-run-123', wait);
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("SET status = 'paused'");
+      expect(query).toContain("jsonb_set(metadata, '{wait}'");
+      expect(JSON.parse(params[1] as string)).toEqual(wait);
+    });
+
+    test('lists due paused waits and quota-failed continuations', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
+      const result = await listDueWorkflowContinuations(new Date('2026-08-25T10:00:00.000Z'), 25);
+      expect(result).toHaveLength(1);
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status = 'paused'");
+      expect(query).toContain("status = 'failed'");
+      expect(params).toEqual(['2026-08-25T10:00:00.000Z', 25]);
+    });
+
+    test('signals only the matching still-open event wait', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      expect(
+        await signalWorkflowWait(
+          'workflow-run-123',
+          'checks.complete',
+          { conclusion: 'success' },
+          {
+            event_type: 'wait_signaled',
+            step_name: 'await-ci',
+            data: { event: 'checks.complete' },
+          }
+        )
+      ).toEqual({ signaled: true });
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("metadata->'wait'->>'event' = $2");
+      expect(query).toContain("metadata->'wait'->>'signaledAt' IS NULL");
+      expect(query).toContain("metadata->'wait'->>'resumeAt' > $3");
+      expect(params[1]).toBe('checks.complete');
+      expect(JSON.parse(params[3] as string)).toEqual({ conclusion: 'success' });
+      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+    });
+
+    test('claims a scheduled quota continuation once and audits the trigger', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      const scheduled = {
+        reason: 'quota' as const,
+        resumeAt: '2026-08-25T10:00:00.000Z',
+        deadlineAt: '2026-08-26T10:00:00.000Z',
+        attempt: 1,
+        maxAttempts: 2,
+        error: 'usage limit reached',
+      };
+      await expect(
+        claimScheduledWorkflowResume('workflow-run-123', scheduled, '2026-08-25T10:00:01.000Z')
+      ).resolves.toEqual({ claimed: true });
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status = 'failed'");
+      expect(query).toContain("metadata->'scheduled_resume'->>'triggeredAt' IS NULL");
+      expect(JSON.parse(params[2] as string)).toMatchObject({
+        ...scheduled,
+        triggeredAt: '2026-08-25T10:00:01.000Z',
+      });
+      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+    });
+
+    test('replaces a new quota schedule wholesale so a prior claim cannot survive', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      const scheduled = {
+        reason: 'quota' as const,
+        resumeAt: '2026-08-25T12:00:00.000Z',
+        deadlineAt: '2026-08-26T10:00:00.000Z',
+        attempt: 2,
+        maxAttempts: 2,
+        error: 'usage limit reached',
+      };
+
+      await setScheduledWorkflowResume('workflow-run-123', scheduled);
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("jsonb_set(metadata, '{scheduled_resume}'");
+      expect(JSON.parse(params[1] as string)).toEqual(scheduled);
+      expect(params[1]).not.toContain('triggeredAt');
     });
   });
 

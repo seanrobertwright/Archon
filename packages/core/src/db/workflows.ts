@@ -9,6 +9,8 @@ import type {
   WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
+  WorkflowWaitContext,
+  ScheduledWorkflowResume,
 } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import type {
@@ -150,6 +152,35 @@ function writeApprovalMetadata(mergeParamIndex: number, approvalParamIndex: numb
   return getDatabaseType() === 'postgresql'
     ? `jsonb_set(metadata || ${merge}::jsonb, '{approval}', ${approval}::jsonb, true)`
     : `json_set(json_patch(metadata, ${merge}), '$.approval', json(${approval}))`;
+}
+
+/** Replace one engine-owned metadata object without dialect-specific deep merging. */
+function replaceMetadataObject(key: 'wait' | 'scheduled_resume', paramIndex: number): string {
+  const value = `$${String(paramIndex)}`;
+  return getDatabaseType() === 'postgresql'
+    ? `jsonb_set(metadata, '{${key}}', ${value}::jsonb, true)`
+    : `json_set(metadata, '$.${key}', json(${value}))`;
+}
+
+/** Replace the quota continuation cursor wholesale so a prior claim cannot survive. */
+export async function setScheduledWorkflowResume(
+  id: string,
+  scheduled: ScheduledWorkflowResume | null
+): Promise<void> {
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET metadata = ${replaceMetadataObject('scheduled_resume', 2)}
+       WHERE id = $1`,
+      [id, JSON.stringify(scheduled)]
+    );
+    if ((result.rowCount ?? 0) === 0) throw new Error(`Workflow run not found (id: ${id})`);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_quota_resume_write_failed');
+    throw new Error(`Failed to write scheduled workflow resume: ${err.message}`);
+  }
 }
 
 /**
@@ -1187,6 +1218,190 @@ export async function pauseWorkflowRun(
     const err = error as Error;
     getLog().error({ err, workflowRunId: id }, 'db.workflow_run_pause_failed');
     throw new Error(`Failed to pause workflow run: ${err.message}`);
+  }
+}
+
+/** Pause a running run on a persisted time/event condition. */
+export async function pauseWorkflowRunForWait(
+  id: string,
+  waitContext: WorkflowWaitContext
+): Promise<void> {
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'paused', metadata = ${replaceMetadataObject('wait', 2)}
+       WHERE id = $1 AND status = 'running'`,
+      [id, JSON.stringify(waitContext)]
+    );
+    if (result.rowCount === 0) {
+      throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_wait_pause_failed');
+    throw new Error(`Failed to pause workflow run for wait: ${err.message}`);
+  }
+}
+
+/** Return a bounded set of time/deadline waits eligible for a resume claim. */
+export async function listDueWorkflowContinuations(
+  now: Date,
+  limit: number
+): Promise<WorkflowRun[]> {
+  const resumeAt =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'resumeAt'"
+      : "json_extract(metadata, '$.wait.resumeAt')";
+  const signaledAt =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'signaledAt'"
+      : "json_extract(metadata, '$.wait.signaledAt')";
+  const scheduledResumeAt =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'scheduled_resume'->>'resumeAt'"
+      : "json_extract(metadata, '$.scheduled_resume.resumeAt')";
+  const scheduledTriggeredAt =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'scheduled_resume'->>'triggeredAt'"
+      : "json_extract(metadata, '$.scheduled_resume.triggeredAt')";
+  try {
+    const result = await pool.query<WorkflowRun>(
+      `SELECT * FROM remote_agent_workflow_runs
+       WHERE (status = 'paused' AND (${signaledAt} IS NOT NULL OR ${resumeAt} <= $1))
+          OR (status = 'failed' AND ${scheduledResumeAt} <= $1 AND ${scheduledTriggeredAt} IS NULL)
+       ORDER BY COALESCE(${resumeAt}, ${scheduledResumeAt}) ASC
+       LIMIT $2`,
+      [now.toISOString(), limit]
+    );
+    return result.rows.map(normalizeWorkflowRun);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_continuation_due_list_failed');
+    throw new Error(`Failed to list due workflow continuations: ${err.message}`);
+  }
+}
+
+/** Atomically record the signal for one exact paused event wait. */
+export async function signalWorkflowWait(
+  id: string,
+  event: string,
+  payload?: unknown,
+  auditEvent?: GateResolutionEvent
+): Promise<{ signaled: boolean }> {
+  const eventExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'event'"
+      : "json_extract(metadata, '$.wait.event')";
+  const signaledExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'signaledAt'"
+      : "json_extract(metadata, '$.wait.signaledAt')";
+  const resumeAtExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'resumeAt'"
+      : "json_extract(metadata, '$.wait.resumeAt')";
+  const signaledAt = new Date().toISOString();
+  const metadataWrite =
+    getDatabaseType() === 'postgresql'
+      ? "jsonb_set(jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($3::text), true), '{wait,payload}', $4::jsonb, true)"
+      : "json_set(metadata, '$.wait.signaledAt', $3, '$.wait.payload', json($4))";
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET metadata = ${metadataWrite}
+         WHERE id = $1 AND status = 'paused' AND ${eventExpr} = $2
+           AND ${signaledExpr} IS NULL AND ${resumeAtExpr} > $3`,
+        [id, event, signaledAt, JSON.stringify(payload ?? null)]
+      );
+      const signaled = (result.rowCount ?? 0) > 0;
+      if (signaled && auditEvent !== undefined) {
+        await insertWorkflowEvent(query, { workflow_run_id: id, ...auditEvent });
+      }
+      return { signaled };
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id, event }, 'db.workflow_wait_signal_failed');
+    throw new Error(`Failed to signal workflow wait: ${err.message}`);
+  }
+}
+
+/** Claim one scheduled quota continuation so the scanner never launches it twice. */
+export async function claimScheduledWorkflowResume(
+  id: string,
+  scheduled: ScheduledWorkflowResume,
+  triggeredAt: string
+): Promise<{ claimed: boolean }> {
+  const triggeredExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'scheduled_resume'->>'triggeredAt'"
+      : "json_extract(metadata, '$.scheduled_resume.triggeredAt')";
+  const resumeAtExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'scheduled_resume'->>'resumeAt'"
+      : "json_extract(metadata, '$.scheduled_resume.resumeAt')";
+  const scheduledWrite = JSON.stringify({ ...scheduled, triggeredAt });
+  const write =
+    getDatabaseType() === 'postgresql'
+      ? "jsonb_set(metadata, '{scheduled_resume}', $3::jsonb, true)"
+      : "json_set(metadata, '$.scheduled_resume', json($3))";
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET metadata = ${write}
+         WHERE id = $1 AND status = 'failed' AND ${resumeAtExpr} = $2 AND ${triggeredExpr} IS NULL`,
+        [id, scheduled.resumeAt, scheduledWrite]
+      );
+      const claimed = (result.rowCount ?? 0) > 0;
+      if (claimed) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'quota_resume_triggered',
+          data: { attempt: scheduled.attempt, resume_at: scheduled.resumeAt },
+        });
+      }
+      return { claimed };
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_quota_resume_claim_failed');
+    throw new Error(`Failed to claim scheduled workflow resume: ${err.message}`);
+  }
+}
+
+/** Escalate an open nested wait to its owning loop-group cursor. */
+export async function rewriteWorkflowWaitContext(
+  id: string,
+  waitContext: WorkflowWaitContext
+): Promise<{ rewritten: boolean }> {
+  const priorNodeId = waitContext.bodyWaitId;
+  if (priorNodeId === undefined) return { rewritten: false };
+  const nodeExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'nodeId'"
+      : "json_extract(metadata, '$.wait.nodeId')";
+  const signaledExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'signaledAt'"
+      : "json_extract(metadata, '$.wait.signaledAt')";
+  const write =
+    getDatabaseType() === 'postgresql'
+      ? "jsonb_set(metadata, '{wait}', $3::jsonb, true)"
+      : "json_set(metadata, '$.wait', json($3))";
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs SET metadata = ${write}
+       WHERE id = $1 AND status = 'paused' AND ${nodeExpr} = $2 AND ${signaledExpr} IS NULL`,
+      [id, priorNodeId, JSON.stringify(waitContext)]
+    );
+    return { rewritten: result.rowCount > 0 };
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_wait_rewrite_failed');
+    throw new Error(`Failed to rewrite workflow wait context: ${err.message}`);
   }
 }
 

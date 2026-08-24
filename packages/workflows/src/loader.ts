@@ -14,6 +14,7 @@ import {
   isLoopNode,
   isLoopGroupNode,
   isGateNode,
+  isWaitNode,
   isHaltNode,
   isWorkflowNode,
   isIncludeDirective,
@@ -31,6 +32,7 @@ import {
   BASH_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
+  WAIT_NODE_IGNORED_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
   WORKFLOW_NODE_IGNORED_FIELDS,
   KNOWN_DAG_NODE_KEYS,
@@ -664,6 +666,8 @@ function parseDagNode(
     nonAiNode = { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
   } else if (isGateNode(node)) {
     nonAiNode = { type: 'approval', fields: BASH_NODE_AI_FIELDS };
+  } else if (isWaitNode(node)) {
+    nonAiNode = { type: 'wait', fields: WAIT_NODE_IGNORED_FIELDS };
   } else if (isLoopNode(node)) {
     nonAiNode = { type: 'loop', fields: LOOP_NODE_AI_FIELDS };
   } else if (isLoopGroupNode(node)) {
@@ -1149,6 +1153,14 @@ export function validateDagStructure(
       );
       if (workflowInBody) {
         return `loop_group '${node.id}' body: 'workflow' (sub-run) is not supported inside a loop_group body`;
+      }
+      const dependedOn = new Set(node.loop_group.nodes.flatMap(n => n.depends_on ?? []));
+      const sinks = node.loop_group.nodes.filter(n => !dependedOn.has(n.id));
+      const misplacedWait = node.loop_group.nodes.find(
+        n => !isIncludeDirective(n) && isWaitNode(n) && (dependedOn.has(n.id) || sinks.length !== 1)
+      );
+      if (misplacedWait) {
+        return `loop_group '${node.id}' body: wait node '${misplacedWait.id}' must be the body's sole terminal sink`;
       }
       const scopeNodes = new Map<string, DagNode | IncludeDirective>([
         ...(enclosingNodes ?? []),

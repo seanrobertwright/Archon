@@ -280,6 +280,33 @@ recommendedWorkflows: "archon-plan"
       expect(config.assistants.codex).toEqual({});
       expect(config.streaming.telegram).toBe('stream');
       expect(config.concurrency.maxConversations).toBe(10);
+      expect(config.workflows).toEqual({
+        autoResumeOnQuotaReset: false,
+        quotaMaxAttempts: 1,
+        quotaDeadlineMs: 86_400_000,
+      });
+    });
+
+    test('merges global and repo quota continuation policy per field', async () => {
+      mockFsReadFile.mockResolvedValueOnce(`
+workflows:
+  autoResumeOnQuotaReset: true
+  quotaFallbackDelayMs: 3600000
+  quotaMaxAttempts: 2
+`).mockResolvedValueOnce(`
+workflows:
+  quotaMaxAttempts: 3
+  quotaDeadlineMs: 43200000
+`);
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.workflows).toEqual({
+        autoResumeOnQuotaReset: true,
+        quotaFallbackDelayMs: 3_600_000,
+        quotaMaxAttempts: 3,
+        quotaDeadlineMs: 43_200_000,
+      });
     });
 
     test('env var DEFAULT_AI_ASSISTANT is a fallback — config file assistant wins', async () => {

@@ -110,6 +110,36 @@ export function classifyError(error: Error): ErrorType {
   return 'UNKNOWN';
 }
 
+const QUOTA_EXHAUSTION_PATTERNS = [
+  'session limit',
+  'usage limit reached',
+  'credit exhaustion',
+  'credit balance',
+];
+
+export function isQuotaExhaustionError(error: string): boolean {
+  const message = error.toLowerCase();
+  return QUOTA_EXHAUSTION_PATTERNS.some(pattern => message.includes(pattern));
+}
+
+/** Parse only provider reset forms that carry an unambiguous instant/duration. */
+export function extractQuotaResetAt(error: string, now = new Date()): Date | null {
+  const epoch = /usage limit reached\|(\d{10,13})/i.exec(error)?.[1];
+  if (epoch !== undefined) {
+    const raw = Number(epoch);
+    const millis = epoch.length === 10 ? raw * 1000 : raw;
+    const parsed = new Date(millis);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  const relative = /resets\s+in\s+(\d+(?:\.\d+)?)\s*(m(?:in(?:ute)?s?)?|h(?:ours?)?)/i.exec(error);
+  if (relative?.[1] !== undefined && relative[2] !== undefined) {
+    const amount = Number(relative[1]);
+    const multiplier = relative[2].toLowerCase().startsWith('h') ? 60 * 60 * 1000 : 60 * 1000;
+    return new Date(now.getTime() + amount * multiplier);
+  }
+  return null;
+}
+
 /**
  * Map the retry-oriented {@link ErrorType} to the telemetry wire enum. The
  * telemetry event carries ONLY this fixed-enum class — never error text.

@@ -296,6 +296,11 @@ const mockResolveAndCancelApprovalGate = mock(async (_id: string, _events?: unkn
   resolved: true,
 }));
 const mockFindChildRuns = mock(async (_parentRunId: string): Promise<unknown[]> => []);
+const mockSignalWorkflowWait = mock(
+  async (_id: string, _event: string, _payload?: unknown, _audit?: unknown) => ({
+    signaled: true,
+  })
+);
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mockListWorkflowRuns,
@@ -307,6 +312,7 @@ mock.module('@archon/core/db/workflows', () => ({
   updateWorkflowRun: mockUpdateWorkflowRun,
   resolveApprovalGate: mockResolveApprovalGate,
   resolveAndCancelApprovalGate: mockResolveAndCancelApprovalGate,
+  signalWorkflowWait: mockSignalWorkflowWait,
   getWorkflowRunByWorkerPlatformId: mockGetWorkflowRunByWorkerPlatformId,
 }));
 
@@ -1678,6 +1684,84 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     ];
     expect(platformConvId).toBe('web-plat-abc');
     expect(dispatchedMessage).toBe('/workflow resume run-uuid-4');
+  });
+});
+
+describe('POST /api/workflows/runs/:runId/signal', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockSignalWorkflowWait.mockReset();
+    mockSignalWorkflowWait.mockResolvedValue({ signaled: true });
+    mockHydrateResumableRun.mockClear();
+    mockExecuteWorkflow.mockClear();
+  });
+
+  test('atomically signals the matching event wait and starts continuation', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-wait-1',
+      status: 'paused',
+      working_path: '/tmp/worktrees/run-wait-1',
+      metadata: {
+        wait: {
+          nodeId: 'checks',
+          kind: 'event',
+          event: 'checks.complete',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-25T10:00:00.000Z',
+        },
+      },
+    });
+    const { app } = makeApp();
+
+    const response = await app.request('/api/workflows/runs/run-wait-1/signal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'checks.complete',
+        payload: { conclusion: 'success' },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockSignalWorkflowWait).toHaveBeenCalledWith(
+      'run-wait-1',
+      'checks.complete',
+      { conclusion: 'success' },
+      {
+        event_type: 'wait_signaled',
+        step_name: 'checks',
+        data: { event: 'checks.complete', payload: { conclusion: 'success' } },
+      }
+    );
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test('rejects a signal that does not match the run wait', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-wait-2',
+      status: 'paused',
+      metadata: {
+        wait: {
+          nodeId: 'checks',
+          kind: 'event',
+          event: 'checks.complete',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-25T10:00:00.000Z',
+        },
+      },
+    });
+    const { app } = makeApp();
+
+    const response = await app.request('/api/workflows/runs/run-wait-2/signal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event: 'deploy.complete' }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(mockSignalWorkflowWait).not.toHaveBeenCalled();
   });
 });
 

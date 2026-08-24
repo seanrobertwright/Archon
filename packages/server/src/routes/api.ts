@@ -60,12 +60,8 @@ import {
   setUserTiers,
   setUserAliases,
   setUserDefault,
-  createWorkflowDeps,
-  createChildWorktreeResolver,
 } from '@archon/core';
 import type { UserTiersPatch, UserAliasesPatch, AliasesPatch } from '@archon/core';
-import { resolveRunContinuation } from '@archon/core/handlers';
-import { HeadlessPlatform } from '../adapters/headless';
 import { findRepoRoot, removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
   createLogger,
@@ -100,12 +96,13 @@ import {
   TERMINAL_WORKFLOW_STATUSES,
   isApprovalContext,
   isGateResolved,
+  isWorkflowWaitContext,
 } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
-import { hydrateResumableRun, executeWorkflow } from '@archon/workflows/executor';
 import type { MessageRow } from '@archon/core/schemas/message';
 import type { DashboardWorkflowRun } from '@archon/core/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
+import { resumeWorkflowRunHeadless } from '../services/workflow-resume-service';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -975,6 +972,37 @@ const resumeWorkflowRunRoute = createRoute({
       description: 'Resumed',
     },
     400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const signalWorkflowWaitBodySchema = z.object({
+  event: z.string().min(1),
+  payload: z.unknown().optional(),
+});
+
+const signalWorkflowWaitRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/signal',
+  tags: ['Workflows'],
+  summary: 'Signal the exact external event awaited by a paused workflow run',
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: {
+      content: {
+        'application/json': {
+          schema: signalWorkflowWaitBodySchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowRunActionResponseSchema } },
+      description: 'Signal accepted and continuation dispatched',
+    },
+    400: jsonError('Run is not waiting on this event'),
     404: jsonError('Not found'),
     500: jsonError('Server error'),
   },
@@ -2430,126 +2458,6 @@ export function registerApiRoutes(
   }
 
   /**
-   * Resume a run with no parent conversation to dispatch a chat message
-   * through (a CLI-launched run never has one, #2008) by executing it
-   * directly, in-process, fire-and-forget — the HTTP-reachable equivalent of
-   * what the CLI's own `workflow approve/reject/resume <run-id>` already
-   * does. Reuses the same continuation resolution, hydration, and executor
-   * the CLI and the chat auto-resume path use; only the platform differs
-   * (no live transport — see `HeadlessPlatform`).
-   *
-   * Returns `true` once execution has been kicked off — never waits for it
-   * to finish, matching every other resume call site. Returns `false` when
-   * the run cannot be resumed this way (no recorded working path, workflow
-   * source unresolvable, nothing left to resume, another resumer already
-   * claimed the run, or an unexpected error) so the caller falls back to its
-   * existing "use the CLI" response. Never throws: the gate decision was
-   * already durably recorded by the caller before this runs, so a failure
-   * here must degrade safely rather than surface as a 500.
-   */
-  async function resumeRunHeadless(run: WorkflowRun, gateActorUserId?: string): Promise<boolean> {
-    if (!run.working_path) {
-      getLog().debug({ runId: run.id }, 'api.workflow_resume_headless_no_working_path');
-      return false;
-    }
-    try {
-      const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
-      const workflowCwd = codebase?.default_cwd ?? getArchonWorkspacesPath();
-      const deps = createWorkflowDeps();
-
-      const continuation = await resolveRunContinuation(run.id, workflowCwd);
-      if (!continuation.ok) {
-        getLog().info(
-          { runId: run.id, reason: continuation.message },
-          'api.workflow_resume_headless_unresolvable'
-        );
-        return false;
-      }
-
-      const platform = new HeadlessPlatform(run.conversation_id);
-      let hydrated: Awaited<ReturnType<typeof hydrateResumableRun>>;
-      try {
-        hydrated = await hydrateResumableRun(deps, run);
-      } catch (err) {
-        if (err instanceof workflowDb.WorkflowNotResumableError) {
-          getLog().info(
-            { runId: run.id, status: err.currentStatus },
-            'api.workflow_resume_headless_lost_race'
-          );
-          return false;
-        }
-        throw err;
-      }
-      if (!hydrated) {
-        getLog().info({ runId: run.id }, 'api.workflow_resume_headless_nothing_to_resume');
-        return false;
-      }
-
-      // Same per-child worktree resolver every other resume caller builds
-      // from the codebase in scope (orchestrator-agent.ts, CLI resume) — a
-      // `workflow:` node with `isolation: worktree` downstream of this gate
-      // needs it injected, or the engine fails it fast pointing at the CLI.
-      const resolveChildIsolation =
-        codebase && codebase.kind !== 'folder'
-          ? createChildWorktreeResolver({
-              codebaseId: codebase.id,
-              codebaseName: codebase.name,
-              canonicalRepoPath: codebase.default_cwd,
-              baseBranch: codebase.default_branch?.trim() || undefined,
-              createdByPlatform: platform.getPlatformType(),
-              createdByUserId: gateActorUserId,
-            })
-          : undefined;
-
-      executeWorkflow(
-        deps,
-        platform,
-        run.conversation_id,
-        run.working_path,
-        continuation.workflow.definition,
-        run.user_message ?? '',
-        run.conversation_id,
-        {
-          codebaseId: run.codebase_id ?? undefined,
-          userId: gateActorUserId,
-          baseBranch: codebase?.default_branch?.trim() || undefined,
-          resolveChildIsolation,
-          ...hydrated,
-        }
-      ).catch((err: unknown) => {
-        // Mirrors executor.ts's parent-run auto-resume catch: the hydrate CAS
-        // above already flipped the run paused/failed→running, and
-        // executeWorkflow's own failure handling doesn't cover its early setup
-        // (config load, credential resolution). Without this the run would
-        // strand at 'running' — a non-terminal status resumeWorkflow refuses
-        // to touch.
-        getLog().error(
-          { err: err as Error, runId: run.id },
-          'api.workflow_resume_headless_execute_failed'
-        );
-        void workflowDb
-          .failWorkflowRun(run.id, `Headless resume failed: ${(err as Error).message}`)
-          .catch((failErr: unknown) => {
-            getLog().error(
-              { err: failErr as Error, runId: run.id },
-              'api.workflow_resume_headless_fail_mark_failed'
-            );
-          });
-      });
-      return true;
-    } catch (err) {
-      // Safe degrade: the gate decision was already committed by the caller
-      // before this runs, so an unexpected error here (e.g. a transient DB
-      // read) must not surface as a 500 — fall back to the CLI-hint response.
-      getLog().warn(
-        { err: err as Error, runId: run.id },
-        'api.workflow_resume_headless_unexpected_error'
-      );
-      return false;
-    }
-  }
-
-  /**
    * Re-enter the orchestrator after a paused approval gate is resolved, so a
    * web-dispatched workflow continues (approve) or runs its on_reject prompt
    * (reject) without the user having to re-run the workflow command. The CLI's
@@ -2564,7 +2472,7 @@ export function registerApiRoutes(
    * command.
    *
    * **No parent conversation at all** (`parent_conversation_id` is `NULL` —
-   * every CLI-launched run): falls back to `resumeRunHeadless`, which
+   * every CLI-launched run): falls back to `resumeWorkflowRunHeadless`, which
    * executes the run directly with no conversation involved (#2008).
    *
    * **Cross-adapter guard**: a run WITH a parent conversation only
@@ -2622,7 +2530,7 @@ export function registerApiRoutes(
     if (!run.parent_conversation_id) {
       // No parent conversation to dispatch a chat message through at all —
       // every CLI-launched run (#2008). Execute directly instead of skipping.
-      const headlessResumed = await resumeRunHeadless(run, gateActorUserId);
+      const headlessResumed = await resumeWorkflowRunHeadless(run, gateActorUserId);
       getLog().info(
         { runId: run.id, workflowName: run.workflow_name },
         headlessResumed ? events.headlessDispatched : events.headlessSkipped
@@ -3739,7 +3647,7 @@ export function registerApiRoutes(
       if (!run.parent_conversation_id) {
         // No parent conversation to dispatch a chat message through at all —
         // every CLI-launched run (#2008). Execute directly instead of 400ing.
-        const headlessResumed = await resumeRunHeadless(run, await resolveWebUserId(c));
+        const headlessResumed = await resumeWorkflowRunHeadless(run, await resolveWebUserId(c));
         if (!headlessResumed) {
           return apiError(
             c,
@@ -3785,6 +3693,37 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_resume_failed');
       return apiError(c, 500, 'Failed to resume workflow run');
+    }
+  });
+
+  registerOpenApiRoute(signalWorkflowWaitRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    const { event, payload } = getValidatedBody(c, signalWorkflowWaitBodySchema);
+    try {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) return apiError(c, 404, 'Workflow run not found');
+      const wait = isWorkflowWaitContext(run.metadata?.wait) ? run.metadata.wait : undefined;
+      if (wait?.kind !== 'event' || wait.event !== event) {
+        return apiError(c, 400, `Run is not waiting on event '${event}'`);
+      }
+      const { signaled } = await workflowDb.signalWorkflowWait(runId, event, payload, {
+        event_type: 'wait_signaled',
+        step_name: wait.nodeId,
+        data: { event, ...(payload !== undefined ? { payload } : {}) },
+      });
+      if (!signaled) {
+        return apiError(c, 400, `Run is not waiting on event '${event}'`);
+      }
+      const resumed = await resumeWorkflowRunHeadless(run, await resolveWebUserId(c));
+      return c.json({
+        success: true,
+        message: resumed
+          ? `Signaled '${event}' and resumed workflow: ${run.workflow_name}`
+          : `Signaled '${event}'. The run remains resumable.`,
+      });
+    } catch (error) {
+      getLog().error({ err: error, runId, event }, 'signal_workflow_wait_api_failed');
+      return apiError(c, 500, 'Failed to signal workflow wait');
     }
   });
 

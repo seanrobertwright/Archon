@@ -10,6 +10,8 @@ import type {
   WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
+  WorkflowWaitContext,
+  ScheduledWorkflowResume,
   WorkflowNodeSession,
   WorkflowRunNodeSession,
 } from './schemas';
@@ -76,6 +78,14 @@ export const WORKFLOW_EVENT_TYPES = [
   'ralph_story_completed',
   'approval_requested',
   'approval_received',
+  'wait_started',
+  'wait_signaled',
+  'wait_completed',
+  'wait_expired',
+  'quota_resume_scheduled',
+  'quota_resume_triggered',
+  'quota_resume_exhausted',
+  'quota_resume_skipped',
   'workflow_cancelled',
   'workflow_artifact',
   'node_session_resumed',
@@ -223,6 +233,14 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     approvalContext: ApprovalContext,
     extraMetadata?: Record<string, unknown>
   ): Promise<void>;
+  /** Pause a running run on an engine-owned time/event wait. */
+  pauseWorkflowRunForWait?(id: string, waitContext: WorkflowWaitContext): Promise<void>;
+  rewriteWorkflowWaitContext?(
+    id: string,
+    waitContext: WorkflowWaitContext
+  ): Promise<{ rewritten: boolean }>;
+  /** Replace the engine-owned quota continuation cursor wholesale. */
+  setScheduledWorkflowResume?(id: string, scheduled: ScheduledWorkflowResume | null): Promise<void>;
 
   /**
    * Rewrite the approval context of an ALREADY-paused, still-open gate — unlike

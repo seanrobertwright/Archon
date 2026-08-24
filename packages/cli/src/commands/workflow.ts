@@ -86,7 +86,12 @@ import type {
   WorkflowWithSource,
 } from '@archon/workflows/schemas/workflow';
 import type { DagNode } from '@archon/workflows/schemas/dag-node';
-import { workflowRunStatusSchema, isApprovalContext } from '@archon/workflows/schemas/workflow-run';
+import {
+  workflowRunStatusSchema,
+  isApprovalContext,
+  isWorkflowWaitContext,
+  isScheduledWorkflowResume,
+} from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import {
   approveWorkflow,
@@ -2801,6 +2806,20 @@ export async function workflowGetCommand(
     const completionMet = gateMeta.completionSignaled === true ? 'yes' : 'no';
     console.log(
       `  Gate:   awaiting approval — completion condition met: ${completionMet} (iteration ${String(gateMeta.iteration ?? '?')})`
+    );
+  }
+  const waitMeta = run.metadata.wait;
+  if (run.status === 'paused' && isWorkflowWaitContext(waitMeta)) {
+    console.log(
+      waitMeta.kind === 'event'
+        ? `  Wait:   event '${waitMeta.event ?? '?'}' until ${waitMeta.resumeAt}`
+        : `  Wait:   until ${waitMeta.resumeAt}`
+    );
+  }
+  const scheduledResume = run.metadata.scheduled_resume;
+  if (run.status === 'failed' && isScheduledWorkflowResume(scheduledResume)) {
+    console.log(
+      `  Resume: scheduled for ${scheduledResume.resumeAt} (attempt ${String(scheduledResume.attempt)}/${String(scheduledResume.maxAttempts)})`
     );
   }
   const runError = typeof run.metadata.error === 'string' ? run.metadata.error : undefined;

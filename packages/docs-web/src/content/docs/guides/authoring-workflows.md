@@ -206,6 +206,7 @@ nodes:
 | `loop` | object | Iterative AI prompt until a declared completion condition is met. See [Loop Nodes](/guides/loop-nodes/) |
 | `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a declared completion condition is met. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
 | `approval` | object | Pauses workflow for human review. See [Approval Nodes](/guides/approval-nodes/) |
+| `wait` | object | Durably pauses the run until a time or bounded external event. The server resumes due waits without keeping a worker or subprocess alive. See [Durable waits](#durable-waits) |
 | `cancel` | string | Terminates the workflow run with a reason string. Uses existing cancellation plumbing — in-flight parallel nodes are stopped |
 | `include` | string | Name of another workflow whose nodes are inlined into this DAG at load time as a namespaced sub-DAG. See [Composing Another Workflow](#composing-another-workflow-with-include) |
 | `workflow` | string | Name of another workflow to run as a governed **child sub-run** at execution time — its own run record, gates, artifacts, and cost. Optional `input` (untyped data string → child's `$ARGUMENTS`) **or** `with:` (named inputs → child's `$INPUTS.<name>`; mutually exclusive with `input`), `isolation` (`'inherit'` \| `'worktree'`), and `fan_out` (one child per item of a runtime list; optional `as:` names the per-item `$INPUTS` channel). See [Launching a Separate Governed Run](#launching-a-separate-governed-run-with-workflow) and [Workflow Signature](#workflow-signature-inputs-returns-and-inputs) |
@@ -643,6 +644,52 @@ Keys:
 - **`.claude/agents/*.md` (on-disk)** — use when the sub-agent is shared across multiple workflows OR the whole project (for example, a `triage-agent` used by several maintenance workflows). On-disk agents live outside workflow YAMLs and are picked up automatically by the Claude Agent SDK.
 
 Both sources coexist — inline agents and on-disk agents are both available to `Task(subagent_type=...)` at runtime.
+
+---
+
+## Durable waits
+
+A `wait:` node records an absolute deadline in the workflow run, changes the run to `paused`, and returns the worker slot. The server scans persisted waits and resumes due runs through the ordinary DAG resume path. Restarting Archon does not reset the clock.
+
+Declare exactly one condition:
+
+```yaml
+nodes:
+  - id: cool-down
+    wait:
+      duration_ms: 3600000
+
+  - id: maintenance-window
+    depends_on: [cool-down]
+    wait:
+      until: "2026-08-25T22:00:00Z"
+
+  - id: checks
+    depends_on: [maintenance-window]
+    wait:
+      event: checks.complete
+      deadline_ms: 86400000
+```
+
+- `duration_ms` starts once, then persists the resulting absolute time. An early manual resume pauses again against the same time; it does not restart the duration.
+- `until` accepts an ISO-8601 timestamp after `$node.output` substitution.
+- `event` requires `deadline_ms`. If no matching signal arrives by the deadline, the node completes with `status: expired`; event waits cannot remain open forever.
+
+A satisfied wait produces the fixed structured output `{ status, waited_ms, event?, payload? }`. `status` is `satisfied` or `expired`, so downstream `when:` or `until_bash` wiring can branch without parsing prose. `output_format`, `retry`, and `always_run` cannot be set on a wait; the engine owns its output and continuation lifecycle.
+
+Signal one exact run through the authenticated API:
+
+```bash
+curl -X POST http://localhost:3090/api/workflows/runs/<run-id>/signal \
+  -H 'Content-Type: application/json' \
+  -d '{"event":"checks.complete","payload":{"conclusion":"success"}}'
+```
+
+The event name must match the run's open wait. The signal and its audit event are committed together; duplicate or wrong-run signals do nothing. The server must be running for scheduled or event-driven continuation. If it is offline when a deadline passes, the persisted run resumes on the next scan after startup.
+
+A wait may be the sole terminal sink in a `loop_group` body. Archon then escalates the persisted cursor to the group and rechecks the group's completion condition after the wait completes. A non-terminal body wait is rejected because resuming a partial iteration would otherwise require replaying already-completed sibling work.
+
+This node follows the [Workflow Language Constitution](/reference/workflow-language-constitution/): YAML declares the engine-visible coordination condition; computation stays in a `bash:`, `script:`, or `prompt:` node whose structured output can feed the wait.
 
 ---
 

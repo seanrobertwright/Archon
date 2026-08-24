@@ -178,6 +178,16 @@ export interface GlobalConfig {
    * overrides these per-field.
    */
   container?: ContainerConfig;
+
+  /** Default-off policy for continuing terminal quota failures after time passes. */
+  workflows?: WorkflowContinuationConfig;
+}
+
+export interface WorkflowContinuationConfig {
+  autoResumeOnQuotaReset?: boolean;
+  quotaFallbackDelayMs?: number;
+  quotaMaxAttempts?: number;
+  quotaDeadlineMs?: number;
 }
 
 /**
@@ -201,6 +211,9 @@ export interface RepoConfig {
 
   /** Repo-level model tier presets — override global tiers with same name. */
   tiers?: RawTiersConfig;
+
+  /** Project override for quota-failure continuation. */
+  workflows?: WorkflowContinuationConfig;
 
   /**
    * Commands configuration
@@ -375,6 +388,12 @@ export interface MergedConfig {
   };
   concurrency: {
     maxConversations: number;
+  };
+  workflows: {
+    autoResumeOnQuotaReset: boolean;
+    quotaFallbackDelayMs?: number;
+    quotaMaxAttempts: number;
+    quotaDeadlineMs: number;
   };
   commands: {
     /**

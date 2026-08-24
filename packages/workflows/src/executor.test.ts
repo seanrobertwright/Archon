@@ -2888,6 +2888,52 @@ describe('hydrateResumableRun', () => {
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-loop');
   });
 
+  it.each([
+    [
+      'first-node wait',
+      'paused',
+      {
+        wait: {
+          nodeId: 'delay',
+          kind: 'time',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-24T11:00:00.000Z',
+        },
+      },
+    ],
+    [
+      'first-node quota continuation',
+      'failed',
+      {
+        scheduled_resume: {
+          reason: 'quota',
+          resumeAt: '2026-08-24T11:00:00.000Z',
+          deadlineAt: '2026-08-25T11:00:00.000Z',
+          attempt: 1,
+          maxAttempts: 1,
+          error: 'usage limit reached',
+        },
+      },
+    ],
+  ] as const)('hydrates a %s with zero completed nodes', async (_label, status, metadata) => {
+    const candidate = makeRun({ id: 'first-node-continuation', status, metadata });
+    const resumed = makeRun({ id: 'first-node-continuation', status: 'running', metadata });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+
+    const result = await hydrateResumableRun(makeDeps(store), candidate);
+
+    expect(result).not.toBeNull();
+    expect(result?.priorCompletedNodes.size).toBe(0);
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('first-node-continuation');
+  });
+
   it('#2714 regression: resumes a first-node legacy on_reject gate with a genuinely staged rework, even with zero completed nodes', async () => {
     // rejectWorkflow's stage-rework path (workflow-operations.ts) never writes
     // node_completed — it only stamps metadata.approval.resolved/rejection_reason

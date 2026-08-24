@@ -377,6 +377,11 @@ function getDefaults(): MergedConfig {
     concurrency: {
       maxConversations: 10,
     },
+    workflows: {
+      autoResumeOnQuotaReset: false,
+      quotaMaxAttempts: 1,
+      quotaDeadlineMs: 24 * 60 * 60 * 1000,
+    },
     commands: {
       folder: undefined,
       autoLoad: true,
@@ -510,6 +515,10 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.concurrency.maxConversations = global.concurrency.maxConversations;
   }
 
+  if (global.workflows) {
+    result.workflows = { ...result.workflows, ...global.workflows };
+  }
+
   // Container backend defaults (folder projects)
   if (global.container) {
     result.container = { ...global.container };
@@ -543,6 +552,10 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
 
   result.aliases = mergeAliases(result.aliases, repo.aliases);
   result.tiers = mergeTiers(result.tiers, repo.tiers);
+
+  if (repo.workflows) {
+    result.workflows = { ...result.workflows, ...repo.workflows };
+  }
 
   // Commands config
   if (repo.commands) {
