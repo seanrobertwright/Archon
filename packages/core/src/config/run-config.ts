@@ -1,5 +1,9 @@
-import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
+import { getRegisteredProviders, isRegisteredProvider } from '@archon/providers';
+import {
+  isEffortValidForProvider,
+  validEffortsForProvider,
+} from '@archon/workflows/model-validation';
 import {
   workflowRunConfigLayerSchema,
   type WorkflowRunConfigInput,
@@ -71,6 +75,57 @@ function validationError(error: { issues: { path: PropertyKey[]; message: string
   return new Error(`Invalid run config at '${path}': ${issue?.message ?? 'invalid value'}`);
 }
 
+function assertRegisteredProvider(provider: string, path: string): void {
+  if (isRegisteredProvider(provider)) return;
+  const available = getRegisteredProviders()
+    .map(entry => entry.id)
+    .sort()
+    .join(', ');
+  throw new Error(
+    `Invalid run config at '${path}': unknown provider '${provider}'.` +
+      (available ? ` Available: ${available}.` : ' No providers are registered.')
+  );
+}
+
+function assertValidPreset(path: string, preset: { provider: string; effort?: string }): void {
+  assertRegisteredProvider(preset.provider, `${path}.provider`);
+  if (preset.effort !== undefined && !isEffortValidForProvider(preset.provider, preset.effort)) {
+    const valid = validEffortsForProvider(preset.provider);
+    throw new Error(
+      `Invalid run config at '${path}.effort': '${preset.effort}' is not valid for provider ` +
+        `'${preset.provider}'. Valid: ${valid?.join(', ') ?? '(none)'}.`
+    );
+  }
+}
+
+/** Validate semantic constraints that depend on the live provider registry and lifecycle. */
+function assertRunConfigSemantics(layer: WorkflowRunConfigLayer): void {
+  if (layer.assistant !== undefined) {
+    assertRegisteredProvider(layer.assistant, 'assistant');
+  }
+  for (const [provider, defaults] of Object.entries(layer.assistants ?? {})) {
+    assertRegisteredProvider(provider, `assistants.${provider}`);
+    if (provider === 'pi' && Object.hasOwn(defaults, 'env')) {
+      throw new Error(
+        "Run config key 'assistants.pi.env' cannot apply: Pi extension environment mutates " +
+          'process.env and is process-scoped.'
+      );
+    }
+    if (provider === 'pi' && Object.hasOwn(defaults, 'maxConcurrent')) {
+      throw new Error(
+        "Run config key 'assistants.pi.maxConcurrent' cannot apply: Pi concurrency is " +
+          'initialized once for the process lifetime.'
+      );
+    }
+  }
+  for (const [tier, preset] of Object.entries(layer.tiers ?? {})) {
+    assertValidPreset(`tiers.${tier}`, preset);
+  }
+  for (const [alias, preset] of Object.entries(layer.aliases ?? {})) {
+    assertValidPreset(`aliases.${alias}`, preset);
+  }
+}
+
 /** Parse one explicitly selected sparse run config. Unlike shared config loading, this is fail-fast. */
 export function parseWorkflowRunConfig(
   value: unknown,
@@ -120,6 +175,7 @@ export function parseWorkflowRunConfig(
   };
   const parsed = workflowRunConfigLayerSchema.safeParse(candidate);
   if (!parsed.success) throw validationError(parsed.error);
+  assertRunConfigSemantics(parsed.data);
   return { layer: parsed.data, source };
 }
 
@@ -168,9 +224,6 @@ export function sealWorkflowRunConfig(
   return {
     version: 1,
     ciphertext,
-    // Hash the sealed value, not secret-bearing plaintext. AES-GCM owns payload
-    // integrity; this digest is only a stable audit identifier for the stored blob.
-    digest: createHash('sha256').update(ciphertext).digest('hex'),
     source,
     keys: configuredKeyPaths(layer),
   };
@@ -185,10 +238,6 @@ export function unsealWorkflowRunConfig(
   } catch {
     throw new Error('Workflow run config could not be decrypted.');
   }
-  const digest = createHash('sha256').update(metadata.ciphertext).digest('hex');
-  if (digest !== metadata.digest) {
-    throw new Error('Workflow run config failed its integrity check.');
-  }
   let value: unknown;
   try {
     value = JSON.parse(plaintext) as unknown;
@@ -199,5 +248,6 @@ export function unsealWorkflowRunConfig(
   if (!parsed.success) {
     throw new Error('Workflow run config payload is invalid.');
   }
+  assertRunConfigSemantics(parsed.data);
   return parsed.data;
 }

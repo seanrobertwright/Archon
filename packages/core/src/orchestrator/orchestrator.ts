@@ -633,6 +633,14 @@ async function dispatchBackgroundWorkflowOwned(
         }
       } catch (error) {
         const err = toError(error);
+        if (preCreatedRun) {
+          await workflowDeps.store.failWorkflowRun(preCreatedRun.id, err.message).catch(dbError => {
+            getLog().error(
+              { err: toError(dbError), workflowRunId: preCreatedRun.id },
+              'background_workflow_fail_db_record_failed'
+            );
+          });
+        }
         getLog().error(
           {
             err,

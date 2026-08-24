@@ -679,7 +679,8 @@ async function main(): Promise<number> {
               // Raw `name=value` assignments; parsed at the invocation gate (#2554).
               inputs: values.input as string[] | undefined,
               modelAssignments: values.model as string[] | undefined,
-              configPath: values.config as string | undefined,
+              configPath:
+                typeof values.config === 'string' ? resolve(cwd, values.config) : undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;

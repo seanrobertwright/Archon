@@ -431,7 +431,6 @@ function makeDeps(store: IWorkflowStore): WorkflowDeps {
     sealRunConfig: (layer, source): WorkflowRunConfigMetadata => ({
       version: 1,
       ciphertext: 'opaque-test-payload',
-      digest: 'a'.repeat(64),
       source,
       keys: [
         ...Object.keys(layer.tiers ?? {}).map(name => `tiers.${name}`),

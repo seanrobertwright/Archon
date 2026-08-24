@@ -1,6 +1,6 @@
 import { z } from '@hono/zod-openapi';
 import { MAX_DURABLE_WAIT_MS } from './dag-node';
-import { rawAliasesConfigSchema, rawTiersConfigSchema } from './model-binding';
+import { rawTiersConfigSchema, runAliasesConfigSchema } from './model-binding';
 
 const providerDefaultsSchema = z.record(z.string(), z.unknown());
 
@@ -18,7 +18,7 @@ export const workflowRunConfigLayerSchema = z
   .object({
     assistant: z.string().trim().min(1).optional(),
     assistants: z.record(z.string(), providerDefaultsSchema).optional(),
-    aliases: rawAliasesConfigSchema.optional(),
+    aliases: runAliasesConfigSchema.optional(),
     tiers: rawTiersConfigSchema.optional(),
     workflows: workflowRunContinuationConfigSchema.optional(),
     docsPath: z.string().trim().min(1).optional(),
@@ -50,7 +50,6 @@ export const workflowRunConfigMetadataSchema = z
   .object({
     version: z.literal(1),
     ciphertext: z.string().min(1),
-    digest: z.string().regex(/^[0-9a-f]{64}$/),
     source: workflowRunConfigSourceSchema,
     keys: z.array(z.string().min(1)),
   })

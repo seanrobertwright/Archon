@@ -10,7 +10,7 @@ import { parseArgs } from 'util';
 import { cliArgOptions } from './args';
 import * as git from '@archon/git';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -127,6 +127,27 @@ describe('workflow run config argument', () => {
     );
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('--config cannot be used when continuing');
+  });
+
+  it('resolves a relative config path from the requested subdirectory cwd', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'archon-cli-config-cwd-'));
+    const subdir = join(repo, 'bench');
+    mkdirSync(subdir, { recursive: true });
+    spawnSync('git', ['init'], { cwd: repo, encoding: 'utf8' });
+    writeFileSync(join(subdir, 'config.yaml'), 'paths: {}\n');
+
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'run', 'x', '--cwd', subdir, '--config', './config.yaml'],
+        { encoding: 'utf8' }
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Run config key 'paths' cannot apply");
+      expect(result.stderr).not.toContain('Unable to read run config');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   for (const args of [

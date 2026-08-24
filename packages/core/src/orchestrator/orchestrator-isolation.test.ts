@@ -96,9 +96,10 @@ mock.module('@archon/providers', () => ({
 }));
 
 const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
+const mockFailWorkflowRun = mock(() => Promise.resolve());
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mockCreateWorkflowRun },
+    store: { createWorkflowRun: mockCreateWorkflowRun, failWorkflowRun: mockFailWorkflowRun },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),
@@ -420,6 +421,7 @@ describe('dispatchBackgroundWorkflow', () => {
     mockResolve.mockClear();
     mockUpdateConversation.mockClear();
     mockCreateWorkflowRun.mockClear();
+    mockFailWorkflowRun.mockClear();
     mockExecuteWorkflow.mockClear();
     mockLogger.info.mockClear();
     mockGetOrCreateConversation.mockResolvedValue(
@@ -591,6 +593,16 @@ describe('dispatchBackgroundWorkflow', () => {
 
     const opts = mockExecuteWorkflow.mock.calls[0]?.[7] as { runConfig?: unknown };
     expect(opts.runConfig).toEqual(runConfig);
+  });
+
+  test('terminalizes a pre-created row when executor setup rejects the run config', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    mockExecuteWorkflow.mockRejectedValueOnce(new Error('invalid run config provider'));
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+    await flushBackgroundExecution();
+
+    expect(mockFailWorkflowRun).toHaveBeenCalledWith('run-1', 'invalid run config provider');
   });
 
   test('default policy still resolves isolation for the worker', async () => {

@@ -36,8 +36,6 @@ export function applyWorkflowRunConfigLayer(
     ...base,
     ...(layer.assistant !== undefined ? { assistant: layer.assistant } : {}),
     assistants: mergeAssistantDefaults(base.assistants, layer.assistants),
-    ...(layer.aliases !== undefined ? { aliases: { ...base.aliases, ...layer.aliases } } : {}),
-    ...(layer.tiers !== undefined ? { tiers: { ...base.tiers, ...layer.tiers } } : {}),
     ...(workflows !== undefined ? { workflows } : {}),
     ...(layer.docsPath !== undefined ? { docsPath: layer.docsPath } : {}),
     ...(layer.envVars !== undefined ? { envVars: { ...base.envVars, ...layer.envVars } } : {}),

@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
+import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +12,11 @@ import {
 
 const TEST_KEY = 'ab'.repeat(32);
 let previousKey: string | undefined;
+
+beforeAll(() => {
+  registerBuiltinProviders();
+  registerCommunityProviders();
+});
 
 beforeEach(() => {
   previousKey = process.env.TOKEN_ENCRYPTION_KEY;
@@ -85,6 +91,42 @@ describe('workflow run config', () => {
       expect(() =>
         parseWorkflowRunConfig({ [key]: {} }, { kind: 'http', label: 'inline' })
       ).toThrow(`Run config key '${key}' cannot apply`);
+    }
+  });
+
+  it('rejects model settings that cannot execute or survive resume', () => {
+    expect(() =>
+      parseWorkflowRunConfig({ assistant: 'not-registered' }, { kind: 'http', label: 'inline' })
+    ).toThrow("Invalid run config at 'assistant': unknown provider 'not-registered'");
+    expect(() =>
+      parseWorkflowRunConfig(
+        { aliases: { planner: { provider: 'claude', model: 'opus' } } },
+        { kind: 'http', label: 'inline' }
+      )
+    ).toThrow("Invalid run config at 'aliases.planner'");
+    expect(() =>
+      parseWorkflowRunConfig(
+        {
+          tiers: {
+            large: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'banana' },
+          },
+        },
+        { kind: 'http', label: 'inline' }
+      )
+    ).toThrow("Invalid run config at 'tiers.large.effort'");
+  });
+
+  it('rejects Pi defaults whose consumers own process-lifetime state', () => {
+    for (const [key, value] of [
+      ['env', { TOKEN: 'secret' }],
+      ['maxConcurrent', 1],
+    ] as const) {
+      expect(() =>
+        parseWorkflowRunConfig(
+          { assistants: { pi: { [key]: value } } },
+          { kind: 'http', label: 'inline' }
+        )
+      ).toThrow(`Run config key 'assistants.pi.${key}' cannot apply`);
     }
   });
 

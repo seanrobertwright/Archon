@@ -153,10 +153,11 @@ Run config accepts settings whose consumers still execute after the run is dispa
 - `worktree` and `container` already affected isolation.
 - `botName`, `streaming`, `paths`, and `concurrency` are process-scoped or have no per-run consumer.
 - `recommendedWorkflows` is listing-only.
+- `assistants.pi.env` and `assistants.pi.maxConcurrent` mutate process-lifetime Pi state rather than one request.
 
-Unknown keys also fail instead of being ignored. CLI accepts a local path; the HTTP run API accepts inline validated content and never a caller-selected server path.
+Unknown keys, unregistered providers, invalid effort values, and alias names without `@` also fail instead of being ignored. CLI accepts a local path; the HTTP run API accepts inline validated content and never a caller-selected server path.
 
-Fresh runs seal the normalized layer before recording it. Run metadata exposes its source label, digest, and configured key paths, not plaintext `env` or provider-default values. A continuation restores that sealed layer without rereading the original file, and child workflows inherit it. This is why `--config` cannot be supplied with `--resume`.
+Fresh runs seal the normalized layer before recording it. Run metadata exposes its source label and configured key paths, not plaintext `env` or provider-default values. A continuation restores that sealed layer without rereading the original file, and child workflows inherit it. Detached CLI launches also transfer the already-validated sealed layer to the child instead of rereading the caller's file. This is why `--config` cannot be supplied with `--resume`.
 
 ## Repository Configuration
 

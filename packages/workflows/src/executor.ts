@@ -2754,7 +2754,7 @@ export async function executeWorkflow(
         event_type: 'workflow_started',
         data: {
           workflowName: workflow.name,
-          defaultAssistant: userAiPrefs.defaultProvider ?? config.assistant,
+          defaultAssistant: baseAiProfile.defaultProvider,
           provider: resolvedProvider,
           model: resolvedModel ?? null,
           isolationMode,

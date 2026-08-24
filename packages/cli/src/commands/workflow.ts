@@ -12,7 +12,11 @@ import {
   isPerUserGitHubEnabled,
   getDecryptedAccessToken,
 } from '@archon/core';
-import { loadWorkflowRunConfigFile } from '@archon/core/config';
+import {
+  loadWorkflowRunConfigFile,
+  sealWorkflowRunConfig,
+  unsealWorkflowRunConfig,
+} from '@archon/core/config';
 import { WORKFLOW_EVENT_TYPES, type WorkflowEventType } from '@archon/workflows/store';
 import {
   isTierName,
@@ -89,6 +93,10 @@ import type {
 } from '@archon/workflows/schemas/workflow';
 import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import {
+  workflowRunConfigMetadataSchema,
+  type WorkflowRunConfigInput,
+} from '@archon/workflows/schemas/run-config';
+import {
   workflowRunStatusSchema,
   isApprovalContext,
   isWorkflowWaitContext,
@@ -137,6 +145,28 @@ function getLog(): ReturnType<typeof createLogger> {
 const DETACHED_STARTUP_WINDOW_MS = 500;
 const DETACHED_LOG_TAIL_MAX_CHARS = 4_000;
 const DETACHED_LOG_TAIL_MAX_LINES = 40;
+const DETACHED_RUN_CONFIG_ENV = 'ARCHON_INTERNAL_DETACHED_RUN_CONFIG';
+
+function consumeDetachedRunConfig(): WorkflowRunConfigInput | undefined {
+  const payload = process.env[DETACHED_RUN_CONFIG_ENV];
+  Reflect.deleteProperty(process.env, DETACHED_RUN_CONFIG_ENV);
+  if (payload === undefined) return undefined;
+
+  let value: unknown;
+  try {
+    value = JSON.parse(payload) as unknown;
+  } catch {
+    throw new Error('Detached workflow run config payload is not valid JSON.');
+  }
+  const metadata = workflowRunConfigMetadataSchema.safeParse(value);
+  if (!metadata.success) {
+    throw new Error('Detached workflow run config payload is invalid.');
+  }
+  return {
+    layer: unsealWorkflowRunConfig(metadata.data),
+    source: metadata.data.source,
+  };
+}
 
 function readDetachedLogTail(path: string): string | null {
   try {
@@ -302,6 +332,8 @@ export interface WorkflowRunOptions {
   modelAssignments?: string[];
   /** Local YAML file supplying a sparse configuration layer for this run. */
   configPath?: string;
+  /** @internal Validated immutable layer transferred from a detached parent. */
+  detachedRunConfig?: WorkflowRunConfigInput;
 }
 
 /**
@@ -409,7 +441,8 @@ export function buildDetachedRunCmd(
 async function spawnDetachedWorkflowRun(
   cwd: string,
   conversationId: string,
-  extraArgs: string[]
+  extraArgs: string[],
+  runConfigPayload?: string
 ): Promise<string | null> {
   const cmd = buildDetachedRunCmd(
     BUNDLED_IS_BINARY,
@@ -453,7 +486,11 @@ async function spawnDetachedWorkflowRun(
     // next step. `windowsHide` keeps the child headless.
     const child = spawn(cmd[0], cmd.slice(1), {
       cwd,
-      env: { ...process.env, [DETACHED_RUN_OWNER_ENV]: '1' },
+      env: {
+        ...process.env,
+        [DETACHED_RUN_OWNER_ENV]: '1',
+        ...(runConfigPayload ? { [DETACHED_RUN_CONFIG_ENV]: runConfigPayload } : {}),
+      },
       stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
       detached: true,
       windowsHide: true,
@@ -1048,14 +1085,14 @@ async function runWorkflowWithOwnedSource(
       ? options.configPath
       : join(cwd, options.configPath)
     : undefined;
-  if (isContinuation && resolvedRunConfigPath) {
+  if (isContinuation && (resolvedRunConfigPath || options.detachedRunConfig)) {
     throw new Error(
       '--resume and --config are mutually exclusive. A resumed run keeps its original run config.'
     );
   }
-  const runConfig = resolvedRunConfigPath
-    ? await loadWorkflowRunConfigFile(resolvedRunConfigPath)
-    : undefined;
+  const runConfig =
+    options.detachedRunConfig ??
+    (resolvedRunConfigPath ? await loadWorkflowRunConfigFile(resolvedRunConfigPath) : undefined);
 
   let preparedSource: PreparedWorkflowSource | undefined;
   // Pinned at the moment of prepare so the SIGINT/SIGTERM cleanup never rm's a
@@ -1490,13 +1527,17 @@ async function runWorkflowWithOwnedSource(
     if (options.discoveryCwd !== undefined) {
       extraArgs.push('--workflow-source', options.discoveryCwd);
     }
-    if (resolvedRunConfigPath !== undefined) {
-      extraArgs.push('--config', resolvedRunConfigPath);
-    }
-
     // The detached child captures its own source, so this process's capture is dead
     // weight — and never adopted, so the owner reclaims it when this returns.
-    const logPath = await spawnDetachedWorkflowRun(cwd, childConversationId, extraArgs);
+    const runConfigPayload = runConfig
+      ? JSON.stringify(sealWorkflowRunConfig(runConfig.layer, runConfig.source))
+      : undefined;
+    const logPath = await spawnDetachedWorkflowRun(
+      cwd,
+      childConversationId,
+      extraArgs,
+      runConfigPayload
+    );
 
     if (options.json) {
       await writeJsonLine({
@@ -2527,8 +2568,12 @@ export async function workflowRunCommand(
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
+  const detachedRunConfig = consumeDetachedRunConfig();
   await withCapturedSource(owner =>
-    runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, options)
+    runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, {
+      ...options,
+      ...(detachedRunConfig ? { detachedRunConfig } : {}),
+    })
   );
 }
 

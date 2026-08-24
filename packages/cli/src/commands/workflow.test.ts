@@ -1,7 +1,17 @@
 /**
  * Tests for workflow commands
  */
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock, jest } from 'bun:test';
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  beforeEach,
+  afterEach,
+  spyOn,
+  mock,
+  jest,
+} from 'bun:test';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,6 +44,13 @@ import {
   hasUnresolvedWriteback,
   buildNodeSummaries,
 } from './workflow';
+
+beforeAll(async () => {
+  const { registerBuiltinProviders, registerCommunityProviders } =
+    await import('@archon/providers');
+  registerBuiltinProviders();
+  registerCommunityProviders();
+});
 
 const mockLogger = {
   fatal: mock(() => undefined),
@@ -5290,30 +5307,70 @@ describe('workflowRunCommand — detach', () => {
     expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
   });
 
-  it('lets the detached child parse the absolute run config appended last', () => {
-    const root = '/absolute/project';
-    const configName = 'config.minimax.yaml';
-    const spawnCmd = buildDetachedRunCmd(
-      false,
-      '/path/to/bun',
-      [
-        '/path/to/bun',
-        '/abs/cli.ts',
-        'workflow',
-        'run',
-        'assist',
-        '--config',
-        `./${configName}`,
-        '--detach',
-      ],
-      root,
-      ['--config', join(root, configName)]
-    );
-    const configIndexes = spawnCmd.flatMap((arg, index) => (arg === '--config' ? [index] : []));
-    expect(configIndexes).toHaveLength(2);
-    const lastConfigIndex = configIndexes.at(-1);
-    expect(lastConfigIndex).toBeDefined();
-    expect(spawnCmd[(lastConfigIndex ?? 0) + 1]).toBe(join(root, configName));
+  it('hands the detached child the sealed validated layer instead of a mutable path', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const paths = await import('@archon/paths');
+    const { unsealWorkflowRunConfig } = await import('@archon/core/config');
+    const { workflowRunConfigMetadataSchema } =
+      await import('@archon/workflows/schemas/run-config');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    const savedKey = process.env.TOKEN_ENCRYPTION_KEY;
+    process.env.TOKEN_ENCRYPTION_KEY = 'ab'.repeat(32);
+    process.argv = [
+      'bun',
+      '/abs/cli.ts',
+      'workflow',
+      'run',
+      'assist',
+      '--config',
+      '/caller/config.yaml',
+      '--detach',
+    ];
+
+    let payload: string | undefined;
+    try {
+      const commandPromise = workflowRunCommand('/test/path', 'assist', '', {
+        detach: true,
+        configPath: '/caller/config.yaml',
+        detachedRunConfig: {
+          source: { kind: 'cli', label: 'config.yaml' },
+          layer: { docsPath: 'accepted', envVars: { SNAPSHOT: 'original' } },
+        },
+      });
+      await finishStartupWindow(commandPromise, spawnSpy);
+      const spawnOptions = spawnSpy.mock.calls[0]?.[0] as
+        | { env?: Record<string, string | undefined> }
+        | undefined;
+      payload = spawnOptions?.env?.ARCHON_INTERNAL_DETACHED_RUN_CONFIG;
+    } finally {
+      process.argv = savedArgv;
+      if (savedKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
+      else process.env.TOKEN_ENCRYPTION_KEY = savedKey;
+      spawnSpy.mockRestore();
+    }
+
+    expect(payload).toBeDefined();
+    process.env.TOKEN_ENCRYPTION_KEY = 'ab'.repeat(32);
+    try {
+      const metadata = workflowRunConfigMetadataSchema.parse(JSON.parse(payload ?? ''));
+      expect(unsealWorkflowRunConfig(metadata)).toMatchObject({
+        docsPath: 'accepted',
+        envVars: { SNAPSHOT: 'original' },
+      });
+    } finally {
+      if (savedKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
+      else process.env.TOKEN_ENCRYPTION_KEY = savedKey;
+    }
   });
 
   // #2213 — the headline `--json` claim. `writeJsonLine` (not console.log) is

@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, mock, beforeAll, beforeEach, afterEach } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -7,6 +7,13 @@ import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
+
+beforeAll(async () => {
+  const { registerBuiltinProviders, registerCommunityProviders } =
+    await import('@archon/providers');
+  registerBuiltinProviders();
+  registerCommunityProviders();
+});
 
 // ---------------------------------------------------------------------------
 // Mock setup — must be before dynamic imports of mocked modules

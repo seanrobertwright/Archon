@@ -1103,7 +1103,6 @@ describe('executeWorkflow', () => {
     const sealedMetadata: WorkflowRunConfigMetadata = {
       version: 1,
       ciphertext: 'opaque-ciphertext',
-      digest: 'a'.repeat(64),
       source: { kind: 'cli', label: 'config.minimax.yaml' },
       keys: ['assistant', 'env.SHARED', 'tiers.large'],
     };
@@ -1345,6 +1344,12 @@ describe('executeWorkflow', () => {
           })
         ),
         getUserAiPrefs: mock(async () => ({ defaultProvider: 'codex' })),
+        sealRunConfig: mock(() => ({
+          version: 1 as const,
+          ciphertext: 'opaque',
+          source: { kind: 'http' as const, label: 'inline' },
+          keys: ['assistant'],
+        })),
       } as WorkflowDeps;
       const platform = {
         sendMessage: mock(async () => {}),
@@ -1364,6 +1369,10 @@ describe('executeWorkflow', () => {
           baseBranch: 'caller-base',
           baseOverride: 'override-base',
           isolationContext: { branchName: 'feature/snapshot' },
+          runConfig: {
+            source: { kind: 'http', label: 'inline' },
+            layer: { assistant: 'pi' },
+          },
         }
       );
 
@@ -1372,7 +1381,7 @@ describe('executeWorkflow', () => {
         .find(event => event.event_type === 'workflow_started');
       expect(startedEvent?.data).toEqual({
         workflowName: 'test-workflow',
-        defaultAssistant: 'codex',
+        defaultAssistant: 'pi',
         provider: 'codex',
         model: 'gpt-5.5',
         isolationMode: 'worktree',

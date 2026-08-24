@@ -35,7 +35,6 @@ describe('applyWorkflowRunConfigLayer', () => {
     const base = baseConfig();
     const resolved = applyWorkflowRunConfigLayer(base, {
       assistants: { claude: { model: 'opus' } },
-      tiers: { large: { provider: 'pi', model: 'minimax/MiniMax-M3' } },
       envVars: { SHARED: 'run' },
       workflows: { quotaMaxAttempts: 4 },
     });
@@ -49,7 +48,6 @@ describe('applyWorkflowRunConfigLayer', () => {
       tiers: {
         small: { provider: 'claude', model: 'haiku' },
         medium: { provider: 'claude', model: 'sonnet' },
-        large: { provider: 'pi', model: 'minimax/MiniMax-M3' },
       },
       envVars: { LOWER: 'kept', SHARED: 'run' },
       workflows: {
@@ -75,7 +73,6 @@ describe('readWorkflowRunConfigMetadata', () => {
     const valid = {
       version: 1 as const,
       ciphertext: 'opaque',
-      digest: 'a'.repeat(64),
       source: { kind: 'http' as const, label: 'inline' },
       keys: ['tiers.large'],
     };
@@ -84,7 +81,7 @@ describe('readWorkflowRunConfigMetadata', () => {
     );
     expect(() =>
       readWorkflowRunConfigMetadata({
-        [WORKFLOW_RUN_CONFIG_METADATA_KEY]: { ...valid, digest: 'bad' },
+        [WORKFLOW_RUN_CONFIG_METADATA_KEY]: { ...valid, version: 2 },
       })
     ).toThrow('invalid run_config metadata');
   });
