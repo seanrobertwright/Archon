@@ -44,7 +44,7 @@ import {
   readTierNoticeState,
   markTierNoticeShown,
 } from '@archon/paths';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { applyWorkflowRunConfigLayer } from '@archon/workflows/run-config';
 import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -436,6 +436,17 @@ export function buildDetachedRunCmd(
   return [...baseCmd, ...userArgs, '--cwd', cwd, ...extraArgs];
 }
 
+/** Freeze the install key context before a detached child changes cwd. */
+export function resolveDetachedRunEncryptionEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd()
+): { TOKEN_ENCRYPTION_KEY: string; ARCHON_HOME: string } {
+  return {
+    TOKEN_ENCRYPTION_KEY: env.TOKEN_ENCRYPTION_KEY ?? '',
+    ARCHON_HOME: env.ARCHON_HOME ? resolve(cwd, env.ARCHON_HOME) : '',
+  };
+}
+
 async function spawnDetachedWorkflowRun(
   cwd: string,
   conversationId: string,
@@ -493,8 +504,7 @@ async function spawnDetachedWorkflowRun(
           ? {
               // Empty strings preserve meaningful absence: Bun will not fill
               // these from the target repo's auto-loaded .env.
-              TOKEN_ENCRYPTION_KEY: process.env.TOKEN_ENCRYPTION_KEY ?? '',
-              ARCHON_HOME: process.env.ARCHON_HOME ?? '',
+              ...resolveDetachedRunEncryptionEnv(),
             }
           : {}),
       },

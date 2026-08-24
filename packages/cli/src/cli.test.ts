@@ -12,7 +12,7 @@ import * as git from '@archon/git';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { sealWorkflowRunConfig } from '@archon/core/config';
 
 const CLI_ENTRY = join(import.meta.dir, 'cli.ts');
@@ -165,7 +165,7 @@ describe('workflow run config argument', () => {
     const savedKey = process.env.TOKEN_ENCRYPTION_KEY;
     const savedArchonHome = process.env.ARCHON_HOME;
     delete process.env.TOKEN_ENCRYPTION_KEY;
-    process.env.ARCHON_HOME = archonHome;
+    process.env.ARCHON_HOME = relative(process.cwd(), archonHome);
     const payload = JSON.stringify(
       sealWorkflowRunConfig({ docsPath: 'accepted' }, { kind: 'cli', label: 'config.minimax.yaml' })
     );

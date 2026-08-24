@@ -39,6 +39,7 @@ import {
   workflowCleanupCommand,
   workflowResetSessionsCommand,
   buildDetachedRunCmd,
+  resolveDetachedRunEncryptionEnv,
   maybePrintTierNotice,
   resolveContainerBackendConfig,
   hasUnresolvedWriteback,
@@ -6381,6 +6382,24 @@ describe('buildDetachedRunCmd', () => {
     expect(cmd).not.toContain('B:/~BUN/root/archon-windows-x64.exe');
     expect(cmd[1]).toBe('workflow');
     expect(cmd[2]).toBe('run');
+  });
+});
+
+describe('resolveDetachedRunEncryptionEnv', () => {
+  it('pins both absence and a relative home before the child changes cwd', () => {
+    expect(resolveDetachedRunEncryptionEnv({}, '/parent/repo')).toEqual({
+      TOKEN_ENCRYPTION_KEY: '',
+      ARCHON_HOME: '',
+    });
+    expect(
+      resolveDetachedRunEncryptionEnv(
+        { TOKEN_ENCRYPTION_KEY: 'install-key', ARCHON_HOME: './relative-home' },
+        '/parent/repo'
+      )
+    ).toEqual({
+      TOKEN_ENCRYPTION_KEY: 'install-key',
+      ARCHON_HOME: '/parent/repo/relative-home',
+    });
   });
 });
 
