@@ -139,15 +139,22 @@ describe('round-trip fidelity', () => {
     expect(toWorkflowDefinition(workflow)).toEqual(definition);
   });
 
-  test('an incomplete wait remains a draft until server validation', () => {
-    const draft = toWorkflowDefinition({
-      name: 'wait-draft',
-      description: 'wait mode is selected before its value is entered',
-      meta: {},
-      nodes: [{ id: 'pause', variant: 'wait', base: {}, data: {} }],
-    });
+  test('cleared wait fields remain drafts until server validation', () => {
+    const clearedWaits = [
+      { duration_ms: undefined },
+      { event: 'checks.complete', deadline_ms: undefined },
+    ];
 
-    expect(draft.nodes).toEqual([{ id: 'pause', wait: {} }]);
+    for (const data of clearedWaits) {
+      const draft = toWorkflowDefinition({
+        name: 'wait-draft',
+        description: 'wait mode is selected before its value is entered',
+        meta: {},
+        nodes: [{ id: 'pause', variant: 'wait', base: {}, data }],
+      });
+
+      expect(draft.nodes).toEqual([{ id: 'pause', wait: data }]);
+    }
   });
 
   test('script runtime/deps/timeout survive partitioning', () => {
