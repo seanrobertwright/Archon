@@ -9,11 +9,10 @@ const mockGetWorkflowRun = mock(() => Promise.resolve(null));
 const mockListWorkflowRuns = mock(() => Promise.resolve([]));
 const mockUpdateWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve({ cancelled: true }));
-const mockCancelResumableWorkflowRun = mock(() => Promise.resolve({ cancelled: true }));
-const mockFindChildRuns = mock((): Promise<unknown[]> => Promise.resolve([]));
-const mockFindResumableRunsForConversation = mock(
-  (): Promise<Array<{ id: string; parent_run_id: string | null }>> => Promise.resolve([])
+const mockCancelResumableRunsForConversation = mock(
+  (): Promise<WorkflowRun[]> => Promise.resolve([])
 );
+const mockFindChildRuns = mock((): Promise<unknown[]> => Promise.resolve([]));
 // CAS gate resolvers (#2113): default to "won the race". Tests that simulate a
 // concurrent loser override with mockResolvedValueOnce({ resolved: false }).
 // resolveApprovalGate = stay-paused resolution (approve, reject stage-rework);
@@ -26,9 +25,8 @@ mock.module('../db/workflows', () => ({
   listWorkflowRuns: mockListWorkflowRuns,
   updateWorkflowRun: mockUpdateWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
-  cancelResumableWorkflowRun: mockCancelResumableWorkflowRun,
+  cancelResumableRunsForConversation: mockCancelResumableRunsForConversation,
   findChildRuns: mockFindChildRuns,
-  findResumableRunsForConversation: mockFindResumableRunsForConversation,
   resolveApprovalGate: mockResolveApprovalGate,
   resolveAndCancelApprovalGate: mockResolveAndCancelApprovalGate,
 }));
@@ -1269,14 +1267,14 @@ describe('abandonWorkflow', () => {
 
 describe('abandonResumableRunsForConversation', () => {
   beforeEach(() => {
-    mockFindResumableRunsForConversation.mockClear();
-    mockFindResumableRunsForConversation.mockImplementation(() => Promise.resolve([]));
+    mockCancelResumableRunsForConversation.mockClear();
+    mockCancelResumableRunsForConversation.mockImplementation(() => Promise.resolve([]));
     mockGetWorkflowRun.mockClear();
     mockGetWorkflowRun.mockImplementation(() => Promise.resolve(makePausedRun()));
-    mockCancelResumableWorkflowRun.mockClear();
-    mockCancelResumableWorkflowRun.mockImplementation(() => Promise.resolve({ cancelled: true }));
     mockFindChildRuns.mockClear();
     mockFindChildRuns.mockImplementation(() => Promise.resolve([]));
+    mockReclaimContainerEnv.mockClear();
+    mockReclaimContainerEnv.mockImplementation(() => Promise.resolve());
   });
 
   test('reports zero when the conversation has nothing resumable', async () => {
@@ -1284,245 +1282,67 @@ describe('abandonResumableRunsForConversation', () => {
 
     expect(result).toEqual({
       abandoned: 0,
-      failures: 0,
-      cascadeFailures: 0,
       blockedParentRunId: null,
     });
-    expect(mockCancelResumableWorkflowRun).not.toHaveBeenCalled();
+    expect(mockCancelResumableRunsForConversation).toHaveBeenCalledWith('conv-1');
   });
 
-  test('abandons each selected run tree once from its root', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([
-        { id: 'child-a', parent_run_id: 'run-a' },
-        { id: 'run-a', parent_run_id: null },
-        { id: 'run-b', parent_run_id: null },
-      ])
-    );
-    mockGetWorkflowRun.mockImplementation((id: unknown) =>
-      Promise.resolve(makePausedRun({ id: id as string }))
-    );
-    mockFindChildRuns.mockImplementation((id: unknown) =>
-      Promise.resolve(
-        id === 'run-a' ? [makePausedRun({ id: 'child-a', parent_run_id: 'run-a' })] : []
-      )
-    );
+  test('counts the rows cancelled by the conversation-scoped mutation', async () => {
+    mockCancelResumableRunsForConversation.mockResolvedValueOnce([
+      makePausedRun({ id: 'run-a' }),
+      makePausedRun({ id: 'run-b' }),
+    ] as WorkflowRun[]);
 
     const result = await abandonResumableRunsForConversation('conv-1');
 
     expect(result).toEqual({
-      abandoned: 3,
-      failures: 0,
-      cascadeFailures: 0,
+      abandoned: 2,
       blockedParentRunId: null,
     });
-    expect(mockFindResumableRunsForConversation).toHaveBeenCalledWith('conv-1');
-    expect(mockGetWorkflowRun.mock.calls.map(c => c[0])).toEqual(['run-a', 'run-b']);
-    expect(mockCancelResumableWorkflowRun.mock.calls.map(c => c[0])).toEqual([
-      'run-a',
-      'child-a',
-      'run-b',
-    ]);
-  });
-
-  test('treats a resumable-only cancellation CAS miss as ownership transferred (#2731 R1)', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([{ id: 'run-resumed', parent_run_id: null }])
-    );
-    mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun({ id: 'run-resumed' }));
-    mockCancelResumableWorkflowRun.mockResolvedValueOnce({ cancelled: false });
-
-    const result = await abandonResumableRunsForConversation('conv-1');
-
-    expect(result).toEqual({
-      abandoned: 0,
-      failures: 0,
-      cascadeFailures: 0,
-      blockedParentRunId: null,
-    });
-    expect(mockCancelResumableWorkflowRun).toHaveBeenCalledWith('run-resumed');
     expect(mockFindChildRuns).not.toHaveBeenCalled();
   });
 
-  test('still abandons a selected child when its parent CAS transfers ownership (#2731 R1)', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([
-        { id: 'parent-resumed', parent_run_id: null },
-        { id: 'child-paused', parent_run_id: 'parent-resumed' },
-      ])
-    );
-    mockGetWorkflowRun
-      .mockResolvedValueOnce(makePausedRun({ id: 'parent-resumed' }))
-      .mockResolvedValueOnce(makePausedRun({ id: 'child-paused', parent_run_id: 'parent-resumed' }))
-      .mockResolvedValueOnce(makePausedRun({ id: 'parent-resumed', status: 'running' }));
-    mockCancelResumableWorkflowRun.mockImplementation((id: unknown) =>
-      Promise.resolve({ cancelled: id === 'child-paused' })
-    );
+  test('reclaims every cancelled container run', async () => {
+    mockCancelResumableRunsForConversation.mockResolvedValueOnce([
+      makePausedRun({
+        id: 'container-a',
+        metadata: { isolation: 'container', isolation_env_id: 'env-a' },
+      }),
+      makePausedRun({
+        id: 'container-b',
+        metadata: { isolation: 'container', isolation_env_id: 'env-b' },
+      }),
+    ] as WorkflowRun[]);
 
-    const result = await abandonResumableRunsForConversation('conv-1');
+    await abandonResumableRunsForConversation('conv-1');
 
-    expect(result).toEqual({
-      abandoned: 1,
-      failures: 0,
-      cascadeFailures: 0,
-      blockedParentRunId: null,
-    });
-    expect(mockCancelResumableWorkflowRun.mock.calls.map(c => c[0])).toEqual([
-      'parent-resumed',
-      'child-paused',
-    ]);
+    expect(mockReclaimContainerEnv.mock.calls.map(call => call[0])).toEqual(['env-a', 'env-b']);
   });
 
-  test('skips a row already resumed before its current-state read', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([
-        { id: 'run-running', parent_run_id: null },
-        { id: 'run-ok', parent_run_id: null },
-      ])
-    );
-    mockGetWorkflowRun.mockImplementation((id: unknown) =>
-      Promise.resolve(
-        id === 'run-running'
-          ? makePausedRun({ id: 'run-running', status: 'running' })
-          : makePausedRun({ id: id as string })
-      )
-    );
-
-    const result = await abandonResumableRunsForConversation('conv-1');
-
-    expect(result).toEqual({
-      abandoned: 1,
-      failures: 0,
-      cascadeFailures: 0,
-      blockedParentRunId: null,
-    });
-    expect(mockCancelResumableWorkflowRun.mock.calls.map(c => c[0])).toEqual(['run-ok']);
-  });
-
-  test('counts a root lookup failure and keeps the loop going', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([
-        { id: 'run-bad', parent_run_id: null },
-        { id: 'run-ok', parent_run_id: null },
-      ])
-    );
-    mockGetWorkflowRun.mockImplementation((id: unknown) =>
-      id === 'run-bad'
-        ? Promise.reject(new Error('connection reset'))
-        : Promise.resolve(makePausedRun({ id: id as string }))
-    );
-
-    const result = await abandonResumableRunsForConversation('conv-1');
-
-    expect(result).toEqual({
-      abandoned: 1,
-      failures: 1,
-      cascadeFailures: 0,
-      blockedParentRunId: null,
-    });
-    expect(mockCancelResumableWorkflowRun.mock.calls.map(c => c[0])).toEqual(['run-ok']);
-  });
-
-  test('counts a resumable cancellation failure and keeps the loop going', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([
-        { id: 'run-bad', parent_run_id: null },
-        { id: 'run-ok', parent_run_id: null },
-      ])
-    );
-    mockGetWorkflowRun.mockImplementation((id: unknown) =>
-      Promise.resolve(makePausedRun({ id: id as string }))
-    );
-    mockCancelResumableWorkflowRun.mockImplementation((id: unknown) =>
-      id === 'run-bad'
-        ? Promise.reject(new Error('connection reset'))
-        : Promise.resolve({ cancelled: true })
-    );
-
-    const result = await abandonResumableRunsForConversation('conv-1');
-
-    expect(result).toEqual({
-      abandoned: 1,
-      failures: 1,
-      cascadeFailures: 0,
-      blockedParentRunId: null,
-    });
-    expect(mockCancelResumableWorkflowRun.mock.calls.map(c => c[0])).toEqual(['run-bad', 'run-ok']);
-  });
-
-  test('reports final cascade failures across selected roots', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([
-        { id: 'run-a', parent_run_id: null },
-        { id: 'run-b', parent_run_id: null },
-      ])
-    );
-    mockGetWorkflowRun.mockImplementation((id: unknown) =>
-      Promise.resolve(makePausedRun({ id: id as string }))
-    );
-    mockFindChildRuns.mockImplementation((parentId: unknown) => {
-      if (parentId === 'run-a') {
-        return Promise.resolve([
-          makePausedRun({
-            id: 'child-a1',
-            parent_run_id: 'run-a',
-            status: 'paused',
-          }),
-        ]);
-      }
-      return Promise.resolve([]);
-    });
-    mockCancelResumableWorkflowRun.mockImplementation((id: unknown) =>
-      id === 'child-a1'
-        ? Promise.reject(new Error('cancel failed'))
-        : Promise.resolve({ cancelled: true })
-    );
-
-    const result = await abandonResumableRunsForConversation('conv-1');
-
-    expect(result.abandoned).toBe(2);
-    expect(result.failures).toBe(0);
-    expect(result.cascadeFailures).toBe(1);
-    expect(result.blockedParentRunId).toBeNull();
-  });
-
-  test('does not expose a transient blocked-parent warning for a selected parent and child (#2731 R4)', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([
-        { id: 'child', parent_run_id: 'parent' },
-        { id: 'parent', parent_run_id: null },
-      ])
-    );
-    mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun({ id: 'parent' }));
-    mockFindChildRuns.mockImplementation((id: unknown) =>
-      Promise.resolve(id === 'parent' ? [makePausedRun({ id: 'child' })] : [])
+  test('reports the clean final state when selected roots overlap through a running parent (#2731 R4)', async () => {
+    mockCancelResumableRunsForConversation.mockResolvedValueOnce([
+      makePausedRun({ id: 'run-a', parent_run_id: null }),
+      makePausedRun({ id: 'run-c', parent_run_id: 'run-b' }),
+    ] as WorkflowRun[]);
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({ id: 'run-b', parent_run_id: 'run-a', status: 'running' })
     );
 
     const result = await abandonResumableRunsForConversation('conv-1');
 
     expect(result).toEqual({
       abandoned: 2,
-      failures: 0,
-      cascadeFailures: 0,
       blockedParentRunId: null,
     });
-    expect(mockGetWorkflowRun.mock.calls.map(c => c[0])).toEqual(['parent']);
-    expect(mockCancelResumableWorkflowRun.mock.calls.map(c => c[0])).toEqual(['parent', 'child']);
+    expect(mockGetWorkflowRun).toHaveBeenCalledWith('run-b');
+    expect(mockFindChildRuns).not.toHaveBeenCalled();
   });
 
   test('surfaces a blocked parent outside the selected run tree', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.resolve([{ id: 'child', parent_run_id: 'parent-paused' }])
-    );
+    mockCancelResumableRunsForConversation.mockResolvedValueOnce([
+      makePausedRun({ id: 'child', parent_run_id: 'parent-paused' }),
+    ] as WorkflowRun[]);
     mockGetWorkflowRun.mockImplementation((id: unknown) => {
-      if (id === 'child') {
-        return Promise.resolve(
-          makePausedRun({
-            id: 'child',
-            parent_run_id: 'parent-paused',
-          })
-        );
-      }
       if (id === 'parent-paused') {
         // The parent is paused blocked-on-child: a child_workflow approval
         // pointing at the child run. isRunBlockedOnChild is the shared predicate
@@ -1550,10 +1370,8 @@ describe('abandonResumableRunsForConversation', () => {
     expect(result.blockedParentRunId).toBe('parent-paused');
   });
 
-  test('propagates a lookup failure rather than reporting a false all-clear', async () => {
-    mockFindResumableRunsForConversation.mockImplementation(() =>
-      Promise.reject(new Error('Connection refused'))
-    );
+  test('propagates an atomic cancellation failure rather than reporting a false all-clear', async () => {
+    mockCancelResumableRunsForConversation.mockRejectedValueOnce(new Error('Connection refused'));
 
     await expect(abandonResumableRunsForConversation('conv-1')).rejects.toThrow(
       'Connection refused'

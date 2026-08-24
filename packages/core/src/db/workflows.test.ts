@@ -31,11 +31,10 @@ import {
   updateWorkflowActivity,
   findResumableRun,
   findResumableRunByParentConversation,
-  findResumableRunsForConversation,
+  cancelResumableRunsForConversation,
   resumeWorkflowRun,
   pauseWorkflowRun,
   cancelWorkflowRun,
-  cancelResumableWorkflowRun,
   failOrphanedRuns,
   findChildRuns,
   getRunAncestry,
@@ -768,55 +767,58 @@ describe('workflows database', () => {
     });
   });
 
-  describe('findResumableRunsForConversation', () => {
-    test('matches the conversation and its worker conversations', async () => {
+  describe('cancelResumableRunsForConversation', () => {
+    test('locks the conversation snapshot and atomically cancels only paused/failed rows', async () => {
+      const paused = { ...mockWorkflowRun, id: 'run-a', status: 'paused' as const };
+      const running = { ...mockWorkflowRun, id: 'run-b', status: 'running' as const };
+      const failed = { ...mockWorkflowRun, id: 'run-c', status: 'failed' as const };
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([paused, running, failed]))
+        .mockResolvedValueOnce(createQueryResult([], 2));
+
+      const result = await cancelResumableRunsForConversation('conv-1');
+
+      expect(result).toEqual([paused, failed]);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      const [selectSql, selectParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(selectSql).toContain('SELECT * FROM remote_agent_workflow_runs');
+      expect(selectSql).toContain('conversation_id = $1 OR parent_conversation_id = $2');
+      expect(selectSql).toContain('FOR UPDATE');
+      expect(selectParams).toEqual(['conv-1', 'conv-1']);
+      const [updateSql, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(updateSql).toContain("status IN ('paused', 'failed')");
+      expect(updateSql).not.toContain("'running'");
+      expect(updateSql).not.toContain("'pending'");
+      expect(updateSql).not.toContain('RETURNING');
+      expect(updateParams).toEqual(['conv-1', 'conv-1']);
+    });
+
+    test('returns without writing when the locked snapshot has nothing resumable', async () => {
       mockQuery.mockResolvedValueOnce(
-        createQueryResult([
-          { id: 'run-1', parent_run_id: null },
-          { id: 'run-2', parent_run_id: 'run-1' },
-        ])
+        createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
       );
 
-      const result = await findResumableRunsForConversation('conv-1');
-
-      expect(result).toEqual([
-        { id: 'run-1', parent_run_id: null },
-        { id: 'run-2', parent_run_id: 'run-1' },
-      ]);
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain('SELECT id, parent_run_id');
-      expect(query).toContain('conversation_id = $1');
-      expect(query).toContain('parent_conversation_id = $2');
-      expect(query).toContain('ORDER BY started_at DESC');
-      expect(query).not.toMatch(/--.*\$\d/); // #999 guard: $N in SQL comments breaks convertPlaceholders
-      expect(params).toEqual(['conv-1', 'conv-1']);
+      expect(await cancelResumableRunsForConversation('conv-1')).toEqual([]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
-    test('never matches live pending or running work', async () => {
-      // The load-bearing assertion. `pending`/`running` may belong to another
-      // process entirely (a CLI run, a webhook dispatch); neither resume lookup
-      // can return them, so cancelling them buys nothing and destroys live work.
-      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+    test('rolls back instead of reporting a stale snapshot count', async () => {
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([{ ...mockWorkflowRun, status: 'paused' as const }])
+        )
+        .mockResolvedValueOnce(createQueryResult([], 0));
 
-      await findResumableRunsForConversation('conv-1');
-
-      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain("status IN ('paused', 'failed')");
-      expect(query).not.toContain("'running'");
-      expect(query).not.toContain("'pending'");
-    });
-
-    test('returns an empty array when nothing is resumable', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([]));
-
-      expect(await findResumableRunsForConversation('conv-1')).toEqual([]);
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Resumable run snapshot changed during reset'
+      );
     });
 
     test('throws on database error', async () => {
       mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
 
-      await expect(findResumableRunsForConversation('conv-1')).rejects.toThrow(
-        'Failed to find resumable runs for conversation: Connection refused'
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Failed to cancel resumable runs for conversation: Connection refused'
       );
     });
   });
@@ -1306,38 +1308,6 @@ describe('workflows database', () => {
 
       await expect(cancelWorkflowRun('workflow-run-123')).rejects.toThrow(
         'Failed to cancel workflow run: Lock timeout'
-      );
-    });
-  });
-
-  describe('cancelResumableWorkflowRun', () => {
-    test('atomically limits reset cancellation to paused and failed runs', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
-
-      await expect(cancelResumableWorkflowRun('workflow-run-123')).resolves.toEqual({
-        cancelled: true,
-      });
-
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain("status IN ('paused', 'failed')");
-      expect(query).not.toContain("'running'");
-      expect(query).not.toContain("'pending'");
-      expect(params).toEqual(['workflow-run-123']);
-    });
-
-    test('returns a CAS miss when another lifecycle resumed the run', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
-
-      await expect(cancelResumableWorkflowRun('workflow-run-123')).resolves.toEqual({
-        cancelled: false,
-      });
-    });
-
-    test('throws on database error', async () => {
-      mockQuery.mockRejectedValueOnce(new Error('Lock timeout'));
-
-      await expect(cancelResumableWorkflowRun('workflow-run-123')).rejects.toThrow(
-        'Failed to cancel resumable workflow run: Lock timeout'
       );
     });
   });

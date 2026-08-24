@@ -93,12 +93,10 @@ type CancelWorkflowRun = (runId: string) => Promise<{ cancelled: boolean }>;
  * Cascade-cancel the `workflow:` sub-run tree under `rootId` (#2121 Phase 2 / D7).
  * A child sub-run shares the parent's conversation and runs in-process, so
  * abandoning the parent walks every DESCENDANT, not just direct children (a child
- * may itself spawn grandchildren). `cancelRun` supplies the caller's ownership
- * policy: explicit abandon cancels every non-terminal descendant, while `/reset`
- * cancels only descendants that are still paused/failed. Best-effort — a per-run
- * failure is logged, never thrown, so the parent abandon always succeeds; the
- * failure COUNT is returned so callers can tell the user part of the tree may
- * still be alive.
+ * may itself spawn grandchildren). `cancelRun` supplies the mutation used for
+ * each descendant. Best-effort — a per-run failure is logged, never thrown, so
+ * the parent abandon always succeeds; the failure COUNT is returned so callers
+ * can tell the user part of the tree may still be alive.
  */
 async function cascadeCancelChildren(
   rootId: string,
@@ -173,6 +171,22 @@ async function findParentBlockedOn(run: WorkflowRun): Promise<string | null> {
       'operations.workflow_abandon_parent_lookup_failed'
     );
     return null;
+  }
+}
+
+/** Reclaim a container owned by a run this process successfully cancelled. */
+async function reclaimCancelledRunContainer(run: WorkflowRun): Promise<void> {
+  if (
+    run.metadata?.isolation !== 'container' ||
+    typeof run.metadata.isolation_env_id !== 'string'
+  ) {
+    return;
+  }
+  try {
+    const { reclaimContainerEnv } = await import('../services/cleanup-service');
+    await reclaimContainerEnv(run.metadata.isolation_env_id);
+  } catch (err) {
+    getLog().warn({ err, runId: run.id }, 'operations.workflow_abandon_container_reclaim_failed');
   }
 }
 
@@ -380,18 +394,7 @@ async function cancelRunAndCleanup(
 
   // Reclaim only when our cancel won the CAS. A miss means another lifecycle
   // owner now controls the run and its environment.
-  if (
-    cancelled &&
-    run.metadata?.isolation === 'container' &&
-    typeof run.metadata.isolation_env_id === 'string'
-  ) {
-    try {
-      const { reclaimContainerEnv } = await import('../services/cleanup-service');
-      await reclaimContainerEnv(run.metadata.isolation_env_id);
-    } catch (err) {
-      getLog().warn({ err, runId: run.id }, 'operations.workflow_abandon_container_reclaim_failed');
-    }
-  }
+  if (cancelled) await reclaimCancelledRunContainer(run);
   return { run, cancelled, cancelledDescendants, cascadeFailures, blockedParentRunId };
 }
 
@@ -422,20 +425,9 @@ export interface AbandonConversationRunsResult {
   /** Runs this call actually took to 'cancelled'. */
   abandoned: number;
   /**
-   * Selected roots whose lookup or resumable-only abandon threw. Non-zero
-   * means part of the set may still be resumable.
-   */
-  failures: number;
-  /**
-   * Descendants the selected-root cascades failed to cancel (capped at
-   * MAX_CASCADE_RUNS, or hit a per-child throw). Non-zero means part of the
-   * abandoned trees may still be alive — surface a warning to the user.
-   */
-  cascadeFailures: number;
-  /**
-   * First selected root that left a parent outside the selected tree paused
-   * blocked-on-child (stranded parent id), or null. The user must resume or
-   * abandon that parent to unstick the tree — nothing auto-resumes it.
+   * First cancelled run that left a parent outside the conversation-scoped
+   * mutation paused blocked-on-child (stranded parent id), or null. The user
+   * must resume or abandon that parent to unstick the tree.
    */
   blockedParentRunId: string | null;
 }
@@ -446,93 +438,34 @@ export interface AbandonConversationRunsResult {
  * Backs `/reset`: with these gone, the resume lookups find nothing, so the next
  * message starts fresh instead of continuing a stale run.
  *
- * Operates once per selected run tree. Descendants whose selected parent is
- * also resumable are handled by that root's cascade, so intermediate
- * blocked-parent and cascade diagnostics cannot leak into the final result. If
- * a root transfers ownership before its cancellation CAS, its selected children
- * become roots so a paused/failed descendant cannot be silently left resumable.
- *
- * Only 'paused'/'failed' rows are selected, and the same predicate is repeated
- * atomically by every root/descendant cancellation. A row concurrently resumed
- * to `running` is therefore a CAS miss owned by the new lifecycle, not a reset
- * failure and never a cancellation target. Explicit `/workflow abandon` keeps
- * its broader running/paused/failed policy.
+ * The DB owns selection and cancellation in one transaction. This matters when
+ * selected paused roots overlap through an unselected running intermediate:
+ * traversing each tree independently can visit the same descendant twice and
+ * retain a transient first failure after the second visit succeeds. The bulk
+ * mutation returns exactly the rows it cancelled, so counts and final parent
+ * diagnostics come from one operation-wide outcome. Explicit `/workflow
+ * abandon` keeps its broader running/paused/failed cascading policy.
  */
 export async function abandonResumableRunsForConversation(
   conversationId: string
 ): Promise<AbandonConversationRunsResult> {
-  const runs = await workflowDb.findResumableRunsForConversation(conversationId);
-  const selectedIds = new Set(runs.map(run => run.id));
-  const roots = runs.filter(run => !run.parent_run_id || !selectedIds.has(run.parent_run_id));
-  const selectedChildren = new Map<string, typeof runs>();
-  for (const run of runs) {
-    if (!run.parent_run_id || !selectedIds.has(run.parent_run_id)) continue;
-    const siblings = selectedChildren.get(run.parent_run_id) ?? [];
-    siblings.push(run);
-    selectedChildren.set(run.parent_run_id, siblings);
-  }
-  const queue = [...roots];
-  const queuedIds = new Set(roots.map(run => run.id));
-  const queueSelectedChildren = (parentId: string): void => {
-    for (const child of selectedChildren.get(parentId) ?? []) {
-      if (queuedIds.has(child.id)) continue;
-      queuedIds.add(child.id);
-      queue.push(child);
-    }
-  };
-  let abandoned = 0;
-  let failures = 0;
-  let cascadeFailures = 0;
+  const runs = await workflowDb.cancelResumableRunsForConversation(conversationId);
   let blockedParentRunId: string | null = null;
-  while (queue.length > 0) {
-    const root = queue.shift();
-    if (!root) break;
-    let run: WorkflowRun | null;
-    try {
-      run = await workflowDb.getWorkflowRun(root.id);
-    } catch (err) {
-      getLog().warn(
-        { err, runId: root.id, conversationId },
-        'operations.workflow_abandon_for_conversation_lookup_failed'
-      );
-      failures++;
-      queueSelectedChildren(root.id);
-      continue;
-    }
-    if (!run) {
-      queueSelectedChildren(root.id);
-      continue;
-    }
-    if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
-      queueSelectedChildren(root.id);
-      continue;
-    }
-    try {
-      const result = await cancelRunAndCleanup(run, workflowDb.cancelResumableWorkflowRun);
-      if (!result.cancelled) {
-        queueSelectedChildren(root.id);
-        continue;
-      }
-      abandoned += 1 + result.cancelledDescendants;
-      const { cascadeFailures: runCascade, blockedParentRunId: blocked } = result;
-      cascadeFailures += runCascade;
-      if (blockedParentRunId === null) blockedParentRunId = blocked;
-    } catch (err) {
-      getLog().warn(
-        { err, runId: root.id, conversationId },
-        'operations.workflow_abandon_for_conversation_failed'
-      );
-      failures++;
-      queueSelectedChildren(root.id);
-    }
+  for (const run of runs) {
+    await reclaimCancelledRunContainer(run);
+    const blocked = await findParentBlockedOn(run);
+    if (blockedParentRunId === null) blockedParentRunId = blocked;
   }
-  if (abandoned > 0 || failures > 0) {
+  if (runs.length > 0) {
     getLog().info(
-      { conversationId, abandoned, failures, cascadeFailures, blockedParentRunId },
+      { conversationId, abandoned: runs.length, blockedParentRunId },
       'operations.workflow_abandon_for_conversation_completed'
     );
   }
-  return { abandoned, failures, cascadeFailures, blockedParentRunId };
+  return {
+    abandoned: runs.length,
+    blockedParentRunId,
+  };
 }
 
 /**

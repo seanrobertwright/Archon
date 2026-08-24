@@ -45,6 +45,7 @@ const {
   getWorkflowRun,
   findResumableRun,
   findResumableRunByParentConversation,
+  cancelResumableRunsForConversation,
   resolveApprovalGate,
   resolveAndCancelApprovalGate,
   claimWriteback,
@@ -191,6 +192,45 @@ describe('resumeWorkflowRun — real SQLite (CAS + orphan recovery)', () => {
 
   test('throws not-found for a missing run', async () => {
     await expect(resumeWorkflowRun('ghost')).rejects.toThrow('Workflow run not found (id: ghost)');
+  });
+});
+
+describe('cancelResumableRunsForConversation — real SQLite', () => {
+  test('cancels paused roots once across a running status gap (#2731 R4)', async () => {
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id)
+       VALUES ('conv-reset-gap', 'web', 'conv-reset-gap-platform')`,
+      []
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+         (id, workflow_name, conversation_id, user_message, status, started_at, metadata)
+       VALUES
+         ('reset-a', 'wf', 'conv-reset-gap', 'msg', 'paused', datetime('now', '-3 seconds'), '{}')`,
+      []
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+         (id, workflow_name, conversation_id, user_message, status, started_at, metadata, parent_run_id)
+       VALUES
+         ('reset-b', 'wf', 'conv-reset-gap', 'msg', 'running', datetime('now', '-2 seconds'), '{}', 'reset-a'),
+         ('reset-c', 'wf', 'conv-reset-gap', 'msg', 'paused', datetime('now', '-1 second'), '{}', 'reset-b')`,
+      []
+    );
+
+    const cancelled = await cancelResumableRunsForConversation('conv-reset-gap');
+
+    expect(cancelled.map(run => run.id).sort()).toEqual(['reset-a', 'reset-c']);
+    const final = await db.query<{ id: string; status: string; completed_at: string | null }>(
+      `SELECT id, status, completed_at FROM remote_agent_workflow_runs
+       WHERE conversation_id = $1 ORDER BY id`,
+      ['conv-reset-gap']
+    );
+    expect(final.rows).toEqual([
+      { id: 'reset-a', status: 'cancelled', completed_at: expect.any(String) },
+      { id: 'reset-b', status: 'running', completed_at: null },
+      { id: 'reset-c', status: 'cancelled', completed_at: expect.any(String) },
+    ]);
   });
 });
 

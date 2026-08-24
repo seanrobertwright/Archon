@@ -1357,17 +1357,11 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       // the count and reports only the failure — precisely the case where the
       // user most needs to know that N runs were already cancelled.
       let abandoned = 0;
-      let abandonFailures = 0;
-      let abandonCascadeFailures = 0;
       let abandonBlockedParentRunId: string | null = null;
       let abandonError: string | null = null;
       try {
-        ({
-          abandoned,
-          failures: abandonFailures,
-          cascadeFailures: abandonCascadeFailures,
-          blockedParentRunId: abandonBlockedParentRunId,
-        } = await abandonResumableRunsForConversation(conversation.id));
+        ({ abandoned, blockedParentRunId: abandonBlockedParentRunId } =
+          await abandonResumableRunsForConversation(conversation.id));
       } catch (error) {
         const err = error as Error;
         getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_abandon_failed');
@@ -1398,18 +1392,6 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
           : `Could not clear the workspace binding: ${bindingError ?? 'unknown error'}`
       );
       if (abandoned > 0) parts.push(`Abandoned ${String(abandoned)} resumable run(s).`);
-      if (abandonFailures > 0) {
-        parts.push(`⚠️ ${String(abandonFailures)} run(s) could not be abandoned — retry /reset.`);
-      }
-      // Cascade + stranded-parent warnings mirror what `/workflow abandon <id>`
-      // reports (#2731 R1): the abandon op surfaced them, `/reset` must too,
-      // otherwise a partial-cascade can be read as "everything starts fresh"
-      // while part of the run tree is still alive / blocked.
-      if (abandonCascadeFailures > 0) {
-        parts.push(
-          `⚠️ ${String(abandonCascadeFailures)} sub-run(s) could not be cancelled and may still be running — check /workflow status.`
-        );
-      }
       if (abandonBlockedParentRunId !== null) {
         parts.push(
           `⚠️ Parent run ${abandonBlockedParentRunId} was blocked on an abandoned sub-run and stays paused. Resume it to fail the node cleanly, or abandon it too.`
@@ -1423,8 +1405,6 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
         sessionError === null &&
         bindingCleared &&
         abandonError === null &&
-        abandonFailures === 0 &&
-        abandonCascadeFailures === 0 &&
         abandonBlockedParentRunId === null;
       parts.push(
         resetComplete
