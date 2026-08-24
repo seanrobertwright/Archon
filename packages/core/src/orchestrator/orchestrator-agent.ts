@@ -1077,6 +1077,10 @@ async function dispatchOrchestratorWorkflowOwned(
       throw err;
     }
     if (prepared) {
+      const suppliedModelBindingNames = [
+        ...Object.keys(options?.modelOverrides?.tiers ?? {}),
+        ...Object.keys(options?.modelOverrides?.aliases ?? {}),
+      ].sort();
       // A resume replays the inputs stamped on its own row; values supplied on THIS
       // call cannot reach it (the row already exists, so the executor's stamp never
       // fires). Say so rather than accepting them and quietly running something else.
@@ -1092,6 +1096,23 @@ async function dispatchOrchestratorWorkflowOwned(
             `keeps the inputs it started with — the values you supplied now (${ignored}) were ` +
             'not applied. To run fresh with them instead, abandon that run first ' +
             `(\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
+        );
+      }
+      if (suppliedModelBindingNames.length > 0) {
+        getLog().info(
+          {
+            workflowName: workflow.name,
+            resumableRunId: resumableRun.id,
+            ignoredBindings: suppliedModelBindingNames,
+          },
+          'orchestrator.resume_ignored_model_bindings'
+        );
+        await platform.sendMessage(
+          conversationId,
+          `▶️ Resuming the paused run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
+            'keeps the model bindings it started with — the bindings you supplied now ' +
+            `(${suppliedModelBindingNames.join(', ')}) were not applied. To run fresh with them ` +
+            `instead, abandon that run first (\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
         );
       }
       // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the

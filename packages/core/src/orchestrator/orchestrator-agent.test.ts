@@ -2644,6 +2644,37 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(mockExecuteWorkflow).toHaveBeenCalled();
   });
 
+  test('tells the caller when model bindings could not be applied to an auto-resumed run', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve({
+        id: 'implicit-model-resume',
+        workflow_name: 'test-workflow',
+        working_path: '/repos/test-repo/worktrees/paused',
+        parent_conversation_id: 'conv-1',
+        status: 'paused',
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
+      workflowModelOverrides: {
+        tiers: { large: 'openai/gpt-5.6' },
+        aliases: { '@planner': 'codex/gpt-5.6-sol' },
+      },
+    });
+
+    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+    expect(sent).toContain('were not applied');
+    expect(sent).toContain('@planner, large');
+    expect(sent).toContain('implicit-model-resume');
+    expect(sent).not.toContain('openai/gpt-5.6');
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.modelOverrides).toBeUndefined();
+  });
+
   test('re-raises the deferred input error when hydration finds nothing to resume', async () => {
     // The gate defers a contract violation while a continuation looks possible. This is
     // the ONE branch where that prediction turns out wrong — hydration returns null, so
