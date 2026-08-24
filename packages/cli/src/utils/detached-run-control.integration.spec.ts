@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { createConnection } from 'node:net';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -40,6 +40,31 @@ function waitForExit(
       reject(error);
     });
   });
+}
+
+async function listen(server: Server, path: string): Promise<void> {
+  await new Promise<void>((resolve: () => void, reject: (reason?: unknown) => void): void => {
+    server.once('error', reject);
+    server.listen(path, resolve);
+  });
+}
+
+async function close(server: Server): Promise<void> {
+  await new Promise<void>((resolve: () => void): void => {
+    server.close((): void => {
+      resolve();
+    });
+  });
+}
+
+async function rejectedError(action: () => Promise<unknown>): Promise<Error> {
+  try {
+    await action();
+  } catch (error) {
+    if (error instanceof Error) return error;
+    throw new Error(`Expected an Error rejection, received ${String(error)}`);
+  }
+  throw new Error('Expected the operation to reject');
 }
 
 describe('detached run control integration', () => {
@@ -116,5 +141,53 @@ describe('detached run control integration', () => {
     await owner.close();
     expect(Date.now() - startedAt).toBeLessThan(3_000);
     client.destroy();
+  });
+
+  it('fails when the owner closes before identifying itself', async () => {
+    const runId = `close-before-pid-${crypto.randomUUID()}`;
+    const path = detachedRunControlPath(runId);
+    const server = createServer((socket: Socket): void => {
+      socket.once('data', (): void => {
+        socket.end();
+      });
+    });
+    await listen(server, path);
+
+    try {
+      const error = await rejectedError(
+        async (): Promise<unknown> => requestDetachedRunStop(runId)
+      );
+      expect(error.message).toMatch(/owner (?:ended|closed) before identifying itself/);
+    } finally {
+      await close(server);
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
+  });
+
+  it('fails when the owner closes before committing termination', async () => {
+    const runId = `close-before-ready-${crypto.randomUUID()}`;
+    const path = detachedRunControlPath(runId);
+    const server = createServer((socket: Socket): void => {
+      socket.setEncoding('utf8');
+      let request = '';
+      socket.on('data', (chunk: Buffer): void => {
+        request += chunk.toString();
+        if (request.includes('stop\n')) {
+          socket.write(`${JSON.stringify({ pid: 12345 })}\n`);
+          request = request.replace('stop\n', '');
+        }
+        if (request.includes('terminate\n')) socket.end();
+      });
+    });
+    await listen(server, path);
+
+    try {
+      const target = await requestDetachedRunStop(runId);
+      const error = await rejectedError(async (): Promise<void> => target.stop());
+      expect(error.message).toMatch(/(?:ended|closed) before committing termination/);
+    } finally {
+      await close(server);
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
   });
 });

@@ -45,32 +45,54 @@ const mockLogger = {
   child: mock(() => mockLogger),
 };
 
-const mockDetachedTargetStop = mock(() => Promise.resolve());
-const mockDetachedTargetRelease = mock(() => undefined);
-const mockReclaimContainerEnv = mock(() => Promise.resolve());
-const mockRequestDetachedRunStop = mock(() =>
-  Promise.resolve({ stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
+const mockDetachedTargetStop = mock((): Promise<void> => Promise.resolve());
+const mockDetachedTargetRelease = mock((): undefined => undefined);
+const mockReclaimContainerEnv = mock((): Promise<void> => Promise.resolve());
+const mockRequestDetachedRunStop = mock(
+  (): Promise<{
+    stop: typeof mockDetachedTargetStop;
+    release: typeof mockDetachedTargetRelease;
+  }> => Promise.resolve({ stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
 );
-const mockDetachedControlClose = mock(() => Promise.resolve());
-const mockAssertDetachedRunProcessOwner = mock(() => undefined);
+const mockDetachedControlClose = mock((): Promise<void> => Promise.resolve());
+const mockAssertDetachedRunProcessOwner = mock((): undefined => undefined);
 let mockDetachedStopRequested = false;
-const mockStartDetachedRunControlServer = mock((_runId: string) =>
-  Promise.resolve({
-    close: mockDetachedControlClose,
-    isStopRequested: () => mockDetachedStopRequested,
+const mockStartDetachedRunControlServer = mock(
+  (
+    _runId: string
+  ): Promise<{
+    close: typeof mockDetachedControlClose;
+    isStopRequested: () => boolean;
+  }> =>
+    Promise.resolve({
+      close: mockDetachedControlClose,
+      isStopRequested: (): boolean => mockDetachedStopRequested,
+    })
+);
+
+mock.module(
+  '../utils/detached-run-control',
+  (): {
+    assertDetachedRunProcessOwner: typeof mockAssertDetachedRunProcessOwner;
+    DETACHED_RUN_OWNER_ENV: string;
+    requestDetachedRunStop: typeof mockRequestDetachedRunStop;
+    startDetachedRunControlServer: typeof mockStartDetachedRunControlServer;
+  } => ({
+    assertDetachedRunProcessOwner: mockAssertDetachedRunProcessOwner,
+    DETACHED_RUN_OWNER_ENV: 'ARCHON_DETACHED_RUN_OWNER',
+    requestDetachedRunStop: mockRequestDetachedRunStop,
+    startDetachedRunControlServer: mockStartDetachedRunControlServer,
   })
 );
 
-mock.module('../utils/detached-run-control', () => ({
-  assertDetachedRunProcessOwner: mockAssertDetachedRunProcessOwner,
-  DETACHED_RUN_OWNER_ENV: 'ARCHON_DETACHED_RUN_OWNER',
-  requestDetachedRunStop: mockRequestDetachedRunStop,
-  startDetachedRunControlServer: mockStartDetachedRunControlServer,
-}));
-
-mock.module('@archon/core/services/cleanup-service', () => ({
-  reclaimContainerEnv: mockReclaimContainerEnv,
-}));
+mock.module(
+  '@archon/core/services/cleanup-service',
+  (): {
+    reclaimContainerEnv: typeof mockReclaimContainerEnv;
+  } => ({
+    reclaimContainerEnv: mockReclaimContainerEnv,
+  })
+);
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
 const mockFolderBackendPrepare = mock(() =>
@@ -309,7 +331,7 @@ mock.module('@archon/core/db/codebases', () => ({
 
 mock.module('@archon/core/db/isolation-environments', () => ({
   createIsolationStore: mock(() => ({})),
-  getById: mock(() => Promise.resolve(null)),
+  getById: mock((): Promise<null> => Promise.resolve(null)),
   findActiveByWorkflow: mock(() => Promise.resolve(null)),
   create: mock(() => Promise.resolve({ id: 'iso-123' })),
   // Reached only by the --resume path. mock.module() MERGES over the real
@@ -6657,16 +6679,18 @@ describe('workflowCancelCommand', () => {
       id: 'container-env-1',
       provider: 'container',
     });
-    mockDetachedTargetStop.mockImplementation(async () => {
+    mockDetachedTargetStop.mockImplementation(async (): Promise<void> => {
       order.push('terminate-owner');
     });
-    mockReclaimContainerEnv.mockImplementation(async () => {
+    mockReclaimContainerEnv.mockImplementation(async (): Promise<void> => {
       order.push('reclaim-container');
     });
-    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockImplementation(async () => {
-      order.push('cancel-state');
-      return { cancelled: true };
-    });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockImplementation(
+      async (): Promise<{ cancelled: boolean }> => {
+        order.push('cancel-state');
+        return { cancelled: true };
+      }
+    );
 
     await workflowCancelCommand(runId, true);
 

@@ -56,6 +56,8 @@ describe('copyArchonSkill', () => {
     await copyArchonSkill(tempDir);
 
     const guidance = [
+      join(tempDir, '.claude', 'skills', 'manage-run', 'SKILL.md'),
+      join(tempDir, '.claude', 'skills', 'manage-run', 'references', 'commands.md'),
       join(tempDir, '.agents', 'skills', 'manage-run', 'SKILL.md'),
       join(tempDir, '.agents', 'skills', 'manage-run', 'references', 'commands.md'),
       join(tempDir, '.agents', 'skills', 'archon', 'references', 'interactive-workflows.md'),
