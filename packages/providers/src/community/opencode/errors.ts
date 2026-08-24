@@ -1,20 +1,6 @@
-// Deliberately excludes a bare '429': that digit can appear in unrelated text
-// (a port, a byte count, a millisecond duration) on this classifier's sole
-// call site (the retry loop's catch in provider.ts:181) — same "bare digits
-// aren't enough signal" reasoning as AUTH_PATTERNS below (#2715, mirror of
-// #2509 R11). A false 'rate_limit' classification wastes a subprocess
-// retry/backoff cycle before the correct terminal message is shown, but
-// (unlike a false 'auth' hit) does not deny the retry outright.
+// Prose patterns exclude bare HTTP codes; exact structured statusCode fields
+// and SDK error discriminators are classified separately below.
 const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', 'overloaded'];
-// Deliberately excludes bare '401'/'403': those digits can appear in
-// unrelated text (a port, a byte offset, a millisecond duration) on this
-// classifier's sole call site (the retry loop's catch in provider.ts:181),
-// which covers every error thrown mid-turn — the most common failure
-// surface in this file. A false 'auth' classification here both misroutes
-// the user-facing message (enrichOpencodeError prefixes the error with
-// `OpenCode auth:` unconditionally) and forces `shouldRetry: false` at
-// provider.ts:182-186, denying a transient failure its retry (#2715,
-// mirror of #2509 R7 / Claude AUTH_PATTERNS).
 const AUTH_PATTERNS = ['unauthorized', 'authentication', 'invalid token', 'api key'];
 const CRASH_PATTERNS = [
   'server disconnected',
@@ -43,6 +29,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+function classifyStructuredError(error: unknown): RetryableErrorClass | undefined {
+  const candidates = [error];
+  if (error instanceof Error) candidates.push(error.cause);
+
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) continue;
+    if (candidate.name === 'ProviderAuthError') return 'auth';
+
+    const data = isRecord(candidate.data) ? candidate.data : undefined;
+    const statusCode =
+      typeof candidate.statusCode === 'number'
+        ? candidate.statusCode
+        : typeof data?.statusCode === 'number'
+          ? data.statusCode
+          : undefined;
+    if (statusCode === 401 || statusCode === 403) return 'auth';
+    if (statusCode === 429) return 'rate_limit';
+  }
+
+  return undefined;
+}
+
 export function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (isRecord(error)) {
@@ -55,6 +63,9 @@ export function errorMessage(error: unknown): string {
 export function classifyOpencodeError(error: unknown, aborted: boolean): RetryableErrorClass {
   if (aborted) return 'aborted';
 
+  const structuredClass = classifyStructuredError(error);
+  if (structuredClass) return structuredClass;
+
   const parts: string[] = [];
   if (error instanceof Error) {
     parts.push(error.name, error.message);
@@ -62,10 +73,8 @@ export function classifyOpencodeError(error: unknown, aborted: boolean): Retryab
   if (isRecord(error)) {
     if (typeof error.name === 'string') parts.push(error.name);
     if (typeof error.message === 'string') parts.push(error.message);
-    if (typeof error.statusCode === 'number') parts.push(String(error.statusCode));
     if (isRecord(error.data)) {
       if (typeof error.data.message === 'string') parts.push(error.data.message);
-      if (typeof error.data.statusCode === 'number') parts.push(String(error.data.statusCode));
       if (typeof error.data.responseBody === 'string') parts.push(error.data.responseBody);
     }
   }

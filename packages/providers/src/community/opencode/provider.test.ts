@@ -694,6 +694,96 @@ describe('OpencodeProvider', () => {
     );
   });
 
+  test('retries a structured 429 from the single-agent session stream', async () => {
+    const sdkError = {
+      name: 'APIError',
+      data: { message: 'upstream request failed', statusCode: 429, isRetryable: true },
+    };
+    const retryRuntime = makeRuntime({
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          {
+            type: 'session.error',
+            properties: { sessionID: 'session-1', error: sdkError },
+          },
+        ]),
+      })),
+    });
+    const successRuntime = makeRuntime({
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          { type: 'session.idle', properties: { sessionID: 'session-1' } },
+        ]),
+      })),
+    });
+    runtimeQueue.push(retryRuntime, successRuntime);
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([{ type: 'result', sessionId: 'session-1' }]);
+    expect(mockCreateOpencode).toHaveBeenCalledTimes(2);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      { attempt: 0, delayMs: 1, errorClass: 'rate_limit' },
+      'opencode.retrying_query'
+    );
+  });
+
+  test('retries a structured 429 from the multi-agent session stream', async () => {
+    const cwd = await createTempProjectDir();
+    const sdkError = {
+      name: 'APIError',
+      data: { message: 'upstream request failed', statusCode: 429, isRetryable: true },
+    };
+    const retrySessionIds = ['scout-session', 'reviewer-session'];
+    const retryRuntime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: retrySessionIds.shift() } })),
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          {
+            type: 'session.error',
+            properties: { sessionID: 'scout-session', error: sdkError },
+          },
+        ]),
+      })),
+    });
+    const successSessionIds = ['scout-session', 'reviewer-session'];
+    const successRuntime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: successSessionIds.shift() } })),
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+          { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+        ]),
+      })),
+    });
+    runtimeQueue.push(retryRuntime, successRuntime);
+
+    const { error } = await consume(
+      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(mockCreateOpencode).toHaveBeenCalledTimes(2);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      { attempt: 0, delayMs: 1, errorClass: 'rate_limit' },
+      'opencode.retrying_query'
+    );
+  });
+
   test('auth errors are classified as non-retryable and do not retry', async () => {
     const runtime = makeRuntime({
       promptAsync: mock(async () => {
@@ -1440,12 +1530,6 @@ describe('OpencodeProvider', () => {
 });
 
 describe('classifyOpencodeError (#2715)', () => {
-  // AUTH_PATTERNS is this classifier's sole gate to 'auth', and 'auth' is what
-  // makes enrichOpencodeError wrap a message as `OpenCode auth:` — a prefix
-  // every error-formatter trusts unconditionally. A bare "401"/"403" used to
-  // be enough to classify as 'auth', so any mid-turn error whose text merely
-  // contained those digits (a port, a timeout in ms) was misrouted to
-  // "OpenCode auth: ..." and had its retry disabled at provider.ts:182-186.
   test('does not classify a bare "401"/"403" substring as auth', () => {
     expect(classifyOpencodeError(new Error('connect ECONNREFUSED 127.0.0.1:401'), false)).not.toBe(
       'auth'
@@ -1466,10 +1550,42 @@ describe('classifyOpencodeError (#2715)', () => {
     ).toBe('auth');
   });
 
-  // RATE_LIMIT_PATTERNS used to admit bare '429', with the same substring scan
-  // pitfall as AUTH_PATTERNS — a port like 127.0.0.1:4291 or a timeout in ms
-  // like "operation timed out after 4293ms" was misrouted to 'rate_limit',
-  // wasting one retry/backoff cycle before the correct terminal message.
+  test('classifies exact structured status codes before prose', () => {
+    expect(classifyOpencodeError({ statusCode: 401 }, false)).toBe('auth');
+    expect(classifyOpencodeError({ statusCode: 429 }, false)).toBe('rate_limit');
+    expect(
+      classifyOpencodeError(
+        { name: 'APIError', data: { message: 'request failed', statusCode: 403 } },
+        false
+      )
+    ).toBe('auth');
+    expect(
+      classifyOpencodeError(
+        {
+          name: 'APIError',
+          data: { message: 'request failed', statusCode: 429, isRetryable: true },
+        },
+        false
+      )
+    ).toBe('rate_limit');
+  });
+
+  test('classifies SDK discriminators and structured status codes through Error.cause', () => {
+    const authError = new Error('provider rejected request');
+    authError.cause = {
+      name: 'ProviderAuthError',
+      data: { providerID: 'anthropic', message: 'provider rejected request' },
+    };
+    expect(classifyOpencodeError(authError, false)).toBe('auth');
+
+    const rateLimitError = new Error('upstream request failed');
+    rateLimitError.cause = {
+      name: 'APIError',
+      data: { message: 'upstream request failed', statusCode: 429, isRetryable: true },
+    };
+    expect(classifyOpencodeError(rateLimitError, false)).toBe('rate_limit');
+  });
+
   test('does not classify a bare "429" substring as rate_limit (#2509 R11 mirror)', () => {
     expect(classifyOpencodeError(new Error('connect ECONNREFUSED 127.0.0.1:4291'), false)).not.toBe(
       'rate_limit'
