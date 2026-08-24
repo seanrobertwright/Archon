@@ -990,6 +990,7 @@ const signalWorkflowWaitRoute = createRoute({
   request: {
     params: z.object({ runId: z.string() }),
     body: {
+      required: true,
       content: {
         'application/json': {
           schema: signalWorkflowWaitBodySchema,

@@ -1801,6 +1801,18 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     expect(response.status).toBe(400);
     expect(mockSignalWorkflowWait).not.toHaveBeenCalled();
   });
+
+  test('rejects a missing JSON body before reading the run', async () => {
+    const { app } = makeApp();
+
+    const response = await app.request('/api/workflows/runs/run-wait-2/signal', {
+      method: 'POST',
+    });
+
+    expect(response.status).toBe(400);
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+    expect(mockSignalWorkflowWait).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
