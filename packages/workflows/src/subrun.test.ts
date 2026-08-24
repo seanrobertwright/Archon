@@ -251,6 +251,45 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve();
   };
 
+  pauseWorkflowRunForWait: IWorkflowStore['pauseWorkflowRunForWait'] = (id, waitContext) => {
+    const r = this.runs.get(id);
+    if (r) {
+      r.status = 'paused';
+      r.metadata = { ...r.metadata, wait: { ...waitContext } };
+    }
+    return Promise.resolve();
+  };
+
+  rewriteWorkflowWaitContext: IWorkflowStore['rewriteWorkflowWaitContext'] = (id, waitContext) => {
+    const r = this.runs.get(id);
+    if (r?.status === 'paused') {
+      r.metadata = { ...r.metadata, wait: { ...waitContext } };
+      return Promise.resolve({ rewritten: true });
+    }
+    return Promise.resolve({ rewritten: false });
+  };
+
+  clearWorkflowWaitContext: IWorkflowStore['clearWorkflowWaitContext'] = (id, waitContext) => {
+    const r = this.runs.get(id);
+    const wait = r?.metadata.wait as { nodeId?: string; resumeAt?: string } | undefined;
+    if (
+      r?.status === 'running' &&
+      wait?.nodeId === waitContext.nodeId &&
+      wait.resumeAt === waitContext.resumeAt
+    ) {
+      const { wait: _wait, ...metadata } = r.metadata;
+      r.metadata = metadata;
+      return Promise.resolve({ cleared: true });
+    }
+    return Promise.resolve({ cleared: false });
+  };
+
+  setScheduledWorkflowResume: IWorkflowStore['setScheduledWorkflowResume'] = (id, scheduled) => {
+    const r = this.runs.get(id);
+    if (r) r.metadata = { ...r.metadata, scheduled_resume: scheduled };
+    return Promise.resolve();
+  };
+
   rewriteApprovalContext: IWorkflowStore['rewriteApprovalContext'] = (id, approvalContext) => {
     const r = this.runs.get(id);
     // Mirrors the real store's CAS guard (unresolvedGateClause): only while still

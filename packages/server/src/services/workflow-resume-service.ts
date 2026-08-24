@@ -4,22 +4,31 @@ import * as codebaseDb from '@archon/core/db/codebases';
 import * as workflowDb from '@archon/core/db/workflows';
 import { createLogger, getArchonWorkspacesPath } from '@archon/paths';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
-import {
-  isScheduledWorkflowResume,
-  type WorkflowRun,
-} from '@archon/workflows/schemas/workflow-run';
+import type { IWorkflowPlatform } from '@archon/workflows/deps';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { HeadlessPlatform } from '../adapters/headless';
 
 const log = createLogger('workflow-resume-service');
 const CONTINUATION_SCAN_INTERVAL_MS = 5_000;
 const CONTINUATION_SCAN_BATCH_SIZE = 25;
+const CONTINUATION_RETRY_DELAY_MS = 60_000;
 let continuationScheduler: ReturnType<typeof setInterval> | undefined;
 let scanInProgress = false;
 
+export interface WorkflowResumeDestination {
+  platform: IWorkflowPlatform;
+  conversationId: string;
+}
+
+export type WorkflowResumeDestinationResolver = (
+  run: WorkflowRun
+) => Promise<WorkflowResumeDestination | undefined>;
+
 /** Resume one persisted run through the same frozen-source path used by the API. */
-export async function resumeWorkflowRunHeadless(
+export async function resumeWorkflowRunFromServer(
   run: WorkflowRun,
-  actorUserId?: string
+  actorUserId?: string,
+  destination?: WorkflowResumeDestination
 ): Promise<boolean> {
   if (!run.working_path) {
     log.debug({ runId: run.id }, 'workflow_resume_headless_no_working_path');
@@ -38,7 +47,8 @@ export async function resumeWorkflowRunHeadless(
       return false;
     }
 
-    const platform = new HeadlessPlatform(run.conversation_id);
+    const platform = destination?.platform ?? new HeadlessPlatform(run.conversation_id);
+    const platformConversationId = destination?.conversationId ?? run.conversation_id;
     let hydrated: Awaited<ReturnType<typeof hydrateResumableRun>>;
     try {
       hydrated = await hydrateResumableRun(deps, run);
@@ -73,7 +83,7 @@ export async function resumeWorkflowRunHeadless(
     executeWorkflow(
       deps,
       platform,
-      run.conversation_id,
+      platformConversationId,
       run.working_path,
       continuation.workflow.definition,
       run.user_message ?? '',
@@ -105,7 +115,7 @@ export async function resumeWorkflowRunHeadless(
 
 export async function scanDueWorkflowContinuations(
   now = new Date(),
-  resume: (run: WorkflowRun) => Promise<boolean> = resumeWorkflowRunHeadless
+  resume: (run: WorkflowRun) => Promise<boolean> = resumeWorkflowRunFromServer
 ): Promise<number> {
   if (scanInProgress) return 0;
   scanInProgress = true;
@@ -113,18 +123,13 @@ export async function scanDueWorkflowContinuations(
     const due = await workflowDb.listDueWorkflowContinuations(now, CONTINUATION_SCAN_BATCH_SIZE);
     const results = await Promise.allSettled(
       due.map(async run => {
-        const scheduled = isScheduledWorkflowResume(run.metadata?.scheduled_resume)
-          ? run.metadata.scheduled_resume
-          : undefined;
-        if (scheduled !== undefined) {
-          const { claimed } = await workflowDb.claimScheduledWorkflowResume(
-            run.id,
-            scheduled,
-            now.toISOString()
-          );
-          if (!claimed) return false;
-        }
         const resumed = await resume(run);
+        if (!resumed) {
+          await workflowDb.deferWorkflowContinuation(
+            run.id,
+            new Date(now.getTime() + CONTINUATION_RETRY_DELAY_MS).toISOString()
+          );
+        }
         return resumed;
       })
     );
@@ -134,13 +139,17 @@ export async function scanDueWorkflowContinuations(
   }
 }
 
-export function startWorkflowContinuationScheduler(): void {
+export function startWorkflowContinuationScheduler(
+  resolveDestination?: WorkflowResumeDestinationResolver
+): void {
   if (continuationScheduler !== undefined) return;
-  void scanDueWorkflowContinuations().catch((error: unknown) => {
+  const resume = async (run: WorkflowRun): Promise<boolean> =>
+    resumeWorkflowRunFromServer(run, undefined, await resolveDestination?.(run));
+  void scanDueWorkflowContinuations(new Date(), resume).catch((error: unknown) => {
     log.error({ err: error as Error }, 'workflow_continuation_scan_failed');
   });
   continuationScheduler = setInterval(() => {
-    void scanDueWorkflowContinuations().catch((error: unknown) => {
+    void scanDueWorkflowContinuations(new Date(), resume).catch((error: unknown) => {
       log.error({ err: error as Error }, 'workflow_continuation_scan_failed');
     });
   }, CONTINUATION_SCAN_INTERVAL_MS);

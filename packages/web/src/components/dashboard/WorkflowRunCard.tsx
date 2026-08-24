@@ -121,6 +121,12 @@ interface WaitMetadata {
   event?: string;
 }
 
+interface ScheduledResumeMetadata {
+  resumeAt: string;
+  attempt: number;
+  maxAttempts: number;
+}
+
 function readWaitMetadata(value: unknown): WaitMetadata | null {
   if (typeof value !== 'object' || value === null) return null;
   const wait = value as Record<string, unknown>;
@@ -131,6 +137,24 @@ function readWaitMetadata(value: unknown): WaitMetadata | null {
     kind: wait.kind,
     resumeAt: wait.resumeAt,
     ...(typeof wait.event === 'string' ? { event: wait.event } : {}),
+  };
+}
+
+function readScheduledResumeMetadata(value: unknown): ScheduledResumeMetadata | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const scheduled = value as Record<string, unknown>;
+  if (
+    scheduled.reason !== 'quota' ||
+    typeof scheduled.resumeAt !== 'string' ||
+    typeof scheduled.attempt !== 'number' ||
+    typeof scheduled.maxAttempts !== 'number'
+  ) {
+    return null;
+  }
+  return {
+    resumeAt: scheduled.resumeAt,
+    attempt: scheduled.attempt,
+    maxAttempts: scheduled.maxAttempts,
   };
 }
 
@@ -197,6 +221,7 @@ export function WorkflowRunCard({
       : run.user_message.slice(0, 80) + '…'
     : null;
   const wait = readWaitMetadata(run.metadata?.wait);
+  const scheduledResume = readScheduledResumeMetadata(run.metadata?.scheduled_resume);
   const hasApproval = wait === null && hasApprovalMetadata(run.metadata?.approval);
 
   return (
@@ -303,6 +328,16 @@ export function WorkflowRunCard({
             {wait.kind === 'event'
               ? `Waiting for event '${wait.event ?? '?'}' until ${wait.resumeAt}`
               : `Waiting until ${wait.resumeAt}`}
+          </p>
+        </div>
+      )}
+
+      {run.status === 'failed' && scheduledResume !== null && (
+        <div className="rounded-md bg-primary/5 border border-primary/20 px-3 py-2 flex items-start gap-2">
+          <PlayCircle className="h-4 w-4 text-primary shrink-0 mt-0.5" />
+          <p className="text-xs text-text-secondary">
+            Resume scheduled for {scheduledResume.resumeAt} (attempt{' '}
+            {String(scheduledResume.attempt)}/{String(scheduledResume.maxAttempts)})
           </p>
         </div>
       )}

@@ -1690,6 +1690,8 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
 describe('POST /api/workflows/runs/:runId/signal', () => {
   beforeEach(() => {
     mockGetWorkflowRun.mockReset();
+    mockGetConversationById.mockReset();
+    mockHandleMessage.mockReset();
     mockSignalWorkflowWait.mockReset();
     mockSignalWorkflowWait.mockResolvedValue({ signaled: true });
     mockHydrateResumableRun.mockClear();
@@ -1735,6 +1737,48 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
       }
     );
     expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test('continues a web-parented run through its originating conversation', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-wait-web',
+      status: 'paused',
+      parent_conversation_id: 'parent-conv-uuid',
+      working_path: '/tmp/worktrees/run-wait-web',
+      metadata: {
+        wait: {
+          nodeId: 'checks',
+          kind: 'event',
+          event: 'checks.complete',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-25T10:00:00.000Z',
+        },
+      },
+    });
+    mockGetConversationById.mockResolvedValueOnce({
+      id: 'parent-conv-uuid',
+      platform_conversation_id: 'web-plat-wait',
+      platform_type: 'web',
+    });
+    const { app } = makeApp();
+
+    const response = await app.request('/api/workflows/runs/run-wait-web/signal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event: 'checks.complete' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockHandleMessage).toHaveBeenCalled();
+    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] as [
+      unknown,
+      string,
+      string,
+    ];
+    expect(platformConvId).toBe('web-plat-wait');
+    expect(dispatchedMessage).toBe('/workflow resume run-wait-web');
   });
 
   test('rejects a signal that does not match the run wait', async () => {

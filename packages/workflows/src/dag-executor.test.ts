@@ -177,6 +177,12 @@ function createMockStore(): MockWorkflowStore {
     pauseWorkflowRunForWait: mock<NonNullable<IWorkflowStore['pauseWorkflowRunForWait']>>(
       async (_id, _waitContext) => {}
     ),
+    rewriteWorkflowWaitContext: mock<IWorkflowStore['rewriteWorkflowWaitContext']>(
+      async (_id, _waitContext) => ({ rewritten: true })
+    ),
+    clearWorkflowWaitContext: mock<IWorkflowStore['clearWorkflowWaitContext']>(
+      async (_id, _waitContext) => ({ cleared: true })
+    ),
     rewriteApprovalContext: mock<IWorkflowStore['rewriteApprovalContext']>(
       async (_id, _approvalContext) => ({ resolved: true })
     ),
@@ -14410,6 +14416,10 @@ describe('executeDagWorkflow -- durable wait node', () => {
     const completion = events.find(event => event.event_type === 'node_completed');
     expect(completion?.data?.structured_output).toMatchObject({ status: 'expired' });
     expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
+    expect(store.clearWorkflowWaitContext).toHaveBeenCalledWith(
+      'wait-resume',
+      workflowRun.metadata.wait
+    );
   });
 
   it('re-pauses an early manual resume against the original absolute time', async () => {

@@ -88,6 +88,7 @@ import {
   isNodeContextResume,
   isBindingDirective,
   SUBRUN_METADATA_KEYS,
+  WAIT_NODE_OUTPUT_FORMAT,
 } from './schemas';
 import type { BindingDirective } from './schemas';
 import type { PersistedNodeOutput } from './store';
@@ -4890,9 +4891,6 @@ async function executeLoopGroupNode(
         ? freshRun.metadata.wait
         : undefined;
       if (terminalSuspendNode.kind === 'wait' && freshWait?.nodeId === terminalSuspendNode.id) {
-        if (deps.store.rewriteWorkflowWaitContext === undefined) {
-          throw new Error('Workflow store does not support nested durable waits');
-        }
         const { rewritten } = await deps.store.rewriteWorkflowWaitContext(workflowRun.id, {
           ...freshWait,
           nodeId: node.id,
@@ -7089,9 +7087,6 @@ async function executeWaitNode(
           );
         });
     }
-    if (deps.store.pauseWorkflowRunForWait === undefined) {
-      throw new Error('Workflow store does not support durable waits');
-    }
     await deps.store.pauseWorkflowRunForWait(workflowRun.id, context);
     return { state: 'completed', output: '' };
   }
@@ -7105,6 +7100,12 @@ async function executeWaitNode(
   } as const;
   const output = JSON.stringify(result);
   const stepName = stepNamePrefix + node.id;
+  if (persisted !== undefined) {
+    const { cleared } = await deps.store.clearWorkflowWaitContext(workflowRun.id, context);
+    if (!cleared) {
+      throw new Error(`Wait node '${node.id}' lost ownership of its persisted wait cursor`);
+    }
+  }
   deps.store
     .createWorkflowEvent({
       workflow_run_id: workflowRun.id,
@@ -7147,7 +7148,7 @@ async function executeWaitNode(
     state: 'completed',
     output,
     structuredOutput: result,
-    declaredFields: ['status', 'waited_ms', 'event', 'payload'],
+    declaredFields: declaredFieldsFromSchema(WAIT_NODE_OUTPUT_FORMAT),
   };
 }
 
@@ -10844,10 +10845,6 @@ export async function executeDagWorkflow(
         output.state === 'failed' && isQuotaExhaustionError(output.error)
     );
     if (quotaFailure === undefined) return;
-    if (deps.store.setScheduledWorkflowResume === undefined) {
-      throw new Error('Workflow store does not support scheduled quota continuation');
-    }
-
     const now = new Date();
     const prior = isScheduledWorkflowResume(workflowRun.metadata?.scheduled_resume)
       ? workflowRun.metadata.scheduled_resume
@@ -10904,7 +10901,6 @@ export async function executeDagWorkflow(
       deadlineAt,
       attempt,
       maxAttempts,
-      error: quotaFailure.error,
     };
     await deps.store.setScheduledWorkflowResume(workflowRun.id, scheduled);
     await deps.store.createWorkflowEvent({

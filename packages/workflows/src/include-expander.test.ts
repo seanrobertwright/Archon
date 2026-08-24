@@ -170,6 +170,39 @@ describe('expandWorkflowIncludes — namespacing', () => {
     expect(inlinePrompt(scope) ?? '').toBe('scope $review__verify.output');
   });
 
+  test('rewrites node refs and inputs in wait conditions', () => {
+    const block = wf('waiting-block', [
+      { id: 'schedule', bash: 'echo 2026-08-25T22:00:00Z' },
+      {
+        id: 'wait-for-window',
+        wait: { until: '$schedule.output' },
+        depends_on: ['schedule'],
+      },
+      {
+        id: 'wait-for-event',
+        wait: { event: '$INPUTS.event', deadline_ms: 60_000 },
+        depends_on: ['wait-for-window'],
+      },
+    ]);
+    block.inputs = { event: { required: true } };
+    const parent = wf('parent', [
+      { id: 'waiting', include: 'waiting-block', with: { event: 'checks.complete' } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get('parent')!;
+    const untilNode = nodeById(expanded, 'waiting__wait-for-window');
+    const eventNode = nodeById(expanded, 'waiting__wait-for-event');
+    expect(untilNode && 'wait' in untilNode ? untilNode.wait.until : undefined).toBe(
+      '$waiting__schedule.output'
+    );
+    expect(eventNode && 'wait' in eventNode ? eventNode.wait.event : undefined).toBe(
+      'checks.complete'
+    );
+  });
+
   test("propagates the include node's when/trigger_rule onto entry nodes", () => {
     const parent = wf('parent', [
       { id: 'gate', bash: 'echo gate' },

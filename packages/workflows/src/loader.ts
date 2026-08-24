@@ -857,7 +857,7 @@ export function validateDagStructure(
   // Check $nodeId.output references across every public YAML field the executor substitutes at
   // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
   // (prompt, systemPrompt, agents.*.prompt/description, bash, script,
-  // approval.message/on_reject.prompt, cancel, loop.prompt, loop.until_bash,
+  // approval.message/on_reject.prompt, wait.until/event, cancel, loop.prompt, loop.until_bash,
   // loop_group.until_bash, workflow.input/with/fan_out.items). A dangling ref in any of
   // them can bind the wrong flat-DAG output or fail at run time, so all must be validated
   // here.
@@ -917,6 +917,14 @@ export function validateDagStructure(
       }
       if (isExecNode(node)) {
         sources.push({ field: node.runtime === 'sh' ? 'bash' : 'script', text: node.script });
+      }
+      if (isWaitNode(node)) {
+        if (node.wait.until !== undefined) {
+          sources.push({ field: 'wait.until', text: node.wait.until });
+        }
+        if (node.wait.event !== undefined) {
+          sources.push({ field: 'wait.event', text: node.wait.event });
+        }
       }
       // Node-local bindings (#2637): an agent's command-sourced `with:` and an exec
       // node's `with:` string values are live ref surfaces (whole refs and
@@ -1005,6 +1013,30 @@ export function validateDagStructure(
             return `Node '${node.id}' field '${source.field}' references unknown node '$${refNodeId}.output'. Expected a node in the loop_group body or current/enclosing DAG scope`;
           }
           return `Node '${node.id}' field '${source.field}' references unknown node '$${refNodeId}.output'. In a composed workflow, pass caller data through declared 'inputs:' and caller 'with:' instead of referencing a caller node directly`;
+        }
+      }
+    }
+
+    if (!isIncludeDirective(node) && isWaitNode(node)) {
+      for (const [field, text] of [
+        ['wait.until', node.wait.until],
+        ['wait.event', node.wait.event],
+      ] as const) {
+        if (text === undefined) continue;
+        outputRefPattern.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = outputRefPattern.exec(text)) !== null) {
+          const producerId = m[1];
+          if (
+            producerId === undefined ||
+            producerId === WHEN_INPUTS_SCOPE ||
+            enclosingNodes?.has(producerId)
+          ) {
+            continue;
+          }
+          if (!transitiveDepsOf(node.id).has(producerId)) {
+            return `Node '${node.id}' field '${field}' references '$${producerId}.output', which is not an upstream dependency — add '${producerId}' to '${node.id}'.depends_on so the wait condition is produced first`;
+          }
         }
       }
     }

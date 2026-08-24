@@ -85,6 +85,12 @@ describe('dagNodeSchema — durable wait', () => {
       dagNodeSchema.safeParse({ id: 'repeating', wait: { duration_ms: 1 }, always_run: true })
         .success
     ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({ id: 'invalid-date', wait: { until: 'tomorrow' } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({ id: 'dynamic-date', wait: { until: '$schedule.output' } }).success
+    ).toBe(true);
   });
 });
 

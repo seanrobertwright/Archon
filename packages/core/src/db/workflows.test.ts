@@ -36,8 +36,9 @@ import {
   pauseWorkflowRun,
   pauseWorkflowRunForWait,
   listDueWorkflowContinuations,
+  deferWorkflowContinuation,
   signalWorkflowWait,
-  claimScheduledWorkflowResume,
+  clearWorkflowWaitContext,
   setScheduledWorkflowResume,
   cancelWorkflowRun,
   failOrphanedRuns,
@@ -363,7 +364,7 @@ describe('workflows database', () => {
       // this suite runs the Postgres dialect, so it pins that branch of
       // writeApprovalMetadata (#2673). Top-level run metadata still merges.
       expect(query).toContain(
-        "metadata = jsonb_set(metadata || $2::jsonb, '{approval}', $3::jsonb, true)"
+        "metadata = jsonb_set((metadata - 'wait') || $2::jsonb, '{approval}', $3::jsonb, true)"
       );
 
       // $2 is run-level metadata (empty here); $3 is the complete gate context,
@@ -448,7 +449,7 @@ describe('workflows database', () => {
       await pauseWorkflowRunForWait('workflow-run-123', wait);
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("SET status = 'paused'");
-      expect(query).toContain("jsonb_set(metadata, '{wait}'");
+      expect(query).toContain("jsonb_set(metadata - 'approval', '{wait}'");
       expect(JSON.parse(params[1] as string)).toEqual(wait);
     });
 
@@ -459,7 +460,42 @@ describe('workflows database', () => {
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'paused'");
       expect(query).toContain("status = 'failed'");
+      expect(query).toContain("metadata->>'continuation_retry_at' IS NULL");
       expect(params).toEqual(['2026-08-25T10:00:00.000Z', 25]);
+    });
+
+    test('defers an unresolvable continuation without changing lifecycle status', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await deferWorkflowContinuation('workflow-run-123', '2026-08-25T10:01:00.000Z');
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status IN ('paused', 'failed')");
+      expect(query).not.toContain('SET status =');
+      expect(JSON.parse(params[1] as string)).toEqual({
+        continuation_retry_at: '2026-08-25T10:01:00.000Z',
+      });
+    });
+
+    test('clears only the exact active wait cursor on a running run', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      const wait = {
+        nodeId: 'await-ci',
+        kind: 'event' as const,
+        event: 'checks.complete',
+        waitingSince: '2026-08-24T10:00:00.000Z',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+      };
+
+      await expect(clearWorkflowWaitContext('workflow-run-123', wait)).resolves.toEqual({
+        cleared: true,
+      });
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("metadata - 'wait'");
+      expect(query).toContain("status = 'running'");
+      expect(query).toContain("metadata->'wait'->>'nodeId' = $2");
+      expect(query).toContain("metadata->'wait'->>'resumeAt' = $3");
+      expect(params).toEqual(['workflow-run-123', 'await-ci', wait.resumeAt]);
     });
 
     test('signals only the matching still-open event wait', async () => {
@@ -482,29 +518,6 @@ describe('workflows database', () => {
       expect(query).toContain("metadata->'wait'->>'resumeAt' > $3");
       expect(params[1]).toBe('checks.complete');
       expect(JSON.parse(params[3] as string)).toEqual({ conclusion: 'success' });
-      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
-    });
-
-    test('claims a scheduled quota continuation once and audits the trigger', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
-      const scheduled = {
-        reason: 'quota' as const,
-        resumeAt: '2026-08-25T10:00:00.000Z',
-        deadlineAt: '2026-08-26T10:00:00.000Z',
-        attempt: 1,
-        maxAttempts: 2,
-        error: 'usage limit reached',
-      };
-      await expect(
-        claimScheduledWorkflowResume('workflow-run-123', scheduled, '2026-08-25T10:00:01.000Z')
-      ).resolves.toEqual({ claimed: true });
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain("status = 'failed'");
-      expect(query).toContain("metadata->'scheduled_resume'->>'triggeredAt' IS NULL");
-      expect(JSON.parse(params[2] as string)).toMatchObject({
-        ...scheduled,
-        triggeredAt: '2026-08-25T10:00:01.000Z',
-      });
       expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
     });
 
@@ -1201,7 +1214,7 @@ describe('workflows database', () => {
       expect(result.completed_at).toBeNull();
       // First call: the row-pinning read of the error the CAS is about to clear.
       const [priorQuery, priorParams] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(priorQuery).toContain('SELECT metadata');
+      expect(priorQuery).toContain('SELECT status, metadata');
       // Postgres row lock — without it the value read is not guaranteed to be the
       // value the CAS clears, so the preserved error could be stale (#2348).
       expect(priorQuery).toContain('FOR UPDATE');
@@ -1213,7 +1226,11 @@ describe('workflows database', () => {
       expect(updateQuery).toContain('metadata = metadata || $3::jsonb');
       // $1 = id, $2 = ORPHAN_RESUME_STALE_DAYS. The day param MUST be bound or the
       // CAS predicate's `< $2 days` references an unbound placeholder (PR #1830 C1).
-      expect(updateParams).toEqual(['workflow-run-123', 1, JSON.stringify({ error: null })]);
+      expect(updateParams).toEqual([
+        'workflow-run-123',
+        1,
+        JSON.stringify({ error: null, continuation_retry_at: null }),
+      ]);
       // Third call: SELECT
       const [selectQuery, selectParams] = mockQuery.mock.calls[2] as [string, unknown[]];
       expect(selectQuery).toContain('SELECT *');
@@ -1256,7 +1273,11 @@ describe('workflows database', () => {
       expect(updateQuery).toContain("status = 'running' AND");
       // The stale-orphan arm references $2 — it MUST be bound to the day count.
       expect(updateQuery).toContain('$2');
-      expect(updateParams).toEqual(['workflow-run-123', 1, JSON.stringify({ error: null })]);
+      expect(updateParams).toEqual([
+        'workflow-run-123',
+        1,
+        JSON.stringify({ error: null, continuation_retry_at: null }),
+      ]);
     });
 
     test('preserves the cleared error as a workflow_resumed event (CAS winner only)', async () => {
@@ -1280,6 +1301,42 @@ describe('workflows database', () => {
       expect(eventParams[1]).toBe('workflow-run-123');
       expect(eventParams[2]).toBe('workflow_resumed');
       expect(eventParams[5]).toBe(JSON.stringify({ error: 'Process terminated (SIGTERM)' }));
+    });
+
+    test('claims quota continuation and audits it in the winning resume transaction', async () => {
+      const scheduled = {
+        reason: 'quota' as const,
+        resumeAt: '2026-08-25T10:00:00.000Z',
+        deadlineAt: '2026-08-26T10:00:00.000Z',
+        attempt: 1,
+        maxAttempts: 2,
+        error: 'usage limit reached',
+      };
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ status: 'failed', metadata: { scheduled_resume: scheduled } }])
+      );
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
+      );
+
+      await resumeWorkflowRun('workflow-run-123');
+
+      const [, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(JSON.parse(updateParams[2] as string)).toMatchObject({
+        error: null,
+        scheduled_resume: {
+          ...scheduled,
+          triggeredAt: expect.any(String),
+        },
+      });
+      const [eventQuery, eventParams] = mockQuery.mock.calls[2] as [string, unknown[]];
+      expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(eventParams[2]).toBe('quota_resume_triggered');
+      expect(eventParams[5]).toBe(
+        JSON.stringify({ attempt: scheduled.attempt, resume_at: scheduled.resumeAt })
+      );
     });
 
     test('writes no event when the CAS loses, even though an error was read', async () => {

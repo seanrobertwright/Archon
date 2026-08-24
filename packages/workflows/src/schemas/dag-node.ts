@@ -646,6 +646,17 @@ export const waitConfigSchema = waitConfigFlatSchema.superRefine((value, ctx) =>
       path: ['deadline_ms'],
     });
   }
+  if (
+    value.until !== undefined &&
+    !value.until.includes('$') &&
+    !Number.isFinite(Date.parse(value.until))
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "'wait.until' must be an ISO-8601 timestamp or contain a runtime reference",
+      path: ['until'],
+    });
+  }
 });
 export type WaitConfig = z.infer<typeof waitConfigSchema>;
 

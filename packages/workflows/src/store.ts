@@ -234,13 +234,18 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     extraMetadata?: Record<string, unknown>
   ): Promise<void>;
   /** Pause a running run on an engine-owned time/event wait. */
-  pauseWorkflowRunForWait?(id: string, waitContext: WorkflowWaitContext): Promise<void>;
-  rewriteWorkflowWaitContext?(
+  pauseWorkflowRunForWait(id: string, waitContext: WorkflowWaitContext): Promise<void>;
+  rewriteWorkflowWaitContext(
     id: string,
     waitContext: WorkflowWaitContext
   ): Promise<{ rewritten: boolean }>;
+  /** Consume the exact active wait cursor before its node can complete. */
+  clearWorkflowWaitContext(
+    id: string,
+    waitContext: WorkflowWaitContext
+  ): Promise<{ cleared: boolean }>;
   /** Replace the engine-owned quota continuation cursor wholesale. */
-  setScheduledWorkflowResume?(id: string, scheduled: ScheduledWorkflowResume | null): Promise<void>;
+  setScheduledWorkflowResume(id: string, scheduled: ScheduledWorkflowResume | null): Promise<void>;
 
   /**
    * Rewrite the approval context of an ALREADY-paused, still-open gate — unlike

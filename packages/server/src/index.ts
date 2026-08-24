@@ -109,6 +109,8 @@ import {
 import type { IPlatformAdapter } from '@archon/core';
 import type { IdentityPlatform } from '@archon/core';
 import * as userDb from '@archon/core/db/users';
+import * as conversationDb from '@archon/core/db/conversations';
+import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import {
   createLogger,
   logArchonPaths,
@@ -323,7 +325,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // Start cleanup scheduler
   startCleanupScheduler();
-  startWorkflowContinuationScheduler();
 
   // Note: orphaned-run cleanup intentionally NOT called at server startup.
   // Running it here killed parallel workflow runs from other processes
@@ -965,6 +966,22 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   } else if (!opts.skipPlatformAdapters) {
     getLog().info('telegram_adapter_skipped');
   }
+
+  // Continuations can execute only after every credential provider and platform
+  // adapter is initialized. Resolve the run's worker conversation back to its
+  // originating adapter so resumed output stays on the same delivery channel.
+  const workflowPlatforms = new Map<string, IWorkflowPlatform>();
+  for (const platform of [webAdapter, github, gitea, gitlab, discord, slack, telegram]) {
+    if (platform !== null) workflowPlatforms.set(platform.getPlatformType(), platform);
+  }
+  startWorkflowContinuationScheduler(async run => {
+    const conversation = await conversationDb.getConversationById(run.conversation_id);
+    if (!conversation?.platform_conversation_id) return undefined;
+    const platform = workflowPlatforms.get(conversation.platform_type);
+    return platform === undefined
+      ? undefined
+      : { platform, conversationId: conversation.platform_conversation_id };
+  });
 
   // Graceful shutdown
   const shutdown = (): void => {

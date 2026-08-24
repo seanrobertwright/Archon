@@ -2454,6 +2454,46 @@ nodes:
       expect(result.errors[0].error).toContain('analyize');
     });
 
+    it('rejects unknown and non-upstream output refs in wait conditions', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'bad-wait-ref.yaml'),
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: schedule
+    bash: echo 2026-08-25T22:00:00Z
+  - id: wait-for-window
+    wait:
+      until: "$schedule.output"
+`
+      );
+
+      let result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain('not an upstream dependency');
+
+      await writeFile(
+        join(workflowDir, 'bad-wait-ref.yaml'),
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: wait-for-checks
+    wait:
+      event: "$missing.output"
+      deadline_ms: 60000
+`
+      );
+
+      result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain("unknown node '$missing.output'");
+    });
+
     it('should accept a workflow where output refs use valid existing node IDs', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });

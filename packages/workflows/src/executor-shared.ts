@@ -39,11 +39,14 @@ function getLog(): ReturnType<typeof createLogger> {
 /** Result of error classification */
 export type ErrorType = 'TRANSIENT' | 'FATAL' | 'UNKNOWN';
 
-/**
- * Fatal error patterns - errors that won't resolve with retry: authentication/
- * authorization failures and provider quota/limit-window exhaustion (a retry
- * inside the same limit window is guaranteed to fail — see #2177).
- */
+const QUOTA_EXHAUSTION_PATTERNS = [
+  'session limit',
+  'usage limit reached',
+  'credit exhaustion',
+  'credit balance',
+] as const;
+
+/** Fatal errors: authentication/authorization failures plus quota exhaustion. */
 export const FATAL_PATTERNS = [
   'unauthorized',
   'forbidden',
@@ -52,10 +55,7 @@ export const FATAL_PATTERNS = [
   'permission denied',
   '401',
   '403',
-  'credit balance',
-  'session limit', // Claude subscription 5h window — covers every detectCreditExhaustion session variant
-  'usage limit reached', // Claude CLI quota string, e.g. "Claude AI usage limit reached|<ts>"
-  'credit exhaustion', // synthesized "Credit exhaustion detected — resume when credits reset"
+  ...QUOTA_EXHAUSTION_PATTERNS,
 ];
 
 /** Ambiguous fatal patterns that yield to concrete transient evidence. */
@@ -109,13 +109,6 @@ export function classifyError(error: Error): ErrorType {
   }
   return 'UNKNOWN';
 }
-
-const QUOTA_EXHAUSTION_PATTERNS = [
-  'session limit',
-  'usage limit reached',
-  'credit exhaustion',
-  'credit balance',
-];
 
 export function isQuotaExhaustionError(error: string): boolean {
   const message = error.toLowerCase();

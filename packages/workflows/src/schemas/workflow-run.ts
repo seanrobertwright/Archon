@@ -67,7 +67,6 @@ export const scheduledWorkflowResumeSchema = z.object({
   deadlineAt: z.string().datetime(),
   attempt: z.number().int().positive(),
   maxAttempts: z.number().int().positive(),
-  error: z.string().min(1),
   triggeredAt: z.string().datetime().optional(),
 });
 export type ScheduledWorkflowResume = z.infer<typeof scheduledWorkflowResumeSchema>;

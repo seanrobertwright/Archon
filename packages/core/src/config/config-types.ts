@@ -13,6 +13,7 @@
 
 // Provider config defaults — canonical definitions live in @archon/providers/types.
 // Imported and re-exported here so existing consumers don't break.
+import { z } from '@hono/zod-openapi';
 import type {
   ClaudeProviderDefaults,
   CodexProviderDefaults,
@@ -183,12 +184,13 @@ export interface GlobalConfig {
   workflows?: WorkflowContinuationConfig;
 }
 
-export interface WorkflowContinuationConfig {
-  autoResumeOnQuotaReset?: boolean;
-  quotaFallbackDelayMs?: number;
-  quotaMaxAttempts?: number;
-  quotaDeadlineMs?: number;
-}
+export const workflowContinuationConfigSchema = z.object({
+  autoResumeOnQuotaReset: z.boolean().optional(),
+  quotaFallbackDelayMs: z.number().finite().positive().optional(),
+  quotaMaxAttempts: z.number().int().positive().optional(),
+  quotaDeadlineMs: z.number().finite().positive().optional(),
+});
+export type WorkflowContinuationConfig = z.infer<typeof workflowContinuationConfigSchema>;
 
 /**
  * Repository configuration (project-specific settings)

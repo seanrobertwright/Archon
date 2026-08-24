@@ -38,6 +38,7 @@ import type {
   RawAliasesConfig,
   RawTiersConfig,
 } from './config-types';
+import { workflowContinuationConfigSchema } from './config-types';
 import { createLogger } from '@archon/paths';
 import {
   isRegisteredProvider,
@@ -257,6 +258,20 @@ async function createDefaultConfig(configPath: string): Promise<void> {
   }
 }
 
+function validateWorkflowContinuationConfig(parsed: unknown, configPath: string): void {
+  if (typeof parsed !== 'object' || parsed === null || !('workflows' in parsed)) return;
+  const config = parsed as { workflows?: unknown };
+  if (config.workflows === undefined) return;
+  const result = workflowContinuationConfigSchema.safeParse(config.workflows);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map(issue => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
+      .join('; ');
+    throw new Error(`Invalid workflows config in '${configPath}': ${issues}`);
+  }
+  config.workflows = result.data;
+}
+
 /**
  * Load global config from ~/.archon/config.yaml
  * Creates default config if file doesn't exist
@@ -270,7 +285,9 @@ export async function loadGlobalConfig(forceReload = false): Promise<GlobalConfi
 
   try {
     const content = await readConfigFile(configPath);
-    cachedGlobalConfig = parseYaml(content) as GlobalConfig;
+    const parsed = parseYaml(content);
+    validateWorkflowContinuationConfig(parsed, configPath);
+    cachedGlobalConfig = parsed as GlobalConfig;
     return cachedGlobalConfig ?? {};
   } catch (error) {
     const err = error as { code?: string };
@@ -320,7 +337,9 @@ export async function loadRepoConfig(repoPath: string): Promise<RepoConfig> {
 
   try {
     const content = await readConfigFile(configPath);
-    const parsed = (parseYaml(content) as RepoConfig) ?? {};
+    const raw = parseYaml(content);
+    validateWorkflowContinuationConfig(raw, configPath);
+    const parsed = (raw as RepoConfig) ?? {};
     const recommendedWorkflows = sanitizeRecommendedWorkflows(
       (parsed as { recommendedWorkflows?: unknown }).recommendedWorkflows,
       configPath

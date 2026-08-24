@@ -101,6 +101,20 @@ concurrency:
       expect(config.concurrency?.maxConversations).toBe(5);
     });
 
+    test('rejects malformed quota continuation policy at config ingress', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  autoResumeOnQuotaReset: yes
+  quotaMaxAttempts: 1.5
+  quotaDeadlineMs: -1
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config).toEqual({});
+      expect(mockLogger.error).toHaveBeenCalled();
+    });
+
     test('caches config on subsequent calls', async () => {
       mockFsReadFile.mockResolvedValue('defaultAssistant: claude');
 

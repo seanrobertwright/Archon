@@ -102,7 +102,7 @@ import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { MessageRow } from '@archon/core/schemas/message';
 import type { DashboardWorkflowRun } from '@archon/core/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
-import { resumeWorkflowRunHeadless } from '../services/workflow-resume-service';
+import { resumeWorkflowRunFromServer } from '../services/workflow-resume-service';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -2530,7 +2530,7 @@ export function registerApiRoutes(
     if (!run.parent_conversation_id) {
       // No parent conversation to dispatch a chat message through at all —
       // every CLI-launched run (#2008). Execute directly instead of skipping.
-      const headlessResumed = await resumeWorkflowRunHeadless(run, gateActorUserId);
+      const headlessResumed = await resumeWorkflowRunFromServer(run, gateActorUserId);
       getLog().info(
         { runId: run.id, workflowName: run.workflow_name },
         headlessResumed ? events.headlessDispatched : events.headlessSkipped
@@ -3647,7 +3647,7 @@ export function registerApiRoutes(
       if (!run.parent_conversation_id) {
         // No parent conversation to dispatch a chat message through at all —
         // every CLI-launched run (#2008). Execute directly instead of 400ing.
-        const headlessResumed = await resumeWorkflowRunHeadless(run, await resolveWebUserId(c));
+        const headlessResumed = await resumeWorkflowRunFromServer(run, await resolveWebUserId(c));
         if (!headlessResumed) {
           return apiError(
             c,
@@ -3714,7 +3714,21 @@ export function registerApiRoutes(
       if (!signaled) {
         return apiError(c, 400, `Run is not waiting on event '${event}'`);
       }
-      const resumed = await resumeWorkflowRunHeadless(run, await resolveWebUserId(c));
+      const actorUserId = await resolveWebUserId(c);
+      let resumed = false;
+      if (!run.parent_conversation_id) {
+        resumed = await resumeWorkflowRunFromServer(run, actorUserId);
+      } else {
+        const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
+        if (parentConv?.platform_conversation_id && parentConv.platform_type === 'web') {
+          await dispatchToOrchestrator(
+            parentConv.platform_conversation_id,
+            `/workflow resume ${run.id}`,
+            { userId: actorUserId }
+          );
+          resumed = true;
+        }
+      }
       return c.json({
         success: true,
         message: resumed
