@@ -4,6 +4,8 @@ import type { IWorkflowStore } from '@archon/workflows/store';
 // Mock DB modules before importing store-adapter
 const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
 const mockGetWorkflowRun = mock(() => Promise.resolve(null));
+const mockFindChildRuns = mock(() => Promise.resolve([]));
+const mockGetRunAncestry = mock(() => Promise.resolve([]));
 const mockGetActiveWorkflowRunByPath = mock(() => Promise.resolve(null));
 const mockFailOrphanedRuns = mock(() => Promise.resolve({ count: 0 }));
 const mockFindResumableRun = mock(() => Promise.resolve(null));
@@ -15,6 +17,9 @@ const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
+const mockPauseWorkflowRunForWait = mock(() => Promise.resolve());
+const mockRewriteWorkflowWaitContext = mock(() => Promise.resolve({ rewritten: true }));
+const mockClearWorkflowWaitContext = mock(() => Promise.resolve({ cleared: true }));
 // Backs createWorkflowStore()'s rewriteApprovalContext (#2707 step 3 pause
 // escalation) — per AGENTS.md's mock.module rule, an export the factory omits
 // keeps its REAL implementation, so this must be listed even though no test
@@ -24,6 +29,8 @@ const mockResolveApprovalGate = mock(() => Promise.resolve({ resolved: true }));
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
   getWorkflowRun: mockGetWorkflowRun,
+  findChildRuns: mockFindChildRuns,
+  getRunAncestry: mockGetRunAncestry,
   getActiveWorkflowRunByPath: mockGetActiveWorkflowRunByPath,
   failOrphanedRuns: mockFailOrphanedRuns,
   findResumableRun: mockFindResumableRun,
@@ -35,6 +42,9 @@ mock.module('../db/workflows', () => ({
   failWorkflowRun: mockFailWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
+  pauseWorkflowRunForWait: mockPauseWorkflowRunForWait,
+  rewriteWorkflowWaitContext: mockRewriteWorkflowWaitContext,
+  clearWorkflowWaitContext: mockClearWorkflowWaitContext,
   resolveApprovalGate: mockResolveApprovalGate,
   claimWriteback: mock(() => Promise.resolve({ claimed: true })),
   releaseWritebackClaim: mock(() => Promise.resolve()),
@@ -134,6 +144,8 @@ describe('createWorkflowStore', () => {
     const requiredMethods: (keyof IWorkflowStore)[] = [
       'createWorkflowRun',
       'getWorkflowRun',
+      'findChildRuns',
+      'getRunAncestry',
       'getActiveWorkflowRunByPath',
       'failOrphanedRuns',
       'findResumableRun',
@@ -144,6 +156,10 @@ describe('createWorkflowStore', () => {
       'completeWorkflowRun',
       'failWorkflowRun',
       'pauseWorkflowRun',
+      'pauseWorkflowRunForWait',
+      'rewriteWorkflowWaitContext',
+      'clearWorkflowWaitContext',
+      'rewriteApprovalContext',
       'claimWriteback',
       'releaseWritebackClaim',
       'cancelWorkflowRun',

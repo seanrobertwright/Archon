@@ -126,6 +126,19 @@ describe('round-trip fidelity', () => {
     }
   });
 
+  test('wait event and deadline round-trip exactly', () => {
+    const definition: WireWorkflowDefinition = {
+      name: 'wait-for-checks',
+      description: 'waits for an external signal',
+      nodes: [{ id: 'checks', wait: { event: 'checks.complete', deadline_ms: 86_400_000 } }],
+    };
+
+    const { workflow, issues } = fromWorkflowDefinition(definition);
+    expect(issues).toEqual([]);
+    expect(workflow.nodes[0]?.variant).toBe('wait');
+    expect(toWorkflowDefinition(workflow)).toEqual(definition);
+  });
+
   test('script runtime/deps/timeout survive partitioning', () => {
     const bw = fromWorkflowDefinition(FIXTURES.script).workflow;
     const node = bw.nodes[0];

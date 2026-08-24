@@ -94,6 +94,12 @@ describe('dagNodeSchema — durable wait', () => {
     expect(
       dagNodeSchema.safeParse({ id: 'dynamic-date', wait: { until: '$schedule.output' } }).success
     ).toBe(true);
+    expect(
+      dagNodeSchema.safeParse({ id: 'input-date', wait: { until: '$INPUTS.resume_at' } }).success
+    ).toBe(true);
+    expect(
+      dagNodeSchema.safeParse({ id: 'date-only', wait: { until: '2026-08-25' } }).success
+    ).toBe(false);
   });
 });
 

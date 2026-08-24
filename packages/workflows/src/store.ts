@@ -37,6 +37,15 @@ export interface DagResumeSnapshot {
   costUsd: number;
 }
 
+/** Durable wait outcome committed atomically with consumption of its active cursor. */
+export interface WorkflowWaitCompletion {
+  stepName: string;
+  status: 'satisfied' | 'expired';
+  waitedMs: number;
+  output: string;
+  result: Record<string, unknown>;
+}
+
 /** Composite primary key identifying a single persisted node session row. */
 export interface WorkflowNodeSessionKey {
   workflow_name: string;
@@ -243,14 +252,12 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     id: string,
     waitContext: WorkflowWaitContext
   ): Promise<{ rewritten: boolean }>;
-  /** Consume the exact active wait cursor before its node can complete. */
+  /** Consume the exact wait cursor and persist its completion snapshot atomically. */
   clearWorkflowWaitContext(
     id: string,
-    waitContext: WorkflowWaitContext
+    waitContext: WorkflowWaitContext,
+    completion: WorkflowWaitCompletion
   ): Promise<{ cleared: boolean }>;
-  /** Replace the engine-owned quota continuation cursor wholesale. */
-  setScheduledWorkflowResume(id: string, scheduled: ScheduledWorkflowResume | null): Promise<void>;
-
   /**
    * Rewrite the approval context of an ALREADY-paused, still-open gate — unlike
    * `pauseWorkflowRun`, which requires the run to currently be `'running'` and so

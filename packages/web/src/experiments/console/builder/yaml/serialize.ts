@@ -2,7 +2,7 @@
  * Hand-rolled YAML serializer for the live preview pane. Ported from the
  * production `YamlCodeView.tsx` pattern (block scalars for multi-line strings,
  * quoting of ambiguous scalars, two-space list/object indentation) and
- * generalized so every wire key the seven variants emit — including the nested
+ * generalized so every wire key the eight variants emit — including the nested
  * `loop:`/`approval:` objects and `output_format` JSON schemas — serializes
  * without a per-field allowlist.
  *

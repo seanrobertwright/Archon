@@ -1698,7 +1698,7 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     mockExecuteWorkflow.mockClear();
   });
 
-  test('atomically signals the matching event wait and starts continuation', async () => {
+  test('atomically signals the matching event wait and leaves continuation to the scheduler', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_RUNNING_RUN,
       id: 'run-wait-1',
@@ -1736,10 +1736,15 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
         data: { event: 'checks.complete', payload: { conclusion: 'success' } },
       }
     );
-    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      message: "Signaled 'checks.complete'. The workflow will resume shortly.",
+    });
   });
 
-  test('continues a web-parented run through its originating conversation', async () => {
+  test('acknowledges a web-parented signal without inline routing after commit', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_RUNNING_RUN,
       id: 'run-wait-web',
@@ -1756,11 +1761,6 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
         },
       },
     });
-    mockGetConversationById.mockResolvedValueOnce({
-      id: 'parent-conv-uuid',
-      platform_conversation_id: 'web-plat-wait',
-      platform_type: 'web',
-    });
     const { app } = makeApp();
 
     const response = await app.request('/api/workflows/runs/run-wait-web/signal', {
@@ -1771,14 +1771,8 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
 
     expect(response.status).toBe(200);
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    expect(mockHandleMessage).toHaveBeenCalled();
-    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] as [
-      unknown,
-      string,
-      string,
-    ];
-    expect(platformConvId).toBe('web-plat-wait');
-    expect(dispatchedMessage).toBe('/workflow resume run-wait-web');
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockGetConversationById).not.toHaveBeenCalled();
   });
 
   test('rejects a signal that does not match the run wait', async () => {

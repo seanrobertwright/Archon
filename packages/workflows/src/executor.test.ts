@@ -200,7 +200,6 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     pauseWorkflowRunForWait: mock(async () => {}),
     rewriteWorkflowWaitContext: mock(async () => ({ rewritten: true })),
     clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
-    setScheduledWorkflowResume: mock(async () => {}),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
@@ -308,6 +307,31 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('container resume guard', () => {
+    it('rejects a fresh container workflow with a durable wait before creating a run', async () => {
+      const workflow = workflowDefinitionSchema.parse({
+        name: 'container-wait',
+        description: 'unsupported durable wait in container isolation',
+        nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+      });
+      const store = makeStore();
+
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          workflow,
+          'msg',
+          'db-conv-1',
+          { execContext: { kind: 'container', containerId: 'cid' } }
+        )
+      ).rejects.toThrow('durable wait, which is not supported in container isolation');
+
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
     it('fails a container run resumed without a container context, pointing at the CLI', async () => {
       const failSpy = mock(async () => {});
       const store = makeStore({ failWorkflowRun: failSpy });

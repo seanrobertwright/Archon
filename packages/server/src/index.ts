@@ -82,6 +82,8 @@ import { registerGithubWebhookRoute } from './routes/webhooks';
 import {
   startWorkflowContinuationScheduler,
   stopWorkflowContinuationScheduler,
+  workflowResumeConversationId,
+  workflowResumeTargetForConversation,
 } from './services/workflow-resume-service';
 import {
   handleMessage,
@@ -968,19 +970,21 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }
 
   // Continuations can execute only after every credential provider and platform
-  // adapter is initialized. Resolve the run's worker conversation back to its
-  // originating adapter so resumed output stays on the same delivery channel.
+  // adapter is initialized. Web background runs execute against a hidden worker
+  // conversation but deliver to their visible parent; other runs use their owning
+  // conversation directly.
   const workflowPlatforms = new Map<string, IWorkflowPlatform>();
   for (const platform of [webAdapter, github, gitea, gitlab, discord, slack, telegram]) {
     if (platform !== null) workflowPlatforms.set(platform.getPlatformType(), platform);
   }
   startWorkflowContinuationScheduler(async run => {
-    const conversation = await conversationDb.getConversationById(run.conversation_id);
-    if (!conversation?.platform_conversation_id) return undefined;
-    const platform = workflowPlatforms.get(conversation.platform_type);
-    return platform === undefined
-      ? undefined
-      : { platform, conversationId: conversation.platform_conversation_id };
+    const conversation = await conversationDb.getConversationById(
+      workflowResumeConversationId(run)
+    );
+    if (!conversation) {
+      return { kind: 'unavailable', reason: 'origin conversation no longer exists' };
+    }
+    return workflowResumeTargetForConversation(conversation, workflowPlatforms);
   });
 
   // Graceful shutdown

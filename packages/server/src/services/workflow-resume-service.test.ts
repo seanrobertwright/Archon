@@ -6,7 +6,11 @@ const mockListDueWorkflowContinuations = mock(async () => [] as WorkflowRun[]);
 const mockDeferWorkflowContinuation = mock(async () => undefined);
 const mockResolveRunContinuation = mock(async () => ({ ok: false as const, message: 'unused' }));
 const mockHydrateResumableRun = mock(async () => null as null | Record<string, unknown>);
-const mockExecuteWorkflow = mock(async () => undefined);
+const mockExecuteWorkflow = mock(async () => ({
+  success: true as const,
+  workflowRunId: 'run-1',
+  summary: 'done',
+}));
 
 mock.module('@archon/core', () => ({
   createChildWorktreeResolver: mock(() => undefined),
@@ -38,6 +42,8 @@ mock.module('@archon/workflows/executor', () => ({
 import {
   resumeWorkflowRunFromServer,
   scanDueWorkflowContinuations,
+  workflowResumeConversationId,
+  workflowResumeTargetForConversation,
 } from './workflow-resume-service';
 
 function run(
@@ -75,7 +81,11 @@ describe('workflow continuation scanner', () => {
     mockHydrateResumableRun.mockReset();
     mockHydrateResumableRun.mockResolvedValue(null);
     mockExecuteWorkflow.mockReset();
-    mockExecuteWorkflow.mockResolvedValue(undefined);
+    mockExecuteWorkflow.mockResolvedValue({
+      success: true,
+      workflowRunId: 'run-1',
+      summary: 'done',
+    });
   });
 
   test('resumes due waits and quota continuations through the shared resume CAS', async () => {
@@ -104,6 +114,30 @@ describe('workflow continuation scanner', () => {
       scanDueWorkflowContinuations(new Date('2026-08-24T11:00:01.000Z'), resume)
     ).resolves.toBe(2);
     expect(resume).toHaveBeenCalledTimes(2);
+  });
+
+  test('routes background web runs through the visible parent and refuses missing adapters', () => {
+    const background = {
+      ...run('wait-web', 'paused', {}),
+      conversation_id: 'worker-conv',
+      parent_conversation_id: 'visible-conv',
+    };
+    expect(workflowResumeConversationId(background)).toBe('visible-conv');
+
+    const unavailable = workflowResumeTargetForConversation(
+      { platform_type: 'telegram', platform_conversation_id: 'chat-1' },
+      new Map()
+    );
+    expect(unavailable).toEqual({
+      kind: 'unavailable',
+      reason: "origin adapter 'telegram' is unavailable",
+    });
+    expect(
+      workflowResumeTargetForConversation(
+        { platform_type: 'cli', platform_conversation_id: 'cli-1' },
+        new Map()
+      )
+    ).toEqual({ kind: 'headless' });
   });
 
   test('resumes a paused wait even when the run retains historical quota metadata', async () => {
@@ -156,8 +190,8 @@ describe('workflow continuation scanner', () => {
 
     await expect(
       resumeWorkflowRunFromServer(paused, undefined, {
-        platform,
-        conversationId: 'slack-thread-123',
+        kind: 'platform',
+        destination: { platform, conversationId: 'slack-thread-123' },
       })
     ).resolves.toBe(true);
 
@@ -166,8 +200,74 @@ describe('workflow continuation scanner', () => {
     expect(mockExecuteWorkflow.mock.calls[0]?.[2]).toBe('slack-thread-123');
   });
 
+  test('surfaces a resumed background-web terminal result on the visible conversation', async () => {
+    const paused = run('wait-web', 'paused', {});
+    mockResolveRunContinuation.mockResolvedValueOnce({
+      ok: true,
+      workflowName: 'deliver',
+      workflow: { definition: { name: 'deliver', nodes: [] } },
+    });
+    mockHydrateResumableRun.mockResolvedValueOnce({
+      preCreatedRun: { ...paused, status: 'running' },
+      priorCompletedNodes: new Map(),
+      priorUsage: { costUsd: 0 },
+      priorNodeSessions: [],
+    });
+    const platform = {
+      sendMessage: mock(async () => undefined),
+      getStreamingMode: () => 'batch' as const,
+      getPlatformType: () => 'web',
+    } satisfies IWorkflowPlatform;
+
+    await expect(
+      resumeWorkflowRunFromServer(paused, undefined, {
+        kind: 'platform',
+        destination: { platform, conversationId: 'visible-web-conv', surfaceResult: true },
+      })
+    ).resolves.toBe(true);
+    await Promise.resolve();
+
+    expect(platform.sendMessage).toHaveBeenCalledWith('visible-web-conv', 'done', {
+      category: 'workflow_result',
+      segment: 'new',
+      workflowResult: { workflowName: 'deliver', runId: 'run-1' },
+    });
+  });
+
+  test('does not claim a continuation when its recorded destination is unavailable', async () => {
+    const paused = run('wait-unavailable', 'paused', {});
+
+    await expect(
+      resumeWorkflowRunFromServer(paused, undefined, {
+        kind: 'unavailable',
+        reason: "origin adapter 'telegram' is unavailable",
+      })
+    ).resolves.toBe(false);
+
+    expect(mockResolveRunContinuation).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
+  });
+
+  test('does not claim a container continuation that only the CLI can rewire', async () => {
+    const paused = run('wait-container', 'paused', { isolation: 'container' });
+
+    await expect(resumeWorkflowRunFromServer(paused)).resolves.toBe(false);
+
+    expect(mockResolveRunContinuation).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
+  });
+
   test('backs off a due row when execution prerequisites are unavailable', async () => {
-    mockListDueWorkflowContinuations.mockResolvedValueOnce([run('wait-poison', 'paused', {})]);
+    mockListDueWorkflowContinuations.mockResolvedValueOnce([
+      run('wait-poison', 'paused', {
+        wait: {
+          nodeId: 'delay',
+          kind: 'time',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-24T11:00:00.000Z',
+        },
+      }),
+    ]);
     const resume = mock(async () => false);
 
     await expect(
@@ -176,12 +276,22 @@ describe('workflow continuation scanner', () => {
 
     expect(mockDeferWorkflowContinuation).toHaveBeenCalledWith(
       'wait-poison',
-      '2026-08-24T11:01:00.000Z'
+      '2026-08-24T11:01:00.000Z',
+      { kind: 'wait', nodeId: 'delay', resumeAt: '2026-08-24T11:00:00.000Z' }
     );
   });
 
   test('logs and backs off a row when destination resolution rejects', async () => {
-    mockListDueWorkflowContinuations.mockResolvedValueOnce([run('wait-reject', 'paused', {})]);
+    mockListDueWorkflowContinuations.mockResolvedValueOnce([
+      run('wait-reject', 'paused', {
+        wait: {
+          nodeId: 'delay',
+          kind: 'time',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-24T11:00:00.000Z',
+        },
+      }),
+    ]);
     const resume = mock(async () => {
       throw new Error('conversation lookup failed');
     });
@@ -192,7 +302,8 @@ describe('workflow continuation scanner', () => {
 
     expect(mockDeferWorkflowContinuation).toHaveBeenCalledWith(
       'wait-reject',
-      '2026-08-24T11:01:00.000Z'
+      '2026-08-24T11:01:00.000Z',
+      { kind: 'wait', nodeId: 'delay', resumeAt: '2026-08-24T11:00:00.000Z' }
     );
   });
 });

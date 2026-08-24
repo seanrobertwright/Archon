@@ -7,6 +7,7 @@ export type {
   LoopNodeData,
   ApprovalOnReject,
   ApprovalNodeData,
+  WaitNodeData,
   CancelNodeData,
   ScriptNodeData,
   CommandNodeData,

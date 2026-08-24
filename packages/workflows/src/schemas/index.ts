@@ -65,6 +65,7 @@ export {
   approvalOnRejectSchema,
   haltNodeSchema,
   waitConfigSchema,
+  waitUntilTimestampSchema,
   waitNodeSchema,
   WAIT_NODE_OUTPUT_FORMAT,
   includeDirectiveSchema,

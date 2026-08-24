@@ -186,9 +186,6 @@ function createMockStore(): MockWorkflowStore {
     rewriteApprovalContext: mock<IWorkflowStore['rewriteApprovalContext']>(
       async (_id, _approvalContext) => ({ resolved: true })
     ),
-    setScheduledWorkflowResume: mock<NonNullable<IWorkflowStore['setScheduledWorkflowResume']>>(
-      async (_id, _scheduled) => {}
-    ),
     claimWriteback: mock<IWorkflowStore['claimWriteback']>(async _id => ({ claimed: true })),
     releaseWritebackClaim: mock<IWorkflowStore['releaseWritebackClaim']>(async _id => {}),
     cancelWorkflowRun: mock<IWorkflowStore['cancelWorkflowRun']>(async _id => ({
@@ -14332,6 +14329,73 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       )
     ).toBe(true);
   });
+
+  it('does not promise automatic quota continuation for a container run', async () => {
+    const creditExhaustedQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
+      async function* () {
+        yield { type: 'assistant', content: "You're out of extra usage" };
+        yield { type: 'result', sessionId: 'dag-session-credit' };
+      }
+    );
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: creditExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-credit',
+      testDir,
+      {
+        name: 'container-credit-resume-test',
+        nodes: [
+          {
+            id: 'investigate',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Investigate the issue' },
+          },
+        ],
+      },
+      makeWorkflowRun('container-credit-resume-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      {
+        ...minimalConfig,
+        workflows: {
+          autoResumeOnQuotaReset: true,
+          quotaFallbackDelayMs: 60_000,
+          quotaMaxAttempts: 1,
+          quotaDeadlineMs: 3_600_000,
+        },
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { kind: 'container', containerId: 'container-1' }
+    );
+
+    const failRun = store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>;
+    expect(failRun.mock.calls[0]?.[2]).toBeUndefined();
+    expect(
+      store.createWorkflowEvent.mock.calls.some(
+        call =>
+          call[0].event_type === 'quota_resume_skipped' &&
+          call[0].data?.reason === 'container_unsupported'
+      )
+    ).toBe(true);
+  });
 });
 
 describe('executeDagWorkflow -- durable wait node', () => {
@@ -14409,14 +14473,15 @@ describe('executeDagWorkflow -- durable wait node', () => {
       'docs/',
       minimalConfig
     );
-    const events = store.createWorkflowEvent.mock.calls.map(call => call[0]);
-    expect(events.some(event => event.event_type === 'wait_expired')).toBe(true);
-    const completion = events.find(event => event.event_type === 'node_completed');
-    expect(completion?.data?.structured_output).toMatchObject({ status: 'expired' });
     expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
     expect(store.clearWorkflowWaitContext).toHaveBeenCalledWith(
       'wait-resume',
-      workflowRun.metadata.wait
+      workflowRun.metadata.wait,
+      expect.objectContaining({
+        stepName: 'ci',
+        status: 'expired',
+        result: expect.objectContaining({ status: 'expired' }),
+      })
     );
   });
 
@@ -21699,6 +21764,17 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(substitutedGate.decisions.find(d => d.id === 'reject')?.rework?.prompt).toBe(
       'retry=PRIOR'
     );
+
+    const wait = dagNodeSchema.parse({
+      id: 'wait',
+      wait: { event: ref, deadline_ms: 60_000 },
+      depends_on: [],
+    });
+    const substitutedWait = applyLoopPrevToBodyNode(wait as DagNode, prev, '');
+    if (!('kind' in substitutedWait) || substitutedWait.kind !== 'wait') {
+      throw new Error('expected wait node');
+    }
+    expect(substitutedWait.wait.event).toBe('PRIOR');
 
     const script = dagNodeSchema.parse({
       id: 'script',

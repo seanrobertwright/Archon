@@ -2495,23 +2495,65 @@ nodes:
     });
 
     it('rejects suspension nodes that can run concurrently', () => {
-      const result = parseWorkflow(
-        `
+      const suspensionNodes = [
+        `  - id: review
+    approval:
+      message: Review this`,
+        `  - id: refine
+    loop:
+      prompt: Iterate.
+      until: DONE
+      max_iterations: 2
+      interactive: true
+      gate_message: Review.`,
+        `  - id: child
+    workflow: child-workflow`,
+      ];
+      for (const suspensionNode of suspensionNodes) {
+        const result = parseWorkflow(
+          `
 name: parallel-suspensions
 description: Two nodes cannot own the run cursor together
 nodes:
   - id: wait-for-time
     wait:
       duration_ms: 60000
-  - id: review
-    approval:
-      message: Review this
+${suspensionNode}
 `,
-        'parallel-suspensions.yaml'
+          'parallel-suspensions.yaml'
+        );
+
+        expect(result.workflow).toBeNull();
+        expect(result.error?.error).toContain("Suspending nodes 'wait-for-time'");
+      }
+    });
+
+    it('rejects waits nested below more than one loop_group boundary', () => {
+      const result = parseWorkflow(
+        `
+name: nested-wait
+description: nested wait
+nodes:
+  - id: outer
+    loop_group:
+      max_iterations: 2
+      until_bash: exit 0
+      nodes:
+        - id: inner
+          loop_group:
+            max_iterations: 2
+            until_bash: exit 0
+            nodes:
+              - id: delay
+                wait:
+                  duration_ms: 1000
+`,
+        '/tmp/nested-wait.yaml'
       );
 
-      expect(result.workflow).toBeNull();
-      expect(result.error?.error).toContain("Suspending nodes 'wait-for-time' and 'review'");
+      expect(result.error?.error).toContain(
+        'wait nodes nested below another loop_group are not supported'
+      );
     });
 
     it('should accept a workflow where output refs use valid existing node IDs', async () => {

@@ -24,6 +24,7 @@ import {
   declaredFieldsFromSchema,
   jsonValueSchema,
   parseWholeOutputRef,
+  parseWholeInputsRef,
   OUTPUT_REF_SOURCE,
   INPUT_NAME_SOURCE,
   type JsonValue,
@@ -623,6 +624,7 @@ export const waitConfigFlatSchema = z.object({
   event: z.string().min(1, "'wait.event' must not be empty").optional(),
   deadline_ms: z.number().int().positive().optional(),
 });
+export const waitUntilTimestampSchema = z.string().datetime();
 export const waitConfigSchema = waitConfigFlatSchema.superRefine((value, ctx) => {
   const conditions = [value.duration_ms, value.until, value.event].filter(
     condition => condition !== undefined
@@ -650,7 +652,8 @@ export const waitConfigSchema = waitConfigFlatSchema.superRefine((value, ctx) =>
   if (
     value.until !== undefined &&
     !new RegExp(OUTPUT_REF_SOURCE).test(value.until) &&
-    !Number.isFinite(Date.parse(value.until))
+    parseWholeInputsRef(value.until) === undefined &&
+    !waitUntilTimestampSchema.safeParse(value.until).success
   ) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,

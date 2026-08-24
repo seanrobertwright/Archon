@@ -284,12 +284,6 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve({ cleared: false });
   };
 
-  setScheduledWorkflowResume: IWorkflowStore['setScheduledWorkflowResume'] = (id, scheduled) => {
-    const r = this.runs.get(id);
-    if (r) r.metadata = { ...r.metadata, scheduled_resume: scheduled };
-    return Promise.resolve();
-  };
-
   rewriteApprovalContext: IWorkflowStore['rewriteApprovalContext'] = (id, approvalContext) => {
     const r = this.runs.get(id);
     // Mirrors the real store's CAS guard (unresolvedGateClause): only while still

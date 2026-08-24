@@ -126,6 +126,36 @@ function checkRequiredFields(node: BuilderNode): Issue[] {
       if (node.data.message.trim().length === 0)
         missing('approval.message', 'approval requires a message');
       break;
+    case 'wait': {
+      const conditions = [node.data.duration_ms, node.data.until, node.data.event].filter(
+        value => value !== undefined
+      );
+      if (conditions.length !== 1) {
+        invalid('wait', "wait requires exactly one of 'duration_ms', 'until', or 'event'");
+      }
+      if (
+        node.data.duration_ms !== undefined &&
+        (!Number.isInteger(node.data.duration_ms) || node.data.duration_ms <= 0)
+      ) {
+        invalid('wait.duration_ms', 'wait duration must be a positive integer');
+      }
+      if (node.data.until?.trim().length === 0)
+        missing('wait.until', 'wait timestamp must not be empty');
+      if (node.data.event?.trim().length === 0)
+        missing('wait.event', 'wait event must not be empty');
+      if (
+        node.data.event !== undefined &&
+        (node.data.deadline_ms === undefined ||
+          !Number.isInteger(node.data.deadline_ms) ||
+          node.data.deadline_ms <= 0)
+      ) {
+        invalid('wait.deadline_ms', 'event waits require a positive integer deadline');
+      }
+      if (node.data.event === undefined && node.data.deadline_ms !== undefined) {
+        invalid('wait.deadline_ms', 'deadline is only supported for event waits');
+      }
+      break;
+    }
     case 'cancel':
       if (node.data.reason.trim().length === 0) missing('cancel', 'cancel requires a reason');
       break;

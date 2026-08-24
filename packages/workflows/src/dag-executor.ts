@@ -77,6 +77,7 @@ import {
   isLoopNode,
   isLoopGroupNode,
   isGateNode,
+  isWaitNode,
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
   isHaltNode,
@@ -89,6 +90,7 @@ import {
   isBindingDirective,
   SUBRUN_METADATA_KEYS,
   WAIT_NODE_OUTPUT_FORMAT,
+  waitUntilTimestampSchema,
 } from './schemas';
 import type { BindingDirective } from './schemas';
 import type { PersistedNodeOutput } from './store';
@@ -5458,6 +5460,20 @@ export function applyLoopPrevToBodyNode(
       ),
     };
   }
+  if (isWaitNode(substitutedNode)) {
+    return {
+      ...substitutedNode,
+      wait: {
+        ...substitutedNode.wait,
+        ...(substitutedNode.wait.until !== undefined
+          ? { until: sub(substitutedNode.wait.until) }
+          : {}),
+        ...(substitutedNode.wait.event !== undefined
+          ? { event: sub(substitutedNode.wait.event) }
+          : {}),
+      },
+    };
+  }
   // Bash never passes through a shell escape hazard-free path — escapedForBash=true
   // shell-quotes $LOOP_PREV/$LOOP_USER_INPUT before splicing into the `bash -c` body.
   // Scripts never pass through a shell (execFile argv) — bash-quoting would inject
@@ -7033,12 +7049,12 @@ async function executeWaitNode(
     };
   } else if (node.wait.until !== undefined) {
     const rendered = substituteNodeOutputRefs(node.wait.until, nodeOutputs);
-    const resumeAtMs = Date.parse(rendered);
-    if (!Number.isFinite(resumeAtMs)) {
+    if (!waitUntilTimestampSchema.safeParse(rendered).success) {
       throw new Error(
         `Wait node '${node.id}' has an invalid 'until' timestamp after substitution: '${rendered}'`
       );
     }
+    const resumeAtMs = Date.parse(rendered);
     context = {
       nodeId: node.id,
       kind: 'time',
@@ -7110,26 +7126,24 @@ async function executeWaitNode(
   const output = JSON.stringify(result);
   const stepName = stepNamePrefix + node.id;
   if (persisted !== undefined) {
-    const { cleared } = await deps.store.clearWorkflowWaitContext(workflowRun.id, context);
+    const { cleared } = await deps.store.clearWorkflowWaitContext(workflowRun.id, context, {
+      stepName,
+      status,
+      waitedMs: result.waited_ms,
+      output,
+      result,
+    });
     if (!cleared) {
       throw new Error(`Wait node '${node.id}' lost ownership of its persisted wait cursor`);
     }
-  }
-  deps.store
-    .createWorkflowEvent({
+  } else {
+    await deps.store.createWorkflowEvent({
       workflow_run_id: workflowRun.id,
       event_type: status === 'expired' ? 'wait_expired' : 'wait_completed',
       step_name: stepName,
       data: result,
-    })
-    .catch((err: Error) => {
-      getLog().error(
-        { err, workflowRunId: workflowRun.id, eventType: `wait_${status}` },
-        'workflow_event_persist_failed'
-      );
     });
-  deps.store
-    .createWorkflowEvent({
+    await deps.store.createWorkflowEvent({
       workflow_run_id: workflowRun.id,
       event_type: 'node_completed',
       step_name: stepName,
@@ -7139,13 +7153,8 @@ async function executeWaitNode(
         node_output: output,
         structured_output: result,
       },
-    })
-    .catch((err: Error) => {
-      getLog().error(
-        { err, workflowRunId: workflowRun.id, eventType: 'node_completed' },
-        'workflow_event_persist_failed'
-      );
     });
+  }
   getWorkflowEventEmitter().emit({
     type: 'node_completed',
     runId: workflowRun.id,
@@ -10849,6 +10858,14 @@ export async function executeDagWorkflow(
   const scheduleQuotaResume = async (): Promise<ScheduledWorkflowResume | null | undefined> => {
     const policy = config.workflows;
     if (policy?.autoResumeOnQuotaReset !== true) return undefined;
+    if (execContext.kind === 'container') {
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'quota_resume_skipped',
+        data: { reason: 'container_unsupported' },
+      });
+      return undefined;
+    }
     const prior = isScheduledWorkflowResume(workflowRun.metadata?.scheduled_resume)
       ? workflowRun.metadata.scheduled_resume
       : undefined;

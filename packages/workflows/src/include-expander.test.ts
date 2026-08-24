@@ -183,10 +183,19 @@ describe('expandWorkflowIncludes — namespacing', () => {
         wait: { event: '$INPUTS.event', deadline_ms: 60_000 },
         depends_on: ['wait-for-window'],
       },
+      {
+        id: 'wait-for-input-time',
+        wait: { until: '$INPUTS.resume_at' },
+        depends_on: ['wait-for-event'],
+      },
     ]);
-    block.inputs = { event: { required: true } };
+    block.inputs = { event: { required: true }, resume_at: { required: true } };
     const parent = wf('parent', [
-      { id: 'waiting', include: 'waiting-block', with: { event: 'checks.complete' } },
+      {
+        id: 'waiting',
+        include: 'waiting-block',
+        with: { event: 'checks.complete', resume_at: '2026-08-25T23:00:00Z' },
+      },
     ]);
 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
@@ -195,11 +204,15 @@ describe('expandWorkflowIncludes — namespacing', () => {
     const expanded = workflows.get('parent')!;
     const untilNode = nodeById(expanded, 'waiting__wait-for-window');
     const eventNode = nodeById(expanded, 'waiting__wait-for-event');
+    const inputTimeNode = nodeById(expanded, 'waiting__wait-for-input-time');
     expect(untilNode && 'wait' in untilNode ? untilNode.wait.until : undefined).toBe(
       '$waiting__schedule.output'
     );
     expect(eventNode && 'wait' in eventNode ? eventNode.wait.event : undefined).toBe(
       'checks.complete'
+    );
+    expect(inputTimeNode && 'wait' in inputTimeNode ? inputTimeNode.wait.until : undefined).toBe(
+      '2026-08-25T23:00:00Z'
     );
   });
 

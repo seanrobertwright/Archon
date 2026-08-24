@@ -854,9 +854,15 @@ export function validateDagStructure(
     return seen;
   };
 
+  const hasDurableWait = (node: DagNode | IncludeDirective): boolean => {
+    if (isIncludeDirective(node)) return false;
+    if (isWaitNode(node)) return true;
+    return isLoopGroupNode(node) && node.loop_group.nodes.some(hasDurableWait);
+  };
   const canSuspend = (node: DagNode | IncludeDirective): boolean => {
     if (isIncludeDirective(node)) return false;
-    if (isGateNode(node) || isWaitNode(node)) return true;
+    if (isGateNode(node) || isWaitNode(node) || isWorkflowNode(node)) return true;
+    if (isLoopNode(node) && node.loop.interactive) return true;
     return isLoopGroupNode(node) && node.loop_group.nodes.some(canSuspend);
   };
   const suspensionNodes = nodes.filter(canSuspend);
@@ -866,8 +872,8 @@ export function validateDagStructure(
     for (const right of suspensionNodes.slice(index + 1)) {
       const ordered =
         transitiveDepsOf(left.id).has(right.id) || transitiveDepsOf(right.id).has(left.id);
-      if (!ordered) {
-        return `Suspending nodes '${left.id}' and '${right.id}' can run concurrently; add a dependency so only one wait or approval owns the run cursor at a time`;
+      if (!ordered && (hasDurableWait(left) || hasDurableWait(right))) {
+        return `Suspending nodes '${left.id}' and '${right.id}' can run concurrently; add a dependency so only one suspension owns the run cursor at a time`;
       }
     }
   }
@@ -1211,6 +1217,12 @@ export function validateDagStructure(
       );
       if (misplacedWait) {
         return `loop_group '${node.id}' body: wait node '${misplacedWait.id}' must be the body's sole terminal sink`;
+      }
+      const nestedWaitGroup = node.loop_group.nodes.find(
+        n => !isIncludeDirective(n) && isLoopGroupNode(n) && hasDurableWait(n)
+      );
+      if (nestedWaitGroup) {
+        return `loop_group '${node.id}' body: wait nodes nested below another loop_group are not supported`;
       }
       const scopeNodes = new Map<string, DagNode | IncludeDirective>([
         ...(enclosingNodes ?? []),

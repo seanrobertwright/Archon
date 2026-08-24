@@ -30,6 +30,7 @@ import {
   reRunsOwnNodeOnResume,
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
+  isWaitNode,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
   RUN_METADATA_KEYS,
@@ -1726,6 +1727,22 @@ export async function executeWorkflow(
     (priorCompletedNodes !== undefined || preCreatedRun.status !== 'pending');
   if (isContinuation && modelOverrides !== undefined) {
     throw new Error('Cannot supply model overrides when resuming an existing workflow run.');
+  }
+
+  const containsWait = (nodes: readonly (DagNode | IncludeDirective)[]): boolean =>
+    nodes.some(node => {
+      if (!('kind' in node)) return false;
+      if (isWaitNode(node)) return true;
+      return isLoopGroupNode(node) && containsWait(node.loop_group.nodes);
+    });
+  if (
+    preCreatedRun === undefined &&
+    execContext.kind === 'container' &&
+    containsWait(workflow.nodes)
+  ) {
+    throw new Error(
+      `Workflow '${workflow.name}' contains a durable wait, which is not supported in container isolation because server continuation cannot rewire the container. Run it without container isolation.`
+    );
   }
 
   if (preCreatedRun !== undefined) {

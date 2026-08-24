@@ -3714,26 +3714,9 @@ export function registerApiRoutes(
       if (!signaled) {
         return apiError(c, 400, `Run is not waiting on event '${event}'`);
       }
-      const actorUserId = await resolveWebUserId(c);
-      let resumed = false;
-      if (!run.parent_conversation_id) {
-        resumed = await resumeWorkflowRunFromServer(run, actorUserId);
-      } else {
-        const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
-        if (parentConv?.platform_conversation_id && parentConv.platform_type === 'web') {
-          await dispatchToOrchestrator(
-            parentConv.platform_conversation_id,
-            `/workflow resume ${run.id}`,
-            { userId: actorUserId }
-          );
-          resumed = true;
-        }
-      }
       return c.json({
         success: true,
-        message: resumed
-          ? `Signaled '${event}' and resumed workflow: ${run.workflow_name}`
-          : `Signaled '${event}'. The run remains resumable.`,
+        message: `Signaled '${event}'. The workflow will resume shortly.`,
       });
     } catch (error) {
       getLog().error({ err: error, runId, event }, 'signal_workflow_wait_api_failed');
