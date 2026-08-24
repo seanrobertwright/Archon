@@ -526,7 +526,8 @@ export default function (pi) {
       const res = await fetch(
         `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`,
       );
-      return JSON.stringify(await res.json());
+      const body = JSON.stringify(await res.json());
+      return { content: [{ type: "text", text: body }], details: {} };
     },
   });
 
@@ -540,7 +541,8 @@ export default function (pi) {
     },
     async execute(_callId, { url }) {
       const res = await fetch(url);
-      return res.text();
+      const text = await res.text();
+      return { content: [{ type: "text", text }], details: {} };
     },
   });
 }
@@ -573,28 +575,39 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 export default function (pi) {
+  // Module scope persists for the whole process while session_start fires per
+  // session — the loader is reloaded once per run, so connect must be idempotent
+  // or the second session throws.
+  let connected = false;
   const client = new Client({ name: "archon-mcp-bridge", version: "1.0.0" });
 
   pi.on("session_start", async () => {
-    await client.connect(
-      new StdioClientTransport({
-        command: "npx",
-        args: ["-y", "@modelcontextprotocol/server-everything"],
-      }),
-    );
+    if (!connected) {
+      await client.connect(
+        new StdioClientTransport({
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-everything"],
+        }),
+      );
+      connected = true;
+    }
     const { tools } = await client.listTools();
     for (const tool of tools) {
       pi.registerTool({
         name: `mcp_${tool.name}`,
         description: tool.description ?? `MCP tool ${tool.name}`,
         parameters: tool.inputSchema,
-        execute: async (_callId, args) =>
-          JSON.stringify(await client.callTool({ name: tool.name, arguments: args })),
+        execute: async (_callId, args) => {
+          const body = JSON.stringify(await client.callTool({ name: tool.name, arguments: args }));
+          return { content: [{ type: "text", text: body }], details: {} };
+        },
       });
     }
   });
 }
 ```
+
+Note that `execute` must return an `AgentToolResult` (`{ content, details }`); a bare string is normalized to an empty tool result and the model never sees any output.
 
 The bridge runs inside the Pi session process, subject to everything above: it loads only when `enableExtensions` is true for that node, its tools are just tools (so you can keep them off nodes with a scoped `pi:` block), and if it needs a UI-bound approval gate you give it `interactive: true`. Community bridges exist too — search the [package ecosystem](https://shittycodingagent.ai/packages) for `mcp` before writing your own.
 
@@ -651,7 +664,7 @@ nodes:
 | System prompt override | ✅ | `systemPrompt:` |
 | Codebase env vars (`envInjection`) | ✅ | `.archon/config.yaml` `env:` section |
 | MCP servers | ❌ (bridged via your own extension) | No `mcpServers` field exists. An extension can act as MCP client and expose the tools in-process — see [Recipe: MCP servers through an extension bridge](#recipe-mcp-servers-through-an-extension-bridge). |
-| In-process native tools | ✅ | none — Archon's `manage_run` tool is auto-injected in project-scoped chat via Pi `customTools` (distinct from MCP, which Pi rejects). Gated on the `nativeTools` provider capability. |
+| In-process native tools | ✅ | none — Archon's `manage_run` tool is auto-injected in project-scoped chat via Pi `customTools` (distinct from MCP, which Pi has no native surface for — see the [bridge recipe](#recipe-mcp-servers-through-an-extension-bridge)). Gated on the `nativeTools` provider capability. |
 | Claude-SDK hooks | ❌ | Claude-specific format |
 | Structured output | ✅ (best-effort) | `output_format:` — schema is appended to the prompt and JSON is parsed out of the assistant text. Handles bare JSON, ```json```-fenced, reasoning-model prose preambles like `Let me evaluate... {...}` (Minimax M2.x pattern), and structurally-corrupt JSON (trailing commas, single quotes, truncated tails) via repair. The parsed output is then **validated against the schema**; on a miss the executor re-asks (prompt + the schema errors) up to **3×**, and only then **fails** the node (it no longer degrades silently to a warning). Not SDK-enforced like Claude/Codex. |
 | Cost limits (`maxBudgetUsd`) | ❌ | tracked in result chunk, not enforced |
