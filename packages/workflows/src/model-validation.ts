@@ -17,35 +17,31 @@
 import { getProviderCapabilities, isRegisteredProvider } from '@archon/providers';
 import { parsePiModelRef } from '@archon/providers/community/pi';
 import tierDefaults from './defaults/tier-defaults.json';
-import { EFFORT_LEVELS, thinkingConfigSchema, type ThinkingConfig } from './schemas/dag-node';
+import { EFFORT_LEVELS } from './schemas/dag-node';
+import {
+  runModelBindingsMetadataSchema,
+  TIER_NAMES,
+  type ModelAliasPreset,
+  type RawAliasEntry,
+  type RawAliasesConfig,
+  type RawTiersConfig,
+  type ResolvedAiProfile,
+  type ResolvedRunModelOverrides,
+  type RunModelBindingsMetadata,
+  type TierName,
+} from './schemas/model-binding';
 
-/** Reserved tier names — cannot be used as custom alias names */
-export const TIER_NAMES = ['small', 'medium', 'large'] as const;
-export type TierName = (typeof TIER_NAMES)[number];
-
-/** A model preset — provider + model string + optional provider-specific options */
-export interface ModelAliasPreset {
-  provider: string;
-  model: string;
-  effort?: string;
-  thinking?: ThinkingConfig;
-}
-
-/** Alias entry as written in config YAML — user-defined @custom aliases.
- * Structurally identical to ModelAliasPreset; kept separate to distinguish
- * config-layer input from resolved output. */
-export interface RawAliasEntry {
-  provider: string;
-  model: string;
-  effort?: string;
-  thinking?: ThinkingConfig;
-}
-
-/** The aliases map from config YAML — keyed by alias name */
-export type RawAliasesConfig = Record<string, RawAliasEntry>;
-
-/** The tiers map from config YAML — keyed by small/medium/large */
-export type RawTiersConfig = Partial<Record<TierName, RawAliasEntry>>;
+export { TIER_NAMES };
+export type {
+  ModelAliasPreset,
+  RawAliasEntry,
+  RawAliasesConfig,
+  RawTiersConfig,
+  ResolvedAiProfile,
+  ResolvedRunModelOverrides,
+  RunModelBindingsMetadata,
+  TierName,
+};
 
 /** Sparse transport shape accepted by one workflow invocation. */
 export interface RunModelOverrides {
@@ -53,26 +49,7 @@ export interface RunModelOverrides {
   aliases?: Record<string, string>;
 }
 
-/** Validated, provider-aware layer applied at the top of one run's profile. */
-export interface ResolvedRunModelOverrides {
-  tiers?: RawTiersConfig;
-  aliases?: RawAliasesConfig;
-}
-
-/** Additive, non-secret run metadata used for attribution and cold resume. */
-export interface RunModelBindingsMetadata {
-  overrides: ResolvedRunModelOverrides;
-  effective: ResolvedAiProfile;
-}
-
 export const RUN_MODEL_BINDINGS_METADATA_KEY = 'model_bindings';
-
-/** The resolved AI profile — used by resolveModelSpec */
-export interface ResolvedAiProfile {
-  defaultProvider: string;
-  /** Fully resolved alias map: includes tier entries (small/medium/large) + @custom entries */
-  aliases: Record<string, ModelAliasPreset>;
-}
 
 /** What resolveModelSpec returns */
 export type ResolvedModelSpec = ModelAliasPreset | { literal: string };
@@ -124,29 +101,9 @@ function assertValidEntry(name: string, entry: RawAliasEntry): void {
   }
 }
 
-function assertValidPersistedPreset(name: string, entry: unknown): asserts entry is RawAliasEntry {
-  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-    throw new Error(`Model binding '${name}' must be an object.`);
-  }
-  const record = entry as Record<string, unknown>;
-  assertValidEntry(name, record as unknown as RawAliasEntry);
-  if (record.effort !== undefined) {
-    if (
-      typeof record.effort !== 'string' ||
-      !isEffortValidForProvider(record.provider as string, record.effort)
-    ) {
-      throw new Error(`Model binding '${name}' has an invalid effort.`);
-    }
-  }
-  if (record.thinking !== undefined) {
-    if (
-      !record.thinking ||
-      typeof record.thinking !== 'object' ||
-      Array.isArray(record.thinking) ||
-      !thinkingConfigSchema.safeParse(record.thinking).success
-    ) {
-      throw new Error(`Model binding '${name}' has invalid thinking options.`);
-    }
+function assertValidPersistedPreset(name: string, entry: ModelAliasPreset): void {
+  if (entry.effort !== undefined && !isEffortValidForProvider(entry.provider, entry.effort)) {
+    throw new Error(`Model binding '${name}' has an invalid effort.`);
   }
 }
 
@@ -400,50 +357,36 @@ export function readRunModelBindingsMetadata(
 ): RunModelBindingsMetadata | undefined {
   const value = metadata?.[RUN_MODEL_BINDINGS_METADATA_KEY];
   if (value === undefined) return undefined;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+  const parsed = runModelBindingsMetadataSchema.safeParse(value);
+  if (!parsed.success) {
+    const path = parsed.error.issues[0]?.path ?? [];
+    const bindingName = typeof path[2] === 'string' ? path[2] : 'unknown';
+    if (path.includes('thinking')) {
+      throw new Error(`Model binding '${bindingName}' has invalid thinking options.`);
+    }
+    if (path.includes('effort')) {
+      throw new Error(`Model binding '${bindingName}' has an invalid effort.`);
+    }
+    if (path[0] === 'overrides' && (path[1] === 'tiers' || path[1] === 'aliases')) {
+      throw new Error(`Workflow run has invalid model_bindings ${path[1]} metadata.`);
+    }
+    if (path[0] === 'effective') {
+      throw new Error('Workflow run has invalid effective model bindings.');
+    }
     throw new Error('Workflow run has invalid model_bindings metadata.');
   }
-  const record = value as Record<string, unknown>;
-  const overrides = record.overrides;
-  const effective = record.effective;
-  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
-    throw new Error('Workflow run has invalid model_bindings overrides metadata.');
-  }
-  if (!effective || typeof effective !== 'object' || Array.isArray(effective)) {
-    throw new Error('Workflow run has invalid model_bindings effective metadata.');
-  }
 
-  const overridesRecord = overrides as Record<string, unknown>;
-  for (const layerName of ['tiers', 'aliases'] as const) {
-    const layer = overridesRecord[layerName];
-    if (layer !== undefined && (!layer || typeof layer !== 'object' || Array.isArray(layer))) {
-      throw new Error(`Workflow run has invalid model_bindings ${layerName} metadata.`);
-    }
-    for (const [name, preset] of Object.entries((layer ?? {}) as Record<string, unknown>)) {
+  for (const layer of [
+    parsed.data.overrides.tiers,
+    parsed.data.overrides.aliases,
+    parsed.data.effective.aliases,
+  ]) {
+    for (const [name, preset] of Object.entries(layer ?? {})) {
       assertValidPersistedPreset(name, preset);
     }
   }
 
-  const effectiveRecord = effective as Record<string, unknown>;
-  if (
-    typeof effectiveRecord.defaultProvider !== 'string' ||
-    !effectiveRecord.aliases ||
-    typeof effectiveRecord.aliases !== 'object' ||
-    Array.isArray(effectiveRecord.aliases)
-  ) {
-    throw new Error('Workflow run has invalid effective model bindings.');
-  }
-
-  const resolved = overridesRecord as ResolvedRunModelOverrides;
-  buildAiProfile(effectiveRecord.defaultProvider, {
-    runTiers: resolved.tiers,
-    runAliases: resolved.aliases,
-  });
-  for (const [name, preset] of Object.entries(effectiveRecord.aliases)) {
-    assertValidPersistedPreset(name, preset);
-  }
-
-  return value as RunModelBindingsMetadata;
+  return parsed.data;
 }
 
 /**
