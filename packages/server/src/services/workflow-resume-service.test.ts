@@ -147,6 +147,7 @@ describe('workflow continuation scanner', () => {
       workflowResumeTargetForConversation(
         { platform_type: 'web', platform_conversation_id: 'web-worker-123' },
         new Map([['web', webPlatform]]),
+        'web-worker-123',
         'visible-web-conv'
       )
     ).toEqual({
@@ -155,6 +156,27 @@ describe('workflow continuation scanner', () => {
         platform: webPlatform,
         conversationId: 'web-worker-123',
         resultConversationId: 'visible-web-conv',
+      },
+    });
+
+    const slackPlatform = {
+      sendMessage: mock(async () => undefined),
+      getStreamingMode: () => 'batch' as const,
+      getPlatformType: () => 'slack',
+    } satisfies IWorkflowPlatform;
+    expect(
+      workflowResumeTargetForConversation(
+        { platform_type: 'slack', platform_conversation_id: 'slack-thread' },
+        new Map([['slack', slackPlatform]]),
+        'hidden-worker-id',
+        'slack-thread'
+      )
+    ).toEqual({
+      kind: 'platform',
+      destination: {
+        platform: slackPlatform,
+        conversationId: 'hidden-worker-id',
+        resultConversationId: 'slack-thread',
       },
     });
 

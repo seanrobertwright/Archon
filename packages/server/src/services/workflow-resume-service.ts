@@ -58,6 +58,7 @@ export function workflowResumeConversationId(run: WorkflowRun): string {
 export function workflowResumeTargetForConversation(
   conversation: { platform_type: string; platform_conversation_id: string | null },
   platforms: ReadonlyMap<string, IWorkflowPlatform>,
+  executionConversationId?: string,
   resultConversationId?: string
 ): WorkflowResumeTarget {
   if (conversation.platform_type === 'cli' || conversation.platform_type === 'api') {
@@ -77,10 +78,12 @@ export function workflowResumeTargetForConversation(
     kind: 'platform',
     destination: {
       platform,
-      conversationId: conversation.platform_conversation_id,
-      ...(conversation.platform_type === 'web'
-        ? { resultConversationId: resultConversationId ?? conversation.platform_conversation_id }
-        : {}),
+      conversationId: executionConversationId ?? conversation.platform_conversation_id,
+      ...(resultConversationId !== undefined
+        ? { resultConversationId }
+        : conversation.platform_type === 'web'
+          ? { resultConversationId: conversation.platform_conversation_id }
+          : {}),
     },
   };
 }

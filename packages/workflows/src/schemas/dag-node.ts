@@ -636,13 +636,25 @@ const waitUntilValueSchema = z
     "'wait.until' must be an ISO-8601 timestamp or contain a runtime reference"
   );
 
+// The transforms preserve the validated wire shape while making sibling fields
+// `never` in the inferred type, so widened programmatic objects cannot combine variants.
 export const waitConfigSchema = z.union([
-  z.strictObject({ duration_ms: z.number().int().positive() }),
-  z.strictObject({ until: waitUntilValueSchema }),
-  z.strictObject({
-    event: z.string().trim().min(1, "'wait.event' must not be empty"),
-    deadline_ms: z.number().int().positive(),
-  }),
+  z
+    .strictObject({ duration_ms: z.number().int().positive() })
+    .transform(
+      value => value as typeof value & { until?: never; event?: never; deadline_ms?: never }
+    ),
+  z
+    .strictObject({ until: waitUntilValueSchema })
+    .transform(
+      value => value as typeof value & { duration_ms?: never; event?: never; deadline_ms?: never }
+    ),
+  z
+    .strictObject({
+      event: z.string().trim().min(1, "'wait.event' must not be empty"),
+      deadline_ms: z.number().int().positive(),
+    })
+    .transform(value => value as typeof value & { duration_ms?: never; until?: never }),
 ]);
 export type WaitConfig = z.infer<typeof waitConfigSchema>;
 
@@ -653,10 +665,10 @@ export type WaitCondition =
   | { kind: 'event'; event: string; deadlineMs: number };
 
 export function waitCondition(config: WaitConfig): WaitCondition {
-  if ('duration_ms' in config) {
+  if (config.duration_ms !== undefined) {
     return { kind: 'duration', durationMs: config.duration_ms };
   }
-  if ('until' in config) {
+  if (config.until !== undefined) {
     return { kind: 'until', timestamp: config.until };
   }
   return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };

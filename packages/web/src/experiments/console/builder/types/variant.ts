@@ -133,6 +133,11 @@ export type WaitNodeData = {
   >;
 };
 
+/** Sparse builder output before structural validation restores the wire invariant. */
+export type BuilderDagFragment = Omit<Partial<WireDagNode>, 'wait'> & {
+  wait?: WaitNodeData;
+};
+
 /** Script node data (inline code or named script run via bun/uv). */
 export interface ScriptNodeData {
   script: string;

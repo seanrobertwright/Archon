@@ -8,6 +8,7 @@ export type {
   ApprovalOnReject,
   ApprovalNodeData,
   WaitNodeData,
+  BuilderDagFragment,
   CancelNodeData,
   ScriptNodeData,
   CommandNodeData,

@@ -16,6 +16,7 @@ import {
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
   scheduledWorkflowResumeSchema,
+  workflowWaitContextSchema,
   TERMINAL_WORKFLOW_STATUSES,
 } from '@archon/workflows/schemas/workflow-run';
 import type {
@@ -1298,13 +1299,14 @@ export async function pauseWorkflowRunForWait(
   waitContext: WorkflowWaitContext,
   pause: WorkflowWaitPause
 ): Promise<void> {
+  const parsedWaitContext = workflowWaitContextSchema.parse(waitContext);
   try {
     await getDatabase().withTransaction(async query => {
       const result = await query(
         `UPDATE remote_agent_workflow_runs
          SET status = 'paused', metadata = ${replaceWaitMetadata(2)}
          WHERE id = $1 AND status = 'running'`,
-        [id, JSON.stringify(waitContext)]
+        [id, JSON.stringify(parsedWaitContext)]
       );
       if ((result.rowCount ?? 0) === 0) {
         throw new Error(`Workflow run not found or not in running state (id: ${id})`);
@@ -1315,9 +1317,9 @@ export async function pauseWorkflowRunForWait(
           event_type: 'wait_started',
           step_name: pause.stepName,
           data: {
-            kind: waitContext.kind,
-            resume_at: waitContext.resumeAt,
-            ...(waitContext.kind === 'event' ? { event: waitContext.event } : {}),
+            kind: parsedWaitContext.kind,
+            resume_at: parsedWaitContext.resumeAt,
+            ...(parsedWaitContext.kind === 'event' ? { event: parsedWaitContext.event } : {}),
           },
         });
       }

@@ -16,6 +16,7 @@ import {
   BASH_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
+  waitConfigSchema,
   inputEnvKey,
   readSubrunMetadata,
   RUN_METADATA_KEYS,
@@ -31,6 +32,7 @@ import type {
   HaltNode,
   IncludeDirective,
   TriggerRule,
+  WaitConfig,
 } from './schemas';
 
 // ---------------------------------------------------------------------------
@@ -120,6 +122,10 @@ describe('dagNodeSchema — durable wait', () => {
   });
 
   test('rejects ambiguous and unbounded waits', () => {
+    const mixedWait = { duration_ms: 1, until: '2026-08-25T10:00:00Z' };
+    // @ts-expect-error A programmatic caller must not be able to construct two wait variants.
+    const invalidTypedWait: WaitConfig = mixedWait;
+    expect(waitConfigSchema.safeParse(invalidTypedWait).success).toBe(false);
     expect(
       dagNodeSchema.safeParse({ id: 'mixed', wait: { duration_ms: 1, until: 'later' } }).success
     ).toBe(false);

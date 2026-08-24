@@ -447,8 +447,8 @@ function rewriteNodeOutputRefs(
   } else if (isExecNode(node)) {
     node.script = code(node.script);
   } else if (isWaitNode(node)) {
-    if ('until' in node.wait) node.wait.until = code(node.wait.until);
-    if ('event' in node.wait) node.wait.event = code(node.wait.event);
+    if (node.wait.until !== undefined) node.wait.until = code(node.wait.until);
+    if (node.wait.event !== undefined) node.wait.event = code(node.wait.event);
   } else if (isWorkflowNode(node)) {
     // workflow.input, workflow.with values and workflow.fan_out.items are live
     // code/expression ref surfaces (data strings), so refs inside an included block's
@@ -609,8 +609,8 @@ function applyInputsMacro(
   } else if (isExecNode(node)) {
     node.script = substitute(node.script);
   } else if (isWaitNode(node)) {
-    if ('until' in node.wait) node.wait.until = substitute(node.wait.until);
-    if ('event' in node.wait) node.wait.event = substitute(node.wait.event);
+    if (node.wait.until !== undefined) node.wait.until = substitute(node.wait.until);
+    if (node.wait.event !== undefined) node.wait.event = substitute(node.wait.event);
   } else if (isWorkflowNode(node)) {
     // `input:` is the child's $ARGUMENTS — a TEXT channel by construction, so a typed
     // input splices as canonical text there; `with:` values are typed positions.

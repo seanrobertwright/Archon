@@ -984,19 +984,22 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     if (!conversation) {
       return { kind: 'unavailable', reason: 'origin conversation no longer exists' };
     }
-    let resultConversationId: string | undefined;
     if (run.parent_conversation_id !== null) {
       const parent = await conversationDb.getConversationById(run.parent_conversation_id);
       if (!parent?.platform_conversation_id) {
         return { kind: 'unavailable', reason: 'parent conversation no longer exists' };
       }
-      resultConversationId = parent.platform_conversation_id;
+      if (!conversation.platform_conversation_id) {
+        return { kind: 'unavailable', reason: 'worker conversation has no platform id' };
+      }
+      return workflowResumeTargetForConversation(
+        parent,
+        workflowPlatforms,
+        conversation.platform_conversation_id,
+        parent.platform_conversation_id
+      );
     }
-    return workflowResumeTargetForConversation(
-      conversation,
-      workflowPlatforms,
-      resultConversationId
-    );
+    return workflowResumeTargetForConversation(conversation, workflowPlatforms);
   });
 
   // Graceful shutdown

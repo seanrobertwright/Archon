@@ -472,6 +472,22 @@ describe('workflows database', () => {
       expect(mockQuery.mock.calls).toHaveLength(2);
     });
 
+    test('rejects widened mixed wait fields before persistence', async () => {
+      const mixed = {
+        owner: 'node' as const,
+        nodeId: 'later',
+        kind: 'time' as const,
+        event: 'checks.complete',
+        waitingSince: '2026-08-24T10:00:00.000Z',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+      };
+
+      await expect(
+        pauseWorkflowRunForWait('workflow-run-123', mixed, { kind: 'continued' })
+      ).rejects.toThrow();
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
     test('lists due paused waits and quota-failed continuations', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
       const result = await listDueWorkflowContinuations(new Date('2026-08-25T10:00:00.000Z'), 25);

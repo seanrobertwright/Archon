@@ -8,7 +8,14 @@
  * type-safe for `toDag` (the data type cannot be correlated with the variant key
  * once destructured). The helpers recover that correlation without `any`.
  */
-import type { BuilderNode, VariantData, VariantDataMap, VariantId, WireDagNode } from '../types';
+import type {
+  BuilderDagFragment,
+  BuilderNode,
+  VariantData,
+  VariantDataMap,
+  VariantId,
+  WireDagNode,
+} from '../types';
 import { VARIANT_CAPABILITIES, type VariantCapabilities } from './capabilities';
 import { defaultLoopData, loopFromDag, loopToDag } from './loop';
 import { approvalFromDag, approvalToDag, defaultApprovalData } from './approval';
@@ -43,7 +50,7 @@ export interface VariantRegistryEntry<K extends VariantId> {
   label: string;
   defaultData: () => VariantDataMap[K];
   fromDag: (variantSpecific: Partial<WireDagNode>) => VariantDataMap[K];
-  toDag: (data: VariantDataMap[K]) => Partial<WireDagNode>;
+  toDag: (data: VariantDataMap[K]) => BuilderDagFragment;
   capabilities: VariantCapabilities;
   /**
    * The wire keys this variant's converters consume from `variantSpecific`.
@@ -140,7 +147,7 @@ export function variantDataFromDag(
  * on the discriminant lets `node.data` narrow to the matching `toDag` parameter
  * type — no casts, no `any`.
  */
-export function nodeDataToDag(node: BuilderNode): Partial<WireDagNode> {
+export function nodeDataToDag(node: BuilderNode): BuilderDagFragment {
   switch (node.variant) {
     case 'loop':
       return loopToDag(node.data);
