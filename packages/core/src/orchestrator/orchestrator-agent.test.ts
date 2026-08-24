@@ -2045,9 +2045,17 @@ describe('workflow dispatch routing — interactive flag', () => {
       'conv-1',
       expect.stringContaining('Found a prior interrupted run of **test-workflow**')
     );
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Discard the interrupted run')
+    );
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('leave the interrupted run as-is')
+    );
     expect(platform.sendMessage).not.toHaveBeenCalledWith(
       'conv-1',
-      expect.stringContaining('Found a prior failed run')
+      expect.stringContaining('failed run')
     );
   });
 
