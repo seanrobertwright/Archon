@@ -1550,40 +1550,35 @@ describe('classifyOpencodeError (#2715)', () => {
     ).toBe('auth');
   });
 
-  test('classifies exact structured status codes before prose', () => {
-    expect(classifyOpencodeError({ statusCode: 401 }, false)).toBe('auth');
-    expect(classifyOpencodeError({ statusCode: 429 }, false)).toBe('rate_limit');
-    expect(
-      classifyOpencodeError(
-        { name: 'APIError', data: { message: 'request failed', statusCode: 403 } },
-        false
-      )
-    ).toBe('auth');
-    expect(
-      classifyOpencodeError(
-        {
-          name: 'APIError',
-          data: { message: 'request failed', statusCode: 429, isRetryable: true },
-        },
-        false
-      )
-    ).toBe('rate_limit');
+  test('classifies exact structured statuses across top-level, SDK, and wrapped shapes', () => {
+    const cases = [
+      [401, 'auth'],
+      [403, 'auth'],
+      [429, 'rate_limit'],
+    ] as const;
+
+    for (const [statusCode, expectedClass] of cases) {
+      expect(classifyOpencodeError({ statusCode }, false)).toBe(expectedClass);
+
+      const sdkError = {
+        name: 'APIError',
+        data: { message: 'request failed', statusCode, isRetryable: statusCode === 429 },
+      };
+      expect(classifyOpencodeError(sdkError, false)).toBe(expectedClass);
+
+      const wrappedError = new Error('request failed');
+      wrappedError.cause = sdkError;
+      expect(classifyOpencodeError(wrappedError, false)).toBe(expectedClass);
+    }
   });
 
-  test('classifies SDK discriminators and structured status codes through Error.cause', () => {
+  test('classifies the SDK auth discriminator through Error.cause', () => {
     const authError = new Error('provider rejected request');
     authError.cause = {
       name: 'ProviderAuthError',
       data: { providerID: 'anthropic', message: 'provider rejected request' },
     };
     expect(classifyOpencodeError(authError, false)).toBe('auth');
-
-    const rateLimitError = new Error('upstream request failed');
-    rateLimitError.cause = {
-      name: 'APIError',
-      data: { message: 'upstream request failed', statusCode: 429, isRetryable: true },
-    };
-    expect(classifyOpencodeError(rateLimitError, false)).toBe('rate_limit');
   });
 
   test('does not classify a bare "429" substring as rate_limit (#2509 R11 mirror)', () => {
