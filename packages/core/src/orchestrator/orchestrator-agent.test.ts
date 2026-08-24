@@ -2471,6 +2471,34 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(ctx.inputs).toEqual({ diff: 'D1' });
   });
 
+  test('threads context.workflowModelOverrides into a fresh foreground run', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
+      workflowModelOverrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
+
+    const opts = mockExecuteWorkflow.mock.calls[0][7] as { modelOverrides?: unknown };
+    expect(opts.modelOverrides).toEqual({ tiers: { large: 'openai/gpt-5.6' } });
+  });
+
+  test('threads context.workflowModelOverrides into the console background path', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
+      workflowModelOverrides: { aliases: { '@planner': 'codex/gpt-5.6-sol' } },
+    });
+
+    const ctx = mockDispatchBackgroundWorkflow.mock.calls[0][0] as { modelOverrides?: unknown };
+    expect(ctx.modelOverrides).toEqual({
+      aliases: { '@planner': 'codex/gpt-5.6-sol' },
+    });
+  });
+
   test('refuses a required-input workflow when nothing is supplied, starting nothing', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));

@@ -335,9 +335,11 @@ import {
 } from './schemas/config.schemas';
 import {
   TIER_NAMES,
+  isTierName,
   isEffortValidForProvider,
   validEffortsForProvider,
 } from '@archon/workflows/model-validation';
+import type { RunModelOverrides } from '@archon/workflows/model-validation';
 import {
   providerListResponseSchema,
   piModelListResponseSchema,
@@ -851,9 +853,10 @@ const runWorkflowRoute = createRoute({
   tags: ['Workflows'],
   summary: 'Run a workflow via the orchestrator (JSON or multipart with file uploads)',
   description:
-    'Accepts `application/json` with `{ conversationId, message, inputs? }` or ' +
+    'Accepts `application/json` with `{ conversationId, message, inputs?, tiers?, aliases? }` or ' +
     '`multipart/form-data` with `conversationId`, `message`, an optional `inputs` field ' +
-    'holding the same map JSON-encoded, and optional file attachments (max 5 files, ' +
+    'holding the same map JSON-encoded, optional `tiers` and `aliases` JSON object fields, ' +
+    'and optional file attachments (max 5 files, ' +
     "10 MB each). `inputs` supplies values for the workflow's declared `inputs:` " +
     '(#2554); it is validated against the declaration before any worktree, clone, or AI ' +
     'cost, so a missing required input or an undeclared key is refused up front.',
@@ -1604,6 +1607,53 @@ export function registerApiRoutes(
     return {
       ok: true,
       inputs: entries.length > 0 ? (raw as Record<string, string>) : undefined,
+    };
+  }
+
+  function parseRunModelOverridesFields(
+    rawTiers: unknown,
+    rawAliases: unknown
+  ): { ok: true; overrides?: RunModelOverrides } | { ok: false; error: string } {
+    const parseMap = (
+      raw: unknown,
+      label: 'tiers' | 'aliases'
+    ): { ok: true; value?: Record<string, string> } | { ok: false; error: string } => {
+      if (raw === undefined || raw === null) return { ok: true };
+      if (typeof raw !== 'object' || Array.isArray(raw)) {
+        return { ok: false, error: `${label} must be an object mapping names to model specs` };
+      }
+      const entries = Object.entries(raw as Record<string, unknown>);
+      for (const [name, spec] of entries) {
+        if (typeof spec !== 'string' || spec.trim().length === 0) {
+          return { ok: false, error: `${label} value for '${name}' must be a non-empty string` };
+        }
+        if (label === 'tiers' && !isTierName(name)) {
+          return {
+            ok: false,
+            error: `Invalid tier '${name}'. Supported tiers: ${TIER_NAMES.join(', ')}`,
+          };
+        }
+        if (label === 'aliases' && !name.startsWith('@')) {
+          return { ok: false, error: `Alias '${name}' must start with '@'` };
+        }
+      }
+      return {
+        ok: true,
+        value: entries.length > 0 ? (raw as Record<string, string>) : undefined,
+      };
+    };
+
+    const tiers = parseMap(rawTiers, 'tiers');
+    if (!tiers.ok) return tiers;
+    const aliases = parseMap(rawAliases, 'aliases');
+    if (!aliases.ok) return aliases;
+    if (!tiers.value && !aliases.value) return { ok: true };
+    return {
+      ok: true,
+      overrides: {
+        ...(tiers.value ? { tiers: tiers.value } : {}),
+        ...(aliases.value ? { aliases: aliases.value } : {}),
+      } as RunModelOverrides,
     };
   }
 
@@ -3397,8 +3447,8 @@ export function registerApiRoutes(
   // POST /api/workflows/:name/run - Run a workflow via the orchestrator
   //
   // Accepts either:
-  //   - application/json: { conversationId, message }
-  //   - multipart/form-data: conversationId + message + files[] (≤5, ≤10MB each)
+  //   - application/json: { conversationId, message, inputs?, tiers?, aliases? }
+  //   - multipart/form-data: those maps JSON-encoded + files[] (≤5, ≤10MB each)
   //
   // Multipart matches /api/conversations/:id/message so the console's draft
   // run input can attach screenshots / stack traces / paste-blobs the same
@@ -3413,6 +3463,7 @@ export function registerApiRoutes(
     let message: string;
     let conversationId: string;
     let workflowInputs: Record<string, string> | undefined;
+    let workflowModelOverrides: RunModelOverrides | undefined;
     let savedFiles: AttachedFile[] = [];
     let uploadDir = '';
 
@@ -3458,6 +3509,35 @@ export function registerApiRoutes(
         workflowInputs = parsed.inputs;
       }
 
+      const decodeObjectField = (
+        raw: string | File | (string | File)[] | undefined,
+        label: 'tiers' | 'aliases'
+      ): { ok: true; value?: unknown } | { ok: false; error: string } => {
+        if (raw === undefined) return { ok: true };
+        if (typeof raw !== 'string') {
+          return { ok: false, error: `${label} must be a JSON-encoded object` };
+        }
+        try {
+          return { ok: true, value: JSON.parse(raw) as unknown };
+        } catch (parseErr: unknown) {
+          getLog().warn(
+            { err: parseErr, workflowName, field: label },
+            'run_workflow.model_overrides_parse_failed'
+          );
+          return { ok: false, error: `${label} must be a JSON-encoded object` };
+        }
+      };
+      const decodedTiers = decodeObjectField(body.tiers, 'tiers');
+      if (!decodedTiers.ok) return apiError(c, 400, decodedTiers.error);
+      const decodedAliases = decodeObjectField(body.aliases, 'aliases');
+      if (!decodedAliases.ok) return apiError(c, 400, decodedAliases.error);
+      const parsedOverrides = parseRunModelOverridesFields(
+        decodedTiers.value,
+        decodedAliases.value
+      );
+      if (!parsedOverrides.ok) return apiError(c, 400, parsedOverrides.error);
+      workflowModelOverrides = parsedOverrides.overrides;
+
       const rawFiles = body.files;
       const fileList: (string | File)[] = Array.isArray(rawFiles)
         ? rawFiles
@@ -3479,7 +3559,13 @@ export function registerApiRoutes(
         );
       }
     } else {
-      let body: { conversationId?: unknown; message?: unknown; inputs?: unknown };
+      let body: {
+        conversationId?: unknown;
+        message?: unknown;
+        inputs?: unknown;
+        tiers?: unknown;
+        aliases?: unknown;
+      };
       try {
         body = await c.req.json();
       } catch (parseErr: unknown) {
@@ -3495,6 +3581,9 @@ export function registerApiRoutes(
       const parsed = parseRunInputsField(body.inputs);
       if (!parsed.ok) return apiError(c, 400, parsed.error);
       workflowInputs = parsed.inputs;
+      const parsedOverrides = parseRunModelOverridesFields(body.tiers, body.aliases);
+      if (!parsedOverrides.ok) return apiError(c, 400, parsedOverrides.error);
+      workflowModelOverrides = parsedOverrides.overrides;
       conversationId = body.conversationId;
       message = body.message;
     }
@@ -3551,6 +3640,7 @@ export function registerApiRoutes(
         userId,
         ...(savedFiles.length > 0 ? { attachedFiles: savedFiles } : {}),
         ...(workflowInputs ? { workflowInputs } : {}),
+        ...(workflowModelOverrides ? { workflowModelOverrides } : {}),
       };
       const filesToCleanup = savedFiles.length > 0 ? { files: savedFiles, uploadDir } : undefined;
       const result = await dispatchToOrchestrator(

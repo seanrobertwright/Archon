@@ -194,6 +194,7 @@ Options:
   --no-worktree              Run on branch directly without worktree isolation
   --folder                   Register the current non-git directory as a folder project and run in place
   --input <name>=<value>     Supply a declared workflow input; repeat per input (mutually exclusive with --resume)
+  --model <name>=<spec>      Rebind small/medium/large or @alias for one run; repeat per binding
   --resume                   Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)
   --dry-run                  Simulate workflow DAG control flow without creating a run or contacting a provider
   --stubs <path>             YAML node-output map for --dry-run
@@ -652,6 +653,7 @@ async function main(): Promise<number> {
               pauseAtGates: pauseAtGatesFlag,
               // Raw `name=value` assignments; parsed at the invocation gate (#2554).
               inputs: values.input as string[] | undefined,
+              modelAssignments: values.model as string[] | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;

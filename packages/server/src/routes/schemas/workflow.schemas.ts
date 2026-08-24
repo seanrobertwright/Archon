@@ -267,6 +267,16 @@ export const runWorkflowBodySchema = z
      * field holding this object JSON-encoded (form fields can only be strings).
      */
     inputs: z.record(z.string(), z.string()).optional(),
+    /** Sparse per-run tier rebindings. Multipart sends this object JSON-encoded. */
+    tiers: z
+      .object({
+        small: z.string().optional(),
+        medium: z.string().optional(),
+        large: z.string().optional(),
+      })
+      .optional(),
+    /** Sparse per-run @alias rebindings. Multipart sends this object JSON-encoded. */
+    aliases: z.record(z.string(), z.string()).optional(),
   })
   .openapi('RunWorkflowBody');
 

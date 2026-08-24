@@ -16,6 +16,8 @@ import { WORKFLOW_EVENT_TYPES, type WorkflowEventType } from '@archon/workflows/
 import {
   isTierName,
   buildAiProfile,
+  parseRunModelAssignments,
+  resolveRunModelOverrides,
   TIER_NAMES,
   type TierName,
   type RawTiersConfig,
@@ -287,6 +289,8 @@ export interface WorkflowRunOptions {
    * (`parseInputAssignments` in `@archon/workflows`).
    */
   inputs?: string[];
+  /** Raw repeatable `--model name=spec` mappings; parsed once at the invocation gate. */
+  modelAssignments?: string[];
 }
 
 /**
@@ -1103,6 +1107,15 @@ async function runWorkflowWithOwnedSource(
   // dropped key can be a gate the author believes is protecting the run.
   emitParseWarnings(workflowEntry?.parseWarnings, workflow.name);
 
+  if (isContinuation && options.modelAssignments && options.modelAssignments.length > 0) {
+    throw new Error(
+      '--resume and --model are mutually exclusive. A resumed run keeps its original model bindings.'
+    );
+  }
+  const modelOverrides = options.modelAssignments
+    ? parseRunModelAssignments(options.modelAssignments)
+    : undefined;
+
   const dryRunOnlyOptions = [
     ['--stubs', options.stubsPath !== undefined],
     ['--stubs-init', options.stubsInitPath !== undefined],
@@ -1185,6 +1198,11 @@ async function runWorkflowWithOwnedSource(
     // script nodes, and running them in the checkout the workflow was merely READ from
     // would mutate the author's tree instead of the one they aimed the dry run at.
     const dryRunConfig = await loadConfig(cwd);
+    const dryRunBaseProfile = buildAiProfile(dryRunConfig.assistant, {
+      repoTiers: dryRunConfig.tiers,
+      repoAliases: dryRunConfig.aliases,
+    });
+    const dryRunModelOverrides = resolveRunModelOverrides(dryRunBaseProfile, modelOverrides);
     const result = await dryRunWorkflow({
       workflow,
       userMessage,
@@ -1198,6 +1216,8 @@ async function runWorkflowWithOwnedSource(
       aiProfile: buildAiProfile(dryRunConfig.assistant, {
         repoTiers: dryRunConfig.tiers,
         repoAliases: dryRunConfig.aliases,
+        runTiers: dryRunModelOverrides.tiers,
+        runAliases: dryRunModelOverrides.aliases,
       }),
     });
     if (options.json) {
@@ -2260,6 +2280,7 @@ async function runWorkflowWithOwnedSource(
           resolveChildIsolation,
           // Fresh run only: a resume (`prepared`) replays the inputs already on its row.
           inputs: resolvedInputs,
+          modelOverrides,
           // The frozen source this run executes, captured before the workflow was even
           // selected. A resume ignores it and loads the source recorded on its own row.
           preparedSource,

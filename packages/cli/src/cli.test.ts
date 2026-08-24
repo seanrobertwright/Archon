@@ -55,6 +55,32 @@ describe('CLI help output', () => {
     expect(result.stdout).toContain('--exec-code');
     expect(result.stdout).toContain('--pause-at-gates');
   });
+
+  it('documents sparse repeatable model bindings', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], { encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('--model <name>=<spec>');
+  });
+});
+
+describe('workflow model arguments', () => {
+  it('parses repeated --model values without accepting a coarse provider flag', () => {
+    const parsed = parseArgs({
+      args: ['workflow', 'run', 'x', '--model', 'large=openai/gpt-5.6', '--model', '@p=large'],
+      options: cliArgOptions,
+      allowPositionals: true,
+      strict: true,
+    });
+    expect(parsed.values.model).toEqual(['large=openai/gpt-5.6', '@p=large']);
+    expect(() =>
+      parseArgs({
+        args: ['workflow', 'run', 'x', '--provider', 'pi'],
+        options: cliArgOptions,
+        allowPositionals: true,
+        strict: true,
+      })
+    ).toThrow(/provider/);
+  });
 });
 
 describe('unknown flag rejection (#2769)', () => {

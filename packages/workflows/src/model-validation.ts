@@ -15,6 +15,7 @@
  */
 
 import { getProviderCapabilities, isRegisteredProvider } from '@archon/providers';
+import { parsePiModelRef } from '@archon/providers/community/pi';
 import tierDefaults from './defaults/tier-defaults.json';
 import { EFFORT_LEVELS, type ThinkingConfig } from './schemas/dag-node';
 
@@ -45,6 +46,26 @@ export type RawAliasesConfig = Record<string, RawAliasEntry>;
 
 /** The tiers map from config YAML — keyed by small/medium/large */
 export type RawTiersConfig = Partial<Record<TierName, RawAliasEntry>>;
+
+/** Sparse transport shape accepted by one workflow invocation. */
+export interface RunModelOverrides {
+  tiers?: Partial<Record<TierName, string>>;
+  aliases?: Record<string, string>;
+}
+
+/** Validated, provider-aware layer applied at the top of one run's profile. */
+export interface ResolvedRunModelOverrides {
+  tiers?: RawTiersConfig;
+  aliases?: RawAliasesConfig;
+}
+
+/** Additive, non-secret run metadata used for attribution and cold resume. */
+export interface RunModelBindingsMetadata {
+  overrides: ResolvedRunModelOverrides;
+  effective: ResolvedAiProfile;
+}
+
+export const RUN_MODEL_BINDINGS_METADATA_KEY = 'model_bindings';
 
 /** The resolved AI profile — used by resolveModelSpec */
 export interface ResolvedAiProfile {
@@ -131,6 +152,10 @@ export interface BuildAiProfileOptions {
   userTiers?: RawTiersConfig;
   /** Per-user aliases (DB) — highest precedence, override repoAliases on key collision */
   userAliases?: RawAliasesConfig;
+  /** One invocation's tier rebindings — highest precedence, sparse by key. */
+  runTiers?: RawTiersConfig;
+  /** One invocation's alias rebindings — highest precedence, sparse by key. */
+  runAliases?: RawAliasesConfig;
 }
 
 /**
@@ -159,7 +184,12 @@ export function buildAiProfile(
     }
   }
 
-  for (const layer of [options.globalTiers, options.repoTiers, options.userTiers]) {
+  for (const layer of [
+    options.globalTiers,
+    options.repoTiers,
+    options.userTiers,
+    options.runTiers,
+  ]) {
     if (!layer) continue;
     for (const [name, entry] of Object.entries(layer)) {
       assertValidTierName(name);
@@ -168,7 +198,12 @@ export function buildAiProfile(
     }
   }
 
-  for (const layer of [options.globalAliases, options.repoAliases, options.userAliases]) {
+  for (const layer of [
+    options.globalAliases,
+    options.repoAliases,
+    options.userAliases,
+    options.runAliases,
+  ]) {
     if (!layer) continue;
     for (const [name, entry] of Object.entries(layer)) {
       assertNotReserved(name);
@@ -179,6 +214,194 @@ export function buildAiProfile(
   }
 
   return { defaultProvider, aliases };
+}
+
+function presetForOverrideTarget(profile: ResolvedAiProfile, name: string): ModelAliasPreset {
+  if (isTierName(name)) return resolveTierWithFallback(profile, name).preset;
+  assertNotReserved(name);
+  assertCustomAliasPrefix(name);
+  const preset = profile.aliases[name];
+  if (!preset) throw new Error(`Cannot rebind unknown alias '${name}'.`);
+  return preset;
+}
+
+function resolveRunOverrideSpec(
+  profile: ResolvedAiProfile,
+  targetName: string,
+  rawSpec: string
+): RawAliasEntry {
+  const spec = rawSpec.trim();
+  if (spec.length === 0) throw new Error(`Model override '${targetName}' has an empty spec.`);
+
+  if (isTierName(spec) || spec.startsWith('@')) {
+    const resolved = resolveModelSpec(profile, spec);
+    if (isLiteralSpec(resolved)) {
+      throw new Error(`Model override '${targetName}' could not resolve '${spec}'.`);
+    }
+    return { ...resolved };
+  }
+
+  const slash = spec.indexOf('/');
+  if (slash === -1) {
+    const target = presetForOverrideTarget(profile, targetName);
+    return { provider: target.provider, model: spec };
+  }
+
+  const prefix = spec.slice(0, slash);
+  const remainder = spec.slice(slash + 1);
+  if (isRegisteredProvider(prefix)) {
+    if (remainder.length === 0) {
+      throw new Error(`Model override '${targetName}' has an empty model id.`);
+    }
+    if (prefix === 'pi' && !parsePiModelRef(remainder)) {
+      throw new Error(
+        `Model override '${targetName}' has invalid Pi model '${remainder}'. Expected <vendor>/<model>.`
+      );
+    }
+    return { provider: prefix, model: remainder };
+  }
+
+  if (!parsePiModelRef(spec)) {
+    throw new Error(
+      `Model override '${targetName}' has invalid model '${spec}'. Expected <agent>/<model> or <vendor>/<model>.`
+    );
+  }
+  return { provider: 'pi', model: spec };
+}
+
+/**
+ * Resolve one invocation's string mappings against the already-layered lower
+ * profile. This is the only transport-to-profile boundary used by CLI and HTTP.
+ */
+export function resolveRunModelOverrides(
+  profile: ResolvedAiProfile,
+  overrides: RunModelOverrides | undefined
+): ResolvedRunModelOverrides {
+  if (!overrides) return {};
+
+  const tiers: RawTiersConfig = {};
+  for (const [name, spec] of Object.entries(overrides.tiers ?? {})) {
+    assertValidTierName(name);
+    tiers[name] = resolveRunOverrideSpec(profile, name, spec);
+  }
+
+  const aliases: RawAliasesConfig = {};
+  for (const [name, spec] of Object.entries(overrides.aliases ?? {})) {
+    presetForOverrideTarget(profile, name);
+    aliases[name] = resolveRunOverrideSpec(profile, name, spec);
+  }
+
+  return {
+    ...(Object.keys(tiers).length > 0 ? { tiers } : {}),
+    ...(Object.keys(aliases).length > 0 ? { aliases } : {}),
+  };
+}
+
+/** Parse repeated CLI `name=spec` mappings into the shared transport shape. */
+export function parseRunModelAssignments(assignments: readonly string[]): RunModelOverrides {
+  const tiers: Partial<Record<TierName, string>> = {};
+  const aliases: Record<string, string> = {};
+  const seen = new Set<string>();
+
+  for (const assignment of assignments) {
+    const equals = assignment.indexOf('=');
+    if (equals <= 0 || equals === assignment.length - 1) {
+      throw new Error(
+        `Invalid --model '${assignment}'. Expected <small|medium|large|@alias>=<model>.`
+      );
+    }
+    const name = assignment.slice(0, equals).trim();
+    const spec = assignment.slice(equals + 1).trim();
+    if (seen.has(name)) throw new Error(`Duplicate --model binding '${name}'.`);
+    seen.add(name);
+
+    if (isTierName(name)) {
+      tiers[name] = spec;
+    } else {
+      assertNotReserved(name);
+      assertCustomAliasPrefix(name);
+      aliases[name] = spec;
+    }
+  }
+
+  return {
+    ...(Object.keys(tiers).length > 0 ? { tiers } : {}),
+    ...(Object.keys(aliases).length > 0 ? { aliases } : {}),
+  };
+}
+
+export function hasRunModelOverrides(overrides: ResolvedRunModelOverrides): boolean {
+  return (
+    Object.keys(overrides.tiers ?? {}).length > 0 || Object.keys(overrides.aliases ?? {}).length > 0
+  );
+}
+
+export function runOverrideAppliesToRef(
+  overrides: ResolvedRunModelOverrides,
+  ref: string | undefined
+): boolean {
+  if (!ref) return false;
+  if (isTierName(ref)) return overrides.tiers?.[ref] !== undefined;
+  return ref.startsWith('@') && overrides.aliases?.[ref] !== undefined;
+}
+
+export function createRunModelBindingsMetadata(
+  overrides: ResolvedRunModelOverrides,
+  effective: ResolvedAiProfile
+): RunModelBindingsMetadata {
+  return {
+    overrides: {
+      ...(overrides.tiers ? { tiers: { ...overrides.tiers } } : {}),
+      ...(overrides.aliases ? { aliases: { ...overrides.aliases } } : {}),
+    },
+    effective: {
+      defaultProvider: effective.defaultProvider,
+      aliases: Object.fromEntries(
+        Object.entries(effective.aliases).map(([name, preset]) => [name, { ...preset }])
+      ),
+    },
+  };
+}
+
+/** Read metadata written by this module; malformed external JSON fails explicitly. */
+export function readRunModelBindingsMetadata(
+  metadata: Record<string, unknown> | undefined
+): RunModelBindingsMetadata | undefined {
+  const value = metadata?.[RUN_MODEL_BINDINGS_METADATA_KEY];
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Workflow run has invalid model_bindings metadata.');
+  }
+  const record = value as Record<string, unknown>;
+  const overrides = record.overrides;
+  const effective = record.effective;
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    throw new Error('Workflow run has invalid model_bindings overrides metadata.');
+  }
+  if (!effective || typeof effective !== 'object' || Array.isArray(effective)) {
+    throw new Error('Workflow run has invalid model_bindings effective metadata.');
+  }
+
+  const effectiveRecord = effective as Record<string, unknown>;
+  if (
+    typeof effectiveRecord.defaultProvider !== 'string' ||
+    !effectiveRecord.aliases ||
+    typeof effectiveRecord.aliases !== 'object' ||
+    Array.isArray(effectiveRecord.aliases)
+  ) {
+    throw new Error('Workflow run has invalid effective model bindings.');
+  }
+
+  const resolved = overrides as ResolvedRunModelOverrides;
+  buildAiProfile(effectiveRecord.defaultProvider, {
+    runTiers: resolved.tiers,
+    runAliases: resolved.aliases,
+  });
+  for (const [name, preset] of Object.entries(effectiveRecord.aliases)) {
+    assertValidEntry(name, preset as RawAliasEntry);
+  }
+
+  return value as RunModelBindingsMetadata;
 }
 
 /**

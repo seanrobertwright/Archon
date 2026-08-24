@@ -99,6 +99,7 @@ import {
   resolveTierWithFallback,
   resolvePresetEffort,
   type ModelAliasPreset,
+  type RunModelOverrides,
   type TierName,
 } from '@archon/workflows/model-validation';
 
@@ -660,6 +661,8 @@ interface WorkflowDispatchOptions {
    * Validated at the dispatch gate before any worktree/clone/AI cost.
    */
   inputs?: Readonly<Record<string, string>>;
+  /** Sparse tier/@alias rebindings supplied by this run invocation (#2481). */
+  modelOverrides?: RunModelOverrides;
 }
 
 const FAILED_RUN_PROMPT_PREVIEW_MAX = 160;
@@ -1160,6 +1163,7 @@ async function dispatchOrchestratorWorkflowOwned(
           // This branch creates a FRESH run row (the prior run had nothing to resume),
           // so the supplied inputs still need stamping.
           inputs: resolvedInputs,
+          modelOverrides: options?.modelOverrides,
         }
       );
     }
@@ -1185,6 +1189,7 @@ async function dispatchOrchestratorWorkflowOwned(
           source,
           parseWarnings: options?.parseWarnings,
           inputs: resolvedInputs,
+          modelOverrides: options?.modelOverrides,
         },
         workflow
       );
@@ -1236,6 +1241,7 @@ async function dispatchOrchestratorWorkflowOwned(
         resolveChildIsolation,
         capturedSourceOwner: owner,
         inputs: resolvedInputs,
+        modelOverrides: options?.modelOverrides,
       }
     );
   }
@@ -1818,6 +1824,7 @@ export async function handleMessage(
               // Declared inputs (#2554) arrive on the request context, not in the
               // command text — the run route is the only caller that sets them.
               inputs: context?.workflowInputs,
+              modelOverrides: context?.workflowModelOverrides,
             }
           );
         }
