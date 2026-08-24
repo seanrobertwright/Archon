@@ -9,7 +9,7 @@ sidebar:
   order: 4
 ---
 
-You must configure **at least one** AI assistant. All four can be configured and mixed within workflows.
+You must configure **at least one** AI assistant. All five can be configured and mixed within workflows.
 
 For a canonical, at-a-glance comparison of which per-node features each provider supports, see the [Provider Capability Matrix](/reference/provider-capabilities/) — it is generated directly from the providers' capability declarations, so it never drifts from runtime behavior. The per-provider sections below add the field-level YAML syntax and caveats.
 
@@ -817,7 +817,7 @@ If a chat asks for the `large` tier and only a different tier is configured, Arc
 The same actions are available headless via [`archon ai`](/reference/cli/#ai):
 
 ```bash
-# Per-user credentials (need TOKEN_ENCRYPTION_KEY)
+# Per-user credentials (vault auto-enabled; TOKEN_ENCRYPTION_KEY is optional)
 echo "$MY_KEY" | archon ai key set openrouter   # API key for any vendor
 archon ai login anthropic                        # subscription (anthropic, openai, or github-copilot)
 archon ai list                                   # what's connected
@@ -853,4 +853,4 @@ There is no run-wide provider or bare-model shortcut. To replace every default t
 - Once a conversation starts, the assistant type is locked for that conversation
 - `DEFAULT_AI_ASSISTANT` (optional) is used only for new conversations without codebase context
 - Workflows can override the assistant on a per-node basis with `provider` and `model` fields
-- Configuration priority: workflow-level options > config file defaults > SDK defaults
+- Chat and workflow resolution use different chains. Chat uses the exact chain above, including highest-precedence per-user defaults. Workflows may declare `provider` and `model` at the workflow or node level; tier and alias references resolve from per-user preferences over repo and global config, then built-in defaults. Literal model IDs pass unchanged to the selected provider SDK.
