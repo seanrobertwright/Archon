@@ -147,7 +147,8 @@ function readScheduledResumeMetadata(value: unknown): ScheduledResumeMetadata | 
     scheduled.reason !== 'quota' ||
     typeof scheduled.resumeAt !== 'string' ||
     typeof scheduled.attempt !== 'number' ||
-    typeof scheduled.maxAttempts !== 'number'
+    typeof scheduled.maxAttempts !== 'number' ||
+    scheduled.triggeredAt !== undefined
   ) {
     return null;
   }

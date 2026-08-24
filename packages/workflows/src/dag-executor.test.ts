@@ -14319,11 +14319,9 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       }
     );
 
-    const setScheduledResume = store.setScheduledWorkflowResume as Mock<
-      NonNullable<IWorkflowStore['setScheduledWorkflowResume']>
-    >;
-    expect(setScheduledResume).toHaveBeenCalledTimes(1);
-    expect(setScheduledResume.mock.calls[0]?.[1]).toMatchObject({
+    const failRun = store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>;
+    expect(failRun).toHaveBeenCalledTimes(1);
+    expect(failRun.mock.calls[0]?.[2]).toMatchObject({
       reason: 'quota',
       attempt: 1,
       maxAttempts: 1,

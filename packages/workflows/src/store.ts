@@ -221,7 +221,11 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
   completeWorkflowRun(id: string, metadata?: Record<string, unknown>): Promise<void>;
-  failWorkflowRun(id: string, error: string): Promise<void>;
+  failWorkflowRun(
+    id: string,
+    error: string,
+    scheduledResume?: ScheduledWorkflowResume | null
+  ): Promise<void>;
   /**
    * Pause a running run for human review, stamping the approval context. Optional
    * `extraMetadata` is folded into the SAME atomic metadata write (e.g. the

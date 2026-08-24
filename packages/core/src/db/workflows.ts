@@ -1160,15 +1160,29 @@ export async function completeWorkflowRun(
  * is dead. Both are non-terminal states owned by this process, so failing either is the
  * same decision. Terminal rows still never transition.
  */
-export async function failWorkflowRun(id: string, error: string): Promise<void> {
+export async function failWorkflowRun(
+  id: string,
+  error: string,
+  scheduledResume?: ScheduledWorkflowResume | null
+): Promise<void> {
   const dialect = getDialect();
+  const metadataWithoutConsumedResume =
+    getDatabaseType() === 'postgresql'
+      ? "(CASE WHEN metadata->'scheduled_resume'->>'triggeredAt' IS NOT NULL THEN metadata - 'scheduled_resume' ELSE metadata END)"
+      : "(CASE WHEN json_extract(metadata, '$.scheduled_resume.triggeredAt') IS NOT NULL THEN json_remove(metadata, '$.scheduled_resume') ELSE metadata END)";
   let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
     result = await pool.query(
       `UPDATE remote_agent_workflow_runs
-       SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
+       SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge(metadataWithoutConsumedResume, 2)}
        WHERE id = $1 AND status IN ('running', 'pending')`,
-      [id, JSON.stringify({ error })]
+      [
+        id,
+        JSON.stringify({
+          error,
+          ...(scheduledResume !== undefined ? { scheduled_resume: scheduledResume } : {}),
+        }),
+      ]
     );
   } catch (dbError) {
     const err = dbError as Error;
@@ -1345,7 +1359,7 @@ export async function listDueWorkflowContinuations(
        WHERE (${retryAt} IS NULL OR ${retryAt} <= $1)
          AND ((status = 'paused' AND (${signaledAt} IS NOT NULL OR ${resumeAt} <= $1))
           OR (status = 'failed' AND ${scheduledResumeAt} <= $1 AND ${scheduledTriggeredAt} IS NULL))
-       ORDER BY COALESCE(${resumeAt}, ${scheduledResumeAt}) ASC
+       ORDER BY COALESCE(${retryAt}, ${resumeAt}, ${scheduledResumeAt}) ASC
        LIMIT $2`,
       [now.toISOString(), limit]
     );

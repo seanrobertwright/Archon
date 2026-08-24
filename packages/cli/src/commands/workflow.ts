@@ -2817,7 +2817,11 @@ export async function workflowGetCommand(
     );
   }
   const scheduledResume = run.metadata.scheduled_resume;
-  if (run.status === 'failed' && isScheduledWorkflowResume(scheduledResume)) {
+  if (
+    run.status === 'failed' &&
+    isScheduledWorkflowResume(scheduledResume) &&
+    scheduledResume.triggeredAt === undefined
+  ) {
     console.log(
       `  Resume: scheduled for ${scheduledResume.resumeAt} (attempt ${String(scheduledResume.attempt)}/${String(scheduledResume.maxAttempts)})`
     );

@@ -24,6 +24,7 @@ import {
   declaredFieldsFromSchema,
   jsonValueSchema,
   parseWholeOutputRef,
+  OUTPUT_REF_SOURCE,
   INPUT_NAME_SOURCE,
   type JsonValue,
 } from '../output-ref';
@@ -648,7 +649,7 @@ export const waitConfigSchema = waitConfigFlatSchema.superRefine((value, ctx) =>
   }
   if (
     value.until !== undefined &&
-    !value.until.includes('$') &&
+    !new RegExp(OUTPUT_REF_SOURCE).test(value.until) &&
     !Number.isFinite(Date.parse(value.until))
   ) {
     ctx.addIssue({

@@ -461,6 +461,7 @@ describe('workflows database', () => {
       expect(query).toContain("status = 'paused'");
       expect(query).toContain("status = 'failed'");
       expect(query).toContain("metadata->>'continuation_retry_at' IS NULL");
+      expect(query).toContain("ORDER BY COALESCE(metadata->>'continuation_retry_at'");
       expect(params).toEqual(['2026-08-25T10:00:00.000Z', 25]);
     });
 
@@ -618,6 +619,26 @@ describe('workflows database', () => {
 
       const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(params).toContain(JSON.stringify({ error: 'Timeout exceeded' }));
+    });
+
+    test('stores a quota continuation in the same transition to failed', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      const scheduled = {
+        reason: 'quota' as const,
+        resumeAt: '2026-08-25T10:00:00.000Z',
+        deadlineAt: '2026-08-26T10:00:00.000Z',
+        attempt: 1,
+        maxAttempts: 2,
+      };
+
+      await failWorkflowRun('workflow-run-123', 'Quota exhausted', scheduled);
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("SET status = 'failed'");
+      expect(JSON.parse(params[1] as string)).toEqual({
+        error: 'Quota exhausted',
+        scheduled_resume: scheduled,
+      });
     });
 
     test('throws when rowCount is 0', async () => {

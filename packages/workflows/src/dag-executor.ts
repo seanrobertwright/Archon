@@ -10837,45 +10837,35 @@ export async function executeDagWorkflow(
       });
   };
 
-  const scheduleQuotaResume = async (): Promise<void> => {
+  const scheduleQuotaResume = async (): Promise<ScheduledWorkflowResume | null | undefined> => {
     const policy = config.workflows;
-    if (policy?.autoResumeOnQuotaReset !== true) return;
+    if (policy?.autoResumeOnQuotaReset !== true) return undefined;
+    const prior = isScheduledWorkflowResume(workflowRun.metadata?.scheduled_resume)
+      ? workflowRun.metadata.scheduled_resume
+      : undefined;
     const quotaFailure = [...runCtx.nodeOutputs.values()].find(
       (output): output is Extract<NodeOutput, { state: 'failed' }> =>
         output.state === 'failed' && isQuotaExhaustionError(output.error)
     );
-    if (quotaFailure === undefined) return;
+    if (quotaFailure === undefined) return prior?.triggeredAt !== undefined ? null : undefined;
     const now = new Date();
-    const prior = isScheduledWorkflowResume(workflowRun.metadata?.scheduled_resume)
-      ? workflowRun.metadata.scheduled_resume
-      : undefined;
-    const maxAttempts =
-      Number.isFinite(policy.quotaMaxAttempts) && policy.quotaMaxAttempts > 0
-        ? Math.floor(policy.quotaMaxAttempts)
-        : 1;
+    const maxAttempts = policy.quotaMaxAttempts;
     const attempt = (prior?.attempt ?? 0) + 1;
-    const deadlineMs =
-      Number.isFinite(policy.quotaDeadlineMs) && policy.quotaDeadlineMs > 0
-        ? policy.quotaDeadlineMs
-        : 24 * 60 * 60 * 1000;
+    const deadlineMs = policy.quotaDeadlineMs;
     const deadlineAt = prior?.deadlineAt ?? new Date(now.getTime() + deadlineMs).toISOString();
     if (attempt > maxAttempts) {
-      await deps.store.setScheduledWorkflowResume(workflowRun.id, null);
       await deps.store.createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'quota_resume_exhausted',
         data: { attempt, max_attempts: maxAttempts },
       });
-      return;
+      return null;
     }
 
     let resumeAt = extractQuotaResetAt(quotaFailure.error, now);
     if (resumeAt === null || resumeAt.getTime() <= now.getTime()) {
       const fallback = policy.quotaFallbackDelayMs;
-      resumeAt =
-        fallback !== undefined && Number.isFinite(fallback) && fallback > 0
-          ? new Date(now.getTime() + fallback)
-          : null;
+      resumeAt = fallback !== undefined ? new Date(now.getTime() + fallback) : null;
     }
     if (resumeAt === null) {
       await deps.store.createWorkflowEvent({
@@ -10883,16 +10873,15 @@ export async function executeDagWorkflow(
         event_type: 'quota_resume_skipped',
         data: { reason: 'reset_unavailable' },
       });
-      return;
+      return null;
     }
     if (resumeAt.getTime() > Date.parse(deadlineAt)) {
-      await deps.store.setScheduledWorkflowResume(workflowRun.id, null);
       await deps.store.createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'quota_resume_exhausted',
         data: { reason: 'deadline', deadline_at: deadlineAt },
       });
-      return;
+      return null;
     }
 
     const scheduled: ScheduledWorkflowResume = {
@@ -10902,7 +10891,6 @@ export async function executeDagWorkflow(
       attempt,
       maxAttempts,
     };
-    await deps.store.setScheduledWorkflowResume(workflowRun.id, scheduled);
     await deps.store.createWorkflowEvent({
       workflow_run_id: workflowRun.id,
       event_type: 'quota_resume_scheduled',
@@ -10913,6 +10901,7 @@ export async function executeDagWorkflow(
         max_attempts: maxAttempts,
       },
     });
+    return scheduled;
   };
 
   await persistAuthoredOutcome();
@@ -11045,13 +11034,15 @@ export async function executeDagWorkflow(
     // Note: nodeCounts not stored for failed runs — failWorkflowRun only stores { error }.
     // Frontend guards with isValidNodeCounts so missing node_counts is safe. (Usage IS
     // stored: persistRunUsage wrote it at the run tail, before this branch — #2469.)
-    await scheduleQuotaResume().catch((dbErr: Error) => {
-      getLog().error(
-        { err: dbErr, workflowRunId: workflowRun.id },
-        'dag.quota_resume_schedule_failed'
-      );
+    const scheduledResume = await scheduleQuotaResume().catch((dbErr: Error) => {
+      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
+      return undefined;
     });
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
+    const failRun =
+      scheduledResume === undefined
+        ? deps.store.failWorkflowRun(workflowRun.id, failMsg)
+        : deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume);
+    await failRun.catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
@@ -11097,13 +11088,15 @@ export async function executeDagWorkflow(
       ...failureTaxonomy,
       ...runUsageProps,
     });
-    await scheduleQuotaResume().catch((dbErr: Error) => {
-      getLog().error(
-        { err: dbErr, workflowRunId: workflowRun.id },
-        'dag.quota_resume_schedule_failed'
-      );
+    const scheduledResume = await scheduleQuotaResume().catch((dbErr: Error) => {
+      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
+      return undefined;
     });
-    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
+    const failRun =
+      scheduledResume === undefined
+        ? deps.store.failWorkflowRun(workflowRun.id, failMsg)
+        : deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume);
+    await failRun.catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
