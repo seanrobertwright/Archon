@@ -203,9 +203,9 @@ async function resolveOAuthCredential(
     getLog().warn({ userId, provider }, 'user_provider_key.oauth_no_pi_provider');
     return null;
   }
-  let creds: OAuthCredentials;
+  let parsed: unknown;
   try {
-    creds = JSON.parse(decryptToken(ciphertext, key)) as OAuthCredentials;
+    parsed = JSON.parse(decryptToken(ciphertext, key));
   } catch (err) {
     getLog().error(
       { err: err as Error, userId, provider },
@@ -213,16 +213,14 @@ async function resolveOAuthCredential(
     );
     return null;
   }
-  // The Pi mint path decides refresh purely by `Date.now() >= creds.expires`
-  // (`@archon/providers/oauth`, Archon-owned since pi-ai 0.84 — the SDK's
-  // toAuth never checks expiry). A missing or non-numeric `expires` from a
-  // legacy/corrupt row would make that comparison silently false and serve a
-  // stale token as success, so enforce the shape here where the raw blob
-  // enters, and treat a mismatch like the decrypt failure above. (The openai
-  // branch validates its own shape inside mintOpenAiOAuthApiKey.)
-  if (piProvider && !Number.isFinite(creds.expires)) {
+  const creds = typeof parsed === 'object' && parsed !== null ? (parsed as OAuthCredentials) : null;
+  // Both mint paths decide refresh from `creds.expires`. A missing or
+  // non-numeric value from a legacy/corrupt row would make that comparison
+  // silently false and serve a stale token as success, so enforce the shape
+  // here where the raw blob enters and treat a mismatch like decrypt failure.
+  if (!creds || !Number.isFinite(creds.expires)) {
     getLog().error(
-      { userId, provider, expiresType: typeof creds.expires },
+      { userId, provider, expiresType: typeof creds?.expires },
       'user_provider_key.oauth_malformed_expires'
     );
     return null;
