@@ -131,14 +131,11 @@ function assertValidPersistedPreset(name: string, entry: unknown): asserts entry
   const record = entry as Record<string, unknown>;
   assertValidEntry(name, record as unknown as RawAliasEntry);
   if (record.effort !== undefined) {
-    if (typeof record.effort !== 'string') {
+    if (
+      typeof record.effort !== 'string' ||
+      !EFFORT_LEVELS.some(effort => effort === record.effort)
+    ) {
       throw new Error(`Model binding '${name}' has an invalid effort.`);
-    }
-    const effort = resolvePresetEffort(record.provider as string, record.effort);
-    if (!effort.ok) {
-      throw new Error(
-        `Model binding '${name}' has effort '${record.effort}' that provider '${String(record.provider)}' does not accept.`
-      );
     }
   }
   if (record.thinking !== undefined) {

@@ -435,7 +435,25 @@ describe('per-run model bindings', () => {
           },
         },
       })
-    ).toThrow(/effort 'warp'/);
+    ).toThrow(/invalid effort/);
+    expect(
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          effective: {
+            ...value.effective,
+            aliases: {
+              ...value.effective.aliases,
+              medium: {
+                provider: 'opencode',
+                model: 'anthropic/claude-sonnet-4-6',
+                effort: 'high',
+              },
+            },
+          },
+        },
+      })
+    ).toBeDefined();
   });
 });
 
