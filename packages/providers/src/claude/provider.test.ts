@@ -1,4 +1,8 @@
-import { describe, test, expect, mock, beforeEach, spyOn } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Options, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import { createMockLogger } from '../test/mocks/logger';
 
 const mockLogger = createMockLogger();
@@ -6,8 +10,11 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
-// Create mock query function
-const mockQuery = mock(async function* () {
+type MockQuery = (...args: Parameters<typeof sdkQuery>) => AsyncGenerator<unknown, void, unknown>;
+
+// Keep the SDK input signature while allowing tests to exercise malformed and
+// forward-compatible events at the provider's runtime validation boundary.
+const mockQuery = mock<MockQuery>(async function* (_params) {
   // Empty generator by default
 });
 
@@ -16,7 +23,7 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
-import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
+import { ClaudeProvider, classifySubprocessError, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 
@@ -118,8 +125,9 @@ describe('ClaudeProvider', () => {
   describe('getCapabilities', () => {
     test('returns full capability set for Claude provider', () => {
       const caps = client.getCapabilities();
-      expect(caps).toEqual({
+      expect(caps).toMatchObject({
         sessionResume: true,
+        sessionFork: true,
         mcp: true,
         hooks: true,
         skills: true,
@@ -132,8 +140,19 @@ describe('ClaudeProvider', () => {
         thinkingControl: true,
         fallbackModel: true,
         sandbox: true,
+        settingSources: true,
         nativeTools: true,
       });
+    });
+
+    test('declares a tool-name vocabulary for allowed/denied_tools validation (#2084)', () => {
+      const caps = client.getCapabilities();
+      // Current names present; renamed legacy names deliberately absent so
+      // validation can flag them with a targeted rename hint.
+      expect(caps.knownToolNames).toContain('Agent');
+      expect(caps.knownToolNames).toContain('Bash');
+      expect(caps.knownToolNames).not.toContain('Task');
+      expect(caps.renamedTools).toMatchObject({ Task: 'Agent' });
     });
   });
 
@@ -191,6 +210,12 @@ describe('ClaudeProvider', () => {
         yield {
           type: 'result',
           session_id: 'session-123-abc',
+          usage: {
+            input_tokens: 20,
+            output_tokens: 5,
+            cache_read_input_tokens: 70,
+            cache_creation_input_tokens: 10,
+          },
         };
       });
 
@@ -200,7 +225,11 @@ describe('ClaudeProvider', () => {
       }
 
       expect(chunks).toHaveLength(1);
-      expect(chunks[0]).toEqual({ type: 'result', sessionId: 'session-123-abc' });
+      expect(chunks[0]).toEqual({
+        type: 'result',
+        sessionId: 'session-123-abc',
+        tokens: { input: 100, output: 5, cacheRead: 70, cacheWrite: 10 },
+      });
     });
 
     test('yields result with structuredOutput when SDK result has structured_output', async () => {
@@ -225,7 +254,7 @@ describe('ClaudeProvider', () => {
       });
     });
 
-    test('yields result with cost, stopReason, numTurns, modelUsage when SDK provides them', async () => {
+    test('yields result with cost, stopReason, numTurns, and a resolved model when SDK provides them', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
           type: 'result',
@@ -233,11 +262,11 @@ describe('ClaudeProvider', () => {
           total_cost_usd: 0.0042,
           stop_reason: 'end_turn',
           num_turns: 3,
-          model_usage: {
+          modelUsage: {
             'claude-sonnet-4-6': {
-              input_tokens: 100,
-              output_tokens: 50,
-              cache_read_input_tokens: 10,
+              inputTokens: 100,
+              outputTokens: 50,
+              cacheReadInputTokens: 10,
             },
           },
         };
@@ -255,17 +284,65 @@ describe('ClaudeProvider', () => {
         cost: 0.0042,
         stopReason: 'end_turn',
         numTurns: 3,
-        modelUsage: {
-          'claude-sonnet-4-6': {
-            input_tokens: 100,
-            output_tokens: 50,
-            cache_read_input_tokens: 10,
-          },
-        },
+        resolvedModel: { id: 'claude-sonnet-4-6' },
       });
+      // Single-model usage is unambiguous — no ambiguity warning.
+      expect(mockLogger.warn).not.toHaveBeenCalled();
     });
 
-    test('omits cost, stopReason, numTurns, modelUsage when SDK result has none', async () => {
+    test('picks the greatest-output-token model and warns when modelUsage has multiple keys', async () => {
+      // A subagent pinned via `agents:` (or a fallbackModel takeover) puts more
+      // than one model in the record, and key order carries no guarantee — the
+      // main model here is deliberately NOT first.
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'result',
+          session_id: 'sid-multi-model',
+          modelUsage: {
+            'claude-haiku-4-5-20251001': {
+              inputTokens: 400,
+              outputTokens: 20,
+              cacheReadInputTokens: 0,
+            },
+            'claude-sonnet-5': {
+              inputTokens: 120,
+              outputTokens: 900,
+              cacheReadInputTokens: 10,
+            },
+          },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).toMatchObject({ resolvedModel: { id: 'claude-sonnet-5' } });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        {
+          models: ['claude-haiku-4-5-20251001', 'claude-sonnet-5'],
+          selected: 'claude-sonnet-5',
+        },
+        'claude.resolved_model_ambiguous'
+      );
+    });
+
+    test('omits resolvedModel when modelUsage is an empty record', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid-empty-usage', modelUsage: {} };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).not.toHaveProperty('resolvedModel');
+      expect(mockLogger.warn).not.toHaveBeenCalled();
+    });
+
+    test('omits cost, stopReason, numTurns, and resolvedModel when SDK result has none', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid-bare' };
       });
@@ -278,7 +355,7 @@ describe('ClaudeProvider', () => {
       expect(chunks[0]).not.toHaveProperty('cost');
       expect(chunks[0]).not.toHaveProperty('stopReason');
       expect(chunks[0]).not.toHaveProperty('numTurns');
-      expect(chunks[0]).not.toHaveProperty('modelUsage');
+      expect(chunks[0]).not.toHaveProperty('resolvedModel');
     });
 
     test('omits stopReason when stop_reason is null', async () => {
@@ -601,6 +678,87 @@ describe('ClaudeProvider', () => {
       expect(chunks[0]).toMatchObject({ type: 'task_notification', status: 'failed' });
     });
 
+    // --- #2083 — background-task liveness (SDK 0.3.209 background_tasks_changed) ---
+
+    test('yields background_tasks chunk from SDK background_tasks_changed', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [
+            { task_id: 't-1', task_type: 'local_agent', description: 'Research problem A' },
+            { task_id: 't-2', task_type: 'local_agent', description: 'Research problem B' },
+          ],
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'background_tasks',
+          tasks: [
+            { taskId: 't-1', taskType: 'local_agent', description: 'Research problem A' },
+            { taskId: 't-2', taskType: 'local_agent', description: 'Research problem B' },
+          ],
+        },
+      ]);
+    });
+
+    test('forwards an EMPTY background_tasks_changed set (drain signal)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      // An empty set means "all background work drained" — it must be forwarded,
+      // not dropped, or the executor's wait gate would never release.
+      expect(chunks).toEqual([{ type: 'background_tasks', tasks: [] }]);
+    });
+
+    test('keeps forwarding chunks that arrive AFTER the result (background-task wait window)', async () => {
+      // Single-turn queries keep streaming after the turn-level result while
+      // background tasks drain; streamClaudeMessages must not stop at result.
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [{ task_id: 't-1', task_type: 'local_agent', description: 'bg work' }],
+        };
+        yield { type: 'result', subtype: 'success', session_id: 's-1', is_error: false };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-1',
+          status: 'completed',
+          output_file: '/tmp/t-1.md',
+          summary: 'done',
+        };
+        yield { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+        yield { type: 'result', subtype: 'success', session_id: 's-1', is_error: false };
+      });
+
+      const types = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        types.push(chunk.type);
+      }
+
+      expect(types).toEqual([
+        'background_tasks',
+        'result',
+        'task_notification',
+        'background_tasks',
+        'result',
+      ]);
+    });
+
     test('yields hook_started chunk from SDK system message', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
@@ -768,6 +926,143 @@ describe('ClaudeProvider', () => {
       expect(callArgs.options).not.toHaveProperty('agentProgressSummaries');
     });
 
+    // --- Issue #2324 — tool-scoped hook frames must reach the audit stream -----
+
+    test('opts the SDK into lifecycle hook events for every surface (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        // Empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace')) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      // The SDK defaults `includeHookEvents` to false, which suppresses
+      // `hook_started` / `hook_response` for every hook type except
+      // SessionStart and Setup. Without an explicit opt-in, a node-level
+      // `PreToolUse` hook that denies Bash never reaches the workflow
+      // `hook_activity` stream.
+      expect(callArgs.options).toMatchObject({ includeHookEvents: true });
+    });
+
+    test('forwards a denied PreToolUse hook through the chunk pipeline (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_started',
+          hook_id: 'h-1',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+        };
+        yield {
+          type: 'system',
+          subtype: 'hook_response',
+          hook_id: 'h-1',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+          outcome: 'error',
+          exit_code: 2,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'hook_started',
+          hookId: 'h-1',
+          hookName: 'Bash',
+          hookEvent: 'PreToolUse',
+        },
+        {
+          type: 'hook_response',
+          hookId: 'h-1',
+          hookName: 'Bash',
+          hookEvent: 'PreToolUse',
+          outcome: 'error',
+          exitCode: 2,
+        },
+      ]);
+    });
+
+    test('forwards a PostToolUse hook lifecycle (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_started',
+          hook_id: 'h-2',
+          hook_name: 'Edit',
+          hook_event: 'PostToolUse',
+        };
+        yield {
+          type: 'system',
+          subtype: 'hook_response',
+          hook_id: 'h-2',
+          hook_name: 'Edit',
+          hook_event: 'PostToolUse',
+          outcome: 'success',
+          exit_code: 0,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'hook_started',
+          hookId: 'h-2',
+          hookName: 'Edit',
+          hookEvent: 'PostToolUse',
+        },
+        {
+          type: 'hook_response',
+          hookId: 'h-2',
+          hookName: 'Edit',
+          hookEvent: 'PostToolUse',
+          outcome: 'success',
+          exitCode: 0,
+        },
+      ]);
+    });
+
+    test('drops hook_progress frames (only emitted for async hooks — none registered) (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_progress',
+          hook_id: 'h-3',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+          stdout: 'still running...',
+          stderr: '',
+          output: '',
+        };
+        yield {
+          type: 'assistant',
+          message: {
+            content: [{ type: 'text', text: 'Real response' }],
+          },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      // The hook_progress frame is intentionally not surfaced: Archon
+      // registers only synchronous hooks, and the hooks guide documents
+      // the carve-out. Only the assistant message reaches the stream.
+      expect(chunks).toEqual([{ type: 'assistant', content: 'Real response' }]);
+    });
+
     test('handles tool_use with empty input', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
@@ -901,6 +1196,35 @@ describe('ClaudeProvider', () => {
       spy.mockRestore();
     });
 
+    test('container run SKIPS host binary resolution (works when host Claude is absent)', async () => {
+      // Simulate a compiled binary with no host Claude — resolveClaudeBinaryPath
+      // would throw. A container run must NOT call it (Claude is baked into the
+      // runner image; the SDK bypasses disk resolution via spawnClaudeCodeProcess).
+      const spy = spyOn(binaryResolver, 'resolveClaudeBinaryPath').mockRejectedValue(
+        new Error('Claude Code not found — set CLAUDE_BIN_PATH')
+      );
+      mockQuery.mockImplementation(async function* () {
+        // empty
+      });
+
+      // Must not throw at resolution time.
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        execContext: { kind: 'container', containerId: 'c-1' },
+      })) {
+        // consume
+      }
+
+      expect(spy).not.toHaveBeenCalled();
+      const callArgs = mockQuery.mock.calls[0][0] as {
+        options: { pathToClaudeCodeExecutable?: string; spawnClaudeCodeProcess?: unknown };
+      };
+      // SDK spawn hook is set; host disk path is omitted.
+      expect(typeof callArgs.options.spawnClaudeCodeProcess).toBe('function');
+      expect(callArgs.options.pathToClaudeCodeExecutable).toBeUndefined();
+
+      spy.mockRestore();
+    });
+
     test('classifies exit code errors as crash and retries up to 3 times', async () => {
       const error = new Error('process exited with code 1');
       mockQuery.mockImplementation(async function* () {
@@ -977,6 +1301,52 @@ describe('ClaudeProvider', () => {
       expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
+    // The SDK reports a spawn failure caused by a MISSING WORKING DIRECTORY as a
+    // libc/architecture mismatch, because posix_spawn returns ENOENT against the
+    // executable's path and the SDK only checks that the executable exists.
+    test('reports a missing working directory instead of the SDK libc message', async () => {
+      const error = new Error(
+        'Claude Code native binary at /pkg/claude exists but failed to launch. ' +
+          "This usually means the binary does not match this system's libc."
+      );
+      mockQuery.mockImplementation(async function* () {
+        throw error;
+      });
+
+      const consumeGenerator = async () => {
+        for await (const _ of client.sendQuery('test', '/worktrees/removed-by-cleanup')) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        /working directory "\/worktrees\/removed-by-cleanup" does not exist/
+      );
+      // The message names libc only to tell the operator to disregard it.
+      await expect(consumeGenerator()).rejects.toThrow(/The binary is fine/);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    });
+
+    test('keeps the original launch error when the working directory exists', async () => {
+      const error = new Error(
+        'Claude Code native binary at /pkg/claude exists but failed to launch. ' +
+          "This usually means the binary does not match this system's libc."
+      );
+      mockQuery.mockImplementation(async function* () {
+        throw error;
+      });
+
+      const consumeGenerator = async () => {
+        // process.cwd() is a real directory, so the cwd explanation does not apply
+        // and a genuine libc mismatch must still surface as itself.
+        for await (const _ of client.sendQuery('test', process.cwd())) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(/failed to launch/);
+    });
+
     test('classifies "Operation aborted" errors as crash and retries', async () => {
       const error = new Error('Operation aborted');
       mockQuery.mockImplementation(async function* () {
@@ -1011,11 +1381,9 @@ describe('ClaudeProvider', () => {
     }, 5_000);
 
     test('captures all stderr output for diagnostics', async () => {
-      mockQuery.mockImplementation(async function* (args: {
-        options: { stderr?: (data: string) => void };
-      }) {
+      mockQuery.mockImplementation(async function* (args) {
         // Simulate non-error stderr output followed by crash
-        if (args.options.stderr) {
+        if (args.options?.stderr) {
           args.options.stderr('Spawning Claude Code process: node cli.js');
           args.options.stderr('AJV validation: schema loaded');
           args.options.stderr('startup diagnostic: ready');
@@ -1030,12 +1398,13 @@ describe('ClaudeProvider', () => {
       };
 
       // Use rejects so assertions always execute
-      const err = await consumeGenerator().catch((e: unknown) => e as Error);
-      expect(err).toBeInstanceOf(Error);
+      const thrown = await consumeGenerator().catch((error: unknown) => error);
+      expect(thrown).toBeInstanceOf(Error);
+      if (!(thrown instanceof Error)) throw new Error('Expected consumeGenerator to throw');
       // The error should contain stderr context from ALL captured lines
-      expect(err.message).toContain('stderr:');
-      expect(err.message).toContain('AJV validation');
-      expect(err.message).toContain('startup diagnostic');
+      expect(thrown.message).toContain('stderr:');
+      expect(thrown.message).toContain('AJV validation');
+      expect(thrown.message).toContain('startup diagnostic');
     }, 5_000);
 
     test('passes settingSources from assistantConfig', async () => {
@@ -1088,6 +1457,57 @@ describe('ClaudeProvider', () => {
       expect(callArgs.options.settingSources).toEqual(['project']);
     });
 
+    test('honors assistant-level settingSources: [] without widening to defaults', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        assistantConfig: { settingSources: [] },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual([]);
+    });
+
+    test('per-node settingSources override wins over the assistant default', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        nodeConfig: { settingSources: ['project'] },
+        assistantConfig: { settingSources: ['project', 'user'] },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual(['project']);
+    });
+
+    test('per-node settingSources applies when no assistant default is set', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        nodeConfig: { settingSources: [] },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      // An explicit empty array is a valid opt-out of ALL setting sources —
+      // it must not fall through to the ['project', 'user'] default.
+      expect(callArgs.options.settingSources).toEqual([]);
+    });
+
     test('passes env from requestOptions into SDK options', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid' };
@@ -1126,6 +1546,176 @@ describe('ClaudeProvider', () => {
       expect(env.HOME).toBe('/custom/home');
     });
 
+    describe('CLAUDE_API_KEY -> ANTHROPIC_API_KEY mapping', () => {
+      const ENV_KEYS_UNDER_TEST = [
+        'CLAUDE_API_KEY',
+        'ANTHROPIC_API_KEY',
+        'CLAUDE_CODE_OAUTH_TOKEN',
+      ] as const;
+      let savedEnv: Partial<Record<(typeof ENV_KEYS_UNDER_TEST)[number], string>>;
+
+      beforeEach(() => {
+        savedEnv = {};
+        for (const key of ENV_KEYS_UNDER_TEST) savedEnv[key] = process.env[key];
+      });
+
+      afterEach(() => {
+        for (const key of ENV_KEYS_UNDER_TEST) {
+          const value = savedEnv[key];
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      });
+
+      test('maps when only the API key is set', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-test';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.CLAUDE_API_KEY).toBe('sk-test');
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-test');
+        // Only the subprocess env copy is written — never process.env itself
+        expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
+      });
+
+      test('does not clobber an explicit ANTHROPIC_API_KEY', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-a';
+        process.env.ANTHROPIC_API_KEY = 'sk-b';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-b');
+      });
+
+      test('OAuth token wins — no injection', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        process.env.CLAUDE_API_KEY = 'sk-a';
+        process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-x';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      });
+
+      test('no key, no injection', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.CLAUDE_API_KEY;
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      });
+
+      test('requestOptions.env still wins over the mapping', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-a';
+
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          env: { ANTHROPIC_API_KEY: 'sk-override' },
+        })) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-override');
+      });
+
+      test('per-user subscription via requestOptions.env suppresses the mirror', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.ANTHROPIC_API_KEY;
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-install-fallback';
+
+        // Exact shape produced by deliverCredential()'s anthropic oauth branch:
+        // the delivered env carries OAuth tokens only, never ANTHROPIC_API_KEY.
+        // The mirror must not inject the install key alongside the user's
+        // subscription token (the CLI would prefer the API key and rebill).
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          env: {
+            CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-user',
+            ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-user',
+          },
+        })) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('sk-ant-oat01-user');
+      });
+
+      test('treats an empty-string ANTHROPIC_API_KEY as missing', async () => {
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        process.env.CLAUDE_API_KEY = 'sk-test';
+        process.env.ANTHROPIC_API_KEY = '';
+
+        for await (const _ of client.sendQuery('test', '/tmp')) {
+          // consume
+        }
+
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        const env = callArgs.options.env as Record<string, string>;
+        expect(env.ANTHROPIC_API_KEY).toBe('sk-test');
+      });
+    });
+
     test('passes effort to SDK via nodeConfig', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid' };
@@ -1152,6 +1742,46 @@ describe('ClaudeProvider', () => {
       }
 
       expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options).not.toHaveProperty('effort');
+    });
+
+    // #2556: Archon's ladder is the union of every provider's vocabulary, so a
+    // Claude node can now ask for `xhigh` (the SDK has had it since 0.3.209),
+    // and `minimal` — which Claude has no rung for — lands on its shallowest.
+    test('passes xhigh through and clamps minimal to low', async () => {
+      for (const [declared, applied] of [
+        ['xhigh', 'xhigh'],
+        ['minimal', 'low'],
+        ['max', 'max'],
+      ] as const) {
+        mockQuery.mockClear();
+        mockQuery.mockImplementation(async function* () {
+          yield { type: 'result', session_id: 'sid' };
+        });
+
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          nodeConfig: { effort: declared },
+        })) {
+          // consume
+        }
+
+        const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+        expect(callArgs.options.effort).toBe(applied);
+      }
+    });
+
+    test('omits effort from SDK for a value that is not a rung', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        nodeConfig: { effort: 'off' },
+      })) {
+        // consume
+      }
+
       const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
       expect(callArgs.options).not.toHaveProperty('effort');
     });
@@ -1481,10 +2111,8 @@ describe('sendQuery decomposition behaviors', () => {
   }, 5_000);
 
   test('enriched error (with stderr) is thrown at retry exhaustion, not raw error', async () => {
-    mockQuery.mockImplementation(async function* (args: {
-      options: { stderr?: (data: string) => void };
-    }) {
-      if (args.options.stderr) {
+    mockQuery.mockImplementation(async function* (args) {
+      if (args.options?.stderr) {
         args.options.stderr('diagnostic: something broke');
       }
       throw new Error('process exited with code 1');
@@ -1496,29 +2124,114 @@ describe('sendQuery decomposition behaviors', () => {
       }
     };
 
-    const err = await consumeGenerator().catch((e: unknown) => e as Error);
-    expect(err).toBeInstanceOf(Error);
+    const thrown = await consumeGenerator().catch((error: unknown) => error);
+    expect(thrown).toBeInstanceOf(Error);
+    if (!(thrown instanceof Error)) throw new Error('Expected consumeGenerator to throw');
     // Must contain stderr context, not just the raw error
-    expect(err.message).toContain('stderr:');
-    expect(err.message).toContain('diagnostic: something broke');
+    expect(thrown.message).toContain('stderr:');
+    expect(thrown.message).toContain('diagnostic: something broke');
   }, 5_000);
 
+  test('PostToolUse hooks preserve success, failure, and interruption outcomes', async () => {
+    mockQuery.mockImplementation(async function* (args) {
+      const successHook = args.options?.hooks?.PostToolUse?.[0]?.hooks?.[0];
+      const failureHook = args.options?.hooks?.PostToolUseFailure?.[0]?.hooks?.[0];
+      const hookOptions = { signal: new AbortController().signal };
+      await successHook?.(
+        { tool_name: 'Read', tool_use_id: 'success-id', tool_response: 'ok' } as never,
+        'success-id',
+        hookOptions
+      );
+      await failureHook?.(
+        {
+          tool_name: 'Bash',
+          tool_use_id: 'error-id',
+          error: 'exit 1',
+          is_interrupt: false,
+        } as never,
+        'error-id',
+        hookOptions
+      );
+      await failureHook?.(
+        {
+          tool_name: 'Task',
+          tool_use_id: 'interrupt-id',
+          error: 'stopped',
+          is_interrupt: true,
+        } as never,
+        'interrupt-id',
+        hookOptions
+      );
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } };
+    });
+
+    const chunks = [];
+    for await (const chunk of client.sendQuery('test', '/workspace')) chunks.push(chunk);
+
+    expect(chunks.slice(0, 3)).toEqual([
+      {
+        type: 'tool_result',
+        toolName: 'Read',
+        toolOutput: 'ok',
+        toolCallId: 'success-id',
+        toolOutcome: 'success',
+      },
+      {
+        type: 'tool_result',
+        toolName: 'Bash',
+        toolOutput: '❌ Error: exit 1',
+        toolCallId: 'error-id',
+        toolOutcome: 'error',
+      },
+      {
+        type: 'tool_result',
+        toolName: 'Task',
+        toolOutput: '⚠️ Interrupted: stopped',
+        toolCallId: 'interrupt-id',
+        toolOutcome: 'interrupted',
+      },
+    ]);
+  });
+
+  test('terminal tool result queue drain preserves hook outcome', async () => {
+    mockQuery.mockImplementation(async function* (args) {
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } };
+      const successHook = args.options?.hooks?.PostToolUse?.[0]?.hooks?.[0];
+      await successHook?.(
+        { tool_name: 'Read', tool_use_id: 'late-id', tool_response: 'ok' } as never,
+        'late-id',
+        { signal: new AbortController().signal }
+      );
+    });
+
+    const chunks = [];
+    for await (const chunk of client.sendQuery('test', '/workspace')) chunks.push(chunk);
+
+    expect(chunks).toContainEqual({
+      type: 'tool_result',
+      toolName: 'Read',
+      toolOutput: 'ok',
+      toolCallId: 'late-id',
+      toolOutcome: 'success',
+    });
+  });
+
   test('PostToolUse hook handles circular reference without crashing', async () => {
-    mockQuery.mockImplementation(async function* (args: {
-      options: {
-        hooks?: Record<string, Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }>>;
-      };
-    }) {
+    mockQuery.mockImplementation(async function* (args) {
       // Simulate a tool use that triggers the PostToolUse hook with circular data
-      const hooks = args.options.hooks?.PostToolUse;
+      const hooks = args.options?.hooks?.PostToolUse;
       if (hooks?.[0]?.hooks?.[0]) {
         const circular: Record<string, unknown> = { key: 'val' };
         circular.self = circular; // circular reference
-        await hooks[0].hooks[0]({
-          tool_name: 'TestTool',
-          tool_use_id: 'tc-circ',
-          tool_response: circular,
-        });
+        await hooks[0].hooks[0](
+          {
+            tool_name: 'TestTool',
+            tool_use_id: 'tc-circ',
+            tool_response: circular,
+          } as never,
+          'tc-circ',
+          { signal: new AbortController().signal }
+        );
       }
       yield {
         type: 'assistant',
@@ -1606,6 +2319,22 @@ describe('sendQuery decomposition behaviors', () => {
   });
 
   describe('inline agents (nodeConfig.agents)', () => {
+    let workflowCwd: string;
+
+    beforeEach(() => {
+      workflowCwd = mkdtempSync(join(tmpdir(), 'archon-claude-workflow-'));
+    });
+
+    afterEach(() => {
+      rmSync(workflowCwd, { recursive: true, force: true });
+    });
+
+    const stageClaudeSkill = (name: string): void => {
+      const dir = join(workflowCwd, '.claude', 'skills', name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: test\n---\n`);
+    };
+
     test('passes inline agents map through to SDK options.agents', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid' };
@@ -1620,8 +2349,8 @@ describe('sendQuery decomposition behaviors', () => {
         },
       };
 
-      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
-        nodeConfig: { agents },
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+        nodeConfig: { nodeId: 'agent-node', agents },
       })) {
         // consume
       }
@@ -1636,8 +2365,9 @@ describe('sendQuery decomposition behaviors', () => {
         yield { type: 'result', session_id: 'sid' };
       });
 
-      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
         nodeConfig: {
+          nodeId: 'agent-node',
           agents: {
             'sub-a': { description: 'd', prompt: 'p' },
           },
@@ -1647,24 +2377,43 @@ describe('sendQuery decomposition behaviors', () => {
       }
 
       const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
-      // agent (singular) is set by skills wrapper; inline-only must leave it unset
       expect(callArgs.options.agent).toBeUndefined();
+      expect(callArgs.options.agents).toMatchObject({
+        'sub-a': { description: 'd', prompt: 'p' },
+      });
     });
 
-    test('merges inline agents with skills wrapper; user wins on ID collision', async () => {
+    test('workflow omission selects no skills and enables strict MCP', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid' };
       });
 
-      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+        nodeConfig: { nodeId: 'closed-node' },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.agent).toBeUndefined();
+      expect(callArgs.options.agents).toBeUndefined();
+      expect(callArgs.options.allowedTools).toBeUndefined();
+      expect(callArgs.options.skills).toEqual([]);
+      expect(callArgs.options.strictMcpConfig).toBe(true);
+      expect(callArgs.options.mcpServers).toBeUndefined();
+    });
+
+    test('passes exact native skill selection while preserving inline agents', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      stageClaudeSkill('my-skill');
+
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
         nodeConfig: {
+          nodeId: 'skilled-node',
           skills: ['my-skill'],
           agents: {
-            // Intentionally collides with the internal 'dag-node-skills' wrapper ID
-            'dag-node-skills': {
-              description: 'user override',
-              prompt: 'user-defined prompt',
-            },
             'extra-sub': { description: 'd', prompt: 'p' },
           },
         },
@@ -1673,46 +2422,22 @@ describe('sendQuery decomposition behaviors', () => {
       }
 
       const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
-      const outAgents = callArgs.options.agents as Record<
-        string,
-        { description: string; prompt: string }
-      >;
-      // Both entries present
-      expect(Object.keys(outAgents).sort()).toEqual(['dag-node-skills', 'extra-sub']);
-      // User's definition wins the collision
-      expect(outAgents['dag-node-skills'].description).toBe('user override');
-      expect(outAgents['dag-node-skills'].prompt).toBe('user-defined prompt');
+      expect(callArgs.options.skills).toEqual(['my-skill']);
+      expect(callArgs.options.agent).toBeUndefined();
+      expect(callArgs.options.agents).toEqual({
+        'extra-sub': { description: 'd', prompt: 'p' },
+      });
     });
 
-    test('logs a warning when user-defined dag-node-skills overrides the skills wrapper', async () => {
+    test('native skills without allowed_tools leave the SDK tool set unrestricted', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid' };
       });
 
-      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+      stageClaudeSkill('agent-browser');
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
         nodeConfig: {
-          skills: ['my-skill'],
-          agents: {
-            'dag-node-skills': { description: 'user override', prompt: 'p' },
-          },
-        },
-      })) {
-        // consume
-      }
-
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ nodeSkills: ['my-skill'] }),
-        'claude.inline_agents_override_skills_wrapper'
-      );
-    });
-
-    test('skills without allowed_tools omits tools field so SDK defaults apply', async () => {
-      mockQuery.mockImplementation(async function* () {
-        yield { type: 'result', session_id: 'sid' };
-      });
-
-      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
-        nodeConfig: {
+          nodeId: 'skilled-node',
           skills: ['agent-browser'],
           // no allowed_tools → options.tools is undefined
         },
@@ -1721,12 +2446,8 @@ describe('sendQuery decomposition behaviors', () => {
       }
 
       const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
-      const outAgents = callArgs.options.agents as Record<
-        string,
-        { description: string; tools?: string[] }
-      >;
-      // tools should NOT be set — lets SDK provide all default native tools
-      expect(outAgents['dag-node-skills'].tools).toBeUndefined();
+      expect(callArgs.options.skills).toEqual(['agent-browser']);
+      expect(callArgs.options.tools).toBeUndefined();
     });
 
     test('skills with allowed_tools includes Skill in the tools list', async () => {
@@ -1734,8 +2455,10 @@ describe('sendQuery decomposition behaviors', () => {
         yield { type: 'result', session_id: 'sid' };
       });
 
-      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+      stageClaudeSkill('agent-browser');
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
         nodeConfig: {
+          nodeId: 'skilled-node',
           skills: ['agent-browser'],
           allowed_tools: ['Bash', 'Read'],
         },
@@ -1744,34 +2467,688 @@ describe('sendQuery decomposition behaviors', () => {
       }
 
       const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
-      const outAgents = callArgs.options.agents as Record<
-        string,
-        { description: string; tools?: string[] }
-      >;
-      // tools should include the explicit list plus Skill
-      expect(outAgents['dag-node-skills'].tools).toEqual(['Bash', 'Read', 'Skill']);
+      expect(callArgs.options.tools).toEqual(['Bash', 'Read', 'Skill']);
+      expect(callArgs.options.allowedTools).toContain('Skill');
     });
 
-    test('does NOT warn when inline agents do not collide with the skills wrapper', async () => {
+    test('fails before querying when a declared skill is unavailable to Claude', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      const agentsOnly = join(workflowCwd, '.agents', 'skills', 'my-skill');
+      mkdirSync(agentsOnly, { recursive: true });
+      writeFileSync(join(agentsOnly, 'SKILL.md'), '# agents only\n');
+
+      let error: unknown;
+      try {
+        for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+          nodeConfig: { nodeId: 'missing-skill', skills: ['my-skill'] },
+        })) {
+          // consume
+        }
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain('.claude/skills/');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('warns but still runs when a declared skill is on no root at all', async () => {
+      // Claude's built-in skills and `plugin:skill` names resolve inside the SDK
+      // and exist under no skills directory. Throwing on "absent from disk" made
+      // every one of them undeclarable (PR #2535 review), so an unresolved name
+      // warns and lets the SDK decide.
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid' };
       });
 
-      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
-        nodeConfig: {
-          skills: ['my-skill'],
-          agents: {
-            'brief-gen': { description: 'd', prompt: 'p' },
+      const chunks: string[] = [];
+      for await (const chunk of client.sendQuery('test', workflowCwd, undefined, {
+        nodeConfig: { nodeId: 'builtin-skill', skills: ['dataviz'] },
+      })) {
+        if (chunk.type === 'system') chunks.push(chunk.content ?? '');
+      }
+
+      expect(mockQuery).toHaveBeenCalled();
+      const callArgs = mockQuery.mock.calls[0]![0] as { options: Options };
+      expect(callArgs.options.skills).toEqual(['dataviz']);
+      expect(chunks.join('\n')).toContain('built-in');
+    });
+
+    test('names only the unreachable skill when a built-in is declared alongside it', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      const agentsOnly = join(workflowCwd, '.agents', 'skills', 'stranded-skill');
+      mkdirSync(agentsOnly, { recursive: true });
+      writeFileSync(join(agentsOnly, 'SKILL.md'), '# agents only\n');
+
+      let error: unknown;
+      try {
+        for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+          nodeConfig: { nodeId: 'mixed', skills: ['dataviz', 'stranded-skill'] },
+        })) {
+          // consume
+        }
+      } catch (caught) {
+        error = caught;
+      }
+
+      // 'dataviz' resolves nowhere on disk and may be a built-in, so it must not
+      // be blamed in an error about a misplaced install.
+      expect((error as Error).message).toContain('stranded-skill');
+      expect((error as Error).message).not.toContain('dataviz');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('resolves user skills from the effective CLAUDE_CONFIG_DIR on host', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      const configDir = join(workflowCwd, 'custom-claude-config');
+      const skillDir = join(configDir, 'skills', 'custom-skill');
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, 'SKILL.md'), '# custom\n');
+
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+        env: { CLAUDE_CONFIG_DIR: configDir },
+        nodeConfig: { nodeId: 'custom-config', skills: ['custom-skill'] },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.skills).toEqual(['custom-skill']);
+    });
+
+    test('rejects a user-only skill when effective settingSources is project-only', async () => {
+      const configDir = join(workflowCwd, 'project-only-config');
+      const skillDir = join(configDir, 'skills', 'user-only');
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, 'SKILL.md'), '# user only\n');
+
+      const consume = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+          env: { CLAUDE_CONFIG_DIR: configDir },
+          assistantConfig: { settingSources: ['project'] },
+          nodeConfig: { nodeId: 'project-only', skills: ['user-only'] },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consume()).rejects.toThrow(/enabled Claude-native skill directory/);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('rejects a project-only skill when per-node settingSources is user-only', async () => {
+      stageClaudeSkill('project-only');
+
+      const consume = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+          nodeConfig: {
+            nodeId: 'user-only',
+            skills: ['project-only'],
+            settingSources: ['user'],
           },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consume()).rejects.toThrow(/enabled Claude-native skill directory/);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('rejects every declared skill when effective settingSources is empty', async () => {
+      stageClaudeSkill('disabled');
+
+      const consume = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+          assistantConfig: { settingSources: ['project', 'user'] },
+          nodeConfig: { nodeId: 'no-sources', skills: ['disabled'], settingSources: [] },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consume()).rejects.toThrow(/effective settingSources currently enables none/);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('assistant-level empty settingSources rejects every declared workflow skill', async () => {
+      stageClaudeSkill('assistant-disabled');
+
+      const consume = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+          assistantConfig: { settingSources: [] },
+          nodeConfig: { nodeId: 'assistant-no-sources', skills: ['assistant-disabled'] },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consume()).rejects.toThrow(/effective settingSources currently enables none/);
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container workflows fail before spend for a host user-only skill', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      const configDir = join(workflowCwd, 'host-claude-config');
+      const skillDir = join(configDir, 'skills', 'user-only');
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(join(skillDir, 'SKILL.md'), '# user only\n');
+
+      let error: unknown;
+      try {
+        for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+          env: { CLAUDE_CONFIG_DIR: configDir },
+          execContext: { kind: 'container', containerId: 'c-1' },
+          nodeConfig: { nodeId: 'container-skill', skills: ['user-only'] },
+        })) {
+          // consume
+        }
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain('Container workflows');
+      expect((error as Error).message).toContain('project-local .claude/skills/');
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container workflows accept a declared project-local skill', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      stageClaudeSkill('container-project-skill');
+
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+        execContext: { kind: 'container', containerId: 'c-1' },
+        nodeConfig: { nodeId: 'container-project', skills: ['container-project-skill'] },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.skills).toEqual(['container-project-skill']);
+      expect(options.strictMcpConfig).toBe(true);
+    });
+
+    test('retries preserve exact declared skill, MCP, and tool restrictions', async () => {
+      let attempt = 0;
+      mockQuery.mockImplementation(async function* () {
+        attempt++;
+        if (attempt === 1) throw new Error('process exited with code 1');
+        yield { type: 'result', session_id: 'sid' };
+      });
+      stageClaudeSkill('retry-skill');
+      const mcpPath = join(workflowCwd, 'retry-mcp.json');
+      writeFileSync(mcpPath, JSON.stringify({ exact: { command: 'node', args: ['server.js'] } }));
+
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+        nodeConfig: {
+          nodeId: 'retry-node',
+          skills: ['retry-skill'],
+          mcp: mcpPath,
+          allowed_tools: ['Read'],
         },
       })) {
         // consume
       }
 
-      const warnCalls = mockLogger.warn.mock.calls.filter(
-        (args: unknown[]) => args[1] === 'claude.inline_agents_override_skills_wrapper'
-      );
-      expect(warnCalls).toHaveLength(0);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      for (const call of mockQuery.mock.calls) {
+        const options = (call[0] as { options: Record<string, unknown> }).options;
+        expect(options.skills).toEqual(['retry-skill']);
+        expect(options.strictMcpConfig).toBe(true);
+        expect(options.mcpServers).toEqual({
+          exact: { command: 'node', args: ['server.js'] },
+        });
+        expect(options.tools).toEqual(['Read', 'Skill']);
+        expect(options.allowedTools).toHaveLength(2);
+        expect(options.allowedTools).toEqual(expect.arrayContaining(['Skill', 'mcp__exact__*']));
+      }
     });
+
+    test('uses the same closed capability options when resuming', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for (const sessionId of [undefined, 'resume-me']) {
+        for await (const _ of client.sendQuery('test', workflowCwd, sessionId, {
+          nodeConfig: { nodeId: 'closed-node' },
+        })) {
+          // consume
+        }
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      for (const call of mockQuery.mock.calls) {
+        const options = (call[0] as { options: Record<string, unknown> }).options;
+        expect(options.skills).toEqual([]);
+        expect(options.strictMcpConfig).toBe(true);
+      }
+      const resumedOptions = (mockQuery.mock.calls[1][0] as { options: Record<string, unknown> })
+        .options;
+      expect(resumedOptions.resume).toBe('resume-me');
+    });
+
+    test('strict MCP passes exactly the workflow-declared server map', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      const mcpPath = join(workflowCwd, 'mcp.json');
+      writeFileSync(
+        mcpPath,
+        JSON.stringify({ declared: { command: 'node', args: ['server.mjs'] } })
+      );
+
+      for await (const _ of client.sendQuery('test', workflowCwd, undefined, {
+        nodeConfig: { nodeId: 'mcp-node', mcp: mcpPath },
+      })) {
+        // consume
+      }
+
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.strictMcpConfig).toBe(true);
+      expect(Object.keys(options.mcpServers as Record<string, unknown>)).toEqual(['declared']);
+      expect(options.allowedTools).toContain('mcp__declared__*');
+    });
+
+    test('keeps partial non-workflow nodeConfig on ambient defaults', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('title', workflowCwd, undefined, {
+        nodeConfig: { allowed_tools: [] },
+      })) {
+        // consume
+      }
+
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.skills).toBeUndefined();
+      expect(options.strictMcpConfig).toBeUndefined();
+      expect(options.tools).toEqual([]);
+    });
+
+    test('does not grant Skill to a non-workflow call that carries skills', async () => {
+      // The `options.skills` narrowing is gated on the workflow path. Granting
+      // the Skill tool outside that gate would expose the whole ambient catalog
+      // instead of a declared subset (PR #2535 review).
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('title', workflowCwd, undefined, {
+        nodeConfig: { allowed_tools: ['Read'], skills: ['my-skill'] },
+      })) {
+        // consume
+      }
+
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.skills).toBeUndefined();
+      expect(options.tools).toEqual(['Read']);
+      expect(options.allowedTools ?? []).not.toContain('Skill');
+    });
+  });
+});
+
+// ─── API errors surfaced as text (#1797) ─────────────────────────────────
+// The SDK does not throw on API-level failures (auth, billing, rate limit).
+// It synthesizes an assistant message (model: '<synthetic>', wrapper
+// `error` code) with the error prose, then emits a result with
+// subtype: 'success' AND is_error: true — the same field pair as the
+// legitimate stop-sequence carve-out (#1425). Shapes below are verbatim
+// captures from claude CLI 2.1.210 (isolated config dir).
+
+describe('API error surfaced as text (#1797)', () => {
+  let client: ClaudeProvider;
+
+  beforeEach(() => {
+    client = new ClaudeProvider({ retryBaseDelayMs: 1 });
+    mockQuery.mockClear();
+    mockLogger.info.mockClear();
+    mockLogger.warn.mockClear();
+    mockLogger.error.mockClear();
+    mockLogger.debug.mockClear();
+  });
+
+  interface CollectedStream {
+    chunks: Array<Record<string, unknown>>;
+    error?: Error;
+  }
+
+  async function collect(gen: AsyncIterable<Record<string, unknown>>): Promise<CollectedStream> {
+    const chunks: Array<Record<string, unknown>> = [];
+    try {
+      for await (const chunk of gen) {
+        chunks.push(chunk);
+      }
+    } catch (e) {
+      return { chunks, error: e as Error };
+    }
+    return { chunks };
+  }
+
+  function syntheticAssistantMessage(errorCode: string, text: string): Record<string, unknown> {
+    return {
+      type: 'assistant',
+      message: {
+        model: '<synthetic>',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text }],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+      error: errorCode,
+      session_id: 'sid-api-err',
+    };
+  }
+
+  function apiErrorResult(text: string): Record<string, unknown> {
+    return {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      api_error_status: null,
+      result: text,
+      stop_reason: 'stop_sequence',
+      terminal_reason: 'api_error',
+      total_cost_usd: 0,
+      session_id: 'sid-api-err',
+    };
+  }
+
+  test('auth error (Not logged in) throws instead of completing with poisoned output', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('authentication_failed', 'Not logged in · Please run /login');
+      yield apiErrorResult('Not logged in · Please run /login');
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain('Claude API error (authentication_failed)');
+    expect(error?.message).toContain('Not logged in');
+    // The poison: no assistant chunk carrying the error prose, no result chunk
+    expect(chunks.filter(c => c.type === 'assistant')).toHaveLength(0);
+    expect(chunks.filter(c => c.type === 'result')).toHaveLength(0);
+    // Auth errors are non-retryable — a single attempt only
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ errorCode: 'authentication_failed' }),
+      'claude.result_api_error'
+    );
+  });
+
+  test('invalid API key (401) shape throws a non-retryable auth error', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage(
+        'authentication_failed',
+        'Invalid API key · Fix external API key'
+      );
+      yield {
+        ...apiErrorResult('Invalid API key · Fix external API key'),
+        api_error_status: 401,
+      };
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (authentication_failed)');
+    expect(error?.message).toContain('Invalid API key');
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test('api_error result without a preceding synthetic message still throws (belt-and-suspenders)', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield apiErrorResult('Something went wrong upstream');
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (unknown)');
+    expect(error?.message).toContain('Something went wrong upstream');
+    expect(chunks.filter(c => c.type === 'result')).toHaveLength(0);
+  });
+
+  test('synthetic rate_limit error retries per existing subprocess policy, then throws', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('rate_limit', 'Rate limited · Try again later');
+      yield apiErrorResult('Rate limited · Try again later');
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (rate_limit)');
+    // MAX_SUBPROCESS_RETRIES = 3 → 4 attempts total
+    expect(mockQuery).toHaveBeenCalledTimes(4);
+  }, 5_000);
+
+  test('400 tool-use-concurrency error with a catch-all code retries like a rate limit (#1341)', async () => {
+    // The SDK types this transient 400 with a catch-all code ('unknown' here;
+    // 'invalid_request' classifies identically), so code-only classification
+    // would fail fast. The narrow text fallback must reclassify it as
+    // rate_limit and drive the existing backoff.
+    const text = 'API Error: 400 due to tool use concurrency issues.';
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('unknown', text);
+      yield { ...apiErrorResult(text), api_error_status: 400 };
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (unknown)');
+    expect(error?.message).toContain('tool use concurrency');
+    // MAX_SUBPROCESS_RETRIES = 3 → 4 attempts total
+    expect(mockQuery).toHaveBeenCalledTimes(4);
+  }, 5_000);
+
+  test('other catch-all-coded api errors stay non-retryable', async () => {
+    // Guards the narrowness of the #1341 fallback: a genuine client error that
+    // also lands on a catch-all code must NOT be retried.
+    const text = 'Invalid request: max_tokens exceeds model limit';
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('invalid_request', text);
+      yield { ...apiErrorResult(text), api_error_status: 400 };
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (invalid_request)');
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test('thrown subprocess error mentioning tool use concurrency retries as rate_limit (#1341)', async () => {
+    mockQuery.mockImplementation(async function* () {
+      throw new Error('API Error: 400 due to tool use concurrency issues.');
+    });
+
+    const consumeGenerator = async (): Promise<void> => {
+      for await (const _ of client.sendQuery('test', '/workspace')) {
+        // consume
+      }
+    };
+
+    await expect(consumeGenerator()).rejects.toThrow(/Claude Code rate_limit/);
+    expect(mockQuery).toHaveBeenCalledTimes(4);
+  }, 5_000);
+
+  test('legitimate output that merely mentions the error phrases is untouched', async () => {
+    // A real model turn (real model id, no wrapper error field, clean result)
+    // whose TEXT happens to discuss login errors — e.g. a node writing docs
+    // about auth failures. Must flow through as a normal success.
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'assistant',
+        message: {
+          model: 'claude-sonnet-4-5',
+          content: [
+            {
+              type: 'text',
+              text: 'If auth fails you may see "Not logged in · Please run /login".',
+            },
+          ],
+        },
+        session_id: 'sid-legit',
+      };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        result: 'done',
+        session_id: 'sid-legit',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    expect(
+      chunks.some(c => typeof c.content === 'string' && c.content.includes('Not logged in'))
+    ).toBe(true);
+    const result = chunks.find(c => c.type === 'result');
+    expect(result).toBeDefined();
+    expect(result).not.toHaveProperty('isError');
+  });
+
+  test('#1425 stop-sequence carve-out is preserved (is_error + subtype success without API-error signals)', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'assistant',
+        message: {
+          model: 'claude-sonnet-4-5',
+          content: [{ type: 'text', text: 'Rate limit guidance: back off exponentially.' }],
+        },
+        session_id: 'sid-stop-seq',
+      };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: true,
+        stop_reason: 'stop_sequence',
+        session_id: 'sid-stop-seq',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    const result = chunks.find(c => c.type === 'result');
+    expect(result).toBeDefined();
+    expect(result).not.toHaveProperty('isError');
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'sid-stop-seq' }),
+      'claude.result_success_validated'
+    );
+  });
+
+  test('real-model message carrying an error code (e.g. max_output_tokens) is not suppressed', async () => {
+    // A REAL (non-synthetic) message can carry a wrapper error code alongside
+    // genuine truncated output. Only '<synthetic>' content is SDK error prose.
+    mockQuery.mockImplementation(async function* () {
+      yield {
+        type: 'assistant',
+        message: {
+          model: 'claude-sonnet-4-5',
+          content: [{ type: 'text', text: 'partial output before truncation' }],
+        },
+        error: 'max_output_tokens',
+        session_id: 'sid-trunc',
+      };
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: 'sid-trunc',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    expect(chunks.some(c => c.content === 'partial output before truncation')).toBe(true);
+  });
+
+  test('fail-safe: synthetic error contradicted by a clean result yields the withheld text late', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('server_error', 'Upstream hiccup');
+      yield {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: 'sid-recovered',
+      };
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error).toBeUndefined();
+    expect(chunks.some(c => c.type === 'assistant' && c.content === 'Upstream hiccup')).toBe(true);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ errorCode: 'server_error' }),
+      'claude.synthetic_error_not_confirmed'
+    );
+  });
+
+  test('stream ending after a synthetic error without a result throws', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('billing_error', 'Credit balance is too low');
+      // stream ends abnormally — no result event
+    });
+
+    const { chunks, error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (billing_error)');
+    expect(error?.message).toContain('Credit balance is too low');
+    expect(chunks.filter(c => c.type === 'assistant')).toHaveLength(0);
+    // billing_error classifies as auth → non-retryable
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('classifySubprocessError (#2715)', () => {
+  test('does not classify a bare "401"/"403" substring as auth', () => {
+    expect(classifySubprocessError('connect ECONNREFUSED 127.0.0.1:401', '')).not.toBe('auth');
+    expect(classifySubprocessError('timeout after 401ms', '')).not.toBe('auth');
+    expect(classifySubprocessError('proxy responded with 403', '')).not.toBe('auth');
+  });
+
+  test('still classifies genuine auth signals as auth', () => {
+    expect(classifySubprocessError('Unauthorized', '')).toBe('auth');
+    expect(classifySubprocessError('authentication failed', '')).toBe('auth');
+    expect(classifySubprocessError('invalid token provided', '')).toBe('auth');
+    expect(classifySubprocessError('Your credit balance is too low to access the API', '')).toBe(
+      'auth'
+    );
+    // Real-world provider shape: a 401 co-occurring with the word "Unauthorized" —
+    // the word carries the signal, not the digits.
+    expect(classifySubprocessError('exceeded retry limit, last status: 401 Unauthorized', '')).toBe(
+      'auth'
+    );
+  });
+
+  test('resolves a crash-pattern message carrying a stray digit to the retryable "crash" class, not silently to "unknown"', () => {
+    // Not classifying as 'auth' isn't sufficient on its own — shouldRetry =
+    // errorClass === 'rate_limit' || errorClass === 'crash', so a crash-shaped
+    // message must specifically land on 'crash' (retryable), not fall through
+    // to 'unknown' (also non-retryable), or a future reordering of
+    // SUBPROCESS_CRASH_PATTERNS/AUTH_PATTERNS could silently regress retry
+    // eligibility without any test catching it.
+    expect(classifySubprocessError('exited with code 401', '')).toBe('crash');
+  });
+
+  test('does not classify a bare "429" substring as rate_limit', () => {
+    expect(classifySubprocessError('connect ECONNREFUSED 127.0.0.1:4291', '')).not.toBe(
+      'rate_limit'
+    );
+    expect(
+      classifySubprocessError('operation timed out after 4293ms while establishing connection', '')
+    ).not.toBe('rate_limit');
+  });
+
+  test('still classifies genuine rate-limit signals as rate_limit', () => {
+    expect(classifySubprocessError('rate limit exceeded', '')).toBe('rate_limit');
+    expect(classifySubprocessError('too many requests, please slow down', '')).toBe('rate_limit');
+    expect(classifySubprocessError('server overloaded', '')).toBe('rate_limit');
   });
 });

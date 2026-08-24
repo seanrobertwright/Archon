@@ -262,13 +262,23 @@ export function toRunEvent(raw: RawWorkflowEvent): RunEvent {
     };
   }
 
-  if (et === 'workflow_started' || et === 'workflow_completed' || et === 'workflow_failed') {
+  if (
+    et === 'workflow_started' ||
+    et === 'workflow_completed' ||
+    et === 'workflow_failed' ||
+    et === 'workflow_resumed'
+  ) {
+    // `workflow_resumed` is written only when a resume CLEARED a prior error
+    // (#2348), and carries that error in `data.error` — the same key
+    // `workflow_failed` uses, so the shared `detail` fallback below surfaces it.
     const label =
       et === 'workflow_started'
         ? 'Workflow started'
         : et === 'workflow_completed'
           ? 'Workflow completed'
-          : 'Workflow failed';
+          : et === 'workflow_resumed'
+            ? 'Workflow resumed (prior error cleared)'
+            : 'Workflow failed';
     const detail =
       readString(data, 'name') ||
       readString(data, 'workflow') ||
@@ -279,6 +289,58 @@ export function toRunEvent(raw: RawWorkflowEvent): RunEvent {
       kind: 'system',
       label,
       detail,
+    };
+  }
+
+  // Container isolation lifecycle (folder-project container runs). Persisted with
+  // DB-side names, NOT the emitter's `container_lifecycle` type — this normalizer
+  // reads DB rows. Surfaced behind the System toggle. created/destroyed bracket the
+  // run; stopped/resumed bracket a suspend across a pause; writeback_* track the
+  // write-back gate (Phase C).
+  const CONTAINER_EVENT_LABELS: Record<string, string> = {
+    container_created: 'Container created',
+    container_stopped: 'Container stopped (paused)',
+    container_resumed: 'Container resumed',
+    container_destroyed: 'Container removed',
+    writeback_requested: 'Write-back requested',
+    writeback_applied: 'Changes applied to live folder',
+    writeback_discarded: 'Changes discarded',
+  };
+  if (et in CONTAINER_EVENT_LABELS) {
+    const containerId = readString(data, 'containerId');
+    let detail = containerId ? containerId.slice(0, 12) : '';
+    if (et === 'writeback_applied') {
+      const filesApplied = readNumberOrNull(data, 'files_applied') ?? 0;
+      const filesDeleted = readNumberOrNull(data, 'files_deleted') ?? 0;
+      detail = `${filesApplied} written, ${filesDeleted} deleted`;
+    } else if (et === 'writeback_requested') {
+      const totalCount = readNumberOrNull(data, 'total_count');
+      detail = totalCount !== null ? `${totalCount} file(s) changed` : '';
+    }
+    return {
+      ...base,
+      kind: 'system',
+      label: CONTAINER_EVENT_LABELS[et] ?? et,
+      detail,
+    };
+  }
+
+  // Keys the engine dropped from this run's YAML (#2213). Mapped explicitly —
+  // the fallback below would render the raw `{"warnings":[…]}` payload. Rendered
+  // as `text`, NOT `system`: system rows sit behind the System toggle (off by
+  // default), and a silently dropped `interactive:` gate is exactly what the
+  // author needs to see without opting in.
+  if (et === 'workflow_parse_warnings') {
+    const warnings = Array.isArray(data.warnings)
+      ? data.warnings.filter((w): w is string => typeof w === 'string')
+      : [];
+    return {
+      ...base,
+      kind: 'text',
+      content:
+        warnings.length > 0
+          ? `⚠️ This workflow declares keys the engine ignores:\n${warnings.map(w => `- ${w}`).join('\n')}`
+          : '⚠️ This workflow declares keys the engine ignores.',
     };
   }
 

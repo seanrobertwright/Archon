@@ -18,6 +18,7 @@ import type { ProviderCapabilities } from '../../types';
  */
 export const PI_CAPABILITIES: ProviderCapabilities = {
   sessionResume: true,
+  sessionFork: true,
   mcp: false,
   hooks: false,
   skills: true,
@@ -30,5 +31,7 @@ export const PI_CAPABILITIES: ProviderCapabilities = {
   thinkingControl: true,
   fallbackModel: false,
   sandbox: false,
+  settingSources: false, // Claude Agent SDK-only knob (which setting sources the agent loads)
   nativeTools: true,
+  containerExec: false, // no in-container spawn path yet (fail-fast source of truth)
 };

@@ -7,7 +7,7 @@ mock.module('@archon/paths', () => ({
 
 import type { SessionEvent } from '@github/copilot-sdk';
 
-import type { MessageChunk, TokenUsage } from '../../types';
+import type { TokenUsage } from '../../types';
 import {
   AsyncQueue,
   mapCopilotEvent,
@@ -216,6 +216,7 @@ describe('mapCopilotEvent', () => {
         toolName: 'bash',
         toolOutput: 'full diff output',
         toolCallId: 'c1',
+        toolOutcome: 'success',
       },
     ]);
   });
@@ -252,6 +253,7 @@ describe('mapCopilotEvent', () => {
         toolName: 'bash',
         toolOutput: '❌ permission denied',
         toolCallId: 'c1',
+        toolOutcome: 'error',
       },
     ]);
   });

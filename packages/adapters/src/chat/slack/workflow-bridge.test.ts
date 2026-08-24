@@ -295,6 +295,38 @@ describe('SlackWorkflowBridge', () => {
     expect(headerText).toContain('workflow resumed');
   });
 
+  test('interactive-loop approval describes the aggregate completion condition', async () => {
+    const { adapter, updated, triggerMap, dispatchAction } = makeFakeAdapter();
+    triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });
+    mockGetConversationId.mockReturnValue('C1:111.0');
+    mockApproveWorkflow.mockResolvedValue({ type: 'interactive_loop' });
+
+    new SlackWorkflowBridge(adapter as never).attach();
+    await dispatchEvent({
+      type: 'workflow_started',
+      runId: 'r1',
+      workflowName: 'assist',
+      conversationId: 'conv-db-uuid',
+    });
+    await dispatchEvent({
+      type: 'approval_pending',
+      runId: 'r1',
+      nodeId: 'review',
+      message: 'Approve the change?',
+    });
+
+    await dispatchAction('approve:r1:review', {
+      user: { id: 'U123' },
+      channel: { id: 'C1' },
+      message: { ts: '2.000' },
+    });
+
+    const headerText = (updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text
+      ?.text;
+    expect(headerText).toContain('completion condition was met');
+    expect(headerText).not.toContain('completion signal');
+  });
+
   test('reject button under retry threshold notes workflow will retry', async () => {
     const { adapter, updated, triggerMap, dispatchAction } = makeFakeAdapter();
     triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });
@@ -322,6 +354,10 @@ describe('SlackWorkflowBridge', () => {
     });
 
     expect(mockRejectWorkflow).toHaveBeenCalledTimes(1);
+    // The reject button has no text-entry affordance, so it can never supply a
+    // reason — the bridge must default it to 'Rejected' itself (#2740),
+    // otherwise a new-mode gate's structured output.text records ''.
+    expect(mockRejectWorkflow).toHaveBeenCalledWith('r1', 'Rejected');
     const text = (updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text?.text;
     expect(text).toContain('Rejected');
     expect(text).toContain('will retry');

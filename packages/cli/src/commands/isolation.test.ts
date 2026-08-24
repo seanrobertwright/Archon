@@ -36,6 +36,12 @@ mock.module('@archon/core/db/workflows', () => ({
   getActiveWorkflowRunByPath: mockGetActiveWorkflowRunByPath,
 }));
 
+const mockLoadRepoConfig = mock(() => Promise.resolve({}));
+
+mock.module('@archon/core', () => ({
+  loadRepoConfig: mockLoadRepoConfig,
+}));
+
 const mockRemoveEnvironment = mock(() =>
   Promise.resolve({ worktreeRemoved: true, branchDeleted: true, warnings: [] })
 );
@@ -68,12 +74,12 @@ mock.module('@archon/core/operations/isolation-operations', () => ({
 }));
 
 const mockHasUncommittedChanges = mock(() => Promise.resolve(false));
-// Default: gh returns empty PR array, git log returns empty string (no commits to report)
+// Default: gh returns empty PR array and git reports no unpushed commits.
 const mockExecFileAsync = mock((cmd: string) =>
   Promise.resolve({ stdout: cmd === 'gh' ? '[]' : '', stderr: '' })
 );
 
-const mockGetDefaultBranch = mock(() => Promise.resolve('main'));
+const mockGetUniqueCommitCount = mock(() => Promise.resolve(0));
 
 mock.module('@archon/git', () => ({
   hasUncommittedChanges: mockHasUncommittedChanges,
@@ -82,7 +88,7 @@ mock.module('@archon/git', () => ({
   toRepoPath: mock((p: string) => p),
   toBranchName: mock((b: string) => b),
   worktreeExists: mock(() => Promise.resolve(true)),
-  getDefaultBranch: mockGetDefaultBranch,
+  getUniqueCommitCount: mockGetUniqueCommitCount,
 }));
 
 mock.module('@archon/isolation', () => ({
@@ -122,12 +128,14 @@ describe('isolationCompleteCommand', () => {
     mockGetActiveWorkflowRunByPath.mockReset();
     mockGetActiveWorkflowRunByPath.mockResolvedValue(null);
     mockExecFileAsync.mockReset();
-    // Default: gh returns empty PR array, git log returns empty string (no commits)
+    // Default: gh returns empty PR array and git reports no unpushed commits.
     mockExecFileAsync.mockImplementation((cmd: string) =>
       Promise.resolve({ stdout: cmd === 'gh' ? '[]' : '', stderr: '' })
     );
-    mockGetDefaultBranch.mockReset();
-    mockGetDefaultBranch.mockResolvedValue('main');
+    mockLoadRepoConfig.mockReset();
+    mockLoadRepoConfig.mockResolvedValue({});
+    mockGetUniqueCommitCount.mockReset();
+    mockGetUniqueCommitCount.mockResolvedValue(0);
   });
 
   afterEach(() => {
@@ -219,26 +227,63 @@ describe('isolationCompleteCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
 
-  it('blocks when there are unmerged commits', async () => {
+  it('completes a branch identical to dev without --force', async () => {
     mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    mockRemoveEnvironment.mockResolvedValueOnce({
+      worktreeRemoved: true,
+      branchDeleted: true,
+      warnings: [],
+    });
+    mockGetUniqueCommitCount.mockResolvedValueOnce(0);
+
+    await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
+
+    expect(mockGetUniqueCommitCount).toHaveBeenCalledWith('/test/repo', 'feature-branch', 'origin');
+    expect(mockRemoveEnvironment).toHaveBeenCalled();
+  });
+
+  it('uses the configured remote for the completion commit checks', async () => {
+    mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    mockRemoveEnvironment.mockResolvedValueOnce({
+      worktreeRemoved: true,
+      branchDeleted: true,
+      warnings: [],
+    });
+    mockLoadRepoConfig.mockResolvedValueOnce({ worktree: { remote: 'upstream' } });
     mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'gh') {
         return Promise.resolve({ stdout: '[]', stderr: '' });
       }
-      if (cmd === 'git' && args.includes(`main..feature-branch`)) {
-        return Promise.resolve({
-          stdout: 'abc1234 fix: something\ndef5678 fix: other\n',
-          stderr: '',
-        });
+      if (cmd === 'git' && args.includes('upstream/feature-branch..feature-branch')) {
+        return Promise.resolve({ stdout: '', stderr: '' });
       }
-      return Promise.resolve({ stdout: '', stderr: '' });
+      return Promise.reject(new Error('fatal: unknown revision origin/feature-branch'));
     });
+
+    await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
+
+    expect(mockGetUniqueCommitCount).toHaveBeenCalledWith(
+      '/test/repo',
+      'feature-branch',
+      'upstream'
+    );
+    expect(mockExecFileAsync).toHaveBeenCalledWith(
+      'git',
+      ['-C', '/test/repo', 'log', 'upstream/feature-branch..feature-branch', '--oneline'],
+      { timeout: 15000 }
+    );
+    expect(mockRemoveEnvironment).toHaveBeenCalled();
+  });
+
+  it('blocks when commits are unique to the branch', async () => {
+    mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    mockGetUniqueCommitCount.mockResolvedValueOnce(2);
 
     await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
 
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
-    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ 2 commit(s) not merged into main');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ 2 commit(s) unique to this branch');
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
@@ -264,8 +309,11 @@ describe('isolationCompleteCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
 
-  it('blocks with "never pushed" when origin/<branch> does not exist', async () => {
+  it('blocks with "never pushed" when origin/<branch> does not exist and the branch has unique commits', async () => {
     mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    // Even though origin/<branch> is missing, the branch has 1 unique commit —
+    // deletion would lose it, so we must block.
+    mockGetUniqueCommitCount.mockResolvedValueOnce(1);
     mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'gh') {
         return Promise.resolve({ stdout: '[]', stderr: '' });
@@ -281,6 +329,74 @@ describe('isolationCompleteCommand', () => {
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
     expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ branch has never been pushed to remote');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
+    expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
+  });
+
+  it('allows never-pushed branch with 0 unique commits to complete without --force', async () => {
+    mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    // Every commit on the branch is reachable from a surviving ref (so
+    // getUniqueCommitCount returns 0), and origin/<branch> does not exist.
+    // Combined, there is provably nothing to lose — completion must succeed
+    // without --force.
+    mockGetUniqueCommitCount.mockResolvedValueOnce(0);
+    mockRemoveEnvironment.mockResolvedValueOnce({
+      worktreeRemoved: true,
+      branchDeleted: true,
+      warnings: [],
+    });
+    mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'gh') {
+        return Promise.resolve({ stdout: '[]', stderr: '' });
+      }
+      if (cmd === 'git' && args.some((a: string) => a.startsWith('origin/'))) {
+        return Promise.reject(new Error('fatal: unknown revision origin/feature-branch'));
+      }
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+
+    await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
+
+    expect(mockRemoveEnvironment).toHaveBeenCalledWith('env-123', {
+      force: false,
+      deleteRemoteBranch: true,
+    });
+    expect(consoleErrorSpy).not.toHaveBeenCalledWith('  Blocked: feature-branch');
+    expect(consoleErrorSpy).not.toHaveBeenCalledWith(
+      '    ✗ branch has never been pushed to remote'
+    );
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Completed: feature-branch');
+    expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 1 completed, 0 failed, 0 not found');
+  });
+
+  it('still blocks when the unique-commit check throws (fail-closed preserved)', async () => {
+    mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    // getUniqueCommitCount throws — check 4's blocker fires. Check 5's
+    // "never pushed" blocker must NOT also fire on the same branch: the gate
+    // (uniqueCommitCount !== undefined && uniqueCommitCount > 0) is false
+    // when uniqueCommitCount is undefined, so an unverifiable check 4 cannot
+    // be misread as "verified zero unique commits".
+    mockGetUniqueCommitCount.mockRejectedValueOnce(new Error('git rev-list failed'));
+    mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'gh') {
+        return Promise.resolve({ stdout: '[]', stderr: '' });
+      }
+      if (cmd === 'git' && args.some((a: string) => a.startsWith('origin/'))) {
+        return Promise.reject(new Error('fatal: unknown revision origin/feature-branch'));
+      }
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+
+    await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
+
+    expect(mockRemoveEnvironment).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '    ✗ could not determine unique commits (git rev-list failed) — refusing to delete unverified'
+    );
+    expect(consoleErrorSpy).not.toHaveBeenCalledWith(
+      '    ✗ branch has never been pushed to remote'
+    );
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Use --force to override.');
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });

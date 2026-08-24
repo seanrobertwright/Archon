@@ -24,7 +24,7 @@ These commands are handled deterministically by the orchestrator — they always
 | `/register-project <path>` | Register a local directory as a project |
 | `/update-project <name> <path>` | Update a project's directory path |
 | `/remove-project <name>` | Remove a project registration |
-| `/setproject <name>` | Bind this conversation to a registered project |
+| `/setproject <name>` | Bind this conversation to a registered project. Clears any working-directory/worktree override and starts a fresh AI session on the next message (chat history stays visible) |
 
 ## Workflows
 
@@ -34,9 +34,9 @@ These commands are handled deterministically by the orchestrator — they always
 | `/workflow reload` | Reload workflow definitions |
 | `/workflow status` | Show active workflows |
 | `/workflow cancel` | Cancel running workflow |
-| `/workflow resume <id>` | Resume a failed run (re-runs, skipping completed nodes) |
+| `/workflow resume <id>` | Resume a failed or paused run (re-runs, skipping completed nodes) |
 | `/workflow abandon <id>` | Discard a run (running, paused, or failed) |
-| `/workflow approve <id> [comment]` | Approve a paused workflow run at an approval gate |
+| `/workflow approve <id> [comment]` | Approve a paused workflow run at an approval gate (interactive-loop gates: no comment on a signal-bearing gate = accept & complete; a comment runs another iteration) |
 | `/workflow reject <id> [reason]` | Reject a paused workflow run at an approval gate |
 | `/workflow run <name> [args]` | Run a workflow directly |
 | `/workflow cleanup [days]` | CLI only -- delete old run records (default: 7 days) |
@@ -48,7 +48,7 @@ These commands are handled deterministically by the orchestrator — they always
 | Command | Description |
 |---------|-------------|
 | `/status` | Show conversation state |
-| `/reset` | Clear session completely |
+| `/reset` | Start fresh: clears the AI session, releases the execution binding (working-directory override + isolation env), and abandons this conversation's **resumable** run trees (`paused`/`failed`) so the next message does not continue one. Runs that are actively executing (`pending`/`running`) are never touched -- they may belong to another process entirely. Each cleanup effect still runs if another fails; an incomplete reset tells you to retry and does not promise a fresh next message. The project attachment (`codebase_id`) is preserved; use `/setproject none` to drop that too |
 | `/help` | Show all commands |
 
 ---
@@ -111,9 +111,9 @@ Bot: Platform: telegram
 ```
 You: /reset
 
-Bot: Session cleared. Starting fresh on next message.
-
-     Codebase configuration preserved.
+Bot: Session cleared. Cleared workspace binding (worktree + isolation env).
+     Abandoned 1 resumable run(s). Project attachment preserved — next message
+     starts fresh.
 ```
 
 ---

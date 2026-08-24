@@ -11,6 +11,8 @@ sidebar:
 
 You must configure **at least one** AI assistant. All four can be configured and mixed within workflows.
 
+For a canonical, at-a-glance comparison of which per-node features each provider supports, see the [Provider Capability Matrix](/reference/provider-capabilities/) — it is generated directly from the providers' capability declarations, so it never drifts from runtime behavior. The per-provider sections below add the field-level YAML syntax and caveats.
+
 ## Structured output guarantees
 
 When a workflow node sets `output_format`, the guarantee level depends on the provider's tier (exposed as `capabilities.structuredOutput` on `GET /api/providers`):
@@ -96,6 +98,8 @@ Claude Code supports three authentication modes via `CLAUDE_USE_GLOBAL_AUTH`:
 2. **Explicit Tokens** (set to `false`): Uses tokens from env vars below
 3. **Auto-Detect** (not set): Uses tokens if present in env, otherwise global auth
 
+If both `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_API_KEY` are set, the OAuth token wins and no API key is passed to Claude. A per-user credential connected in Settings → Agents always takes precedence over these install-wide variables for that user's runs.
+
 ### Option 1: Global Auth (Recommended)
 
 ```ini
@@ -140,7 +144,7 @@ assistants:
     # claudeBinaryPath: /absolute/path/to/claude
 ```
 
-The `settingSources` option controls which `CLAUDE.md`, skill, command, and agent files the Claude Code SDK loads. The default is `['project', 'user']`, which loads both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. Set it to `['project']` if you want to scope a workflow to project-only resources.
+The `settingSources` option controls where the Claude Code SDK discovers `CLAUDE.md`, skill, command, and agent files. The default is `['project', 'user']`, which includes both the project-level `<cwd>/.claude/` and your personal `~/.claude/`. For workflow skills, discovery is only eligibility: the node's `skills:` list remains the exact active selection, and omission/`[]` activates none. Set `settingSources` to `['project']` to exclude user-level resources, or `[]` for a lean node with no setting sources; a declared skill must live under a source the node enables. See [Claude SDK Advanced Options](/guides/authoring-workflows/#claude-sdk-advanced-options).
 
 ### Set as Default (Optional)
 
@@ -228,8 +232,9 @@ You can configure Codex's behavior in `.archon/config.yaml`:
 ```yaml
 assistants:
   codex:
-    model: gpt-5.3-codex
+    model: gpt-5.6-sol
     modelReasoningEffort: medium  # 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+                                  # (install default; a workflow's `effort:` overrides it)
     webSearchMode: live           # 'disabled' | 'cached' | 'live'
     additionalDirectories:
       - /absolute/path/to/other/repo
@@ -245,7 +250,11 @@ DEFAULT_AI_ASSISTANT=codex
 
 ### Skills
 
-Codex supports skills via filesystem auto-discovery from `.agents/skills/`. Run `archon skill install` (or `archon setup`) to install the bundled `archon` and `manage-run` skills for both Claude Code and Codex.
+Codex supports installed skills from `.agents/skills/`. In workflow nodes Archon
+turns the automatic skill catalog off, so commands and prompts invoke a skill
+explicitly with `$skill-name`. Direct Codex chat keeps native discovery behavior.
+Run `archon skill install` (or `archon setup`) to install the bundled `archon`
+and `manage-run` skills for both Claude Code and Codex.
 
 See [Per-Node Skills](/guides/skills/#codex-compatibility) for behavior details and limitations.
 
@@ -305,7 +314,7 @@ assistants:
 | Skills | ✅ | SKILL.md files with YAML frontmatter, pattern-based permissions |
 | Tool restrictions | ✅ | `tools` / `disallowedTools` per agent; deny wins over allow |
 | Inline agents (`agents:`) | ✅ | File-materialized agents; single and parallel multi-agent fan-out |
-| Hooks | ✅ | Plugin hook system (tool, session, message hooks) |
+| Hooks | ❌ | Archon's per-node `hooks` field is Claude-SDK-shaped; the OpenCode provider has no translation site, so a node's `hooks:` is ignored (with a warning) |
 | Effort / reasoning control | ❌ | No per-request param; not configurable in agent file, opencode puts it in config. |
 | Thinking control | ❌ | No explicit `thinking` field in agent frontmatter; OpenCode auto-enables reasoning when `agents[].model` is a reasoning-capable model (e.g. `anthropic/claude-sonnet-4-5`) |
 | Fallback model | ❌ | No native failover in the SDK |
@@ -419,7 +428,19 @@ Most extensions need three config surfaces:
 |---|---|
 | `extensionFlags` | Per-extension feature flags (maps 1:1 to Pi's `--flag` CLI switches) |
 | `env` | Env vars the extension reads at runtime (managed via `.archon/config.yaml` or the Web UI codebase env panel) |
-| Workflow-level `interactive: true` | Required for **approval-gate extensions** on the web UI — forces foreground execution so the user can respond |
+| `interactive: true` | Binds a UI context so approval-gate extensions can block for human input; also set the **workflow-level** `interactive: true` on the web UI so the run stays foreground |
+
+#### Scoping extension posture per node
+
+`enableExtensions`, `interactive`, and `extensionFlags` are the three fields that make up a node's **extension posture**. Setting them under `assistants.pi` applies the posture to *every* Pi node in *every* workflow — which is usually wrong. A planning extension like plannotator only belongs on the node that actually plans: if the same `plan: true` flag leaks into a downstream `implement` node, that node starts in planning mode, its code edits get blocked ("edits are limited to markdown files"), and it hangs waiting on a review nobody asked for.
+
+Scope the posture to the node that plays that role. Three layers resolve per node, in ascending precedence:
+
+1. **Assistant-level** (`assistants.pi.*`) — the install-wide default for every Pi node.
+2. **Install-level node map** (`assistants.pi.nodes.<nodeId>`) — overrides the default for a node id on this machine. Handy when you can't edit the workflow, but it's non-portable: the override lives in one machine's `config.yaml` and is keyed by node-id string, so a node rename silently orphans it.
+3. **Portable node `pi:` block** — the per-node posture written directly in the workflow YAML. It travels with the workflow and wins over both layers above. This is the recommended surface.
+
+Each layer's `extensionFlags` shallow-merge over the ones below it (later wins per key), so a node can negate an inherited flag with `plan: false`. The `pi:` block is honored on `prompt`, `command`, and `loop` nodes (a `loop:` node's per-iteration call is exactly where planning mode tends to leak); on a `loop_group` it's ignored with a warning — put it on the body nodes instead.
 
 **Example — [plannotator](https://github.com/dmcglinn/plannotator) (human-in-the-loop plan review):**
 
@@ -428,25 +449,171 @@ Most extensions need three config surfaces:
 pi install npm:@plannotator/pi-extension
 ```
 
+Keep `assistants.pi` free of the planning flag — set only the extension's runtime env there:
+
 ```yaml
 # .archon/config.yaml
 assistants:
   pi:
     model: anthropic/claude-haiku-4-5
-    extensionFlags:
-      plan: true              # enables the plannotator "plan" flag
     env:
       PLANNOTATOR_REMOTE: "1" # exposes the review URL on 127.0.0.1:19432 so you can open it from anywhere
 ```
 
+Then grant the `plan` flag and a UI context to the planner node, and explicitly deny them on the implement loop — right in the workflow, so the posture ships with it:
+
 ```yaml
-# .archon/workflows/my-piv.yaml
-name: my-piv
+# .archon/workflows/plan-then-build.yaml
+name: plan-then-build
 provider: pi
-interactive: true             # plannotator gates the node on human approval — required on web UI
+interactive: true             # workflow-level: keeps the run foreground on the web UI so you can approve
+nodes:
+  - id: plan
+    prompt: "Draft a plan for: $ARGUMENTS"
+    pi:
+      interactive: true        # bind the UI context — plannotator opens its review server
+      extensionFlags:
+        plan: true             # planning mode ON for this node only
+
+  - id: implement
+    depends_on: [plan]
+    loop:
+      prompt: "Implement the approved plan. Print DONE when finished."
+      until: "DONE"
+      max_iterations: 10
+    pi:
+      interactive: false       # no review server on the implement loop
+      extensionFlags:
+        plan: false            # planning mode OFF — code edits are allowed
 ```
 
-When the node runs, plannotator prints a review URL and blocks until you click approve/deny in the browser. Archon's CLI/SSE batch buffer flushes that URL to you immediately so you never get stuck waiting on a node that silently wants input.
+When the `plan` node runs, plannotator prints a review URL and blocks until you click approve/deny in the browser. Archon's CLI/SSE batch buffer flushes that URL to you immediately so you never get stuck waiting on a node that silently wants input. The `implement` loop then runs headless with edits allowed.
+
+If you can't edit the workflow (e.g. a bundled default), the same scoping is available install-side via the node map — same precedence, lower priority than the workflow's own `pi:` block:
+
+```yaml
+# .archon/config.yaml
+assistants:
+  pi:
+    nodes:
+      plan:
+        interactive: true
+        extensionFlags: { plan: true }
+      implement:
+        interactive: false
+        extensionFlags: { plan: false }
+```
+
+#### Recipe: web search and fetch through your own extension
+
+Archon does not build web search into the Pi engine — and deliberately so: Pi's extension API already lets you register custom tools, and Archon picks them up automatically because extensions load inside the same Pi session Archon drives. The result is a workflow node that can search the web with **zero Archon-side configuration** beyond the extension posture you already know.
+
+Write the extension once, into your global Pi extensions directory:
+
+```ts
+// ~/.pi/agent/extensions/web-search.ts
+export default function (pi) {
+  pi.registerTool({
+    name: "web_search",
+    description:
+      "Search the web. Returns titles, URLs and snippets for each result.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+    async execute(_callId, { query }) {
+      const res = await fetch(
+        `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`,
+      );
+      const body = JSON.stringify(await res.json());
+      return { content: [{ type: "text", text: body }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "web_fetch",
+    description: "Fetch a URL and return its body as plain text.",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
+    },
+    async execute(_callId, { url }) {
+      const res = await fetch(url);
+      const text = await res.text();
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  });
+}
+```
+
+That's the whole setup. Extensions are on by default (`enableExtensions` defaults to true), Pi discovers `~/.pi/agent/extensions/*.ts` on every session, and Archon restarts Pi sessions fresh per run — so the tools appear on the next workflow run without touching `.archon/config.yaml` at all. For a production extension you'd use a real search API key via the `env:` surface instead of a keyless endpoint, and install it as an npm package with `pi install npm:<package>`.
+
+Then use it from any workflow node — no Archon config changes:
+
+```yaml
+# .archon/workflows/research.yaml
+name: research
+provider: pi
+nodes:
+  - id: research
+    prompt: "Research $ARGUMENTS using web_search/web_fetch and summarize the findings with citations."
+```
+
+To restrict where the tools appear, scope the posture per node exactly as described in [Scoping extension posture per node](#scoping-extension-posture-per-node): leave `assistants.pi` clean and put `pi: { enableExtensions: true }` only on nodes that should search, or flip it to `false` on nodes that shouldn't.
+
+#### Recipe: MCP servers through an extension bridge
+
+Pi rejects MCP by design — there is no `mcpServers` field to set, and Archon does not add one. The supported route is the same as above: an extension that acts as the MCP **client** itself and re-exposes each MCP server's tools as ordinary Pi tools. The model never knows MCP is involved; Archon sees nothing but regular extension tools.
+
+Sketch of such a bridge:
+
+```ts
+// ~/.pi/agent/extensions/mcp-bridge.ts
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+export default function (pi) {
+  // Module scope persists for the whole process while session_start fires per
+  // session — the loader is reloaded once per run, so connect must be idempotent
+  // or the second session throws.
+  let connected = false;
+  const client = new Client({ name: "archon-mcp-bridge", version: "1.0.0" });
+
+  pi.on("session_start", async () => {
+    if (!connected) {
+      await client.connect(
+        new StdioClientTransport({
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-everything"],
+        }),
+      );
+      connected = true;
+    }
+    const { tools } = await client.listTools();
+    for (const tool of tools) {
+      pi.registerTool({
+        name: `mcp_${tool.name}`,
+        description: tool.description ?? `MCP tool ${tool.name}`,
+        parameters: tool.inputSchema,
+        execute: async (_callId, args) => {
+          const body = JSON.stringify(await client.callTool({ name: tool.name, arguments: args }));
+          return { content: [{ type: "text", text: body }], details: {} };
+        },
+      });
+    }
+  });
+}
+```
+
+Note that `execute` must return an `AgentToolResult` (`{ content, details }`); a bare string is normalized to an empty tool result and the model never sees any output.
+
+The bridge runs inside the Pi session process, subject to everything above: it loads only when `enableExtensions` is true for that node, its tools are just tools (so you can keep them off nodes with a scoped `pi:` block), and if it needs a UI-bound approval gate you give it `interactive: true`. Community bridges exist too — search the [package ecosystem](https://shittycodingagent.ai/packages) for `mcp` before writing your own.
+
+:::warning Repo-controlled `.pi/` directories
+Extension discovery also includes `<cwd>/.pi/extensions/*.ts` and `<cwd>/.pi/settings.json` in the **working directory of the run**. When Archon executes a workflow against a repository you didn't write, anything shipped in that repo's `.pi/` loads automatically — arbitrary JS with the Archon server's OS permissions — unless you disable extensions. Before running workflows on third-party repos either audit their `.pi/` directory first or set `enableExtensions: false` (globally, or per node via the `pi:` block). This trust decision lives with the operator; Archon will not make it for you.
+:::
 
 ### Model reference format
 
@@ -488,16 +655,16 @@ nodes:
 
 | Feature | Support | YAML field |
 |---|---|---|
-| Extensions (community + local) | ✅ (default on) | `enableExtensions: false` to disable; `interactive: false` to load without UI bridge; `extensionFlags: { <name>: true }` per extension |
+| Extensions (community + local) | ✅ (default on) | `enableExtensions: false` to disable; `interactive: false` to load without UI bridge; `extensionFlags: { <name>: true }` per extension. Scope per node with a `pi:` block (`pi: { interactive, enableExtensions, extensionFlags }`) — see [Scoping extension posture per node](#scoping-extension-posture-per-node) |
 | Session resume | ✅ | automatic (Archon persists `sessionId`) |
 | Tool restrictions | ✅ | `allowed_tools` / `denied_tools` (read, bash, edit, write, grep, find, ls) |
-| Thinking level | ✅ | `effort: low\|medium\|high\|max` (max → xhigh) |
+| Thinking level | ✅ | `effort: minimal\|low\|medium\|high\|xhigh\|max` (every rung is Pi-native; nothing is clamped) |
 | Skills | ✅ | `skills: [name]` (searches `.agents/skills`, `.claude/skills`, user-global) |
 | Inline sub-agents | ❌ | `agents:` is Claude-only; ignored with a warning on Pi |
 | System prompt override | ✅ | `systemPrompt:` |
 | Codebase env vars (`envInjection`) | ✅ | `.archon/config.yaml` `env:` section |
-| MCP servers | ❌ | Pi rejects MCP by design |
-| In-process native tools | ✅ | none — Archon's `manage_run` tool is auto-injected in project-scoped chat via Pi `customTools` (distinct from MCP, which Pi rejects). Gated on the `nativeTools` provider capability. |
+| MCP servers | ❌ (bridged via your own extension) | No `mcpServers` field exists. An extension can act as MCP client and expose the tools in-process — see [Recipe: MCP servers through an extension bridge](#recipe-mcp-servers-through-an-extension-bridge). |
+| In-process native tools | ✅ | none — Archon's `manage_run` tool is auto-injected in project-scoped chat via Pi `customTools` (distinct from MCP, which Pi has no native surface for — see the [bridge recipe](#recipe-mcp-servers-through-an-extension-bridge)). Gated on the `nativeTools` provider capability. |
 | Claude-SDK hooks | ❌ | Claude-specific format |
 | Structured output | ✅ (best-effort) | `output_format:` — schema is appended to the prompt and JSON is parsed out of the assistant text. Handles bare JSON, ```json```-fenced, reasoning-model prose preambles like `Let me evaluate... {...}` (Minimax M2.x pattern), and structurally-corrupt JSON (trailing commas, single quotes, truncated tails) via repair. The parsed output is then **validated against the schema**; on a miss the executor re-asks (prompt + the schema errors) up to **3×**, and only then **fails** the node (it no longer degrades silently to a warning). Not SDK-enforced like Claude/Codex. |
 | Cost limits (`maxBudgetUsd`) | ❌ | tracked in result chunk, not enforced |
@@ -562,7 +729,7 @@ You can configure Copilot's behavior in `.archon/config.yaml`:
 assistants:
   copilot:
     model: gpt-5-mini             # 'gpt-5', 'gpt-5-mini', 'claude-sonnet-4.5', 'auto', etc.
-    modelReasoningEffort: medium  # 'low' | 'medium' | 'high' | 'xhigh' | 'max' (alias for xhigh)
+    modelReasoningEffort: medium  # 'minimal'..'max' — clamped to the SDK's 'low'..'xhigh'
     # configDir: /absolute/path/to/copilot-config
     # enableConfigDiscovery: false  # only enable for trusted repos — bypasses Archon's workflow MCP/skill validation
     # useLoggedInUser: false        # opt into env-token auth (GH_TOKEN / GITHUB_TOKEN); default uses `copilot login`
@@ -637,11 +804,11 @@ The console **AI Settings** page (Settings in the web UI) has four sections:
 - **Model Tiers** — map the `small` / `medium` / `large` tiers to a provider + model (and optional effort). This writes the install's `tiers:` config and works on **any** install, even without `TOKEN_ENCRYPTION_KEY` (it's non-secret config). Pi tier models show a cost/reasoning/context hint from Pi's model catalog.
 - **Model Aliases** — define `@custom` refs (e.g. `@fast`) usable in workflow `model:` fields, with the same scope toggle.
 - **Agents** — one card per agent (Claude Code, Codex, Pi, OpenCode, Copilot) with the credentials it can spend nested inside, each card showing a readiness state (ready / needs credential). Connect a credential for *your* user inside the agent that uses it. Credentials are keyed by **vendor** (`anthropic`, `openai`, `github-copilot`, `openrouter`, …), and one credential serves every agent that consumes it (an `anthropic` key powers Claude Code and Pi's anthropic backend — both cards reflect it). Every vendor accepts an **API key**; **`anthropic`**, **`openai`**, and **`github-copilot`** additionally offer **subscription login** (an OAuth flow — for `openai`/ChatGPT it is an Archon-owned PKCE flow where you paste the redirect URL or code back, [#1924](https://github.com/coleam00/Archon/issues/1924)). Legacy ids (`claude`/`codex`/`copilot`) are accepted and normalized. The **Pi** card keeps its 30+ backends behind a searchable "Add backend…" picker (with model counts from Pi's catalog) and shows ambient chains (Amazon Bedrock, Google Vertex) as status-only rows; the **OpenCode** card loads its backend catalog on demand from the embedded runtime — its connections are install-wide, not per-user.
-- **Defaults** — the default assistant and per-provider model defaults, plus a "Your default" (just-me) assistant select.
+- **Defaults** — leads with a "Chat runs on [provider][model]" combo line in both scopes (the install line edits the default assistant + `assistants.<provider>.model`; the just-me line edits your personal default assistant + chat-model pin), with the per-provider model grid below as the advanced view.
 
 ### Per-user model preferences ("Just me")
 
-When you're logged in (a web identity resolves), the **Model Tiers** and **Model Aliases** panels show a **"This install / Just me"** scope toggle, and **Defaults** gains a "Your default" select. The "Just me" scope stores your personal tiers/aliases/default assistant in Archon's database and applies them as the **highest-precedence** layer — your overrides win over the install config for runs and chats *you* start, without changing anyone else's. This needs an identity but **no** `TOKEN_ENCRYPTION_KEY` (model names aren't secrets); on a solo install without web auth the toggle simply doesn't appear and everything behaves exactly as before.
+When you're logged in (a web identity resolves), the **Model Tiers** and **Model Aliases** panels show a **"This install / Just me"** scope toggle, and **Defaults** gains a just-me "Chat runs on" combo (provider + model). The "Just me" scope stores your personal tiers/aliases/default assistant (and optional chat-model pin) in Archon's database and applies them as the **highest-precedence** layer — your overrides win over the install config for runs and chats *you* start, without changing anyone else's. This needs an identity but **no** `TOKEN_ENCRYPTION_KEY` (model names aren't secrets); on a solo install without web auth the toggle simply doesn't appear and everything behaves exactly as before.
 
 If a chat asks for the `large` tier and only a different tier is configured, Archon uses the nearest preset and posts a one-line notice telling you which tier answered and where to set `large`.
 
@@ -663,7 +830,14 @@ archon ai default claude
 # The same, but just for YOU (per-user prefs; identity from ARCHON_USER_ID/$USER)
 archon ai tier set large claude opus --scope user
 archon ai default codex --scope user
+
+# Pin YOUR chat to a specific provider + model without touching the `large`
+# tier that workflows use (provider + model are written together; omitting
+# the model clears a previous pin)
+archon ai default pi openrouter/minimax/minimax-m2 --scope user
 ```
+
+**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: your `default_model` pin (only when your default provider matches the effective provider) → the configured `large` tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when no `large` tier is configured anywhere) → the built-in tier default. Workflow nodes are unaffected — `model: large` keeps meaning the tier.
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
 

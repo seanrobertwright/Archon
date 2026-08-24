@@ -17,7 +17,7 @@ mock.module('@archon/paths', () => ({
 import { IsolationResolver } from './resolver';
 import type { IsolationResolverDeps } from './resolver';
 import type { IIsolationStore } from './store';
-import type { IsolationEnvironmentRow, IsolatedEnvironment } from './types';
+import type { IsolationEnvironmentRow, IsolatedEnvironment, IsolationRequest } from './types';
 
 function makeEnvRow(overrides?: Partial<IsolationEnvironmentRow>): IsolationEnvironmentRow {
   return {
@@ -31,6 +31,7 @@ function makeEnvRow(overrides?: Partial<IsolationEnvironmentRow>): IsolationEnvi
     status: 'active',
     created_at: new Date(),
     created_by_platform: 'web',
+    created_by_user_id: null,
     metadata: {},
     ...overrides,
   };
@@ -61,7 +62,7 @@ function makeMockProvider() {
       id: '/worktrees/new-branch',
       provider: 'worktree',
       workingPath: '/worktrees/new-branch',
-      branchName: 'new-branch',
+      branchName: git.toBranchName('new-branch'),
       status: 'active',
       createdAt: new Date(),
       metadata: { adopted: false },
@@ -188,6 +189,63 @@ describe('IsolationResolver', () => {
     }
   });
 
+  test('folder project — returns none with the real folder cwd (not /workspace)', async () => {
+    const resolver = createResolver();
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: { id: 'cb-folder', defaultCwd: '/tmp/platform', name: 'platform', kind: 'folder' },
+      platformType: 'web',
+    });
+
+    expect(result.status).toBe('none');
+    if (result.status === 'none') {
+      // Must be the real folder path, NOT the '/workspace' docker sentinel.
+      expect(result.cwd).toBe('/tmp/platform');
+    }
+  });
+
+  test('folder project routes through the in-place backend — result byte-identical to the pre-seam early-return', async () => {
+    const resolver = createResolver();
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: {
+        id: 'cb-folder',
+        defaultCwd: '/srv/ops-client',
+        name: 'ops-client',
+        kind: 'folder',
+      },
+      platformType: 'web',
+    });
+
+    // The seam (resolveFolderBackend → InPlaceBackend.prepare) must reproduce
+    // EXACTLY the { status: 'none', cwd: <folder root> } shape the resolver
+    // returned before the backend seam existed. Full-object equality guards the
+    // zero-behavior-change contract against future drift.
+    expect(result).toEqual({ status: 'none', cwd: '/srv/ops-client' });
+  });
+
+  test('repo kind (explicit) — proceeds to normal worktree resolution', async () => {
+    const env = makeEnvRow();
+    const resolver = createResolver({
+      store: makeMockStore({
+        findActiveByWorkflow: async (_cid, wt, wid) =>
+          wt === 'issue' && wid === '42' ? env : null,
+      }),
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: { ...defaultCodebase, kind: 'repo' },
+      hints: { workflowType: 'issue', workflowId: '42' },
+      platformType: 'web',
+    });
+
+    // kind: 'repo' must NOT short-circuit — it resolves a worktree as usual.
+    expect(result.status).toBe('resolved');
+  });
+
   test('workflow reuse — returns resolved with workflow_reuse method', async () => {
     const env = makeEnvRow();
     const resolver = createResolver({
@@ -257,7 +315,7 @@ describe('IsolationResolver', () => {
     const result = await resolver.resolve({
       existingEnvId: null,
       codebase: defaultCodebase,
-      hints: { workflowType: 'pr', workflowId: '99', prBranch: 'feature-branch' },
+      hints: { workflowType: 'pr', workflowId: '99', prBranch: git.toBranchName('feature-branch') },
       platformType: 'web',
     });
 
@@ -297,7 +355,7 @@ describe('IsolationResolver', () => {
             id: '/worktrees/new-branch',
             provider: 'worktree',
             workingPath: '/worktrees/new-branch',
-            branchName: 'new-branch',
+            branchName: git.toBranchName('new-branch'),
             status: 'active',
             createdAt: new Date(),
             metadata: { adopted: false },
@@ -312,7 +370,7 @@ describe('IsolationResolver', () => {
       hints: {
         workflowType: 'task',
         workflowId: 'test-adapters',
-        fromBranch: 'feature/extract-adapters',
+        fromBranch: git.toBranchName('feature/extract-adapters'),
       },
       platformType: 'web',
     });
@@ -321,7 +379,7 @@ describe('IsolationResolver', () => {
       expect.objectContaining({
         workflowType: 'task',
         identifier: 'test-adapters',
-        fromBranch: 'feature/extract-adapters',
+        fromBranch: git.toBranchName('feature/extract-adapters'),
       })
     );
   });
@@ -372,7 +430,7 @@ describe('IsolationResolver', () => {
       platformType: 'web',
     });
 
-    expect(updatedStatus).toBe('destroyed');
+    expect(updatedStatus as string | null).toBe('destroyed');
   });
 
   test('findReusable marks stale DB record as destroyed when worktree gone', async () => {
@@ -401,8 +459,8 @@ describe('IsolationResolver', () => {
     });
 
     // Should have cleaned up the stale record and then created a new environment
-    expect(updatedId).toBe('env-1');
-    expect(updatedStatus).toBe('destroyed');
+    expect(updatedId as string | null).toBe('env-1');
+    expect(updatedStatus as string | null).toBe('destroyed');
     expect(result.status).toBe('resolved');
     if (result.status === 'resolved') {
       expect(result.method.type).toBe('created');
@@ -440,8 +498,8 @@ describe('IsolationResolver', () => {
       platformType: 'web',
     });
 
-    expect(updatedId).toBe('env-linked');
-    expect(updatedStatus).toBe('destroyed');
+    expect(updatedId as string | null).toBe('env-linked');
+    expect(updatedStatus as string | null).toBe('destroyed');
     // Should proceed to create new since linked env was stale
     expect(result.status).toBe('resolved');
     if (result.status === 'resolved') {
@@ -598,7 +656,7 @@ describe('IsolationResolver', () => {
           id: '/worktrees/new-branch',
           provider: 'worktree',
           workingPath: '/worktrees/new-branch',
-          branchName: 'new-branch',
+          branchName: git.toBranchName('new-branch'),
           status: 'active',
           createdAt: new Date(),
           metadata: { adopted: false },
@@ -643,13 +701,13 @@ describe('IsolationResolver', () => {
     const resolver = createResolver({
       provider: {
         ...makeMockProvider(),
-        create: async (request: unknown) => {
+        create: async (request: IsolationRequest): Promise<IsolatedEnvironment> => {
           capturedRequests.push(request);
           return {
             id: '/worktrees/new-branch',
             provider: 'worktree' as const,
             workingPath: '/worktrees/new-branch',
-            branchName: 'new-branch',
+            branchName: git.toBranchName('new-branch'),
             status: 'active' as const,
             createdAt: new Date(),
             metadata: { adopted: false },
@@ -669,6 +727,113 @@ describe('IsolationResolver', () => {
 
     expect(capturedRequests).toHaveLength(1);
     expect(capturedRequests[0]).toMatchObject({ codebaseName: 'owner/repo' });
+  });
+
+  // --- defaultBranch → baseBranch threading tests ---
+
+  test('passes defaultBranch from codebase as baseBranch on the isolation request', async () => {
+    const capturedRequests: unknown[] = [];
+    const resolver = createResolver({
+      provider: {
+        ...makeMockProvider(),
+        create: async (request: IsolationRequest): Promise<IsolatedEnvironment> => {
+          capturedRequests.push(request);
+          return {
+            id: '/worktrees/new-branch',
+            provider: 'worktree' as const,
+            workingPath: '/worktrees/new-branch',
+            branchName: git.toBranchName('new-branch'),
+            status: 'active' as const,
+            createdAt: new Date(),
+            metadata: { adopted: false },
+          };
+        },
+      },
+    });
+
+    worktreeExistsSpy.mockResolvedValue(false);
+
+    await resolver.resolve({
+      existingEnvId: null,
+      codebase: {
+        id: 'cb-1',
+        name: 'owner/repo',
+        defaultCwd: '/local/repo',
+        defaultBranch: git.toBranchName('develop'),
+      },
+      hints: { workflowType: 'task', workflowId: 'wf-1' },
+      platformType: 'web',
+    });
+
+    expect(capturedRequests).toHaveLength(1);
+    expect(capturedRequests[0]).toMatchObject({ baseBranch: 'develop' });
+  });
+
+  test('omits baseBranch on the isolation request when defaultBranch is null', async () => {
+    const capturedRequests: unknown[] = [];
+    const resolver = createResolver({
+      provider: {
+        ...makeMockProvider(),
+        create: async (request: IsolationRequest): Promise<IsolatedEnvironment> => {
+          capturedRequests.push(request);
+          return {
+            id: '/worktrees/new-branch',
+            provider: 'worktree' as const,
+            workingPath: '/worktrees/new-branch',
+            branchName: git.toBranchName('new-branch'),
+            status: 'active' as const,
+            createdAt: new Date(),
+            metadata: { adopted: false },
+          };
+        },
+      },
+    });
+
+    worktreeExistsSpy.mockResolvedValue(false);
+
+    await resolver.resolve({
+      existingEnvId: null,
+      codebase: {
+        id: 'cb-1',
+        name: 'owner/repo',
+        defaultCwd: '/local/repo',
+        defaultBranch: null,
+      },
+      hints: { workflowType: 'task', workflowId: 'wf-1' },
+      platformType: 'web',
+    });
+
+    expect(capturedRequests).toHaveLength(1);
+    expect((capturedRequests[0] as { baseBranch?: string }).baseBranch).toBeUndefined();
+  });
+
+  test('folder project with defaultBranch still short-circuits to none (no provider call)', async () => {
+    const capturedRequests: unknown[] = [];
+    const resolver = createResolver({
+      provider: {
+        ...makeMockProvider(),
+        create: async (request: IsolationRequest): Promise<IsolatedEnvironment> => {
+          capturedRequests.push(request);
+          throw new Error('provider.create must not be called for folder projects');
+        },
+      },
+    });
+
+    const result = await resolver.resolve({
+      existingEnvId: null,
+      codebase: {
+        id: 'cb-folder',
+        defaultCwd: '/tmp/platform',
+        name: 'platform',
+        defaultBranch: git.toBranchName('develop'),
+        kind: 'folder',
+      },
+      hints: { workflowType: 'task', workflowId: 'wf-1' },
+      platformType: 'web',
+    });
+
+    expect(result.status).toBe('none');
+    expect(capturedRequests).toHaveLength(0);
   });
 
   // --- Constructor validation tests ---
@@ -997,6 +1162,39 @@ describe('IsolationResolver', () => {
   // become a `blocked` result; unknown errors propagate as crashes.
   // -------------------------------------------------------------------------
   describe('canonical path resolution failure handling', () => {
+    test('uses an exact registered external-git-dir checkout as the worktree anchor', async () => {
+      const defaultCwd = '/workspace/external-linked';
+      getCanonicalSpy.mockRejectedValue(
+        new git.CanonicalRepoPathUnavailableError(defaultCwd, '/metadata/repository')
+      );
+      const createSpy = mock(
+        async (_request: IsolationRequest): Promise<IsolatedEnvironment> => ({
+          id: '/worktrees/new-branch',
+          provider: 'worktree',
+          workingPath: '/worktrees/new-branch',
+          branchName: git.toBranchName('new-branch'),
+          status: 'active',
+          createdAt: new Date(),
+          metadata: { adopted: false },
+        })
+      );
+      const resolver = createResolver({
+        provider: { ...makeMockProvider(), create: createSpy },
+      });
+
+      const result = await resolver.resolve({
+        existingEnvId: null,
+        codebase: { ...defaultCodebase, defaultCwd },
+        hints: { workflowType: 'issue', workflowId: '42' },
+        platformType: 'web',
+      });
+
+      expect(result.status).toBe('resolved');
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ canonicalRepoPath: defaultCwd })
+      );
+    });
+
     test('known infrastructure error returns blocked with classified user message', async () => {
       const eaccesError = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
       eaccesError.code = 'EACCES';

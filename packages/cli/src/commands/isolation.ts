@@ -3,6 +3,7 @@
  */
 import * as isolationDb from '@archon/core/db/isolation-environments';
 import * as workflowDb from '@archon/core/db/workflows';
+import { loadRepoConfig } from '@archon/core';
 import { createLogger } from '@archon/paths';
 import {
   toRepoPath,
@@ -10,11 +11,13 @@ import {
   execFileAsync,
   hasUncommittedChanges,
   toWorktreePath,
-  getDefaultBranch,
+  getUniqueCommitCount,
 } from '@archon/git';
 import { getIsolationProvider } from '@archon/isolation';
 import {
   removeEnvironment,
+  listContainerEnvironments,
+  cleanupContainerEnvironments,
   type RemoveEnvironmentResult,
 } from '@archon/core/services/cleanup-service';
 import {
@@ -66,7 +69,22 @@ export async function isolationListCommand(): Promise<void> {
   if (totalEnvironments === 0) {
     console.log('No active isolation environments.');
   } else {
-    console.log(`\nTotal: ${String(totalEnvironments)} environment(s)`);
+    console.log(`\nTotal: ${String(totalEnvironments)} worktree environment(s)`);
+  }
+
+  // Container isolation environments (folder-project container backend). These are
+  // not worktrees — they're labeled Docker containers + upper volumes. A paused
+  // run's container shows here (awaiting approve/resume) and is never auto-pruned.
+  const containers = await listContainerEnvironments();
+  if (containers.length > 0) {
+    console.log('\nContainer environments (folder projects):');
+    for (const c of containers) {
+      const runPart = c.runId ? `run ${c.runId.slice(0, 8)} (${c.runStatus})` : 'no run (orphan)';
+      console.log(`  ${c.envId.slice(0, 8)} — ${c.codebaseName}`);
+      console.log(`    Path: ${c.workingPath}`);
+      console.log(`    ${runPart} | Age: ${c.ageDays}d`);
+    }
+    console.log(`\nTotal: ${String(containers.length)} container environment(s)`);
   }
 }
 
@@ -121,6 +139,29 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
   }
 
   console.log(`\nCleanup complete: ${String(cleaned)} cleaned, ${String(failed)} failed`);
+
+  // Reap orphaned container environments (terminal / run-less, older than the
+  // threshold). Paused runs' containers are deliberately skipped (awaited state).
+  const containerReport = await cleanupContainerEnvironments(daysStale);
+  const containerTotal =
+    containerReport.removed.length + containerReport.skipped.length + containerReport.errors.length;
+  if (containerTotal > 0) {
+    console.log('\nContainer environments:');
+    for (const id of containerReport.removed) {
+      console.log(`  Removed: ${id.slice(0, 8)}`);
+    }
+    for (const s of containerReport.skipped) {
+      console.log(`  Skipped: ${s.id.slice(0, 8)} — ${s.reason}`);
+    }
+    for (const e of containerReport.errors) {
+      console.error(`  Failed: ${e.id.slice(0, 8)} — ${e.error}`);
+    }
+    console.log(
+      `Container cleanup: ${String(containerReport.removed.length)} removed, ` +
+        `${String(containerReport.skipped.length)} skipped, ` +
+        `${String(containerReport.errors.length)} failed`
+    );
+  }
 }
 
 /**
@@ -251,28 +292,54 @@ export async function isolationCompleteCommand(
         getLog().warn({ err, branch }, 'isolation.complete_pr_check_failed');
       }
 
-      // Check 4: unmerged commits (not yet in default branch)
+      // Check 4: commits that would become unreachable after branch deletion.
+      // `uniqueCommitCount` is hoisted so check 5 can reuse it: a branch that
+      // has never been pushed is provably safe to delete iff every commit on it
+      // is already reachable from a surviving ref (i.e. uniqueCommitCount === 0).
+      // Leaving it undefined on the failure path keeps check 4's fail-closed
+      // behaviour (see below) and prevents check 5 from treating "unverified"
+      // as "verified zero".
+      let remote = 'origin';
+      let uniqueCommitCount: number | undefined;
       try {
-        const defaultBranch = await getDefaultBranch(toRepoPath(env.codebase_default_cwd));
-        const unmergedResult = await execFileAsync(
-          'git',
-          ['-C', env.codebase_default_cwd, 'log', `${defaultBranch}..${branch}`, '--oneline'],
-          { timeout: 15000 }
+        const repoConfig = await loadRepoConfig(env.codebase_default_cwd);
+        remote = repoConfig.worktree?.remote?.trim() || remote;
+        uniqueCommitCount = await getUniqueCommitCount(
+          toRepoPath(env.codebase_default_cwd),
+          toBranchName(branch),
+          remote
         );
-        const unmergedLines = unmergedResult.stdout.trim().split('\n').filter(Boolean);
-        if (unmergedLines.length > 0) {
-          blockers.push(`${unmergedLines.length} commit(s) not merged into ${defaultBranch}`);
+        if (uniqueCommitCount > 0) {
+          blockers.push(`${String(uniqueCommitCount)} commit(s) unique to this branch`);
         }
       } catch (error) {
-        getLog().warn({ err: error as Error, branch }, 'isolation.complete_unmerged_check_failed');
-        console.warn('  Warning: could not check for unmerged commits — skipping unmerged check');
+        const err = error as Error;
+        getLog().warn({ err, branch }, 'isolation.complete_unique_commit_check_failed');
+        // Fail CLOSED. This check exists to stop a branch being deleted while it
+        // holds commits reachable from nowhere else; treating an unanswerable
+        // check as "no unique commits" would let exactly the loss it guards
+        // against proceed on any git failure — permissions, a corrupt ref, a
+        // timeout. An unnecessary blocker costs the operator one --force; a
+        // wrong skip costs them the commits.
+        // `uniqueCommitCount` is left undefined here so check 5 cannot mistake
+        // "unverified" for "verified zero" — the blocker pushed in this branch
+        // is what covers the unverifiable case.
+        blockers.push(
+          `could not determine unique commits (${err.message}) — refusing to delete unverified`
+        );
       }
 
-      // Check 5: unpushed commits (not yet on remote)
+      // Check 5: unpushed commits (not yet on remote).
+      // A branch that was never pushed carries zero commits we can lose — every
+      // commit on it is already reachable from a surviving ref — so the
+      // "never pushed" blocker is gated on check 4 having confirmed there ARE
+      // unique commits. If check
+      // 4 failed (uniqueCommitCount undefined), the gate is false and this
+      // check is suppressed; check 4's own blocker still covers the case.
       try {
         const unpushedResult = await execFileAsync(
           'git',
-          ['-C', env.codebase_default_cwd, 'log', `origin/${branch}..${branch}`, '--oneline'],
+          ['-C', env.codebase_default_cwd, 'log', `${remote}/${branch}..${branch}`, '--oneline'],
           { timeout: 15000 }
         );
         const unpushedLines = unpushedResult.stdout.trim().split('\n').filter(Boolean);
@@ -281,9 +348,15 @@ export async function isolationCompleteCommand(
         }
       } catch (error) {
         const err = error as Error;
-        // origin/<branch> doesn't exist means branch was never pushed
+        // origin/<branch> doesn't exist means branch was never pushed. Only
+        // flag it as a blocker when check 4 confirmed the branch has unique
+        // commits; otherwise the branch is provably safe to delete even
+        // though it's unpushed (e.g. a branch that was created and merged
+        // locally, byte-identical to base, and never pushed upstream).
         if (err.message.includes('unknown revision') || err.message.includes('bad revision')) {
-          blockers.push('branch has never been pushed to remote');
+          if (uniqueCommitCount !== undefined && uniqueCommitCount > 0) {
+            blockers.push('branch has never been pushed to remote');
+          }
         } else {
           getLog().warn({ err, branch }, 'isolation.complete_unpushed_check_failed');
         }

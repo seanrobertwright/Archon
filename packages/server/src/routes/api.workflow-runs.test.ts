@@ -1,4 +1,7 @@
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -49,6 +52,10 @@ const mockAddMessage = mock(async () => ({
   created_at: new Date().toISOString(),
 }));
 const mockGenerateAndSetTitle = mock(async () => {});
+const mockResolveTitleRequest = mock(async () => ({
+  provider: 'claude',
+  options: {} as Record<string, unknown>,
+}));
 
 // Type aliases for clarity in tests
 type MockWorkflowRun = {
@@ -58,6 +65,7 @@ type MockWorkflowRun = {
   parent_conversation_id: string | null;
   codebase_id: string | null;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+  outcome: 'succeeded' | 'failed' | null;
   user_message: string;
   started_at: string;
   completed_at: string | null;
@@ -76,6 +84,13 @@ type MockWorkflowEvent = {
   created_at: string;
 };
 
+// resumeRunHeadless (#2008) — stubbed so a future change to it or its
+// neighbors can't silently start touching the real workflow store or the
+// real isolation provider (see #2240 for what an un-stubbed export costs).
+const mockCreateChildWorktreeResolver = mock((_config: unknown) =>
+  mock(async () => ({}) as unknown)
+);
+
 mock.module('@archon/core', () => ({
   handleMessage: mockHandleMessage,
   getDatabaseType: () => 'sqlite',
@@ -90,6 +105,9 @@ mock.module('@archon/core', () => ({
   },
   getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
   generateAndSetTitle: mockGenerateAndSetTitle,
+  resolveTitleRequest: mockResolveTitleRequest,
+  createWorkflowDeps: mock(() => ({ store: {} })),
+  createChildWorktreeResolver: mockCreateChildWorktreeResolver,
   createLogger: () => ({
     fatal: mock(() => undefined),
     error: mock(() => undefined),
@@ -105,6 +123,81 @@ mock.module('@archon/core', () => ({
     level: 'info',
   }),
 }));
+
+/**
+ * Deterministic stand-ins for the shared identity→paths helpers (#2200),
+ * mirroring the real branch order and layout under the mocked ARCHON_HOME.
+ */
+type FakeStorageKey =
+  | { kind: 'repo'; owner: string; repo: string }
+  | { kind: 'folder'; slug: string }
+  | { kind: 'cwd'; cwd: string };
+
+function parseOwnerRepoFake(name: string): { owner: string; repo: string } | null {
+  const parts = name.split('/');
+  if (parts.length !== 2) return null;
+  const [owner, repo] = parts;
+  if (!owner || !repo) return null;
+  if (owner === '.' || owner === '..' || repo === '.' || repo === '..') return null;
+  if (!/^[a-zA-Z0-9._-]+$/.test(owner) || !/^[a-zA-Z0-9._-]+$/.test(repo)) return null;
+  return { owner, repo };
+}
+
+function basenameFake(p: string): string {
+  return p.split('/').filter(Boolean).pop() ?? '';
+}
+
+function resolveProjectStorageKeyFake(
+  codebase: { kind?: string | null; name: string; default_cwd: string } | null | undefined,
+  cwd: string
+): FakeStorageKey {
+  if (codebase) {
+    if (codebase.kind === 'folder') {
+      const slug =
+        codebase.name
+          .toLowerCase()
+          .replace(/[^a-z0-9._-]+/g, '-')
+          .replace(/^-+|-+$/g, '') || 'folder';
+      return { kind: 'folder', slug };
+    }
+    const parsed = parseOwnerRepoFake(codebase.name);
+    if (parsed) return { kind: 'repo', ...parsed };
+    const base = basenameFake(codebase.default_cwd);
+    if (base && base !== '.' && base !== '..') return { kind: 'repo', owner: '_local', repo: base };
+  }
+  return { kind: 'cwd', cwd };
+}
+
+/**
+ * Mutable so the filesystem-touching artifact tests can point ARCHON_HOME at a
+ * real temp dir. A hard-coded '/tmp/...' is fine for tests that only assert
+ * status codes, but tests that mkdir/readdir need a path that is absolute on
+ * Windows too.
+ */
+let mockArchonHome = '/tmp/.archon';
+function wsRoot(): string {
+  return join(mockArchonHome, 'workspaces');
+}
+
+function storageRootFake(key: FakeStorageKey): string {
+  if (key.kind === 'repo') return join(wsRoot(), key.owner, key.repo);
+  if (key.kind === 'folder') return join(wsRoot(), '_folder', key.slug);
+  return join(wsRoot(), '_cwd', basenameFake(key.cwd) || '_');
+}
+
+function storagePathsForRootFake(root: string): {
+  root: string;
+  artifactsRoot: string;
+  logsDir: string;
+  stateRoot: string;
+} {
+  return {
+    root,
+    artifactsRoot: join(root, 'artifacts'),
+    logsDir: join(root, 'logs'),
+    stateRoot: join(root, 'state'),
+  };
+}
 
 const mockCaptureApprovalResolved = mock(() => undefined);
 mock.module('@archon/paths', () => ({
@@ -127,10 +220,19 @@ mock.module('@archon/paths', () => ({
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
   getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
   getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
-  getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
-  getArchonHome: () => '/tmp/.archon',
+  getArchonWorkspacesPath: () => wsRoot(),
+  getArchonHome: () => mockArchonHome,
   getRunArtifactsPath: (owner: string, repo: string, runId: string): string =>
-    `/tmp/.archon/workspaces/${owner}/${repo}/artifacts/runs/${runId}`,
+    join(wsRoot(), owner, repo, 'artifacts', 'runs', runId),
+  // Mirrors the real parseOwnerRepo semantics (exactly owner/repo, no
+  // traversal segments, GitHub-safe characters only).
+  parseOwnerRepo: parseOwnerRepoFake,
+  // Mirrors the real identity→paths resolver (#2200) so the routes are
+  // exercised as delegation, with paths rooted at the mocked ARCHON_HOME.
+  resolveProjectStorageKey: resolveProjectStorageKeyFake,
+  getStoragePathsForRoot: storagePathsForRootFake,
+  getRunArtifactsDirForKey: (key: FakeStorageKey, runId: string): string =>
+    join(storageRootFake(key), 'artifacts', 'runs', runId),
 }));
 
 mockAllWorkflowModules();
@@ -160,7 +262,14 @@ mock.module('@archon/core/db/conversations', () => ({
   getConversationById: mockGetConversationById,
 }));
 
-const mockGetCodebase = mock(async (_id: string) => null as null | { name: string });
+type MockCodebase = {
+  id?: string;
+  name: string;
+  kind?: 'repo' | 'folder';
+  default_cwd: string;
+  default_branch?: string | null;
+};
+const mockGetCodebase = mock(async (_id: string) => null as null | MockCodebase);
 
 mock.module('@archon/core/db/codebases', () => ({
   listCodebases: mock(async () => [{ default_cwd: '/tmp/project' }]),
@@ -175,14 +284,29 @@ mock.module('@archon/core/db/isolation-environments', () => ({
 
 const mockDeleteWorkflowRun = mock(async (_id: string) => {});
 const mockUpdateWorkflowRun = mock(async (_id: string, _update: unknown) => {});
+// CAS gate resolvers (#2113) — the real approve/reject operations stamp the
+// resolution here. resolveAndCancelApprovalGate is the atomic resolve+cancel for
+// terminal reject outcomes. Default to "won the race".
+// The 3rd arg (approve) / 2nd arg (cancel) is the audit-event batch written in the
+// same transaction as the resolution (#2146).
+const mockResolveApprovalGate = mock(async (_id: string, _md: unknown, _events?: unknown) => ({
+  resolved: true,
+}));
+const mockResolveAndCancelApprovalGate = mock(async (_id: string, _events?: unknown) => ({
+  resolved: true,
+}));
+const mockFindChildRuns = mock(async (_parentRunId: string): Promise<unknown[]> => []);
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mockListWorkflowRuns,
   listDashboardRuns: mockListDashboardRuns,
   getWorkflowRun: mockGetWorkflowRun,
+  findChildRuns: mockFindChildRuns,
   cancelWorkflowRun: mockCancelWorkflowRun,
   deleteWorkflowRun: mockDeleteWorkflowRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
+  resolveApprovalGate: mockResolveApprovalGate,
+  resolveAndCancelApprovalGate: mockResolveAndCancelApprovalGate,
   getWorkflowRunByWorkerPlatformId: mockGetWorkflowRunByWorkerPlatformId,
 }));
 
@@ -202,6 +326,42 @@ mock.module('@archon/core/utils/commands', () => ({
   findMarkdownFilesRecursive: mock(async () => []),
 }));
 
+// resumeRunHeadless (#2008) — the direct in-process resume fallback used when
+// a run has no parent conversation to dispatch a chat message through.
+type MockContinuationResult =
+  | { ok: true; workflowName: string; workflow: { definition: unknown } }
+  | { ok: false; message: string };
+const mockResolveRunContinuation = mock(
+  async (_runId: string, _cwd: string): Promise<MockContinuationResult> => ({
+    ok: true,
+    workflowName: 'deploy',
+    workflow: { definition: { name: 'deploy', nodes: [] } },
+  })
+);
+mock.module('@archon/core/handlers', () => ({
+  resolveRunContinuation: mockResolveRunContinuation,
+}));
+
+type MockHydrated = {
+  preCreatedRun: unknown;
+  priorCompletedNodes: Map<string, unknown>;
+  priorUsage: { costUsd: number };
+  priorNodeSessions: unknown[];
+} | null;
+const mockHydrateResumableRun = mock(
+  async (_deps: unknown, run: MockWorkflowRun): Promise<MockHydrated> => ({
+    preCreatedRun: { ...run, status: 'running' },
+    priorCompletedNodes: new Map(),
+    priorUsage: { costUsd: 0 },
+    priorNodeSessions: [],
+  })
+);
+const mockExecuteWorkflow = mock(async () => ({}) as unknown);
+mock.module('@archon/workflows/executor', () => ({
+  hydrateResumableRun: mockHydrateResumableRun,
+  executeWorkflow: mockExecuteWorkflow,
+}));
+
 import { registerApiRoutes } from './api';
 
 // ---------------------------------------------------------------------------
@@ -217,6 +377,7 @@ const MOCK_RUNNING_RUN: MockWorkflowRun = {
   parent_conversation_id: null,
   codebase_id: 'cb-uuid-1',
   status: 'running',
+  outcome: null,
   user_message: 'Deploy to staging',
   started_at: NOW,
   completed_at: null,
@@ -229,6 +390,7 @@ const MOCK_COMPLETED_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-2',
   status: 'completed',
+  outcome: 'failed',
   completed_at: NOW,
 };
 
@@ -236,6 +398,7 @@ const MOCK_FAILED_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-4',
   status: 'failed',
+  outcome: 'succeeded',
   completed_at: NOW,
 };
 
@@ -371,6 +534,54 @@ describe('POST /api/workflows/:name/run', () => {
     );
   });
 
+  test('accepts a percent-encoded namespaced name and forwards the decoded name', async () => {
+    // Regression guard: percent-encoded '/' must be decoded and validate, not raw-route to 400.
+    const { isValidWorkflowName, isValidCommandName } =
+      await import('@archon/workflows/command-validation');
+    const segmentOk = (seg: string) =>
+      !!seg && !seg.startsWith('.') && !seg.includes('\\') && !seg.includes('..');
+    // Real namespaced logic: `triage/review` is valid (one subfolder deep).
+    (isValidWorkflowName as ReturnType<typeof mock>).mockImplementationOnce((name: string) => {
+      if (!name) return false;
+      const segments = name.split('/');
+      if (segments.length > 2) return false;
+      return segments.every(segmentOk);
+    });
+    // Strict command logic that rejects `/`, so this test goes red if the run
+    // route validates with isValidCommandName instead of isValidWorkflowName.
+    (isValidCommandName as ReturnType<typeof mock>).mockImplementationOnce(
+      (name: string) => segmentOk(name) && !name.includes('/')
+    );
+
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Run triage',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/triage%2Freview/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Run triage' }),
+    });
+    expect(response.status).toBe(200);
+
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      '/workflow run triage/review Run triage',
+      expect.objectContaining({
+        isolationHints: { workflowType: 'thread', workflowId: 'web-test-abc' },
+      })
+    );
+  });
+
   test('persists user message to DB when conversation found', async () => {
     mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
     mockAddMessage.mockImplementationOnce(async () => ({
@@ -465,9 +676,9 @@ describe('POST /api/workflows/:name/run', () => {
     expect([400, 404]).toContain(response.status);
   });
 
-  test('returns 400 when isValidCommandName rejects the name', async () => {
-    const { isValidCommandName } = await import('@archon/workflows/command-validation');
-    (isValidCommandName as ReturnType<typeof mock>).mockReturnValueOnce(false);
+  test('returns 400 when isValidWorkflowName rejects the name', async () => {
+    const { isValidWorkflowName } = await import('@archon/workflows/command-validation');
+    (isValidWorkflowName as ReturnType<typeof mock>).mockReturnValueOnce(false);
 
     const { app } = makeApp();
     const response = await app.request('/api/workflows/.hidden/run', {
@@ -489,6 +700,155 @@ describe('POST /api/workflows/:name/run', () => {
       body: 'not valid json {{{',
     });
     expect(response.status).toBe(400);
+  });
+
+  // -------------------------------------------------------------------------
+  // Declared inputs (#2554)
+  // -------------------------------------------------------------------------
+
+  test('forwards a JSON `inputs` map on the context, never in the message text', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Review it',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/review-block/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Review it',
+        inputs: { diff: 'D1', style: 'terse' },
+      }),
+    });
+    expect(response.status).toBe(200);
+
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      // The command text is untouched — a supplied value must never be confusable
+      // with $ARGUMENTS, and this route must not invent a chat grammar.
+      '/workflow run review-block Review it',
+      expect.objectContaining({ workflowInputs: { diff: 'D1', style: 'terse' } })
+    );
+  });
+
+  test('omits workflowInputs entirely when no inputs are supplied', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Go',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go' }),
+    });
+
+    const ctx = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    expect(ctx).not.toHaveProperty('workflowInputs');
+  });
+
+  test('returns 400 when `inputs` is not an object of strings', async () => {
+    const { app } = makeApp();
+    for (const inputs of [['a'], 'nope', { diff: 5 }, { diff: null }]) {
+      const response = await app.request('/api/workflows/deploy/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go', inputs }),
+      });
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toContain('inputs');
+    }
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+  });
+
+  test('treats an explicit empty `inputs` object as nothing supplied', async () => {
+    // `{}` is valid, not an error — it means "take every declared default", so the
+    // context must carry no workflowInputs rather than an empty map.
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Go',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go', inputs: {} }),
+    });
+    expect(response.status).toBe(200);
+
+    const ctx = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    expect(ctx).not.toHaveProperty('workflowInputs');
+  });
+
+  test('accepts a multipart `inputs` field carrying the map JSON-encoded', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockAddMessage.mockImplementationOnce(async () => ({
+      id: 'msg-1',
+      conversation_id: MOCK_CONV.id,
+      role: 'user' as const,
+      content: 'Review it',
+      metadata: '{}',
+      created_at: NOW,
+    }));
+    mockHandleMessage.mockImplementationOnce(async () => {});
+
+    const form = new FormData();
+    form.append('conversationId', 'web-test-abc');
+    form.append('message', 'Review it');
+    form.append('inputs', JSON.stringify({ diff: 'D1' }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/review-block/run', {
+      method: 'POST',
+      body: form,
+    });
+    expect(response.status).toBe(200);
+
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      '/workflow run review-block Review it',
+      expect.objectContaining({ workflowInputs: { diff: 'D1' } })
+    );
+  });
+
+  test('returns 400 for a malformed multipart `inputs` field rather than dropping it', async () => {
+    const form = new FormData();
+    form.append('conversationId', 'web-test-abc');
+    form.append('message', 'Review it');
+    form.append('inputs', 'not json {{{');
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/review-block/run', {
+      method: 'POST',
+      body: form,
+    });
+    expect(response.status).toBe(400);
+    expect(mockHandleMessage).not.toHaveBeenCalled();
   });
 });
 
@@ -649,9 +1009,12 @@ describe('GET /api/workflows/runs', () => {
     const response = await app.request('/api/workflows/runs');
     expect(response.status).toBe(200);
 
-    const body = (await response.json()) as { runs: Array<{ id: string }> };
+    const body = (await response.json()) as {
+      runs: Array<{ id: string; outcome: 'succeeded' | 'failed' | null }>;
+    };
     expect(body.runs.length).toBe(2);
     expect(body.runs[0]?.id).toBe('run-uuid-1');
+    expect(body.runs.map(run => run.outcome)).toEqual([null, 'failed']);
   });
 
   test('converts Date objects to ISO strings in response', async () => {
@@ -801,6 +1164,24 @@ describe('GET /api/workflows/runs/:runId', () => {
     expect(body.error).toContain('not found');
   });
 
+  test('returns authored outcome independently from failed lifecycle status', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_FAILED_RUN);
+    mockListWorkflowEvents.mockImplementationOnce(async () => []);
+    mockGetConversationById.mockImplementationOnce(async () => ({
+      id: 'conv-uuid-1',
+      platform_conversation_id: 'web-conv-abc',
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-4');
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      run: { status: string; outcome: string | null };
+    };
+    expect(body.run).toMatchObject({ status: 'failed', outcome: 'succeeded' });
+  });
+
   test('includes conversation_platform_id for CLI runs (no parent_conversation_id)', async () => {
     // CLI run: conversation_id set, no parent_conversation_id
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
@@ -914,12 +1295,13 @@ describe('GET /api/dashboard/runs', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
-      runs: unknown[];
+      runs: Array<{ status: string; outcome: string | null }>;
       total: number;
       counts: { all: number };
     };
     expect(Array.isArray(body.runs)).toBe(true);
     expect(body.runs.length).toBe(2);
+    expect(body.runs[1]).toMatchObject({ status: 'completed', outcome: 'failed' });
     expect(body.total).toBe(2);
     expect(body.counts.all).toBe(5);
   });
@@ -1059,12 +1441,14 @@ describe('GET /api/workflows/runs/by-worker/:platformId', () => {
   });
 
   test('returns run when found', async () => {
-    mockGetWorkflowRunByWorkerPlatformId.mockResolvedValueOnce(MOCK_RUNNING_RUN);
+    mockGetWorkflowRunByWorkerPlatformId.mockResolvedValueOnce(MOCK_COMPLETED_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/by-worker/some-platform-id');
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { run: unknown };
-    expect(body.run).toBeDefined();
+    const body = (await response.json()) as {
+      run: { status: string; outcome: string | null };
+    };
+    expect(body.run).toMatchObject({ status: 'completed', outcome: 'failed' });
   });
 
   test('returns 404 when not found', async () => {
@@ -1084,6 +1468,9 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     mockGetWorkflowRun.mockReset();
     mockGetConversationById.mockReset();
     mockHandleMessage.mockReset();
+    mockResolveRunContinuation.mockClear();
+    mockHydrateResumableRun.mockClear();
+    mockExecuteWorkflow.mockClear();
   });
 
   test('returns 404 when run not found', async () => {
@@ -1106,12 +1493,42 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     expect(body.error).toContain('Cannot resume');
   });
 
-  test('returns 400 with CLI hint when run has no parent_conversation_id', async () => {
-    // CLI-created runs cannot be resumed from the web dashboard — the API
-    // surfaces the equivalent CLI command rather than silently doing nothing.
+  test('resumes headlessly (no dispatch) when run has no parent_conversation_id (#2008)', async () => {
+    // A CLI-launched run has no parent conversation to dispatch a chat
+    // message through — it now resumes directly, in-process, instead of
+    // being stranded until someone runs the CLI.
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_FAILED_RUN,
       parent_conversation_id: null,
+      working_path: '/tmp/worktrees/run-uuid-4',
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-4/resume', {
+      method: 'POST',
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { success: boolean; message: string };
+    expect(body.success).toBe(true);
+    expect(body.message).toContain('Resuming workflow');
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockGetConversationById).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    const [, , , cwd] = mockExecuteWorkflow.mock.calls[0] as [unknown, unknown, unknown, string];
+    expect(cwd).toBe('/tmp/worktrees/run-uuid-4');
+  });
+
+  test('returns 400 with CLI hint when the run has no parent conversation and cannot be resolved headlessly', async () => {
+    // Safe degrade: the workflow source is unresolvable (e.g. deleted) —
+    // falls back to the existing CLI-hint response instead of a silent 500.
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_FAILED_RUN,
+      parent_conversation_id: null,
+      working_path: '/tmp/worktrees/run-uuid-4',
+    });
+    mockResolveRunContinuation.mockResolvedValueOnce({
+      ok: false,
+      message: 'workflow deleted',
     });
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-uuid-4/resume', {
@@ -1121,6 +1538,7 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('archon workflow resume run-uuid-4');
     expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
   });
 
   test('returns 400 when parent conversation no longer exists', async () => {
@@ -1189,7 +1607,7 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
       string,
     ];
     expect(platformConvId).toBe('web-plat-abc');
-    expect(dispatchedMessage).toBe('/workflow run deploy Run the deploy');
+    expect(dispatchedMessage).toBe('/workflow resume run-uuid-4');
   });
 });
 
@@ -1201,6 +1619,11 @@ describe('POST /api/workflows/runs/:runId/abandon', () => {
   beforeEach(() => {
     mockGetWorkflowRun.mockReset();
     mockCancelWorkflowRun.mockReset();
+    // The shared abandonWorkflow op destructures { cancelled } from this call —
+    // a bare mockReset() would make it return undefined and 500 the route.
+    mockCancelWorkflowRun.mockImplementation(async (_id: string) => ({ cancelled: true }));
+    mockFindChildRuns.mockReset();
+    mockFindChildRuns.mockImplementation(async (_parentRunId: string): Promise<unknown[]> => []);
   });
 
   test('returns 404 when run not found', async () => {
@@ -1212,7 +1635,7 @@ describe('POST /api/workflows/runs/:runId/abandon', () => {
     expect(response.status).toBe(404);
   });
 
-  test('returns 400 when run is already terminal', async () => {
+  test('returns 400 when run is completed (non-resumable terminal)', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(MOCK_COMPLETED_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-uuid-2/abandon', {
@@ -1221,10 +1644,28 @@ describe('POST /api/workflows/runs/:runId/abandon', () => {
     expect(response.status).toBe(400);
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('Cannot abandon');
+    expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  test('returns 400 when run is cancelled (non-resumable terminal)', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_RUNNING_RUN,
+      status: 'cancelled' as const,
+      completed_at: NOW,
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1/abandon', {
+      method: 'POST',
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Cannot abandon');
+    expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 
   test('returns 200 and calls cancelWorkflowRun for running run', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_RUNNING_RUN);
+    // Two lookups now: the route's pre-check + the shared abandonWorkflow op's own.
+    mockGetWorkflowRun.mockResolvedValue(MOCK_RUNNING_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-uuid-1/abandon', {
       method: 'POST',
@@ -1234,6 +1675,22 @@ describe('POST /api/workflows/runs/:runId/abandon', () => {
     expect(body.success).toBe(true);
     expect(body.message).toContain('Abandoned');
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-uuid-1');
+  });
+
+  // #1887: a failed run is terminal but resumable, so it must remain
+  // abandonable — the HTTP route previously rejected it, contradicting CLI/chat.
+  test('returns 200 and calls cancelWorkflowRun for failed run', async () => {
+    // Two lookups now: the route's pre-check + the shared abandonWorkflow op's own.
+    mockGetWorkflowRun.mockResolvedValue(MOCK_FAILED_RUN);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-4/abandon', {
+      method: 'POST',
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { success: boolean; message: string };
+    expect(body.success).toBe(true);
+    expect(body.message).toContain('Abandoned');
+    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-uuid-4');
   });
 });
 
@@ -1312,6 +1769,8 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
   beforeEach(() => {
     mockGetWorkflowRun.mockReset();
     mockUpdateWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
     mockCreateWorkflowEvent.mockReset();
   });
 
@@ -1337,8 +1796,64 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(response.status).toBe(400);
   });
 
-  test('stores user comment as node_output when captureResponse is true', async () => {
+  // #2121 Phase 2: a parent paused blocked on a `workflow:` child has no approvable
+  // gate of its own — approving the PARENT must 400 with a redirect to the child id,
+  // never stamp a spurious node_completed for the parent's sub-run node.
+  test('returns 400 redirecting to the child when the parent is blocked on a sub-run', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'parent-blocked-1',
+      metadata: {
+        approval: {
+          type: 'child_workflow',
+          nodeId: 'sub',
+          message: 'Blocked on sub-run',
+          childRunId: 'child-xyz',
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/parent-blocked-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({}),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toContain('child-xyz');
+    // No gate mutation happened.
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('returns 400 when the gate is already resolved (double-approve guard)', async () => {
+    // Post-#2075 an approved run stays 'paused' with approval.resolved set —
+    // the status check alone no longer blocks a second approve.
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          resolved: 'approved',
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'again' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('already approved');
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    expect(mockUpdateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  test('bare gate with captureResponse but no decisionsAuthored keeps plain-text output (R2 fix — #2707)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       id: 'run-capture',
       metadata: {
@@ -1357,16 +1872,19 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
       headers: { 'Content-Type': 'application/json' },
     });
     expect(response.status).toBe(200);
-    const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
-      (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
-    );
-    expect(nodeCompletedCall?.[0]).toMatchObject({
+    // Audit events ride the CAS transaction now (#2146), not a separate write.
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
       data: { node_output: 'Looks great, proceed', approval_decision: 'approved' },
     });
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
   });
 
-  test('stores empty node_output when captureResponse is not set', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_PAUSED_RUN);
+  test('bare gate with no captureResponse set — empty output, unaffected by #2707', async () => {
+    mockGetWorkflowRun.mockResolvedValue(MOCK_PAUSED_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
       method: 'POST',
@@ -1374,13 +1892,167 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
       headers: { 'Content-Type': 'application/json' },
     });
     expect(response.status).toBe(200);
-    const nodeCompletedCall = mockCreateWorkflowEvent.mock.calls.find(
-      (c: unknown[]) => (c[0] as Record<string, unknown>).event_type === 'node_completed'
-    );
-    expect(nodeCompletedCall?.[0]).toMatchObject({
+    // Audit events ride the CAS transaction now (#2146), not a separate write.
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
       data: { node_output: '', approval_decision: 'approved' },
     });
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'approved' });
+  });
+
+  test('new-mode gate (decisionsAuthored) produces structured output (#2707)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-new-mode',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-new-mode/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'a comment' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: {
+        node_output: JSON.stringify({ decision: 'approve', text: 'a comment' }),
+        approval_decision: 'approved',
+        structured_output: { decision: 'approve', text: 'a comment' },
+      },
+    });
+  });
+
+  test('legacy on_reject-configured gate keeps plain text output, unaffected by #2707', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-legacy-capture',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          captureResponse: true,
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-legacy-capture/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'Looks great, proceed' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: { node_output: 'Looks great, proceed', approval_decision: 'approved' },
+    });
+    expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
+  });
+
+  test('passes an absent comment through as no-feedback on an interactive_loop gate (#2074)', async () => {
+    // The route must NOT default the comment to 'Approved' — approveWorkflow derives
+    // loop_feedback_given from the RAW comment, and a masked no-feedback would make
+    // every web approve iterate instead of finalize.
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-loop-bare',
+      metadata: {
+        approval: {
+          type: 'interactive_loop',
+          nodeId: 'refine',
+          message: 'gate',
+          iteration: 1,
+          completionSignaled: true,
+          signaledOutput: 'REPORT',
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-loop-bare/approve', {
+      method: 'POST',
+      body: JSON.stringify({}),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casCall = mockResolveApprovalGate.mock.calls[0] as unknown[];
+    expect(casCall[1]).toMatchObject({
+      loop_feedback_given: false,
+      loop_user_input: 'Approved',
+    });
+  });
+
+  test('returns 400 (not a silent bare approve) when the body is sent but malformed (#2074)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-bad-body',
+      metadata: {
+        approval: {
+          type: 'interactive_loop',
+          nodeId: 'refine',
+          message: 'gate',
+          iteration: 1,
+          completionSignaled: true,
+          signaledOutput: 'REPORT',
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-bad-body/approve', {
+      method: 'POST',
+      body: '{"comment": "intended feedback', // truncated JSON — client bug
+      headers: { 'Content-Type': 'application/json' },
+    });
+    // A malformed body must never be coerced into a bare approve — that would
+    // FINALIZE a signal-bearing gate while silently discarding the feedback.
+    expect(response.status).toBe(400);
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('passes a provided comment through as feedback on an interactive_loop gate (#2074)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-loop-feedback',
+      metadata: {
+        approval: {
+          type: 'interactive_loop',
+          nodeId: 'refine',
+          message: 'gate',
+          iteration: 1,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-loop-feedback/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'actually re-check X' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casCall = mockResolveApprovalGate.mock.calls[0] as unknown[];
+    expect(casCall[1]).toMatchObject({
+      loop_feedback_given: true,
+      loop_user_input: 'actually re-check X',
+    });
   });
 });
 
@@ -1392,6 +2064,8 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
   beforeEach(() => {
     mockGetWorkflowRun.mockReset();
     mockUpdateWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
     mockCancelWorkflowRun.mockReset();
     mockCreateWorkflowEvent.mockReset();
   });
@@ -1418,8 +2092,35 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     expect(response.status).toBe(400);
   });
 
+  // #2121 Phase 2: rejecting a parent blocked on a `workflow:` child must 400 with a
+  // redirect to the child id, not cancel the parent or stamp its sub-run node.
+  test('returns 400 redirecting to the child when the parent is blocked on a sub-run', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'parent-blocked-2',
+      metadata: {
+        approval: {
+          type: 'child_workflow',
+          nodeId: 'sub',
+          message: 'Blocked on sub-run',
+          childRunId: 'child-abc',
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/parent-blocked-2/reject', {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'no' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toContain('child-abc');
+    expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
+  });
+
   test('cancels immediately when no on_reject configured', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_PAUSED_RUN);
+    mockGetWorkflowRun.mockResolvedValue(MOCK_PAUSED_RUN);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-paused-1/reject', {
       method: 'POST',
@@ -1429,12 +2130,21 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { success: boolean; message: string };
     expect(body.success).toBe(true);
-    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-paused-1');
+    // Terminal reject resolves + cancels atomically (#2113); the audit event rides
+    // the same transaction (#2146).
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-paused-1', [
+      {
+        event_type: 'approval_received',
+        step_name: 'review-gate',
+        data: { decision: 'rejected', reason: 'needs work' },
+      },
+    ]);
+    expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'rejected' });
   });
 
   test('records rejection and increments count when on_reject configured and under limit', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       id: 'run-on-reject',
       metadata: {
@@ -1457,16 +2167,36 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { success: boolean; message: string };
     expect(body.success).toBe(true);
-    expect(body.message).toContain('On-reject prompt');
-    expect(mockUpdateWorkflowRun).toHaveBeenCalledWith('run-on-reject', {
-      status: 'failed',
-      metadata: { rejection_reason: 'needs more tests', rejection_count: 1 },
-    });
+    // This fixture has no parent_conversation_id, so the on-reject prompt now
+    // resumes headlessly (#2008) instead of surfacing the old CLI-hint text.
+    expect(body.message).toContain('Running on-reject prompt');
+    expect(mockResolveApprovalGate).toHaveBeenCalledWith(
+      'run-on-reject',
+      {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Approve?',
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+          onRejectMaxAttempts: 3,
+          resolved: 'rejected',
+        },
+        rejection_reason: 'needs more tests',
+        rejection_count: 1,
+      },
+      [
+        {
+          event_type: 'approval_received',
+          step_name: 'review-gate',
+          data: { decision: 'rejected', reason: 'needs more tests' },
+        },
+      ]
+    );
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 
   test('cancels when max attempts reached', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       id: 'run-max-attempts',
       metadata: {
@@ -1490,8 +2220,142 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     const body = (await response.json()) as { success: boolean; message: string };
     expect(body.success).toBe(true);
     expect(body.message).toContain('max attempts reached');
-    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-max-attempts');
+    // Terminal reject resolves + cancels atomically (#2113); the audit event rides
+    // the same transaction (#2146).
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-max-attempts', [
+      {
+        event_type: 'approval_received',
+        step_name: 'review-gate',
+        data: { decision: 'rejected', reason: 'still bad' },
+      },
+    ]);
+    expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
     expect(mockUpdateWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
+// #2707 step 2 — the general drive verb. 'approve'/'reject' produce the exact same
+// resolution as the dedicated routes above; any other decision resolves through the
+// new declared-decision path.
+describe('POST /api/workflows/runs/:runId/respond', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockUpdateWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
+    mockCreateWorkflowEvent.mockReset();
+  });
+
+  test('returns 404 when run not found', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(null);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/missing/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'revise' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(404);
+  });
+
+  test('returns 400 when the body has no decision', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_PAUSED_RUN);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/respond', {
+      method: 'POST',
+      body: JSON.stringify({ text: 'no decision here' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('returns 400 naming the actual options when the decision is not declared', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-respond-invalid',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-respond-invalid/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'escalate' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain("does not declare decision 'escalate'");
+    expect(body.error).toContain('approve, revise');
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('resolves a declared non-default decision with the caller-supplied id', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-respond-revise',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-respond-revise/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'revise', text: 'needs more detail' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: {
+        structured_output: { decision: 'revise', text: 'needs more detail' },
+      },
+    });
+  });
+
+  test("'approve' produces the exact same resolution as POST .../approve", async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-respond-approve',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Review the plan',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-respond-approve/respond', {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'approve', text: 'lgtm' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(200);
+    const casEvents = (mockResolveApprovalGate.mock.calls[0] as unknown[])[2] as Array<
+      Record<string, unknown>
+    >;
+    const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
+    expect(nodeCompleted).toMatchObject({
+      data: { structured_output: { decision: 'approve', text: 'lgtm' } },
+    });
   });
 });
 
@@ -1505,14 +2369,21 @@ describe('approve/reject auto-resume', () => {
   beforeEach(() => {
     mockGetWorkflowRun.mockReset();
     mockUpdateWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
     mockCreateWorkflowEvent.mockReset();
     mockGetConversationById.mockReset();
     mockHandleMessage.mockReset();
     mockCancelWorkflowRun.mockReset();
+    mockResolveRunContinuation.mockClear();
+    mockHydrateResumableRun.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockGetCodebase.mockReset();
+    mockCreateChildWorktreeResolver.mockClear();
   });
 
   test('approve: dispatches resume when parent_conversation_id is set', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       id: 'run-auto-resume-approve',
       parent_conversation_id: 'parent-conv-uuid',
@@ -1543,13 +2414,20 @@ describe('approve/reject auto-resume', () => {
       string,
     ];
     expect(platformConvId).toBe('web-plat-abc');
-    expect(dispatchedMessage).toBe('/workflow run deploy Deploy feature X');
+    expect(dispatchedMessage).toBe('/workflow resume run-auto-resume-approve');
   });
 
-  test('approve: skips dispatch when parent_conversation_id is null (CLI-dispatched run)', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+  test('approve: resumes headlessly when parent_conversation_id is null (CLI-dispatched run, #2008)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       parent_conversation_id: null,
+    });
+    mockGetCodebase.mockResolvedValueOnce({
+      id: 'cb-uuid-1',
+      name: 'owner/repo',
+      kind: 'repo',
+      default_cwd: '/home/u/owner/repo',
+      default_branch: 'main',
     });
 
     const { app } = makeApp();
@@ -1561,13 +2439,135 @@ describe('approve/reject auto-resume', () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as { message: string };
-    expect(body.message).toContain('archon workflow resume run-paused-1');
+    expect(body.message).toContain('Resuming workflow');
+    // No chat message to dispatch through — resumed directly instead.
     expect(mockHandleMessage).not.toHaveBeenCalled();
     expect(mockGetConversationById).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    // #2008 R1: a git-repo codebase in scope gets a child-isolation resolver
+    // wired into the resumed execution, same as CLI/chat resume, so a
+    // downstream `workflow:` node with isolation:worktree doesn't fail.
+    expect(mockCreateChildWorktreeResolver).toHaveBeenCalledWith(
+      expect.objectContaining({ codebaseId: 'cb-uuid-1', codebaseName: 'owner/repo' })
+    );
+    const [, , , , , , , opts] = mockExecuteWorkflow.mock.calls[0] as [
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      unknown,
+      { resolveChildIsolation?: unknown; baseBranch?: string },
+    ];
+    expect(opts.resolveChildIsolation).toBeDefined();
+    expect(opts.baseBranch).toBe('main');
+  });
+
+  test('approve: skips the child-isolation resolver for a folder-project codebase', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      parent_conversation_id: null,
+    });
+    mockGetCodebase.mockResolvedValueOnce({
+      id: 'cb-folder-1',
+      name: 'ops-folder',
+      kind: 'folder',
+      default_cwd: '/home/u/ops-folder',
+      default_branch: null,
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockCreateChildWorktreeResolver).not.toHaveBeenCalled();
+  });
+
+  test('approve: falls back to the CLI-hint response when headless resume cannot resolve the workflow', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      parent_conversation_id: null,
+    });
+    mockResolveRunContinuation.mockResolvedValueOnce({ ok: false, message: 'workflow deleted' });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { message: string };
+    expect(body.message).toContain('archon workflow resume run-paused-1');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('approve: falls back to the CLI-hint response (not a 500) when headless resume hits an unexpected error (#2008 R2)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      parent_conversation_id: null,
+    });
+    mockHydrateResumableRun.mockImplementationOnce(async () => {
+      throw new Error('transient DB error');
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: JSON.stringify({ comment: 'LGTM' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    // The gate decision was already recorded — an unexpected error resuming
+    // it must degrade safely, not surface as a 500.
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { message: string };
+    expect(body.message).toContain('archon workflow resume run-paused-1');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('reject: resumes headlessly when parent_conversation_id is null (CLI-dispatched run, #2008)', async () => {
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-reject-headless',
+      parent_conversation_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review-gate',
+          message: 'Approve?',
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+          onRejectMaxAttempts: 3,
+        },
+        rejection_count: 0,
+      },
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-reject-headless/reject', {
+      method: 'POST',
+      body: JSON.stringify({ reason: 'tests missing' }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { message: string };
+    expect(body.message).toContain('Running on-reject prompt');
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockGetConversationById).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
   });
 
   test('approve: skips dispatch when parent conversation no longer exists', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       parent_conversation_id: 'deleted-conv-uuid',
     });
@@ -1591,7 +2591,7 @@ describe('approve/reject auto-resume', () => {
     // must not route through dispatchToOrchestrator — that helper is wired
     // to the web adapter + lock manager, so dispatching a Slack thread_ts
     // or Telegram chat_id would misroute through the wrong adapter.
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       parent_conversation_id: 'slack-parent-conv-uuid',
     });
@@ -1616,7 +2616,7 @@ describe('approve/reject auto-resume', () => {
   });
 
   test('reject: dispatches resume for on_reject flows when parent is set', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       id: 'run-auto-resume-reject',
       parent_conversation_id: 'parent-conv-uuid',
@@ -1655,11 +2655,11 @@ describe('approve/reject auto-resume', () => {
       string,
     ];
     expect(platformConvId).toBe('web-plat-xyz');
-    expect(dispatchedMessage).toBe('/workflow run deploy Review PR');
+    expect(dispatchedMessage).toBe('/workflow resume run-auto-resume-reject');
   });
 
   test('reject: surfaces CLI resume hint when on_reject configured but parent is non-web', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       id: 'run-reject-non-web',
       parent_conversation_id: 'slack-parent-conv-uuid',
@@ -1694,7 +2694,7 @@ describe('approve/reject auto-resume', () => {
   });
 
   test('reject: does NOT dispatch when the run is being cancelled (no on_reject configured)', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce({
+    mockGetWorkflowRun.mockResolvedValue({
       ...MOCK_PAUSED_RUN,
       parent_conversation_id: 'parent-conv-uuid', // set, but doesn't matter — reject cancels
     });
@@ -1709,7 +2709,15 @@ describe('approve/reject auto-resume', () => {
     expect(response.status).toBe(200);
     // Cancellation path doesn't auto-resume — nothing to resume to.
     expect(mockHandleMessage).not.toHaveBeenCalled();
-    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-paused-1');
+    // Terminal reject resolves + cancels atomically (#2113); the audit event rides
+    // the same transaction (#2146).
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-paused-1', [
+      {
+        event_type: 'approval_received',
+        step_name: 'review-gate',
+        data: { decision: 'rejected', reason: 'no' },
+      },
+    ]);
   });
 });
 
@@ -1718,9 +2726,20 @@ describe('approve/reject auto-resume', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/runs/:runId/artifacts', () => {
-  beforeEach(() => {
+  // These cases write real files under the resolved artifact dir, so point the
+  // fake ARCHON_HOME at an OS temp dir — a hard-coded '/tmp/...' is not an
+  // absolute path on Windows. Torn down per case, so no cross-test leakage.
+  const originalMockHome = mockArchonHome;
+  beforeEach(async () => {
+    mockArchonHome = await mkdtemp(join(tmpdir(), 'archon-artifacts-home-'));
     mockGetWorkflowRun.mockReset();
     mockGetCodebase.mockReset();
+  });
+
+  afterEach(async () => {
+    const used = mockArchonHome;
+    mockArchonHome = originalMockHome;
+    await rm(used, { recursive: true, force: true });
   });
 
   test('returns 400 for invalid run ids (regex guard)', async () => {
@@ -1736,7 +2755,9 @@ describe('GET /api/runs/:runId/artifacts', () => {
     expect(response.status).toBe(404);
   });
 
-  test('returns empty files when run has no codebase_id', async () => {
+  // #2200: an unresolvable output location is an explicit 404. An empty 200 was
+  // indistinguishable from "the run produced nothing".
+  test('returns 404 when run has no codebase_id and no output_root', async () => {
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
       ...MOCK_RUNNING_RUN,
       id: 'run-orphan',
@@ -1744,24 +2765,127 @@ describe('GET /api/runs/:runId/artifacts', () => {
     }));
     const { app } = makeApp();
     const response = await app.request('/api/runs/run-orphan/artifacts');
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { files: unknown[] };
-    expect(body.files).toEqual([]);
+    expect(response.status).toBe(404);
     expect(mockGetCodebase).not.toHaveBeenCalled();
   });
 
-  test('returns empty files when codebase name lacks owner/repo shape', async () => {
+  test('resolves a bare-basename (_local) codebase instead of failing the parse', async () => {
+    const runId = 'run-local-listing';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'plan.md'), '# plan');
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
       ...MOCK_RUNNING_RUN,
-      id: 'run-no-slash',
+      id: runId,
       codebase_id: 'cb-1',
     }));
-    mockGetCodebase.mockImplementationOnce(async () => ({ name: 'plain-name' }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
     const { app } = makeApp();
-    const response = await app.request('/api/runs/run-no-slash/artifacts');
+    const response = await app.request(`/api/runs/${runId}/artifacts`);
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { files: unknown[] };
-    expect(body.files).toEqual([]);
+    const body = (await response.json()) as { files: { path: string }[] };
+    // Before #2200 this returned an empty list — parseOwnerRepo(name) was null.
+    expect(body.files.map(f => f.path)).toEqual(['plan.md']);
+  });
+
+  test('resolves a folder project to _folder/<slug> storage', async () => {
+    const runId = 'run-folder-listing';
+    const dir = join(wsRoot(), '_folder', 'my-ops-folder', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'report.md'), '# report');
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-folder',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'My Ops Folder',
+      kind: 'folder',
+      default_cwd: '/srv/ops',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/runs/${runId}/artifacts`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { files: { path: string }[] };
+    expect(body.files.map(f => f.path)).toEqual(['report.md']);
+  });
+
+  test('a persisted output_root wins over a codebase renamed since the run', async () => {
+    const runId = 'run-persisted-root';
+    const root = join(wsRoot(), 'acme', 'original');
+    const dir = join(root, 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'out.md'), 'x');
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-renamed',
+      output_root: root,
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'acme/renamed-since',
+      kind: 'repo',
+      default_cwd: '/repos/renamed',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/runs/${runId}/artifacts`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { files: { path: string }[] };
+    expect(body.files.map(f => f.path)).toEqual(['out.md']);
+  });
+
+  test('an out-of-tree output_root falls through to re-derivation, keeping the tree relocatable', async () => {
+    // Durability, not just correctness: move ARCHON_HOME (machine migration,
+    // restored backup, the ARCHON_DATA split) and EVERY stamped root is
+    // out-of-tree. Hard-failing here would permanently un-browse every
+    // historical run whose artifacts are sitting right there under the new
+    // home — and output_root is write-once via COALESCE, so the app could never
+    // clear the column to recover.
+    const runId = 'run-stale-root';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'plan.md'), '# still here');
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-1',
+      // A root from the OLD home — the shape every run has after a relocation.
+      output_root: '/previous/archon/home/workspaces/_local/workspace',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request(`/api/runs/${runId}/artifacts`);
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { files: { path: string }[] };
+    expect(body.files.map(f => f.path)).toEqual(['plan.md']);
+  });
+
+  test('the containment guard still rejects a DERIVED path that escapes the tree', async () => {
+    // The guard's live purpose after the fix: nothing re-derivable, and a
+    // persisted root that cannot be trusted, must not serve a path outside
+    // ARCHON_HOME.
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-escape-root',
+      codebase_id: null,
+      output_root: '/etc',
+    }));
+    const { app } = makeApp();
+    const response = await app.request('/api/runs/run-escape-root/artifacts');
+    // No codebase to re-derive from, and the persisted root is untrusted, so the
+    // location is genuinely unresolvable.
+    expect(response.status).toBe(404);
   });
 
   test('returns 500 + logs when the codebase lookup throws', async () => {
@@ -1778,19 +2902,167 @@ describe('GET /api/runs/:runId/artifacts', () => {
     expect(response.status).toBe(500);
   });
 
-  // Path-escape guard: a maliciously crafted owner/repo with `..` segments
-  // would, after the join, resolve to a directory outside ARCHON_HOME. The
-  // mocked getRunArtifactsPath above naively joins inputs, so passing
-  // `'..'` as the owner produces a path that normalises outside /tmp/.archon.
-  test('returns 400 when the resolved artifact dir escapes ARCHON_HOME', async () => {
+  // Traversal-shaped codebase names never produce a traversal path: they fail
+  // parseOwnerRepo and fall through to `_local/<basename(default_cwd)>`, which
+  // is a single sanitised segment. The result is a real (empty) project dir,
+  // NOT an escape — and the ARCHON_HOME containment check is the second layer.
+  test('a traversal-shaped codebase name resolves inside ARCHON_HOME, never outside it', async () => {
+    for (const name of ['../../etc/passwd', 'a/b/c', '../repo', 'owner/..', 'ow ner/repo']) {
+      mockGetWorkflowRun.mockImplementationOnce(async () => ({
+        ...MOCK_RUNNING_RUN,
+        id: 'run-bad-name',
+        codebase_id: 'cb-bad',
+      }));
+      mockGetCodebase.mockImplementationOnce(async () => ({
+        name,
+        kind: 'repo',
+        default_cwd: '/home/u/checkout',
+      }));
+      const { app } = makeApp();
+      const response = await app.request('/api/runs/run-bad-name/artifacts');
+      // Resolved to _local/checkout (which does not exist) → empty list, not an escape.
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { files: unknown[] };
+      expect(body.files).toEqual([]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: GET /api/artifacts/:runId/* — the artifact file-serving endpoint
+// (owner/repo derivation only; content serving hits the real filesystem)
+// ---------------------------------------------------------------------------
+
+describe('GET /api/artifacts/:runId/* storage-key resolution', () => {
+  // These cases write real files under the resolved artifact dir, so point the
+  // fake ARCHON_HOME at an OS temp dir — a hard-coded '/tmp/...' is not an
+  // absolute path on Windows. Torn down per case, so no cross-test leakage.
+  const originalMockHome = mockArchonHome;
+  beforeEach(async () => {
+    mockArchonHome = await mkdtemp(join(tmpdir(), 'archon-artifacts-home-'));
+    mockGetWorkflowRun.mockReset();
+    mockGetCodebase.mockReset();
+  });
+
+  afterEach(async () => {
+    const used = mockArchonHome;
+    mockArchonHome = originalMockHome;
+    await rm(used, { recursive: true, force: true });
+  });
+
+  test('returns 404 when there is no codebase and no output_root to resolve from', async () => {
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
       ...MOCK_RUNNING_RUN,
-      id: 'run-escape',
-      codebase_id: 'cb-escape',
+      id: 'run-serve-orphan',
+      codebase_id: null,
     }));
-    mockGetCodebase.mockImplementationOnce(async () => ({ name: '../../etc/passwd' }));
     const { app } = makeApp();
-    const response = await app.request('/api/runs/run-escape/artifacts');
-    expect(response.status).toBe(400);
+    const response = await app.request('/api/artifacts/run-serve-orphan/plan.md');
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('could not resolve');
+  });
+
+  test('serves a folder project’s artifact (404 before #2200)', async () => {
+    const runId = 'run-serve-folder';
+    const dir = join(wsRoot(), '_folder', 'my-ops-folder', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'plan.md'), '# folder plan');
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-folder',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'My Ops Folder',
+      kind: 'folder',
+      default_cwd: '/srv/ops',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${runId}/plan.md`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('# folder plan');
+  });
+
+  test('serves a no-remote local repo’s artifact (404 before #2200)', async () => {
+    const runId = 'run-serve-local';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'plan.md'), '# local plan');
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-local',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${runId}/plan.md`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('# local plan');
+  });
+
+  test('an out-of-tree output_root falls through to re-derivation and still serves', async () => {
+    // Same relocation case as the list route: a stamped root from a previous
+    // ARCHON_HOME must not permanently un-serve a run whose file is present.
+    const runId = 'run-serve-stale-root';
+    const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'plan.md'), '# still here');
+
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-1',
+      output_root: '/previous/archon/home/workspaces/_local/workspace',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'workspace',
+      kind: 'repo',
+      default_cwd: '/home/u/workspace',
+    }));
+
+    const { app } = makeApp();
+    const response = await app.request(`/api/artifacts/${runId}/plan.md`);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('# still here');
+  });
+
+  test('an untrusted output_root with nothing to re-derive from is unresolvable', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-serve-escape-root',
+      codebase_id: null,
+      output_root: '/etc',
+    }));
+    const { app } = makeApp();
+    const response = await app.request('/api/artifacts/run-serve-escape-root/passwd');
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('could not resolve');
+  });
+
+  test('a valid owner/repo name resolves and proceeds to the file read', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => ({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-serve-ok',
+      codebase_id: 'cb-ok',
+    }));
+    mockGetCodebase.mockImplementationOnce(async () => ({
+      name: 'acme/widgets',
+      kind: 'repo',
+      default_cwd: '/repos/widgets',
+    }));
+    const { app } = makeApp();
+    const response = await app.request('/api/artifacts/run-serve-ok/plan.md');
+    // Artifact dir does not exist on disk → ENOENT, distinct from the
+    // unresolvable-location rejection above.
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toBe('Artifact file not found');
   });
 });

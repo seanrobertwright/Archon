@@ -39,10 +39,12 @@ export {
   getDialect,
   getDatabaseType,
   getDbNotificationListener,
+  getSchemaVersion,
   closeDatabase,
   resetDatabase,
 } from './db/connection';
 export type { IDatabase, SqlDialect, DbNotificationListener } from './db/adapters/types';
+export type { SchemaVersionInfo } from './db/schema-version';
 
 // Namespaced db modules for explicit access
 export * as conversationDb from './db/conversations';
@@ -67,6 +69,10 @@ export {
   registerGitHubAppAuthProvider,
 } from './workflows/store-adapter';
 
+// Per-child isolation resolver factory (#2121 slice 2, PR-A)
+export { createChildWorktreeResolver } from './workflows/child-isolation-resolver';
+export type { ChildWorktreeResolverConfig } from './workflows/child-isolation-resolver';
+
 // Workflow Events DB
 export * as workflowEventDb from './db/workflow-events';
 
@@ -79,7 +85,8 @@ export * as isolationOperations from './operations/isolation-operations';
 // =============================================================================
 // Orchestrator
 // =============================================================================
-export { handleMessage } from './orchestrator/orchestrator-agent';
+export { handleMessage, resolveTitleRequest } from './orchestrator/orchestrator-agent';
+export type { TitleRequest } from './orchestrator/orchestrator-agent';
 export {
   buildOrchestratorPrompt,
   buildProjectScopedPrompt,
@@ -90,7 +97,12 @@ export {
 // Handlers
 // =============================================================================
 export { handleCommand, parseCommand } from './handlers/command-handler';
-export { cloneRepository, registerRepository, type RegisterResult } from './handlers/clone';
+export {
+  cloneRepository,
+  registerRepository,
+  registerFolder,
+  type RegisterResult,
+} from './handlers/clone';
 
 // =============================================================================
 // Config
@@ -144,6 +156,9 @@ export {
 
 // Conversation lock
 export { ConversationLockManager, type LockAcquisitionResult } from './utils/conversation-lock';
+
+// Webhook delivery dedup
+export { DeliveryDeduplicator } from './utils/delivery-dedup';
 
 // Error formatting
 export { classifyAndFormatError } from './utils/error-formatter';
@@ -241,7 +256,7 @@ export {
   getUserAiPrefs,
   setUserTiers,
   setUserAliases,
-  setUserDefaultProvider,
+  setUserDefault,
   clearUserAiPrefs,
   type UserAiPrefs,
   type UserTiersPatch,
@@ -255,4 +270,4 @@ export { isPathWithinWorkspace, validateAndResolvePath } from './utils/path-vali
 export { getPort } from './utils/port-allocation';
 
 // Worktree sync
-export { syncArchonToWorktree } from './utils/worktree-sync';
+export { resolveWorkflowSourceRoot } from './utils/workflow-source-root';

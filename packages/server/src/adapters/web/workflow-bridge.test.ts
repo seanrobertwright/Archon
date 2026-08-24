@@ -23,6 +23,56 @@ mock.module('@archon/paths', () => ({
 import { mapWorkflowEvent } from './workflow-bridge';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
 
+describe('mapWorkflowEvent — tool activity correlation', () => {
+  test('forwards tool call IDs and completion metadata', () => {
+    const started: WorkflowEmitterEvent = {
+      type: 'tool_started',
+      runId: 'run-1',
+      toolName: 'Bash',
+      stepName: 'implement',
+      toolCallId: 'call-1',
+    };
+    const completed: WorkflowEmitterEvent = {
+      type: 'tool_completed',
+      runId: 'run-1',
+      toolName: 'Bash',
+      stepName: 'implement',
+      durationMs: 42,
+      toolCallId: 'call-1',
+      toolOutcome: 'error',
+      exitCode: 1,
+    };
+
+    expect(JSON.parse(mapWorkflowEvent(started) ?? '{}')).toMatchObject({
+      type: 'workflow_tool_activity',
+      status: 'started',
+      toolCallId: 'call-1',
+    });
+    expect(JSON.parse(mapWorkflowEvent(completed) ?? '{}')).toMatchObject({
+      type: 'workflow_tool_activity',
+      status: 'completed',
+      toolCallId: 'call-1',
+      toolOutcome: 'error',
+      exitCode: 1,
+    });
+  });
+
+  test('omits optional completion metadata for legacy events', () => {
+    const completed: WorkflowEmitterEvent = {
+      type: 'tool_completed',
+      runId: 'run-1',
+      toolName: 'Bash',
+      stepName: 'implement',
+      durationMs: 42,
+      toolCallId: 'call-1',
+    };
+
+    const payload = JSON.parse(mapWorkflowEvent(completed) ?? '{}') as Record<string, unknown>;
+    expect(payload).not.toHaveProperty('toolOutcome');
+    expect(payload).not.toHaveProperty('exitCode');
+  });
+});
+
 describe('mapWorkflowEvent — task_activity (Phase 2 of #975)', () => {
   beforeEach(() => {
     mockLogger.warn.mockClear();
@@ -145,5 +195,34 @@ describe('mapWorkflowEvent — hook_activity (Phase 2 of #975)', () => {
     const payload = JSON.parse(sse ?? '{}') as Record<string, unknown>;
     expect(payload.outcome).toBe('error');
     expect(payload).not.toHaveProperty('exitCode');
+  });
+});
+
+describe('mapWorkflowEvent — container_lifecycle (Phase B)', () => {
+  test('container_lifecycle created → workflow_container_lifecycle SSE', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'container_lifecycle',
+      runId: 'run-1',
+      phase: 'created',
+      containerId: 'abc123def456',
+    };
+    const sse = mapWorkflowEvent(event);
+    const payload = JSON.parse(sse ?? '{}') as Record<string, unknown>;
+    expect(payload.type).toBe('workflow_container_lifecycle');
+    expect(payload.runId).toBe('run-1');
+    expect(payload.phase).toBe('created');
+    expect(payload.containerId).toBe('abc123def456');
+  });
+
+  test('container_lifecycle destroyed → SSE without a containerId', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'container_lifecycle',
+      runId: 'run-1',
+      phase: 'destroyed',
+    };
+    const payload = JSON.parse(mapWorkflowEvent(event) ?? '{}') as Record<string, unknown>;
+    expect(payload.type).toBe('workflow_container_lifecycle');
+    expect(payload.phase).toBe('destroyed');
+    expect(payload).not.toHaveProperty('containerId');
   });
 });

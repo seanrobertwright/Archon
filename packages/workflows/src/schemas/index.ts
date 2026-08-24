@@ -13,8 +13,8 @@ export { stepRetryConfigSchema } from './retry';
 export type { StepRetryConfig } from './retry';
 
 // Loop node configuration
-export { loopNodeConfigSchema } from './loop';
-export type { LoopNodeConfig } from './loop';
+export { loopNodeConfigSchema, loopControlSchema } from './loop';
+export type { LoopNodeConfig, LoopControl } from './loop';
 
 // Hooks
 export {
@@ -30,46 +30,77 @@ export {
   triggerRuleSchema,
   TRIGGER_RULES,
   dagNodeBaseSchema,
-  commandNodeSchema,
-  promptNodeSchema,
-  bashNodeSchema,
+  nodeContextSchema,
+  promptSourceSchema,
+  agentNodeSchema,
+  execNodeSchema,
   loopNodeSchema,
-  approvalNodeSchema,
+  loopGroupNodeSchema,
+  loopGroupNodeConfigSchema,
+  decisionOptionSchema,
+  gateNodeSchema,
   approvalOnRejectSchema,
-  cancelNodeSchema,
-  scriptNodeSchema,
+  haltNodeSchema,
+  includeDirectiveSchema,
+  workflowNodeSchema,
+  fanOutConfigSchema,
   dagNodeSchema,
-  isBashNode,
+  INPUT_NAME_SOURCE,
+  inputEnvKey,
+  bindingDirectiveSchema,
+  isBindingDirective,
+  isAgentNode,
+  isExecNode,
+  isGateNode,
+  isHaltNode,
   isLoopNode,
-  isApprovalNode,
-  isCancelNode,
-  isScriptNode,
+  isLoopGroupNode,
+  isWorkflowNode,
+  isIncludeDirective,
   isPersistableNode,
+  isNodeContextResume,
   isTriggerRule,
   BASH_NODE_AI_FIELDS,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
+  LOOP_GROUP_NODE_AI_FIELDS,
+  INCLUDE_NODE_IGNORED_FIELDS,
+  WORKFLOW_NODE_IGNORED_FIELDS,
+  KNOWN_DAG_NODE_KEYS,
+  KNOWN_NODE_NESTED_KEYS,
+  approvalConfigSchema,
+  dagNodeFlatSchema,
   effortLevelSchema,
   thinkingConfigSchema,
   sandboxSettingsSchema,
   agentDefinitionSchema,
+  piNodeConfigSchema,
 } from './dag-node';
 export type {
   TriggerRule,
   DagNodeBase,
-  CommandNode,
-  PromptNode,
-  BashNode,
+  NodeContext,
+  BindingDirective,
+  PromptSource,
+  AgentNode,
+  ExecNode,
   LoopNode,
-  ApprovalNode,
+  LoopGroupNode,
+  LoopGroupNodeConfig,
+  DecisionOption,
+  GateNode,
   ApprovalOnReject,
-  CancelNode,
-  ScriptNode,
+  HaltNode,
+  IncludeDirective,
+  WorkflowNode,
+  FanOutConfig,
   DagNode,
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
   AgentDefinition,
+  PiNodeConfig,
+  NestedKeySpec,
 } from './dag-node';
 
 // Workflow definition
@@ -77,13 +108,20 @@ export {
   modelReasoningEffortSchema,
   webSearchModeSchema,
   workflowRequirementSchema,
+  workflowEvidencePolicySchema,
+  workflowInputSpecSchema,
   workflowBaseSchema,
   workflowDefinitionSchema,
+  KNOWN_WORKFLOW_KEYS,
+  KNOWN_WORKFLOW_NESTED_KEYS,
+  WORKFLOW_ONLY_KEYS,
 } from './workflow';
 export type {
   ModelReasoningEffort,
   WebSearchMode,
   WorkflowRequirement,
+  WorkflowEvidencePolicy,
+  WorkflowInputSpec,
   WorkflowBase,
   WorkflowDefinition,
 } from './workflow';
@@ -91,6 +129,7 @@ export type {
 // Workflow run state
 export {
   workflowRunStatusSchema,
+  workflowRunOutcomeSchema,
   workflowStepStatusSchema,
   nodeStateSchema,
   nodeOutputSchema,
@@ -99,24 +138,45 @@ export {
   TERMINAL_WORKFLOW_STATUSES,
   RESUMABLE_WORKFLOW_STATUSES,
   isApprovalContext,
+  isRunBlockedOnChild,
+  suspendReasonSchema,
+  isRecognizedSuspendReason,
+  reRunsOwnNodeOnResume,
+  SUBRUN_METADATA_KEYS,
+  readSubrunMetadata,
+  RUN_METADATA_KEYS,
+  readIdentityUnresolved,
+  WORKFLOW_SOURCE_METADATA_KEY,
+  workflowSourceMetadataSchema,
+  readWorkflowSourceMetadata,
+  readWorkflowSourceState,
 } from './workflow-run';
 export type {
   WorkflowRunStatus,
+  WorkflowRunOutcome,
   WorkflowStepStatus,
   NodeState,
   NodeOutput,
   WorkflowRun,
   ArtifactType,
   ApprovalContext,
+  SuspendReason,
+  LoopGateRunMetadata,
+  WorkflowSourceMetadata,
+  WorkflowSourceState,
 } from './workflow-run';
 
 // Per-node persisted provider sessions
 export { workflowNodeSessionSchema } from './workflow-node-session';
 export type { WorkflowNodeSession } from './workflow-node-session';
 
+// Private provider session handles scoped to one workflow run
+export { workflowRunNodeSessionSchema } from './workflow-run-node-session';
+export type { WorkflowRunNodeSession } from './workflow-run-node-session';
+
 // Node typed-output artifacts (output_type metadata)
-export { nodeArtifactSchema } from './node-artifact';
-export type { NodeArtifact } from './node-artifact';
+export { nodeArtifactSchema, nodeArtifactLoopFrameSchema } from './node-artifact';
+export type { NodeArtifact, NodeArtifactLoopFrame } from './node-artifact';
 
 // Result types (non-schema hand-written types)
 export type {
@@ -126,6 +186,7 @@ export type {
   WorkflowLoadResult,
   WorkflowSource,
   WorkflowWithSource,
+  DeclaredWorkflowConfig,
 } from './workflow';
 
 // DagWorkflow — alias kept for backward compatibility

@@ -46,7 +46,7 @@ import { BUNDLED_IS_BINARY, BUNDLED_VERSION } from './bundled-build';
 import { createLogger } from './logger';
 
 /** Bumped when the captured property set changes (documented in README). */
-export const TELEMETRY_SCHEMA_VERSION = 4;
+export const TELEMETRY_SCHEMA_VERSION = 6;
 
 // Minimal shape of posthog-node's `fetch` option — copied from @posthog/core
 // (a transitive dep) to avoid pulling it in as a direct dependency.
@@ -180,7 +180,7 @@ export function classifyWorkflowForTelemetry(
  * Model ids are user-supplied (forwarded verbatim from workflow/`config.yaml`
  * YAML), so unlike `provider` they're not structurally categorical. Forward a
  * value only when it looks like a real model ref (alphanumerics plus `/._:-`,
- * bounded length — covers `sonnet`, `gpt-5.3-codex`, `anthropic/claude-haiku-4-5`,
+ * bounded length — covers `sonnet`, `gpt-5.6-sol`, `anthropic/claude-haiku-4-5`,
  * `openrouter/qwen/qwen3-coder`). Anything else is dropped so a stray free-text
  * value can't slip through the "categorical only" telemetry contract.
  *
@@ -520,6 +520,7 @@ export interface WorkflowInvokedProperties {
   model?: string;
   nodeCount?: number;
   usesLoop?: boolean;
+  usesLoopGroup?: boolean;
   usesApproval?: boolean;
   usesScript?: boolean;
   usesBash?: boolean;
@@ -585,7 +586,13 @@ export interface ChatTurnProperties {
 }
 
 /** Categorical terminal exit reason — a fixed enum, never raw error text. */
-export type WorkflowExitReason = 'no_nodes_completed' | 'node_error' | 'unhandled_error';
+export type WorkflowExitReason =
+  | 'no_nodes_completed'
+  | 'node_error'
+  | 'unhandled_error'
+  // Evidence gate (#2230): all nodes succeeded but `evidence_policy.required`
+  // found no `$ARTIFACTS_DIR/evidence.json`, so the run was marked failed.
+  | 'evidence_missing';
 
 /**
  * Categorical failure class derived from the engine's error classifier
@@ -602,6 +609,7 @@ export type WorkflowNodeType =
   | 'bash'
   | 'script'
   | 'loop'
+  | 'loop_group'
   | 'approval'
   | 'cancel';
 
@@ -628,10 +636,20 @@ export interface WorkflowCompletedProperties {
   failedNodeType?: WorkflowNodeType;
   /** Aggregate provider-reported cost (USD) for the run. Numeric total only. */
   costUsd?: number;
-  /** Aggregate provider-reported input tokens for the run. */
+  /** Aggregate provider-reported gross input tokens for the run. */
   tokensIn?: number;
   /** Aggregate provider-reported output tokens for the run. */
   tokensOut?: number;
+  /** Aggregate cache-read input tokens; absent when no contribution reported the axis. */
+  cacheReadTokens?: number;
+  /** Aggregate cache-write input tokens; absent when no contribution reported the axis. */
+  cacheWriteTokens?: number;
+  /**
+   * True when the two cache totals above are a FLOOR because at least one contributing
+   * node did not report that axis. Without it a narrowed total would be indistinguishable
+   * from a complete one and would bias aggregate cache figures low (#2662).
+   */
+  cachePartialTokens?: true;
   /** Total loop iterations across all loop nodes in the run. */
   loopIterations?: number;
 }
@@ -676,6 +694,7 @@ export function captureWorkflowInvoked(props: WorkflowInvokedProperties): void {
         ...(model ? { model } : {}),
         ...(props.nodeCount !== undefined ? { node_count: props.nodeCount } : {}),
         uses_loop: Boolean(props.usesLoop),
+        uses_loop_group: Boolean(props.usesLoopGroup),
         uses_approval: Boolean(props.usesApproval),
         uses_script: Boolean(props.usesScript),
         uses_bash: Boolean(props.usesBash),
@@ -871,6 +890,13 @@ export function captureWorkflowCompleted(props: WorkflowCompletedProperties): vo
         ...(props.costUsd !== undefined ? { cost_usd: props.costUsd } : {}),
         ...(props.tokensIn !== undefined ? { tokens_in: props.tokensIn } : {}),
         ...(props.tokensOut !== undefined ? { tokens_out: props.tokensOut } : {}),
+        ...(props.cacheReadTokens !== undefined
+          ? { cache_read_tokens: props.cacheReadTokens }
+          : {}),
+        ...(props.cacheWriteTokens !== undefined
+          ? { cache_write_tokens: props.cacheWriteTokens }
+          : {}),
+        ...(props.cachePartialTokens ? { cache_partial: true } : {}),
         ...(props.loopIterations !== undefined ? { loop_iterations: props.loopIterations } : {}),
       },
     });

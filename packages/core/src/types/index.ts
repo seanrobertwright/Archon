@@ -54,6 +54,16 @@ export interface HandleMessageContext {
    * own auth flows are wired.
    */
   readonly userId?: string;
+  /**
+   * Declared workflow inputs supplied by the caller (#2554), keyed by input name.
+   *
+   * Set ONLY by the `POST /api/workflows/:name/run` route, whose body carries an
+   * `inputs` map. It rides the context rather than the message text so a supplied value
+   * is never confused with `$ARGUMENTS`, and so chat platforms — which have no channel
+   * for it and never populate this field — keep their existing behaviour unchanged
+   * (#2555 tracks giving them one).
+   */
+  readonly workflowInputs?: Readonly<Record<string, string>>;
 }
 
 export interface CommandResult {
@@ -67,6 +77,15 @@ export interface CommandResult {
     force?: boolean;
     resumeRunId?: string;
     resumeRun?: WorkflowRun;
+    /**
+     * The continuation graph already resolved from that run's recorded source.
+     *
+     * Carried so dispatch does not repeat the digest verification and discovery the
+     * handler just paid for. A value, not a flag: it cannot claim work it did not do.
+     */
+    resolvedContinuation?: WorkflowDefinition;
+    /** Keys the engine dropped from this workflow's YAML (#2213). */
+    parseWarnings?: readonly string[];
   };
 }
 

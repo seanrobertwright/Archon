@@ -7,7 +7,7 @@ import { ApprovalPanel } from './ApprovalPanel';
 import { ApprovalContext } from './ApprovalContext';
 import type { Run } from '../primitives/run';
 import { shortRunId, formatElapsed, elapsedSince, formatCost } from '../lib/format';
-import { useIsDocker, openInIde } from '../lib/health';
+import { useIsDocker, useIdeEnv, openInIde } from '../lib/health';
 import { statusTextClass, statusLabel } from '../lib/run-status';
 
 /** Present + non-empty — narrows `string | null | undefined` to `string`. */
@@ -48,6 +48,7 @@ export function ActiveRunCard({
 }: ActiveRunCardProps): ReactElement {
   const navigate = useNavigate();
   const isDocker = useIsDocker();
+  const ideEnv = useIdeEnv();
   const elapsed = formatElapsed(elapsedSince(run.startedAt));
   const canOpen = run.projectId !== null && !run.id.startsWith('demo-');
   const canOpenIde =
@@ -129,7 +130,7 @@ export function ActiveRunCard({
                 type="button"
                 onClick={e => {
                   e.stopPropagation();
-                  if (run.workingPath !== null) openInIde(run.workingPath);
+                  if (run.workingPath !== null) openInIde(run.workingPath, ideEnv);
                 }}
                 title={`Open ${run.workingPath} in IDE`}
                 aria-label="Open in IDE"
@@ -193,6 +194,22 @@ export function ActiveRunCard({
               <ApprovalPanel run={run} />
             </>
           )
+        ) : null}
+
+        {/* Resolved gate awaiting auto-resume — the run is still 'paused' in the
+            DB for the second or so between approve/reject and the executor
+            flipping it to running. Show a hint instead of stale gate buttons. */}
+        {run.status === 'paused' && run.gateResolved !== null && run.gateResolved !== undefined ? (
+          <div className="mt-2 flex items-center gap-2 rounded border border-border bg-surface-hover/40 px-3 py-2 text-[12px] text-text-secondary">
+            <span aria-hidden className="inline-block animate-pulse leading-none">
+              ▸
+            </span>
+            <span>
+              {run.gateResolved === 'approved'
+                ? 'Approved — resuming…'
+                : 'Rejected — running on-reject rework…'}
+            </span>
+          </div>
         ) : null}
       </div>
     </article>

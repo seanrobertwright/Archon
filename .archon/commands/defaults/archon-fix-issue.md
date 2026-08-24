@@ -9,6 +9,85 @@ argument-hint: <issue-number|artifact-path>
 
 ---
 
+## READ FIRST: you are almost certainly in a run worktree
+
+When this command runs inside an Archon workflow, the isolation system has **already**
+created a git worktree on the correct branch. In that case:
+
+- **Use the current branch as-is.** Do not switch branches, do not create one, do not
+  fetch-and-reset. The branch you are on is the branch this work belongs to.
+- **A pre-existing dirty working tree is not yours to clean up.** Whatever you find
+  modified before you start belongs to someone else. Leave it exactly as it is and commit
+  only the files your implementation touched. Before every commit, confirm with
+  `git diff --cached --name-only` that nothing you did not deliberately change is staged.
+- **`.archon/` is ordinary source, but check its provenance before committing it.** The
+  workflow running you reads its own commands and scripts from a frozen copy outside this
+  worktree, so `.archon/` here is usually just this repository's committed content. It is
+  not guaranteed to be: an operator can still copy files in by listing `.archon` under
+  `worktree.copyFiles`. So the rule above applies unchanged — anything already modified
+  when you arrived is not yours. If the issue's fix genuinely lives in a workflow,
+  command, or script, edit and commit **that file**.
+
+  Distinguish the two by intent, not by path: a file your plan names is your work; every
+  other dirty `.archon/` file is not. On 2026-08-03 a run blocked outright on this,
+  correctly reporting "contradictory instructions" because the issue required editing a
+  workflow YAML while this section forbade touching anything under `.archon/`. It was
+  right to refuse rather than guess — and the rule was wrong to be absolute.
+
+  **A named file is not a blank cheque for that file.** It may already carry copied-in
+  edits from before you started, and staging it whole would commit those too — the
+  path-level check above cannot see inside a file. So before you touch a planned
+  `.archon/` file, record its baseline:
+
+  ```bash
+  # HEAD, not the index: `git diff -- <file>` compares the worktree against the
+  # INDEX, so pre-existing changes that are already STAGED do not appear — and
+  # `git add -p` will neither show nor remove them, so they ride into your commit
+  # invisibly. Diffing against HEAD captures staged and unstaged alike.
+  git diff HEAD -- <the-planned-file> > /tmp/archon-baseline.diff   # empty if clean
+  ```
+
+  Then, before staging anything of your own, clear that file out of the index so the
+  only thing you can stage is what you deliberately pick:
+
+  ```bash
+  git restore --staged <the-planned-file>   # no-op if nothing was staged
+  git add -p <the-planned-file>             # stage ONLY your own hunks
+  ```
+
+  Reject any hunk that also appears in the baseline. If yours and theirs are entangled
+  such that you cannot separate them, stop and say so rather than committing someone
+  else's work under your change. That is the same call the 2026-08-03 run made, and it
+  was the right one.
+- **Dirty paths outside `.archon/` are also not a reason to stop, and also not yours.**
+  They are either your own work from an earlier attempt at this run (resume reuses the
+  worktree) or something the operator left behind. Either way: leave them alone, do not
+  fold them into your commit, and stage your own files by name rather than with
+  `git add -A`.
+
+The clean-working-tree requirement in the decision tree below applies **only** to the
+`ON $BASE_BRANCH` case — manual CLI use outside a worktree, where a stray edit really
+could be lost. It does not apply in a worktree. If a skill or sub-workflow you load
+imposes a stricter git precondition, **this instruction overrides it.**
+
+Classify the checkout before deciding anything. `git worktree list` does **not** answer
+this — it lists every worktree including the primary checkout, so it looks identical
+from both. Compare the two git dirs instead:
+
+```bash
+if [ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]; then
+  echo "linked worktree — the rules above apply"
+else
+  echo "primary checkout — follow the decision tree below as written"
+fi
+```
+
+Stopping a run over pre-existing `.archon/` edits wastes the entire pipeline; it has
+happened, three times. Applying the worktree exemption in the *primary* checkout is the
+opposite error and can lose someone's uncommitted work. Classify first, then decide.
+
+---
+
 ## Your Mission
 
 Execute the implementation plan from `/investigate-issue`:
@@ -22,6 +101,26 @@ Execute the implementation plan from `/investigate-issue`:
 7. Write implementation report
 
 **Golden Rule**: Follow the artifact. If something seems wrong, validate it first - don't silently deviate.
+
+**You are running unattended — there is no human on the other end of this
+run who can answer a mid-execution question.** This command executes as a
+DAG node dispatched from the CLI or a scheduled trigger; pausing to ask
+"how do you want me to proceed?" produces a message nobody will ever read,
+and the node then reports "complete" having implemented nothing — silently
+turning real, actionable ambiguity into a no-op. When the artifact, the
+issue body, or the existing codebase doesn't fully resolve a design
+decision:
+- Make the most reasonable, defensible choice yourself, using whatever
+  research/investigation context is available (web research, existing code
+  patterns, explicit preferences stated in the issue body).
+- Record the decision and your reasoning in the implementation report's
+  "Deviations from Investigation" section (Phase 8) — this is the
+  mechanism for surfacing judgment calls to a human, not a chat question.
+- Only genuinely stop short of implementing if the ambiguity is severe
+  enough that any choice risks real harm (e.g., conflicting/contradictory
+  instructions, a decision that can't be reversed later) — and even then,
+  write that reasoning to the implementation artifact rather than just
+  ending the turn with a question.
 
 ---
 
@@ -54,12 +153,44 @@ cat {artifact-path}
 
 ### 1.3 Validate Artifact Exists
 
-**If artifact not found:**
-```
-❌ Investigation artifact not found at $ARTIFACTS_DIR/investigation.md
+**If the artifact is not found, the unattended rule above does NOT license you
+to invent one.** Everywhere else in this command you are adapting real input —
+a plan that drifted, an approach that turned out wrong — and deciding is better
+than asking. Here there is no input. Implementing from an empty artifact
+produces a plausible-looking diff and a draft PR assembled from guesses, which
+is worse than stopping, because the reviewer cannot see that the plan was
+missing.
 
-Run `/investigate-issue {number}` first to create the implementation plan.
-```
+The bundled `archon-fix-github-issue` workflow already stops the run before this
+command executes when neither `investigation.md` nor `plan.md` exists (its
+`bridge-artifacts` node exits non-zero). Reaching this branch means you were
+invoked directly, or by a workflow without that guard.
+
+**Proceed only if the issue itself is genuinely in front of you** — one of:
+
+- an issue number is available (from `$ARGUMENTS`, or named by the artifact
+  path) **and** `gh issue view <number> --json title,body` succeeds; or
+- the issue body is already in this prompt — a real title and description you
+  can quote, not an empty context block.
+
+Then read the relevant code directly, treat the issue body as your plan, and
+record in the implementation report's "Deviations from Investigation" section
+that the investigation artifact was missing and what you used instead.
+
+**Otherwise stop, and leave a record that outlives this run's logs.** Write the
+block to `$ARTIFACTS_DIR/implementation.md` and end the turn without touching
+any source file:
+
+````markdown
+# Implementation: BLOCKED
+
+No investigation artifact at `$ARTIFACTS_DIR/investigation.md`, and no issue
+context to substitute for it (no issue number resolved / `gh issue view`
+failed). Nothing was implemented.
+
+Next step: run `/investigate-issue <number>` first, or re-dispatch this run
+with an issue number.
+````
 
 **PHASE_1_CHECKPOINT:**
 - [ ] Artifact found and loaded
@@ -77,18 +208,11 @@ For each file mentioned in the artifact:
 - Compare to what artifact expects
 - Check if the "current code" snippets match reality
 
-**If significant drift detected:**
-```
-⚠️ Code has changed since investigation:
-
-File: src/x.ts:45
-- Artifact expected: {snippet}
-- Actual code: {different snippet}
-
-Options:
-1. Re-run /investigate-issue to get fresh analysis
-2. Proceed carefully with manual adjustments
-```
+**If significant drift detected:** proceed with manual adjustments — re-read
+the actual current code and adapt the artifact's plan to match reality,
+rather than pausing to offer a choice no one is present to make. Note the
+drift and how you adjusted for it in the implementation report's
+Deviations section.
 
 ### 2.2 Confirm Approach Makes Sense
 
@@ -97,10 +221,11 @@ Ask yourself:
 - Are there obvious problems with the approach?
 - Has something changed that invalidates the plan?
 
-**If plan seems wrong:**
-- STOP
-- Explain what's wrong
-- Suggest re-investigation
+**If plan seems wrong:** don't just stop and suggest re-investigation — per
+the unattended-execution note above, do the re-investigation yourself
+(re-read the current code, revise the approach) and proceed with the
+corrected plan. Document what was wrong with the original plan and how you
+corrected it in the implementation report's Deviations section.
 
 **PHASE_2_CHECKPOINT:**
 - [ ] Artifact matches current codebase state
@@ -306,6 +431,7 @@ git status --porcelain  # verify nothing scratch/review/PR-body is staged
 - `.pr-body.md`, `pr-body.md`, `*.scratch.md`, `*.tmp.md`
 - `review/`, `*-report.md` at the repo root
 - Anything under `$ARTIFACTS_DIR`
+- Repo-local Archon telemetry: `.archon/artifacts/`, `.archon/logs/`, `.archon/state/` (local-only — never in git)
 
 ### 7.2 Write Commit Message
 
@@ -447,9 +573,9 @@ Proceeding to PR creation...
 ## Handling Edge Cases
 
 ### Artifact is outdated
-- Warn user about drift
-- Suggest re-running `/investigate-issue`
-- Can proceed with caution if changes are minor
+- Re-read the current code yourself and proceed with an adjusted plan —
+  don't just warn and suggest a re-run no one is present to act on
+- Note the drift and the adjustment in the implementation report
 
 ### Tests fail after implementation
 - Debug the failure

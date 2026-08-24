@@ -33,18 +33,21 @@ archon workflow run archon-assist "Investigate the flaky test" --detach
 | `--branch <name>` / `-b` | Branch name for worktree. Reuses existing worktree if healthy |
 | `--from <name>` / `--from-branch <name>` | Start-point branch for new worktree (default: repo default branch) |
 | `--no-worktree` | Skip isolation — run in the live checkout |
-| `--resume` | Resume the last failed run of this workflow at this cwd (skips completed nodes) |
+| `--resume` | Resume the most recent failed or paused run of this workflow at this cwd (skips completed nodes) |
 | `--detach` | Run in a detached background child and return immediately (find the run via `workflow runs`). Pair with `--json` for a structured ack. Child output goes to `~/.archon/logs/`. In the web console the run appears in the Workflow dock (listed by project) but may not update **live** until a refetch — it runs out-of-process and doesn't stream to the console's live event feed. |
+| `--folder` | Register the current NON-git directory as a **folder project** and run in place (no worktree). For multi-repo roots and plain ops folders. Incompatible with `--branch`/`--from`; workflows pinned `worktree.enabled: true` are rejected on folder projects |
 | `--cwd <path>` | Working directory override |
+| `--verbose` / `-v` | Debug logs + tool-level workflow progress events on stderr |
 
 **Flag conflicts** (errors):
 - `--branch` + `--no-worktree`
 - `--from` + `--no-worktree`
 - `--resume` + `--branch`
+- `--branch`/`--from` on a folder project
 
-**Default behavior** (no flags): Auto-creates a worktree with branch name `{workflow-name}-{timestamp}`.
+**Default behavior** (no flags): Starts a fresh workflow run and auto-creates a worktree with branch name `{workflow-name}-{timestamp}`.
 
-**Auto-resume without `--resume`**: If a prior invocation of the same workflow at the same cwd failed, the next invocation automatically skips completed nodes. `--resume` is only needed when you want to force resume a specific failed run or to reuse the worktree from that run.
+**Explicit resume**: `archon workflow run <name> --resume` resumes the most recent failed or paused run for that workflow at the invocation cwd. To target a known run and reuse its recorded working path/worktree, use `archon workflow resume <run-id>`. A bare `archon workflow run <name>` never resumes a prior run.
 
 ### `archon workflow status`
 
@@ -112,22 +115,37 @@ archon workflow reject abc123 "Plan misses test coverage"
 
 ### `archon workflow abandon <run-id> [--json]`
 
-Mark a non-terminal workflow run as cancelled. Use when a `running` row is stuck after a server crash or when you want to discard a paused run without rejecting. This does NOT kill an in-flight subprocess — it only transitions the DB row.
+Mark a non-terminal workflow run as cancelled. Use when you want to discard a paused
+run without rejecting, or after independently verifying that a `running` row was
+orphaned by a crash. This does NOT kill an in-flight subprocess — it only transitions
+the DB row.
 
 ```bash
 archon workflow abandon abc123
 archon workflow abandon abc123 --json   # { "ok": true, "runId": "abc123", "action": "abandon", "status": "cancelled", ... }
 ```
 
-> **There is no `archon workflow cancel` CLI subcommand.** To actively cancel a running workflow (terminate its subprocess), use the chat slash command `/workflow cancel <run-id>` on the platform that started it (Web UI, Slack, Telegram, etc.), or the Cancel button on the Web UI dashboard. The CLI only offers `abandon`, which is the right tool for orphan cleanup but does not interrupt a live subprocess.
+### `archon workflow cancel <run-id> [--json]`
 
-### `archon workflow resume <run-id> [message] [--json]`
+Actively stop a running workflow started with CLI `--detach`. Archon contacts the live
+owner for that exact run, terminates its process tree, confirms that it stopped, and
+only then marks the run `cancelled`.
 
-Explicitly re-run a failed run. Most workflows auto-resume without this — use it when you want to force a specific run ID. (`--json` validates that the run is resumable and returns `executed: false` WITHOUT running — see the note under `approve`; to actually execute, use the blocking form as a background task.)
+```bash
+archon workflow cancel abc123
+archon workflow cancel abc123 --json
+```
+
+If Archon cannot reach the detached owner or cannot confirm process-tree termination,
+the command fails and leaves the database row unchanged. Verify an orphan separately
+before using the state-only `workflow abandon` command.
+
+### `archon workflow resume <run-id> [--json]`
+
+Explicitly re-run a specific failed or paused run, reusing its recorded working path/worktree and skipping completed nodes. This differs from `workflow run <name> --resume`, which selects the most recent resumable run by workflow name and invocation cwd. (`--json` validates that the run is resumable and returns `executed: false` WITHOUT running — see the note under `approve`; to actually execute, use the blocking form as a background task.)
 
 ```bash
 archon workflow resume abc123
-archon workflow resume abc123 "continue with the plan"
 ```
 
 ### `archon workflow cleanup [days]`
@@ -139,12 +157,23 @@ archon workflow cleanup             # Default: 7 days
 archon workflow cleanup 30          # Custom: 30 days
 ```
 
-### `archon workflow event emit --run-id <uuid> --type <event-type> [--data <json>]`
+### `archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]`
 
-Emit a workflow event to a running workflow. Used inside loop prompts to signal state (e.g. "checkpoint written") for observability. Rarely invoked from the shell directly.
+Clear persisted per-node AI sessions (`persist_session` cross-run memory) for a workflow. Without `--scope`, wipes EVERY scope and requires `--yes`. `--node` narrows to one node's session.
 
 ```bash
-archon workflow event emit --run-id abc123 --type checkpoint --data '{"step":"plan"}'
+archon workflow reset-sessions standup-report --scope <conversation-id>
+archon workflow reset-sessions standup-report --node report --yes    # all scopes, one node
+```
+
+Chat equivalent: `/workflow reset-sessions <name> [<node-id>]` (auto-scoped to the current conversation).
+
+### `archon workflow event emit --run-id <uuid> --type <event-type> [--data <json>]`
+
+Emit a workflow event into the run's audit log (`workflow_events`). **Write-only observability** — it does NOT steer the run: loop completion is decided solely by the loop's own declared completion channels, never by emitted events. Used inside loop prompts to record progress markers (e.g. "checkpoint written").
+
+```bash
+archon workflow event emit --run-id abc123 --type task_activity --data '{"step":"plan"}'
 ```
 
 ### `archon continue <branch> [flags] [message]`
@@ -239,6 +268,15 @@ archon version
 #   Platform: darwin-arm64
 #   Build: source (bun)
 #   Database: sqlite
+```
+
+### `archon doctor`
+
+Verify the Archon setup: Claude binary resolution, Codex binary resolution (when Codex is configured or an OpenAI credential is connected), Pi auth, `gh` auth, OpenCode runtime SDK presence (with `--full`, or when OpenCode is the configured assistant), database connectivity, connected providers, workspace writability, bundled defaults, and adapter configuration (Slack/Telegram). Run this first when workflows fail with environment-shaped errors (binary not found, auth failures).
+
+```bash
+archon doctor
+archon doctor --full   # also probe the OpenCode runtime SDK (module presence only — never boots the runtime)
 ```
 
 ### `archon setup [--spawn]`

@@ -15,6 +15,8 @@ import {
   toBranchName,
   isAncestorOf,
   verifyWorktreeOwnership,
+  CanonicalRepoPathUnavailableError,
+  toRepoPath,
 } from '@archon/git';
 import type { RepoPath, BranchName, WorktreePath } from '@archon/git';
 
@@ -30,6 +32,7 @@ import type {
 } from './types';
 import type { IIsolationStore } from './store';
 import { classifyIsolationError, isKnownIsolationError } from './errors';
+import { resolveFolderBackend } from './backend-router';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -101,12 +104,38 @@ export class IsolationResolver {
       return { status: 'none', cwd: '/workspace' };
     }
 
+    // 2b. Folder projects run through the folder-backend seam — no worktree.
+    // The in-place backend (Phase A default) returns the REAL folder path (not
+    // the '/workspace' docker sentinel), so chat/workflows land in the actual
+    // project directory — byte-identical to the pre-seam early-return. Container
+    // selection is a Phase B config concern; the chat path stays in-place for now.
+    //
+    // NOTE (Phase A): only `prepared.cwd` is propagated. `prepared.execContext`
+    // is intentionally DROPPED here because the `IsolationResolution` 'none'
+    // variant carries no execution-context field, so chat/orchestrator callers
+    // (which consume this result) have no channel for it — they run host-only in
+    // Phase A. Phase B, when it wires containerized CHAT, must extend the 'none'
+    // variant with an `execContext` and thread it through the orchestrator; until
+    // then only the CLI workflow path carries execContext (from the backend it
+    // resolves directly).
+    if (request.codebase.kind === 'folder') {
+      const folderCodebase = {
+        id: request.codebase.id,
+        defaultCwd: request.codebase.defaultCwd,
+        name: request.codebase.name,
+        kind: 'folder' as const,
+      };
+      const backend = resolveFolderBackend(folderCodebase, { container: false });
+      const prepared = await backend.prepare({ codebase: folderCodebase });
+      return { status: 'none', cwd: prepared.cwd };
+    }
+
     const codebase = request.codebase;
     const hints = request.hints;
     const workflowType: IsolationWorkflowType = hints?.workflowType ?? 'thread';
     const workflowId = hints?.workflowId ?? '';
 
-    // Compute canonical repo path once — paths 3-6 all need it either for
+    // Compute the Git command anchor once — paths 3-6 all need it either for
     // ownership verification (cross-clone guard) or for worktree creation.
     // Mirror createNewEnvironment's contract: known infrastructure failures
     // (permission denied, ENOENT, malformed worktree pointer, etc.) become
@@ -117,29 +146,37 @@ export class IsolationResolver {
     try {
       canonicalPath = await getCanonicalRepoPath(codebase.defaultCwd);
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      getLog().error(
-        {
-          err,
-          errorType: err.constructor.name,
-          codebaseId: codebase.id,
-          defaultCwd: codebase.defaultCwd,
-        },
-        'isolation.canonical_repo_path_resolution_failed'
-      );
+      // A registered checkout backed by `--separate-git-dir` is already the
+      // authoritative path, but Git has no reverse pointer from its linked
+      // worktree metadata to a primary checkout. Git worktree operations are
+      // valid from that registered linked checkout, so retain it as the anchor.
+      if (error instanceof CanonicalRepoPathUnavailableError) {
+        canonicalPath = toRepoPath(codebase.defaultCwd);
+      } else {
+        const err = error instanceof Error ? error : new Error(String(error));
+        getLog().error(
+          {
+            err,
+            errorType: err.constructor.name,
+            codebaseId: codebase.id,
+            defaultCwd: codebase.defaultCwd,
+          },
+          'isolation.canonical_repo_path_resolution_failed'
+        );
 
-      if (!isKnownIsolationError(err)) {
-        throw err;
+        if (!isKnownIsolationError(err)) {
+          throw err;
+        }
+
+        const userMessage = classifyIsolationError(err);
+        return {
+          status: 'blocked',
+          reason: 'creation_failed',
+          userMessage:
+            userMessage +
+            ' Execution blocked to prevent changes to shared codebase. Please resolve the issue and try again.',
+        };
       }
-
-      const userMessage = classifyIsolationError(err);
-      return {
-        status: 'blocked',
-        reason: 'creation_failed',
-        userMessage:
-          userMessage +
-          ' Execution blocked to prevent changes to shared codebase. Please resolve the issue and try again.',
-      };
     }
 
     // 3. Check for existing environment with same workflow
@@ -445,6 +482,7 @@ export class IsolationResolver {
       codebaseId: codebase.id,
       codebaseName: codebase.name,
       canonicalRepoPath: canonicalPath,
+      baseBranch: codebase.defaultBranch ?? undefined,
       identifier: workflowId,
       gitIdentity,
     };

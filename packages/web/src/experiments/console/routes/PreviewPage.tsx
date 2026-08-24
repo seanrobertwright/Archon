@@ -19,6 +19,7 @@ const baseRun: Omit<Run, 'id' | 'workflow' | 'status'> = {
   costUsd: null,
   conversationId: null,
   conversationPlatformId: null,
+  workerPlatformId: null,
   origin: 'cli',
   startedAt: new Date(Date.now() - 4 * 60 * 1000 - 12 * 1000).toISOString(),
   finishedAt: null,
@@ -45,6 +46,9 @@ const SAMPLE_RUNS: Run[] = [
     approval: {
       nodeId: 'implement/verify',
       message: 'Approve running bun validate?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
     },
   },
   {

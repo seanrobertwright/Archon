@@ -5,34 +5,224 @@
  * Full integration tests would require mocking the database and commands.
  */
 import { describe, it, expect } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { parseArgs } from 'util';
+import { cliArgOptions } from './args';
 import * as git from '@archon/git';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const CLI_ENTRY = join(import.meta.dir, 'cli.ts');
+
+describe('CLI help output', () => {
+  it('lists the workflow resume command', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      'workflow resume <run-id>   Resume a failed or paused run from completed nodes'
+    );
+  });
+
+  it('distinguishes active cancel from state-only abandon', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      'workflow cancel <run-id>   Stop a running workflow started with --detach'
+    );
+    expect(result.stdout).toContain(
+      'workflow abandon <run-id>  Mark a run cancelled without stopping host work'
+    );
+  });
+
+  it('documents workflow dry-run flags', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('--dry-run');
+    expect(result.stdout).toContain('--stubs <path>');
+    expect(result.stdout).toContain('--stubs-init <path>');
+    expect(result.stdout).toContain('--default-stubs');
+    expect(result.stdout).toContain('--exec-code');
+    expect(result.stdout).toContain('--pause-at-gates');
+  });
+});
+
+describe('unknown flag rejection (#2769)', () => {
+  it('exits non-zero naming the mistyped flag before any command runs', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'run', 'assist', '--dryrun', '--stubs', 'x.yaml'],
+      { encoding: 'utf8' }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--dryrun');
+  });
+
+  it('still accepts a valid workflow dry-run invocation', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'run', 'definitely-not-a-workflow', '--dry-run'],
+      { encoding: 'utf8', cwd: join(import.meta.dir, '../../../') }
+    );
+
+    // Fails on the unknown workflow name (after parsing), not on the flag.
+    expect(result.stderr).not.toContain('Error parsing arguments');
+  });
+});
+
+describe('workflow status arguments', () => {
+  it('rejects a run id and points to workflow get', () => {
+    const result = spawnSync(
+      process.execPath,
+      [join(import.meta.dir, 'cli.ts'), 'workflow', 'status', 'abc123'],
+      { encoding: 'utf8' }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      'Usage: archon workflow status [--json] [--verbose] [--events]'
+    );
+    expect(result.stderr).toContain('archon workflow get <run-id>');
+    expect(result.stdout).toBe('');
+  });
+});
+
+describe('workflow get arguments', () => {
+  it('rejects extra positional arguments', () => {
+    const result = spawnSync(
+      process.execPath,
+      [join(import.meta.dir, 'cli.ts'), 'workflow', 'get', 'abc123', 'accidental-extra'],
+      { encoding: 'utf8' }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      'Usage: archon workflow get <run-id> [--json] [--verbose] [--events]'
+    );
+    expect(result.stdout).toBe('');
+  });
+});
+
+describe('CLI workflow event dispatch', () => {
+  it('resolves a run prefix using the registered effective cwd', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'archon-cli-event-'));
+    const archonHome = join(scratch, 'home');
+    const repoDir = join(scratch, 'repo');
+    mkdirSync(archonHome, { recursive: true });
+    mkdirSync(repoDir, { recursive: true });
+
+    try {
+      expect(spawnSync('git', ['init', '-q', '.'], { cwd: repoDir }).status).toBe(0);
+      const repoRoot = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: repoDir,
+        encoding: 'utf8',
+      });
+      expect(repoRoot.status).toBe(0);
+
+      const env = {
+        ...process.env,
+        ARCHON_HOME: archonHome,
+        ARCHON_TELEMETRY_DISABLED: '1',
+      };
+      const initialize = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--cwd', repoDir],
+        { env, encoding: 'utf8' }
+      );
+      expect({ status: initialize.status, stderr: initialize.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+
+      const fullRunId = '0b1ee8da-1111-2222-3333-444455556666';
+      const database = new Database(join(archonHome, 'archon.db'));
+      try {
+        database.run(
+          'INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES (?, ?, ?)',
+          ['codebase-1', 'fixture', repoRoot.stdout.trim()]
+        );
+        database.run(
+          'INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, codebase_id) VALUES (?, ?, ?, ?)',
+          ['conversation-1', 'cli', 'cli-fixture', 'codebase-1']
+        );
+        database.run(
+          'INSERT INTO remote_agent_workflow_runs (id, conversation_id, codebase_id, workflow_name, user_message) VALUES (?, ?, ?, ?, ?)',
+          [fullRunId, 'conversation-1', 'codebase-1', 'fixture', 'test']
+        );
+      } finally {
+        database.close();
+      }
+
+      const emitted = spawnSync(
+        process.execPath,
+        [
+          CLI_ENTRY,
+          'workflow',
+          'event',
+          'emit',
+          '--run-id',
+          fullRunId.slice(0, 8),
+          '--type',
+          'workflow_started',
+          '--cwd',
+          repoDir,
+        ],
+        { env, encoding: 'utf8' }
+      );
+      expect({ status: emitted.status, stderr: emitted.stderr }).toEqual({ status: 0, stderr: '' });
+
+      const verify = new Database(join(archonHome, 'archon.db'), { readonly: true });
+      try {
+        const event = verify
+          .query<
+            { workflow_run_id: string; event_type: string },
+            []
+          >('SELECT workflow_run_id, event_type FROM remote_agent_workflow_events')
+          .get();
+        expect(event).toEqual({
+          workflow_run_id: fullRunId,
+          event_type: 'workflow_started',
+        });
+      } finally {
+        verify.close();
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
 
 // Test the argument parsing logic used in cli.ts
 describe('CLI argument parsing', () => {
-  // Mirror the actual parseArgs options from cli.ts
   const parseCliArgs = (
     args: string[]
   ): { values: Record<string, unknown>; positionals: string[] } => {
     return parseArgs({
       args,
-      options: {
-        cwd: { type: 'string', default: process.cwd() },
-        help: { type: 'boolean', short: 'h' },
-        branch: { type: 'string', short: 'b' },
-        from: { type: 'string' },
-        'from-branch': { type: 'string' },
-        'no-worktree': { type: 'boolean' },
-        spawn: { type: 'boolean' },
-        quiet: { type: 'boolean', short: 'q' },
-        verbose: { type: 'boolean', short: 'v' },
-        scope: { type: 'string' },
-        force: { type: 'boolean' },
-      },
+      options: cliArgOptions,
       allowPositionals: true,
-      strict: false,
+      strict: true,
     });
   };
+
+  describe('isolation cleanup flags', () => {
+    it('parses --merged and --include-closed in strict mode', () => {
+      const { values } = parseCliArgs(['isolation', 'cleanup', '--merged', '--include-closed']);
+      expect(values.merged).toBe(true);
+      expect(values['include-closed']).toBe(true);
+    });
+  });
 
   describe('--cwd flag', () => {
     it('should parse --cwd with path', () => {
@@ -151,6 +341,34 @@ describe('CLI argument parsing', () => {
       expect(result.values.from).toBe('feature/primary');
       expect(result.values['from-branch']).toBe('feature/secondary');
     });
+
+    it('should parse --base flag for workflow run', () => {
+      const result = parseCliArgs(['workflow', 'run', 'assist', '--base', 'epic/foo']);
+      expect(result.values.base).toBe('epic/foo');
+    });
+
+    it('parses workflow dry-run flags', () => {
+      const result = parseCliArgs([
+        'workflow',
+        'run',
+        'assist',
+        '--dry-run',
+        '--stubs',
+        'fixtures.yaml',
+        '--stubs-init',
+        'generated.yaml',
+        '--default-stubs',
+        '--exec-code',
+        '--pause-at-gates',
+      ]);
+
+      expect(result.values['dry-run']).toBe(true);
+      expect(result.values.stubs).toBe('fixtures.yaml');
+      expect(result.values['stubs-init']).toBe('generated.yaml');
+      expect(result.values['default-stubs']).toBe(true);
+      expect(result.values['exec-code']).toBe(true);
+      expect(result.values['pause-at-gates']).toBe(true);
+    });
   });
 
   describe('version flag detection', () => {
@@ -205,18 +423,13 @@ describe('CLI argument parsing', () => {
     });
   });
 
-  describe('unknown flags with strict: false', () => {
-    it('should pass through unknown flags', () => {
-      const result = parseCliArgs(['--unknown', 'workflow', 'list']);
-      // Unknown flag is ignored, positionals are preserved
-      expect(result.positionals).toEqual(['workflow', 'list']);
+  describe('unknown flags (#2769)', () => {
+    it('rejects an unknown flag instead of dropping it', () => {
+      expect(() => parseCliArgs(['--unknown', 'workflow', 'list'])).toThrow(/unknown option/i);
     });
 
-    it('should pass through typos like --cwdd', () => {
-      const result = parseCliArgs(['--cwdd', '/path', 'workflow', 'list']);
-      // Typo is ignored, --cwd defaults to process.cwd()
-      expect(result.values.cwd).toBe(process.cwd());
-      expect(result.positionals).toContain('/path'); // /path becomes positional
+    it('rejects a typoed flag like --cwdd', () => {
+      expect(() => parseCliArgs(['--cwdd', '/path', 'workflow', 'list'])).toThrow(/--cwdd/);
     });
   });
 
@@ -398,9 +611,11 @@ describe('CLI git repo check', () => {
     });
 
     it('should return null for system directories outside any git repo', async () => {
-      // /tmp is typically not inside a git repo
-      // Note: This test may need adjustment if /tmp happens to be inside a repo
-      const result = await git.findRepoRoot('/tmp');
+      // The OS temp dir is not inside a git repo on any supported platform.
+      // Hardcoding '/tmp' fails on Windows, where that path does not exist —
+      // this file was absent from the package test script until #2384, so the
+      // POSIX assumption never surfaced in CI.
+      const result = await git.findRepoRoot(tmpdir());
       expect(result).toBeNull();
     });
   });
@@ -412,7 +627,7 @@ describe('CLI git repo check', () => {
 
     it('should detect existing directories', () => {
       expect(existsSync(process.cwd())).toBe(true);
-      expect(existsSync('/tmp')).toBe(true);
+      expect(existsSync(tmpdir())).toBe(true);
     });
 
     it('should detect non-existent directories', () => {

@@ -7,6 +7,7 @@ import type { MessageChunk } from '@archon/providers/types';
 import { createLogger } from '@archon/paths';
 import { MessagePersistence } from './web/persistence';
 import { SSETransport, type SSEWriter } from './web/transport';
+import { truncateToolOutput } from './web/truncate';
 import { WorkflowEventBridge } from './web/workflow-bridge';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -73,11 +74,15 @@ export class WebAdapter implements IWebPlatformAdapter {
       return;
     }
 
+    // `category` rides the wire so the client segments messages from the same
+    // typed signal `MessagePersistence.appendText` uses (persistence.ts), rather
+    // than re-deriving it by pattern-matching the message text.
     const event = JSON.stringify({
       type: 'text',
       content: message,
       isComplete: true,
       timestamp: Date.now(),
+      ...(metadata?.category ? { category: metadata.category } : {}),
       ...(metadata?.workflowResult ? { workflowResult: metadata.workflowResult } : {}),
     });
 
@@ -188,11 +193,12 @@ export class WebAdapter implements IWebPlatformAdapter {
       } catch (e: unknown) {
         getLog().error({ conversationId, err: e }, 'tool_result_persist_failed');
       }
+      // Bound the SSE payload only — the DB write above keeps the full output
       event = JSON.stringify({
         type: 'tool_result',
         toolCallId: matchedToolCallId,
         name: chunk.toolName,
-        output: chunk.toolOutput,
+        output: truncateToolOutput(chunk.toolOutput),
         duration,
         timestamp: now,
       });

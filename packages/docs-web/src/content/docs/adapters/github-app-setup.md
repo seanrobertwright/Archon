@@ -176,7 +176,7 @@ Archon enforces this at startup: with App mode active and the server bound to a 
 
 Example Caddy snippet that drops `/internal/*` (bare-metal):
 
-```caddyfile
+```txt
 example.com {
   @internal path /internal/*
   respond @internal 404
@@ -203,7 +203,7 @@ The `!override` tag (compose-spec) replaces the base file's `ports` list instead
 
 Insert this `handle` block before the fallthrough `handle { }` block:
 
-```caddyfile
+```txt
 handle /internal/* {
   respond "Not Found" 404
 }
@@ -252,7 +252,7 @@ If the external POST probe returns anything other than `404` or `403` from the p
 2. Add `GITHUB_APP_*` env vars (Step 6).
 3. **Remove** `GITHUB_TOKEN` from your env (or comment it out). Archon refuses to start if both are set.
 4. Restart Archon.
-5. Webhook URLs configured per-repo against the PAT-mode setup can stay or be removed — the App's single webhook URL covers everything once it's installed. New repos auto-join via App installation.
+5. Webhook URLs configured per-repo against the PAT-mode setup can stay or be removed — the App's single webhook URL covers everything once it's installed. New repos auto-join via App installation. While both webhooks are active, a comment delivered by each is deduplicated at ingest, so the bot still responds once.
 
 ## Troubleshooting
 

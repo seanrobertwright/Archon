@@ -9,6 +9,10 @@ import type { MergedConfig } from '../config/config-types';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
 import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
+import {
+  listWorkflowRunNodeSessions,
+  upsertWorkflowRunNodeSession,
+} from '../db/workflow-run-node-sessions';
 import * as codebaseDb from '../db/codebases';
 import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
@@ -39,10 +43,26 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+// The supported OAuth deliveries use access/refresh tokens, while OpenAI also
+// writes its OIDC token. Other raw fields are public provider metadata.
+const OAUTH_SECRET_FIELDS = ['access', 'refresh', 'id_token'] as const;
+
+function collectOAuthCredentialValues(
+  rawCreds: Record<string, unknown>,
+  values: Set<string>
+): void {
+  for (const field of OAUTH_SECRET_FIELDS) {
+    const value = rawCreds[field];
+    if (typeof value === 'string' && value.length > 0) values.add(value);
+  }
+}
+
 export function createWorkflowStore(): IWorkflowStore {
   return {
     createWorkflowRun: workflowDb.createWorkflowRun,
     getWorkflowRun: workflowDb.getWorkflowRun,
+    findChildRuns: workflowDb.findChildRuns,
+    getRunAncestry: workflowDb.getRunAncestry,
     getActiveWorkflowRunByPath: workflowDb.getActiveWorkflowRunByPath,
     findResumableRun: workflowDb.findResumableRun,
     failOrphanedRuns: workflowDb.failOrphanedRuns,
@@ -57,6 +77,10 @@ export function createWorkflowStore(): IWorkflowStore {
     completeWorkflowRun: workflowDb.completeWorkflowRun,
     failWorkflowRun: workflowDb.failWorkflowRun,
     pauseWorkflowRun: workflowDb.pauseWorkflowRun,
+    rewriteApprovalContext: (id, approvalContext) =>
+      workflowDb.resolveApprovalGate(id, { approval: approvalContext }, []),
+    claimWriteback: workflowDb.claimWriteback,
+    releaseWritebackClaim: workflowDb.releaseWritebackClaim,
     cancelWorkflowRun: workflowDb.cancelWorkflowRun,
     createWorkflowEvent: async (data): Promise<void> => {
       try {
@@ -70,12 +94,14 @@ export function createWorkflowStore(): IWorkflowStore {
         );
       }
     },
-    getCompletedDagNodeOutputs: workflowEventDb.getCompletedDagNodeOutputs,
+    getDagResumeSnapshot: workflowEventDb.getDagResumeSnapshot,
     getCodebase: codebaseDb.getCodebase,
     getCodebaseEnvVars: envVarDb.getCodebaseEnvVars,
     getWorkflowNodeSession: workflowNodeSessionDb.getWorkflowNodeSession,
     upsertWorkflowNodeSession: workflowNodeSessionDb.upsertWorkflowNodeSession,
     deleteWorkflowNodeSessions: workflowNodeSessionDb.deleteWorkflowNodeSessions,
+    listWorkflowRunNodeSessions,
+    upsertWorkflowRunNodeSession,
   };
 }
 
@@ -137,9 +163,9 @@ export function createWorkflowDeps(): WorkflowDeps {
     },
     // Per-user AI-provider credentials (Phase 2): list the user's decrypted
     // credentials and translate each through the delivery map into an env bag
-    // (and optional file deliveries) for the run. Engine-facing contract is
-    // env+files only — the delivery map is owned here, not in @archon/workflows,
-    // so the workflow engine stays free of provider-specific knowledge.
+    // (and optional file deliveries) for the run. Exact decrypted values travel
+    // beside that bag only so the workflow subprocess boundary can scrub echoed
+    // file-delivered credentials without knowing provider-specific file shapes.
     isPerUserProviderKeysEnabled: () => isPerUserProviderKeysEnabled(),
     getUserProviderEnv: async (
       userId: string,
@@ -147,16 +173,24 @@ export function createWorkflowDeps(): WorkflowDeps {
     ): Promise<{
       env: Record<string, string>;
       files: { path: string; contents: string }[];
+      protectedValues: string[];
     }> => {
       try {
         const creds = await listDecryptedUserProviderCredentials(userId);
         const env: Record<string, string> = {};
         const files: { path: string; contents: string }[] = [];
+        const protectedValues = new Set<string>();
         for (const { provider, cred } of creds) {
           try {
             const result = deliverCredential(provider, cred, { artifactsDir });
             Object.assign(env, result.env);
             if (result.files) files.push(...result.files);
+            if (cred.kind === 'api_key') {
+              protectedValues.add(cred.apiKey);
+            } else {
+              protectedValues.add(cred.oauthApiKey);
+              collectOAuthCredentialValues(cred.rawCreds, protectedValues);
+            }
           } catch (err) {
             // Unknown provider / shape mismatch — log at ERROR (no per-credential
             // user-facing skip event yet) and skip this credential rather than
@@ -178,10 +212,10 @@ export function createWorkflowDeps(): WorkflowDeps {
             env[PI_AUTH_PATH_ENV] = piAuthPath;
           }
         }
-        return { env, files };
+        return { env, files, protectedValues: [...protectedValues] };
       } catch (err) {
         getLog().warn({ err: err as Error, userId }, 'workflow_deps.provider_creds_resolve_failed');
-        return { env: {}, files: [] };
+        return { env: {}, files: [], protectedValues: [] };
       }
     },
     // Per-user AI prefs (Phase 3): personal tiers/aliases/default-provider,

@@ -85,7 +85,9 @@ let userPrefsResult: Record<string, unknown> = {};
 const mockGetUserAiPrefs = mock(async (_userId: string) => userPrefsResult);
 const mockSetUserTiers = mock(async (_userId: string, _patch: unknown) => {});
 const mockSetUserAliases = mock(async (_userId: string, _patch: unknown) => {});
-const mockSetUserDefaultProvider = mock(async (_userId: string, _provider: string | null) => {});
+const mockSetUserDefault = mock(
+  async (_userId: string, _provider: string | null, _model: string | null) => {}
+);
 
 mock.module('@archon/core', () => ({
   isPerUserProviderKeysEnabled: () => enabled,
@@ -104,7 +106,7 @@ mock.module('@archon/core', () => ({
   getUserAiPrefs: mockGetUserAiPrefs,
   setUserTiers: mockSetUserTiers,
   setUserAliases: mockSetUserAliases,
-  setUserDefaultProvider: mockSetUserDefaultProvider,
+  setUserDefault: mockSetUserDefault,
 }));
 mock.module('@archon/core/db/users', () => ({
   findOrCreateUserByPlatformIdentity: mock(async () => ({ id: 'u1' })),
@@ -133,8 +135,19 @@ import {
 
 let logSpy: ReturnType<typeof spyOn<Console, 'log'>>;
 let errSpy: ReturnType<typeof spyOn<Console, 'error'>>;
+let stdoutSpy: ReturnType<typeof spyOn>;
 function out(): string {
   return [...logSpy.mock.calls, ...errSpy.mock.calls].flat().join('\n');
+}
+
+/**
+ * `--json` payloads go through `writeJsonLine()` (src/utils/stdout.ts), i.e.
+ * `process.stdout.write`, so a piped consumer can never get a truncated
+ * document (#2384). Capture them here; real-pipe delivery is covered by
+ * src/utils/stdout.test.ts.
+ */
+function jsonOut(): string {
+  return ((stdoutSpy.mock.calls[0]?.[0] as string) ?? '').trimEnd();
 }
 
 beforeEach(() => {
@@ -147,15 +160,21 @@ beforeEach(() => {
   mockGetUserAiPrefs.mockClear();
   mockSetUserTiers.mockClear();
   mockSetUserAliases.mockClear();
-  mockSetUserDefaultProvider.mockClear();
+  mockSetUserDefault.mockClear();
   userPrefsResult = {};
   loadConfigResult = { assistant: 'claude', tiers: {} };
   logSpy = spyOn(console, 'log').mockImplementation(() => {});
   errSpy = spyOn(console, 'error').mockImplementation(() => {});
+  stdoutSpy = spyOn(process.stdout, 'write').mockImplementation((...args: unknown[]) => {
+    const callback = args.find(arg => typeof arg === 'function');
+    if (typeof callback === 'function') (callback as () => void)();
+    return true;
+  });
 });
 afterEach(() => {
   logSpy.mockRestore();
   errSpy.mockRestore();
+  stdoutSpy.mockRestore();
 });
 
 describe('gate (vault unavailable — defensive guard)', () => {
@@ -365,7 +384,7 @@ describe('aiTierListCommand', () => {
   it('--json emits structured output', async () => {
     loadConfigResult = { assistant: 'claude', tiers: {} };
     expect(await aiTierListCommand(true)).toBe(0);
-    const parsed = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as {
+    const parsed = JSON.parse(jsonOut()) as {
       defaultAssistant: string;
       tiers: unknown[];
     };
@@ -376,12 +395,20 @@ describe('aiTierListCommand', () => {
 
 describe('aiDefaultCommand', () => {
   it('sets the default assistant → 0', async () => {
-    expect(await aiDefaultCommand('codex')).toBe(0);
+    expect(await aiDefaultCommand('codex', undefined)).toBe(0);
     expect(mockUpdateGlobalConfig).toHaveBeenCalledWith({ defaultAssistant: 'codex' });
   });
 
+  it('with model → also writes assistants.<provider>.model', async () => {
+    expect(await aiDefaultCommand('codex', 'gpt-5.5')).toBe(0);
+    expect(mockUpdateGlobalConfig).toHaveBeenCalledWith({
+      defaultAssistant: 'codex',
+      assistants: { codex: { model: 'gpt-5.5' } },
+    });
+  });
+
   it('unknown provider → 1, no write', async () => {
-    expect(await aiDefaultCommand('nope')).toBe(1);
+    expect(await aiDefaultCommand('nope', undefined)).toBe(1);
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
 });
@@ -414,9 +441,15 @@ describe('--scope user (per-user prefs, Phase 3)', () => {
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
 
-  it('default --scope user → per-user default provider', async () => {
-    expect(await aiDefaultCommand('codex', 'user')).toBe(0);
-    expect(mockSetUserDefaultProvider).toHaveBeenCalledWith('u1', 'codex');
+  it('default --scope user → per-user default provider (model pin cleared)', async () => {
+    expect(await aiDefaultCommand('codex', undefined, 'user')).toBe(0);
+    expect(mockSetUserDefault).toHaveBeenCalledWith('u1', 'codex', null);
+    expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('default <provider> <model> --scope user → atomic provider + model write', async () => {
+    expect(await aiDefaultCommand('codex', 'gpt-5.5', 'user')).toBe(0);
+    expect(mockSetUserDefault).toHaveBeenCalledWith('u1', 'codex', 'gpt-5.5');
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
 
@@ -507,7 +540,7 @@ describe('aiAliasListCommand', () => {
       aliases: { '@fast': { provider: 'claude', model: 'haiku' } },
     };
     expect(await aiAliasListCommand(true)).toBe(0);
-    const parsed = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as { aliases: unknown[] };
+    const parsed = JSON.parse(jsonOut()) as { aliases: unknown[] };
     expect(Array.isArray(parsed.aliases)).toBe(true);
     expect(parsed.aliases.length).toBe(1);
   });

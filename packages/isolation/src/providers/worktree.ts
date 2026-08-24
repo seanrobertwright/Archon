@@ -13,6 +13,7 @@ import {
   execFileAsync,
   findWorktreeByBranch,
   getCanonicalRepoPath,
+  getDefaultRemote,
   getWorktreeBase,
   listWorktrees,
   mkdirAsync,
@@ -23,6 +24,7 @@ import {
   toRepoPath,
   toWorktreePath,
   toBranchName,
+  CanonicalRepoPathUnavailableError,
 } from '@archon/git';
 import type { WorktreeBaseOverride } from '@archon/git';
 import { getArchonWorkspacesPath } from '@archon/paths';
@@ -46,6 +48,35 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('isolation.worktree');
   return cachedLog;
+}
+
+/**
+ * Resolve the anchors from which Git worktree commands should run.
+ *
+ * External `--separate-git-dir` repositories do not record a reverse path to
+ * their primary checkout. The exact linked checkout is valid while it exists;
+ * its common Git directory remains usable after that checkout is removed.
+ */
+interface GitCommandAnchors {
+  active: RepoPath;
+  durable: RepoPath;
+}
+
+async function getGitCommandAnchors(path: string): Promise<GitCommandAnchors> {
+  try {
+    const canonicalPath = await getCanonicalRepoPath(path);
+    return { active: canonicalPath, durable: canonicalPath };
+  } catch (error) {
+    if (error instanceof CanonicalRepoPathUnavailableError) {
+      return {
+        active: toRepoPath(path),
+        // The exact checkout may be removed by destroy(), while Git's common
+        // directory remains a valid anchor for prune and branch cleanup.
+        durable: toRepoPath(error.commonGitDir),
+      };
+    }
+    throw error;
+  }
 }
 
 /**
@@ -209,9 +240,9 @@ export class WorktreeProvider implements IIsolationProvider {
     // Get canonical repo path - use provided path or derive from worktree
     let repoPath: string;
     if (options?.canonicalRepoPath) {
-      repoPath = options.canonicalRepoPath;
+      repoPath = (await getGitCommandAnchors(options.canonicalRepoPath)).durable;
     } else if (pathExists) {
-      repoPath = await getCanonicalRepoPath(worktreePath);
+      repoPath = (await getGitCommandAnchors(worktreePath)).durable;
     } else {
       // Path doesn't exist and no canonicalRepoPath provided - can't clean up branch
       // This is expected when worktree was already fully cleaned up externally
@@ -292,7 +323,8 @@ export class WorktreeProvider implements IIsolationProvider {
         result.remoteBranchDeleted = await this.deleteRemoteBranchTracked(
           repoPath,
           options.branchName,
-          result
+          result,
+          options.remote
         );
       }
     }
@@ -381,10 +413,11 @@ export class WorktreeProvider implements IIsolationProvider {
   private async deleteRemoteBranchTracked(
     repoPath: string,
     branchName: string,
-    result: DestroyResult
+    result: DestroyResult,
+    remote = 'origin'
   ): Promise<boolean> {
     try {
-      await execFileAsync('git', ['-C', repoPath, 'push', 'origin', '--delete', branchName], {
+      await execFileAsync('git', ['-C', repoPath, 'push', remote, '--delete', branchName], {
         timeout: GIT_OPERATION_TIMEOUT_MS,
       });
       getLog().debug({ repoPath, branchName }, 'remote_branch_deleted');
@@ -429,7 +462,7 @@ export class WorktreeProvider implements IIsolationProvider {
     let repoPath: RepoPath;
     let worktrees: WorktreeInfo[];
     try {
-      repoPath = await getCanonicalRepoPath(worktreePath);
+      repoPath = (await getGitCommandAnchors(worktreePath)).active;
       worktrees = await listWorktrees(repoPath);
     } catch (error) {
       getLog().error({ err: error, worktreePath }, 'worktree_query_failed');
@@ -495,7 +528,7 @@ export class WorktreeProvider implements IIsolationProvider {
     let repoPath: RepoPath;
     let worktrees: WorktreeInfo[];
     try {
-      repoPath = await getCanonicalRepoPath(path);
+      repoPath = (await getGitCommandAnchors(path)).active;
       worktrees = await listWorktrees(repoPath);
     } catch (error) {
       const err = error as Error;
@@ -704,9 +737,16 @@ export class WorktreeProvider implements IIsolationProvider {
   ): Promise<{ warnings: string[] }> {
     const repoPath = request.canonicalRepoPath;
 
-    // Sync uses only the configured base branch (or auto-detects via getDefaultBranch).
+    // Resolve git remote name: explicit config > auto-detect > actionable error
+    const remote = await this.resolveRemote(repoPath, worktreeConfig?.remote);
+
+    // Base precedence: a per-dispatch --base override (request.baseOverride) wins,
+    // then explicit repo config, then the registered codebase's default branch
+    // (request.baseBranch), then auto-detect via getDefaultBranch.
     // request.fromBranch is the start-point for worktree creation, not a sync target.
-    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, worktreeConfig?.baseBranch);
+    const preferredBaseBranch =
+      request.baseOverride ?? worktreeConfig?.baseBranch ?? request.baseBranch;
+    const baseBranch = await this.syncWorkspaceBeforeCreate(repoPath, preferredBaseBranch, remote);
 
     const override: WorktreeBaseOverride = {
       repoLocal: resolveRepoLocalOverride(worktreeConfig?.path, repoPath),
@@ -718,10 +758,10 @@ export class WorktreeProvider implements IIsolationProvider {
 
     if (isPRIsolationRequest(request)) {
       // For PRs: fetch and checkout the PR branch (actual or synthetic)
-      await this.createFromPR(request, worktreePath);
+      await this.createFromPR(request, worktreePath, remote);
     } else {
       // For issues, tasks, threads: create new branch
-      await this.createNewBranch(request, repoPath, worktreePath, branchName, baseBranch);
+      await this.createNewBranch(request, repoPath, worktreePath, branchName, baseBranch, remote);
     }
 
     // Stamp the originating user's git identity on this worktree so workflow
@@ -781,6 +821,56 @@ export class WorktreeProvider implements IIsolationProvider {
   }
 
   /**
+   * Resolve the git remote name to use for all fetch/push operations.
+   *
+   * Resolution order: explicit config (worktree.remote) > auto-detect via
+   * getDefaultRemote() > actionable error when ambiguous.
+   */
+  private async resolveRemote(repoPath: RepoPath, configuredRemote?: string): Promise<string> {
+    const configured = configuredRemote?.trim();
+    if (configured) {
+      getLog().debug({ repoPath, remote: configured }, 'worktree.remote_from_config');
+      return configured;
+    }
+
+    const detected = await getDefaultRemote(repoPath);
+    if (detected) {
+      if (detected !== 'origin') {
+        // Non-standard remote picked up automatically — log at info so the
+        // choice is visible when debugging fetch/push behavior.
+        getLog().info({ repoPath, remote: detected }, 'worktree.remote_auto_detected');
+      }
+      return detected;
+    }
+
+    // Distinguish no remotes from multiple non-origin remotes for an actionable error.
+    let remoteNames: string[] | null = null;
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', repoPath, 'remote'], { timeout: 10000 });
+      remoteNames = stdout
+        .split(/\r?\n/)
+        .map(remote => remote.trim())
+        .filter(remote => remote.length > 0);
+    } catch {
+      // Best-effort for error message only
+    }
+
+    if (remoteNames?.length === 0) {
+      throw new Error(
+        `Cannot determine git remote for ${repoPath}: no git remote is configured. ` +
+          'Add one with `git remote add origin URL`, or use `--no-worktree` to run in the live checkout.'
+      );
+    }
+
+    const remoteList = remoteNames?.join(', ') ?? '<unknown>';
+    throw new Error(
+      `Cannot determine git remote for ${repoPath}: no 'origin' remote found and ` +
+        `multiple remotes exist (${remoteList}). ` +
+        'Set worktree.remote in .archon/config.yaml to specify which remote to use.'
+    );
+  }
+
+  /**
    * Sync workspace with remote before creating a new worktree
    * Ensures new work starts from the latest code on the base branch.
    *
@@ -800,11 +890,12 @@ export class WorktreeProvider implements IIsolationProvider {
    */
   private async syncWorkspaceBeforeCreate(
     repoPath: RepoPath,
-    configuredBaseBranch?: string
+    configuredBaseBranch?: string,
+    remote = 'origin'
   ): Promise<string> {
     try {
       getLog().debug(
-        { repoPath, branch: configuredBaseBranch ?? 'auto-detect' },
+        { repoPath, branch: configuredBaseBranch ?? 'auto-detect', remote },
         'workspace_sync_starting'
       );
       // Only hard-reset for Archon-managed clones when creating isolated worktrees.
@@ -815,9 +906,9 @@ export class WorktreeProvider implements IIsolationProvider {
       const { branch } = await syncWorkspace(
         repoPath,
         configuredBaseBranch ? toBranchName(configuredBaseBranch) : undefined,
-        { mode: isManagedClone ? 'reset' : 'fast-forward' }
+        { mode: isManagedClone ? 'reset' : 'fast-forward', remote }
       );
-      getLog().debug({ repoPath, branch }, 'workspace_synced');
+      getLog().debug({ repoPath, branch, remote }, 'workspace_synced');
       return branch;
     } catch (error) {
       const err = error as Error & { code?: string };
@@ -840,8 +931,8 @@ export class WorktreeProvider implements IIsolationProvider {
       } else {
         // Network errors, timeouts — cannot guarantee correct start-point
         throw new Error(
-          `Failed to fetch base branch from origin: ${err.message}. ` +
-            'Check your network connection and try again.'
+          `Failed to fetch base branch from '${remote}': ${err.message}. ` +
+            'Check your network connection and remote configuration.'
         );
       }
     }
@@ -852,15 +943,24 @@ export class WorktreeProvider implements IIsolationProvider {
    * Returns `configLoadFailed: true` when no config was provided and the
    * internal fallback load of the config fails — so the caller can surface
    * a warning without blocking worktree creation.
+   *
+   * `.archon` used to be copied unconditionally, because it was the only way a
+   * workflow's own commands and scripts could be seen from inside the worktree it
+   * executed against. That is now handled by the run's own source capture
+   * (`@archon/workflows` `workflow-source.ts`), which keeps the source outside the
+   * target entirely. The implicit copy is gone because it was never scoped to
+   * executable source: it also carried `.archon/.env`, cross-run `state/`, and any
+   * other ignored content, overwrote the worktree's own tracked `.archon` files, and
+   * put all of it into the target's `git status` and its validators' inputs.
+   *
+   * An operator who still wants `.archon` (or anything else) in a worktree lists it
+   * under `worktree.copyFiles`, which is unchanged and still honored verbatim.
    */
   private async copyConfiguredFiles(
     canonicalRepoPath: string,
     worktreePath: string,
     worktreeConfig?: { baseBranch?: string; copyFiles?: string[] } | null
   ): Promise<{ configLoadFailed: boolean }> {
-    // Default files to always copy
-    const defaultCopyFiles = ['.archon'];
-
     // Load user config - log errors and set configLoadFailed, but don't fail worktree creation
     let userCopyFiles: string[] = [];
     let configLoadFailed = false;
@@ -883,8 +983,8 @@ export class WorktreeProvider implements IIsolationProvider {
       }
     }
 
-    // Merge defaults with user config (Set deduplicates)
-    const copyFiles = [...new Set([...defaultCopyFiles, ...userCopyFiles])];
+    // Only what the operator explicitly configured. Set deduplicates a repeated entry.
+    const copyFiles = [...new Set(userCopyFiles)];
 
     if (copyFiles.length === 0) {
       return { configLoadFailed };
@@ -922,7 +1022,11 @@ export class WorktreeProvider implements IIsolationProvider {
    * When prSha is provided, the worktree is initially created at the specific
    * commit (detached HEAD), then a local tracking branch is created.
    */
-  private async createFromPR(request: PRIsolationRequest, worktreePath: string): Promise<void> {
+  private async createFromPR(
+    request: PRIsolationRequest,
+    worktreePath: string,
+    remote = 'origin'
+  ): Promise<void> {
     // Clean up any orphan directory before creating worktree
     await this.cleanOrphanDirectoryIfExists(worktreePath);
 
@@ -932,10 +1036,10 @@ export class WorktreeProvider implements IIsolationProvider {
     try {
       if (!request.isForkPR) {
         // Same-repo PR: Use the actual branch so changes push directly to PR
-        await this.createFromSameRepoPR(repoPath, worktreePath, request.prBranch);
+        await this.createFromSameRepoPR(repoPath, worktreePath, request.prBranch, remote);
       } else {
         // Fork PR: Use synthetic review branch
-        await this.createFromForkPR(repoPath, worktreePath, prNumber, request.prSha);
+        await this.createFromForkPR(repoPath, worktreePath, prNumber, remote, request.prSha);
       }
     } catch (error) {
       // Clean up orphaned git-registered worktree from partial failure
@@ -952,10 +1056,11 @@ export class WorktreeProvider implements IIsolationProvider {
   private async createFromSameRepoPR(
     repoPath: string,
     worktreePath: string,
-    prBranch: string
+    prBranch: string,
+    remote = 'origin'
   ): Promise<void> {
     // Fetch the PR's actual branch
-    await execFileAsync('git', ['-C', repoPath, 'fetch', 'origin', prBranch], {
+    await execFileAsync('git', ['-C', repoPath, 'fetch', remote, prBranch], {
       timeout: GIT_OPERATION_TIMEOUT_MS,
     });
 
@@ -964,7 +1069,7 @@ export class WorktreeProvider implements IIsolationProvider {
       // If branch doesn't exist locally, create it tracking remote
       await execFileAsync(
         'git',
-        ['-C', repoPath, 'worktree', 'add', worktreePath, '-b', prBranch, `origin/${prBranch}`],
+        ['-C', repoPath, 'worktree', 'add', worktreePath, '-b', prBranch, `${remote}/${prBranch}`],
         { timeout: GIT_OPERATION_TIMEOUT_MS }
       );
     } catch (error) {
@@ -983,7 +1088,7 @@ export class WorktreeProvider implements IIsolationProvider {
     try {
       await execFileAsync(
         'git',
-        ['-C', worktreePath, 'branch', '--set-upstream-to', `origin/${prBranch}`],
+        ['-C', worktreePath, 'branch', '--set-upstream-to', `${remote}/${prBranch}`],
         { timeout: GIT_OPERATION_TIMEOUT_MS }
       );
     } catch (trackingError) {
@@ -1002,13 +1107,14 @@ export class WorktreeProvider implements IIsolationProvider {
     repoPath: string,
     worktreePath: string,
     prNumber: string,
+    remote = 'origin',
     prSha?: string
   ): Promise<void> {
     const reviewBranch = `pr-${prNumber}-review`;
 
     if (prSha) {
       // SHA provided: create at specific commit for reproducible reviews
-      await execFileAsync('git', ['-C', repoPath, 'fetch', 'origin', `pull/${prNumber}/head`], {
+      await execFileAsync('git', ['-C', repoPath, 'fetch', remote, `pull/${prNumber}/head`], {
         timeout: GIT_OPERATION_TIMEOUT_MS,
       });
 
@@ -1032,7 +1138,7 @@ export class WorktreeProvider implements IIsolationProvider {
         () =>
           execFileAsync(
             'git',
-            ['-C', repoPath, 'fetch', 'origin', `pull/${prNumber}/head:${reviewBranch}`],
+            ['-C', repoPath, 'fetch', remote, `pull/${prNumber}/head:${reviewBranch}`],
             { timeout: GIT_OPERATION_TIMEOUT_MS }
           ),
         reviewBranch
@@ -1077,7 +1183,8 @@ export class WorktreeProvider implements IIsolationProvider {
     repoPath: string,
     worktreePath: string,
     branchName: string,
-    baseBranch: string
+    baseBranch: string,
+    remote = 'origin'
   ): Promise<void> {
     // Clean up any orphan directory before creating worktree
     await this.cleanOrphanDirectoryIfExists(worktreePath);
@@ -1086,7 +1193,7 @@ export class WorktreeProvider implements IIsolationProvider {
     const startPoint =
       request.workflowType === 'task' && request.fromBranch
         ? request.fromBranch
-        : `origin/${baseBranch}`;
+        : `${remote}/${baseBranch}`;
 
     try {
       // `--no-track` keeps `branch.<name>.merge` unset; otherwise `gh pr view`

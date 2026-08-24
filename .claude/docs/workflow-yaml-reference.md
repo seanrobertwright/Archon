@@ -24,7 +24,8 @@ Workflows are YAML files discovered from `.archon/workflows/` (recursively) plus
 - **Used by**: Router prompt — this is the primary signal the AI uses to select a workflow. Include `Use when:` and `NOT for:` sections.
 
 ### `provider` (optional)
-- **Type**: `'claude'` | `'codex'`
+- **Type**: any registered provider id — `'claude'` | `'codex'` | `'pi'` | `'copilot'` | `'opencode'`
+  (validated at load against the registry, so the list follows what is registered)
 - **Default**: falls back to `.archon/config.yaml` assistants default (Claude)
 
 ### `model` (optional)
@@ -33,9 +34,21 @@ Workflows are YAML files discovered from `.archon/workflows/` (recursively) plus
 - **Codex models**: anything that does NOT match Claude patterns
 - **Validation**: incompatible provider/model fails loading
 
-### `modelReasoningEffort` (optional, Codex only)
+### `effort` (optional)
+- **Type**: `'minimal'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`
+- **Applies to**: every provider with a reasoning control (Claude, Codex, Pi, Copilot).
+  Pi takes all six; the others clamp a rung their SDK lacks to the nearest one
+  they have (`max` → `xhigh` on Codex/Copilot; `minimal` → `low` on
+  Claude/Copilot). OpenCode has none.
+- **Also valid per-node**, where it overrides the workflow-level value.
+
+### `modelReasoningEffort` (was Codex-only) — DEPRECATED
 - **Type**: `'minimal'` | `'low'` | `'medium'` | `'high'` | `'xhigh'`
+- **Use `effort:` instead.** Still accepted: the loader translates it into
+  `effort:` and warns. If both are declared, `effort:` wins and this one is
+  dropped. Will be removed.
 - **Default**: from `.archon/config.yaml` `assistants.codex.modelReasoningEffort`
+  (that config key is NOT deprecated)
 
 ### `webSearchMode` (optional, Codex only)
 - **Type**: `'disabled'` | `'cached'` | `'live'`
@@ -228,13 +241,11 @@ when: "$classify.output.complexity != 'trivial'"
 | `$PLAN` | Previous plan from session metadata |
 | `$IMPLEMENTATION_SUMMARY` | Previous execution summary |
 
-### Positional Variables (command handler)
+### User Message Variables
 
 | Variable | Replaced With |
 |----------|--------------|
-| `$1` through `$9` | Positional arguments split from user message |
-| `$ARGUMENTS` | All arguments joined |
-| `\$` | Literal `$` (escape) |
+| `$ARGUMENTS` / `$USER_MESSAGE` | The user's whole trigger message (positional `$1`–`$9` are not supported) |
 
 ### DAG Node Output References
 

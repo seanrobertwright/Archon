@@ -15,25 +15,45 @@ describe('Workflow Router', () => {
       name: 'fix-bug',
       description: 'Fix a bug in the codebase',
       nodes: [
-        { id: 'analyze', command: 'analyze' },
-        { id: 'fix', command: 'fix', depends_on: ['analyze'] },
+        { id: 'analyze', kind: 'agent', source: { kind: 'command', name: 'analyze' } },
+        {
+          id: 'fix',
+          kind: 'agent',
+          source: { kind: 'command', name: 'fix' },
+          depends_on: ['analyze'],
+        },
       ],
     },
     {
       name: 'add-feature',
       description: 'Add a new feature',
       nodes: [
-        { id: 'plan', command: 'plan' },
-        { id: 'implement', command: 'implement', depends_on: ['plan'] },
+        { id: 'plan', kind: 'agent', source: { kind: 'command', name: 'plan' } },
+        {
+          id: 'implement',
+          kind: 'agent',
+          source: { kind: 'command', name: 'implement' },
+          depends_on: ['plan'],
+        },
       ],
     },
     {
       name: 'feature-development',
       description: 'Full feature development workflow',
       nodes: [
-        { id: 'plan', command: 'plan' },
-        { id: 'implement', command: 'implement', depends_on: ['plan'] },
-        { id: 'create-pr', command: 'create-pr', depends_on: ['implement'] },
+        { id: 'plan', kind: 'agent', source: { kind: 'command', name: 'plan' } },
+        {
+          id: 'implement',
+          kind: 'agent',
+          source: { kind: 'command', name: 'implement' },
+          depends_on: ['plan'],
+        },
+        {
+          id: 'create-pr',
+          kind: 'agent',
+          source: { kind: 'command', name: 'create-pr' },
+          depends_on: ['implement'],
+        },
       ],
     },
   ];
@@ -102,7 +122,7 @@ describe('Workflow Router', () => {
           description: `Use when: No other workflow matches.
 Handles: Questions, debugging, exploration.
 Capability: Full Claude Code agent.`,
-          nodes: [{ id: 'assist', command: 'assist' }],
+          nodes: [{ id: 'assist', kind: 'agent', source: { kind: 'command', name: 'assist' } }],
         },
       ];
 

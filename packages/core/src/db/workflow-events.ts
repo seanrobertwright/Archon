@@ -9,8 +9,11 @@
  * Read operations also throw on error — callers own the degradation policy.
  */
 import { pool, getDialect, getDatabaseType } from './connection';
+import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
+import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
+import { readFile } from 'node:fs/promises';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -53,31 +56,58 @@ function parseEventRow(row: WorkflowEventRow): WorkflowEventRow {
   }
 }
 
-/**
- * Create a workflow event. Fire-and-forget - never throws.
- */
-export async function createWorkflowEvent(data: {
+/** The column payload for a single workflow-event row. */
+export interface WorkflowEventInput {
   workflow_run_id: string;
   event_type: string;
   step_index?: number;
   step_name?: string;
   data?: Record<string, unknown>;
-}): Promise<void> {
+}
+
+/**
+ * A query function scoped to a specific connection — either the module-level
+ * `pool` or a transaction-scoped query from `IDatabase.withTransaction`. The row
+ * type is unused (INSERT returns none), so it is fixed to `unknown` rather than
+ * generic, which lets a generic transaction query be passed directly.
+ */
+type EventInsertQuery = (sql: string, params?: unknown[]) => Promise<QueryResult<unknown>>;
+
+/**
+ * Insert one workflow-event row via `query` and THROW on failure. This is the
+ * single source of truth for the event columns and dialect UUID; the
+ * fire-and-forget createWorkflowEvent wraps it in try/catch, while callers that
+ * need the write to be atomic with another mutation (the approval-gate CAS in
+ * db/workflows.ts, #2146) pass a transaction-scoped query so a failed event
+ * write rolls back the enclosing UPDATE instead of stranding a resolved gate
+ * with no audit trail.
+ */
+export async function insertWorkflowEvent(
+  query: EventInsertQuery,
+  data: WorkflowEventInput
+): Promise<void> {
+  const dialect = getDialect();
+  const id = dialect.generateUuid();
+  await query(
+    `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_index, step_name, data)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      id,
+      data.workflow_run_id,
+      data.event_type,
+      data.step_index ?? null,
+      data.step_name ?? null,
+      JSON.stringify(data.data ?? {}),
+    ]
+  );
+}
+
+/**
+ * Create a workflow event. Fire-and-forget - never throws.
+ */
+export async function createWorkflowEvent(data: WorkflowEventInput): Promise<void> {
   try {
-    const dialect = getDialect();
-    const id = dialect.generateUuid();
-    await pool.query(
-      `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_index, step_name, data)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
-        id,
-        data.workflow_run_id,
-        data.event_type,
-        data.step_index ?? null,
-        data.step_name ?? null,
-        JSON.stringify(data.data ?? {}),
-      ]
-    );
+    await insertWorkflowEvent((sql, params) => pool.query(sql, params), data);
   } catch (error) {
     getLog().error(
       { err: error as Error, eventType: data.event_type, runId: data.workflow_run_id },
@@ -88,14 +118,15 @@ export async function createWorkflowEvent(data: {
 }
 
 /**
- * List all events for a workflow run, ordered by creation time.
+ * List all events for a workflow run in lifecycle order. `event_order` is
+ * allocated by the database, so it preserves insertion order when timestamps tie.
  */
 export async function listWorkflowEvents(workflowRunId: string): Promise<WorkflowEventRow[]> {
   try {
     const result = await pool.query<WorkflowEventRow>(
       `SELECT * FROM remote_agent_workflow_events
        WHERE workflow_run_id = $1
-       ORDER BY created_at ASC`,
+       ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
       [workflowRunId]
     );
     return [...result.rows].map(row => ({
@@ -120,7 +151,7 @@ export async function listRecentEvents(
       const result = await pool.query<WorkflowEventRow>(
         `SELECT * FROM remote_agent_workflow_events
          WHERE workflow_run_id = $1 AND created_at > $2
-         ORDER BY created_at ASC`,
+         ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
         [workflowRunId, since.toISOString()]
       );
       return [...result.rows].map(row => ({
@@ -171,7 +202,7 @@ export async function listWorkflowEventsSince(
     const result = await pool.query<WorkflowEventRow>(
       `SELECT * FROM remote_agent_workflow_events
        WHERE created_at >= $1${typeClause}
-       ORDER BY created_at ASC
+       ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC
        LIMIT ${limitParam}`,
       params
     );
@@ -185,23 +216,66 @@ export async function listWorkflowEventsSince(
 }
 
 /**
- * Return a map of nodeId → output for all node_completed events in a workflow run.
- * Used by the DAG executor to restore node outputs when resuming a failed run.
+ * Return completed node outputs and cumulative usage (tokens AND cost) for a workflow
+ * run. Used by the DAG executor to restore state when resuming a failed run.
  * Throws on DB error — caller owns the degradation policy.
+ *
+ * Both usage axes are summed from `node_completed` and `node_failed` rows, and only
+ * from rows that are not marked `data.aggregate`. Failed rows contribute spend but
+ * never completed outputs, so their nodes remain eligible for resume.
+ *
+ * This makes a run's total MONEY BURNED, not the cost of the surviving path — the
+ * figure an operator watching a budget wants, and a deliberate change from what the
+ * number meant before failed rows were summed (#2654). Three consequences follow, all
+ * intended:
+ *
+ * - The same node's first and second attempt both count. A node that failed at $0.02
+ *   and succeeded at $0.03 on resume contributes $0.05, because both rows are real
+ *   spend.
+ * - `retry:` counts every attempt, for the same reason — `runNodeRetryLoop` writes one
+ *   event per attempt.
+ * - An `always_run` node re-executes on every resume pass and its spend accrues each
+ *   time.
+ *
+ * A resumed run's total therefore exceeds what the surviving path cost, and grows with
+ * each resume. That is the point; it is not double counting, which is what the two
+ * exclusions below prevent.
+ *
+ * Cache axes sum over the rows that reported them and carry `cachePartial` when any row
+ * did not, so a pre-#2654 row narrows the cache total instead of erasing it. Two
+ * distinct duplication hazards:
+ *
+ * - `node_skipped_prior_success` rows replay a node an earlier pass already counted, so
+ *   counting them would multiply that node's usage by the number of resume passes.
+ * - `aggregate: true` rows are derived from other rows already in this log — a
+ *   `loop_group`'s roll-up restates the `cost_usd` its own `<groupId>.<nodeId>` body rows
+ *   carry, so summing both counts that group twice (#2469).
+ *
+ * Rows written before the `aggregate` marker existed carry no flag, so a run that
+ * completed a loop_group under an older build and is resumed under this one can still
+ * double-count its cost. Bounded and self-clearing: only cost is affected (the roll-up
+ * never carried `tokens`), and only until those runs reach a terminal state.
  */
-export async function getCompletedDagNodeOutputs(
-  workflowRunId: string
-): Promise<Map<string, string>> {
+export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
+  completedNodeOutputs: Map<string, { output: string; structuredOutput?: unknown }>;
+  tokens?: TokenUsage;
+  costUsd: number;
+}> {
   const result = await pool.query<{
     step_name: string | null;
+    event_type: 'node_completed' | 'node_failed' | 'node_skipped_prior_success';
     data: string | Record<string, unknown>;
   }>(
-    `SELECT step_name, data FROM remote_agent_workflow_events
-     WHERE workflow_run_id = $1 AND event_type IN ('node_completed', 'node_skipped_prior_success')
-     ORDER BY created_at ASC`,
+    `SELECT step_name, event_type, data FROM remote_agent_workflow_events
+     WHERE workflow_run_id = $1 AND event_type IN ('node_completed', 'node_failed', 'node_skipped_prior_success')
+     ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
     [workflowRunId]
   );
-  const outputs = new Map<string, string>();
+  const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
+  // Collected and merged once at the end rather than folded pairwise: a pairwise fold
+  // cannot tell "one of five contributions reported" from "one of two" (#2662).
+  const usages: TokenUsage[] = [];
+  let costUsd = 0;
   for (const row of result.rows) {
     if (!row.step_name) continue;
     let data: Record<string, unknown>;
@@ -214,9 +288,133 @@ export async function getCompletedDagNodeOutputs(
       );
       continue;
     }
-    if (typeof data.node_output === 'string') {
-      outputs.set(row.step_name, data.node_output);
+    if (row.event_type === 'node_failed') {
+      // A later failure for this step supersedes any earlier node_completed /
+      // node_skipped_prior_success entry (#2705 R2) — otherwise a node the engine's own
+      // prior-cache invalidation re-executed, and which then genuinely failed, is
+      // reported as a cached success again on a subsequent resume.
+      completedNodeOutputs.delete(row.step_name);
+    } else if (typeof data.node_output === 'string') {
+      // A bash/script node's persisted text is a bounded preview once it exceeded the
+      // truncation cap; the full bytes were spilled to `node_output_spill_path` at write
+      // time (#2726). Prefer the spill so a resumed run's `$node.output`/`.field` sees
+      // exactly what a fresh run's in-process consumer would have. A missing/unreadable
+      // spill degrades to the preview rather than failing resume — this is not a DB
+      // error, so it must not propagate as one (see this function's own doc comment).
+      //
+      // The spill file is addressed by a stable, node-scoped filename that a later
+      // execution of the SAME node overwrites in place (by design — see
+      // `formatPersistedNodeOutput`'s doc comment). Its write races this row's own
+      // fire-and-forget insert (`createWorkflowEvent` never awaited, never throws), so a
+      // process crash between "spill file overwritten by a later execution" and "this
+      // row's insert lands" could otherwise leave an older, still-durable row pointing at
+      // a NEWER execution's content. Guard against that by validating the file's actual
+      // byte length against this row's own recorded `node_output_original_bytes` before
+      // trusting it — a mismatch means the file no longer describes this row, so fall
+      // back to the bounded preview exactly like a missing spill would.
+      let output = data.node_output;
+      if (typeof data.node_output_spill_path === 'string') {
+        try {
+          const spilled = await readFile(data.node_output_spill_path, 'utf8');
+          const spilledBytes = Buffer.byteLength(spilled, 'utf8');
+          if (
+            typeof data.node_output_original_bytes === 'number' &&
+            spilledBytes !== data.node_output_original_bytes
+          ) {
+            getLog().warn(
+              {
+                runId: workflowRunId,
+                stepName: row.step_name,
+                spillPath: data.node_output_spill_path,
+                expectedBytes: data.node_output_original_bytes,
+                actualBytes: spilledBytes,
+              },
+              'db.workflow_dag_node_output_spill_stale'
+            );
+          } else {
+            output = spilled;
+          }
+        } catch (spillErr) {
+          getLog().warn(
+            {
+              err: spillErr as Error,
+              runId: workflowRunId,
+              stepName: row.step_name,
+              spillPath: data.node_output_spill_path,
+            },
+            'db.workflow_dag_node_output_spill_read_failed'
+          );
+        }
+      }
+      completedNodeOutputs.set(row.step_name, {
+        output,
+        // The node's logical value (#2637), persisted beside its text by the emit
+        // sites (and copied forward by node_skipped_prior_success re-emits). Absent
+        // on pre-#2637 rows — the executor then falls back to text re-parsing.
+        ...(data.structured_output !== undefined
+          ? { structuredOutput: data.structured_output }
+          : {}),
+      });
+    }
+    // A derived row restates usage that other rows in this same log already carry.
+    if (data.aggregate === true) continue;
+    if (row.event_type !== 'node_skipped_prior_success' && data.tokens !== undefined) {
+      const eventTokens = data.tokens;
+      if (
+        typeof eventTokens === 'object' &&
+        eventTokens !== null &&
+        'input' in eventTokens &&
+        'output' in eventTokens &&
+        typeof eventTokens.input === 'number' &&
+        typeof eventTokens.output === 'number' &&
+        Number.isFinite(eventTokens.input) &&
+        Number.isFinite(eventTokens.output)
+      ) {
+        const normalized: TokenUsage = {
+          input: eventTokens.input,
+          output: eventTokens.output,
+        };
+        const optionalTokens = eventTokens as Record<string, unknown>;
+        for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+          const value = optionalTokens[axis];
+          if (value === undefined) continue;
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            normalized[axis] = value;
+          } else {
+            getLog().warn(
+              { runId: workflowRunId, stepName: row.step_name, axis, value },
+              'db.workflow_dag_node_optional_tokens_invalid_ignored'
+            );
+          }
+        }
+        // A node whose own usage was already a floor (a loop total, an OpenCode
+        // multi-agent node) keeps the resumed run a floor. Anything other than `true`
+        // is ignored without a warn: unlike the numeric axes it carries no total.
+        if (optionalTokens.cachePartial === true) {
+          normalized.cachePartial = true;
+        }
+        usages.push(normalized);
+      } else {
+        getLog().warn(
+          { runId: workflowRunId, stepName: row.step_name, tokens: eventTokens },
+          'db.workflow_dag_node_tokens_invalid_ignored'
+        );
+      }
+    }
+    if (row.event_type !== 'node_skipped_prior_success' && data.cost_usd !== undefined) {
+      const eventCost = data.cost_usd;
+      // Same guard shape as tokens: a non-finite value from a provider must not
+      // silently poison the total (NaN > 0 is false, which would drop the run's
+      // cost from the persisted metadata with no trace).
+      if (typeof eventCost === 'number' && Number.isFinite(eventCost)) {
+        costUsd += eventCost;
+      } else {
+        getLog().warn(
+          { runId: workflowRunId, stepName: row.step_name, costUsd: eventCost },
+          'db.workflow_dag_node_cost_invalid_ignored'
+        );
+      }
     }
   }
-  return outputs;
+  return { completedNodeOutputs, tokens: mergeTokenUsage(usages), costUsd };
 }

@@ -87,6 +87,7 @@ interface NodeStartedEvent {
   provider?: string; // resolved AI provider (absent for bash/script nodes)
   model?: string; // resolved model string (absent for bash/script nodes)
   tier?: 'small' | 'medium' | 'large'; // only set when node.model was a tier keyword
+  effort?: string; // resolved AI effort (absent when unset or unsupported)
 }
 
 interface NodeCompletedEvent {
@@ -121,6 +122,7 @@ interface ToolStartedEvent {
   runId: string;
   toolName: string;
   stepName: string;
+  toolCallId: string;
 }
 
 interface ToolCompletedEvent {
@@ -129,6 +131,9 @@ interface ToolCompletedEvent {
   toolName: string;
   stepName: string;
   durationMs: number;
+  toolCallId: string;
+  toolOutcome?: 'success' | 'error' | 'interrupted' | 'unknown';
+  exitCode?: number;
 }
 
 interface ApprovalPendingEvent {
@@ -161,6 +166,9 @@ interface TaskActivityEvent {
   usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
   lastToolName?: string;
   taskType?: string;
+  /** Transcript/output file the settled task points at (task_notification only)
+   *  — the artifact trail for delegated work (#2083). */
+  outputFile?: string;
   /** True when SDK signaled skip_transcript (housekeeping) — propagated so the
    *  UI / persistence layer can decide whether to surface. The provider
    *  filters these out today, but the field is here for forward-compat. */
@@ -183,6 +191,26 @@ interface HookActivityEvent {
   exitCode?: number;
 }
 
+/**
+ * Container isolation backend lifecycle (folder-project container runs).
+ * `created`/`destroyed` bracket the run; `stopped`/`resumed` bracket a suspend
+ * across a pause; the `writeback_*` phases track the engine-level write-back gate
+ * (requested → applied / discarded) (Phase C).
+ */
+export interface ContainerLifecycleEvent {
+  type: 'container_lifecycle';
+  runId: string;
+  phase:
+    | 'created'
+    | 'stopped'
+    | 'resumed'
+    | 'destroyed'
+    | 'writeback_requested'
+    | 'writeback_applied'
+    | 'writeback_discarded';
+  containerId?: string;
+}
+
 export type WorkflowEmitterEvent =
   | WorkflowStartedEvent
   | WorkflowCompletedEvent
@@ -200,7 +228,8 @@ export type WorkflowEmitterEvent =
   | ApprovalPendingEvent
   | WorkflowCancelledEvent
   | TaskActivityEvent
-  | HookActivityEvent;
+  | HookActivityEvent
+  | ContainerLifecycleEvent;
 
 // ---------------------------------------------------------------------------
 // Emitter class

@@ -2,10 +2,13 @@
 export {
   expandTilde,
   isDocker,
+  isWSL,
+  getWSLDistroName,
   getArchonHome,
   getArchonWorkspacesPath,
   ensureArchonWorkspacesPath,
   getArchonWorktreesPath,
+  getArchonTempPath,
   getArchonConfigPath,
   getCredentialKeyPath,
   getArchonEnvPath,
@@ -22,6 +25,7 @@ export {
   logArchonPaths,
   validateAppDefaultsPaths,
   parseOwnerRepo,
+  resolveRepoProjectIdentity,
   getProjectRoot,
   getProjectSourcePath,
   getProjectWorktreesPath,
@@ -29,12 +33,27 @@ export {
   getProjectLogsPath,
   getRunArtifactsPath,
   getRunLogPath,
+  sanitizeScopeSegment,
+  getScopeArtifactsPath,
+  resolveProjectStorageKey,
+  getProjectStoragePaths,
+  getStoragePathsForRoot,
+  isInsideArchonHome,
+  getRunArtifactsDirForKey,
+  getRunArtifactsDirForRoot,
+  slugifyFolderName,
+  getFolderProjectRoot,
+  getFolderProjectArtifactsPath,
+  getFolderProjectLogsPath,
+  getFolderRunArtifactsPath,
+  ensureFolderProjectStructure,
   resolveProjectRootFromCwd,
   ensureProjectStructure,
   createProjectSourceSymlink,
   findMarkdownFilesRecursive,
   getWebDistDir,
 } from './archon-paths';
+export type { ProjectStorageKey, ProjectStoragePaths } from './archon-paths';
 
 // Env loader
 export { loadArchonEnv, isVerboseBoot } from './env-loader';
@@ -44,7 +63,12 @@ export { createLogger, setLogLevel, getLogLevel, rootLogger } from './logger';
 export type { Logger } from './logger';
 
 // Build-time constants (rewritten by scripts/build-binaries.sh)
-export { BUNDLED_IS_BINARY, BUNDLED_VERSION, BUNDLED_GIT_COMMIT } from './bundled-build';
+export {
+  BUNDLED_IS_BINARY,
+  BUNDLED_VERSION,
+  BUNDLED_GIT_COMMIT,
+  BUNDLED_WEB_DIST_SHA256,
+} from './bundled-build';
 
 // Update check
 export {

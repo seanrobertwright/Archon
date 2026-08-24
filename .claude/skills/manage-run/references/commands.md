@@ -88,6 +88,13 @@ Approve a paused gate (approval node or interactive loop).
 ```
 Non-`--json`: records the approval **and auto-resumes** (blocking — run as a background task).
 
+**Interactive-loop gates:** the comment decides finalize-vs-iterate. If the gate paused on
+an iteration where any declared completion condition was met (`get <run-id> --json` →
+`.metadata.approval.completionSignaled` is `true`), approving with **no comment** accepts
+the completion — the node finalizes from its computed output on resume (no re-run).
+A comment runs another iteration with it as `$LOOP_USER_INPUT`. On an unmet gate,
+both forms iterate.
+
 ### `archon workflow reject <run-id> [reason] [--json]`
 Reject a paused gate. `cancelled: false` means an `on_reject` rework pass is queued
 (run is resumable); `cancelled: true` ends the run.
@@ -97,9 +104,18 @@ Reject a paused gate. `cancelled: false` means an `on_reject` rework pass is que
 ```
 
 ### `archon workflow abandon <run-id> [--json]`
-Cancel a non-terminal run. (There is no separate `cancel` verb.)
+Mark a non-terminal run cancelled without stopping host work. Use for paused runs or
+after independently verifying that a running owner is gone.
 ```json
 { "ok": true, "runId": "…", "action": "abandon", "status": "cancelled", "workflowName": "…" }
+```
+
+### `archon workflow cancel <run-id> [--json]`
+Actively stop a running CLI `--detach` owner. The command proves the exact live owner,
+terminates its process tree, and only then records `cancelled`. Failure leaves state unchanged.
+```json
+{ "ok": true, "runId": "…", "action": "cancel", "status": "cancelled",
+  "processStopped": true, "workflowName": "…" }
 ```
 
 ### `archon workflow resume <run-id> [--json]`

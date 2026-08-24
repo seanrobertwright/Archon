@@ -8,7 +8,7 @@ import { type Conversation, type CommandResult, ConversationNotFoundError } from
 import * as db from '../db/conversations';
 import * as codebaseDb from '../db/codebases';
 import * as sessionDb from '../db/sessions';
-import { listWorktrees, execFileAsync, toRepoPath } from '@archon/git';
+import { listWorktrees, execFileAsync, listChildRepos, toRepoPath } from '@archon/git';
 import { getIsolationProvider } from '@archon/isolation';
 import * as isolationEnvDb from '../db/isolation-environments';
 import {
@@ -20,22 +20,26 @@ import { getArchonWorkspacesPath } from '@archon/paths';
 import { loadConfig } from '../config/config-loader';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
+import { resolveContinuationWorkflow } from '@archon/workflows/executor';
+import { createWorkflowDeps } from '../workflows/store-adapter';
 import type {
   WorkflowWithSource,
   WorkflowLoadError,
   WorkflowDefinition,
 } from '@archon/workflows/schemas/workflow';
+import { isContainerRun } from '@archon/workflows/schemas/workflow-run';
 import * as workflowDb from '../db/workflows';
 import {
   approveWorkflow,
   rejectWorkflow,
+  respondToWorkflow,
   getWorkflowStatus,
   resumeWorkflow,
   abandonWorkflow,
+  abandonResumableRunsForConversation,
   resetWorkflowNodeSessions,
 } from '../operations/workflow-operations';
-import { getTriggerForCommand, type DeactivatingCommand } from '../state/session-transitions';
-import { SessionNotFoundError } from '../db/sessions';
+import { safeDeactivateSession } from '../state/session-transitions';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -139,17 +143,35 @@ async function getCurrentBranch(repoPath: string): Promise<string> {
 }
 
 /**
+ * Format a folder project's contained git repos for status display.
+ * Truncates the visible list at 10 and appends a "(+N more)" count.
+ */
+function formatChildRepos(childRepos: string[]): string {
+  const MAX_SHOWN = 10;
+  const shown = childRepos.slice(0, MAX_SHOWN);
+  const remaining = childRepos.length - shown.length;
+  const suffix = remaining > 0 ? `, … (+${String(remaining)} more)` : '';
+  return `Contains ${String(childRepos.length)} git repo${childRepos.length === 1 ? '' : 's'}: ${shown.join(', ')}${suffix}`;
+}
+
+/**
  * Format repository context for user-facing display.
  * Shows "owner/repo @ branch" instead of filesystem paths.
  *
  * @returns Formatted context string. Never throws - falls back gracefully on errors.
  */
 async function formatRepoContext(
-  codebase: { name: string; default_cwd: string } | null,
+  codebase: { name: string; default_cwd: string; kind?: 'repo' | 'folder' } | null,
   isolationEnvId: string | null
 ): Promise<string> {
   if (!codebase) {
     return 'No codebase configured';
+  }
+
+  // Folder projects have no git — show an honest "no git" label instead of a
+  // branch (a folder root may not be a repo at all).
+  if (codebase.kind === 'folder') {
+    return `${codebase.name} (folder — no git)`;
   }
 
   // If in a worktree, use the worktree's branch name from database
@@ -248,26 +270,152 @@ function findWorkflowLoadError(
 }
 
 /**
- * Safely deactivate a session with TOCTOU race handling.
- * Between getActiveSession() and deactivateSession(), another process
- * (cleanup service, concurrent command) may have already deactivated it.
- * Treats SessionNotFoundError as benign in that case.
+ * Resolve everything the orchestrator needs to continue a resumable run: the run
+ * itself plus its workflow definition, packaged as the `workflow` payload of a
+ * `CommandResult`. Returns a user-facing failure message instead when the run is
+ * not resumable or its workflow can no longer be loaded.
+ *
+ * Shared by `/workflow resume`, `/workflow approve` and `/workflow reject`
+ * (#2565): a gate decision that does not continue the run leaves it stranded, so
+ * all three resolve the same continuation the same way. Also reused by the HTTP
+ * `resumeRunHeadless` fallback (packages/server) for runs with no parent
+ * conversation to dispatch a chat message through (#2008).
  */
-async function safeDeactivateSession(
-  sessionId: string,
-  commandName: DeactivatingCommand
-): Promise<void> {
-  const trigger = getTriggerForCommand(commandName);
-  try {
-    await sessionDb.deactivateSession(sessionId, trigger);
-    getLog().debug({ sessionId, trigger }, 'session_deactivated');
-  } catch (error) {
-    if (error instanceof SessionNotFoundError) {
-      getLog().debug({ sessionId, trigger }, 'session_already_deactivated');
-    } else {
-      throw error;
-    }
+export async function resolveRunContinuation(
+  runId: string,
+  workflowCwd: string
+): Promise<
+  | { ok: true; workflow: NonNullable<CommandResult['workflow']>; workflowName: string }
+  // `resumeHint` replaces the caller's default "retry with /workflow resume"
+  // line when that is the wrong next step.
+  | { ok: false; message: string; resumeHint?: string }
+> {
+  const run = await resumeWorkflow(runId);
+  // A container run can only be resumed where the container can be rewired, so
+  // handing this one back for a chat dispatch would fail the run to say what we
+  // can say here for free (#2565).
+  if (isContainerRun(run)) {
+    return {
+      ok: false,
+      message: 'it executed inside an isolation container, which chat cannot rewire.',
+      resumeHint: `Finish it with \`archon workflow resume ${runId}\` from the CLI in the same project.`,
+    };
   }
+  // The graph this run FROZE, not whatever the target holds now. Without this the run
+  // resumes into a possibly-edited DAG while the executor still feeds it commands and
+  // scripts from the old capture — a graph from one moment against resources from
+  // another. Returns undefined only for a run predating capture, which falls through to
+  // live discovery below exactly as before.
+  try {
+    const continuation = await resolveContinuationWorkflow(createWorkflowDeps(), run, workflowCwd);
+    if (continuation) {
+      return {
+        ok: true,
+        workflowName: continuation.workflow.name,
+        workflow: {
+          definition: continuation.workflow,
+          args: run.user_message,
+          resumeRunId: run.id,
+          resumeRun: run,
+          // Already resolved from the run's recorded source, digest verified and
+          // discovered. Forwarded so dispatch does not pay for both again.
+          resolvedContinuation: continuation.workflow,
+        },
+      };
+    }
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, runId }, 'cmd.workflow_continuation_source_failed');
+    return {
+      ok: false,
+      message: `its recorded workflow source is unavailable: ${err.message}`,
+      resumeHint: 'Start a fresh run to execute the current workflow.',
+    };
+  }
+
+  let workflowEntries: readonly WorkflowWithSource[];
+  let loadErrors: readonly WorkflowLoadError[];
+  try {
+    const result = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
+    workflowEntries = result.workflows;
+    loadErrors = result.errors;
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, cwd: workflowCwd, runId }, 'cmd.workflow_resume_discovery_failed');
+    return {
+      ok: false,
+      message: `Failed to load workflows: ${err.message}\n\nCheck .archon/workflows/ for YAML syntax issues.`,
+    };
+  }
+  const workflow = resolveWorkflowName(
+    run.workflow_name,
+    workflowEntries.map(ws => ws.workflow)
+  );
+  if (!workflow) {
+    const loadError = findWorkflowLoadError(loadErrors, run.workflow_name);
+    if (loadError) {
+      return {
+        ok: false,
+        message: `Workflow \`${run.workflow_name}\` failed to load: ${loadError.error}\n\nFix the YAML file and try again.`,
+      };
+    }
+    return {
+      ok: false,
+      message:
+        `Workflow \`${run.workflow_name}\` for run ${runId} was not found.\n\n` +
+        'Use /workflow list to check available workflows.',
+    };
+  }
+  return {
+    ok: true,
+    workflowName: workflow.name,
+    workflow: {
+      definition: workflow,
+      args: run.user_message,
+      resumeRunId: run.id,
+      resumeRun: run,
+    },
+  };
+}
+
+/**
+ * Attach the run continuation to an already-recorded gate decision.
+ *
+ * The decision is committed by the time this runs, so a continuation that cannot
+ * be resolved is reported as a follow-up step, never as a failed command — saying
+ * "failed" about a gate that IS resolved would send the user to re-approve a run
+ * that refuses a second decision.
+ */
+async function withRunContinuation(
+  runId: string,
+  workflowCwd: string,
+  headline: string,
+  action: 'approve' | 'reject' | 'respond'
+): Promise<CommandResult> {
+  let continuation: Awaited<ReturnType<typeof resolveRunContinuation>>;
+  try {
+    continuation = await resolveRunContinuation(runId, workflowCwd);
+  } catch (error) {
+    const err = error as Error;
+    getLog().warn(
+      { err, errorType: err.constructor.name, runId, action },
+      'cmd.workflow_gate_continuation_unresolved'
+    );
+    continuation = { ok: false, message: err.message };
+  }
+  if (!continuation.ok) {
+    const hint =
+      continuation.resumeHint ?? `Resume it with \`/workflow resume ${runId}\` once that is fixed.`;
+    return {
+      success: true,
+      message: `${headline}\nThe run could not be continued automatically: ${continuation.message}\n${hint}`,
+    };
+  }
+  return {
+    success: true,
+    message: `${headline}\nResuming \`${continuation.workflowName}\`...`,
+    workflow: continuation.workflow,
+  };
 }
 
 async function handleWorktreeCommand(
@@ -284,6 +432,15 @@ async function handleWorktreeCommand(
   const codebase = await codebaseDb.getCodebase(conversation.codebase_id);
   if (!codebase) {
     return { success: false, message: 'Codebase not found.' };
+  }
+
+  // Worktrees are a git-repo concept — folder projects run in place and have no
+  // worktree lifecycle. Reject clearly rather than failing deep in git.
+  if (codebase.kind === 'folder') {
+    return {
+      success: false,
+      message: `/worktree is not applicable to folder projects. "${codebase.name}" runs in place (no git worktree).`,
+    };
   }
 
   const mainPath = codebase.default_cwd;
@@ -634,9 +791,16 @@ async function handleWorkflowCommand(
 
       if (workflowEntries.length > 0) {
         msg += 'Available Workflows:\n\n';
-        for (const { workflow: w } of workflowEntries) {
+        for (const { workflow: w, parseWarnings } of workflowEntries) {
           const modeInfo = `DAG: ${String(w.nodes.length)} nodes`;
-          msg += `**\`${w.name}\`**\n  ${w.description}\n  ${modeInfo}\n\n`;
+          msg += `**\`${w.name}\`**\n  ${w.description}\n  ${modeInfo}\n`;
+          // Keys the engine silently drops (#2213). Rendered inline with the
+          // workflow rather than in a trailer so the author sees which of their
+          // workflows is affected without cross-referencing.
+          for (const warning of parseWarnings ?? []) {
+            msg += `  ⚠️ ${warning}\n`;
+          }
+          msg += '\n';
         }
       }
 
@@ -741,47 +905,14 @@ async function handleWorkflowCommand(
         };
       }
       try {
-        const run = await resumeWorkflow(runId);
-        let workflowEntries: readonly WorkflowWithSource[];
-        let loadErrors: readonly WorkflowLoadError[];
-        try {
-          const result = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
-          workflowEntries = result.workflows;
-          loadErrors = result.errors;
-        } catch (error) {
-          const err = error as Error;
-          getLog().error({ err, cwd: workflowCwd, runId }, 'cmd.workflow_resume_discovery_failed');
-          return {
-            success: false,
-            message: `Failed to load workflows: ${err.message}\n\nCheck .archon/workflows/ for YAML syntax issues.`,
-          };
-        }
-        const workflows = workflowEntries.map(ws => ws.workflow);
-        const workflow = resolveWorkflowName(run.workflow_name, workflows);
-        if (!workflow) {
-          const loadError = findWorkflowLoadError(loadErrors, run.workflow_name);
-          if (loadError) {
-            return {
-              success: false,
-              message: `Workflow \`${run.workflow_name}\` failed to load: ${loadError.error}\n\nFix the YAML file and try again.`,
-            };
-          }
-          return {
-            success: false,
-            message:
-              `Workflow \`${run.workflow_name}\` for run ${runId} was not found.\n\n` +
-              'Use /workflow list to check available workflows.',
-          };
+        const continuation = await resolveRunContinuation(runId, workflowCwd);
+        if (!continuation.ok) {
+          return { success: false, message: continuation.message };
         }
         return {
           success: true,
-          message: `Resuming workflow: \`${workflow.name}\``,
-          workflow: {
-            definition: workflow,
-            args: run.user_message,
-            resumeRunId: run.id,
-            resumeRun: run,
-          },
+          message: `Resuming workflow: \`${continuation.workflowName}\``,
+          workflow: continuation.workflow,
         };
       } catch (error) {
         const err = error as Error;
@@ -799,11 +930,15 @@ async function handleWorkflowCommand(
         };
       }
       try {
-        const run = await abandonWorkflow(runId);
-        return {
-          success: true,
-          message: `Abandoned workflow run \`${run.workflow_name}\` (${runId})`,
-        };
+        const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(runId);
+        let message = `Abandoned workflow run \`${run.workflow_name}\` (${runId})`;
+        if (cascadeFailures > 0) {
+          message += `\n⚠️ ${String(cascadeFailures)} sub-run(s) could not be cancelled and may still be running — check /workflow status.`;
+        }
+        if (blockedParentRunId) {
+          message += `\n⚠️ Parent run ${blockedParentRunId} was blocked on this sub-run and stays paused. Resume it to fail the node cleanly, or abandon it too.`;
+        }
+        return { success: true, message };
       } catch (error) {
         const err = error as Error;
         getLog().error({ err, runId }, 'cmd.workflow_abandon_failed');
@@ -850,15 +985,24 @@ async function handleWorkflowCommand(
           message: 'Usage: /workflow approve <id> [comment]\n\nApproves a paused workflow run.',
         };
       }
-      const comment = args.slice(2).join(' ') || 'Approved';
+      // Pass the RAW comment through (undefined when the user typed none) —
+      // approveWorkflow defaults the recorded comment internally, but "no
+      // feedback" must survive so a signal-bearing interactive-loop gate
+      // finalizes instead of re-running (#2074, loop_feedback_given). Mirrors
+      // the HTTP route and CLI.
+      const rawComment = args.slice(2).join(' ');
+      const comment = rawComment.length > 0 ? rawComment : undefined;
       try {
         const result = await approveWorkflow(runId, comment);
         const pathInfo = result.workingPath ? `\nPath: \`${result.workingPath}\`` : '';
-        const msg =
+        const headline =
           result.type === 'interactive_loop'
-            ? `Workflow \`${result.workflowName}\` loop input received.${pathInfo}\nType your next message in this conversation to resume the workflow.`
-            : `Workflow \`${result.workflowName}\` approved.${pathInfo}\nType your response in this conversation to resume the workflow.`;
-        return { success: true, message: msg };
+            ? `Workflow \`${result.workflowName}\` loop input received.${pathInfo}`
+            : `Workflow \`${result.workflowName}\` approved.${pathInfo}`;
+        // Resolving is only half the action — continue the run too (#2565).
+        // Before #2565 this told the user to "type your response to resume",
+        // which relied on a natural-language branch that no longer exists.
+        return await withRunContinuation(runId, workflowCwd, headline, 'approve');
       } catch (error) {
         const err = error as Error;
         getLog().error({ err, runId }, 'cmd.workflow_approve_failed');
@@ -884,16 +1028,77 @@ async function handleWorkflowCommand(
             message: `Workflow \`${result.workflowName}\` rejected and cancelled${suffix}.`,
           };
         }
-        return {
-          success: true,
-          message:
-            `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...\n` +
-            'Type your next message in this conversation to resume the workflow.',
-        };
+        // Not cancelled means either a legacy on_reject rework is staged, or
+        // (#2707 step 1) a new-mode gate resolved with structured output —
+        // continue the run either way so the resolution actually takes effect
+        // (#2565).
+        return await withRunContinuation(
+          runId,
+          workflowCwd,
+          result.newMode
+            ? `Workflow \`${result.workflowName}\` rejected. Continuing...`
+            : `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
+          'reject'
+        );
       } catch (error) {
         const err = error as Error;
         getLog().error({ err, runId }, 'cmd.workflow_reject_failed');
         return { success: false, message: `Failed to reject workflow run: ${err.message}` };
+      }
+    }
+
+    case 'respond': {
+      // General drive verb (#2707 step 2): resolves a paused gate with any of its
+      // author-declared decisions. 'approve'/'reject' behave identically to the
+      // dedicated commands above — respondToWorkflow delegates those two ids to the
+      // exact same approveWorkflow/rejectWorkflow functions — this handler just
+      // formats whichever result shape comes back.
+      const runId = args[1];
+      const decision = args[2];
+      if (!runId || !decision) {
+        return {
+          success: false,
+          message:
+            'Usage: /workflow respond <id> <decision> [text]\n\n' +
+            "Resolves a paused gate with any of its declared decisions ('approve'/'reject' " +
+            'are sugar for the dedicated /workflow approve|reject commands).',
+        };
+      }
+      const rawText = args.slice(3).join(' ');
+      // Mirrors the dedicated /workflow reject command's default: an empty reason
+      // becomes 'Rejected' rather than reaching a new-mode gate's structured
+      // output as ''. Only for decision === 'reject' — respond's other decisions
+      // (including 'approve', which stays optional/undefined) are unaffected.
+      const text = rawText.length > 0 ? rawText : decision === 'reject' ? 'Rejected' : undefined;
+      try {
+        const result = await respondToWorkflow(runId, decision, text);
+        if ('cancelled' in result) {
+          if (result.cancelled) {
+            const suffix = result.maxAttemptsReached ? ' (max attempts reached)' : '';
+            return {
+              success: true,
+              message: `Workflow \`${result.workflowName}\` rejected and cancelled${suffix}.`,
+            };
+          }
+          return await withRunContinuation(
+            runId,
+            workflowCwd,
+            result.newMode
+              ? `Workflow \`${result.workflowName}\` rejected. Continuing...`
+              : `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
+            'respond'
+          );
+        }
+        const pathInfo = result.workingPath ? `\nPath: \`${result.workingPath}\`` : '';
+        const headline =
+          result.type === 'interactive_loop'
+            ? `Workflow \`${result.workflowName}\` loop input received.${pathInfo}`
+            : `Workflow \`${result.workflowName}\` responded '${decision}'.${pathInfo}`;
+        return await withRunContinuation(runId, workflowCwd, headline, 'respond');
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, runId, decision }, 'cmd.workflow_respond_failed');
+        return { success: false, message: `Failed to respond to workflow run: ${err.message}` };
       }
     }
 
@@ -979,6 +1184,11 @@ async function handleWorkflowCommand(
 
       getLog().info({ workflow: workflow.name, args: workflowArgs }, 'cmd.workflow_starting');
 
+      // Recover the discovery entry the `.map()` above dropped, so the keys the
+      // engine ignores reach the conversation when the run STARTS — not only
+      // when the author happens to browse `/workflow list` (#2213).
+      const resolvedEntry = workflowEntries.find(ws => ws.workflow === workflow);
+
       // Return special result that triggers workflow execution in orchestrator
       return {
         success: true,
@@ -987,6 +1197,9 @@ async function handleWorkflowCommand(
           definition: workflow,
           args: workflowArgs,
           force: force ? true : undefined,
+          ...(resolvedEntry?.parseWarnings && resolvedEntry.parseWarnings.length > 0
+            ? { parseWarnings: resolvedEntry.parseWarnings }
+            : {}),
         },
       };
     }
@@ -1070,12 +1283,22 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       const codebase = conversation.codebase_id
         ? await codebaseDb.getCodebase(conversation.codebase_id)
         : null;
+      const isFolderProject = codebase?.kind === 'folder';
 
       if (codebase?.name) {
         const repoContext = await formatRepoContext(codebase, conversation.isolation_env_id);
+        // conversation.cwd is an explicit runtime override (set by worktree
+        // create/remove); when unset, the registered project root is the
+        // effective working directory. Same fallback as handleWorkflowCommand.
+        const effectiveCwd = conversation.cwd ?? codebase.default_cwd;
         msg += `\n\n## Conversation Context\n- Project: ${repoContext}`;
-        if (conversation.cwd) {
-          msg += `\n- Working Directory: ${conversation.cwd}`;
+        msg += `\n- Working Directory: ${effectiveCwd}`;
+        // For a folder project, surface the git repos contained under its root.
+        if (isFolderProject) {
+          const childRepos = await listChildRepos(codebase.default_cwd);
+          if (childRepos.length > 0) {
+            msg += `\n- ${formatChildRepos(childRepos)}`;
+          }
         }
       } else {
         msg += '\n\n## Conversation Context\n- Project: None — orchestrator will route as needed';
@@ -1113,8 +1336,9 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
         );
       }
 
-      // Add worktree breakdown if codebase is configured
-      if (codebase) {
+      // Add worktree breakdown if codebase is configured. Folder projects run in
+      // place and have no worktrees — skip the breakdown entirely.
+      if (codebase && !isFolderProject) {
         try {
           const breakdown = await getWorktreeStatusBreakdown(codebase.id, codebase.default_cwd);
           msg += `\n\nWorktrees: ${String(breakdown.total)} active`;
@@ -1159,18 +1383,94 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
     }
 
     case 'reset': {
-      const session = await sessionDb.getActiveSession(conversation.id);
-      if (session) {
-        await safeDeactivateSession(session.id, 'reset');
-        return {
-          success: true,
-          message:
-            'Session cleared. Starting fresh on next message.\n\nCodebase configuration preserved.',
-        };
+      // /reset is an explicit "start fresh" intent, and deactivating the AI
+      // session alone does not deliver it: the execution binding (cwd +
+      // isolation env) survives, and so does every resumable run, so the next
+      // message can continue an old run on an old worktree instead of starting
+      // over. This clears all three.
+      //
+      // `codebase_id` is deliberately PRESERVED. The resulting row —
+      // {codebase_id: <kept>, cwd: null, isolation_env_id: null} — is byte-for-
+      // byte what /setproject already writes, so this is a well-trodden state,
+      // not a novel one. Detaching the project is /setproject none's job.
+      let hadActiveSession = false;
+      let sessionError: string | null = null;
+      try {
+        const session = await sessionDb.getActiveSession(conversation.id);
+        hadActiveSession = session !== null;
+        if (session) {
+          await safeDeactivateSession(session.id, 'reset');
+        }
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_clear_session_failed');
+        sessionError = err.message;
       }
+
+      // Three independent effects, three independent try blocks. Sharing the
+      // run and binding effects would mean that a binding-clear failure AFTER
+      // a successful abandon swallows
+      // the count and reports only the failure — precisely the case where the
+      // user most needs to know that N runs were already cancelled.
+      let abandoned = 0;
+      let abandonBlockedParentRunId: string | null = null;
+      let abandonError: string | null = null;
+      try {
+        ({ abandoned, blockedParentRunId: abandonBlockedParentRunId } =
+          await abandonResumableRunsForConversation(conversation.id));
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_abandon_failed');
+        abandonError = err.message;
+      }
+
+      let bindingCleared = true;
+      let bindingError: string | null = null;
+      try {
+        await db.updateConversation(conversation.id, { cwd: null, isolation_env_id: null });
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_clear_binding_failed');
+        bindingCleared = false;
+        bindingError = err.message;
+      }
+
+      const parts = [
+        sessionError !== null
+          ? `Could not clear the AI session: ${sessionError}`
+          : hadActiveSession
+            ? 'Session cleared.'
+            : 'No active session.',
+      ];
+      parts.push(
+        bindingCleared
+          ? 'Cleared workspace binding (worktree + isolation env).'
+          : `Could not clear the workspace binding: ${bindingError ?? 'unknown error'}`
+      );
+      if (abandoned > 0) parts.push(`Abandoned ${String(abandoned)} resumable run(s).`);
+      if (abandonBlockedParentRunId !== null) {
+        parts.push(
+          `⚠️ Parent run ${abandonBlockedParentRunId} was blocked on an abandoned sub-run and stays paused. Resume it to fail the node cleanly, or abandon it too.`
+        );
+      }
+      if (abandonError !== null) {
+        parts.push(`⚠️ Could not look up resumable runs: ${abandonError}`);
+      }
+
+      const resetComplete =
+        sessionError === null &&
+        bindingCleared &&
+        abandonError === null &&
+        abandonBlockedParentRunId === null;
+      parts.push(
+        resetComplete
+          ? 'Project attachment preserved — next message starts fresh.'
+          : 'Project attachment preserved. Reset is incomplete — retry /reset before sending the next message.'
+      );
+
       return {
-        success: true,
-        message: 'No active session to reset.',
+        success: resetComplete,
+        message: parts.join(' '),
       };
     }
 
@@ -1181,15 +1481,24 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       return handleWorkflowCommand(conversation, args);
 
     case 'init': {
-      // Create .archon structure in current repo
-      if (!conversation.cwd) {
+      // Create .archon structure in the effective working directory:
+      // the explicit runtime override (conversation.cwd) when set, else the
+      // selected project's root. Web-created project conversations have
+      // codebase_id but null cwd (issue #1993), so the fallback is what
+      // makes /init work there.
+      const initCodebase = conversation.codebase_id
+        ? await codebaseDb.getCodebase(conversation.codebase_id)
+        : null;
+      const initCwd = conversation.cwd ?? initCodebase?.default_cwd;
+      if (!initCwd) {
         return {
           success: false,
-          message: 'No working directory set. Register a project first with /register-project.',
+          message:
+            'No project selected. Pick one with /setproject <name> (register it first with /register-project if needed).',
         };
       }
 
-      const archonDir = join(conversation.cwd, '.archon');
+      const archonDir = join(initCwd, '.archon');
       const commandsDir = join(archonDir, 'commands');
       const configPath = join(archonDir, 'config.yaml');
 
@@ -1232,8 +1541,7 @@ description: Example command
 This is an example command.
 
 Arguments:
-- $1 - First positional argument
-- $ARGUMENTS - All arguments as string
+- $ARGUMENTS - The full trigger message
 
 Task: $ARGUMENTS
 `;

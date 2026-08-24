@@ -2,6 +2,12 @@
 -- Version: Combined (final state after migrations 001-020)
 -- Description: Complete database schema (idempotent - safe to run multiple times)
 --
+-- Layout (load-bearing, not cosmetic — see the final section for why):
+--   * CREATE TABLE and ALTER TABLE ... ADD COLUMN come first, in feature order.
+--   * Everything that NAMES A COLUMN — every CREATE INDEX, every
+--     COMMENT ON COLUMN — goes in the final "Indexes and column comments"
+--     section, below every ADD COLUMN.
+--
 -- 14 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
 --   1. remote_agent_codebases
 --   1b. remote_agent_codebase_env_vars
@@ -37,6 +43,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_codebases (
   default_cwd VARCHAR(500) NOT NULL,
   default_branch VARCHAR(255),
   ai_assistant_type VARCHAR(20) DEFAULT 'claude',
+  kind VARCHAR(10) NOT NULL DEFAULT 'repo' CHECK (kind IN ('repo', 'folder')),
   allow_env_keys BOOLEAN NOT NULL DEFAULT FALSE,
   commands JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMP DEFAULT NOW(),
@@ -59,9 +66,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_codebase_env_vars (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   UNIQUE(codebase_id, key)
 );
-
-CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id
-  ON remote_agent_codebase_env_vars(codebase_id);
 
 COMMENT ON TABLE remote_agent_codebase_env_vars IS
   'Per-project env vars merged into Options.env on Claude SDK calls. Managed via Web UI or config.';
@@ -95,9 +99,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_user_identities (
   UNIQUE(platform, platform_user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_user_identities_user_id
-  ON remote_agent_user_identities(user_id);
-
 COMMENT ON TABLE remote_agent_user_identities IS
   'Maps platform-native user IDs (Slack U-ids, Telegram chat ids, GitHub logins, Discord snowflakes) to Archon user UUIDs.';
 
@@ -122,16 +123,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_conversations (
   UNIQUE(platform_type, platform_conversation_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_remote_agent_conversations_codebase
-  ON remote_agent_conversations(codebase_id);
-CREATE INDEX IF NOT EXISTS idx_conversations_hidden
-  ON remote_agent_conversations(hidden);
-CREATE INDEX IF NOT EXISTS idx_conversations_codebase
-  ON remote_agent_conversations(codebase_id) WHERE deleted_at IS NULL;
-
-COMMENT ON COLUMN remote_agent_conversations.isolation_env_id IS
-  'UUID reference to isolation_environments table (the only isolation reference)';
-
 -- ============================================================================
 -- Table 3: Sessions
 -- ============================================================================
@@ -150,22 +141,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_sessions (
   started_at TIMESTAMP DEFAULT NOW(),
   ended_at TIMESTAMP
 );
-
-CREATE INDEX IF NOT EXISTS idx_remote_agent_sessions_conversation
-  ON remote_agent_sessions(conversation_id, active);
-CREATE INDEX IF NOT EXISTS idx_remote_agent_sessions_codebase
-  ON remote_agent_sessions(codebase_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_parent
-  ON remote_agent_sessions(parent_session_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_conversation_started
-  ON remote_agent_sessions(conversation_id, started_at DESC);
-
-COMMENT ON COLUMN remote_agent_sessions.parent_session_id IS
-  'Links to the previous session in this conversation (for audit trail)';
-COMMENT ON COLUMN remote_agent_sessions.transition_reason IS
-  'Why this session was created: plan-to-execute, isolation-changed, reset-requested, etc.';
-COMMENT ON COLUMN remote_agent_sessions.ended_reason IS
-  'Why this session was deactivated: reset-requested, cwd-changed, conversation-closed, etc.';
 
 -- ============================================================================
 -- Table 4: Isolation Environments
@@ -193,33 +168,13 @@ CREATE TABLE IF NOT EXISTS remote_agent_isolation_environments (
   metadata              JSONB DEFAULT '{}'
 );
 
--- Partial unique index: only active environments need uniqueness
-CREATE UNIQUE INDEX IF NOT EXISTS unique_active_workflow
-  ON remote_agent_isolation_environments (codebase_id, workflow_type, workflow_id)
-  WHERE status = 'active';
-
--- Indexes for common queries
-CREATE INDEX IF NOT EXISTS idx_isolation_env_codebase
-  ON remote_agent_isolation_environments(codebase_id);
-CREATE INDEX IF NOT EXISTS idx_isolation_env_status
-  ON remote_agent_isolation_environments(status);
-CREATE INDEX IF NOT EXISTS idx_isolation_env_workflow
-  ON remote_agent_isolation_environments(workflow_type, workflow_id);
-
 -- Add FK from conversations to isolation_environments (deferred to avoid circular dependency)
 ALTER TABLE remote_agent_conversations
   ADD COLUMN IF NOT EXISTS isolation_env_id UUID
     REFERENCES remote_agent_isolation_environments(id) ON DELETE SET NULL;
 
-CREATE INDEX IF NOT EXISTS idx_conversations_isolation_env_id
-  ON remote_agent_conversations(isolation_env_id);
-
 COMMENT ON TABLE remote_agent_isolation_environments IS
   'Work-centric isolated environments with independent lifecycle';
-COMMENT ON COLUMN remote_agent_isolation_environments.workflow_type IS
-  'Type of work: issue, pr, review, thread, task';
-COMMENT ON COLUMN remote_agent_isolation_environments.workflow_id IS
-  'Identifier for the work (issue number, PR number, thread hash, etc.)';
 
 -- ============================================================================
 -- Table 5: Workflow Runs
@@ -231,27 +186,18 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
   conversation_id UUID REFERENCES remote_agent_conversations(id) ON DELETE CASCADE,
   codebase_id UUID REFERENCES remote_agent_codebases(id) ON DELETE SET NULL,
   current_step_index INTEGER,
-  status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending, running, completed, failed
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending, running, completed, failed, cancelled, paused
+  outcome VARCHAR(20) CHECK (outcome IN ('succeeded', 'failed')),
   user_message TEXT NOT NULL,
   metadata JSONB DEFAULT '{}',
   parent_conversation_id UUID REFERENCES remote_agent_conversations(id) ON DELETE SET NULL,
+  parent_run_id UUID REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL,
   started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   completed_at TIMESTAMP WITH TIME ZONE,
   last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  working_path TEXT
+  working_path TEXT,
+  output_root TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
-  ON remote_agent_workflow_runs(conversation_id);
-CREATE INDEX IF NOT EXISTS idx_workflow_runs_status
-  ON remote_agent_workflow_runs(status);
-CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv
-  ON remote_agent_workflow_runs(parent_conversation_id);
-
--- Partial index for efficient staleness queries on running workflows
-CREATE INDEX IF NOT EXISTS idx_workflow_runs_last_activity
-  ON remote_agent_workflow_runs(last_activity_at)
-  WHERE status = 'running';
 
 COMMENT ON TABLE remote_agent_workflow_runs IS
   'Tracks workflow execution state for resumption and observability';
@@ -263,6 +209,7 @@ COMMENT ON TABLE remote_agent_workflow_runs IS
 CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  event_order BIGINT,
   event_type VARCHAR(50) NOT NULL,
   step_index INTEGER,
   step_name VARCHAR(255),
@@ -270,17 +217,25 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id
-  ON remote_agent_workflow_events(workflow_run_id);
-CREATE INDEX IF NOT EXISTS idx_workflow_events_type
-  ON remote_agent_workflow_events(event_type);
--- Global created_at index for the dashboard event poller's cross-run tail
--- (WHERE created_at >= $1 ORDER BY created_at ASC).
-CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at
-  ON remote_agent_workflow_events(created_at);
-
 COMMENT ON TABLE remote_agent_workflow_events IS
   'Lean UI-relevant workflow events for observability (step transitions, artifacts, errors)';
+
+-- ============================================================================
+-- Workflow run node sessions (private same-run session lineage)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS remote_agent_workflow_run_node_sessions (
+  workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  node_id VARCHAR(255) NOT NULL,
+  provider VARCHAR(50) NOT NULL,
+  provider_session_id TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  PRIMARY KEY (workflow_run_id, node_id)
+);
+
+COMMENT ON TABLE remote_agent_workflow_run_node_sessions IS
+  'Private provider session handles produced by top-level nodes within one workflow run. Cascades with the owning run and is never exposed through run or event APIs.';
 
 -- ============================================================================
 -- Workflow node sessions (persist_session opt-in across re-runs)
@@ -298,11 +253,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_node_sessions (
   PRIMARY KEY (workflow_name, node_id, scope_key, provider)
 );
 
-CREATE INDEX IF NOT EXISTS idx_workflow_node_sessions_scope
-  ON remote_agent_workflow_node_sessions(scope_key);
-CREATE INDEX IF NOT EXISTS idx_workflow_node_sessions_workflow
-  ON remote_agent_workflow_node_sessions(workflow_name);
-
 COMMENT ON TABLE remote_agent_workflow_node_sessions IS
   'Per-node provider session IDs persisted across workflow re-runs. Keyed by (workflow, node, scope, provider). Scope is typically conversation UUID. No cascade on conversation delete (soft delete + never-reused UUID = harmless orphans); a future hard-delete path must delete by scope_key.';
 
@@ -318,9 +268,6 @@ CREATE TABLE IF NOT EXISTS remote_agent_messages (
   metadata JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMP DEFAULT NOW()
 );
-
-CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
-  ON remote_agent_messages(conversation_id, created_at ASC);
 
 -- ============================================================================
 -- Cleanup: Drop legacy objects from older schemas
@@ -387,6 +334,12 @@ ALTER TABLE remote_agent_codebases
 ALTER TABLE remote_agent_codebases
   ADD COLUMN IF NOT EXISTS default_branch VARCHAR(255);
 
+-- From migration 024: project kind discriminator ('repo' | 'folder').
+-- Folder projects are non-git workspaces (multi-repo roots or plain ops folders)
+-- that run in place with named artifact/log storage under _folder/<slug>/.
+ALTER TABLE remote_agent_codebases
+  ADD COLUMN IF NOT EXISTS kind VARCHAR(10) NOT NULL DEFAULT 'repo';
+
 -- User identity foreign keys (nullable on the four primary tables).
 -- All FKs use ON DELETE SET NULL so future user deletion never cascades destructively.
 ALTER TABLE remote_agent_conversations
@@ -402,10 +355,28 @@ ALTER TABLE remote_agent_isolation_environments
   ADD COLUMN IF NOT EXISTS created_by_user_id UUID
     REFERENCES remote_agent_users(id) ON DELETE SET NULL;
 
-CREATE INDEX IF NOT EXISTS idx_conversations_user_id
-  ON remote_agent_conversations(user_id) WHERE user_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_workflow_runs_user_id
-  ON remote_agent_workflow_runs(user_id) WHERE user_id IS NOT NULL;
+-- Run-tree parent (#2121 Phase 2): a `workflow:` sub-run links back to the run
+-- that spawned it. Self-referential FK, ON DELETE SET NULL so deleting a parent
+-- orphans children rather than cascade-deleting their audit trail. First
+-- self-referential FK on this table — declared identically on SQLite (sqlite.ts).
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS parent_run_id UUID
+    REFERENCES remote_agent_workflow_runs(id) ON DELETE SET NULL;
+
+-- Durable output root (#2200): the resolved `~/.archon/workspaces/<project>/`
+-- directory this run's artifacts, logs, and state live under, written once at
+-- run start. Readers prefer it and only re-derive from codebase identity when
+-- it is NULL (pre-existing rows), so historical artifacts stay addressable
+-- across a codebase rename (#1192). Declared identically on SQLite (sqlite.ts).
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS output_root TEXT;
+
+-- Authored workflow verdict (#2618), independent from lifecycle status. Nullable
+-- means undeclared or not yet authored; no default/backfill so historical rows
+-- remain unknown rather than being reinterpreted from current workflow YAML.
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS outcome VARCHAR(20)
+    CHECK (outcome IN ('succeeded', 'failed'));
 
 -- From PR-C: per-user GitHub user-to-server tokens (device flow), encrypted at rest.
 -- One row per Archon user; cascades on user deletion. github_user_id is the
@@ -477,10 +448,18 @@ CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
   tiers TEXT,
   aliases TEXT,
   default_provider VARCHAR(64),
+  default_model VARCHAR(255),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   UNIQUE(user_id)
 );
+
+-- #1998: per-user default CHAT model, written atomically with
+-- default_provider (a model pin is only meaningful for the provider it was
+-- set with). Idempotent upgrade for installs that created the table before
+-- this column existed.
+ALTER TABLE remote_agent_user_ai_prefs
+  ADD COLUMN IF NOT EXISTS default_model VARCHAR(255);
 
 -- ============================================================================
 -- Web auth (opt-in): role on the canonical user + Better Auth tables
@@ -490,6 +469,50 @@ CREATE TABLE IF NOT EXISTS remote_agent_user_ai_prefs (
 -- 'member' is reserved for future per-resource scoping. Visibility stays open.
 ALTER TABLE remote_agent_users
   ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'admin';
+
+-- Lifecycle ordering (#2359 follow-up): timestamps can tie, especially on
+-- SQLite (one-second precision), so a database-assigned order breaks the tie and
+-- preserves event chronology. `id` cannot serve this role — it is a random UUID,
+-- not monotonic.
+--
+-- Deliberately a plain column plus a sequence DEFAULT, NOT `GENERATED ... AS
+-- IDENTITY`. Adding an identity column REWRITES the whole table under ACCESS
+-- EXCLUSIVE (verified on postgres:18: relfilenode changes), and this is the
+-- largest table in the schema while the schema auto-applies on startup — that is
+-- a boot-time stall proportional to event history. ADD COLUMN with no default is
+-- metadata-only, and SET DEFAULT afterwards applies to future inserts only.
+--
+-- It also keeps both databases honest: existing rows stay NULL on Postgres AND
+-- SQLite, so the COALESCE(event_order, 0) fallback in read queries behaves
+-- identically. An identity column would have back-filled Postgres rows (1, 2,
+-- 3...) while SQLite left them NULL.
+ALTER TABLE remote_agent_workflow_events
+  ADD COLUMN IF NOT EXISTS event_order BIGINT;
+CREATE SEQUENCE IF NOT EXISTS remote_agent_workflow_events_event_order_seq
+  OWNED BY remote_agent_workflow_events.event_order;
+ALTER TABLE remote_agent_workflow_events
+  ALTER COLUMN event_order SET DEFAULT nextval('remote_agent_workflow_events_event_order_seq');
+
+-- ============================================================================
+-- Schema vintage (#2316)
+-- ============================================================================
+--
+-- Which Archon build created this database, and which last applied schema to it.
+-- Diagnostic only — nothing gates, refuses, or warns on these values. Single row
+-- (id = 1); the row's VALUES are written by the adapters from APP_VERSION
+-- (packages/core/src/db/schema-version.ts) so the version string has exactly one
+-- source of truth. created_app_version is NULL for databases that predate this
+-- table and is never back-filled with a guess.
+CREATE TABLE IF NOT EXISTS remote_agent_schema_version (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  created_app_version VARCHAR(64),
+  app_version VARCHAR(64) NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE remote_agent_schema_version IS
+  'Diagnostic schema vintage: the Archon build that created this database and the one that last applied schema to it.';
 
 -- Better Auth tables (PostgreSQL only). Generated by `@better-auth/cli generate`
 -- against packages/server/src/auth/instance.ts (modelName-renamed to the
@@ -545,3 +568,135 @@ CREATE TABLE IF NOT EXISTS remote_agent_auth_verification (
   "createdAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL,
   "updatedAt" timestamptz DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+
+-- ============================================================================
+-- Indexes and column comments
+-- ============================================================================
+--
+-- Every statement that names a COLUMN lives here, below every ADD COLUMN above.
+-- This placement is structural, not stylistic.
+--
+-- `CREATE TABLE IF NOT EXISTS` is a no-op on a database that already has the
+-- table, so a column declared only in a CREATE TABLE body does not exist while
+-- that block runs on an upgrade — it appears later, when the additive ALTER
+-- TABLE block runs. An index or COMMENT ON COLUMN written next to its
+-- CREATE TABLE therefore succeeds on a fresh install and fails on an upgrade
+-- with `ERROR 42703: column ... does not exist`. Because initSchema() applies
+-- this file as one transaction and re-throws at fatal, that single statement
+-- rolls back the entire apply and crash-loops every boot (#2508, #2443).
+--
+-- Keeping these statements below the additive block makes that failure
+-- unrepresentable instead of something each author has to remember. Add new
+-- indexes and column comments HERE, never beside the table body — and add new
+-- `ALTER TABLE ... ADD COLUMN` statements ABOVE this section, not after it, so
+-- this section stays last. (Both mistakes fail migration-statement-order.test.ts
+-- rather than reaching a user's upgrade.)
+--
+-- Guarded by packages/core/src/db/migration-statement-order.test.ts and
+-- exercised against real PostgreSQL upgrades by scripts/check-schema-upgrades.ts.
+
+-- Codebase env vars
+CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id
+  ON remote_agent_codebase_env_vars(codebase_id);
+
+-- User identities
+CREATE INDEX IF NOT EXISTS idx_user_identities_user_id
+  ON remote_agent_user_identities(user_id);
+
+-- Better Auth core models (generated by auth@1.6.30)
+CREATE INDEX IF NOT EXISTS "remote_agent_auth_session_userId_idx"
+  ON remote_agent_auth_session("userId");
+CREATE INDEX IF NOT EXISTS "remote_agent_auth_account_userId_idx"
+  ON remote_agent_auth_account("userId");
+CREATE INDEX IF NOT EXISTS "remote_agent_auth_verification_identifier_idx"
+  ON remote_agent_auth_verification("identifier");
+
+-- Conversations
+CREATE INDEX IF NOT EXISTS idx_remote_agent_conversations_codebase
+  ON remote_agent_conversations(codebase_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_hidden
+  ON remote_agent_conversations(hidden);
+CREATE INDEX IF NOT EXISTS idx_conversations_codebase
+  ON remote_agent_conversations(codebase_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_conversations_isolation_env_id
+  ON remote_agent_conversations(isolation_env_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_user_id
+  ON remote_agent_conversations(user_id) WHERE user_id IS NOT NULL;
+
+COMMENT ON COLUMN remote_agent_conversations.isolation_env_id IS
+  'UUID reference to isolation_environments table (the only isolation reference)';
+
+-- Sessions
+CREATE INDEX IF NOT EXISTS idx_remote_agent_sessions_conversation
+  ON remote_agent_sessions(conversation_id, active);
+CREATE INDEX IF NOT EXISTS idx_remote_agent_sessions_codebase
+  ON remote_agent_sessions(codebase_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent
+  ON remote_agent_sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_conversation_started
+  ON remote_agent_sessions(conversation_id, started_at DESC);
+
+COMMENT ON COLUMN remote_agent_sessions.parent_session_id IS
+  'Links to the previous session in this conversation (for audit trail)';
+COMMENT ON COLUMN remote_agent_sessions.transition_reason IS
+  'Why this session was created: plan-to-execute, isolation-changed, reset-requested, etc.';
+COMMENT ON COLUMN remote_agent_sessions.ended_reason IS
+  'Why this session was deactivated: reset-requested, cwd-changed, conversation-closed, etc.';
+
+-- Isolation environments
+-- Partial unique index: only active environments need uniqueness
+CREATE UNIQUE INDEX IF NOT EXISTS unique_active_workflow
+  ON remote_agent_isolation_environments (codebase_id, workflow_type, workflow_id)
+  WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_isolation_env_codebase
+  ON remote_agent_isolation_environments(codebase_id);
+CREATE INDEX IF NOT EXISTS idx_isolation_env_status
+  ON remote_agent_isolation_environments(status);
+CREATE INDEX IF NOT EXISTS idx_isolation_env_workflow
+  ON remote_agent_isolation_environments(workflow_type, workflow_id);
+
+COMMENT ON COLUMN remote_agent_isolation_environments.workflow_type IS
+  'Type of work: issue, pr, review, thread, task';
+COMMENT ON COLUMN remote_agent_isolation_environments.workflow_id IS
+  'Identifier for the work (issue number, PR number, thread hash, etc.)';
+
+-- Workflow runs
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
+  ON remote_agent_workflow_runs(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_status
+  ON remote_agent_workflow_runs(status);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_conv
+  ON remote_agent_workflow_runs(parent_conversation_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_user_id
+  ON remote_agent_workflow_runs(user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_run
+  ON remote_agent_workflow_runs(parent_run_id) WHERE parent_run_id IS NOT NULL;
+-- Partial index for efficient staleness queries on running workflows
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_last_activity
+  ON remote_agent_workflow_runs(last_activity_at)
+  WHERE status = 'running';
+
+-- Workflow events
+CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id
+  ON remote_agent_workflow_events(workflow_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_type
+  ON remote_agent_workflow_events(event_type);
+-- Global created_at index for the dashboard event poller's cross-run tail
+-- (WHERE created_at >= $1 ORDER BY created_at ASC).
+CREATE INDEX IF NOT EXISTS idx_workflow_events_created_at
+  ON remote_agent_workflow_events(created_at);
+-- Tie-breaker order within a run; NULL for rows written before event_order
+-- existed, which the partial predicate keeps out of the unique constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_events_run_order
+  ON remote_agent_workflow_events(workflow_run_id, event_order)
+  WHERE event_order IS NOT NULL;
+
+-- Workflow node sessions
+CREATE INDEX IF NOT EXISTS idx_workflow_node_sessions_scope
+  ON remote_agent_workflow_node_sessions(scope_key);
+CREATE INDEX IF NOT EXISTS idx_workflow_node_sessions_workflow
+  ON remote_agent_workflow_node_sessions(workflow_name);
+
+-- Messages
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_id
+  ON remote_agent_messages(conversation_id, created_at ASC);

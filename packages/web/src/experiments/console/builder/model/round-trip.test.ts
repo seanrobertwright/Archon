@@ -25,6 +25,97 @@ describe('round-trip fidelity', () => {
     }
   });
 
+  test('a loop with no until round-trips exactly, and no until key is introduced (#2563)', () => {
+    // Before `until` became optional the builder read it unconditionally, so a
+    // deterministic-only loop threw on `undefined.trim()` in structural validation
+    // and would have exported `until: undefined`.
+    const deterministic: WireWorkflowDefinition = {
+      name: 'deterministic-loop',
+      description: 'Terminates on until_bash alone',
+      nodes: [
+        {
+          id: 'fix',
+          loop: {
+            prompt: 'Fix the failing tests',
+            max_iterations: 5,
+            fresh_context: false,
+            until_bash: 'bun run test',
+          },
+        },
+      ],
+    };
+
+    const { workflow, issues } = fromWorkflowDefinition(deterministic);
+    expect(issues).toEqual([]);
+    const node = workflow.nodes[0];
+    expect(node.variant).toBe('loop');
+    if (node.variant === 'loop') {
+      expect(node.data.until).toBeUndefined();
+      expect(node.data.until_bash).toBe('bun run test');
+    }
+
+    const exported = toWorkflowDefinition(workflow);
+    expect(exported).toEqual(deterministic);
+    expect('until' in (exported.nodes[0].loop ?? {})).toBe(false);
+  });
+
+  test('a loop with until_field round-trips exactly, schema and all (#2563)', () => {
+    // `variants/loop.ts` is a hand-written FIELD LIST, and the importer's
+    // unsupported-key warning only walks top-level wire keys — anything nested in
+    // `loop: {…}` is invisible to it. A channel missing from the converter is
+    // therefore deleted silently on the first open-and-save, with no import issue
+    // to notice: the loop would quietly fall back to another channel or stop
+    // terminating. This test is the lock on that for `until_field`.
+    const structured: WireWorkflowDefinition = {
+      name: 'judgment-loop',
+      description: 'Terminates on a validated boolean',
+      nodes: [
+        {
+          id: 'triage',
+          output_format: {
+            type: 'object',
+            properties: { done: { type: 'boolean' } },
+            required: ['done'],
+          },
+          loop: {
+            prompt: 'Work the backlog',
+            max_iterations: 20,
+            fresh_context: false,
+            until_field: 'done',
+          },
+        },
+      ],
+    };
+
+    const { workflow, issues } = fromWorkflowDefinition(structured);
+    expect(issues).toEqual([]);
+    const node = workflow.nodes[0];
+    expect(node.variant).toBe('loop');
+    if (node.variant === 'loop') {
+      expect(node.data.until_field).toBe('done');
+      expect(node.data.until).toBeUndefined();
+    }
+
+    // Exact equality is the assertion that matters: the schema must survive as a
+    // base field and `until_field` must come back out of the converter.
+    expect(toWorkflowDefinition(workflow)).toEqual(structured);
+  });
+
+  test('command-backed loop round-trips exactly — command preserved, no prompt key introduced', () => {
+    const { workflow, issues } = fromWorkflowDefinition(FIXTURES.loopCommand);
+    expect(issues).toEqual([]);
+    const node = workflow.nodes[0];
+    expect(node.variant).toBe('loop');
+    if (node.variant === 'loop') {
+      expect(node.data.command).toBe('refine-draft');
+      expect(node.data.prompt).toBeUndefined();
+    }
+    const exported = toWorkflowDefinition(workflow);
+    // Exact equality: `{ command }` must NOT come back as `{ prompt: '' }`.
+    expect(exported).toEqual(FIXTURES.loopCommand);
+    expect('prompt' in (exported.nodes[0].loop ?? {})).toBe(false);
+  });
+
   test('approval on_reject and capture_response survive partitioning', () => {
     const bw = fromWorkflowDefinition(FIXTURES.approval).workflow;
     const node = bw.nodes[0];
@@ -113,6 +204,35 @@ describe('import issues', () => {
     expect(issues[0].path).toEqual({ nodeId: 'p', field: 'timeout' });
     const out = toWorkflowDefinition(workflow);
     expect('timeout' in out.nodes[0]).toBe(false);
+  });
+
+  test('a loop with both prompt and command is flagged with an error and keeps the prompt', () => {
+    // Not engine-producible input (the schema enforces exactly-one) — the
+    // importer must not silently drop either source.
+    const { workflow, issues } = fromWorkflowDefinition(
+      wire([
+        {
+          id: 'both',
+          loop: {
+            prompt: 'inline',
+            command: 'cmd-file',
+            until: 'DONE',
+            max_iterations: 3,
+            fresh_context: false,
+          },
+        },
+      ])
+    );
+    expect(issues).toHaveLength(1);
+    expect(issues[0].rule).toBe('structural.field.unsupported');
+    expect(issues[0].severity).toBe('error');
+    expect(issues[0].path).toEqual({ nodeId: 'both', field: 'loop.command' });
+    const node = workflow.nodes[0];
+    expect(node.variant).toBe('loop');
+    if (node.variant === 'loop') {
+      expect(node.data.prompt).toBe('inline');
+      expect(node.data.command).toBeUndefined();
+    }
   });
 
   test('timeout on bash and script nodes is carried, not flagged', () => {

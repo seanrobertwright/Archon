@@ -4,11 +4,17 @@ import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 
 const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
 
-// Mock the connection module before importing the module under test
+// Mock the connection module before importing the module under test.
+// `getDatabase().withTransaction` runs its callback against the SAME mockQuery,
+// so a transactional function's statements land in mockQuery.mock.calls in
+// order, exactly like the non-transactional ones.
 mock.module('./connection', () => ({
   pool: {
     query: mockQuery,
   },
+  getDatabase: () => ({
+    withTransaction: <T>(fn: (query: typeof mockQuery) => Promise<T>): Promise<T> => fn(mockQuery),
+  }),
   getDialect: () => mockPostgresDialect,
   getDatabaseType: () => 'postgresql' as const,
 }));
@@ -24,12 +30,18 @@ import {
   failWorkflowRun,
   updateWorkflowActivity,
   findResumableRun,
+  findResumableRunByParentConversation,
+  cancelResumableRunsForConversation,
   resumeWorkflowRun,
+  pauseWorkflowRun,
   cancelWorkflowRun,
   failOrphanedRuns,
+  findChildRuns,
+  getRunAncestry,
   listWorkflowRuns,
   deleteOldWorkflowRuns,
   deleteWorkflowRun,
+  WorkflowNotResumableError,
 } from './workflows';
 
 describe('workflows database', () => {
@@ -76,6 +88,7 @@ describe('workflows database', () => {
           null,
           null,
           null,
+          null,
         ]
       );
     });
@@ -107,6 +120,7 @@ describe('workflows database', () => {
           null,
           null,
           null,
+          null,
         ]
       );
     });
@@ -124,7 +138,17 @@ describe('workflows database', () => {
       expect(result.codebase_id).toBeNull();
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining('INSERT INTO remote_agent_workflow_runs'),
-        ['feature-development', 'conv-456', null, 'Add dark mode support', '{}', null, null, null]
+        [
+          'feature-development',
+          'conv-456',
+          null,
+          'Add dark mode support',
+          '{}',
+          null,
+          null,
+          null,
+          null,
+        ]
       );
     });
   });
@@ -237,6 +261,65 @@ describe('workflows database', () => {
       ]);
     });
 
+    test('updates authored outcome without touching lifecycle columns', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', { outcome: 'succeeded' });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('outcome = $1');
+      expect(query).not.toContain('status =');
+      expect(query).not.toContain('completed_at');
+      expect(params).toEqual(['succeeded', 'workflow-run-123']);
+    });
+
+    // output_root (#2200) is the durable pointer to a run's storage tree. It is
+    // write-once at the DB layer via COALESCE so a caller that forgets the
+    // null-guard cannot repoint a run mid-life and orphan its artifacts.
+    test('writes output_root through COALESCE so the first value wins', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', { output_root: '/home/u/.archon/ws/acme/x' });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('output_root = COALESCE(output_root, $1)');
+      expect(params).toEqual(['/home/u/.archon/ws/acme/x', 'workflow-run-123']);
+    });
+
+    test('output_root placeholder is numbered correctly alongside other fields', async () => {
+      // The SET clause is built by hand with positional placeholders, so an
+      // off-by-one here would silently bind the wrong value.
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', {
+        status: 'running',
+        metadata: { step: 'plan' },
+        outcome: 'failed',
+        output_root: '/root/x',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('status = $1');
+      expect(query).toContain('outcome = $3');
+      expect(query).toContain('output_root = COALESCE(output_root, $4)');
+      expect(params).toEqual([
+        'running',
+        JSON.stringify({ step: 'plan' }),
+        'failed',
+        '/root/x',
+        'workflow-run-123',
+      ]);
+    });
+
+    test('omitting output_root leaves it out of the SET clause entirely', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', { status: 'completed' });
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).not.toContain('output_root');
+    });
+
     test('updates multiple fields', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
@@ -255,6 +338,94 @@ describe('workflows database', () => {
       await updateWorkflowRun('workflow-run-123', {});
 
       expect(mockQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('pauseWorkflowRun', () => {
+    test('replaces the approval object rather than merging into it', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await pauseWorkflowRun('workflow-run-123', {
+        nodeId: 'review',
+        message: 'Please review',
+        type: 'approval',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status = 'paused'");
+      expect(query).toContain("AND status = 'running'");
+      // The approval object is SET wholesale, never folded into the stored one —
+      // this suite runs the Postgres dialect, so it pins that branch of
+      // writeApprovalMetadata (#2673). Top-level run metadata still merges.
+      expect(query).toContain(
+        "metadata = jsonb_set(metadata || $2::jsonb, '{approval}', $3::jsonb, true)"
+      );
+
+      // $2 is run-level metadata (empty here); $3 is the complete gate context,
+      // bound separately so the replace can target it.
+      expect(JSON.parse(params[1] as string)).toEqual({});
+      // Exactly what the caller passed — no explicit-null reset list. Every field
+      // this gate leaves unset is absent, which is what makes a prior gate's value
+      // unable to survive at any depth.
+      expect(JSON.parse(params[2] as string)).toEqual({
+        nodeId: 'review',
+        message: 'Please review',
+        type: 'approval',
+      });
+    });
+
+    test('preserves interactive-loop signal and usage fields when the gate provides them', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await pauseWorkflowRun('workflow-run-123', {
+        nodeId: 'refine',
+        message: 'gate',
+        type: 'interactive_loop',
+        iteration: 1,
+        completionSignaled: true,
+        signaledOutput: 'REPORT',
+        signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
+        signaledCostUsd: 0.02,
+        commandSnapshot: 'Loaded command body',
+      });
+
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const approval = JSON.parse(params[2] as string) as Record<string, unknown>;
+      expect(approval.completionSignaled).toBe(true);
+      expect(approval.signaledOutput).toBe('REPORT');
+      expect(approval.signaledTokens).toEqual({
+        input: 40,
+        output: 4,
+        cacheRead: 20,
+        cacheWrite: 0,
+      });
+      expect(approval.signaledCostUsd).toBe(0.02);
+      expect(approval.commandSnapshot).toBe('Loaded command body');
+      expect(approval.resolved).toBeUndefined();
+    });
+
+    test('folds caller-supplied run metadata into the same write', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await pauseWorkflowRun(
+        'workflow-run-123',
+        { nodeId: '__writeback__', message: 'Apply changes?', type: 'writeback' },
+        { pending_writeback: true }
+      );
+
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // Same atomic UPDATE, so there is no window where the run is paused
+      // without the marker (M3) — it merges at the top level, beside `approval`.
+      expect(JSON.parse(params[1] as string)).toEqual({ pending_writeback: true });
+      expect((JSON.parse(params[2] as string) as { nodeId: string }).nodeId).toBe('__writeback__');
+    });
+
+    test('throws when the run is not running', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(
+        pauseWorkflowRun('workflow-run-123', { nodeId: 'review', message: 'Please review' })
+      ).rejects.toThrow('not found or not in running state');
     });
   });
 
@@ -321,7 +492,9 @@ describe('workflows database', () => {
         expect.any(Array)
       );
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining("AND status = 'running'"),
+        // Pending too: capture, artifact setup, and credential resolution all run before
+        // the row goes running, and a running-only guard left those failures pending forever.
+        expect.stringContaining("AND status IN ('running', 'pending')"),
         expect.any(Array)
       );
     });
@@ -339,7 +512,7 @@ describe('workflows database', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
 
       await expect(failWorkflowRun('workflow-run-123', 'some error')).rejects.toThrow(
-        'not found or not in running state'
+        'not found or already terminal'
       );
     });
   });
@@ -548,6 +721,108 @@ describe('workflows database', () => {
     });
   });
 
+  describe('findResumableRunByParentConversation', () => {
+    test('scopes by workflow name, parent conversation and codebase', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
+
+      const result = await findResumableRunByParentConversation('piv', 'conv-1', 'codebase-789');
+
+      expect(result).toEqual(mockWorkflowRun);
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('workflow_name = $1');
+      expect(query).toContain('parent_conversation_id = $2');
+      expect(query).toContain('codebase_id = $3');
+      expect(params).toEqual(['piv', 'conv-1', 'codebase-789']);
+    });
+
+    test('prefers a paused run over a newer failed one (paused-first ordering)', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await findResumableRunByParentConversation('piv', 'conv-1', 'cb');
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status IN ('failed', 'paused')");
+      // Status is the primary sort key: an open gate auto-resumes, while a
+      // failed candidate is gated behind an explicit user prompt. Ordering by
+      // started_at alone lets a newer failure shadow an older waiting gate.
+      expect(query).toContain("ORDER BY CASE WHEN status = 'paused' THEN 0 ELSE 1 END");
+      // Recency still breaks ties within a status.
+      expect(query).toContain('started_at DESC');
+    });
+
+    test('returns null when no run matches', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await findResumableRunByParentConversation('piv', 'conv-1', 'cb');
+
+      expect(result).toBeNull();
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+
+      await expect(findResumableRunByParentConversation('piv', 'conv-1', 'cb')).rejects.toThrow(
+        'Failed to find resumable run by parent conversation: Connection refused'
+      );
+    });
+  });
+
+  describe('cancelResumableRunsForConversation', () => {
+    test('locks the conversation snapshot and atomically cancels only paused/failed rows', async () => {
+      const paused = { ...mockWorkflowRun, id: 'run-a', status: 'paused' as const };
+      const running = { ...mockWorkflowRun, id: 'run-b', status: 'running' as const };
+      const failed = { ...mockWorkflowRun, id: 'run-c', status: 'failed' as const };
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([paused, running, failed]))
+        .mockResolvedValueOnce(createQueryResult([], 2));
+
+      const result = await cancelResumableRunsForConversation('conv-1');
+
+      expect(result).toEqual([paused, failed]);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      const [selectSql, selectParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(selectSql).toContain('SELECT * FROM remote_agent_workflow_runs');
+      expect(selectSql).toContain('conversation_id = $1 OR parent_conversation_id = $2');
+      expect(selectSql).toContain('FOR UPDATE');
+      expect(selectParams).toEqual(['conv-1', 'conv-1']);
+      const [updateSql, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(updateSql).toContain("status IN ('paused', 'failed')");
+      expect(updateSql).not.toContain("'running'");
+      expect(updateSql).not.toContain("'pending'");
+      expect(updateSql).not.toContain('RETURNING');
+      expect(updateParams).toEqual(['conv-1', 'conv-1']);
+    });
+
+    test('returns without writing when the locked snapshot has nothing resumable', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
+      );
+
+      expect(await cancelResumableRunsForConversation('conv-1')).toEqual([]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('rolls back instead of reporting a stale snapshot count', async () => {
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([{ ...mockWorkflowRun, status: 'paused' as const }])
+        )
+        .mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Resumable run snapshot changed during reset'
+      );
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Failed to cancel resumable runs for conversation: Connection refused'
+      );
+    });
+  });
+
   describe('getActiveWorkflowRunByPath', () => {
     test('returns active or failed run for the given working path', async () => {
       const activeRun = { ...mockWorkflowRun, working_path: '/repo/path' };
@@ -631,6 +906,112 @@ describe('workflows database', () => {
         'Failed to get active workflow run by path: Connection refused'
       );
     });
+
+    // #2121 Phase 2: the ancestor chain of a shared-checkout sub-run must not
+    // count as a lock — each id gets its own positional placeholder (no array
+    // binding, works on both dialects).
+    test('excludes ancestor run ids via NOT IN with positional placeholders', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      const startedAt = new Date('2026-04-14T10:00:00Z');
+
+      await getActiveWorkflowRunByPath('/repo/path', {
+        id: 'child-id',
+        startedAt,
+        excludeRunIds: ['parent-id', 'grandparent-id'],
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('id != $2');
+      expect(query).toContain('id NOT IN ($3, $4)');
+      // The tiebreaker's id comparison must reference SELF ($2) — a positional
+      // back-reference once pointed it at $4 (an ancestor id) when excludeRunIds
+      // params landed between the self id and startedAt.
+      expect(query).toContain('started_at = $5::timestamptz AND id < $2');
+      expect(params).toEqual([
+        '/repo/path',
+        'child-id',
+        'parent-id',
+        'grandparent-id',
+        startedAt.toISOString(),
+      ]);
+    });
+
+    test('omits the NOT IN clause when excludeRunIds is empty', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await getActiveWorkflowRunByPath('/repo/path', {
+        id: 'child-id',
+        startedAt: new Date(),
+        excludeRunIds: [],
+      });
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).not.toContain('NOT IN');
+    });
+  });
+
+  describe('findChildRuns', () => {
+    test('selects by parent_run_id ordered oldest-first', async () => {
+      const child = { ...mockWorkflowRun, id: 'child-1', parent_run_id: 'parent-1' };
+      mockQuery.mockResolvedValueOnce(createQueryResult([child]));
+
+      const result = await findChildRuns('parent-1');
+
+      expect(result).toHaveLength(1);
+      expect(result[0]?.id).toBe('child-1');
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('WHERE parent_run_id = $1');
+      // The executor's re-entry picks children[children.length - 1] as "most
+      // recent" — that only holds because this ORDER BY pins oldest-first.
+      expect(query).toContain('ORDER BY started_at ASC');
+      expect(params).toEqual(['parent-1']);
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('boom'));
+
+      await expect(findChildRuns('parent-1')).rejects.toThrow(
+        'Failed to find child workflow runs: boom'
+      );
+    });
+  });
+
+  describe('getRunAncestry', () => {
+    const runRow = (id: string, parentRunId: string | null) => ({
+      ...mockWorkflowRun,
+      id,
+      parent_run_id: parentRunId,
+    });
+
+    test('walks parent_run_id to the root, nearest ancestor first', async () => {
+      // child -> parent -> root (each lookup is one getWorkflowRun query).
+      mockQuery.mockResolvedValueOnce(createQueryResult([runRow('child', 'parent')]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([runRow('parent', 'root')]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([runRow('root', null)]));
+
+      const result = await getRunAncestry('child');
+
+      expect(result.map(r => r.id)).toEqual(['parent', 'root']);
+    });
+
+    test('stops on cyclic parent data instead of looping forever', async () => {
+      // child -> parent -> child (hand-edited/corrupt DB).
+      mockQuery.mockResolvedValueOnce(createQueryResult([runRow('child', 'parent')]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([runRow('parent', 'child')]));
+
+      const result = await getRunAncestry('child');
+
+      expect(result.map(r => r.id)).toEqual(['parent']);
+    });
+
+    test('ends the chain at a deleted parent (ON DELETE SET NULL orphan)', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([runRow('child', 'gone')]));
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await getRunAncestry('child');
+
+      expect(result).toEqual([]);
+    });
   });
 
   describe('listWorkflowRuns', () => {
@@ -708,6 +1089,8 @@ describe('workflows database', () => {
   describe('resumeWorkflowRun', () => {
     test('updates run to running, clears completed_at, and returns updated row', async () => {
       const updatedRun = { ...mockWorkflowRun, status: 'running' as const, completed_at: null };
+      // Pre-CAS read of the metadata about to be cleared (no prior error here)
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
       // UPDATE query returns rowCount 1
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       // SELECT query returns the updated row
@@ -717,17 +1100,27 @@ describe('workflows database', () => {
 
       expect(result.status).toBe('running');
       expect(result.completed_at).toBeNull();
-      // First call: UPDATE
-      const [updateQuery, updateParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // First call: the row-pinning read of the error the CAS is about to clear.
+      const [priorQuery, priorParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(priorQuery).toContain('SELECT metadata');
+      // Postgres row lock — without it the value read is not guaranteed to be the
+      // value the CAS clears, so the preserved error could be stale (#2348).
+      expect(priorQuery).toContain('FOR UPDATE');
+      expect(priorParams).toEqual(['workflow-run-123']);
+      // Second call: UPDATE
+      const [updateQuery, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
       expect(updateQuery).toContain("status = 'running'");
       expect(updateQuery).toContain('completed_at = NULL');
+      expect(updateQuery).toContain('metadata = metadata || $3::jsonb');
       // $1 = id, $2 = ORPHAN_RESUME_STALE_DAYS. The day param MUST be bound or the
       // CAS predicate's `< $2 days` references an unbound placeholder (PR #1830 C1).
-      expect(updateParams).toEqual(['workflow-run-123', 1]);
-      // Second call: SELECT
-      const [selectQuery, selectParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(updateParams).toEqual(['workflow-run-123', 1, JSON.stringify({ error: null })]);
+      // Third call: SELECT
+      const [selectQuery, selectParams] = mockQuery.mock.calls[2] as [string, unknown[]];
       expect(selectQuery).toContain('SELECT *');
       expect(selectParams).toEqual(['workflow-run-123']);
+      // No prior error → no audit event (only three statements ran).
+      expect(mockQuery.mock.calls).toHaveLength(3);
     });
 
     test('refreshes started_at to NOW so resumed row competes fairly in the path-lock tiebreaker', async () => {
@@ -735,6 +1128,7 @@ describe('workflows database', () => {
       // hours-old) started_at and sorts ahead of any currently-active holder
       // in the older-wins tiebreaker — slipping past the lock and causing
       // two active workflows on the same working_path.
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       mockQuery.mockResolvedValueOnce(
         createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
@@ -742,7 +1136,7 @@ describe('workflows database', () => {
 
       await resumeWorkflowRun('workflow-run-123');
 
-      const [updateQuery] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [updateQuery] = mockQuery.mock.calls[1] as [string, unknown[]];
       expect(updateQuery).toContain('started_at = NOW()');
     });
 
@@ -750,6 +1144,7 @@ describe('workflows database', () => {
       // The flip to 'running' must only match a row that is still resumable —
       // failed/paused, or a stale 'running' orphan — so two concurrent resumers
       // can't both win and double-claim the worktree.
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       mockQuery.mockResolvedValueOnce(
         createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
@@ -757,15 +1152,60 @@ describe('workflows database', () => {
 
       await resumeWorkflowRun('workflow-run-123');
 
-      const [updateQuery, updateParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [updateQuery, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
       expect(updateQuery).toContain("status IN ('failed', 'paused')");
       expect(updateQuery).toContain("status = 'running' AND");
       // The stale-orphan arm references $2 — it MUST be bound to the day count.
       expect(updateQuery).toContain('$2');
-      expect(updateParams).toEqual(['workflow-run-123', 1]);
+      expect(updateParams).toEqual(['workflow-run-123', 1, JSON.stringify({ error: null })]);
+    });
+
+    test('preserves the cleared error as a workflow_resumed event (CAS winner only)', async () => {
+      // The resume clears metadata.error, which for a SIGTERM-killed CLI run is
+      // the ONLY record that the run ever failed — no workflow_failed/node_failed
+      // event is written on that path (#2348). The clear must not lose it.
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ metadata: { error: 'Process terminated (SIGTERM)' } }])
+      );
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1)); // CAS wins
+      mockQuery.mockResolvedValueOnce(createQueryResult([])); // event INSERT
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
+      );
+
+      await resumeWorkflowRun('workflow-run-123');
+
+      const [eventQuery, eventParams] = mockQuery.mock.calls[2] as [string, unknown[]];
+      expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
+      // [id, workflow_run_id, event_type, step_index, step_name, data]
+      expect(eventParams[1]).toBe('workflow-run-123');
+      expect(eventParams[2]).toBe('workflow_resumed');
+      expect(eventParams[5]).toBe(JSON.stringify({ error: 'Process terminated (SIGTERM)' }));
+    });
+
+    test('writes no event when the CAS loses, even though an error was read', async () => {
+      // A concurrent resumer already flipped the row: this caller read the error
+      // but its UPDATE matched nothing, so it must write NOTHING at all —
+      // otherwise a lost race still emits an audit event for a clear it never did.
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ metadata: { error: 'Process terminated (SIGTERM)' } }])
+      );
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0)); // CAS loses
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ status: 'running' }])); // probe
+
+      await expect(resumeWorkflowRun('workflow-run-123')).rejects.toThrow(
+        WorkflowNotResumableError
+      );
+
+      const inserts = mockQuery.mock.calls.filter(([sql]) =>
+        String(sql).includes('INSERT INTO remote_agent_workflow_events')
+      );
+      expect(inserts).toHaveLength(0);
     });
 
     test('throws when no row matched and the run is gone (not found)', async () => {
+      // Pre-CAS read finds nothing (row already deleted)
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
       // UPDATE returns rowCount 0
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
       // Probe SELECT finds no row → deleted
@@ -777,6 +1217,7 @@ describe('workflows database', () => {
     });
 
     test('throws "not resumable" when the run was concurrently activated (CAS miss)', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
       // UPDATE matches nothing because the row is already 'running'
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
       // Probe SELECT reveals the current status
@@ -788,6 +1229,7 @@ describe('workflows database', () => {
     });
 
     test('throws on database error during the disambiguation probe', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0)); // UPDATE matched nothing
       mockQuery.mockRejectedValueOnce(new Error('Connection lost')); // probe fails
 
@@ -797,6 +1239,17 @@ describe('workflows database', () => {
     });
 
     test('throws on database error during UPDATE', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
+      mockQuery.mockRejectedValueOnce(new Error('Lock timeout'));
+
+      await expect(resumeWorkflowRun('workflow-run-123')).rejects.toThrow(
+        'Failed to resume workflow run: Lock timeout'
+      );
+    });
+
+    test('throws on database error during the pre-CAS read', async () => {
+      // The read shares the CAS's try/catch — a failure there must surface as the
+      // same resume error, and the transaction rolls back with nothing written.
       mockQuery.mockRejectedValueOnce(new Error('Lock timeout'));
 
       await expect(resumeWorkflowRun('workflow-run-123')).rejects.toThrow(
@@ -805,6 +1258,7 @@ describe('workflows database', () => {
     });
 
     test('throws on database error during SELECT after UPDATE', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
       // UPDATE succeeds
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       // SELECT fails
@@ -816,6 +1270,7 @@ describe('workflows database', () => {
     });
 
     test('throws when row vanishes between UPDATE and SELECT', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ metadata: {} }]));
       // UPDATE succeeds (rowCount 1)
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       // SELECT returns nothing (row deleted between statements)

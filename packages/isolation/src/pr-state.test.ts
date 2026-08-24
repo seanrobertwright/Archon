@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, mock } from 'bun:test';
+import { describe, test, expect, mock } from 'bun:test';
 
 const mockLogger = {
   fatal: mock(() => undefined),
@@ -29,9 +29,10 @@ mock.module('@archon/git', () => ({
 }));
 
 import { getPrState, type PrState } from './pr-state';
+import { toBranchName, toRepoPath } from '@archon/git';
 
-const REPO = '/workspace/repo';
-const BRANCH = 'feature-branch';
+const REPO = toRepoPath('/workspace/repo');
+const BRANCH = toBranchName('feature-branch');
 
 function setupGhResponse(remoteUrl: string, ghStdout: string | Error): void {
   mockExecFileAsync.mockReset();
@@ -81,6 +82,19 @@ describe('getPrState', () => {
     setupGhResponse('https://gitlab.com/owner/repo.git', '[{"state":"MERGED"}]');
     const result = await getPrState(BRANCH, REPO);
     expect(result).toBe('NONE');
+  });
+
+  test('queries the custom remote when provided', async () => {
+    setupGhResponse('https://github.com/owner/repo.git', '[{"state":"MERGED"}]');
+
+    const result = await getPrState(BRANCH, REPO, undefined, 'upstream');
+
+    expect(result).toBe('MERGED');
+    expect(mockExecFileAsync).toHaveBeenCalledWith(
+      'git',
+      ['-C', REPO, 'remote', 'get-url', 'upstream'],
+      expect.any(Object)
+    );
   });
 
   test('uses cache on subsequent lookups for same branch', async () => {
