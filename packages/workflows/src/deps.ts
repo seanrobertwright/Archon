@@ -20,6 +20,13 @@ import type {
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from './model-validation';
 
+export const CODEX_AUTH_JSON_RELATIVE_PATH = 'codex-home/auth.json';
+export const PI_AUTH_JSON_RELATIVE_PATH = 'pi-home/auth.json';
+export const MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS = [
+  CODEX_AUTH_JSON_RELATIVE_PATH,
+  PI_AUTH_JSON_RELATIVE_PATH,
+] as const;
+
 // Re-export provider types so existing workflow engine consumers don't break
 export type {
   IAgentProvider,

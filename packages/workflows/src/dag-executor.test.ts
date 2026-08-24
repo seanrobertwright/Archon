@@ -25923,6 +25923,7 @@ describe('subprocess credential redaction', () => {
     const openAiSecret = 'sk-openai-not-shaped';
     const otherInjectedSecret = 'credential-with-no-known-shape';
     const projectSecret = 'project-secret-with-no-known-shape';
+    const databaseUrl = 'postgres://user:password@db.internal/archon';
     const fileDeliveredSecret = 'oauth-token-only-present-in-auth-file';
     const logDir = join(testDir, 'logs');
     const workflowRun = makeWorkflowRun('container-redaction-run', {
@@ -25936,6 +25937,7 @@ describe('subprocess credential redaction', () => {
           code: number;
           killed: boolean;
           cmd: string;
+          spawnargs: string[];
           stdout: string;
           stderr: string;
         })
@@ -25949,8 +25951,9 @@ describe('subprocess credential redaction', () => {
             code: 1,
             killed: false,
             cmd: commandLine,
-            stdout: `stdout echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, and ${fileDeliveredSecret}`,
-            stderr: `stderr echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, and ${fileDeliveredSecret}`,
+            spawnargs: args,
+            stdout: `stdout echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, ${databaseUrl}, and ${fileDeliveredSecret}`,
+            stderr: `stderr echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, ${databaseUrl}, and ${fileDeliveredSecret}`,
           }
         );
         throw rejection;
@@ -25982,9 +25985,10 @@ describe('subprocess credential redaction', () => {
             OPENAI_API_KEY: openAiSecret,
             CUSTOM_AUTH: otherInjectedSecret,
             PROJECT_SECRET: projectSecret,
+            DATABASE_URL: databaseUrl,
             BASE_BRANCH: 'main',
           },
-          protectedEnvKeys: ['OPENAI_API_KEY', 'CUSTOM_AUTH'],
+          protectedEnvKeys: ['OPENAI_API_KEY', 'CUSTOM_AUTH', 'DATABASE_URL'],
           protectedCredentialValues: [fileDeliveredSecret],
         },
         undefined,
@@ -26002,6 +26006,7 @@ describe('subprocess credential redaction', () => {
       expect(dockerArgs.join(' ')).toContain(openAiSecret);
       expect(dockerArgs.join(' ')).toContain(otherInjectedSecret);
       expect(dockerArgs.join(' ')).toContain(projectSecret);
+      expect(dockerArgs.join(' ')).toContain(databaseUrl);
 
       expect(rejection).toBeDefined();
       expect(rejection?.code).toBe(1);
@@ -26010,17 +26015,23 @@ describe('subprocess credential redaction', () => {
         rejection?.message,
         rejection?.stack,
         rejection?.cmd,
+        rejection?.spawnargs.join(' '),
         rejection?.stdout,
         rejection?.stderr,
       ].join('\n');
       expect(rejectionText).not.toContain(openAiSecret);
       expect(rejectionText).not.toContain(otherInjectedSecret);
       expect(rejectionText).not.toContain(projectSecret);
+      expect(rejectionText).not.toContain(databaseUrl);
       expect(rejectionText).not.toContain(fileDeliveredSecret);
       expect(rejection?.cmd).toContain('OPENAI_API_KEY=[REDACTED]');
       expect(rejection?.cmd).toContain('CUSTOM_AUTH=[REDACTED]');
       expect(rejection?.cmd).toContain('PROJECT_SECRET=[REDACTED]');
+      expect(rejection?.cmd).toContain('DATABASE_URL=[REDACTED]');
       expect(rejection?.cmd).toContain('BASE_BRANCH=main');
+      expect(rejection?.spawnargs.join(' ')).toContain('OPENAI_API_KEY=[REDACTED]');
+      expect(rejection?.spawnargs.join(' ')).toContain('DATABASE_URL=[REDACTED]');
+      expect(rejection?.spawnargs.join(' ')).toContain('BASE_BRANCH=main');
 
       const durableEventText = JSON.stringify(
         (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls
@@ -26031,6 +26042,7 @@ describe('subprocess credential redaction', () => {
         expect(durableText).not.toContain(openAiSecret);
         expect(durableText).not.toContain(otherInjectedSecret);
         expect(durableText).not.toContain(projectSecret);
+        expect(durableText).not.toContain(databaseUrl);
         expect(durableText).not.toContain(fileDeliveredSecret);
       }
     } finally {
@@ -26040,6 +26052,12 @@ describe('subprocess credential redaction', () => {
 
   it('removes a protected credential echoed by a failed host subprocess', async () => {
     const protectedSecret = 'host-file-delivered-oauth-secret';
+    const ambientSecret = 'host-ambient-anthropic-secret';
+    const ambientDatabaseUrl = 'postgres://ambient:password@db.internal/archon';
+    const originalAmbientSecret = process.env.ANTHROPIC_API_KEY;
+    const originalAmbientDatabaseUrl = process.env.DATABASE_URL;
+    process.env.ANTHROPIC_API_KEY = ambientSecret;
+    process.env.DATABASE_URL = ambientDatabaseUrl;
     const logDir = join(testDir, 'host-logs');
     const workflowRun = makeWorkflowRun('host-redaction-run', {
       workflow_name: 'host-redaction',
@@ -26054,13 +26072,15 @@ describe('subprocess credential redaction', () => {
       async (command: string, args: string[]) => {
         const commandLine = [command, ...args].join(' ');
         rejection = Object.assign(
-          new Error(`Command failed: ${commandLine}\nmessage echoed ${protectedSecret}`),
+          new Error(
+            `Command failed: ${commandLine}\nmessage echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`
+          ),
           {
             code: 1,
             killed: false,
             cmd: commandLine,
-            stdout: `stdout echoed ${protectedSecret}`,
-            stderr: `stderr echoed ${protectedSecret}`,
+            stdout: `stdout echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`,
+            stderr: `stderr echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`,
           }
         );
         throw rejection;
@@ -26103,6 +26123,8 @@ describe('subprocess credential redaction', () => {
         rejection?.stderr,
       ].join('\n');
       expect(rejectionText).not.toContain(protectedSecret);
+      expect(rejectionText).not.toContain(ambientSecret);
+      expect(rejectionText).not.toContain(ambientDatabaseUrl);
 
       const durableEventText = JSON.stringify(
         (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls
@@ -26111,9 +26133,21 @@ describe('subprocess credential redaction', () => {
       const durableLogText = await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8');
       for (const durableText of [durableEventText, durableMessageText, durableLogText]) {
         expect(durableText).not.toContain(protectedSecret);
+        expect(durableText).not.toContain(ambientSecret);
+        expect(durableText).not.toContain(ambientDatabaseUrl);
       }
     } finally {
       execSpy.mockRestore();
+      if (originalAmbientSecret === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAmbientSecret;
+      }
+      if (originalAmbientDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = originalAmbientDatabaseUrl;
+      }
     }
   });
 });

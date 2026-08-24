@@ -288,7 +288,7 @@ describe('createWorkflowDeps', () => {
       expect(result?.protectedValues).toEqual(['or-k', 'g-k']);
     });
 
-    test('getUserProviderEnv protects every string delivered through an OAuth file', async () => {
+    test('getUserProviderEnv protects OAuth secrets without hiding public metadata', async () => {
       mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
         {
           provider: 'openai',
@@ -301,7 +301,8 @@ describe('createWorkflowDeps', () => {
               refresh: 'refresh-token',
               id_token: 'id-token',
               accountId: 'account-id',
-              nested: { futureToken: 'nested-token' },
+              enterpriseUrl: 'company.ghe.com',
+              availableModelIds: ['claude-sonnet-4', 'gpt-5'],
               expires: 123,
             },
           },
@@ -314,10 +315,12 @@ describe('createWorkflowDeps', () => {
         'access-token',
         'refresh-token',
         'id-token',
-        'account-id',
-        'nested-token',
       ]);
       expect(result?.protectedValues).not.toContain('oauth');
+      expect(result?.protectedValues).not.toContain('account-id');
+      expect(result?.protectedValues).not.toContain('company.ghe.com');
+      expect(result?.protectedValues).not.toContain('claude-sonnet-4');
+      expect(result?.protectedValues).not.toContain('gpt-5');
     });
   });
 });

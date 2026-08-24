@@ -43,20 +43,17 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
-function collectCredentialStringValues(value: unknown, values: Set<string>): void {
-  if (typeof value === 'string') {
-    if (value.length > 0) values.add(value);
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectCredentialStringValues(item, values);
-    return;
-  }
-  if (value && typeof value === 'object') {
-    for (const [key, item] of Object.entries(value)) {
-      // Pi tags OAuth blobs with a public `type: "oauth"` discriminator.
-      if (key !== 'type') collectCredentialStringValues(item, values);
-    }
+// The supported OAuth deliveries use access/refresh tokens, while OpenAI also
+// writes its OIDC token. Other raw fields are public provider metadata.
+const OAUTH_SECRET_FIELDS = ['access', 'refresh', 'id_token'] as const;
+
+function collectOAuthCredentialValues(
+  rawCreds: Record<string, unknown>,
+  values: Set<string>
+): void {
+  for (const field of OAUTH_SECRET_FIELDS) {
+    const value = rawCreds[field];
+    if (typeof value === 'string' && value.length > 0) values.add(value);
   }
 }
 
@@ -192,7 +189,7 @@ export function createWorkflowDeps(): WorkflowDeps {
               protectedValues.add(cred.apiKey);
             } else {
               protectedValues.add(cred.oauthApiKey);
-              collectCredentialStringValues(cred.rawCreds, protectedValues);
+              collectOAuthCredentialValues(cred.rawCreds, protectedValues);
             }
           } catch (err) {
             // Unknown provider / shape mismatch — log at ERROR (no per-credential

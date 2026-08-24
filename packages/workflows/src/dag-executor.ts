@@ -3231,9 +3231,11 @@ type RawSubprocessRejection = Error & {
   stdout?: string;
   stderr?: string;
   cmd?: string;
+  spawnargs?: string[];
 };
 
 const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
+const CREDENTIAL_ENV_KEYS = new Set(['DATABASE_URL']);
 
 function collectSubprocessCredentialValues(
   env: NodeJS.ProcessEnv,
@@ -3242,7 +3244,12 @@ function collectSubprocessCredentialValues(
 ): string[] {
   const explicitlyProtected = new Set(protectedEnvKeys);
   const values = Object.entries(env).flatMap(([key, value]) =>
-    value && (explicitlyProtected.has(key) || CREDENTIAL_ENV_KEY_SUFFIX.test(key)) ? [value] : []
+    value &&
+    (explicitlyProtected.has(key) ||
+      CREDENTIAL_ENV_KEYS.has(key) ||
+      CREDENTIAL_ENV_KEY_SUFFIX.test(key))
+      ? [value]
+      : []
   );
   return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
     .filter(value => value.length > 0)
@@ -3268,7 +3275,8 @@ function redactCredentialValues(input: string, credentialValues: readonly string
  * the original object, and a replacement would silently drop those and turn every
  * timeout into a generic failure.
  *
- * `cmd` is not redundant with `message`. It is the ONLY carrier when the rejection
+ * `cmd` and `spawnargs` are not redundant with `message`. They can be the only
+ * carriers when the rejection
  * is not a non-zero exit: a maxBuffer overflow rejects with `message` = 'stdout
  * maxBuffer length exceeded' — no argv at all — so the credentials survive solely
  * in `cmd`. Pino serializes every enumerable `err` property, so an unredacted `cmd`
@@ -3287,6 +3295,9 @@ function redactSubprocessError(
     e.stderr = redactCredentialValues(e.stderr, credentialValues);
   }
   if (typeof e.cmd === 'string') e.cmd = redactCredentialValues(e.cmd, credentialValues);
+  if (Array.isArray(e.spawnargs)) {
+    e.spawnargs = e.spawnargs.map(arg => redactCredentialValues(arg, credentialValues));
+  }
   return e;
 }
 
@@ -3302,6 +3313,8 @@ async function runSubprocess(
     protectedCredentialValues?: readonly string[];
   }
 ): Promise<{ stdout: string; stderr: string }> {
+  const subprocessEnv =
+    execContext.kind === 'container' ? options.env : { ...process.env, ...options.env };
   try {
     if (execContext.kind === 'container') {
       const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
@@ -3316,11 +3329,11 @@ async function runSubprocess(
     return await execFileAsync(cmd, args, {
       cwd: options.cwd,
       timeout: options.timeout,
-      env: { ...process.env, ...options.env },
+      env: subprocessEnv,
     });
   } catch (err) {
     const credentialValues = collectSubprocessCredentialValues(
-      options.env,
+      subprocessEnv,
       options.protectedEnvKeys,
       options.protectedCredentialValues
     );

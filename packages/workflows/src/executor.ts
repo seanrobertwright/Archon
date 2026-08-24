@@ -5,6 +5,7 @@ import { mkdir, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
+import { MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS } from './deps';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
@@ -232,6 +233,17 @@ async function resolveUserGithubEnvForWorkflow(
     }
   }
   return resolveGithubTokenOverrides(perUserEnabled, userId, userToken);
+}
+
+/**
+ * Remove file-delivered credentials left by an earlier invocation of this run.
+ * A resume must not keep a readable credential after it has been disconnected
+ * or after fresh credential resolution fails.
+ */
+async function clearManagedProviderCredentialFiles(artifactsDir: string): Promise<void> {
+  for (const relativePath of MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS) {
+    await rm(join(artifactsDir, relativePath), { force: true });
+  }
 }
 
 /**
@@ -583,8 +595,8 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * Archon user UUID for attribution on the workflow_run row. Resolved by
    * chat/forge adapters via findOrCreateUserByPlatformIdentity. Web/CLI paths
    * pass undefined until their own auth surfaces are wired.
-   * Ignored when `preCreatedRun` is set — the original creator's attribution
-   * is preserved on resume.
+   * Ignored when `preCreatedRun` is set — the persisted creator remains both
+   * the run attribution and the credential/prefs execution identity on resume.
    */
   userId?: string;
   /**
@@ -1671,6 +1683,8 @@ export async function executeWorkflow(
     preparedSource,
   } = opts;
 
+  const executionUserId = preCreatedRun ? (preCreatedRun.user_id ?? undefined) : userId;
+
   if (preCreatedRun !== undefined) {
     const foreignPriorNodeSession = priorNodeSessions?.find(
       row => row.workflow_run_id !== preCreatedRun.id
@@ -1717,7 +1731,7 @@ export async function executeWorkflow(
   // time in the GitHub adapter), but the env injection is enough for the
   // typical <1h workflow.
   const botGitHubEnv = await resolveBotGitHubEnvForWorkflow(deps, codebaseId);
-  const userGitHubEnv = await resolveUserGithubEnvForWorkflow(deps, userId);
+  const userGitHubEnv = await resolveUserGithubEnvForWorkflow(deps, executionUserId);
   const config: WorkflowConfig = {
     ...fileConfig,
     // Order: file < db < bot-token < per-user. Per-codebase env vars are
@@ -1727,7 +1741,11 @@ export async function executeWorkflow(
     // the per-user policy scrub the corresponding key via the subprocess merge.
     envVars: { ...fileConfig.envVars, ...dbEnvVars, ...botGitHubEnv, ...userGitHubEnv },
   };
-  const protectedEnvKeys = new Set([...Object.keys(botGitHubEnv), ...Object.keys(userGitHubEnv)]);
+  const protectedEnvKeys = new Set([
+    ...Object.keys(dbEnvVars),
+    ...Object.keys(botGitHubEnv),
+    ...Object.keys(userGitHubEnv),
+  ]);
   if (protectedEnvKeys.size > 0) {
     config.protectedEnvKeys = [...protectedEnvKeys];
   }
@@ -1773,17 +1791,20 @@ export async function executeWorkflow(
   // non-throwing, but a third-party deps impl might throw anyway — guard so a
   // prefs failure can never abort a run; `{}` keeps config-only behavior.
   let userAiPrefs: UserAiPrefsLayer = {};
-  if (userId && deps.getUserAiPrefs) {
+  if (executionUserId && deps.getUserAiPrefs) {
     try {
-      userAiPrefs = await deps.getUserAiPrefs(userId);
+      userAiPrefs = await deps.getUserAiPrefs(executionUserId);
     } catch (error) {
-      getLog().warn({ err: error as Error, userId }, 'workflow.user_ai_prefs_resolve_failed');
+      getLog().warn(
+        { err: error as Error, userId: executionUserId },
+        'workflow.user_ai_prefs_resolve_failed'
+      );
     }
   }
   if (userAiPrefs.tiers || userAiPrefs.aliases || userAiPrefs.defaultProvider) {
     getLog().debug(
       {
-        userId,
+        userId: executionUserId,
         tierKeys: Object.keys(userAiPrefs.tiers ?? {}),
         aliasKeys: Object.keys(userAiPrefs.aliases ?? {}),
         defaultProvider: userAiPrefs.defaultProvider,
@@ -1803,7 +1824,10 @@ export async function executeWorkflow(
     // Structurally invalid STORED prefs (corrupt DB row) must not kill the run
     // before its record exists — degrade to config-only. A broken config layer
     // still fails fast: the rebuild below rethrows the same error.
-    getLog().error({ err: error as Error, userId }, 'workflow.user_ai_prefs_profile_invalid');
+    getLog().error(
+      { err: error as Error, userId: executionUserId },
+      'workflow.user_ai_prefs_profile_invalid'
+    );
     aiProfile = buildAiProfile(config.assistant, {
       repoTiers: config.tiers,
       repoAliases: config.aliases,
@@ -2370,13 +2394,38 @@ export async function executeWorkflow(
 
   // Per-user AI-provider credentials (Phase 2). Resolved AFTER artifactsDir is
   // created because file-based deliveries (Codex `CODEX_HOME/auth.json`) live
-  // under it. Merged LAST into config.envVars so the originating user's keys
+  // under it. Clear files from an earlier invocation first: a disconnected
+  // credential or failed refresh must not leave stale secrets readable on resume.
+  // Merged LAST into config.envVars so the originating user's keys
   // win over file/db/bot-github env — preserves the GitHub merge order and
   // keeps the no-key path byte-for-byte unchanged (resolveUserProviderEnvForWorkflow
   // returns empty bags when the feature is disabled or no userId is present).
+  try {
+    await clearManagedProviderCredentialFiles(artifactsDir);
+  } catch (error) {
+    const err = error as Error;
+    const message = `Could not safely prepare provider credentials: ${err.message}`;
+    getLog().error(
+      { err, workflowRunId: workflowRun.id },
+      'workflow.user_provider_files_cleanup_failed'
+    );
+    await deps.store.failWorkflowRun(workflowRun.id, message).catch((dbErr: Error) => {
+      getLog().error(
+        { err: dbErr, workflowRunId: workflowRun.id },
+        'workflow.user_provider_files_cleanup_fail_db_record_failed'
+      );
+    });
+    await sendCriticalMessage(
+      platform,
+      conversationId,
+      'Workflow blocked: Unable to safely prepare provider credentials. Please retry.'
+    );
+    return { success: false, workflowRunId: workflowRun.id, error: message };
+  }
+
   const { env: userProviderEnv, protectedValues } = await resolveUserProviderEnvForWorkflow(
     deps,
-    userId,
+    executionUserId,
     artifactsDir
   );
   config.envVars = { ...config.envVars, ...userProviderEnv };
