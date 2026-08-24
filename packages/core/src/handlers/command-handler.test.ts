@@ -33,6 +33,9 @@ const mockDeactivateSession = mock(() => Promise.resolve());
 // Workflow database mocks
 const mockGetActiveWorkflowRun = mock(() => Promise.resolve(null));
 const mockCancelWorkflowRun = mock(() => Promise.resolve({ cancelled: true }));
+const mockCancelResumableRunsForConversation = mock(
+  (): Promise<Record<string, unknown>[]> => Promise.resolve([])
+);
 const mockListWorkflowRuns = mock(() => Promise.resolve([]));
 const mockGetWorkflowRun = mock(() => Promise.resolve(null));
 const mockResumeWorkflowRun = mock(() => Promise.resolve({ id: 'run-id', status: 'running' }));
@@ -99,6 +102,7 @@ mock.module('../db/sessions', () => ({
 mock.module('../db/workflows', () => ({
   getActiveWorkflowRun: mockGetActiveWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
+  cancelResumableRunsForConversation: mockCancelResumableRunsForConversation,
   listWorkflowRuns: mockListWorkflowRuns,
   getWorkflowRun: mockGetWorkflowRun,
   findChildRuns: mockFindChildRuns,
@@ -257,6 +261,7 @@ function clearAllMocks(): void {
   // Workflow db mocks
   mockGetActiveWorkflowRun.mockClear();
   mockCancelWorkflowRun.mockClear();
+  mockCancelResumableRunsForConversation.mockClear();
   mockListWorkflowRuns.mockClear();
   mockGetWorkflowRun.mockClear();
   mockResumeWorkflowRun.mockClear();
@@ -741,6 +746,70 @@ describe('CommandHandler', () => {
     });
 
     describe('/reset', () => {
+      beforeEach(() => {
+        mockCancelResumableRunsForConversation.mockClear();
+        mockCancelResumableRunsForConversation.mockImplementation(() => Promise.resolve([]));
+        mockUpdateConversation.mockClear();
+        mockUpdateConversation.mockImplementation(() => Promise.resolve());
+        mockGetWorkflowRun.mockClear();
+        mockFindChildRuns.mockClear();
+        mockFindChildRuns.mockImplementation(() => Promise.resolve([]));
+      });
+
+      test('clears the execution binding but preserves the project attachment', async () => {
+        mockGetActiveSession.mockResolvedValue(null);
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(result.success).toBe(true);
+        // cwd + isolation env go; codebase_id is deliberately absent from the
+        // payload — detaching the project is /setproject none's job.
+        expect(mockUpdateConversation).toHaveBeenCalledWith(baseConversation.id, {
+          cwd: null,
+          isolation_env_id: null,
+        });
+        const [, payload] = mockUpdateConversation.mock.calls[0] as [string, object];
+        expect(payload).not.toHaveProperty('codebase_id');
+        expect(result.message).toContain('Project attachment preserved');
+      });
+
+      test('abandons resumable runs and names the count', async () => {
+        mockGetActiveSession.mockResolvedValue(null);
+        mockCancelResumableRunsForConversation.mockImplementation(() =>
+          Promise.resolve([
+            { id: 'run-a', parent_run_id: null, status: 'paused', metadata: {} },
+            { id: 'run-b', parent_run_id: null, status: 'failed', metadata: {} },
+          ])
+        );
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(mockCancelResumableRunsForConversation).toHaveBeenCalledWith(baseConversation.id);
+        // "resumable", not "pending": pending is itself a status name and reads
+        // as "waiting" to a user.
+        expect(result.message).toContain('Abandoned 2 resumable run(s).');
+      });
+
+      test('still reports the abandoned count when clearing the binding fails', async () => {
+        // The two effects live in separate try blocks precisely so a failure in
+        // the second cannot swallow what the first already did.
+        mockGetActiveSession.mockResolvedValue(null);
+        mockCancelResumableRunsForConversation.mockImplementation(() =>
+          Promise.resolve([{ id: 'run-a', parent_run_id: null, status: 'paused', metadata: {} }])
+        );
+        mockUpdateConversation.mockImplementation(() =>
+          Promise.reject(new Error('Conversation not found: conv-123'))
+        );
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Abandoned 1 resumable run(s).');
+        expect(result.message).toContain('Could not clear the workspace binding');
+        // And it must NOT claim the binding was cleared.
+        expect(result.message).not.toContain('Cleared workspace binding');
+      });
+
       test('should deactivate active session', async () => {
         mockGetActiveSession.mockResolvedValue({
           id: 'session-123',
@@ -767,6 +836,122 @@ describe('CommandHandler', () => {
         const result = await handleCommand(baseConversation, '/reset');
         expect(result.success).toBe(true);
         expect(result.message).toContain('No active session');
+      });
+
+      test('continues run and binding cleanup when the session lookup fails (#2731 R3)', async () => {
+        mockGetActiveSession.mockRejectedValueOnce(new Error('session DB unavailable'));
+        mockCancelResumableRunsForConversation.mockResolvedValueOnce([
+          { id: 'run-a', parent_run_id: null, status: 'paused', metadata: {} },
+        ]);
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Could not clear the AI session: session DB unavailable');
+        expect(result.message).toContain('Reset is incomplete — retry /reset');
+        expect(result.message).not.toContain('next message starts fresh');
+        expect(mockCancelResumableRunsForConversation).toHaveBeenCalledWith(baseConversation.id);
+        expect(mockUpdateConversation).toHaveBeenCalledWith(baseConversation.id, {
+          cwd: null,
+          isolation_env_id: null,
+        });
+      });
+
+      test('continues run and binding cleanup when session deactivation fails (#2731 R3)', async () => {
+        mockGetActiveSession.mockResolvedValueOnce({
+          id: 'session-123',
+          conversation_id: 'conv-123',
+          codebase_id: 'cb-123',
+          ai_assistant_type: 'claude',
+          assistant_session_id: 'sdk-123',
+          active: true,
+          metadata: {},
+          started_at: new Date(),
+          ended_at: null,
+        });
+        mockDeactivateSession.mockRejectedValueOnce(new Error('deactivation failed'));
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Could not clear the AI session: deactivation failed');
+        expect(result.message).toContain('Reset is incomplete — retry /reset');
+        expect(mockCancelResumableRunsForConversation).toHaveBeenCalledWith(baseConversation.id);
+        expect(mockUpdateConversation).toHaveBeenCalledWith(baseConversation.id, {
+          cwd: null,
+          isolation_env_id: null,
+        });
+      });
+
+      test('does not claim a fresh start when a selected run cannot be abandoned (#2731 R2)', async () => {
+        mockGetActiveSession.mockResolvedValue(null);
+        mockCancelResumableRunsForConversation.mockRejectedValueOnce(new Error('database busy'));
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Could not look up resumable runs: database busy');
+        expect(result.message).toContain('Reset is incomplete — retry /reset');
+        expect(result.message).not.toContain('next message starts fresh');
+      });
+
+      test('surfaces a blocked-parent warning when abandoning a child strands its parent (#2731 R1)', async () => {
+        // The parent is paused blocked-on-child; abandoning the child leaves
+        // the parent stuck. /reset must name the stranded parent so the user
+        // knows to resume or abandon it.
+        mockGetActiveSession.mockResolvedValue(null);
+        mockCancelResumableRunsForConversation.mockImplementation(() =>
+          Promise.resolve([
+            { id: 'child', parent_run_id: 'parent-stuck', status: 'paused', metadata: {} },
+          ])
+        );
+        mockGetWorkflowRun.mockImplementation((id: unknown) => {
+          if (id === 'parent-stuck') {
+            return Promise.resolve({
+              id: 'parent-stuck',
+              status: 'paused',
+              metadata: {
+                approval: {
+                  nodeId: 'workflow',
+                  message: 'waiting on sub-run',
+                  type: 'child_workflow',
+                  childRunId: 'child',
+                },
+              },
+            });
+          }
+          return Promise.resolve(null);
+        });
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Parent run parent-stuck was blocked');
+        expect(result.message).toContain('stays paused');
+        expect(result.message).not.toContain('next message starts fresh');
+      });
+
+      test('reports only the final state across a running status gap (#2731 R4)', async () => {
+        mockGetActiveSession.mockResolvedValue(null);
+        mockCancelResumableRunsForConversation.mockImplementation(() =>
+          Promise.resolve([
+            { id: 'run-a', parent_run_id: null, status: 'paused', metadata: {} },
+            { id: 'run-c', parent_run_id: 'run-b', status: 'paused', metadata: {} },
+          ])
+        );
+        mockGetWorkflowRun.mockResolvedValue({
+          id: 'run-b',
+          status: 'running',
+          metadata: {},
+        });
+
+        const result = await handleCommand(baseConversation, '/reset');
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('Abandoned 2 resumable run(s).');
+        expect(result.message).not.toContain('Parent run run-b was blocked');
+        expect(result.message).not.toContain('sub-run(s) could not be cancelled');
+        expect(result.message).toContain('next message starts fresh');
       });
     });
 

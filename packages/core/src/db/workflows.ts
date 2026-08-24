@@ -79,10 +79,9 @@ function resumableStatusClause(dialect: SqlDialect, dayParamIndex: number): stri
  * not need it — the adapter serializes transactions on one connection, and a
  * cross-process writer that commits between our read and our write makes the
  * deferred BEGIN's read→write upgrade fail with SQLITE_BUSY rather than let a
- * stale snapshot through). Used by resumeWorkflowRun to pin the row across its
- * read-then-CAS pair so the value it reads is the value the CAS acts on.
- * Dialect-branched here rather than in SqlDialect: this is the only caller, and
- * the branch mirrors unresolvedGateClause's local getDatabaseType() check.
+ * stale snapshot through). Used to pin rows across a read-then-write pair so
+ * the values read are the values the mutation acts on. Dialect-branched here
+ * rather than in SqlDialect because this lock is local DB policy.
  */
 function rowLockClause(): string {
   return getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : '';
@@ -493,6 +492,71 @@ export async function getPausedWorkflowRun(conversationId: string): Promise<Work
     const err = error as Error;
     getLog().error({ err, conversationId }, 'db.workflow_run_get_paused_failed');
     return null;
+  }
+}
+
+/**
+ * Atomically cancel every RESUMABLE run belonging to a conversation.
+ *
+ * Used by `/reset` to give the user a real escape hatch: after these are
+ * abandoned, the resume lookups find nothing, so the next dispatch starts fresh
+ * instead of continuing a stale run.
+ *
+ * The status set is exactly what the two resume lookups can return —
+ * findResumableRunByParentConversation ('failed'/'paused') and
+ * getPausedWorkflowRun ('paused'). `pending` and `running` are deliberately NOT
+ * matched: neither lookup can ever return them, so leaving them alone cannot
+ * cause the stale continuation this exists to prevent, while cancelling them
+ * would stop live work that may belong to another process entirely (a CLI run,
+ * a webhook-triggered run, a scheduled dispatch).
+ *
+ * The transaction first locks every existing run in the conversation, including
+ * running intermediates. That makes the paused/failed snapshot and the bulk
+ * UPDATE one ownership decision: a concurrent resume either wins before the
+ * lock or waits until reset has cancelled the run. Locking the running rows too
+ * prevents a status-gap run from becoming paused between the snapshot and the
+ * UPDATE and being cancelled without appearing in the returned outcomes.
+ *
+ * SQLite deliberately cannot use UPDATE RETURNING. Returning the locked
+ * snapshot and verifying UPDATE rowCount preserves the same contract in both
+ * dialects; any phantom or stale-snapshot mismatch throws and rolls back rather
+ * than reporting a false all-clear.
+ */
+export async function cancelResumableRunsForConversation(
+  conversationId: string
+): Promise<WorkflowRun[]> {
+  const dialect = getDialect();
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const snapshot = await query<WorkflowRun>(
+        `SELECT * FROM remote_agent_workflow_runs
+         WHERE conversation_id = $1 OR parent_conversation_id = $2
+         ORDER BY started_at DESC${rowLockClause()}`,
+        [conversationId, conversationId]
+      );
+      const resumable = snapshot.rows.filter(
+        run => run.status === 'paused' || run.status === 'failed'
+      );
+      if (resumable.length === 0) return [];
+
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'cancelled', completed_at = ${dialect.now()}
+         WHERE (conversation_id = $1 OR parent_conversation_id = $2)
+           AND status IN ('paused', 'failed')`,
+        [conversationId, conversationId]
+      );
+      if (result.rowCount !== resumable.length) {
+        throw new Error(
+          `Resumable run snapshot changed during reset (expected ${String(resumable.length)}, cancelled ${String(result.rowCount)})`
+        );
+      }
+      return resumable.map(run => normalizeWorkflowRun(run));
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, conversationId }, 'db.workflow_run_cancel_resumable_for_conv_failed');
+    throw new Error(`Failed to cancel resumable runs for conversation: ${err.message}`);
   }
 }
 
