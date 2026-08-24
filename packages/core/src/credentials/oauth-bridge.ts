@@ -43,11 +43,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '@archon/paths';
-import type {
-  OAuthCredentials as PiOAuthCredentials,
-  OAuthAuthInfo,
-  OAuthDeviceCodeInfo,
-} from '@archon/providers/oauth';
+import type { OAuthAuthInfo, OAuthDeviceCodeInfo } from '@archon/providers/oauth';
 import {
   piOAuthProviderFor,
   SUBSCRIPTION_PROVIDERS,
@@ -59,7 +55,10 @@ import {
   exchangeOpenAiAuthorizationCode,
   type OpenAiOAuthCredentials,
 } from './openai-oauth';
-import { normalizeCredentialVendor } from './delivery';
+import {
+  normalizeCredentialVendor,
+  type OAuthCredentials as DeliveryOAuthCredentials,
+} from './delivery';
 import { persistProviderOAuth } from './connect-service';
 import { sanitizeCredentials, sanitizeError } from '../utils/credential-sanitizer';
 
@@ -222,8 +221,8 @@ async function runOpenAiManualLogin(session: OAuthSession): Promise<OpenAiOAuthC
   if (!parsed.code) {
     throw new Error('Missing authorization code.');
   }
-  // Returns its true type — structurally assignable to PiOAuthCredentials
-  // (access/refresh/expires plus extras), so no cast at the loginPromise join.
+  // Returns its true type — the loginPromise join is typed as delivery.ts's
+  // loose `OAuthCredentials`, which this satisfies structurally (no cast).
   return exchangeOpenAiAuthorizationCode(parsed.code, flow.verifier, session.abort.signal);
 }
 
@@ -295,7 +294,13 @@ export async function startOAuth(userId: string, providerId: string): Promise<St
   sessions.set(sessionId, session);
 
   // Kick off the login WITHOUT awaiting — it blocks on the callbacks/deferred.
-  const loginPromise: Promise<PiOAuthCredentials> = piProvider
+  // The join is typed as the loose shape the only consumer accepts:
+  // `persistProviderOAuth` takes delivery.ts's `OAuthCredentials =
+  // Record<string, unknown>`, and both branches (pi-ai 0.84's strict
+  // `type: "oauth"`-tagged credential, and the Archon-owned openai flow's
+  // `OpenAiOAuthCredentials` with its Codex-required `id_token`, #1924)
+  // satisfy it structurally. The bridge never reads the `type` discriminator.
+  const loginPromise: Promise<DeliveryOAuthCredentials> = piProvider
     ? piProvider.login({
         onAuth: (info: OAuthAuthInfo) => {
           session.url = info.url;
@@ -322,7 +327,7 @@ export async function startOAuth(userId: string, providerId: string): Promise<St
       })
     : runOpenAiManualLogin(session);
   session.settled = loginPromise
-    .then(async (creds: PiOAuthCredentials) => {
+    .then(async (creds: DeliveryOAuthCredentials) => {
       await persistProviderOAuth(userId, provider, creds);
       session.status = 'connected';
       getLog().info({ userId, provider }, 'oauth_bridge.connected');
