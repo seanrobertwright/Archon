@@ -6756,6 +6756,40 @@ describe('workflowCancelCommand', () => {
     });
   });
 
+  it('does not report cancellation when the state transition loses a race', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>)
+      .mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'running',
+      })
+      .mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'running',
+      })
+      .mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'completed',
+      });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      cancelled: false,
+    });
+
+    await workflowCancelCommand(runId, true);
+
+    expect(mockDetachedTargetStop).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'cancel',
+      error: expect.stringContaining(
+        'The run status is completed; it was not reported as cancelled'
+      ),
+    });
+  });
+
   it('refuses a non-running run without contacting a process owner', async () => {
     const workflowDb = require('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({

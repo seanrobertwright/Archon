@@ -1177,8 +1177,9 @@ describe('abandonWorkflow', () => {
   test('cancels a non-terminal run', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun({ status: 'running' }));
 
-    const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow('run-1');
+    const { run, cancelled, cascadeFailures, blockedParentRunId } = await abandonWorkflow('run-1');
     expect(run.id).toBe('run-1');
+    expect(cancelled).toBe(true);
     expect(cascadeFailures).toBe(0);
     expect(blockedParentRunId).toBeNull();
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-1');
@@ -1297,8 +1298,9 @@ describe('abandonWorkflow', () => {
   test('does not cascade when the parent cancel loses the race', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun({ status: 'paused' }));
     mockCancelWorkflowRun.mockImplementationOnce(() => Promise.resolve({ cancelled: false }));
-    await abandonWorkflow('run-1');
+    const result = await abandonWorkflow('run-1');
     // findChildRuns is never consulted (no cascade) when the CAS was lost.
+    expect(result.cancelled).toBe(false);
     expect(mockFindChildRuns).not.toHaveBeenCalled();
   });
 

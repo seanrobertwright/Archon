@@ -3281,7 +3281,15 @@ export async function workflowCancelCommand(
       }
     }
 
-    const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
+    const { run, cancelled, cascadeFailures, blockedParentRunId } =
+      await abandonWorkflow(resolvedId);
+    if (!cancelled) {
+      const latest = await workflowDb.getWorkflowRun(resolvedId);
+      throw new Error(
+        'Detached work stopped, but cancellation did not win the run state transition. ' +
+          `The run status is ${latest?.status ?? 'unknown'}; it was not reported as cancelled.`
+      );
+    }
     return {
       resolvedId,
       workflowName: run.workflow_name,
