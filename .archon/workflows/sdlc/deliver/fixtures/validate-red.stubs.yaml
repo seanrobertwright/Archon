@@ -20,5 +20,5 @@ review__synthesize:
 validate__validate:
   green: false
   summary: "stub: tests failed — 3 red"
-await-checks: "no checks configured on this repository — nothing to await"
+ci-probe: '{"state":"concluded","detail":"no checks configured on this repository — nothing to await"}'
 flip-ready: "https://github.com/example/repo/pull/2"

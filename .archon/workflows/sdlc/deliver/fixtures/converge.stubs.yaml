@@ -36,5 +36,5 @@ validate__validate:
   green: true
   summary: "stub: full gate green"
 gate-validated: '{"validated":"true"}'
-await-checks: "all 2 check(s) green"
+ci-probe: '{"state":"concluded","detail":"all 2 check(s) green"}'
 flip-ready: "https://github.com/example/repo/pull/1"

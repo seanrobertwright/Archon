@@ -182,12 +182,31 @@ nodes:
       fi
     depends_on: [validate]
 
-  # Explicit 60-minute bound: without `timeout:` the engine kills a script node
-  # at its 120 s default (R5) — far under a normal 5-10 minute CI run.
+  # CI wait, durably. The probe classifies check state once; a pending state
+  # routes into the engine's `wait:` node (#2744), which suspends the run and
+  # releases the worker slot — the server's continuation scan resumes it when
+  # the clock fires, surviving restarts. This replaced a 60-minute in-process
+  # polling script the moment the engine could hold the time itself. Red fails
+  # the body (and so the group) immediately; a concluded probe skips the pause
+  # and `until_bash` ends the loop with zero wasted wait. 13 iterations bound
+  # the watch at ~60 minutes of CI time, the same ceiling the poller had —
+  # exhausting it fails the run rather than flipping a PR whose CI never ended.
   - id: await-checks
-    script: await-checks
-    runtime: uv
-    timeout: 3600000
+    loop_group:
+      max_iterations: 13
+      until_bash: test "$ci-probe.output.state" != "pending"
+      nodes:
+        - id: ci-probe
+          script: check-ci
+          runtime: uv
+          # The probe's only in-process wait is the single 60 s registration
+          # grace; headroom over the 120 s script default keeps that honest.
+          timeout: 180000
+        - id: ci-pause
+          wait:
+            duration_ms: 300000
+          when: $ci-probe.output.state == 'pending'
+          depends_on: [ci-probe]
     depends_on: [gate-validated]
 
   - id: flip-ready

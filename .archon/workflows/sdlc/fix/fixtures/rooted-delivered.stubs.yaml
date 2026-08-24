@@ -19,7 +19,7 @@ deliver__impl__record-start: '{"start":"recorded"}'
 deliver__impl__assert-changed: "3 files changed"
 deliver__gate-green: '{"gate":"green"}'
 deliver__pr__pr: "https://github.com/example/repo/pull/2 (draft)"
-deliver__await-checks: "all checks passed"
+deliver__ci-probe: '{"state":"concluded","detail":"all checks passed"}'
 deliver__flip-ready: "https://github.com/example/repo/pull/2"
 deliver__validate__validate:
   green: true

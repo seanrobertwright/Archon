@@ -1,24 +1,25 @@
-"""Wait for the current branch's PR checks to clear.
+"""Classify the current branch PR's check state, once.
 
-Archon-owned facts only (gh state, never the project's toolchain). A repository
-with no checks configured passes -- the bundle must run on any project -- and
-says so.
+Archon-owned facts only (gh state, never the project's toolchain). This is the
+single-shot probe inside the `await-checks` loop_group: the engine's durable
+`wait:` node owns the time between probes (#2744), so this script never sleeps
+through CI — it reads the state, declares it, and exits.
 
-Success is an EXPLICIT set: `pass` counts, `skipping` is accepted as
-non-blocking (and named), everything else -- `fail`, `cancel`, or any bucket
-this script does not recognize -- fails the node with the check names. A
-cancelled check is not a green check (R4).
+States, on stdout as JSON so `when:`/`until_bash` can branch without prose:
+  {"state": "pending", "detail": ...}    checks exist and some are still running
+  {"state": "concluded", "detail": ...}  green, no CI configured, or CI gated on
+                                         a maintainer's approval (fork or first
+                                         contribution) — a gate only a
+                                         maintainer can open, named, never
+                                         blocked on and never called green
+Red exits 1 with the failing names: `pass` counts, `skipping` is accepted as
+non-blocking (and named), everything else — `fail`, `cancel`, or any bucket this
+script does not recognize — fails the node. A cancelled check is not a green
+check (R4).
 
-Permission-agnostic: on a fork or first-contribution PR, CI is configured but
-will not start until a maintainer approves it. That is a gate only a
-maintainer can open, so this node SKIPS it with the reason stated -- it never
-blocks on it and never calls it green. "No checks started" and "no CI
-configured" are distinguished by asking whether the repository has active
-workflow definitions at all.
-
-The wait is bounded by the node's declared `timeout:` (60 minutes in
-deliver.yaml) -- without it the engine kills a script node at its 120 s
-default, far under a normal CI run.
+The one in-process wait left: when CI is configured but nothing has started
+yet, registration gets a single 60 s grace before the maintainer-gated skip is
+declared — the same grace the polling predecessor gave it.
 """
 
 import json
@@ -39,12 +40,12 @@ def checks() -> list[dict]:
     try:
         parsed = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        print(f"await-checks: could not read check state: {proc.stderr.strip()}", file=sys.stderr)
+        print(f"check-ci: could not read check state: {proc.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
     if not isinstance(parsed, list) or not all(
         isinstance(c, dict) and "name" in c and "bucket" in c for c in parsed
     ):
-        print(f"await-checks: unexpected check payload shape: {proc.stdout[:200]}", file=sys.stderr)
+        print(f"check-ci: unexpected check payload shape: {proc.stdout[:200]}", file=sys.stderr)
         sys.exit(1)
     return parsed
 
@@ -65,29 +66,33 @@ def repo_has_active_workflows() -> bool | None:
         return None
 
 
+def conclude(detail: str) -> int:
+    print(json.dumps({"state": "concluded", "detail": detail}))
+    return 0
+
+
 def main() -> int:
     rounds = checks()
     if not rounds:
         active = repo_has_active_workflows()
         if active is False:
-            print("no checks configured on this repository — nothing to await")
-            return 0
+            return conclude("no checks configured on this repository — nothing to await")
         # CI exists (or could not be ruled out) but nothing started. Give
         # registration one grace interval, then skip with the reason: starting
         # gated CI is a maintainer's power, not this run's.
         time.sleep(60)
         rounds = checks()
         if not rounds:
-            print(
+            return conclude(
                 "CI is configured but no checks started on this PR — most likely awaiting "
                 "a maintainer's approval to run (fork or first contribution), or path filters. "
                 "Skipping the CI gate; running and verifying checks stays with the maintainer."
             )
-            return 0
 
-    while any(c["bucket"] == "pending" for c in rounds):
-        time.sleep(30)
-        rounds = checks()
+    pending = [c["name"] for c in rounds if c["bucket"] == "pending"]
+    if pending:
+        print(json.dumps({"state": "pending", "detail": f"{len(pending)} check(s) running"}))
+        return 0
 
     passed = [c["name"] for c in rounds if c["bucket"] == "pass"]
     skipped = [c["name"] for c in rounds if c["bucket"] == "skipping"]
@@ -100,8 +105,7 @@ def main() -> int:
         return 1
 
     note = f"; skipped (non-blocking): {', '.join(skipped)}" if skipped else ""
-    print(f"all {len(passed)} required check(s) green{note}")
-    return 0
+    return conclude(f"all {len(passed)} required check(s) green{note}")
 
 
 if __name__ == "__main__":

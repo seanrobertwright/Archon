@@ -20,5 +20,5 @@ validate__validate:
   green: true
   summary: "stub: full gate green"
 gate-validated: '{"validated":"true"}'
-await-checks: "no checks configured on this repository — nothing to await"
+ci-probe: '{"state":"concluded","detail":"no checks configured on this repository — nothing to await"}'
 flip-ready: "https://github.com/example/repo/pull/2"
