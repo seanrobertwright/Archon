@@ -78,6 +78,8 @@ export interface WorkflowConfig {
   envVars?: Record<string, string>;
   /** Archon-injected credential entries within envVars. */
   protectedEnvKeys?: readonly string[];
+  /** Exact injected credential values, including credentials delivered through files. */
+  protectedCredentialValues?: readonly string[];
   aliases?: RawAliasesConfig;
   tiers?: RawTiersConfig;
   commands: { folder?: string };
@@ -156,12 +158,13 @@ export interface WorkflowDeps {
   isPerUserProviderKeysEnabled?: () => boolean;
   /**
    * Optional: resolve every connected provider credential for a user into a
-   * delivery bag (env vars + files to write under `artifactsDir`). Called
+   * delivery bag (env vars + files to write under `artifactsDir`) plus the
+   * decrypted values that must be scrubbed from subprocess failures. Called
    * once per run from `executeWorkflow`. Implementations own the delivery
    * map — the engine just merges `env` into `config.envVars` and writes the
    * `files` before any provider invocation.
    *
-   * Must never throw — return `{ env: {}, files: [] }` on any failure so the
+   * Must never throw — return empty bags on any failure so the
    * workflow continues with whatever env inheritance was already in place.
    */
   getUserProviderEnv?: (
@@ -170,6 +173,7 @@ export interface WorkflowDeps {
   ) => Promise<{
     env: Record<string, string>;
     files: { path: string; contents: string }[];
+    protectedValues: string[];
   }>;
   /**
    * Optional: resolve the originating user's personal AI preferences (model

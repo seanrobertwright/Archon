@@ -3237,13 +3237,16 @@ const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
 
 function collectSubprocessCredentialValues(
   env: NodeJS.ProcessEnv,
-  protectedEnvKeys: readonly string[] | undefined
+  protectedEnvKeys: readonly string[] | undefined,
+  protectedCredentialValues: readonly string[] | undefined
 ): string[] {
   const explicitlyProtected = new Set(protectedEnvKeys);
   const values = Object.entries(env).flatMap(([key, value]) =>
     value && (explicitlyProtected.has(key) || CREDENTIAL_ENV_KEY_SUFFIX.test(key)) ? [value] : []
   );
-  return [...new Set(values)].sort((a, b) => b.length - a.length);
+  return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
+    .filter(value => value.length > 0)
+    .sort((a, b) => b.length - a.length);
 }
 
 function redactCredentialValues(input: string, credentialValues: readonly string[]): string {
@@ -3296,6 +3299,7 @@ async function runSubprocess(
     timeout: number;
     env: NodeJS.ProcessEnv;
     protectedEnvKeys?: readonly string[];
+    protectedCredentialValues?: readonly string[];
   }
 ): Promise<{ stdout: string; stderr: string }> {
   if (execContext.kind === 'container') {
@@ -3312,7 +3316,8 @@ async function runSubprocess(
     } catch (err) {
       const credentialValues = collectSubprocessCredentialValues(
         options.env,
-        options.protectedEnvKeys
+        options.protectedEnvKeys,
+        options.protectedCredentialValues
       );
       throw redactSubprocessError(err as RawSubprocessRejection, credentialValues);
     }
@@ -3449,6 +3454,7 @@ async function executeBashNode(
   issueContext?: string,
   envVars?: Record<string, string>,
   protectedEnvKeys?: readonly string[],
+  protectedCredentialValues?: readonly string[],
   stepNamePrefix = '',
   iteration?: number,
   // Per-iteration $LOOP_USER_INPUT free-text for loop_group body bash nodes, delivered via
@@ -3556,6 +3562,7 @@ async function executeBashNode(
       timeout,
       env: subprocessEnv,
       protectedEnvKeys,
+      protectedCredentialValues,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -3725,6 +3732,7 @@ async function executeScriptNode(
   issueContext?: string,
   envVars?: Record<string, string>,
   protectedEnvKeys?: readonly string[],
+  protectedCredentialValues?: readonly string[],
   stepNamePrefix = '',
   iteration?: number,
   // Per-iteration $LOOP_USER_INPUT free-text for loop_group body scripts, delivered via
@@ -3945,6 +3953,7 @@ async function executeScriptNode(
       timeout,
       env: subprocessEnv,
       protectedEnvKeys,
+      protectedCredentialValues,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -4493,6 +4502,7 @@ async function executeLoopGroupNode(
             cwd,
             timeout: SUBPROCESS_DEFAULT_TIMEOUT,
             protectedEnvKeys: config.protectedEnvKeys,
+            protectedCredentialValues: config.protectedCredentialValues,
             env: {
               ...(config.envVars ?? {}),
               USER_MESSAGE: workflowRun.user_message,
@@ -4936,6 +4946,7 @@ async function executeLoopGroupNode(
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
           protectedEnvKeys: config.protectedEnvKeys,
+          protectedCredentialValues: config.protectedCredentialValues,
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env spreads FIRST so the reserved
@@ -6571,6 +6582,7 @@ async function executeLoopNode(
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
           protectedEnvKeys: config.protectedEnvKeys,
+          protectedCredentialValues: config.protectedCredentialValues,
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env (managed per-project vars +
@@ -9056,6 +9068,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                       issueContext,
                       config.envVars,
                       config.protectedEnvKeys,
+                      config.protectedCredentialValues,
                       stepNamePrefix,
                       iteration,
                       ctx.bodyLoopUserInput ?? '',
@@ -9088,6 +9101,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                     issueContext,
                     config.envVars,
                     config.protectedEnvKeys,
+                    config.protectedCredentialValues,
                     stepNamePrefix,
                     iteration,
                     ctx.bodyLoopUserInput ?? '',

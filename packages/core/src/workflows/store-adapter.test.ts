@@ -258,11 +258,11 @@ describe('createWorkflowDeps', () => {
       expect(typeof deps.getUserProviderEnv).toBe('function');
     });
 
-    test('getUserProviderEnv returns { env: {}, files: [] } when list query throws', async () => {
+    test('getUserProviderEnv returns empty delivery bags when list query throws', async () => {
       mockListDecryptedUserProviderCredentials.mockRejectedValueOnce(new Error('db gone'));
       const deps = createWorkflowDeps();
       const result = await deps.getUserProviderEnv?.('u-1', '/tmp/art');
-      expect(result).toEqual({ env: {}, files: [] });
+      expect(result).toEqual({ env: {}, files: [], protectedValues: [] });
     });
 
     // Regression guard for #2035: enabling the credential vault (auto-key on by
@@ -274,7 +274,7 @@ describe('createWorkflowDeps', () => {
       mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([]);
       const deps = createWorkflowDeps();
       const result = await deps.getUserProviderEnv?.('u-unconnected', '/tmp/art');
-      expect(result).toEqual({ env: {}, files: [] });
+      expect(result).toEqual({ env: {}, files: [], protectedValues: [] });
     });
 
     test('getUserProviderEnv aggregates env from multiple providers', async () => {
@@ -285,6 +285,37 @@ describe('createWorkflowDeps', () => {
       const deps = createWorkflowDeps();
       const result = await deps.getUserProviderEnv?.('u-1', '/tmp/art');
       expect(result?.env).toMatchObject({ OPENROUTER_API_KEY: 'or-k', GEMINI_API_KEY: 'g-k' });
+      expect(result?.protectedValues).toEqual(['or-k', 'g-k']);
+    });
+
+    test('getUserProviderEnv protects every string delivered through an OAuth file', async () => {
+      mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
+        {
+          provider: 'openai',
+          cred: {
+            kind: 'oauth',
+            oauthApiKey: 'derived-bearer',
+            rawCreds: {
+              access: 'access-token',
+              refresh: 'refresh-token',
+              id_token: 'id-token',
+              accountId: 'account-id',
+              nested: { futureToken: 'nested-token' },
+              expires: 123,
+            },
+          },
+        },
+      ]);
+      const deps = createWorkflowDeps();
+      const result = await deps.getUserProviderEnv?.('u-1', '/tmp/art');
+      expect(result?.protectedValues).toEqual([
+        'derived-bearer',
+        'access-token',
+        'refresh-token',
+        'id-token',
+        'account-id',
+        'nested-token',
+      ]);
     });
   });
 });

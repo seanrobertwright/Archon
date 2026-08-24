@@ -239,27 +239,24 @@ async function resolveUserGithubEnvForWorkflow(
  * any file-based deliveries (e.g. Codex `CODEX_HOME/auth.json`) under the
  * run's artifacts directory. Returns the env bag to merge LAST into
  * `config.envVars` so a connected user's keys win over file/db/bot-github
- * env. Returns `{}` when per-user provider keys are disabled, no userId is
- * present, or the deps adapter is absent.
+ * env, plus exact credential values for failure-path redaction. Returns empty
+ * bags when per-user provider keys are disabled, no userId is present, or the
+ * deps adapter is absent.
  *
- * Contract: NEVER THROWS. Adapter failures are logged and yield `{}` so the
+ * Contract: NEVER THROWS. Adapter failures are logged and yield empty bags so the
  * workflow continues with whatever env inheritance was already in place.
  */
 async function resolveUserProviderEnvForWorkflow(
   deps: WorkflowDeps,
   userId: string | undefined,
   artifactsDir: string
-): Promise<Record<string, string>> {
+): Promise<{ env: Record<string, string>; protectedValues: string[] }> {
   const perUserEnabled = deps.isPerUserProviderKeysEnabled?.() ?? false;
-  if (!perUserEnabled || !userId || !deps.getUserProviderEnv) return {};
+  if (!perUserEnabled || !userId || !deps.getUserProviderEnv) {
+    return { env: {}, protectedValues: [] };
+  }
   try {
-    // TODO(#1891 PR-3): when Codex OAuth delivery is enabled, file-write failures
-    // must drop only the affected provider's env keys, not all of them. Move file
-    // writes into getUserProviderEnv per-delivery so env + write are atomic
-    // per-provider, or wrap each write in a per-file try-catch that strips the
-    // matching env keys on failure. Currently safe: no OAuth rows can be created
-    // in PR-1 so `files` is always empty and this loop never executes.
-    const { env, files } = await deps.getUserProviderEnv(userId, artifactsDir);
+    const { env, files, protectedValues } = await deps.getUserProviderEnv(userId, artifactsDir);
     for (const f of files) {
       await mkdir(dirname(f.path), { recursive: true });
       await writeFile(f.path, f.contents, { encoding: 'utf8', mode: 0o600 });
@@ -268,10 +265,10 @@ async function resolveUserProviderEnvForWorkflow(
     if (envKeys.length > 0) {
       getLog().debug({ userId, keys: envKeys }, 'workflow.user_provider_env_injected');
     }
-    return env;
+    return { env, protectedValues };
   } catch (err) {
     getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_env_resolve_failed');
-    return {};
+    return { env: {}, protectedValues: [] };
   }
 }
 
@@ -2365,14 +2362,21 @@ export async function executeWorkflow(
   // under it. Merged LAST into config.envVars so the originating user's keys
   // win over file/db/bot-github env — preserves the GitHub merge order and
   // keeps the no-key path byte-for-byte unchanged (resolveUserProviderEnvForWorkflow
-  // returns {} when the feature is disabled or no userId is present).
-  const userProviderEnv = await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
+  // returns empty bags when the feature is disabled or no userId is present).
+  const { env: userProviderEnv, protectedValues } = await resolveUserProviderEnvForWorkflow(
+    deps,
+    userId,
+    artifactsDir
+  );
   config.envVars = { ...config.envVars, ...userProviderEnv };
   for (const key of Object.keys(userProviderEnv)) {
     protectedEnvKeys.add(key);
   }
   if (protectedEnvKeys.size > 0) {
     config.protectedEnvKeys = [...protectedEnvKeys];
+  }
+  if (protectedValues.length > 0) {
+    config.protectedCredentialValues = protectedValues;
   }
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error.

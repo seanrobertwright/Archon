@@ -25923,6 +25923,7 @@ describe('container subprocess credential redaction', () => {
     const openAiSecret = 'sk-openai-not-shaped';
     const otherInjectedSecret = 'credential-with-no-known-shape';
     const projectSecret = 'project-secret-with-no-known-shape';
+    const fileDeliveredSecret = 'oauth-token-only-present-in-auth-file';
     const logDir = join(testDir, 'logs');
     const workflowRun = makeWorkflowRun('container-redaction-run', {
       workflow_name: 'container-redaction',
@@ -25948,8 +25949,8 @@ describe('container subprocess credential redaction', () => {
             code: 1,
             killed: false,
             cmd: commandLine,
-            stdout: `stdout echoed ${openAiSecret}, ${otherInjectedSecret}, and ${projectSecret}`,
-            stderr: `stderr echoed ${openAiSecret}, ${otherInjectedSecret}, and ${projectSecret}`,
+            stdout: `stdout echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, and ${fileDeliveredSecret}`,
+            stderr: `stderr echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, and ${fileDeliveredSecret}`,
           }
         );
         throw rejection;
@@ -25983,6 +25984,7 @@ describe('container subprocess credential redaction', () => {
             BASE_BRANCH: 'main',
           },
           protectedEnvKeys: ['OPENAI_API_KEY', 'CUSTOM_AUTH'],
+          protectedCredentialValues: [fileDeliveredSecret],
         },
         undefined,
         undefined,
@@ -26013,6 +26015,7 @@ describe('container subprocess credential redaction', () => {
       expect(rejectionText).not.toContain(openAiSecret);
       expect(rejectionText).not.toContain(otherInjectedSecret);
       expect(rejectionText).not.toContain(projectSecret);
+      expect(rejectionText).not.toContain(fileDeliveredSecret);
       expect(rejection?.cmd).toContain('OPENAI_API_KEY=[REDACTED]');
       expect(rejection?.cmd).toContain('CUSTOM_AUTH=[REDACTED]');
       expect(rejection?.cmd).toContain('PROJECT_SECRET=[REDACTED]');
@@ -26027,6 +26030,7 @@ describe('container subprocess credential redaction', () => {
         expect(durableText).not.toContain(openAiSecret);
         expect(durableText).not.toContain(otherInjectedSecret);
         expect(durableText).not.toContain(projectSecret);
+        expect(durableText).not.toContain(fileDeliveredSecret);
       }
     } finally {
       execSpy.mockRestore();

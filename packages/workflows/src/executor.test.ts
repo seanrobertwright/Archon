@@ -1524,7 +1524,11 @@ describe('executeWorkflow', () => {
 
   describe('user provider env injection', () => {
     it('skips injection when isPerUserProviderKeysEnabled returns false', async () => {
-      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const getUserProviderEnv = mock(async () => ({
+        env: { SHOULD_NOT_APPEAR: '1' },
+        files: [],
+        protectedValues: ['1'],
+      }));
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => false,
@@ -1544,7 +1548,11 @@ describe('executeWorkflow', () => {
     });
 
     it('skips injection when userId is absent even if feature is enabled', async () => {
-      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const getUserProviderEnv = mock(async () => ({
+        env: { SHOULD_NOT_APPEAR: '1' },
+        files: [],
+        protectedValues: ['1'],
+      }));
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => true,
@@ -1570,6 +1578,7 @@ describe('executeWorkflow', () => {
       const getUserProviderEnv = mock(async () => ({
         env: { SHARED_KEY: 'user_wins', USER_KEY: 'u_val' },
         files: [] as { path: string; contents: string }[],
+        protectedValues: ['user_wins', 'u_val'],
       }));
       const deps: WorkflowDeps = {
         ...makeDeps(store),
@@ -1593,6 +1602,7 @@ describe('executeWorkflow', () => {
         USER_KEY: 'u_val',
       });
       expect(configArg?.protectedEnvKeys).toEqual(['SHARED_KEY', 'USER_KEY']);
+      expect(configArg?.protectedCredentialValues).toEqual(['user_wins', 'u_val']);
     });
 
     it('protects bot and per-user GitHub credentials beside provider credentials', async () => {
@@ -1614,6 +1624,7 @@ describe('executeWorkflow', () => {
         getUserProviderEnv: mock(async () => ({
           env: { ANTHROPIC_API_KEY: 'provider-token' },
           files: [],
+          protectedValues: ['provider-token'],
         })),
       };
 
@@ -1641,6 +1652,7 @@ describe('executeWorkflow', () => {
         'COPILOT_GITHUB_TOKEN',
         'ANTHROPIC_API_KEY',
       ]);
+      expect(configArg?.protectedCredentialValues).toEqual(['provider-token']);
     });
 
     it('returns {} and does not throw when getUserProviderEnv rejects', async () => {

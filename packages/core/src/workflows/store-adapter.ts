@@ -43,6 +43,20 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+function collectStringValues(value: unknown, values: Set<string>): void {
+  if (typeof value === 'string') {
+    if (value.length > 0) values.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStringValues(item, values);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const item of Object.values(value)) collectStringValues(item, values);
+  }
+}
+
 export function createWorkflowStore(): IWorkflowStore {
   return {
     createWorkflowRun: workflowDb.createWorkflowRun,
@@ -149,9 +163,9 @@ export function createWorkflowDeps(): WorkflowDeps {
     },
     // Per-user AI-provider credentials (Phase 2): list the user's decrypted
     // credentials and translate each through the delivery map into an env bag
-    // (and optional file deliveries) for the run. Engine-facing contract is
-    // env+files only — the delivery map is owned here, not in @archon/workflows,
-    // so the workflow engine stays free of provider-specific knowledge.
+    // (and optional file deliveries) for the run. Exact decrypted values travel
+    // beside that bag only so the workflow subprocess boundary can scrub echoed
+    // file-delivered credentials without knowing provider-specific file shapes.
     isPerUserProviderKeysEnabled: () => isPerUserProviderKeysEnabled(),
     getUserProviderEnv: async (
       userId: string,
@@ -159,16 +173,24 @@ export function createWorkflowDeps(): WorkflowDeps {
     ): Promise<{
       env: Record<string, string>;
       files: { path: string; contents: string }[];
+      protectedValues: string[];
     }> => {
       try {
         const creds = await listDecryptedUserProviderCredentials(userId);
         const env: Record<string, string> = {};
         const files: { path: string; contents: string }[] = [];
+        const protectedValues = new Set<string>();
         for (const { provider, cred } of creds) {
           try {
             const result = deliverCredential(provider, cred, { artifactsDir });
             Object.assign(env, result.env);
             if (result.files) files.push(...result.files);
+            if (cred.kind === 'api_key') {
+              protectedValues.add(cred.apiKey);
+            } else {
+              protectedValues.add(cred.oauthApiKey);
+              collectStringValues(cred.rawCreds, protectedValues);
+            }
           } catch (err) {
             // Unknown provider / shape mismatch — log at ERROR (no per-credential
             // user-facing skip event yet) and skip this credential rather than
@@ -190,10 +212,10 @@ export function createWorkflowDeps(): WorkflowDeps {
             env[PI_AUTH_PATH_ENV] = piAuthPath;
           }
         }
-        return { env, files };
+        return { env, files, protectedValues: [...protectedValues] };
       } catch (err) {
         getLog().warn({ err: err as Error, userId }, 'workflow_deps.provider_creds_resolve_failed');
-        return { env: {}, files: [] };
+        return { env: {}, files: [], protectedValues: [] };
       }
     },
     // Per-user AI prefs (Phase 3): personal tiers/aliases/default-provider,
