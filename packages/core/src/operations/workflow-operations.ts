@@ -363,6 +363,8 @@ export async function resumeWorkflow(runId: string): Promise<WorkflowRun> {
 
 export interface AbandonWorkflowResult {
   run: WorkflowRun;
+  /** Whether this call won the state transition to `cancelled`. */
+  cancelled: boolean;
   /**
    * Number of sub-run descendants the cascade failed to cancel (best-effort walk;
    * failures are also logged). Non-zero means part of the tree may still be alive.
@@ -378,7 +380,6 @@ export interface AbandonWorkflowResult {
 }
 
 interface AbandonAttemptResult extends AbandonWorkflowResult {
-  cancelled: boolean;
   cancelledDescendants: number;
 }
 
@@ -434,6 +435,7 @@ export async function abandonWorkflow(runId: string): Promise<AbandonWorkflowRes
   const result = await cancelRunAndCleanup(run, workflowDb.cancelWorkflowRun);
   return {
     run: result.run,
+    cancelled: result.cancelled,
     cascadeFailures: result.cascadeFailures,
     blockedParentRunId: result.blockedParentRunId,
   };

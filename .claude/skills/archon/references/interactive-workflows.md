@@ -95,7 +95,7 @@ When the workflow finishes (status becomes `completed` or `failed`), report the 
 # Approve with feedback (interactive loops)
 archon workflow approve <run-id> "your feedback or answers here"
 
-# Reject (cancels the workflow)
+# Reject an approval gate (cancels or queues its on_reject rework path)
 archon workflow reject <run-id> "reason for rejection"
 ```
 
@@ -103,4 +103,4 @@ archon workflow reject <run-id> "reason for rejection"
 
 - **Workflow shows `running` for a long time**: The AI is doing research/implementation. Be patient — check again in a few minutes.
 - **Log file not found**: The log is at `~/.archon/workspaces/<owner>/<repo>/logs/<run-id>.jsonl`
-- **User wants to cancel**: Run `archon workflow reject <run-id>` to stop at an approval gate, or `archon workflow abandon <run-id>` to mark the run cancelled without killing any subprocess. To actively terminate a still-live subprocess, use the chat slash command `/workflow cancel <run-id>` on the platform that started it — there is no `archon workflow cancel` CLI subcommand
+- **User wants to reject an approval gate**: Run `archon workflow reject <run-id>`. Use `archon workflow cancel <run-id>` to actively stop a running CLI `--detach` owner, or `archon workflow abandon <run-id>` to cancel a paused run or verified orphan where no host work remains.

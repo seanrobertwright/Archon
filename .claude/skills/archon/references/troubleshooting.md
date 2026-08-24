@@ -89,8 +89,9 @@ Three possibilities:
 1. **The AI is actually working.** Check `~/.archon/workspaces/<owner>/<repo>/logs/<run-id>.jsonl` — if you see recent `tool` or `assistant` events in the tail, it's fine. Wait.
 2. **The server crashed and left an orphan row.** Server startup no longer auto-fails orphaned `running` rows (per the "No Autonomous Lifecycle Mutation" rule — `CLAUDE.md`). Transition it manually:
    - Web UI: Dashboard → Abandon or Cancel button on the run card
-   - CLI: `archon workflow abandon <run-id>` — marks the DB row cancelled without killing any subprocess. Right tool for orphans since the subprocess is already gone
-   - Chat (Slack / Telegram / Web): `/workflow cancel <run-id>` — actively terminates the subprocess. Use for a still-live run that needs to be interrupted (there is no `archon workflow cancel` CLI subcommand)
+   - CLI live detached owner: `archon workflow cancel <run-id>` — stops the exact CLI `--detach` process tree before marking the row cancelled
+   - CLI verified orphan: `archon workflow abandon <run-id>` — marks the DB row cancelled without claiming to stop host work
+   - Chat (Slack / Telegram / Web): `/workflow cancel` in the conversation that owns the active run
 3. **A node is past its `idle_timeout`.** The default is 30 minutes of complete silence (the timer resets on every streamed message — it's a deadlock detector, not a work limiter). Override with per-node `idle_timeout` (ms) if a node legitimately goes quiet for longer.
 
 ### Workflow fails mid-way; how do I resume?

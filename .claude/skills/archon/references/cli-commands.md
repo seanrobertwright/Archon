@@ -115,14 +115,30 @@ archon workflow reject abc123 "Plan misses test coverage"
 
 ### `archon workflow abandon <run-id> [--json]`
 
-Mark a non-terminal workflow run as cancelled. Use when a `running` row is stuck after a server crash or when you want to discard a paused run without rejecting. This does NOT kill an in-flight subprocess — it only transitions the DB row.
+Mark a non-terminal workflow run as cancelled. Use when you want to discard a paused
+run without rejecting, or after independently verifying that a `running` row was
+orphaned by a crash. This does NOT kill an in-flight subprocess — it only transitions
+the DB row.
 
 ```bash
 archon workflow abandon abc123
 archon workflow abandon abc123 --json   # { "ok": true, "runId": "abc123", "action": "abandon", "status": "cancelled", ... }
 ```
 
-> **There is no `archon workflow cancel` CLI subcommand.** To actively cancel a running workflow (terminate its subprocess), use the chat slash command `/workflow cancel <run-id>` on the platform that started it (Web UI, Slack, Telegram, etc.), or the Cancel button on the Web UI dashboard. The CLI only offers `abandon`, which is the right tool for orphan cleanup but does not interrupt a live subprocess.
+### `archon workflow cancel <run-id> [--json]`
+
+Actively stop a running workflow started with CLI `--detach`. Archon contacts the live
+owner for that exact run, terminates its process tree, confirms that it stopped, and
+only then marks the run `cancelled`.
+
+```bash
+archon workflow cancel abc123
+archon workflow cancel abc123 --json
+```
+
+If Archon cannot reach the detached owner or cannot confirm process-tree termination,
+the command fails and leaves the database row unchanged. Verify an orphan separately
+before using the state-only `workflow abandon` command.
 
 ### `archon workflow resume <run-id> [--json]`
 
