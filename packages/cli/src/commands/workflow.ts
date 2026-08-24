@@ -3248,12 +3248,16 @@ export async function workflowCancelCommand(
       );
     }
 
-    const isolationEnvId = current.metadata?.isolation_env_id;
-    const containerEnvId =
-      current.metadata?.isolation === 'container' && typeof isolationEnvId === 'string'
-        ? isolationEnvId
-        : undefined;
-    if (containerEnvId) {
+    let containerEnvId: string | undefined;
+    if (current.metadata?.isolation === 'container') {
+      const isolationEnvId = current.metadata.isolation_env_id;
+      if (typeof isolationEnvId !== 'string' || isolationEnvId.trim().length === 0) {
+        throw new Error(
+          `Cannot confirm the isolation container owned by run ${resolvedId}. ` +
+            'The run was not changed; its container tracking ID is missing.'
+        );
+      }
+      containerEnvId = isolationEnvId;
       const containerEnv = await isolationDb.getById(containerEnvId);
       if (containerEnv?.provider !== 'container') {
         throw new Error(

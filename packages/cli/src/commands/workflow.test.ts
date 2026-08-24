@@ -6734,6 +6734,28 @@ describe('workflowCancelCommand', () => {
     });
   });
 
+  it('does not stop the owner when a container run has no tracking ID', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    const isolationDb = require('@archon/core/db/isolation-environments');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+      metadata: { isolation: 'container' },
+    });
+
+    await workflowCancelCommand(runId, true);
+
+    expect(isolationDb.getById).not.toHaveBeenCalled();
+    expect(mockRequestDetachedRunStop).not.toHaveBeenCalled();
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'cancel',
+      error: expect.stringContaining('container tracking ID is missing'),
+    });
+  });
+
   it('refuses a non-running run without contacting a process owner', async () => {
     const workflowDb = require('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
