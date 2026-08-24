@@ -382,6 +382,14 @@ export function readRunModelBindingsMetadata(
     throw new Error('Workflow run has invalid model_bindings effective metadata.');
   }
 
+  const overridesRecord = overrides as Record<string, unknown>;
+  for (const layerName of ['tiers', 'aliases'] as const) {
+    const layer = overridesRecord[layerName];
+    if (layer !== undefined && (!layer || typeof layer !== 'object' || Array.isArray(layer))) {
+      throw new Error(`Workflow run has invalid model_bindings ${layerName} metadata.`);
+    }
+  }
+
   const effectiveRecord = effective as Record<string, unknown>;
   if (
     typeof effectiveRecord.defaultProvider !== 'string' ||
@@ -392,7 +400,7 @@ export function readRunModelBindingsMetadata(
     throw new Error('Workflow run has invalid effective model bindings.');
   }
 
-  const resolved = overrides as ResolvedRunModelOverrides;
+  const resolved = overridesRecord as ResolvedRunModelOverrides;
   buildAiProfile(effectiveRecord.defaultProvider, {
     runTiers: resolved.tiers,
     runAliases: resolved.aliases,

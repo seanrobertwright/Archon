@@ -396,6 +396,16 @@ describe('per-run model bindings', () => {
 
     expect(readRunModelBindingsMetadata({ model_bindings: value })).toEqual(value);
     expect(() => readRunModelBindingsMetadata({ model_bindings: 'bad' })).toThrow(/invalid/);
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: { ...value, overrides: { tiers: 1 } },
+      })
+    ).toThrow(/invalid model_bindings tiers/);
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: { ...value, overrides: { aliases: [] } },
+      })
+    ).toThrow(/invalid model_bindings aliases/);
   });
 });
 

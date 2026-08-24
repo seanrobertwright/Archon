@@ -801,6 +801,39 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
     });
 
+    it('fails a pre-created run when its effective bindings cannot be recorded', async () => {
+      const updateRun = mock<IWorkflowStore['updateWorkflowRun']>(async () => {
+        throw new Error('database unavailable');
+      });
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({ id: 'pending-run', status: 'pending', metadata: {} });
+
+      const result = await executeWorkflow(
+        makeDeps(makeStore({ updateWorkflowRun: updateRun, failWorkflowRun: failRun })),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun,
+          modelOverrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+        }
+      );
+
+      expect(result).toEqual({
+        success: false,
+        workflowRunId: 'pending-run',
+        error: 'Database error recording workflow model bindings',
+      });
+      expect(failRun).toHaveBeenCalledWith(
+        'pending-run',
+        'Database error recording workflow model bindings'
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
     it('restores the persisted sparse layer on resume and refuses a new one', async () => {
       const preCreatedRun = makeRun({
         id: 'resume-model-run',

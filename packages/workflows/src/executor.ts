@@ -2047,9 +2047,35 @@ export async function executeWorkflow(
   }
 
   if (preCreatedRun && !isContinuation) {
-    await deps.store.updateWorkflowRun(preCreatedRun.id, {
-      metadata: { [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata },
-    });
+    try {
+      await deps.store.updateWorkflowRun(preCreatedRun.id, {
+        metadata: { [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata },
+      });
+    } catch (error) {
+      const err = error as Error;
+      getLog().error(
+        { err, workflowRunId: preCreatedRun.id },
+        'workflow.model_bindings_persist_failed'
+      );
+      await deps.store
+        .failWorkflowRun(preCreatedRun.id, 'Database error recording workflow model bindings')
+        .catch((dbError: Error) => {
+          getLog().error(
+            { err: dbError, workflowRunId: preCreatedRun.id },
+            'workflow.model_bindings_failure_record_failed'
+          );
+        });
+      await sendCriticalMessage(
+        platform,
+        conversationId,
+        '❌ **Workflow failed**: Unable to record the run model bindings. Please try again later.'
+      );
+      return {
+        success: false,
+        workflowRunId: preCreatedRun.id,
+        error: 'Database error recording workflow model bindings',
+      };
+    }
     workflowRun = {
       ...preCreatedRun,
       metadata: {
