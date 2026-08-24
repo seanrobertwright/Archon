@@ -226,10 +226,11 @@ export function buildRequestSubprocessEnv(
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
+// Prose patterns exclude bare HTTP codes; SDK result codes are classified
+// structurally in classifyAndEnrichError.
 const RATE_LIMIT_PATTERNS = [
   'rate limit',
   'too many requests',
-  '429',
   'overloaded',
   // "API Error: 400 due to tool use concurrency issues" — transient server-side
   // rejection of concurrent tool calls; retrying after backoff succeeds (#1341).
@@ -263,14 +264,7 @@ const UNTYPED_TRANSIENT_PATTERNS: readonly string[] = [
   'tool use concurrency',
 ];
 
-const AUTH_PATTERNS = [
-  'credit balance',
-  'unauthorized',
-  'authentication',
-  'invalid token',
-  '401',
-  '403',
-];
+const AUTH_PATTERNS = ['credit balance', 'unauthorized', 'authentication', 'invalid token'];
 const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'operation aborted'];
 
 /**
@@ -286,7 +280,8 @@ const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'oper
  */
 const SPAWN_FAILURE_PATTERNS = ['failed to launch', 'enoent'];
 
-function classifySubprocessError(
+/** Classify untyped subprocess errors without treating bare HTTP codes as prose signals. */
+export function classifySubprocessError(
   errorMessage: string,
   stderrOutput: string
 ): 'rate_limit' | 'auth' | 'crash' | 'unknown' {
