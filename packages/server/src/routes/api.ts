@@ -97,6 +97,7 @@ import {
   isApprovalContext,
   isGateResolved,
   isWorkflowWaitContext,
+  workflowWaitStepName,
 } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { MessageRow } from '@archon/core/schemas/message';
@@ -3709,7 +3710,7 @@ export function registerApiRoutes(
       }
       const { signaled } = await workflowDb.signalWorkflowWait(runId, event, payload, {
         event_type: 'wait_signaled',
-        step_name: wait.nodeId,
+        step_name: workflowWaitStepName(wait),
         data: { event, ...(payload !== undefined ? { payload } : {}) },
       });
       if (!signaled) {

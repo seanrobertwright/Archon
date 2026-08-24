@@ -3798,12 +3798,17 @@ export interface components {
           max_attempts?: number;
         };
       };
-      wait?: {
-        duration_ms?: number;
-        until?: string;
-        event?: string;
-        deadline_ms?: number;
-      };
+      wait?:
+        | {
+            duration_ms: number;
+          }
+        | {
+            until: string;
+          }
+        | {
+            event: string;
+            deadline_ms: number;
+          };
       cancel?: string;
       include?: string;
       workflow?: string;

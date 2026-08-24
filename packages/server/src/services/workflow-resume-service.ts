@@ -41,7 +41,7 @@ function continuationCursor(run: WorkflowRun): WorkflowResumeCursor | undefined 
 export interface WorkflowResumeDestination {
   platform: IWorkflowPlatform;
   conversationId: string;
-  surfaceResult?: boolean;
+  resultConversationId?: string;
 }
 
 export type WorkflowResumeTarget =
@@ -52,12 +52,13 @@ export type WorkflowResumeTarget =
 export type WorkflowResumeDestinationResolver = (run: WorkflowRun) => Promise<WorkflowResumeTarget>;
 
 export function workflowResumeConversationId(run: WorkflowRun): string {
-  return run.parent_conversation_id ?? run.conversation_id;
+  return run.conversation_id;
 }
 
 export function workflowResumeTargetForConversation(
   conversation: { platform_type: string; platform_conversation_id: string | null },
-  platforms: ReadonlyMap<string, IWorkflowPlatform>
+  platforms: ReadonlyMap<string, IWorkflowPlatform>,
+  resultConversationId?: string
 ): WorkflowResumeTarget {
   if (conversation.platform_type === 'cli' || conversation.platform_type === 'api') {
     return { kind: 'headless' };
@@ -77,7 +78,9 @@ export function workflowResumeTargetForConversation(
     destination: {
       platform,
       conversationId: conversation.platform_conversation_id,
-      surfaceResult: conversation.platform_type === 'web',
+      ...(conversation.platform_type === 'web'
+        ? { resultConversationId: resultConversationId ?? conversation.platform_conversation_id }
+        : {}),
     },
   };
 }
@@ -165,7 +168,7 @@ export async function resumeWorkflowRunFromServer(
       }
     ).then(
       result => {
-        if (destination?.surfaceResult !== true || 'paused' in result) return;
+        if (destination?.resultConversationId === undefined || 'paused' in result) return;
         let message: string;
         let resultRunId: string;
         if (result.success) {
@@ -178,7 +181,7 @@ export async function resumeWorkflowRunFromServer(
           resultRunId = result.workflowRunId;
         }
         void platform
-          .sendMessage(platformConversationId, message, {
+          .sendMessage(destination.resultConversationId, message, {
             category: 'workflow_result',
             segment: 'new',
             workflowResult: { workflowName: run.workflow_name, runId: resultRunId },

@@ -946,10 +946,10 @@ export function validateDagStructure(
         sources.push({ field: node.runtime === 'sh' ? 'bash' : 'script', text: node.script });
       }
       if (isWaitNode(node)) {
-        if (node.wait.until !== undefined) {
+        if ('until' in node.wait) {
           sources.push({ field: 'wait.until', text: node.wait.until });
         }
-        if (node.wait.event !== undefined) {
+        if ('event' in node.wait) {
           sources.push({ field: 'wait.event', text: node.wait.event });
         }
       }
@@ -1045,11 +1045,10 @@ export function validateDagStructure(
     }
 
     if (!isIncludeDirective(node) && isWaitNode(node)) {
-      for (const [field, text] of [
-        ['wait.until', node.wait.until],
-        ['wait.event', node.wait.event],
-      ] as const) {
-        if (text === undefined) continue;
+      const waitSources: (readonly [string, string])[] = [];
+      if ('until' in node.wait) waitSources.push(['wait.until', node.wait.until]);
+      if ('event' in node.wait) waitSources.push(['wait.event', node.wait.event]);
+      for (const [field, text] of waitSources) {
         outputRefPattern.lastIndex = 0;
         let m: RegExpExecArray | null;
         while ((m = outputRefPattern.exec(text)) !== null) {

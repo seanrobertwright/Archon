@@ -723,6 +723,13 @@ export async function updateGlobalConfig(
       merged.concurrency = { ...current.concurrency, ...updates.concurrency };
     }
 
+    if (updates.workflows) {
+      merged.workflows = workflowContinuationConfigSchema.parse({
+        ...current.workflows,
+        ...updates.workflows,
+      });
+    }
+
     if (updates.tiers) {
       // Per-key merge: `null` unsets a tier, a value sets it, and an absent key
       // (`undefined`) preserves the existing tier — so a single-tier PATCH/CLI

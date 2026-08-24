@@ -20,6 +20,9 @@ import {
   readSubrunMetadata,
   RUN_METADATA_KEYS,
   readIdentityUnresolved,
+  workflowWaitContextSchema,
+  scheduledWorkflowResumeSchema,
+  workflowWaitStepName,
 } from './schemas';
 import type {
   DagNode,
@@ -46,6 +49,58 @@ const promptNode: AgentNode = {
 };
 const bashNode: ExecNode = { id: 'n3', kind: 'exec', runtime: 'sh', script: 'echo hello' };
 const cancelNode: HaltNode = { id: 'n5', kind: 'halt', reason: 'Precondition failed' };
+
+describe('persisted workflow continuation schemas', () => {
+  const timeWait = {
+    owner: 'node' as const,
+    nodeId: 'later',
+    kind: 'time' as const,
+    waitingSince: '2026-08-24T10:00:00.000Z',
+    resumeAt: '2026-08-25T10:00:00.000Z',
+  };
+
+  test('requires the fields belonging to the persisted wait kind and owner', () => {
+    expect(workflowWaitContextSchema.safeParse(timeWait).success).toBe(true);
+    expect(
+      workflowWaitContextSchema.safeParse({ ...timeWait, event: 'deploy.complete' }).success
+    ).toBe(false);
+    expect(workflowWaitContextSchema.safeParse({ ...timeWait, kind: 'event' }).success).toBe(false);
+
+    const loopEvent = workflowWaitContextSchema.parse({
+      owner: 'loop_group',
+      nodeId: 'release',
+      bodyWaitId: 'checks',
+      iteration: 2,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'event',
+      event: 'checks.complete',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      resumeAt: '2026-08-25T10:00:00.000Z',
+    });
+    expect(workflowWaitStepName(loopEvent)).toBe('release.checks');
+  });
+
+  test('rejects quota continuations beyond their attempt or time budget', () => {
+    const scheduled = {
+      reason: 'quota' as const,
+      resumeAt: '2026-08-25T10:00:00.000Z',
+      deadlineAt: '2026-08-26T10:00:00.000Z',
+      attempt: 1,
+      maxAttempts: 2,
+    };
+    expect(scheduledWorkflowResumeSchema.safeParse(scheduled).success).toBe(true);
+    expect(scheduledWorkflowResumeSchema.safeParse({ ...scheduled, attempt: 3 }).success).toBe(
+      false
+    );
+    expect(
+      scheduledWorkflowResumeSchema.safeParse({
+        ...scheduled,
+        resumeAt: '2026-08-27T10:00:00.000Z',
+      }).success
+    ).toBe(false);
+  });
+});
 
 describe('dagNodeSchema — durable wait', () => {
   test('normalizes duration, until, and bounded event waits', () => {

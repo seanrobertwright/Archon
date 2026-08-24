@@ -205,15 +205,21 @@ describe('expandWorkflowIncludes — namespacing', () => {
     const untilNode = nodeById(expanded, 'waiting__wait-for-window');
     const eventNode = nodeById(expanded, 'waiting__wait-for-event');
     const inputTimeNode = nodeById(expanded, 'waiting__wait-for-input-time');
-    expect(untilNode && 'wait' in untilNode ? untilNode.wait.until : undefined).toBe(
-      '$waiting__schedule.output'
-    );
-    expect(eventNode && 'wait' in eventNode ? eventNode.wait.event : undefined).toBe(
-      'checks.complete'
-    );
-    expect(inputTimeNode && 'wait' in inputTimeNode ? inputTimeNode.wait.until : undefined).toBe(
-      '2026-08-25T23:00:00Z'
-    );
+    expect(
+      untilNode && 'wait' in untilNode && 'until' in untilNode.wait
+        ? untilNode.wait.until
+        : undefined
+    ).toBe('$waiting__schedule.output');
+    expect(
+      eventNode && 'wait' in eventNode && 'event' in eventNode.wait
+        ? eventNode.wait.event
+        : undefined
+    ).toBe('checks.complete');
+    expect(
+      inputTimeNode && 'wait' in inputTimeNode && 'until' in inputTimeNode.wait
+        ? inputTimeNode.wait.until
+        : undefined
+    ).toBe('2026-08-25T23:00:00Z');
   });
 
   test("propagates the include node's when/trigger_rule onto entry nodes", () => {

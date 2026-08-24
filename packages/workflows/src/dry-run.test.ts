@@ -806,6 +806,7 @@ describe('dryRunWorkflow', () => {
     });
 
     expect(result.outcome).toBe('paused');
+    expect(createDryRunStubScaffold(workflow)).toEqual({});
     expect(result.trace).toEqual([
       {
         nodeId: 'delay',
@@ -815,6 +816,7 @@ describe('dryRunWorkflow', () => {
       },
     ]);
     expect(result.missingStubs).toEqual([]);
+    expect(result.unusedStubs).toEqual([]);
   });
 
   test('simulates loop completion and max-iteration failure', async () => {

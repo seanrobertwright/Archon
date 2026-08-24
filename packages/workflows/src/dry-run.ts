@@ -188,7 +188,13 @@ function stubSatisfiesNode(node: DagNode, stub: DryRunStubValue): boolean {
 
 function collectsStub(node: DagNode): boolean {
   // `include:` is no longer a DagNode member (#2486) — it never reaches this function.
-  return !(isGateNode(node) || isHaltNode(node) || isWorkflowNode(node) || isLoopGroupNode(node));
+  return !(
+    isGateNode(node) ||
+    isWaitNode(node) ||
+    isHaltNode(node) ||
+    isWorkflowNode(node) ||
+    isLoopGroupNode(node)
+  );
 }
 
 /** Build the complete static stub map for an already-expanded workflow definition. */

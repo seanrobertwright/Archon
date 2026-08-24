@@ -14324,7 +14324,7 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       store.createWorkflowEvent.mock.calls.some(
         call => call[0].event_type === 'quota_resume_scheduled'
       )
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it('does not promise automatic quota continuation for a container run', async () => {
@@ -21844,7 +21844,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     if (!('kind' in substitutedWait) || substitutedWait.kind !== 'wait') {
       throw new Error('expected wait node');
     }
-    expect(substitutedWait.wait.event).toBe('PRIOR');
+    expect('event' in substitutedWait.wait ? substitutedWait.wait.event : undefined).toBe('PRIOR');
 
     const script = dagNodeSchema.parse({
       id: 'script',

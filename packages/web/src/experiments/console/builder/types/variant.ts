@@ -118,8 +118,20 @@ export interface CancelNodeData {
   reason: string;
 }
 
-/** Durable time/event wait configuration. Structural validation enforces its one-of rule. */
-export type WaitNodeData = NonNullable<WireDagNode['wait']>;
+type UnionKeys<T> = T extends T ? keyof T : never;
+type UnionValue<T, K extends PropertyKey> = T extends Record<K, infer V> ? V : never;
+
+/**
+ * The wire wait is a validated one-of union. The builder deliberately holds an
+ * incomplete form while the operator switches variants and edits fields, then
+ * structural validation restores the wire invariant before serialization.
+ */
+export type WaitNodeData = {
+  [K in UnionKeys<NonNullable<WireDagNode['wait']>>]?: UnionValue<
+    NonNullable<WireDagNode['wait']>,
+    K
+  >;
+};
 
 /** Script node data (inline code or named script run via bun/uv). */
 export interface ScriptNodeData {

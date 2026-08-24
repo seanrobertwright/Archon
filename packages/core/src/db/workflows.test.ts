@@ -665,6 +665,7 @@ describe('workflows database', () => {
 
     test('stores a quota continuation in the same transition to failed', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       const scheduled = {
         reason: 'quota' as const,
         resumeAt: '2026-08-25T10:00:00.000Z',
@@ -681,6 +682,43 @@ describe('workflows database', () => {
         error: 'Quota exhausted',
         scheduled_resume: scheduled,
       });
+      const [eventQuery, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(eventParams[2]).toBe('quota_resume_scheduled');
+      expect(JSON.parse(eventParams[5] as string)).toEqual({
+        resume_at: scheduled.resumeAt,
+        deadline_at: scheduled.deadlineAt,
+        attempt: 1,
+        max_attempts: 2,
+      });
+    });
+
+    test('does not complete the quota transition when its audit insert fails', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockRejectedValueOnce(new Error('audit unavailable'));
+
+      await expect(
+        failWorkflowRun('workflow-run-123', 'Quota exhausted', {
+          reason: 'quota',
+          resumeAt: '2026-08-25T10:00:00.000Z',
+          deadlineAt: '2026-08-26T10:00:00.000Z',
+          attempt: 1,
+          maxAttempts: 2,
+        })
+      ).rejects.toThrow('audit unavailable');
+    });
+
+    test('rejects an invalid quota continuation before writing the failed row', async () => {
+      await expect(
+        failWorkflowRun('workflow-run-123', 'Quota exhausted', {
+          reason: 'quota',
+          resumeAt: '2026-08-27T10:00:00.000Z',
+          deadlineAt: '2026-08-26T10:00:00.000Z',
+          attempt: 3,
+          maxAttempts: 2,
+        })
+      ).rejects.toThrow();
+      expect(mockQuery).not.toHaveBeenCalled();
     });
 
     test('throws when rowCount is 0', async () => {

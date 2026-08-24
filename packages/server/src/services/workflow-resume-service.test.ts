@@ -130,13 +130,33 @@ describe('workflow continuation scanner', () => {
     ]);
   });
 
-  test('routes background web runs through the visible parent and refuses missing adapters', () => {
+  test('routes background web execution through its worker and results through the parent', () => {
     const background = {
       ...run('wait-web', 'paused', {}),
       conversation_id: 'worker-conv',
       parent_conversation_id: 'visible-conv',
     };
-    expect(workflowResumeConversationId(background)).toBe('visible-conv');
+    expect(workflowResumeConversationId(background)).toBe('worker-conv');
+
+    const webPlatform = {
+      sendMessage: mock(async () => undefined),
+      getStreamingMode: () => 'batch' as const,
+      getPlatformType: () => 'web',
+    } satisfies IWorkflowPlatform;
+    expect(
+      workflowResumeTargetForConversation(
+        { platform_type: 'web', platform_conversation_id: 'web-worker-123' },
+        new Map([['web', webPlatform]]),
+        'visible-web-conv'
+      )
+    ).toEqual({
+      kind: 'platform',
+      destination: {
+        platform: webPlatform,
+        conversationId: 'web-worker-123',
+        resultConversationId: 'visible-web-conv',
+      },
+    });
 
     const unavailable = workflowResumeTargetForConversation(
       { platform_type: 'telegram', platform_conversation_id: 'chat-1' },
@@ -248,10 +268,16 @@ describe('workflow continuation scanner', () => {
     await expect(
       resumeWorkflowRunFromServer(paused, undefined, {
         kind: 'platform',
-        destination: { platform, conversationId: 'visible-web-conv', surfaceResult: true },
+        destination: {
+          platform,
+          conversationId: 'web-worker-conv',
+          resultConversationId: 'visible-web-conv',
+        },
       })
     ).resolves.toBe(true);
     await Promise.resolve();
+
+    expect(mockExecuteWorkflow.mock.calls[0]?.[2]).toBe('web-worker-conv');
 
     expect(platform.sendMessage).toHaveBeenCalledWith('visible-web-conv', 'done', {
       category: 'workflow_result',

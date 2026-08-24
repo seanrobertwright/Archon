@@ -175,6 +175,7 @@ export {
   RESUMABLE_WORKFLOW_STATUSES,
   isApprovalContext,
   isWorkflowWaitContext,
+  workflowWaitStepName,
   isScheduledWorkflowResume,
   isRunBlockedOnChild,
   suspendReasonSchema,

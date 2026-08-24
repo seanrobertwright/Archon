@@ -15,6 +15,7 @@ import type {
 import {
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
+  scheduledWorkflowResumeSchema,
   TERMINAL_WORKFLOW_STATUSES,
 } from '@archon/workflows/schemas/workflow-run';
 import type {
@@ -120,30 +121,12 @@ function normalizeMetadata(raw: unknown): Record<string, unknown> {
  * all collapse to null.
  */
 function readMetadataError(raw: unknown): string | null {
-  let metadata: unknown = raw;
-  if (typeof metadata === 'string') {
-    try {
-      metadata = JSON.parse(metadata);
-    } catch {
-      return null;
-    }
-  }
-  if (typeof metadata !== 'object' || metadata === null) return null;
-  const error = (metadata as Record<string, unknown>).error;
+  const error = normalizeMetadata(raw).error;
   return typeof error === 'string' && error !== '' ? error : null;
 }
 
 function readScheduledResume(raw: unknown): ScheduledWorkflowResume | null {
-  let metadata: unknown = raw;
-  if (typeof metadata === 'string') {
-    try {
-      metadata = JSON.parse(metadata);
-    } catch {
-      return null;
-    }
-  }
-  if (typeof metadata !== 'object' || metadata === null) return null;
-  const scheduled = (metadata as Record<string, unknown>).scheduled_resume;
+  const scheduled = normalizeMetadata(raw).scheduled_resume;
   return isScheduledWorkflowResume(scheduled) ? scheduled : null;
 }
 
@@ -191,18 +174,16 @@ function writeApprovalMetadata(mergeParamIndex: number, approvalParamIndex: numb
     : `json_set(json_patch(json_remove(metadata, '$.wait'), ${merge}), '$.approval', json(${approval}))`;
 }
 
-/** Replace one engine-owned metadata object without dialect-specific deep merging. */
-function replaceMetadataObject(key: 'wait' | 'scheduled_resume', paramIndex: number): string {
+/** Replace the engine-owned wait object and remove any stale human approval. */
+function replaceWaitMetadata(paramIndex: number): string {
   const value = `$${String(paramIndex)}`;
   const metadata =
-    key === 'wait'
-      ? getDatabaseType() === 'postgresql'
-        ? "metadata - 'approval'"
-        : "json_remove(metadata, '$.approval')"
-      : 'metadata';
+    getDatabaseType() === 'postgresql'
+      ? "metadata - 'approval'"
+      : "json_remove(metadata, '$.approval')";
   return getDatabaseType() === 'postgresql'
-    ? `jsonb_set(${metadata}, '{${key}}', ${value}::jsonb, true)`
-    : `json_set(${metadata}, '$.${key}', json(${value}))`;
+    ? `jsonb_set(${metadata}, '{wait}', ${value}::jsonb, true)`
+    : `json_set(${metadata}, '$.wait', json(${value}))`;
 }
 
 /**
@@ -1183,24 +1164,43 @@ export async function failWorkflowRun(
   scheduledResume?: ScheduledWorkflowResume
 ): Promise<void> {
   const dialect = getDialect();
+  const parsedSchedule =
+    scheduledResume === undefined
+      ? undefined
+      : scheduledWorkflowResumeSchema.parse(scheduledResume);
   const metadataWithoutScheduledResume =
     getDatabaseType() === 'postgresql'
       ? "metadata - 'scheduled_resume'"
       : "json_remove(metadata, '$.scheduled_resume')";
   let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
-    result = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge(metadataWithoutScheduledResume, 2)}
-       WHERE id = $1 AND status IN ('running', 'pending')`,
-      [
-        id,
-        JSON.stringify({
-          error,
-          ...(scheduledResume !== undefined ? { scheduled_resume: scheduledResume } : {}),
-        }),
-      ]
-    );
+    result = await getDatabase().withTransaction(async query => {
+      const update = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge(metadataWithoutScheduledResume, 2)}
+         WHERE id = $1 AND status IN ('running', 'pending')`,
+        [
+          id,
+          JSON.stringify({
+            error,
+            ...(parsedSchedule !== undefined ? { scheduled_resume: parsedSchedule } : {}),
+          }),
+        ]
+      );
+      if ((update.rowCount ?? 0) > 0 && parsedSchedule !== undefined) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'quota_resume_scheduled',
+          data: {
+            resume_at: parsedSchedule.resumeAt,
+            deadline_at: parsedSchedule.deadlineAt,
+            attempt: parsedSchedule.attempt,
+            max_attempts: parsedSchedule.maxAttempts,
+          },
+        });
+      }
+      return update;
+    });
   } catch (dbError) {
     const err = dbError as Error;
     getLog().error({ err }, 'db.workflow_run_mark_failed_error');
@@ -1302,7 +1302,7 @@ export async function pauseWorkflowRunForWait(
     await getDatabase().withTransaction(async query => {
       const result = await query(
         `UPDATE remote_agent_workflow_runs
-         SET status = 'paused', metadata = ${replaceMetadataObject('wait', 2)}
+         SET status = 'paused', metadata = ${replaceWaitMetadata(2)}
          WHERE id = $1 AND status = 'running'`,
         [id, JSON.stringify(waitContext)]
       );
@@ -1317,7 +1317,7 @@ export async function pauseWorkflowRunForWait(
           data: {
             kind: waitContext.kind,
             resume_at: waitContext.resumeAt,
-            ...(waitContext.event !== undefined ? { event: waitContext.event } : {}),
+            ...(waitContext.kind === 'event' ? { event: waitContext.event } : {}),
           },
         });
       }

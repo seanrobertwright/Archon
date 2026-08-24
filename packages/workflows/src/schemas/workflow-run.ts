@@ -41,33 +41,42 @@ export const workflowRunOutcomeSchema = z.enum(['succeeded', 'failed']);
 
 export type WorkflowRunOutcome = z.infer<typeof workflowRunOutcomeSchema>;
 
-const workflowWaitContextBaseSchema = z.object({
-  kind: z.enum(['time', 'event']),
+const workflowWaitTimeFields = {
+  kind: z.literal('time'),
   waitingSince: z.string().datetime(),
   resumeAt: z.string().datetime(),
-  event: z.string().min(1).optional(),
+} as const;
+const workflowWaitEventFields = {
+  kind: z.literal('event'),
+  waitingSince: z.string().datetime(),
+  resumeAt: z.string().datetime(),
+  event: z.string().trim().min(1),
   signaledAt: z.string().datetime().optional(),
   payload: z.unknown().optional(),
-});
+} as const;
+const workflowWaitNodeOwnerFields = {
+  owner: z.literal('node'),
+  nodeId: z.string().min(1),
+} as const;
+const workflowWaitLoopOwnerFields = {
+  owner: z.literal('loop_group'),
+  nodeId: z.string().min(1),
+  bodyWaitId: z.string().min(1),
+  iteration: z.number().int().positive(),
+  sessionId: z.string().nullable(),
+  sessionProvider: z.string().nullable(),
+} as const;
 
 /**
  * Persisted reason a run is waiting on the outside world rather than a person.
  * Loop-owned cursors carry their complete owner path in the initial pause write;
  * there is no externally visible body-owned intermediate state.
  */
-export const workflowWaitContextSchema = z.discriminatedUnion('owner', [
-  workflowWaitContextBaseSchema.extend({
-    owner: z.literal('node'),
-    nodeId: z.string().min(1),
-  }),
-  workflowWaitContextBaseSchema.extend({
-    owner: z.literal('loop_group'),
-    nodeId: z.string().min(1),
-    bodyWaitId: z.string().min(1),
-    iteration: z.number().int().positive(),
-    sessionId: z.string().nullable(),
-    sessionProvider: z.string().nullable(),
-  }),
+export const workflowWaitContextSchema = z.union([
+  z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitTimeFields }),
+  z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitEventFields }),
+  z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitTimeFields }),
+  z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitEventFields }),
 ]);
 export type WorkflowWaitContext = z.infer<typeof workflowWaitContextSchema>;
 
@@ -75,14 +84,35 @@ export function isWorkflowWaitContext(value: unknown): value is WorkflowWaitCont
   return workflowWaitContextSchema.safeParse(value).success;
 }
 
-export const scheduledWorkflowResumeSchema = z.object({
-  reason: z.literal('quota'),
-  resumeAt: z.string().datetime(),
-  deadlineAt: z.string().datetime(),
-  attempt: z.number().int().positive(),
-  maxAttempts: z.number().int().positive(),
-  triggeredAt: z.string().datetime().optional(),
-});
+export function workflowWaitStepName(wait: WorkflowWaitContext): string {
+  return wait.owner === 'loop_group' ? `${wait.nodeId}.${wait.bodyWaitId}` : wait.nodeId;
+}
+
+export const scheduledWorkflowResumeSchema = z
+  .object({
+    reason: z.literal('quota'),
+    resumeAt: z.string().datetime(),
+    deadlineAt: z.string().datetime(),
+    attempt: z.number().int().positive(),
+    maxAttempts: z.number().int().positive(),
+    triggeredAt: z.string().datetime().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.attempt > value.maxAttempts) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['attempt'],
+        message: 'quota continuation attempt cannot exceed maxAttempts',
+      });
+    }
+    if (Date.parse(value.resumeAt) > Date.parse(value.deadlineAt)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['resumeAt'],
+        message: 'quota continuation resumeAt cannot exceed deadlineAt',
+      });
+    }
+  });
 export type ScheduledWorkflowResume = z.infer<typeof scheduledWorkflowResumeSchema>;
 
 export function isScheduledWorkflowResume(value: unknown): value is ScheduledWorkflowResume {

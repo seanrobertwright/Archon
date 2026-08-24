@@ -1777,6 +1777,43 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     expect(mockGetConversationById).not.toHaveBeenCalled();
   });
 
+  test('attributes a loop-owned signal to the body wait step', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-loop-wait',
+      status: 'paused',
+      metadata: {
+        wait: {
+          owner: 'loop_group',
+          nodeId: 'release',
+          bodyWaitId: 'checks',
+          iteration: 2,
+          sessionId: null,
+          sessionProvider: null,
+          kind: 'event',
+          event: 'checks.complete',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-25T10:00:00.000Z',
+        },
+      },
+    });
+    const { app } = makeApp();
+
+    const response = await app.request('/api/workflows/runs/run-loop-wait/signal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event: 'checks.complete' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockSignalWorkflowWait).toHaveBeenCalledWith(
+      'run-loop-wait',
+      'checks.complete',
+      undefined,
+      expect.objectContaining({ step_name: 'release.checks' })
+    );
+  });
+
   test('rejects a signal that does not match the run wait', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_RUNNING_RUN,

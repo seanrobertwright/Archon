@@ -72,9 +72,11 @@ export function resolveNodeDisplay(dn: DagNode): {
   }
   if ('wait' in dn && dn.wait) {
     const condition =
-      dn.wait.event ??
-      dn.wait.until ??
-      (dn.wait.duration_ms !== undefined ? `${String(dn.wait.duration_ms)} ms` : undefined);
+      'event' in dn.wait
+        ? dn.wait.event
+        : 'until' in dn.wait
+          ? dn.wait.until
+          : `${String(dn.wait.duration_ms)} ms`;
     return { label: 'Wait', nodeType: 'wait', promptText: condition };
   }
   return {

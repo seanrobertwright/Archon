@@ -7147,8 +7147,12 @@ async function executeWaitNode(
   const result = {
     status,
     waited_ms: Math.max(0, now.getTime() - Date.parse(context.waitingSince)),
-    ...(context.event !== undefined ? { event: context.event } : {}),
-    ...(context.payload !== undefined ? { payload: context.payload } : {}),
+    ...(context.kind === 'event'
+      ? {
+          event: context.event,
+          ...(context.payload !== undefined ? { payload: context.payload } : {}),
+        }
+      : {}),
   } as const;
   const output = JSON.stringify(result);
   const stepName = stepNamePrefix + node.id;
@@ -10949,16 +10953,6 @@ export async function executeDagWorkflow(
       attempt,
       maxAttempts,
     };
-    await deps.store.createWorkflowEvent({
-      workflow_run_id: workflowRun.id,
-      event_type: 'quota_resume_scheduled',
-      data: {
-        resume_at: scheduled.resumeAt,
-        deadline_at: scheduled.deadlineAt,
-        attempt,
-        max_attempts: maxAttempts,
-      },
-    });
     return scheduled;
   };
 

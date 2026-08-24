@@ -15,5 +15,10 @@ export function waitFromDag(variantSpecific: Partial<WireDagNode>): WaitNodeData
 }
 
 export function waitToDag(data: WaitNodeData): Partial<WireDagNode> {
-  return { wait: { ...data } };
+  if (data.duration_ms !== undefined) return { wait: { duration_ms: data.duration_ms } };
+  if (data.until !== undefined) return { wait: { until: data.until } };
+  if (data.event !== undefined && data.deadline_ms !== undefined) {
+    return { wait: { event: data.event, deadline_ms: data.deadline_ms } };
+  }
+  throw new Error('waitToDag: wait configuration is incomplete');
 }

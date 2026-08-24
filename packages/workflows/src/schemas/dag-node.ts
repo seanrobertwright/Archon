@@ -624,45 +624,27 @@ export const waitConfigFlatSchema = z.object({
   event: z.string().trim().min(1, "'wait.event' must not be empty").optional(),
   deadline_ms: z.number().int().positive().optional(),
 });
-export type WaitConfig = z.infer<typeof waitConfigFlatSchema>;
 export const waitUntilTimestampSchema = z.string().datetime();
-export const waitConfigSchema = waitConfigFlatSchema.superRefine((value, ctx) => {
-  const conditions = [value.duration_ms, value.until, value.event].filter(
-    condition => condition !== undefined
+const waitUntilValueSchema = z
+  .string()
+  .min(1, "'wait.until' must not be empty")
+  .refine(
+    value =>
+      new RegExp(OUTPUT_REF_SOURCE).test(value) ||
+      parseWholeInputsRef(value) !== undefined ||
+      waitUntilTimestampSchema.safeParse(value).success,
+    "'wait.until' must be an ISO-8601 timestamp or contain a runtime reference"
   );
-  if (conditions.length !== 1) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "'wait' must declare exactly one of 'duration_ms', 'until', or 'event'",
-    });
-  }
-  if (value.event !== undefined && value.deadline_ms === undefined) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "'wait.deadline_ms' is required for event waits",
-      path: ['deadline_ms'],
-    });
-  }
-  if (value.event === undefined && value.deadline_ms !== undefined) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "'wait.deadline_ms' is only supported for event waits",
-      path: ['deadline_ms'],
-    });
-  }
-  if (
-    value.until !== undefined &&
-    !new RegExp(OUTPUT_REF_SOURCE).test(value.until) &&
-    parseWholeInputsRef(value.until) === undefined &&
-    !waitUntilTimestampSchema.safeParse(value.until).success
-  ) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: "'wait.until' must be an ISO-8601 timestamp or contain a runtime reference",
-      path: ['until'],
-    });
-  }
-});
+
+export const waitConfigSchema = z.union([
+  z.strictObject({ duration_ms: z.number().int().positive() }),
+  z.strictObject({ until: waitUntilValueSchema }),
+  z.strictObject({
+    event: z.string().trim().min(1, "'wait.event' must not be empty"),
+    deadline_ms: z.number().int().positive(),
+  }),
+]);
+export type WaitConfig = z.infer<typeof waitConfigSchema>;
 
 /** Validated engine condition used for exhaustive wait execution. */
 export type WaitCondition =
@@ -671,16 +653,13 @@ export type WaitCondition =
   | { kind: 'event'; event: string; deadlineMs: number };
 
 export function waitCondition(config: WaitConfig): WaitCondition {
-  if (config.duration_ms !== undefined) {
+  if ('duration_ms' in config) {
     return { kind: 'duration', durationMs: config.duration_ms };
   }
-  if (config.until !== undefined) {
+  if ('until' in config) {
     return { kind: 'until', timestamp: config.until };
   }
-  if (config.event !== undefined && config.deadline_ms !== undefined) {
-    return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };
-  }
-  throw new Error('Invalid wait condition reached execution after schema validation');
+  return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };
 }
 
 export const workflowWaitResultSchema = z.object({

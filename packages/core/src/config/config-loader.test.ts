@@ -854,6 +854,28 @@ assistants:
       expect(writtenContent).toContain('MyBot');
     });
 
+    test('merges workflow continuation policy into the persisted config', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  autoResumeOnQuotaReset: false
+  quotaMaxAttempts: 2
+`);
+
+      await updateGlobalConfig({
+        workflows: { autoResumeOnQuotaReset: true, quotaFallbackDelayMs: 60_000 },
+      });
+
+      const writtenContent = mockFsWriteFile.mock.calls[0]?.[1] as string;
+      const written = Bun.YAML.parse(writtenContent) as {
+        workflows?: Record<string, unknown>;
+      };
+      expect(written.workflows).toEqual({
+        autoResumeOnQuotaReset: true,
+        quotaMaxAttempts: 2,
+        quotaFallbackDelayMs: 60_000,
+      });
+    });
+
     test('creates config when file does not exist', async () => {
       const error = new Error('ENOENT') as NodeJS.ErrnoException;
       error.code = 'ENOENT';
