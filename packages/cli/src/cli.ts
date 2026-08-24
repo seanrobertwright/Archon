@@ -32,6 +32,7 @@ import { withDrainedExit } from './utils/exit-with-drain';
 installPipeSafeConsole();
 
 import { parseArgs } from 'util';
+import { cliArgOptions } from './args';
 import { resolve } from 'path';
 import { existsSync, realpathSync } from 'fs';
 import { stat } from 'fs/promises';
@@ -313,53 +314,7 @@ async function main(): Promise<number> {
   try {
     parsedArgs = parseArgs({
       args,
-      options: {
-        cwd: { type: 'string', default: process.cwd() },
-        help: { type: 'boolean', short: 'h' },
-        branch: { type: 'string', short: 'b' },
-        from: { type: 'string' },
-        'from-branch': { type: 'string' },
-        base: { type: 'string' },
-        'workflow-source': { type: 'string' },
-        'no-worktree': { type: 'boolean' },
-        folder: { type: 'boolean' },
-        container: { type: 'boolean' },
-        resume: { type: 'boolean' },
-        spawn: { type: 'boolean' },
-        quiet: { type: 'boolean', short: 'q' },
-        verbose: { type: 'boolean', short: 'v' },
-        json: { type: 'boolean' },
-        events: { type: 'boolean' },
-        'run-id': { type: 'string' },
-        type: { type: 'string' },
-        data: { type: 'string' },
-        comment: { type: 'string' },
-        reason: { type: 'string' },
-        text: { type: 'string' },
-        workflow: { type: 'string' },
-        'no-context': { type: 'boolean' },
-        port: { type: 'string' },
-        'download-only': { type: 'boolean' },
-        scope: { type: 'string' },
-        node: { type: 'string' },
-        yes: { type: 'boolean' },
-        force: { type: 'boolean' },
-        'conversation-id': { type: 'string' },
-        detach: { type: 'boolean' },
-        all: { type: 'boolean' },
-        status: { type: 'string' },
-        limit: { type: 'string' },
-        effort: { type: 'string' },
-        full: { type: 'boolean' },
-        'dry-run': { type: 'boolean' },
-        stubs: { type: 'string' },
-        'stubs-init': { type: 'string' },
-        'default-stubs': { type: 'boolean' },
-        'exec-code': { type: 'boolean' },
-        'pause-at-gates': { type: 'boolean' },
-        // Repeatable: `--input a=1 --input b=2` yields ['a=1', 'b=2'] (#2554).
-        input: { type: 'string', multiple: true },
-      },
+      options: cliArgOptions,
       allowPositionals: true,
       // Strict mode rejects unknown flags so a mistyped option (e.g. `--dry-run`)
       // errors here instead of being silently dropped before command validation.
@@ -958,11 +913,10 @@ async function main(): Promise<number> {
             break;
 
           case 'cleanup': {
-            // Check for --merged flag in remaining args
-            const mergedFlag = args.includes('--merged') || positionals.includes('--merged');
-            if (mergedFlag) {
-              const includeClosed = args.includes('--include-closed');
-              await isolationCleanupMergedCommand({ includeClosed });
+            if (values.merged) {
+              await isolationCleanupMergedCommand({
+                includeClosed: Boolean(values['include-closed']),
+              });
             } else {
               const days = parseInt(positionals[2] ?? '7', 10);
               await isolationCleanupCommand(days);
@@ -1009,7 +963,7 @@ async function main(): Promise<number> {
           console.error('Usage: archon complete <branch-name> [branch2 ...]');
           return 1;
         }
-        const forceFlag = args.includes('--force');
+        const forceFlag = Boolean(values.force);
         await isolationCompleteCommand(branches, { force: forceFlag, deleteRemote: true });
         break;
       }

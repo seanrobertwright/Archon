@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { parseArgs } from 'util';
+import { cliArgOptions } from './args';
 import * as git from '@archon/git';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
@@ -190,36 +191,24 @@ describe('CLI workflow event dispatch', () => {
 
 // Test the argument parsing logic used in cli.ts
 describe('CLI argument parsing', () => {
-  // Mirror the actual parseArgs options from cli.ts
   const parseCliArgs = (
     args: string[]
   ): { values: Record<string, unknown>; positionals: string[] } => {
     return parseArgs({
       args,
-      options: {
-        cwd: { type: 'string', default: process.cwd() },
-        help: { type: 'boolean', short: 'h' },
-        branch: { type: 'string', short: 'b' },
-        from: { type: 'string' },
-        'from-branch': { type: 'string' },
-        base: { type: 'string' },
-        'no-worktree': { type: 'boolean' },
-        spawn: { type: 'boolean' },
-        quiet: { type: 'boolean', short: 'q' },
-        verbose: { type: 'boolean', short: 'v' },
-        scope: { type: 'string' },
-        force: { type: 'boolean' },
-        'dry-run': { type: 'boolean' },
-        stubs: { type: 'string' },
-        'stubs-init': { type: 'string' },
-        'default-stubs': { type: 'boolean' },
-        'exec-code': { type: 'boolean' },
-        'pause-at-gates': { type: 'boolean' },
-      },
+      options: cliArgOptions,
       allowPositionals: true,
       strict: true,
     });
   };
+
+  describe('isolation cleanup flags', () => {
+    it('parses --merged and --include-closed in strict mode', () => {
+      const { values } = parseCliArgs(['isolation', 'cleanup', '--merged', '--include-closed']);
+      expect(values.merged).toBe(true);
+      expect(values['include-closed']).toBe(true);
+    });
+  });
 
   describe('--cwd flag', () => {
     it('should parse --cwd with path', () => {
