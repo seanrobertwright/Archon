@@ -139,6 +139,17 @@ describe('round-trip fidelity', () => {
     expect(toWorkflowDefinition(workflow)).toEqual(definition);
   });
 
+  test('an incomplete wait remains a draft until server validation', () => {
+    const draft = toWorkflowDefinition({
+      name: 'wait-draft',
+      description: 'wait mode is selected before its value is entered',
+      meta: {},
+      nodes: [{ id: 'pause', variant: 'wait', base: {}, data: {} }],
+    });
+
+    expect(draft.nodes).toEqual([{ id: 'pause', wait: {} }]);
+  });
+
   test('script runtime/deps/timeout survive partitioning', () => {
     const bw = fromWorkflowDefinition(FIXTURES.script).workflow;
     const node = bw.nodes[0];

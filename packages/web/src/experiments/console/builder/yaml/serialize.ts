@@ -11,7 +11,7 @@
  * without a DOM. Not a general YAML emitter — it covers the value shapes the
  * wire `WorkflowDefinition` can contain (scalars, arrays, plain objects).
  */
-import type { WireDagNode, WireWorkflowDefinition } from '../types';
+import type { BuilderDagNode, BuilderWorkflowDefinition } from '../types';
 
 /**
  * Word scalars a YAML parser may re-type, matched case-insensitively. Includes
@@ -106,13 +106,13 @@ function keyLine(prefix: string, key: string, value: unknown, indent: number): s
 }
 
 /** Node keys render `id` first, then the author's field order. */
-function nodeKeyOrder(node: WireDagNode): string[] {
+function nodeKeyOrder(node: BuilderDagNode): string[] {
   const keys = Object.keys(node).filter(k => k !== 'id');
   return ['id', ...keys];
 }
 
 /** Serialize one node as a `- ` list item at the given indent. */
-function serializeNode(node: WireDagNode, indent: number): string {
+function serializeNode(node: BuilderDagNode, indent: number): string {
   const record = node as Record<string, unknown>;
   const pad = ' '.repeat(indent);
   const lines: string[] = [];
@@ -128,7 +128,7 @@ function serializeNode(node: WireDagNode, indent: number): string {
 }
 
 /** Convert a wire workflow definition into the YAML preview string. */
-export function serializeToYaml(def: WireWorkflowDefinition): string {
+export function serializeToYaml(def: BuilderWorkflowDefinition): string {
   const { name, description, nodes, ...meta } = def;
   const lines: string[] = [];
 

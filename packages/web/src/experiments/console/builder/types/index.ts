@@ -9,6 +9,8 @@ export type {
   ApprovalNodeData,
   WaitNodeData,
   BuilderDagFragment,
+  BuilderDagNode,
+  BuilderWorkflowDefinition,
   CancelNodeData,
   ScriptNodeData,
   CommandNodeData,

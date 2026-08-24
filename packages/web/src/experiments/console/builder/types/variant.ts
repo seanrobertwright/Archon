@@ -138,6 +138,16 @@ export type BuilderDagFragment = Omit<Partial<WireDagNode>, 'wait'> & {
   wait?: WaitNodeData;
 };
 
+/** Full preview node that may still contain an incomplete wait draft. */
+export type BuilderDagNode = Omit<WireDagNode, 'wait'> & {
+  wait?: WaitNodeData;
+};
+
+/** Preview/validation payload; it becomes a wire definition only after validation. */
+export type BuilderWorkflowDefinition = Omit<WireWorkflowDefinition, 'nodes'> & {
+  nodes: BuilderDagNode[];
+};
+
 /** Script node data (inline code or named script run via bun/uv). */
 export interface ScriptNodeData {
   script: string;
