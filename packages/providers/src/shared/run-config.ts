@@ -14,6 +14,14 @@ export function invalidRunConfigValue(fieldPath: string, expected: string): neve
   throw new InvalidProviderRunConfigError(fieldPath, `expected ${expected}`);
 }
 
+export function normalizeRunConfigString(value: unknown, fieldPath: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    invalidRunConfigValue(fieldPath, 'a non-blank string');
+  }
+  return value.trim();
+}
+
 export function isConfigRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

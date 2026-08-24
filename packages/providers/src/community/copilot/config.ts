@@ -1,6 +1,10 @@
 import type { CopilotProviderDefaults } from '../../types';
 import { clampEffort, isEffortRung } from '../../shared/effort';
-import { assertKnownRunConfigKeys, invalidRunConfigValue } from '../../shared/run-config';
+import {
+  assertKnownRunConfigKeys,
+  invalidRunConfigValue,
+  normalizeRunConfigString,
+} from '../../shared/run-config';
 
 export type { CopilotProviderDefaults };
 
@@ -86,7 +90,8 @@ export function parseCopilotRunConfig(raw: Record<string, unknown>): CopilotProv
     'useLoggedInUser',
     'logLevel',
   ]);
-  for (const key of ['model', 'copilotCliPath', 'configDir'] as const) {
+  const model = normalizeRunConfigString(raw.model, 'model');
+  for (const key of ['copilotCliPath', 'configDir'] as const) {
     if (raw[key] !== undefined && typeof raw[key] !== 'string') {
       invalidRunConfigValue(key, 'a string');
     }
@@ -106,5 +111,6 @@ export function parseCopilotRunConfig(raw: Record<string, unknown>): CopilotProv
   ) {
     invalidRunConfigValue('logLevel', 'none, error, warning, info, debug, or all');
   }
-  return parseCopilotConfig(raw);
+  const parsed = parseCopilotConfig(raw);
+  return model === undefined ? parsed : { ...parsed, model };
 }

@@ -819,7 +819,7 @@ describe('workflowRunCommand — dry-run', () => {
 
       await workflowRunCommand('/test/path', 'plan', 'hello', {
         dryRun: true,
-        modelAssignments: ['large=@personal', '@planner=next-model'],
+        modelAssignments: ['large=@personal', '@planner=openai/next-model'],
       });
 
       const options = (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
@@ -832,7 +832,7 @@ describe('workflowRunCommand — dry-run', () => {
       expect(options.aiProfile.aliases.large).toEqual({ provider: 'claude', model: 'opus' });
       expect(options.aiProfile.aliases['@planner']).toEqual({
         provider: 'pi',
-        model: 'next-model',
+        model: 'openai/next-model',
       });
     } finally {
       if (previousUserId === undefined) Reflect.deleteProperty(process.env, 'ARCHON_USER_ID');

@@ -5,10 +5,7 @@ import {
   InvalidProviderRunConfigError,
   isRegisteredProvider,
 } from '@archon/providers';
-import {
-  isEffortValidForProvider,
-  validEffortsForProvider,
-} from '@archon/workflows/model-validation';
+import { validEffortsForProvider, type ModelAliasPreset } from '@archon/workflows/model-validation';
 import {
   workflowRunConfigLayerSchema,
   type WorkflowRunConfigInput,
@@ -92,22 +89,37 @@ function assertRegisteredProvider(provider: string, path: string): void {
   );
 }
 
-function assertValidPreset(
-  path: string,
-  preset: { provider: string; model: string; effort?: string }
-): void {
+function normalizePreset(path: string, preset: ModelAliasPreset): ModelAliasPreset {
   assertRegisteredProvider(preset.provider, `${path}.provider`);
-  const modelError = getRegistration(preset.provider).validateModelRef?.(preset.model);
-  if (modelError !== undefined) {
-    throw new Error(`Invalid run config at '${path}.model': ${modelError}.`);
+  const registration = getRegistration(preset.provider);
+  const parsedModel = registration.parseModelRef?.(preset.model);
+  if (parsedModel?.ok === false) {
+    throw new Error(`Invalid run config at '${path}.model': ${parsedModel.reason}.`);
   }
-  if (preset.effort !== undefined && !isEffortValidForProvider(preset.provider, preset.effort)) {
+  if (preset.effort !== undefined) {
     const valid = validEffortsForProvider(preset.provider);
+    if (valid === null) {
+      throw new Error(
+        `Invalid run config at '${path}.effort': provider '${preset.provider}' does not ` +
+          'support per-run effort.'
+      );
+    }
+    if (!valid.includes(preset.effort)) {
+      throw new Error(
+        `Invalid run config at '${path}.effort': '${preset.effort}' is not valid for provider ` +
+          `'${preset.provider}'. Valid: ${valid.join(', ')}.`
+      );
+    }
+  }
+  if (preset.thinking !== undefined && !registration.capabilities.thinkingControl) {
     throw new Error(
-      `Invalid run config at '${path}.effort': '${preset.effort}' is not valid for provider ` +
-        `'${preset.provider}'. Valid: ${valid?.join(', ') ?? '(none)'}.`
+      `Invalid run config at '${path}.thinking': provider '${preset.provider}' does not ` +
+        'support per-run thinking.'
     );
   }
+  return parsedModel?.ok === true && parsedModel.model !== preset.model
+    ? { ...preset, model: parsedModel.model }
+    : preset;
 }
 
 /** Validate and normalize constraints owned by the live provider registry and lifecycle. */
@@ -142,13 +154,24 @@ function normalizeRunConfigSemantics(layer: WorkflowRunConfigLayer): WorkflowRun
       throw error;
     }
   }
-  for (const [tier, preset] of Object.entries(layer.tiers ?? {})) {
-    assertValidPreset(`tiers.${tier}`, preset);
-  }
-  for (const [alias, preset] of Object.entries(layer.aliases ?? {})) {
-    assertValidPreset(`aliases.${alias}`, preset);
-  }
-  return layer.assistants === undefined ? layer : { ...layer, assistants };
+  const tiers = Object.fromEntries(
+    Object.entries(layer.tiers ?? {}).map(([tier, preset]) => [
+      tier,
+      normalizePreset(`tiers.${tier}`, preset),
+    ])
+  );
+  const aliases = Object.fromEntries(
+    Object.entries(layer.aliases ?? {}).map(([alias, preset]) => [
+      alias,
+      normalizePreset(`aliases.${alias}`, preset),
+    ])
+  );
+  return {
+    ...layer,
+    ...(layer.assistants === undefined ? {} : { assistants }),
+    ...(layer.tiers === undefined ? {} : { tiers }),
+    ...(layer.aliases === undefined ? {} : { aliases }),
+  };
 }
 
 /** Parse one explicitly selected sparse run config. Unlike shared config loading, this is fail-fast. */

@@ -14,7 +14,7 @@
  * per call.
  */
 
-import { getProviderCapabilities, isRegisteredProvider } from '@archon/providers';
+import { getProviderCapabilities, getRegistration, isRegisteredProvider } from '@archon/providers';
 import { parsePiModelRef } from '@archon/providers/community/pi';
 import tierDefaults from './defaults/tier-defaults.json';
 import { EFFORT_LEVELS } from './schemas/dag-node';
@@ -208,6 +208,24 @@ function presetForOverrideTarget(profile: ResolvedAiProfile, name: string): Mode
   return preset;
 }
 
+function normalizeRunOverridePreset(targetName: string, preset: RawAliasEntry): RawAliasEntry {
+  if (!isRegisteredProvider(preset.provider)) {
+    throw new Error(
+      `Model override '${targetName}' resolved to unknown provider '${preset.provider}'.`
+    );
+  }
+  const parsed = getRegistration(preset.provider).parseModelRef?.(preset.model);
+  if (parsed?.ok === false) {
+    throw new Error(
+      `Model override '${targetName}' has invalid ${preset.provider} model '${preset.model}': ` +
+        `${parsed.reason}.`
+    );
+  }
+  return parsed?.ok === true && parsed.model !== preset.model
+    ? { ...preset, model: parsed.model }
+    : preset;
+}
+
 function resolveRunOverrideSpec(
   profile: ResolvedAiProfile,
   targetName: string,
@@ -221,13 +239,13 @@ function resolveRunOverrideSpec(
     if (isLiteralSpec(resolved)) {
       throw new Error(`Model override '${targetName}' could not resolve '${spec}'.`);
     }
-    return { ...resolved };
+    return normalizeRunOverridePreset(targetName, { ...resolved });
   }
 
   const slash = spec.indexOf('/');
   if (slash === -1) {
     const target = presetForOverrideTarget(profile, targetName);
-    return { provider: target.provider, model: spec };
+    return normalizeRunOverridePreset(targetName, { provider: target.provider, model: spec });
   }
 
   const prefix = spec.slice(0, slash);
@@ -236,12 +254,7 @@ function resolveRunOverrideSpec(
     if (remainder.length === 0) {
       throw new Error(`Model override '${targetName}' has an empty model id.`);
     }
-    if (prefix === 'pi' && !parsePiModelRef(remainder)) {
-      throw new Error(
-        `Model override '${targetName}' has invalid Pi model '${remainder}'. Expected <vendor>/<model>.`
-      );
-    }
-    return { provider: prefix, model: remainder };
+    return normalizeRunOverridePreset(targetName, { provider: prefix, model: remainder });
   }
 
   if (!parsePiModelRef(spec)) {
@@ -249,7 +262,7 @@ function resolveRunOverrideSpec(
       `Model override '${targetName}' has invalid model '${spec}'. Expected <agent>/<model> or <vendor>/<model>.`
     );
   }
-  return { provider: 'pi', model: spec };
+  return normalizeRunOverridePreset(targetName, { provider: 'pi', model: spec });
 }
 
 /**

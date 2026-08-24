@@ -5,7 +5,11 @@
 import type { ModelReasoningEffort } from '@openai/codex-sdk';
 import type { CodexProviderDefaults } from '../types';
 import type { AssertNever } from '../shared/effort';
-import { assertKnownRunConfigKeys, invalidRunConfigValue } from '../shared/run-config';
+import {
+  assertKnownRunConfigKeys,
+  invalidRunConfigValue,
+  normalizeRunConfigString,
+} from '../shared/run-config';
 
 // Re-export so consumers can import the type from either location
 export type { CodexProviderDefaults } from '../types';
@@ -81,9 +85,7 @@ export function parseCodexRunConfig(raw: Record<string, unknown>): CodexProvider
     'additionalDirectories',
     'codexBinaryPath',
   ]);
-  if (raw.model !== undefined && typeof raw.model !== 'string') {
-    invalidRunConfigValue('model', 'a string');
-  }
+  const model = normalizeRunConfigString(raw.model, 'model');
   if (raw.modelReasoningEffort !== undefined && !isCodexEffort(raw.modelReasoningEffort)) {
     invalidRunConfigValue('modelReasoningEffort', CODEX_EFFORTS.join(', '));
   }
@@ -106,5 +108,6 @@ export function parseCodexRunConfig(raw: Record<string, unknown>): CodexProvider
   if (raw.codexBinaryPath !== undefined && typeof raw.codexBinaryPath !== 'string') {
     invalidRunConfigValue('codexBinaryPath', 'a string');
   }
-  return parseCodexConfig(raw);
+  const parsed = parseCodexConfig(raw);
+  return model === undefined ? parsed : { ...parsed, model };
 }

@@ -11,7 +11,9 @@ export const modelAliasPresetSchema = z.object({
   effort: z.string().optional(),
   thinking: thinkingConfigSchema.optional(),
 });
-const runModelAliasPresetSchema = modelAliasPresetSchema.strict();
+const runModelAliasPresetSchema = modelAliasPresetSchema
+  .extend({ model: z.string().trim().min(1) })
+  .strict();
 
 export type ModelAliasPreset = z.infer<typeof modelAliasPresetSchema>;
 export type RawAliasEntry = z.infer<typeof modelAliasPresetSchema>;

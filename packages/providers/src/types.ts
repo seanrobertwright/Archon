@@ -786,8 +786,8 @@ export interface ProviderRegistration {
    */
   parseRunConfig: ProviderRunConfigParser;
 
-  /** Return a reason when a model reference cannot reach this provider. */
-  validateModelRef?: (model: string) => string | undefined;
+  /** Validate and canonicalize a model reference before it is persisted for one run. */
+  parseModelRef?: (model: string) => { ok: true; model: string } | { ok: false; reason: string };
 }
 
 /**

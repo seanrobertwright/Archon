@@ -24,8 +24,12 @@ export function registerPiProvider(): void {
     capabilities: PI_CAPABILITIES,
     builtIn: false,
     parseRunConfig: parsePiRunConfig,
-    validateModelRef: model =>
-      parsePiModelRef(model) === undefined ? "expected '<provider>/<model>'" : undefined,
+    parseModelRef: model => {
+      const parsed = parsePiModelRef(model);
+      return parsed === undefined
+        ? { ok: false, reason: "expected '<provider>/<model>'" }
+        : { ok: true, model: `${parsed.provider}/${parsed.modelId}` };
+    },
     // Generated from the installed pi-ai SDK — see generate:pi-vendor-map.
     credentials: { kind: 'static', specs: PI_CREDENTIAL_SPECS },
   });

@@ -3,6 +3,7 @@ import {
   assertKnownRunConfigKeys,
   invalidRunConfigValue,
   isConfigRecord,
+  normalizeRunConfigString,
 } from '../../shared/run-config';
 import { parsePiModelRef } from './model-ref';
 
@@ -195,9 +196,9 @@ export function parsePiRunConfig(raw: Record<string, unknown>): ParsedPiConfig {
     'extensionFlags',
     'nodes',
   ]);
-  if (raw.model !== undefined) {
-    if (typeof raw.model !== 'string') invalidRunConfigValue('model', 'a string');
-    if (parsePiModelRef(raw.model) === undefined) {
+  const model = normalizeRunConfigString(raw.model, 'model');
+  if (model !== undefined) {
+    if (parsePiModelRef(model) === undefined) {
       invalidRunConfigValue('model', "'<provider>/<model>'");
     }
   }
@@ -219,5 +220,6 @@ export function parsePiRunConfig(raw: Record<string, unknown>): ParsedPiConfig {
       validateExtensionPosture(value, `nodes.${nodeId}.`);
     }
   }
-  return parsePiConfig(raw);
+  const parsed = parsePiConfig(raw);
+  return model === undefined ? parsed : { ...parsed, model };
 }

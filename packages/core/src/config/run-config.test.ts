@@ -132,6 +132,40 @@ describe('workflow run config', () => {
         )
       ).toThrow("Invalid run config at 'aliases.@bad.model'");
     }
+    for (const value of ['', '   ']) {
+      expect(() =>
+        parseWorkflowRunConfig(
+          { tiers: { large: { provider: 'claude', model: value } } },
+          { kind: 'http', label: 'inline' }
+        )
+      ).toThrow("Invalid run config at 'tiers.large.model'");
+      expect(() =>
+        parseWorkflowRunConfig(
+          { assistants: { codex: { model: value } } },
+          { kind: 'http', label: 'inline' }
+        )
+      ).toThrow("Invalid run config at 'assistants.codex.model'");
+    }
+    expect(() =>
+      parseWorkflowRunConfig(
+        {
+          aliases: {
+            '@unsupported': { provider: 'opencode', model: 'openai/gpt-5', effort: 'high' },
+          },
+        },
+        { kind: 'http', label: 'inline' }
+      )
+    ).toThrow("Invalid run config at 'aliases.@unsupported.effort'");
+    expect(() =>
+      parseWorkflowRunConfig(
+        {
+          tiers: {
+            medium: { provider: 'codex', model: 'gpt-5.6', thinking: 'adaptive' },
+          },
+        },
+        { kind: 'http', label: 'inline' }
+      )
+    ).toThrow("Invalid run config at 'tiers.medium.thinking'");
   });
 
   it('rejects Pi defaults whose consumers own process-lifetime state', () => {
@@ -178,10 +212,20 @@ describe('workflow run config', () => {
     expect(parsed.layer.assistants?.copilot).toEqual({ modelReasoningEffort: 'xhigh' });
     expect(
       parseWorkflowRunConfig(
-        { assistants: { opencode: { model: 'anthropic/claude-sonnet-4-5' } } },
+        { assistants: { opencode: { model: ' anthropic / claude-sonnet-4-5 ' } } },
         { kind: 'http', label: 'inline' }
       ).layer.assistants?.opencode
     ).toEqual({ model: 'anthropic/claude-sonnet-4-5' });
+    expect(
+      parseWorkflowRunConfig(
+        {
+          aliases: {
+            '@open': { provider: 'opencode', model: ' openai / gpt-5.6 ' },
+          },
+        },
+        { kind: 'http', label: 'inline' }
+      ).layer.aliases?.['@open']
+    ).toEqual({ provider: 'opencode', model: 'openai/gpt-5.6' });
   });
 
   it('seals secrets for replay while exposing only attribution and key paths', () => {

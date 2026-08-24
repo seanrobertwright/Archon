@@ -361,8 +361,28 @@ describe('per-run model bindings', () => {
       resolveRunModelOverrides(base, { tiers: { large: 'pi/openrouter/qwen/qwen3' } }).tiers?.large
     ).toEqual({ provider: 'pi', model: 'openrouter/qwen/qwen3' });
     expect(() => resolveRunModelOverrides(base, { tiers: { large: 'pi/not-a-model' } })).toThrow(
-      /Expected <vendor>\/<model>/
+      /expected '<provider>\/<model>'/
     );
+  });
+
+  test('provider model parsers validate and canonicalize the final explicit override', () => {
+    const opencodeBase = buildAiProfile('opencode', {
+      globalTiers: {
+        large: { provider: 'opencode', model: 'openai/gpt-5' },
+      },
+    });
+
+    expect(() => resolveRunModelOverrides(opencodeBase, { tiers: { large: 'banana' } })).toThrow(
+      /invalid opencode model 'banana'/
+    );
+    expect(() =>
+      resolveRunModelOverrides(opencodeBase, { tiers: { large: 'opencode/banana' } })
+    ).toThrow(/invalid opencode model 'banana'/);
+    expect(
+      resolveRunModelOverrides(opencodeBase, {
+        tiers: { large: 'opencode/ openai / gpt-5.6 ' },
+      }).tiers?.large
+    ).toEqual({ provider: 'opencode', model: 'openai/gpt-5.6' });
   });
 
   test('unqualified literals inherit the target provider and preset refs copy options', () => {
