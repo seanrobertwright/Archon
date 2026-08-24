@@ -858,6 +858,7 @@ describe('classifyError', () => {
     expect(extractQuotaResetAt('session limit reached — resets in 2h', now)?.toISOString()).toBe(
       '2026-08-24T12:00:00.000Z'
     );
+    expect(extractQuotaResetAt('session limit reached — resets in 2400000001h', now)).toBeNull();
     expect(extractQuotaResetAt('Token Plan usage limit reached (2056)', now)).toBeNull();
   });
 

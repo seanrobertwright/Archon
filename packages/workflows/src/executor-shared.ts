@@ -118,7 +118,8 @@ export function extractQuotaResetAt(error: string, now = new Date()): Date | nul
   if (relative?.[1] !== undefined && relative[2] !== undefined) {
     const amount = Number(relative[1]);
     const multiplier = relative[2].toLowerCase().startsWith('h') ? 60 * 60 * 1000 : 60 * 1000;
-    return new Date(now.getTime() + amount * multiplier);
+    const parsed = new Date(now.getTime() + amount * multiplier);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
   }
   return null;
 }

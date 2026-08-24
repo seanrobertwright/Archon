@@ -14265,10 +14265,13 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     expect(store.failWorkflowRun).toHaveBeenCalled();
   });
 
-  it('schedules one bounded continuation when quota policy supplies a fallback delay', async () => {
+  it('uses the bounded fallback when provider-relative reset text overflows Date', async () => {
     const creditExhaustedQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
       async function* () {
-        yield { type: 'assistant', content: "You're out of extra usage" };
+        yield {
+          type: 'assistant',
+          content: "You're out of extra usage · resets in 2400000001h",
+        };
         yield { type: 'result', sessionId: 'dag-session-credit' };
       }
     );
