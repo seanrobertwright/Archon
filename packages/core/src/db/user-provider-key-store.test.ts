@@ -318,6 +318,35 @@ describe('user-provider-key-store', () => {
       expect(mockGetOAuthApiKey).not.toHaveBeenCalled();
     });
 
+    test('openai oauth row → null on malformed expires, no mint attempt', async (): Promise<void> => {
+      const malformedExpires = [
+        { label: 'null payload', raw: 'null', type: 'undefined' },
+        { label: 'missing', raw: '{"access":"oa"}', type: 'undefined' },
+        { label: 'non-numeric', raw: '{"access":"oa","expires":"soon"}', type: 'string' },
+        { label: 'non-finite', raw: '{"access":"oa","expires":1e400}', type: 'number' },
+      ];
+
+      for (const { label, raw, type } of malformedExpires) {
+        mockMintOpenAi.mockClear();
+        mockLogger.error.mockClear();
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            oauthRow({
+              provider: 'openai',
+              oauth_creds_encrypted: encryptToken(raw, getEncryptionKey()),
+            }),
+          ])
+        );
+
+        expect(await getDecryptedProviderCredential('user-1', 'openai'), label).toBeNull();
+        expect(mockMintOpenAi, label).not.toHaveBeenCalled();
+        expect(mockLogger.error, label).toHaveBeenCalledWith(
+          { userId: 'user-1', provider: 'openai', expiresType: type },
+          'user_provider_key.oauth_malformed_expires'
+        );
+      }
+    });
+
     test("legacy 'codex' rows normalize onto the openai path", async () => {
       mockGetOAuthApiKey.mockClear();
       mockMintOpenAi.mockClear();
