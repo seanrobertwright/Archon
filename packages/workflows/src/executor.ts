@@ -7,7 +7,7 @@ import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS } from './deps';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
-import type { WorkflowDeps, WorkflowConfig } from './deps';
+import type { WorkflowDeps } from './deps';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, captureWorkflowCompleted } from '@archon/paths';
 import { getDefaultBranch, toRepoPath } from '@archon/git';
@@ -94,6 +94,12 @@ import {
   RUN_MODEL_BINDINGS_METADATA_KEY,
   runOverrideAppliesToRef,
 } from './model-validation';
+import {
+  applyWorkflowRunConfigLayer,
+  readWorkflowRunConfigMetadata,
+  WORKFLOW_RUN_CONFIG_METADATA_KEY,
+} from './run-config';
+import type { WorkflowRunConfigInput, WorkflowRunConfigMetadata } from './schemas/run-config';
 import type {
   BuildAiProfileOptions,
   ResolvedAiProfile,
@@ -662,6 +668,8 @@ export type ExecuteWorkflowOptions = ResumePayload & {
   modelOverrideLayer?:
     | { kind: 'raw'; overrides: RunModelOverrides }
     | { kind: 'resolved'; overrides: ResolvedRunModelOverrides };
+  /** Validated sparse config supplied by a fresh CLI/HTTP workflow invocation. */
+  runConfig?: WorkflowRunConfigInput;
   /**
    * The frozen source this run executes, from {@link prepareWorkflowSource}.
    *
@@ -1119,6 +1127,7 @@ async function runChildWorkflow(
   platform: IWorkflowPlatform,
   args: RunChildWorkflowArgs,
   resolvedModelOverrides: ResolvedRunModelOverrides,
+  runConfig: WorkflowRunConfigInput | undefined,
   resolveChildIsolation?: ChildIsolationResolver
 ): Promise<ChildWorkflowOutcome> {
   const {
@@ -1406,6 +1415,7 @@ async function runChildWorkflow(
         codebaseId,
         resolveChildIsolation,
         preparedSource: childSource,
+        ...(runConfig ? { runConfig } : {}),
       };
       childRunId = childRun.id;
     }
@@ -1718,6 +1728,7 @@ export async function executeWorkflow(
     resolveChildIsolation,
     inputs: suppliedInputs,
     modelOverrideLayer,
+    runConfig: callerRunConfig,
     preparedSource,
   } = opts;
 
@@ -1731,6 +1742,9 @@ export async function executeWorkflow(
     (priorCompletedNodes !== undefined || preCreatedRun.status !== 'pending');
   if (isContinuation && modelOverrides !== undefined) {
     throw new Error('Cannot supply model overrides when resuming an existing workflow run.');
+  }
+  if (isContinuation && callerRunConfig !== undefined) {
+    throw new Error('Cannot supply a run config when resuming an existing workflow run.');
   }
 
   const containsWait = (nodes: readonly (DagNode | IncludeDirective)[]): boolean =>
@@ -1783,7 +1797,46 @@ export async function executeWorkflow(
     return { success: false, workflowRunId: preCreatedRun.id, error: msg };
   }
 
-  // Load config once for the entire workflow execution
+  let runConfigMetadata: WorkflowRunConfigMetadata | undefined;
+  let effectiveRunConfig: WorkflowRunConfigInput | undefined;
+  try {
+    if (isContinuation) {
+      runConfigMetadata = readWorkflowRunConfigMetadata(preCreatedRun.metadata);
+      if (runConfigMetadata) {
+        if (!deps.unsealRunConfig) {
+          throw new Error('This Archon build cannot restore persisted workflow run config.');
+        }
+        effectiveRunConfig = {
+          layer: deps.unsealRunConfig(runConfigMetadata),
+          source: runConfigMetadata.source,
+        };
+      }
+    } else {
+      effectiveRunConfig = callerRunConfig;
+      if (effectiveRunConfig) {
+        if (!deps.sealRunConfig) {
+          throw new Error('This Archon build cannot persist workflow run config.');
+        }
+        runConfigMetadata = deps.sealRunConfig(effectiveRunConfig.layer, effectiveRunConfig.source);
+      }
+    }
+  } catch (error) {
+    if (preCreatedRun) {
+      await deps.store
+        .failWorkflowRun(preCreatedRun.id, (error as Error).message)
+        .catch((dbError: Error) => {
+          getLog().error(
+            { err: dbError, workflowRunId: preCreatedRun.id },
+            'workflow.run_config_fail_db_record_failed'
+          );
+        });
+    }
+    throw error;
+  }
+
+  // Load shared config once, then add this invocation's sparse layer at the
+  // executor boundary. DB values remain below the run layer; protected
+  // Archon-managed credentials are added later and keep their authority.
   const fileConfig = await deps.loadConfig(cwd);
   const dbEnvVars = codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
   // Resolve a fresh bot GitHub token once at workflow start when:
@@ -1796,14 +1849,24 @@ export async function executeWorkflow(
   // typical <1h workflow.
   const botGitHubEnv = await resolveBotGitHubEnvForWorkflow(deps, codebaseId);
   const userGitHubEnv = await resolveUserGithubEnvForWorkflow(deps, executionUserId);
-  const config: WorkflowConfig = {
-    ...fileConfig,
-    // Order: file < db < bot-token < per-user. Per-codebase env vars are
-    // operator-set; the injected bot token is system-set; the per-user override
+  const config = applyWorkflowRunConfigLayer(
+    {
+      ...fileConfig,
+      // Order before the run layer: file < db. Per-codebase env vars are
+      // operator-set; an explicit run config is the operator's final runtime
+      // choice. Bot/user credentials remain protected and are merged after it.
+      envVars: { ...fileConfig.envVars, ...dbEnvVars },
+    },
+    effectiveRunConfig?.layer
+  );
+  config.envVars = {
+    ...config.envVars,
+    // The injected bot token is system-set; the per-user override
     // wins last so a run routes through the originating human's token (or scrubs
     // the org/bot token when they haven't connected). Empty-string values from
     // the per-user policy scrub the corresponding key via the subprocess merge.
-    envVars: { ...fileConfig.envVars, ...dbEnvVars, ...botGitHubEnv, ...userGitHubEnv },
+    ...botGitHubEnv,
+    ...userGitHubEnv,
   };
   const protectedEnvKeys = new Set([...Object.keys(botGitHubEnv), ...Object.keys(userGitHubEnv)]);
   if (protectedEnvKeys.size > 0) {
@@ -1876,13 +1939,15 @@ export async function executeWorkflow(
   let appliedProfileOptions: BuildAiProfileOptions;
   try {
     appliedProfileOptions = {
-      repoTiers: config.tiers,
-      repoAliases: config.aliases,
+      repoTiers: fileConfig.tiers,
+      repoAliases: fileConfig.aliases,
       userTiers: userAiPrefs.tiers,
       userAliases: userAiPrefs.aliases,
+      runTiers: effectiveRunConfig?.layer.tiers,
+      runAliases: effectiveRunConfig?.layer.aliases,
     };
     baseAiProfile = buildAiProfile(
-      userAiPrefs.defaultProvider ?? config.assistant,
+      effectiveRunConfig?.layer.assistant ?? userAiPrefs.defaultProvider ?? fileConfig.assistant,
       appliedProfileOptions
     );
   } catch (error) {
@@ -1894,10 +1959,15 @@ export async function executeWorkflow(
       'workflow.user_ai_prefs_profile_invalid'
     );
     appliedProfileOptions = {
-      repoTiers: config.tiers,
-      repoAliases: config.aliases,
+      repoTiers: fileConfig.tiers,
+      repoAliases: fileConfig.aliases,
+      runTiers: effectiveRunConfig?.layer.tiers,
+      runAliases: effectiveRunConfig?.layer.aliases,
     };
-    baseAiProfile = buildAiProfile(config.assistant, appliedProfileOptions);
+    baseAiProfile = buildAiProfile(
+      effectiveRunConfig?.layer.assistant ?? fileConfig.assistant,
+      appliedProfileOptions
+    );
   }
 
   let persistedModelBindings: RunModelBindingsMetadata | undefined;
@@ -1929,8 +1999,14 @@ export async function executeWorkflow(
   }
   const aiProfile = buildAiProfile(baseAiProfile.defaultProvider, {
     ...appliedProfileOptions,
-    runTiers: resolvedModelOverrides.tiers,
-    runAliases: resolvedModelOverrides.aliases,
+    runTiers: {
+      ...effectiveRunConfig?.layer.tiers,
+      ...resolvedModelOverrides.tiers,
+    },
+    runAliases: {
+      ...effectiveRunConfig?.layer.aliases,
+      ...resolvedModelOverrides.aliases,
+    },
   });
   const modelBindingsMetadata = createRunModelBindingsMetadata(resolvedModelOverrides, aiProfile);
   if (hasRunModelOverrides(resolvedModelOverrides)) {
@@ -2061,6 +2137,7 @@ export async function executeWorkflow(
             ? { [SUBRUN_METADATA_KEYS.inputs]: { ...suppliedInputs } }
             : {}),
           [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata,
+          ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
         },
         parent_conversation_id: parentConversationId,
         user_id: userId,
@@ -2083,31 +2160,34 @@ export async function executeWorkflow(
   if (preCreatedRun && !isContinuation) {
     try {
       await deps.store.updateWorkflowRun(preCreatedRun.id, {
-        metadata: { [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata },
+        metadata: {
+          [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata,
+          ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
+        },
       });
     } catch (error) {
       const err = error as Error;
       getLog().error(
         { err, workflowRunId: preCreatedRun.id },
-        'workflow.model_bindings_persist_failed'
+        'workflow.invocation_metadata_persist_failed'
       );
       await deps.store
-        .failWorkflowRun(preCreatedRun.id, 'Database error recording workflow model bindings')
+        .failWorkflowRun(preCreatedRun.id, 'Database error recording workflow invocation settings')
         .catch((dbError: Error) => {
           getLog().error(
             { err: dbError, workflowRunId: preCreatedRun.id },
-            'workflow.model_bindings_failure_record_failed'
+            'workflow.invocation_metadata_failure_record_failed'
           );
         });
       await sendCriticalMessage(
         platform,
         conversationId,
-        '❌ **Workflow failed**: Unable to record the run model bindings. Please try again later.'
+        '❌ **Workflow failed**: Unable to record the run invocation settings. Please try again later.'
       );
       return {
         success: false,
         workflowRunId: preCreatedRun.id,
-        error: 'Database error recording workflow model bindings',
+        error: 'Database error recording workflow invocation settings',
       };
     }
     workflowRun = {
@@ -2115,6 +2195,7 @@ export async function executeWorkflow(
       metadata: {
         ...preCreatedRun.metadata,
         [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata,
+        ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
       },
     };
   }
@@ -2863,7 +2944,14 @@ export async function executeWorkflow(
       // Also captures the per-child isolation resolver (slice 2, PR-A) so an
       // `isolation: 'worktree'` child gets its own worktree cwd.
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
-        runChildWorkflow(deps, platform, childArgs, resolvedModelOverrides, resolveChildIsolation),
+        runChildWorkflow(
+          deps,
+          platform,
+          childArgs,
+          resolvedModelOverrides,
+          effectiveRunConfig,
+          resolveChildIsolation
+        ),
       dagPriorUsage,
       priorNodeSessions,
       // Container runs resolve from the capture like every other run: it is bind-mounted

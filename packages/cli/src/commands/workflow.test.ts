@@ -806,6 +806,59 @@ describe('workflowRunCommand — dry-run', () => {
     }
   });
 
+  it('applies the config file and then replaces only the explicit model binding', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'archon-cli-dry-run-config-'));
+    const configPath = join(dir, 'config.minimax.yaml');
+    appendFileSync(
+      configPath,
+      'tiers:\n  large: { provider: pi, model: minimax/MiniMax-M3 }\nenv:\n  BENCH_MODE: "1"\n'
+    );
+    try {
+      const core = await import('@archon/core');
+      const dryRun = await import('@archon/workflows/dry-run');
+      (core.loadConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        assistant: 'claude',
+        assistants: { claude: {}, pi: {} },
+        tiers: {
+          small: { provider: 'claude', model: 'haiku' },
+          medium: { provider: 'claude', model: 'sonnet' },
+          large: { provider: 'claude', model: 'opus' },
+        },
+        aliases: {},
+        envVars: { LOWER: 'kept' },
+        commands: {},
+      });
+
+      await workflowRunCommand('/test/path', 'plan', 'hello', {
+        dryRun: true,
+        configPath,
+        modelAssignments: ['large=openai/gpt-5.6'],
+      });
+
+      const options = (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+        config: { envVars?: Record<string, string> };
+        aiProfile: {
+          aliases: Record<string, { provider: string; model: string }>;
+        };
+      };
+      expect(options.config.envVars).toEqual({ LOWER: 'kept', BENCH_MODE: '1' });
+      expect(options.aiProfile.aliases.large).toEqual({
+        provider: 'pi',
+        model: 'openai/gpt-5.6',
+      });
+      expect(options.aiProfile.aliases.small).toEqual({
+        provider: 'claude',
+        model: 'haiku',
+      });
+      expect(options.aiProfile.aliases.medium).toEqual({
+        provider: 'claude',
+        model: 'sonnet',
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('writes a scaffold from the discovered workflow and exits before simulation', async () => {
     const { executeWorkflow } = await import('@archon/workflows/executor');
     const dryRun = await import('@archon/workflows/dry-run');
@@ -1429,6 +1482,91 @@ describe('workflowRunCommand — sparse model bindings (#2481)', () => {
         modelAssignments: ['large=openai/gpt-5.6'],
       })
     ).rejects.toThrow(/--resume and --model/);
+  });
+});
+
+describe('workflowRunCommand — sparse config file (#2482)', () => {
+  let tempRoot: string;
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    tempRoot = mkdtempSync(join(tmpdir(), 'archon-cli-run-config-'));
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+    rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  async function stubWorkflow(): Promise<void> {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'bench' }, 'project')],
+      errors: [],
+    });
+  }
+
+  it('passes validated file content beside explicit model mappings', async () => {
+    const path = join(tempRoot, 'config.minimax.yaml');
+    appendFileSync(
+      path,
+      'tiers:\n  large: { provider: pi, model: minimax/MiniMax-M3 }\nenv:\n  BENCH: "yes"\n'
+    );
+    await stubWorkflow();
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-config',
+    });
+
+    await workflowRunCommand(tempRoot, 'bench', 'go', {
+      noWorktree: true,
+      configPath: './config.minimax.yaml',
+      modelAssignments: ['large=openai/gpt-5.6'],
+    });
+
+    const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][7] as {
+      runConfig?: unknown;
+      modelOverrideLayer?: unknown;
+    };
+    expect(opts.runConfig).toEqual({
+      source: { kind: 'cli', label: 'config.minimax.yaml' },
+      layer: {
+        tiers: { large: { provider: 'pi', model: 'minimax/MiniMax-M3' } },
+        envVars: { BENCH: 'yes' },
+      },
+    });
+    expect(opts.modelOverrideLayer).toEqual({
+      kind: 'raw',
+      overrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
+  });
+
+  it('rejects an ineffective key before source capture or execution', async () => {
+    const path = join(tempRoot, 'bad.yaml');
+    appendFileSync(path, 'commands:\n  folder: custom\n');
+    const { executeWorkflow, prepareWorkflowSource } = await import('@archon/workflows/executor');
+    const prepareCallsBefore = (prepareWorkflowSource as ReturnType<typeof mock>).mock.calls.length;
+
+    await expect(
+      workflowRunCommand('/repo/root', 'bench', 'go', { configPath: path })
+    ).rejects.toThrow("Run config key 'commands' cannot apply");
+    expect((prepareWorkflowSource as ReturnType<typeof mock>).mock.calls).toHaveLength(
+      prepareCallsBefore
+    );
+    expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('refuses config on resume without trying to read the path', async () => {
+    await expect(
+      workflowRunCommand('/repo/root', 'bench', 'go', {
+        resume: true,
+        configPath: join(tempRoot, 'does-not-exist.yaml'),
+      })
+    ).rejects.toThrow(/--resume and --config/);
   });
 });
 
@@ -5150,6 +5288,32 @@ describe('workflowRunCommand — detach', () => {
     expect(execAfter).toBe(execBefore);
     expect(child.unref).toHaveBeenCalledTimes(1);
     expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
+  });
+
+  it('lets the detached child parse the absolute run config appended last', () => {
+    const root = '/absolute/project';
+    const configName = 'config.minimax.yaml';
+    const spawnCmd = buildDetachedRunCmd(
+      false,
+      '/path/to/bun',
+      [
+        '/path/to/bun',
+        '/abs/cli.ts',
+        'workflow',
+        'run',
+        'assist',
+        '--config',
+        `./${configName}`,
+        '--detach',
+      ],
+      root,
+      ['--config', join(root, configName)]
+    );
+    const configIndexes = spawnCmd.flatMap((arg, index) => (arg === '--config' ? [index] : []));
+    expect(configIndexes).toHaveLength(2);
+    const lastConfigIndex = configIndexes.at(-1);
+    expect(lastConfigIndex).toBeDefined();
+    expect(spawnCmd[(lastConfigIndex ?? 0) + 1]).toBe(join(root, configName));
   });
 
   // #2213 — the headline `--json` claim. `writeJsonLine` (not console.log) is

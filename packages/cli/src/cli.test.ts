@@ -61,6 +61,12 @@ describe('CLI help output', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('--model <name>=<spec>');
   });
+
+  it('documents the per-run config file', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], { encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('--config <path>');
+  });
 });
 
 describe('workflow model arguments', () => {
@@ -98,6 +104,45 @@ describe('workflow model arguments', () => {
         '--model cannot be used when continuing an existing workflow run'
       );
       expect(result.stderr).toContain('keeps the model bindings it started with');
+    });
+  }
+});
+
+describe('workflow run config argument', () => {
+  it('parses one local path', () => {
+    const parsed = parseArgs({
+      args: ['workflow', 'run', 'x', '--config', './config.minimax.yaml'],
+      options: cliArgOptions,
+      allowPositionals: true,
+      strict: true,
+    });
+    expect(parsed.values.config).toBe('./config.minimax.yaml');
+  });
+
+  it('rejects a new config on run --resume before reading it', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'run', 'x', '--resume', '--config', './does-not-exist.yaml'],
+      { encoding: 'utf8' }
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--config cannot be used when continuing');
+  });
+
+  for (const args of [
+    ['workflow', 'resume', 'run-1'],
+    ['workflow', 'approve', 'run-1'],
+    ['workflow', 'reject', 'run-1'],
+    ['workflow', 'respond', 'run-1', 'approve'],
+  ]) {
+    it(`rejects --config on ${args[0]} ${args[1]}`, () => {
+      const result = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, ...args, '--config', './config.minimax.yaml'],
+        { encoding: 'utf8' }
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('--config can only be used with workflow run');
     });
   }
 });

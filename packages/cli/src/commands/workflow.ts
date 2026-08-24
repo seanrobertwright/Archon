@@ -12,6 +12,7 @@ import {
   isPerUserGitHubEnabled,
   getDecryptedAccessToken,
 } from '@archon/core';
+import { loadWorkflowRunConfigFile } from '@archon/core/config';
 import { WORKFLOW_EVENT_TYPES, type WorkflowEventType } from '@archon/workflows/store';
 import {
   isTierName,
@@ -40,6 +41,7 @@ import {
   markTierNoticeShown,
 } from '@archon/paths';
 import { isAbsolute, join } from 'node:path';
+import { applyWorkflowRunConfigLayer } from '@archon/workflows/run-config';
 import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
@@ -298,6 +300,8 @@ export interface WorkflowRunOptions {
   inputs?: string[];
   /** Raw repeatable `--model name=spec` mappings; parsed once at the invocation gate. */
   modelAssignments?: string[];
+  /** Local YAML file supplying a sparse configuration layer for this run. */
+  configPath?: string;
 }
 
 /**
@@ -1039,6 +1043,20 @@ async function runWorkflowWithOwnedSource(
   // never agreed to and still not make it deterministic.
   const isContinuation = options.resume === true || continuationRun !== undefined;
 
+  const resolvedRunConfigPath = options.configPath
+    ? isAbsolute(options.configPath)
+      ? options.configPath
+      : join(cwd, options.configPath)
+    : undefined;
+  if (isContinuation && resolvedRunConfigPath) {
+    throw new Error(
+      '--resume and --config are mutually exclusive. A resumed run keeps its original run config.'
+    );
+  }
+  const runConfig = resolvedRunConfigPath
+    ? await loadWorkflowRunConfigFile(resolvedRunConfigPath)
+    : undefined;
+
   let preparedSource: PreparedWorkflowSource | undefined;
   // Pinned at the moment of prepare so the SIGINT/SIGTERM cleanup never rm's a
   // path a live run is reading from. For `--container` folder-codebase runs,
@@ -1216,24 +1234,30 @@ async function runWorkflowWithOwnedSource(
     // The target workspace, never the authoring root: `--exec-code` runs real bash and
     // script nodes, and running them in the checkout the workflow was merely READ from
     // would mutate the author's tree instead of the one they aimed the dry run at.
-    const dryRunConfig = await loadConfig(cwd);
+    const dryRunFileConfig = await loadConfig(cwd);
+    const dryRunConfig = applyWorkflowRunConfigLayer(dryRunFileConfig, runConfig?.layer);
     const dryRunUserPrefs = await resolveCliDryRunAiPrefs();
-    let dryRunDefaultProvider = dryRunUserPrefs.defaultProvider ?? dryRunConfig.assistant;
+    let dryRunDefaultProvider =
+      runConfig?.layer.assistant ?? dryRunUserPrefs.defaultProvider ?? dryRunFileConfig.assistant;
     let dryRunProfileOptions: BuildAiProfileOptions = {
-      repoTiers: dryRunConfig.tiers,
-      repoAliases: dryRunConfig.aliases,
+      repoTiers: dryRunFileConfig.tiers,
+      repoAliases: dryRunFileConfig.aliases,
       userTiers: dryRunUserPrefs.tiers,
       userAliases: dryRunUserPrefs.aliases,
+      runTiers: runConfig?.layer.tiers,
+      runAliases: runConfig?.layer.aliases,
     };
     let dryRunBaseProfile: ResolvedAiProfile;
     try {
       dryRunBaseProfile = buildAiProfile(dryRunDefaultProvider, dryRunProfileOptions);
     } catch (error) {
       getLog().error({ err: error as Error }, 'cli.dry_run_user_ai_prefs_profile_invalid');
-      dryRunDefaultProvider = dryRunConfig.assistant;
+      dryRunDefaultProvider = runConfig?.layer.assistant ?? dryRunFileConfig.assistant;
       dryRunProfileOptions = {
-        repoTiers: dryRunConfig.tiers,
-        repoAliases: dryRunConfig.aliases,
+        repoTiers: dryRunFileConfig.tiers,
+        repoAliases: dryRunFileConfig.aliases,
+        runTiers: runConfig?.layer.tiers,
+        runAliases: runConfig?.layer.aliases,
       };
       dryRunBaseProfile = buildAiProfile(dryRunDefaultProvider, dryRunProfileOptions);
     }
@@ -1250,8 +1274,8 @@ async function runWorkflowWithOwnedSource(
       config: dryRunConfig,
       aiProfile: buildAiProfile(dryRunDefaultProvider, {
         ...dryRunProfileOptions,
-        runTiers: dryRunModelOverrides.tiers,
-        runAliases: dryRunModelOverrides.aliases,
+        runTiers: { ...runConfig?.layer.tiers, ...dryRunModelOverrides.tiers },
+        runAliases: { ...runConfig?.layer.aliases, ...dryRunModelOverrides.aliases },
       }),
     });
     if (options.json) {
@@ -1465,6 +1489,9 @@ async function runWorkflowWithOwnedSource(
     // would silently point the child at another directory — or at nothing.
     if (options.discoveryCwd !== undefined) {
       extraArgs.push('--workflow-source', options.discoveryCwd);
+    }
+    if (resolvedRunConfigPath !== undefined) {
+      extraArgs.push('--config', resolvedRunConfigPath);
     }
 
     // The detached child captures its own source, so this process's capture is dead
@@ -2317,6 +2344,7 @@ async function runWorkflowWithOwnedSource(
           ...(modelOverrides
             ? { modelOverrideLayer: { kind: 'raw' as const, overrides: modelOverrides } }
             : {}),
+          ...(runConfig ? { runConfig } : {}),
           // The frozen source this run executes, captured before the workflow was even
           // selected. A resume ignores it and loads the source recorded on its own row.
           preparedSource,

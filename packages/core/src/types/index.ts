@@ -4,6 +4,7 @@
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { RunModelOverrides } from '@archon/workflows/model-validation';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 
 // MessageChunk + TokenUsage are used by IPlatformAdapter below.
 import type { MessageChunk, TokenUsage } from '@archon/providers/types';
@@ -67,6 +68,8 @@ export interface HandleMessageContext {
   readonly workflowInputs?: Readonly<Record<string, string>>;
   /** Sparse tier/@alias rebindings supplied by the workflow run route (#2481). */
   readonly workflowModelOverrides?: RunModelOverrides;
+  /** Validated inline config content supplied by the workflow run route. */
+  readonly workflowRunConfig?: WorkflowRunConfigInput;
 }
 
 export interface CommandResult {

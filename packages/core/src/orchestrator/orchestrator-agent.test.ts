@@ -2510,6 +2510,28 @@ describe('workflow dispatch routing — interactive flag', () => {
     });
   });
 
+  test('threads context.workflowRunConfig into fresh foreground and background runs', async () => {
+    const runConfig = {
+      source: { kind: 'http' as const, label: 'inline' },
+      layer: { docsPath: 'handbook' },
+    };
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
+      workflowRunConfig: runConfig,
+    });
+    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.runConfig).toEqual(runConfig);
+
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow', {
+      workflowRunConfig: runConfig,
+    });
+    expect(mockDispatchBackgroundWorkflow.mock.calls[0]?.[0]?.runConfig).toEqual(runConfig);
+  });
+
   test('refuses a required-input workflow when nothing is supplied, starting nothing', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
@@ -2684,6 +2706,35 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(sent).not.toContain('openai/gpt-5.6');
     expect(mockExecuteWorkflow).toHaveBeenCalled();
     expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.modelOverrideLayer).toBeUndefined();
+  });
+
+  test('refuses a new run config when the command would auto-resume existing work', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve({
+        id: 'implicit-config-resume',
+        workflow_name: 'test-workflow',
+        working_path: '/repos/test-repo/worktrees/paused',
+        parent_conversation_id: 'conv-1',
+        status: 'paused',
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
+      workflowRunConfig: {
+        source: { kind: 'http', label: 'inline' },
+        layer: { docsPath: 'handbook' },
+      },
+    });
+
+    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+    expect(sent).toContain('a new run config cannot be applied');
+    expect(sent).toContain('force a fresh run');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
   });
 
   test('uses the actual state when explicit resume ignores supplied model bindings', async () => {

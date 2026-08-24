@@ -579,6 +579,20 @@ describe('dispatchBackgroundWorkflow', () => {
     });
   });
 
+  test('passes validated run config to the executor for a pre-created background run', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    const runConfig = {
+      source: { kind: 'http' as const, label: 'inline' },
+      layer: { docsPath: 'handbook' },
+    };
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx({ runConfig }), workflow);
+    await flushBackgroundExecution();
+
+    const opts = mockExecuteWorkflow.mock.calls[0]?.[7] as { runConfig?: unknown };
+    expect(opts.runConfig).toEqual(runConfig);
+  });
+
   test('default policy still resolves isolation for the worker', async () => {
     const workflow = makeWorkflow();
     mockResolve.mockResolvedValueOnce({

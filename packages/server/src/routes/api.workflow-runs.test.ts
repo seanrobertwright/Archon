@@ -924,6 +924,82 @@ describe('POST /api/workflows/:name/run', () => {
     }
     expect(mockHandleMessage).not.toHaveBeenCalled();
   });
+
+  test('forwards validated inline JSON config as structured context', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async () => {});
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/bench/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'Go',
+        config: {
+          defaultAssistant: 'pi',
+          tiers: { small: { provider: 'pi', model: 'minimax/MiniMax-M3' } },
+          env: { BENCH_TOKEN: 'secret' },
+        },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockHandleMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      'web-test-abc',
+      '/workflow run bench Go',
+      expect.objectContaining({
+        workflowRunConfig: {
+          source: { kind: 'http', label: 'inline' },
+          layer: {
+            assistant: 'pi',
+            tiers: { small: { provider: 'pi', model: 'minimax/MiniMax-M3' } },
+            envVars: { BENCH_TOKEN: 'secret' },
+          },
+        },
+      })
+    );
+  });
+
+  test('accepts multipart config as a JSON-encoded object', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async () => {});
+    const form = new FormData();
+    form.append('conversationId', 'web-test-abc');
+    form.append('message', 'Go');
+    form.append('config', JSON.stringify({ docs: { path: 'handbook' } }));
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/bench/run', {
+      method: 'POST',
+      body: form,
+    });
+
+    expect(response.status).toBe(200);
+    const context = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    expect(context.workflowRunConfig).toEqual({
+      source: { kind: 'http', label: 'inline' },
+      layer: { docsPath: 'handbook' },
+    });
+  });
+
+  test('rejects caller-supplied server paths and ineffective config before dispatch', async () => {
+    const { app } = makeApp();
+    for (const payload of [
+      { configPath: '/etc/passwd' },
+      { config: null },
+      { config: { paths: { worktrees: '/tmp/other' } } },
+      { config: { unknown: true } },
+    ]) {
+      const response = await app.request('/api/workflows/bench/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go', ...payload }),
+      });
+      expect(response.status).toBe(400);
+    }
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------

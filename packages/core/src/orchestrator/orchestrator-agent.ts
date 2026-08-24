@@ -66,6 +66,7 @@ import type {
   WorkflowSource,
 } from '@archon/workflows/schemas/workflow';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import { isPerUserGitHubEnabled } from '../github-auth/config';
 import { getDecryptedAccessToken } from '../db/user-github-token-store';
 import { isPerUserProviderKeysEnabled } from '../credentials/config';
@@ -663,6 +664,8 @@ interface WorkflowDispatchOptions {
   inputs?: Readonly<Record<string, string>>;
   /** Sparse tier/@alias rebindings supplied by this run invocation (#2481). */
   modelOverrides?: RunModelOverrides;
+  /** Validated sparse config content supplied by a fresh HTTP invocation. */
+  runConfig?: WorkflowRunConfigInput;
 }
 
 const FAILED_RUN_PROMPT_PREVIEW_MAX = 160;
@@ -822,6 +825,14 @@ async function dispatchOrchestratorWorkflowOwned(
   const willContinueExistingRun =
     Boolean(resumableRun?.working_path) &&
     (resumableRun?.status === 'paused' || resumableRun?.id === options?.resumeRunId);
+  if (willContinueExistingRun && options?.runConfig) {
+    await platform.sendMessage(
+      conversationId,
+      'This command would resume an existing run, so a new run config cannot be applied. ' +
+        'Resume without config, or force a fresh run.'
+    );
+    return;
+  }
 
   // ── Executable source ───────────────────────────────────────────────────────
   //
@@ -1197,6 +1208,7 @@ async function dispatchOrchestratorWorkflowOwned(
                 },
               }
             : {}),
+          ...(options?.runConfig ? { runConfig: options.runConfig } : {}),
         }
       );
     }
@@ -1223,6 +1235,7 @@ async function dispatchOrchestratorWorkflowOwned(
           parseWarnings: options?.parseWarnings,
           inputs: resolvedInputs,
           modelOverrides: options?.modelOverrides,
+          runConfig: options?.runConfig,
         },
         workflow
       );
@@ -1279,6 +1292,7 @@ async function dispatchOrchestratorWorkflowOwned(
               modelOverrideLayer: { kind: 'raw' as const, overrides: options.modelOverrides },
             }
           : {}),
+        ...(options?.runConfig ? { runConfig: options.runConfig } : {}),
       }
     );
   }
@@ -1862,6 +1876,7 @@ export async function handleMessage(
               // command text — the run route is the only caller that sets them.
               inputs: context?.workflowInputs,
               modelOverrides: context?.workflowModelOverrides,
+              runConfig: context?.workflowRunConfig,
             }
           );
         }

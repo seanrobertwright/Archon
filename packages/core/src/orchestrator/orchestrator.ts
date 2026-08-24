@@ -68,6 +68,7 @@ import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
 import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import type { RunModelOverrides } from '@archon/workflows/model-validation';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import {
@@ -318,6 +319,8 @@ export interface WorkflowRoutingContext {
   readonly inputs?: Readonly<Record<string, string>>;
   /** Sparse tier/@alias rebindings supplied by this invocation (#2481). */
   readonly modelOverrides?: RunModelOverrides;
+  /** Validated sparse config content supplied by this fresh invocation. */
+  readonly runConfig?: WorkflowRunConfigInput;
 }
 
 /**
@@ -584,6 +587,7 @@ async function dispatchBackgroundWorkflowOwned(
             ...(ctx.modelOverrides
               ? { modelOverrideLayer: { kind: 'raw' as const, overrides: ctx.modelOverrides } }
               : {}),
+            ...(ctx.runConfig ? { runConfig: ctx.runConfig } : {}),
           }
         );
         // Surface workflow output to parent conversation as a result card

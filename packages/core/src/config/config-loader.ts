@@ -178,7 +178,7 @@ function getLog(): ReturnType<typeof createLogger> {
 /**
  * Parse YAML using Bun's native YAML parser
  */
-function parseYaml(content: string): unknown {
+export function parseYaml(content: string): unknown {
   return Bun.YAML.parse(content);
 }
 

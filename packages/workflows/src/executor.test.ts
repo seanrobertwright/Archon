@@ -170,6 +170,7 @@ import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './schemas';
 import { RUN_METADATA_KEYS, workflowDefinitionSchema } from './schemas';
+import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 
 // --- Helpers ---
 
@@ -863,11 +864,11 @@ describe('executeWorkflow', () => {
       expect(result).toEqual({
         success: false,
         workflowRunId: 'pending-run',
-        error: 'Database error recording workflow model bindings',
+        error: 'Database error recording workflow invocation settings',
       });
       expect(failRun).toHaveBeenCalledWith(
         'pending-run',
-        'Database error recording workflow model bindings'
+        'Database error recording workflow invocation settings'
       );
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
@@ -1095,6 +1096,221 @@ describe('executeWorkflow', () => {
       expect(cleanCall?.[6]).toBe('claude');
       expect(cleanCall?.[7]).not.toBe('openai/gpt-5.6');
       expect(cleanCall?.[7]).not.toBe('gpt-5.6-sol');
+    });
+  });
+
+  describe('run-scoped config layer (#2482)', () => {
+    const sealedMetadata: WorkflowRunConfigMetadata = {
+      version: 1,
+      ciphertext: 'opaque-ciphertext',
+      digest: 'a'.repeat(64),
+      source: { kind: 'cli', label: 'config.minimax.yaml' },
+      keys: ['assistant', 'env.SHARED', 'tiers.large'],
+    };
+
+    it('layers file content above DB/user config and explicit model mappings above the file', async () => {
+      const createRun = mock<IWorkflowStore['createWorkflowRun']>(async data =>
+        makeRun({ metadata: data.metadata })
+      );
+      const store = makeStore({
+        createWorkflowRun: createRun,
+        getCodebaseEnvVars: mock(async () => ({ SHARED: 'db', DB_ONLY: 'kept' })),
+      });
+      const sealRunConfig = mock(() => sealedMetadata);
+      const deps: WorkflowDeps = {
+        ...makeDeps(store),
+        sealRunConfig,
+        loadConfig: mock(async () => ({
+          assistant: 'claude',
+          assistants: { claude: {}, codex: {} },
+          tiers: { large: { provider: 'claude', model: 'opus' } },
+          envVars: { SHARED: 'repo', REPO_ONLY: 'kept' },
+          commands: {},
+        })),
+        getUserAiPrefs: mock(async () => ({
+          defaultProvider: 'codex',
+          tiers: { large: { provider: 'codex', model: 'gpt-5.5' } },
+        })),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async () => ({
+          env: { PROTECTED_TOKEN: 'credential-wins' },
+          files: [],
+          protectedValues: ['credential-wins'],
+        })),
+      };
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ model: 'large' }),
+        'msg',
+        'db-conv-1',
+        {
+          codebaseId: 'codebase-1',
+          runConfig: {
+            source: sealedMetadata.source,
+            layer: {
+              assistant: 'pi',
+              tiers: { large: { provider: 'pi', model: 'minimax/MiniMax-M3' } },
+              envVars: { SHARED: 'run', PROTECTED_TOKEN: 'must-not-win' },
+            },
+          },
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { tiers: { large: 'openai/gpt-5.6' } },
+          },
+          userId: 'user-1',
+        }
+      );
+
+      expect(sealRunConfig).toHaveBeenCalledTimes(1);
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('pi');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('openai/gpt-5.6');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[13]).toMatchObject({
+        assistant: 'pi',
+        envVars: {
+          REPO_ONLY: 'kept',
+          DB_ONLY: 'kept',
+          SHARED: 'run',
+          PROTECTED_TOKEN: 'credential-wins',
+        },
+        protectedEnvKeys: ['PROTECTED_TOKEN'],
+      });
+      expect(createRun.mock.calls[0]?.[0].metadata).toMatchObject({
+        run_config: sealedMetadata,
+        model_bindings: {
+          effective: {
+            defaultProvider: 'pi',
+            aliases: { large: { provider: 'pi', model: 'openai/gpt-5.6' } },
+          },
+        },
+      });
+    });
+
+    it('restores the sealed layer on cold resume without caller input', async () => {
+      const layer = {
+        docsPath: 'handbook',
+        envVars: { RUN_ONLY: 'restored' },
+      };
+      const unsealRunConfig = mock(() => layer);
+      const preCreatedRun = makeRun({
+        id: 'resume-config-run',
+        status: 'running',
+        metadata: { run_config: sealedMetadata },
+      });
+
+      await executeWorkflow(
+        { ...makeDeps(makeStore()), unsealRunConfig },
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun, priorCompletedNodes: new Map() }
+      );
+
+      expect(unsealRunConfig).toHaveBeenCalledWith(sealedMetadata);
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[12]).toBe('handbook');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[13]).toMatchObject({
+        envVars: { RUN_ONLY: 'restored' },
+      });
+    });
+
+    it('terminalizes a pre-created run when persisted config cannot be restored', async () => {
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({
+        id: 'broken-config-run',
+        status: 'running',
+        metadata: { run_config: sealedMetadata },
+      });
+
+      await expect(
+        executeWorkflow(
+          {
+            ...makeDeps(makeStore({ failWorkflowRun: failRun })),
+            unsealRunConfig: () => {
+              throw new Error('Workflow run config could not be decrypted.');
+            },
+          },
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          { preCreatedRun, priorCompletedNodes: new Map() }
+        )
+      ).rejects.toThrow('could not be decrypted');
+      expect(failRun).toHaveBeenCalledWith(
+        'broken-config-run',
+        'Workflow run config could not be decrypted.'
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('keeps concurrent run layers isolated and leaves no residue', async () => {
+      const workflow = makeWorkflow({ model: 'large', mutates_checkout: false });
+      const input = (id: string, provider: 'pi' | 'codex', model: string, marker: string) =>
+        executeWorkflow(
+          {
+            ...makeDeps(makeStore({ createWorkflowRun: mock(async () => makeRun({ id })) })),
+            sealRunConfig: () => sealedMetadata,
+          },
+          makePlatform(),
+          `conv-${id}`,
+          '/tmp',
+          workflow,
+          id,
+          `db-${id}`,
+          {
+            runConfig: {
+              source: sealedMetadata.source,
+              layer: {
+                tiers: { large: { provider, model } },
+                envVars: { RUN_MARKER: marker },
+              },
+            },
+          }
+        );
+
+      await Promise.all([
+        input('config-a', 'pi', 'openai/gpt-5.6', 'a'),
+        input('config-b', 'codex', 'gpt-5.6-sol', 'b'),
+      ]);
+
+      const concurrent = mockExecuteDagWorkflow.mock.calls.slice(0, 2).map(call => ({
+        provider: call[6],
+        model: call[7],
+        marker: (call[13] as WorkflowConfig | undefined)?.envVars?.RUN_MARKER,
+      }));
+      expect(concurrent).toContainEqual({
+        provider: 'pi',
+        model: 'openai/gpt-5.6',
+        marker: 'a',
+      });
+      expect(concurrent).toContainEqual({
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        marker: 'b',
+      });
+
+      await executeWorkflow(
+        makeDeps(
+          makeStore({ createWorkflowRun: mock(async () => makeRun({ id: 'config-clean' })) })
+        ),
+        makePlatform(),
+        'conv-clean',
+        '/tmp',
+        workflow,
+        'clean',
+        'db-clean'
+      );
+      const cleanConfig = mockExecuteDagWorkflow.mock.calls[2]?.[13] as WorkflowConfig | undefined;
+      expect(cleanConfig?.envVars?.RUN_MARKER).toBeUndefined();
+      expect(mockExecuteDagWorkflow.mock.calls[2]?.[6]).toBe('claude');
     });
   });
 

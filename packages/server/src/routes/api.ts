@@ -62,6 +62,8 @@ import {
   setUserDefault,
 } from '@archon/core';
 import type { UserTiersPatch, UserAliasesPatch, AliasesPatch } from '@archon/core';
+import { parseWorkflowRunConfig } from '@archon/core/config';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import { findRepoRoot, removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
   createLogger,
@@ -850,13 +852,15 @@ const runWorkflowRoute = createRoute({
   tags: ['Workflows'],
   summary: 'Run a workflow via the orchestrator (JSON or multipart with file uploads)',
   description:
-    'Accepts `application/json` with `{ conversationId, message, inputs?, tiers?, aliases? }` or ' +
-    '`multipart/form-data` with `conversationId`, `message`, an optional `inputs` field ' +
-    'holding the same map JSON-encoded, optional `tiers` and `aliases` JSON object fields, ' +
+    'Accepts `application/json` with `{ conversationId, message, inputs?, config?, tiers?, aliases? }` or ' +
+    '`multipart/form-data` with `conversationId`, `message`, optional `inputs` and `config` fields ' +
+    'holding their objects JSON-encoded, optional `tiers` and `aliases` JSON object fields, ' +
     'and optional file attachments (max 5 files, ' +
     "10 MB each). `inputs` supplies values for the workflow's declared `inputs:` " +
     '(#2554); it is validated against the declaration before any worktree, clone, or AI ' +
-    'cost, so a missing required input or an undeclared key is refused up front.',
+    'cost, so a missing required input or an undeclared key is refused up front. `config` ' +
+    'supplies a sparse runtime layer; `tiers` and `aliases` rebind named model presets above it. ' +
+    'Caller-supplied filesystem config paths are rejected.',
   request: {
     params: z.object({ name: z.string() }),
   },
@@ -3374,6 +3378,7 @@ export function registerApiRoutes(
     let conversationId: string;
     let workflowInputs: Record<string, string> | undefined;
     let workflowModelOverrides: RunModelOverrides | undefined;
+    let workflowRunConfig: WorkflowRunConfigInput | undefined;
     let savedFiles: AttachedFile[] = [];
     let uploadDir = '';
 
@@ -3398,6 +3403,10 @@ export function registerApiRoutes(
       }
       message = rawMessage;
       conversationId = rawConv;
+
+      if (body.configPath !== undefined) {
+        return apiError(c, 400, 'configPath is not supported; send validated config content');
+      }
 
       // Declared inputs (#2554). A form field can only be a string, so the map travels
       // JSON-encoded. A malformed field is refused rather than ignored — silently
@@ -3448,6 +3457,27 @@ export function registerApiRoutes(
       if (!parsedOverrides.ok) return apiError(c, 400, parsedOverrides.error);
       workflowModelOverrides = parsedOverrides.overrides;
 
+      if (body.config !== undefined) {
+        if (typeof body.config !== 'string') {
+          return apiError(c, 400, 'config must be a JSON-encoded object');
+        }
+        let decodedConfig: unknown;
+        try {
+          decodedConfig = JSON.parse(body.config) as unknown;
+        } catch (parseErr: unknown) {
+          getLog().warn({ err: parseErr, workflowName }, 'run_workflow.config_parse_failed');
+          return apiError(c, 400, 'config must be a JSON-encoded object');
+        }
+        try {
+          workflowRunConfig = parseWorkflowRunConfig(decodedConfig, {
+            kind: 'http',
+            label: 'inline',
+          });
+        } catch (error) {
+          return apiError(c, 400, (error as Error).message);
+        }
+      }
+
       const rawFiles = body.files;
       const fileList: (string | File)[] = Array.isArray(rawFiles)
         ? rawFiles
@@ -3475,6 +3505,8 @@ export function registerApiRoutes(
         inputs?: unknown;
         tiers?: unknown;
         aliases?: unknown;
+        config?: unknown;
+        configPath?: unknown;
       };
       try {
         body = await c.req.json();
@@ -3488,12 +3520,25 @@ export function registerApiRoutes(
       if (typeof body.message !== 'string' || !body.message) {
         return apiError(c, 400, 'message must be a non-empty string');
       }
+      if (body.configPath !== undefined) {
+        return apiError(c, 400, 'configPath is not supported; send validated config content');
+      }
       const parsed = parseRunInputsField(body.inputs);
       if (!parsed.ok) return apiError(c, 400, parsed.error);
       workflowInputs = parsed.inputs;
       const parsedOverrides = parseRunModelOverridesFields(body.tiers, body.aliases);
       if (!parsedOverrides.ok) return apiError(c, 400, parsedOverrides.error);
       workflowModelOverrides = parsedOverrides.overrides;
+      if (body.config !== undefined) {
+        try {
+          workflowRunConfig = parseWorkflowRunConfig(body.config, {
+            kind: 'http',
+            label: 'inline',
+          });
+        } catch (error) {
+          return apiError(c, 400, (error as Error).message);
+        }
+      }
       conversationId = body.conversationId;
       message = body.message;
     }
@@ -3551,6 +3596,7 @@ export function registerApiRoutes(
         ...(savedFiles.length > 0 ? { attachedFiles: savedFiles } : {}),
         ...(workflowInputs ? { workflowInputs } : {}),
         ...(workflowModelOverrides ? { workflowModelOverrides } : {}),
+        ...(workflowRunConfig ? { workflowRunConfig } : {}),
       };
       const filesToCleanup = savedFiles.length > 0 ? { files: savedFiles, uploadDir } : undefined;
       const result = await dispatchToOrchestrator(

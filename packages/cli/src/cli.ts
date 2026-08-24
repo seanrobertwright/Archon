@@ -195,6 +195,7 @@ Options:
   --folder                   Register the current non-git directory as a folder project and run in place
   --input <name>=<value>     Supply a declared workflow input; repeat per input (mutually exclusive with --resume)
   --model <name>=<spec>      Rebind small/medium/large or @alias for one run; repeat per binding
+  --config <path>            Load a sparse YAML config layer for one fresh workflow run
   --resume                   Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)
   --dry-run                  Simulate workflow DAG control flow without creating a run or contacting a provider
   --stubs <path>             YAML node-output map for --dry-run
@@ -545,6 +546,10 @@ async function main(): Promise<number> {
       }
 
       case 'workflow':
+        if (values.config !== undefined && subcommand !== 'run') {
+          console.error('Error: --config can only be used with workflow run.');
+          return 1;
+        }
         if (
           values.model !== undefined &&
           (subcommand === 'resume' ||
@@ -570,6 +575,13 @@ async function main(): Promise<number> {
               return 1;
             }
             const userMessage = positionals.slice(3).join(' ') || '';
+            if (resumeFlag && values.config !== undefined) {
+              console.error(
+                'Error: --config cannot be used when continuing an existing workflow run. ' +
+                  'The run keeps the config it started with.'
+              );
+              return 1;
+            }
             if (branchName !== undefined && noWorktree) {
               console.error(
                 'Error: --branch and --no-worktree are mutually exclusive.\n' +
@@ -667,6 +679,7 @@ async function main(): Promise<number> {
               // Raw `name=value` assignments; parsed at the invocation gate (#2554).
               inputs: values.input as string[] | undefined,
               modelAssignments: values.model as string[] | undefined,
+              configPath: values.config as string | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;
