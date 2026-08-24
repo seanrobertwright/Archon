@@ -327,7 +327,7 @@ curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
   -F 'tiers={"large":"openai/gpt-5.6"}'
 ```
 
-Tier keys are `small`, `medium`, and `large`; alias keys start with `@`. A model spec can name an Archon agent/model, a Pi vendor/model, an unqualified model under the binding's current provider, or another tier/alias preset. Literal model pins in the workflow remain unchanged. To replace all default tiers, author all three mappings explicitly. The effective non-secret bindings are recorded in the run's `metadata.model_bindings` for attribution and reused on resume.
+Tier keys are `small`, `medium`, and `large`; alias keys start with `@`. A model spec can name an Archon agent/model, a Pi vendor/model, an unqualified model under the binding's current provider, or another tier/alias preset. Literal model pins in the workflow remain unchanged. To replace all default tiers, author all three mappings explicitly. The run's `metadata.model_bindings` records the effective non-secret bindings for attribution and the sparse resolved overrides for reuse on resume.
 
 #### List Run Artifacts
 
