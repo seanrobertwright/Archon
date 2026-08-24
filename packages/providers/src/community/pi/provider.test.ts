@@ -1,4 +1,12 @@
-import { readFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -86,7 +94,7 @@ const mockCreateAgentSession = mock<
     createMockSessionResult()
 );
 
-// Per-test state backing the AuthStorage mock. `fileCreds` emulates what's
+// Per-test state backing the ModelRuntime mock. `fileCreds` emulates what's
 // in ~/.pi/agent/auth.json; `runtimeOverrides` emulates env-var passthrough
 // via setRuntimeApiKey. Tests mutate these via helpers.
 let fileCreds: Record<
@@ -95,32 +103,30 @@ let fileCreds: Record<
 > = {};
 let runtimeOverrides: Record<string, string> = {};
 
-const mockSetRuntimeApiKey = mock((providerId: string, key: string) => {
+const mockSetRuntimeApiKey = mock(async (providerId: string, key: string) => {
   runtimeOverrides[providerId] = key;
 });
-const mockGetApiKey = mock(async (providerId: string): Promise<string | undefined> => {
-  // Mirror Pi's resolution: runtime → file api_key → file oauth → env var
-  if (runtimeOverrides[providerId]) return runtimeOverrides[providerId];
+const mockGetAuth = mock(async (providerId: string) => {
+  // Mirror Pi's runtime resolution: runtime override → file api_key → file
+  // oauth → ambient (not exercised in unit tests). Returns the new
+  // `AuthResult` shape so the provider can read `auth.apiKey` (the shape
+  // discriminator for Anthropic subscription OAuth lives on the apiKey
+  // value itself, so a raw string is fine).
+  if (runtimeOverrides[providerId]) {
+    return { auth: { apiKey: runtimeOverrides[providerId] }, source: 'runtime-override' };
+  }
   const cred = fileCreds[providerId];
-  if (cred?.type === 'api_key') return cred.key;
+  if (cred?.type === 'api_key') return { auth: { apiKey: cred.key }, source: 'auth.json' };
   // Real Anthropic subscription OAuth access tokens are `sk-ant-oat…` — keep
   // the stub shape-accurate so token-shape-based detection is exercised.
-  if (cred?.type === 'oauth') return 'sk-ant-oat01-file-stub';
+  if (cred?.type === 'oauth')
+    return { auth: { apiKey: 'sk-ant-oat01-file-stub' }, source: 'auth.json' };
   return undefined;
 });
-const mockGetCredential = mock((providerId: string) => fileCreds[providerId]);
-const mockGetProviderEnv = mock((providerId: string) => fileCreds[providerId]?.env);
-const mockHasAuth = mock(
+const mockHasConfiguredAuth = mock(
   (providerId: string) =>
     runtimeOverrides[providerId] !== undefined || fileCreds[providerId] !== undefined
 );
-const mockAuthCreate = mock(() => ({
-  setRuntimeApiKey: mockSetRuntimeApiKey,
-  getApiKey: mockGetApiKey,
-  get: mockGetCredential,
-  getProviderEnv: mockGetProviderEnv,
-  hasAuth: mockHasAuth,
-}));
 
 function createMockModel(provider: string, modelId: string): Model<Api> {
   return {
@@ -147,22 +153,70 @@ type MockModelRegistry = Pick<ModelRegistry, 'find'> &
       ModelRegistry,
       'getApiKeyAndHeaders' | 'getError' | 'hasConfiguredAuth' | 'registerProvider'
     >
-  >;
-type MockModelRegistryCreate = (
-  ...args: Parameters<typeof import('@earendil-works/pi-coding-agent').ModelRegistry.create>
-) => MockModelRegistry;
-const mockModelRegistryCreate = mock<MockModelRegistryCreate>(
-  (authStorage): MockModelRegistry => ({
+  > & {
+    /** Per-registry extension provider registrations, for assertions. */
+    registered?: Map<string, unknown>;
+  };
+// pi 0.84.0+: ModelRegistry is a constructor that takes a ModelRuntime (the
+// pre-0.84 static `ModelRegistry.create(authStorage)` factory is gone). The
+// mock honours the new `new ModelRegistry(runtime)` shape; tests that
+// previously poked at the auth passed to `ModelRegistry.create` now poke at
+// the runtime passed to the constructor.
+type MockModelRuntime = {
+  setRuntimeApiKey(providerId: string, key: string): Promise<void>;
+  getAuth(providerId: string): Promise<unknown>;
+  hasConfiguredAuth(providerId: string): boolean;
+};
+type MockModelRegistryCtor = new (runtime: MockModelRuntime) => MockModelRegistry;
+function makeMockRegistry(runtime: MockModelRuntime): MockModelRegistry {
+  return {
     find: mockModelRegistryFind,
-    hasConfiguredAuth: mock(model => authStorage.hasAuth(model.provider)),
+    hasConfiguredAuth: mock(model => runtime.hasConfiguredAuth(model.provider)),
     getApiKeyAndHeaders: mock(async model => {
-      const apiKey = await authStorage.getApiKey(model.provider, { includeFallback: false });
+      const resolution = (await runtime.getAuth(model.provider)) as
+        | { auth: { apiKey?: string } }
+        | undefined;
       return {
         ok: true as const,
-        apiKey,
-        env: authStorage.getProviderEnv(model.provider),
+        apiKey: resolution?.auth.apiKey,
+        env: fileCreds[model.provider]?.env,
       };
     }),
+    // Per-call extension provider registrations. The real ModelRegistry facade
+    // forwards registerProvider() to its runtime; we mirror that by stashing
+    // the (name, config) pair in a per-call map so tests can assert which
+    // extensions the provider's extension re-apply step wrote through.
+    registerProvider: ((name: string, config: unknown) => {
+      mockRegistryRegistered.set(name, config);
+    }) as ModelRegistry['registerProvider'],
+    registered: mockRegistryRegistered,
+  };
+}
+
+/** Per-registry provider registration map for the most-recent registry. */
+const mockRegistryRegistered = new Map<string, unknown>();
+// Constructor (mocked via `mock()`): the new SDK does `new ModelRegistry(runtime)`,
+// so the replacement must behave as a class. bun's mock() of a function works
+// through `mockImplementation`/etc.; for `new` we return-style (ES semantics
+// use the explicit object return when a constructor returns one).
+function MockModelRegistryCtorImpl(this: unknown, runtime: MockModelRuntime): MockModelRegistry {
+  return makeMockRegistry(runtime);
+}
+const MockModelRegistry = MockModelRegistryCtorImpl as unknown as MockModelRegistryCtor;
+const mockModelRegistryConstruct = mock(
+  MockModelRegistryCtorImpl as unknown as (...args: unknown[]) => unknown
+);
+
+// ModelRuntime.create mock. Returns a fresh runtime whose methods delegate to
+// the `mockSetRuntimeApiKey`/`mockGetAuth`/`mockHasConfiguredAuth` state above,
+// so tests that previously poked `authStorage.setRuntimeApiKey(...)` or
+// `authStorage.getApiKey(...)` continue to assert against the same call shape
+// (just on the runtime object now).
+const mockModelRuntimeCreate = mock(
+  async (_options?: { authPath?: string; modelsPath?: string }): Promise<MockModelRuntime> => ({
+    setRuntimeApiKey: mockSetRuntimeApiKey,
+    getAuth: mockGetAuth,
+    hasConfiguredAuth: mockHasConfiguredAuth,
   })
 );
 
@@ -223,8 +277,13 @@ const mockCreateLsTool = mock((_cwd: string) => ({ __piTool: 'ls' }));
 
 mock.module('@earendil-works/pi-coding-agent', () => ({
   createAgentSession: mockCreateAgentSession,
-  AuthStorage: { create: mockAuthCreate },
-  ModelRegistry: { create: mockModelRegistryCreate },
+  // pi 0.84.0+: ModelRuntime.create replaces AuthStorage.create; ModelRegistry
+  // is now a `new`-able class constructed from a runtime (the pre-0.84 static
+  // `ModelRegistry.create(authStorage)` factory is gone).
+  ModelRuntime: {
+    create: mockModelRuntimeCreate,
+  },
+  ModelRegistry: mockModelRegistryConstruct,
   SessionManager: {
     create: mockSessionCreate,
     open: mockSessionOpen,
@@ -307,13 +366,12 @@ describe('PiProvider', () => {
     mockGetExtensions.mockClear();
     mockLoaderRuntime.pendingProviderRegistrations = [];
     mockCreateAgentSession.mockClear();
-    mockAuthCreate.mockClear();
-    mockModelRegistryCreate.mockClear();
+    mockModelRuntimeCreate.mockClear();
+    mockModelRegistryConstruct.mockClear();
     mockModelRegistryFind.mockClear();
     mockSetRuntimeApiKey.mockClear();
-    mockGetApiKey.mockClear();
-    mockGetCredential.mockClear();
-    mockGetProviderEnv.mockClear();
+    mockGetAuth.mockClear();
+    mockHasConfiguredAuth.mockClear();
     MockDefaultResourceLoader.mockClear();
     mockCreateReadTool.mockClear();
     mockCreateBashTool.mockClear();
@@ -420,10 +478,11 @@ describe('PiProvider', () => {
     expect(mockCreateAgentSession).toHaveBeenCalledTimes(1);
   });
 
-  test('ModelRegistry.create receives the AuthStorage instance', async () => {
-    // ModelRegistry.create must receive the same AuthStorage instance
-    // returned by AuthStorage.create(), so extension providers can resolve
-    // credentials and register models during bindExtensions().
+  test('new ModelRegistry receives the ModelRuntime instance', async () => {
+    // pi 0.84.0+: ModelRegistry is now a class constructed from a ModelRuntime
+    // (the pre-0.84 `ModelRegistry.create(authStorage)` factory is gone). The
+    // runtime the registry wraps is the same one we built with `setRuntimeApiKey`
+    // calls and the same one createAgentSession uses to resolve auth on send.
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());
 
@@ -433,41 +492,415 @@ describe('PiProvider', () => {
       })
     );
 
-    expect(mockAuthCreate).toHaveBeenCalledTimes(1);
-    expect(mockModelRegistryCreate).toHaveBeenCalledTimes(1);
-    const authInstance = mockAuthCreate.mock.results[0]?.value;
-    expect(mockModelRegistryCreate).toHaveBeenCalledWith(authInstance);
+    expect(mockModelRuntimeCreate).toHaveBeenCalledTimes(1);
+    expect(mockModelRegistryConstruct).toHaveBeenCalledTimes(1);
+    // The runtime passed to the registry constructor is the resolved value
+    // of the Promise returned by ModelRuntime.create (the wrapper awaits it
+    // before constructing the registry, per the new SDK contract).
+    const runtimeInstance = await mockModelRuntimeCreate.mock.results[0]?.value;
+    expect(mockModelRegistryConstruct).toHaveBeenCalledWith(runtimeInstance);
   });
 
-  test('custom provider receives request env without acting-user provider credentials', async () => {
-    resetScript(scriptedAgentEnd());
-
-    await consume(
-      new PiProvider().sendQuery('hi', '/tmp', undefined, {
-        model: 'mygw/demo',
-        env: {
-          MYGW_API_KEY: 'request-secret',
-          ANTHROPIC_API_KEY: 'acting-user-secret',
+  test('custom provider: per-call models.json carries substituted ${VAR} values', async () => {
+    // pi 0.84.0+ — the wrapper around the registry was dropped (it plugged
+    // into a surface the SDK no longer consults during session auth; see
+    // `request-auth.ts` for the full rationale). The replacement writes a
+    // per-call `models.json` with `${VAR}` references substituted against
+    // `requestOptions.env` and passes it as `modelsPath` to
+    // `ModelRuntime.create`. The SDK then reads the literal at session-auth
+    // time — no `process.env` fallback can fire, so the
+    // `credentialless-custom-provider + per-call-secret` contract holds.
+    // Regression for the review R1 finding (PR #2757).
+    const userModelsDir = mkdtempSync(join(tmpdir(), 'archon-pi-test-user-models-'));
+    const userModelsPath = join(userModelsDir, 'models.json');
+    writeFileSync(
+      userModelsPath,
+      JSON.stringify({
+        providers: {
+          mygw: {
+            baseUrl: 'https://gateway.example/v1',
+            api: 'openai-completions',
+            apiKey: 'prefix-${MYGW_API_KEY}',
+            headers: { 'X-Project': '${MYGW_PROJECT}' },
+            models: [{ id: 'demo' }],
+          },
         },
-        protectedEnvKeys: ['ANTHROPIC_API_KEY'],
       })
     );
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = userModelsDir;
 
-    const requestAuthStorage = mockModelRegistryCreate.mock.calls[0]?.[0];
-    const fileAuthStorage = mockAuthCreate.mock.results[0]?.value as typeof requestAuthStorage;
-    expect(requestAuthStorage).toBe(fileAuthStorage);
-    expect(requestAuthStorage?.getProviderEnv('mygw')).toEqual({
-      MYGW_API_KEY: 'request-secret',
+    // The per-call file is unlinked in `provider.ts`'s `finally` block as
+    // soon as ModelRuntime.create resolves. The mock factory returns
+    // synchronously without actually reading the file, so the cleanup
+    // would race with the file-content assertions below. Capture the file
+    // contents INSIDE the mock implementation, while the file still exists,
+    // and assert against the captured snapshot.
+    let capturedPerCallContent: string | undefined;
+    mockModelRuntimeCreate.mockImplementationOnce(async (options?: { modelsPath?: string }) => {
+      if (options?.modelsPath && existsSync(options.modelsPath)) {
+        capturedPerCallContent = readFileSync(options.modelsPath, 'utf-8');
+      }
+      return {
+        setRuntimeApiKey: mockSetRuntimeApiKey,
+        getAuth: mockGetAuth,
+        hasConfiguredAuth: mockHasConfiguredAuth,
+      };
     });
-    expect(requestAuthStorage?.hasAuth('mygw')).toBe(true);
-    expect(requestAuthStorage?.getProviderEnv('anthropic')).toBeUndefined();
-    const requestRegistry = mockModelRegistryCreate.mock.results[0]?.value as
-      | MockModelRegistry
-      | undefined;
-    expect(requestRegistry?.getApiKeyAndHeaders).not.toHaveBeenCalled();
+
+    resetScript(scriptedAgentEnd());
+    let createArgs: { authPath?: string; modelsPath?: string } | undefined;
+    try {
+      await consume(
+        new PiProvider().sendQuery('hi', '/tmp', undefined, {
+          model: 'mygw/demo',
+          env: {
+            MYGW_API_KEY: 'request-secret',
+            MYGW_PROJECT: 'project-123',
+            // ANTHROPIC_API_KEY is protected; a `${ANTHROPIC_API_KEY}` reference
+            // in the user models.json must NEVER be substituted into the
+            // per-call file. The current provider entry doesn't reference it,
+            // so the protected-keys contract is a no-op for this test —
+            // covered separately in request-auth.test.ts.
+            ANTHROPIC_API_KEY: 'acting-user-secret',
+          },
+          protectedEnvKeys: ['ANTHROPIC_API_KEY'],
+        })
+      );
+
+      // The runtime was created with a per-call modelsPath (the substituted
+      // file), NOT the user's models.json — the SDK then reads the literal
+      // substituted values directly without falling through to process.env.
+      expect(mockModelRuntimeCreate).toHaveBeenCalledTimes(1);
+      createArgs = mockModelRuntimeCreate.mock.calls[0]?.[0] as
+        | { authPath?: string; modelsPath?: string }
+        | undefined;
+      expect(createArgs?.modelsPath).toBeDefined();
+      expect(createArgs?.modelsPath).not.toBe(userModelsPath);
+      // The per-call file carried the substituted literals at create time.
+      // The cleanup `finally` in provider.ts unlinks it as soon as create()
+      // resolves — see the dedicated "per-call models.json is unlinked after
+      // ModelRuntime.create" test below for the post-cleanup assertion.
+      expect(capturedPerCallContent).toBeDefined();
+      const perCallModels = JSON.parse(capturedPerCallContent as string) as {
+        providers: Record<
+          string,
+          {
+            apiKey: string;
+            headers: Record<string, string>;
+            models: { id: string }[];
+            baseUrl: string;
+          }
+        >;
+      };
+      expect(perCallModels.providers.mygw.apiKey).toBe('prefix-request-secret');
+      expect(perCallModels.providers.mygw.headers).toEqual({ 'X-Project': 'project-123' });
+      expect(perCallModels.providers.mygw.models).toEqual([{ id: 'demo' }]);
+      expect(perCallModels.providers.mygw.baseUrl).toBe('https://gateway.example/v1');
+
+      // The wrapped registry is gone — no `getApiKeyAndHeaders` override on
+      // the per-call registry.
+      const requestRegistry = mockModelRegistryConstruct.mock.results[0]?.value as
+        | MockModelRegistry
+        | undefined;
+      // The mock registry IS the runtime's view — assert it has the standard
+      // methods (and not a wrapping that introduces overrides).
+      expect(requestRegistry?.getApiKeyAndHeaders).toBeDefined();
+      // The test never resolves a credential for `mygw`, so the SDK-side
+      // auth path isn't reached. The mock registry's getApiKeyAndHeaders is
+      // the bare mock — it should NOT have been called by anything in the
+      // provider's pre-session path (the substitution happens at models.json
+      // load time, before the session even constructs).
+      expect(requestRegistry?.getApiKeyAndHeaders).not.toHaveBeenCalled();
+    } finally {
+      // Best-effort: if the per-call file is still on disk (cleanup didn't
+      // run for some reason in this test path), unlink it so the dir
+      // cleanup below doesn't blow up.
+      if (createArgs?.modelsPath && existsSync(createArgs.modelsPath)) {
+        rmSync(createArgs.modelsPath, { force: true });
+      }
+      rmSync(userModelsDir, { recursive: true, force: true });
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    }
   });
 
-  test('AuthStorage.create reads ARCHON_PI_AUTH_PATH from requestOptions.env (per-user channel)', async () => {
+  test('custom provider: per-call models.json is unlinked after ModelRuntime.create', async () => {
+    // Round-2 review (Finding 3): the per-call models.json was written and
+    // returned to the caller, but never deleted. Long-running processes
+    // accumulate one file per sendQuery until mkdirSync/writeFileSync fails
+    // with ENOSPC, after which buildCustomProviderModelsPath's errors are
+    // caught at the caller and the SDK silently falls back to the
+    // unsubstituted user models.json — re-opening the round-1 R1 leak
+    // surface. The fix wraps ModelRuntime.create in a try/finally that
+    // unlinks the file regardless of create() outcome.
+    const userModelsDir = mkdtempSync(join(tmpdir(), 'archon-pi-test-user-models-cleanup-'));
+    writeFileSync(
+      join(userModelsDir, 'models.json'),
+      JSON.stringify({
+        providers: {
+          mygw: {
+            baseUrl: 'https://gateway.example/v1',
+            api: 'openai-completions',
+            apiKey: 'prefix-${MYGW_API_KEY}',
+            models: [{ id: 'demo' }],
+          },
+        },
+      })
+    );
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = userModelsDir;
+
+    resetScript(scriptedAgentEnd());
+    let perCallPath: string | undefined;
+    try {
+      await consume(
+        new PiProvider().sendQuery('hi', '/tmp', undefined, {
+          model: 'mygw/demo',
+          env: { MYGW_API_KEY: 'request-secret' },
+          protectedEnvKeys: [],
+        })
+      );
+      const createArgs = mockModelRuntimeCreate.mock.calls[0]?.[0] as
+        | { modelsPath?: string }
+        | undefined;
+      perCallPath = createArgs?.modelsPath;
+      expect(perCallPath).toBeDefined();
+      // The cleanup ran in the provider's `finally` block, so the file is
+      // gone after sendQuery resolves.
+      expect(existsSync(perCallPath as string)).toBe(false);
+    } finally {
+      if (perCallPath && existsSync(perCallPath)) {
+        rmSync(perCallPath, { force: true });
+      }
+      rmSync(userModelsDir, { recursive: true, force: true });
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    }
+  });
+
+  test('custom provider: per-call models.json is unlinked even when ModelRuntime.create throws', async () => {
+    // Round-2 review (Finding 3): cleanup must run on the failure path
+    // too, otherwise a transient SDK failure (corrupt auth.json, transient
+    // ENOSPC, etc.) leaks the per-call file. The file holds the literal
+    // substituted secret, so leaving it on disk after a failed create()
+    // is a credential-leak regression.
+    const userModelsDir = mkdtempSync(join(tmpdir(), 'archon-pi-test-user-models-cleanup-fail-'));
+    writeFileSync(
+      join(userModelsDir, 'models.json'),
+      JSON.stringify({
+        providers: {
+          mygw: {
+            baseUrl: 'https://gateway.example/v1',
+            api: 'openai-completions',
+            apiKey: 'prefix-${MYGW_API_KEY}',
+            models: [{ id: 'demo' }],
+          },
+        },
+      })
+    );
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = userModelsDir;
+
+    mockModelRuntimeCreate.mockImplementationOnce(async (options?: { modelsPath?: string }) => {
+      // Force the SDK to throw AFTER reading the per-call file's existence
+      // so the cleanup `finally` runs on the failure path. The provider
+      // wraps the error in a "Pi auth storage init failed" message; we
+      // assert the cleanup still happened regardless.
+      if (options?.modelsPath) {
+        // Touch the file so we can verify it disappears.
+        if (existsSync(options.modelsPath)) {
+          // ok
+        }
+      }
+      throw new Error('simulated SDK failure');
+    });
+
+    try {
+      const { error } = await consume(
+        new PiProvider().sendQuery('hi', '/tmp', undefined, {
+          model: 'mygw/demo',
+          env: { MYGW_API_KEY: 'request-secret' },
+          protectedEnvKeys: [],
+        })
+      );
+      expect(error).toBeDefined();
+      expect(error?.message).toContain('Pi auth storage init failed');
+      expect(error?.message).toContain('simulated SDK failure');
+      // Capture the path from the call that DID happen (before the throw).
+      const createArgs = mockModelRuntimeCreate.mock.calls[0]?.[0] as
+        | { modelsPath?: string }
+        | undefined;
+      expect(createArgs?.modelsPath).toBeDefined();
+      // The cleanup ran in the failure path too — file is gone.
+      expect(existsSync(createArgs!.modelsPath as string)).toBe(false);
+    } finally {
+      rmSync(userModelsDir, { recursive: true, force: true });
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    }
+  });
+
+  test('custom provider: filesystem error from buildCustomProviderModelsPath is classified as Pi auth storage init failed', async () => {
+    // Round-3 review (R1): the R2 cleanup fix correctly removed the silent
+    // swallow around mkdirSync/writeFileSync so FS errors now throw, but the
+    // throw site (buildCustomProviderModelsPath inside request-auth.ts) sits
+    // ABOVE the try block in provider.ts that wraps ModelRuntime.create
+    // errors as 'Pi auth storage init failed: …'. An EACCES/ENOSPC on the
+    // per-call tmpdir would propagate raw and bypass the classification the
+    // request-auth.ts doc comment promises. The fix moves the assignment
+    // inside the try; this test exercises the FS-error path against a real
+    // read-only tmpdir and asserts the framed error reaches the caller.
+    //
+    // Force the failure by pointing TMPDIR at a real, pre-populated dir
+    // chmod'd to 0o555. The shim's archon-pi-shim/package.json is
+    // pre-created so ensurePiPackageDirShim() succeeds (the if-guard on
+    // existsSync short-circuits the mkdirSync), but
+    // buildCustomProviderModelsPath's mkdirSync(archon-pi-models) fails with
+    // EACCES — exactly the production failure shape on a host with a
+    // read-only or misconfigured tmpdir.
+    const readOnlyTmp = mkdtempSync(join(tmpdir(), 'archon-pi-test-tmp-ro-'));
+    const roShimDir = join(readOnlyTmp, 'archon-pi-shim');
+    mkdirSync(roShimDir, { recursive: true });
+    writeFileSync(
+      join(roShimDir, 'package.json'),
+      JSON.stringify({ name: 'archon-pi-shim', version: '0.0.0', piConfig: {} })
+    );
+    chmodSync(readOnlyTmp, 0o555); // r-x for all, no write — mkdirSync fails with EACCES
+
+    // The user models.json lives at a SEPARATE dir (PI_CODING_AGENT_DIR) so
+    // the per-call substitution still triggers — only the per-call write
+    // fails.
+    const userModelsDir = mkdtempSync(join(tmpdir(), 'archon-pi-test-user-models-fserror-'));
+    writeFileSync(
+      join(userModelsDir, 'models.json'),
+      JSON.stringify({
+        providers: {
+          mygw: {
+            baseUrl: 'https://gateway.example/v1',
+            api: 'openai-completions',
+            apiKey: 'prefix-${MYGW_API_KEY}',
+            models: [{ id: 'demo' }],
+          },
+        },
+      })
+    );
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousTmpDir = process.env.TMPDIR;
+    const previousTmp = process.env.TMP;
+    const previousTemp = process.env.TEMP;
+    process.env.PI_CODING_AGENT_DIR = userModelsDir;
+    // Set all three env vars node:os reads so the override holds regardless
+    // of which one the host happens to define.
+    process.env.TMPDIR = readOnlyTmp;
+    process.env.TMP = readOnlyTmp;
+    process.env.TEMP = readOnlyTmp;
+
+    try {
+      const { error } = await consume(
+        new PiProvider().sendQuery('hi', '/tmp', undefined, {
+          model: 'mygw/demo',
+          env: { MYGW_API_KEY: 'request-secret' },
+          protectedEnvKeys: [],
+        })
+      );
+      // The throw from mkdirSync inside buildCustomProviderModelsPath now
+      // reaches the provider's catch and is framed as 'Pi auth storage
+      // init failed: …' — same shape as the ModelRuntime.create throw test
+      // above, so orchestrator pattern-matchers that key on this prefix see
+      // the FS error too. Raw 'EACCES: permission denied, mkdir …' must NOT
+      // leak through.
+      expect(error).toBeDefined();
+      expect(error?.message).toContain('Pi auth storage init failed');
+      expect(error?.message).toMatch(/EACCES|permission denied/);
+      expect(error?.message).toContain('~/.pi/agent/auth.json');
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ piProvider: 'mygw' }),
+        'pi.auth_storage_init_failed'
+      );
+      // buildCustomProviderModelsPath threw before the file existed, so
+      // ModelRuntime.create was never reached — the cleanup `finally`'s
+      // `if (customProviderModelsPath)` guard short-circuits, no rmSync
+      // runs. Verify by checking the runtime mock was never invoked.
+      expect(mockModelRuntimeCreate).not.toHaveBeenCalled();
+    } finally {
+      // Restore write perms on the read-only tmpdir so cleanup can rmrf.
+      chmodSync(readOnlyTmp, 0o755);
+      rmSync(readOnlyTmp, { recursive: true, force: true });
+      rmSync(userModelsDir, { recursive: true, force: true });
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+      if (previousTmpDir === undefined) {
+        delete process.env.TMPDIR;
+      } else {
+        process.env.TMPDIR = previousTmpDir;
+      }
+      if (previousTmp === undefined) {
+        delete process.env.TMP;
+      } else {
+        process.env.TMP = previousTmp;
+      }
+      if (previousTemp === undefined) {
+        delete process.env.TEMP;
+      } else {
+        process.env.TEMP = previousTemp;
+      }
+    }
+  });
+
+  test('custom provider: no ${VAR} references leaves modelsPath unset', async () => {
+    // When the user's `models.json` entry has no template references, no
+    // per-call file is needed — the SDK's default `modelsPath` lookup handles
+    // the literal apiKey directly.
+    const userModelsDir = mkdtempSync(join(tmpdir(), 'archon-pi-test-user-models-literal-'));
+    writeFileSync(
+      join(userModelsDir, 'models.json'),
+      JSON.stringify({
+        providers: { mygw: { baseUrl: 'https://gateway.example/v1', apiKey: 'literal-key' } },
+      })
+    );
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = userModelsDir;
+
+    resetScript(scriptedAgentEnd());
+    try {
+      await consume(
+        new PiProvider().sendQuery('hi', '/tmp', undefined, {
+          model: 'mygw/demo',
+          env: { MYGW_API_KEY: 'unused-because-no-template' },
+          protectedEnvKeys: [],
+        })
+      );
+
+      expect(mockModelRuntimeCreate).toHaveBeenCalledTimes(1);
+      const createArgs = mockModelRuntimeCreate.mock.calls[0]?.[0] as
+        | { modelsPath?: string }
+        | undefined;
+      // No substitution was applicable → no per-call modelsPath passed.
+      expect(createArgs?.modelsPath).toBeUndefined();
+    } finally {
+      rmSync(userModelsDir, { recursive: true, force: true });
+      if (previousAgentDir === undefined) {
+        delete process.env.PI_CODING_AGENT_DIR;
+      } else {
+        process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    }
+  });
+
+  test('ModelRuntime.create reads ARCHON_PI_AUTH_PATH from requestOptions.env (per-user channel)', async () => {
     // The executor delivers per-user credentials — including the per-run
     // auth.json PATH — on the per-call requestOptions.env channel, which it
     // deliberately keeps OUT of process.env (subprocess-isolation). Pi runs
@@ -486,10 +919,10 @@ describe('PiProvider', () => {
       })
     );
 
-    expect(mockAuthCreate).toHaveBeenCalledWith(perRunAuthPath);
+    expect(mockModelRuntimeCreate).toHaveBeenCalledWith({ authPath: perRunAuthPath });
   });
 
-  test('AuthStorage.create falls back to process.env.ARCHON_PI_AUTH_PATH (shell override)', async () => {
+  test('ModelRuntime.create falls back to process.env.ARCHON_PI_AUTH_PATH (shell override)', async () => {
     // A shell-level ARCHON_PI_AUTH_PATH still applies when no per-call value is
     // present, preserving the local-dev / manual override path.
     fileCreds.anthropic = { type: 'oauth' };
@@ -502,15 +935,15 @@ describe('PiProvider', () => {
       })
     );
 
-    expect(mockAuthCreate).toHaveBeenCalledWith('/shell/override/auth.json');
+    expect(mockModelRuntimeCreate).toHaveBeenCalledWith({ authPath: '/shell/override/auth.json' });
   });
 
-  test('AuthStorage.create() throwing surfaces a contextualized error', async () => {
-    // Both AuthStorage.create() and ModelRegistry.create() read from disk
-    // and can throw on malformed JSON or filesystem errors. Wrap with
-    // try/catch and surface a Pi-framed error so operators see the cause
-    // rather than a raw SDK stack trace.
-    mockAuthCreate.mockImplementationOnce(() => {
+  test('ModelRuntime.create() throwing surfaces a contextualized error', async () => {
+    // ModelRuntime.create() reads the auth.json from disk and can throw on
+    // malformed JSON or filesystem errors. Wrap with try/catch and surface a
+    // Pi-framed error so operators see the cause rather than a raw SDK stack
+    // trace.
+    mockModelRuntimeCreate.mockImplementationOnce(async () => {
       throw new Error('Unexpected token } in JSON at position 42');
     });
 
@@ -536,10 +969,15 @@ describe('PiProvider', () => {
     // resolves extension providers. Both must return undefined to trigger the error.
     mockModelRegistryFind.mockImplementationOnce(() => undefined);
     mockModelRegistryFind.mockImplementationOnce(() => undefined);
-    mockModelRegistryCreate.mockImplementationOnce(() => ({
-      find: mockModelRegistryFind,
-      getError: () => 'Provider lm-studio: "baseUrl" is required when defining custom models.',
-    }));
+    mockModelRegistryConstruct.mockImplementationOnce((runtime: unknown) => {
+      const r = runtime as MockModelRuntime;
+      return {
+        find: mockModelRegistryFind,
+        hasConfiguredAuth: mock((model: Model<Api>) => r.hasConfiguredAuth(model.provider)),
+        getApiKeyAndHeaders: mock(async () => ({ ok: true as const })),
+        getError: () => 'Provider lm-studio: "baseUrl" is required when defining custom models.',
+      };
+    });
 
     resetScript(scriptedAgentEnd());
     const { error } = await consume(
@@ -607,10 +1045,10 @@ describe('PiProvider', () => {
       })
     );
     expect(error).toBeUndefined();
-    // Runtime override NOT set — no env var present — so Pi's getApiKey
+    // Runtime override NOT set — no env var present — so Pi's getAuth
     // resolves through the OAuth code path.
     expect(mockSetRuntimeApiKey).not.toHaveBeenCalled();
-    expect(mockGetApiKey).toHaveBeenCalledWith('anthropic');
+    expect(mockGetAuth).toHaveBeenCalledWith('anthropic');
   });
 
   test('throws when ModelRegistry.find returns undefined', async () => {
@@ -2598,25 +3036,31 @@ describe('PiProvider', () => {
         registered,
         find: (provider: string, modelId: string) =>
           registered.has(provider) ? createMockModel(provider, modelId) : undefined,
-        registerProvider: (name: string, config: ExtensionProviderConfig): void => {
+        hasConfiguredAuth: mock(() => false),
+        getApiKeyAndHeaders: mock(async () => ({ ok: true as const, apiKey: 'fake' })),
+        registerProvider: ((name: string, config: ExtensionProviderConfig): void => {
           registered.set(name, config);
-        },
+        }) as ModelRegistry['registerProvider'],
       };
     }
 
     /**
      * Simulate the real SDK's bindCore() drain for one createAgentSession
-     * call: flush the shared runtime's pending queue into THIS session's
-     * registry, then clear it (the SDK reassigns to []).
+     * call: pi 0.84.0+ flushes the shared extension runtime's pending queue
+     * into the SDK's INTERNAL registry, not ours — our provider re-applies
+     * the snapshot separately (see `modelRegistry.registerProvider(name,
+     * config)` in provider.ts). In this test the `bindCore` drain is a
+     * no-op against our registry: the registrations land via the re-apply.
+     * We just drain the queue so the second call's session sees an empty
+     * queue (matching the SDK's behavior) — the source of truth is the
+     * per-call registry re-apply.
      */
     function drainQueueOnceIntoSessionRegistry(): void {
       mockCreateAgentSession.mockImplementationOnce(
-        async (options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
-          const modelRegistry = options?.modelRegistry;
-          if (!modelRegistry) throw new Error('Expected a model registry');
-          for (const { name, config } of mockLoaderRuntime.pendingProviderRegistrations) {
-            modelRegistry.registerProvider(name, config);
-          }
+        async (_options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
+          // The SDK drains the queue into ITS internal registry (built from
+          // the same ModelRuntime); for our test we just need to clear the
+          // shared queue so subsequent reloads don't replay it.
           mockLoaderRuntime.pendingProviderRegistrations = [];
           return createMockSessionResult();
         }
@@ -2633,8 +3077,8 @@ describe('PiProvider', () => {
         registries.push(registry);
         return registry;
       };
-      mockModelRegistryCreate.mockImplementationOnce(nextRegistry);
-      mockModelRegistryCreate.mockImplementationOnce(nextRegistry);
+      mockModelRegistryConstruct.mockImplementationOnce(() => nextRegistry());
+      mockModelRegistryConstruct.mockImplementationOnce(() => nextRegistry());
       drainQueueOnceIntoSessionRegistry();
       drainQueueOnceIntoSessionRegistry();
 
@@ -2686,7 +3130,7 @@ describe('PiProvider', () => {
       ];
       // Static-catalog model resolves via the default find(); registerProvider
       // rejects the broken extension config — mirroring a validation throw.
-      mockModelRegistryCreate.mockImplementationOnce(() => ({
+      mockModelRegistryConstruct.mockImplementationOnce(() => ({
         find: mockModelRegistryFind,
         registerProvider: (): void => {
           throw new Error('Provider broken: "apiKey" or "oauth" is required when defining models.');
