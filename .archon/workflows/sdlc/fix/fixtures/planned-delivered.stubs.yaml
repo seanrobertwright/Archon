@@ -17,3 +17,4 @@ deliver__validate__validate:
   green: true
   summary: "stub: project gate green"
 outcome: "https://github.com/example/repo/pull/3"
+ci-probe: '{"state":"concluded","detail":"all checks green"}'
