@@ -48,11 +48,11 @@ Other worktree config (`baseBranch`, `copyFiles`, `initSubmodules`, `path`) live
 
 ### Claude SDK Advanced Options
 
-These fields apply to Claude nodes workflow-wide; each can be overridden per-node. Codex nodes ignore them with a warning.
+These fields apply workflow-wide and can each be overridden per-node. They are Claude-only unless noted — Codex and the community providers ignore the Claude-only ones with a warning.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `effort` | `'low'` \| `'medium'` \| `'high'` \| `'max'` | Claude Agent SDK reasoning depth. Different from Codex `modelReasoningEffort` below |
+| `effort` | `'minimal'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'` | Reasoning depth — **the one spelling, on every provider that has the control** (Claude, Codex, Pi, Copilot). Pi takes all six; Claude has no `minimal`, Codex no `max`, Copilot neither, and each clamps to its nearest rung. OpenCode has none |
 | `thinking` | string \| object | Extended thinking. String shorthand: `'adaptive'` \| `'enabled'` \| `'disabled'`. Object form: `{ type: 'enabled', budgetTokens: 8000 }` |
 | `fallbackModel` | string | Model to use if the primary model fails (e.g. `claude-haiku-4-5-20251001`) |
 | `betas` | string[] | SDK beta feature flags (non-empty array). Example: `['context-1m-2025-08-07']` for 1M-context Claude |
@@ -64,7 +64,7 @@ Per-node-only (NOT valid at workflow level): `maxBudgetUsd`, `systemPrompt`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `modelReasoningEffort` | `'minimal'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` | Codex reasoning depth. Separate field from Claude's `effort` |
+| `modelReasoningEffort` | `'minimal'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` | **DEPRECATED** — use `effort:` above, which reaches Codex and works per-node. Still accepted: the loader translates it into `effort:` and warns. If both are declared, `effort:` wins and this one is dropped |
 | `webSearchMode` | `'disabled'` \| `'cached'` \| `'live'` | Codex web search behavior. Default: `disabled` |
 | `additionalDirectories` | string[] | Absolute paths Codex can read outside the codebase (shared libraries, docs repos) |
 
@@ -446,10 +446,12 @@ Loop nodes iterate an AI prompt until a completion condition is met. Use them fo
 - id: my-loop
   loop:
     prompt: "..."              # Required. Sent each iteration
-    until: COMPLETE            # Required. Completion signal
+    until: COMPLETE            # Prose completion signal
     max_iterations: 10         # Required. Integer >= 1. Fails if exceeded
     fresh_context: true        # Optional. Default: false
-    until_bash: "..."          # Optional. Exit 0 = complete
+    until_bash: "..."          # Exit 0 = complete
+    until_field: done          # Declared boolean in output_format; true = complete
+                               # At least ONE of until / until_bash / until_field
     interactive: true          # Optional. Pauses between iterations for user input
     gate_message: "..."        # Required when interactive: true
 ```
@@ -457,10 +459,11 @@ Loop nodes iterate an AI prompt until a completion condition is met. Use them fo
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `prompt` | string | Yes | Prompt template. Supports all variable substitution (`$ARGUMENTS`, `$nodeId.output`, `$LOOP_USER_INPUT`, etc.) |
-| `until` | string | Yes | Completion signal to detect in AI output |
+| `until` | string | One channel required | Completion signal to detect in AI output. Omit it for a deterministic or structured loop — with no signal declared there is no prose matching at all, so a sentinel the model emits while reasoning cannot end the loop |
 | `max_iterations` | number | Yes | Hard limit. Node **fails** if exceeded |
 | `fresh_context` | boolean | No | Default `false`. `true` = fresh AI session each iteration |
-| `until_bash` | string | No | Shell script run after each iteration. Exit 0 = complete. Variable substitution applies; `$nodeId.output` IS shell-quoted here |
+| `until_bash` | string | One channel required | Shell script run after each iteration. Exit 0 = complete. Skipped once a cheaper channel already fired. Variable substitution applies; `$nodeId.output` IS shell-quoted here |
+| `until_field` | string | One channel required | **`loop:` only.** Names a boolean property in the node's `output_format` whose validated `true` ends the loop. Must be declared, in `required`, and typed `boolean` — all checked at load. Use for judgment-based completion instead of a prose sentinel. On `loop_group`, use a body node's `output_format` + `until_bash: '[ "$decide.output.done" = "true" ]'` |
 | `interactive` | boolean | No | Default `false`. `true` = pause after each non-completing iteration for user feedback via `/workflow approve <id> <text>` |
 | `gate_message` | string | **Required when `interactive: true`** | Message shown to the user at each pause. Validated at parse time — a loop with `interactive: true` and no `gate_message` fails to load |
 
@@ -503,8 +506,9 @@ The flow:
 Checked after each iteration:
 1. **AI signal** — `<promise>SIGNAL</promise>` in output (recommended) or plain signal at end
 2. **`until_bash`** — shell script exits 0
+3. **`until_field`** — the validated `output_format` payload has that property `=== true` (`loop:` only)
 
-Either triggers completion. `<promise>` tags are stripped from output.
+At least one must be declared; a loop with none fails to load. Any of them triggers completion (they are OR'd — `until_bash` cannot veto the signal), and `until_bash` is skipped once a cheaper channel already completed the iteration. `<promise>` tags are stripped from output. With `output_format` declared, the loop's output is the validated JSON, and an invalid payload FAILS the node (after up to 3 re-asks within the iteration on Pi/Copilot) rather than silently iterating again.
 
 ### Session Patterns
 
@@ -520,7 +524,8 @@ First iteration is always fresh regardless.
 - `provider`, `model` — **WORK**: resolved once and forwarded to every iteration's AI call
 - `idle_timeout` — works, applies per iteration
 - `retry` — **hard error** at parse time (the loop manages its own iteration)
-- `hooks`, `mcp`, `skills`, `allowed_tools`, `denied_tools`, `output_format` — silently ignored (loader warning)
+- `output_format` — **WORKS** (#2563): a loop runs its own provider call, so the schema reaches it, each iteration's payload is validated against it, and the node's output becomes the validated JSON. Pairs with `until_field`
+- `hooks`, `mcp`, `skills`, `allowed_tools`, `denied_tools` — silently ignored (loader warning)
 - `context: fresh` — ignored (use `loop.fresh_context` instead)
 - `persist_session` — not supported on loops (in-run session threading between iterations only)
 
@@ -595,7 +600,7 @@ Same iteration controls as `loop:` (`until`, `max_iterations`, `fresh_context`, 
 - **Failure**: a failed body node **fails the whole group immediately** (no more iterations) — the group never silently re-runs a broken body.
 - **Group output**: `$groupId.output` = the final iteration's terminal body node output (first completed body node, in definition order, that no other body node depends on).
 - **Sessions**: with `fresh_context: false`, the body's sequential session threads across iterations; `persist_session` on body nodes is not supported (resets each iteration).
-- **`until_bash`** is skipped when the completion signal was already detected in the terminal output (unlike single `loop:` which always runs it).
+- **`until_bash`** is skipped when the completion signal was already detected in the terminal output — same as a single `loop:` node (the two variants disagreed until #2563).
 - **Interactive gates** work like `loop:` — pause after a non-completing iteration, `$LOOP_USER_INPUT` on the first resumed iteration.
 - **Observability caveat**: body node lifecycle events currently carry the raw body node id, not `<groupId>.<nodeId>` (#2090) — only skip/control events are namespaced.
 
@@ -664,9 +669,12 @@ archon workflow reject <run-id> --reason "plan needs more test coverage"
 /workflow approve <run-id> <optional comment>
 /workflow reject <run-id> <optional reason>
 
-# Natural language (all platforms except CLI — auto-detects paused workflow)
+# Asking the chat agent (all platforms except CLI)
 User: "Looks good, proceed"
-# → auto-approves. With capture_response: true, the message becomes $review-gate.output
+# → the agent reads the open gate and approves it; the run continues.
+#   Your words travel through as the comment, so with capture_response: true they
+#   become $review-gate.output. A plain message is NOT an automatic approval —
+#   an objection rejects, and an ambiguous message resolves nothing.
 ```
 
 ### What Does NOT Work on Approval Nodes

@@ -1515,7 +1515,7 @@ export interface paths {
     put?: never;
     /**
      * Run a workflow via the orchestrator (JSON or multipart with file uploads)
-     * @description Accepts `application/json` with `{ conversationId, message }` or `multipart/form-data` with `conversationId`, `message`, and optional file attachments (max 5 files, 10 MB each).
+     * @description Accepts `application/json` with `{ conversationId, message, inputs? }` or `multipart/form-data` with `conversationId`, `message`, an optional `inputs` field holding the same map JSON-encoded, and optional file attachments (max 5 files, 10 MB each). `inputs` supplies values for the workflow's declared `inputs:` (#2554); it is validated against the declaration before any worktree, clone, or AI cost, so a missing required input or an undeclared key is refused up front.
      */
     post: {
       parameters: {
@@ -1906,6 +1906,75 @@ export interface paths {
       };
       responses: {
         /** @description Rejected */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['WorkflowRunActionResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/workflows/runs/{runId}/respond': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Resolve a paused workflow run with any of the gate's declared decisions */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          runId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['RespondWorkflowRunBody'];
+        };
+      };
+      responses: {
+        /** @description Responded */
         200: {
           headers: {
             [name: string]: unknown;
@@ -2510,7 +2579,7 @@ export interface paths {
     };
     /**
      * List a run's artifact files
-     * @description Walks the run's artifact directory and returns relative file paths with size + mtime. Drives the console Artifacts tab. Returns `{ files: [] }` when the run has no codebase or the codebase name is not in `owner/repo` form.
+     * @description Walks the run's artifact directory and returns relative file paths with size + mtime. Drives the console Artifacts tab. Resolves for every project kind — `owner/repo`, `_local/<basename>`, and `_folder/<slug>` — preferring the run's persisted `output_root` and re-deriving from the codebase when it is absent or no longer inside ARCHON_HOME. Returns `{ files: [] }` only when the location resolved and the run genuinely wrote nothing; returns 404 when the output location cannot be resolved at all.
      */
     get: {
       parameters: {
@@ -3281,6 +3350,7 @@ export interface components {
     WorkflowListEntry: {
       workflow: components['schemas']['WorkflowDefinition'];
       source: components['schemas']['WorkflowSource'];
+      parseWarnings?: string[];
     };
     WorkflowDefinition: {
       name: string;
@@ -3293,7 +3363,7 @@ export interface components {
       webSearchMode?: 'disabled' | 'cached' | 'live';
       interactive?: boolean;
       /** @enum {string} */
-      effort?: 'low' | 'medium' | 'high' | 'max';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       thinking?:
         | {
             /** @enum {string} */
@@ -3349,10 +3419,22 @@ export interface components {
         /** @enum {string} */
         write_back?: 'approve' | 'auto';
       };
+      evidence_policy?: {
+        required: boolean;
+      };
       mutates_checkout?: boolean;
       persist_sessions?: boolean;
       tags?: string[];
       requires?: 'github'[];
+      inputs?: {
+        [key: string]: {
+          required?: boolean;
+          default?: unknown;
+          description?: string;
+        };
+      };
+      returns?: string;
+      outcome_field?: string;
       nodes: components['schemas']['DagNode'][];
     };
     DagNode: {
@@ -3364,8 +3446,11 @@ export interface components {
       trigger_rule?: 'all_success' | 'one_success' | 'none_failed_min_one_success' | 'all_done';
       model?: string;
       provider?: string;
-      /** @enum {string} */
-      context?: 'fresh' | 'shared';
+      context?:
+        | ('fresh' | 'shared')
+        | {
+            resume: string;
+          };
       output_format?: {
         [key: string]: unknown;
       };
@@ -3548,7 +3633,7 @@ export interface components {
         };
       };
       /** @enum {string} */
-      effort?: 'low' | 'medium' | 'high' | 'max';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
       thinking?:
         | {
             /** @enum {string} */
@@ -3566,6 +3651,7 @@ export interface components {
       maxBudgetUsd?: number;
       systemPrompt?: string;
       fallbackModel?: string;
+      settingSources?: ('project' | 'user')[];
       betas?: string[];
       sandbox?: {
         enabled?: boolean;
@@ -3605,7 +3691,7 @@ export interface components {
       prompt?: string;
       bash?: string;
       loop?: {
-        until: string;
+        until?: string;
         max_iterations: number;
         /** @default false */
         fresh_context: boolean;
@@ -3615,9 +3701,10 @@ export interface components {
         signal_completes?: boolean;
         prompt?: string;
         command?: string;
+        until_field?: string;
       };
       loop_group?: {
-        until: string;
+        until?: string;
         max_iterations: number;
         /** @default false */
         fresh_context: boolean;
@@ -3629,6 +3716,10 @@ export interface components {
       };
       approval?: {
         message: string;
+        decisions?: {
+          id: string;
+          label?: string;
+        }[];
         capture_response?: boolean;
         on_reject?: {
           prompt: string;
@@ -3641,6 +3732,17 @@ export interface components {
       input?: string;
       /** @enum {string} */
       isolation?: 'inherit' | 'worktree';
+      fan_out?: {
+        items: string;
+        as?: string;
+        /** @default 5 */
+        max_parallel: number;
+        /**
+         * @default all_done
+         * @enum {string}
+         */
+        join: 'all_success' | 'all_done' | 'first_success';
+      };
       with?: unknown;
       script?: string;
       /** @enum {string} */
@@ -3677,6 +3779,8 @@ export interface components {
       codebase_id: string | null;
       /** @enum {string} */
       status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+      /** @enum {string|null} */
+      outcome: 'succeeded' | 'failed' | null;
       user_message: string;
       metadata: {
         [key: string]: unknown;
@@ -3687,6 +3791,7 @@ export interface components {
       working_path: string | null;
       user_id: string | null;
       parent_run_id: string | null;
+      output_root: string | null;
       codebase_name: string | null;
       platform_type: string | null;
       worker_platform_id: string | null;
@@ -3713,6 +3818,10 @@ export interface components {
     RejectWorkflowRunBody: {
       reason?: string;
     };
+    RespondWorkflowRunBody: {
+      decision: string;
+      text?: string;
+    };
     ResetWorkflowNodeSessionsResponse: {
       success: boolean;
       deleted: number;
@@ -3728,6 +3837,7 @@ export interface components {
       codebase_id: string | null;
       /** @enum {string} */
       status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
+      outcome: components['schemas']['WorkflowRunOutcome'];
       user_message: string;
       metadata: {
         [key: string]: unknown;
@@ -3738,7 +3848,10 @@ export interface components {
       working_path: string | null;
       user_id: string | null;
       parent_run_id: string | null;
+      output_root: string | null;
     };
+    /** @enum {string|null} */
+    WorkflowRunOutcome: 'succeeded' | 'failed' | null;
     WorkflowRunByWorkerResponse: {
       run: components['schemas']['WorkflowRun'];
     };
@@ -3761,6 +3874,7 @@ export interface components {
       };
       /** Format: date-time */
       created_at: string;
+      event_order?: number | null;
     };
     ValidateWorkflowResponse: {
       valid: boolean;
@@ -3869,6 +3983,7 @@ export interface components {
     };
     ProviderCapabilities: {
       sessionResume: boolean;
+      sessionFork?: boolean;
       mcp: boolean;
       hooks: boolean;
       skills: boolean;
@@ -3936,6 +4051,11 @@ export interface components {
       is_wsl: boolean;
       wsl_distro?: string;
       activePlatforms?: string[];
+      schema?: {
+        createdAppVersion: string | null;
+        appVersion: string;
+        appliedAt: string | null;
+      };
     };
     UpdateCheckResponse: {
       updateAvailable: boolean;

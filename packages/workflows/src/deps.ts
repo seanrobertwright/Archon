@@ -76,6 +76,8 @@ export interface WorkflowConfig {
   baseBranch?: string;
   docsPath?: string;
   envVars?: Record<string, string>;
+  /** Archon-injected credential entries within envVars. */
+  protectedEnvKeys?: readonly string[];
   aliases?: RawAliasesConfig;
   tiers?: RawTiersConfig;
   commands: { folder?: string };

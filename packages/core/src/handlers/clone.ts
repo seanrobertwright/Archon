@@ -7,6 +7,7 @@ import { join, basename, resolve } from 'path';
 import * as codebaseDb from '../db/codebases';
 import { sanitizeError } from '../utils/credential-sanitizer';
 import { execFileAsync } from '@archon/git';
+import { findCodebaseForCheckoutPath } from '../services/codebase-checkout-resolver';
 import {
   expandTilde,
   getCommandFolderSearchPaths,
@@ -411,8 +412,9 @@ export async function registerRepository(localPath: string): Promise<RegisterRes
     throw new Error(`Path is not a git repository: ${localPath} (${(error as Error).message})`);
   }
 
-  // Check if already registered by path
-  const existing = await codebaseDb.findCodebaseByDefaultCwd(localPath);
+  // Git's physical common directory proves linked-checkout ownership without
+  // conflating separate clones, remotes, names, or branches (#1192).
+  const existing = await findCodebaseForCheckoutPath(localPath);
   if (existing) {
     return {
       codebaseId: existing.id,

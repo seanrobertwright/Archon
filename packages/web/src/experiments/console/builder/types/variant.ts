@@ -80,10 +80,22 @@ export type BaseFields = Pick<WireDagNode, WireBaseKey>;
 export interface LoopNodeData {
   prompt?: string;
   command?: string;
-  until: string;
+  /**
+   * Prose completion signal. Optional since #2563 — a loop declaring only
+   * `until_bash` has no prose path at all, so the engine requires *at least one*
+   * of the two rather than `until` unconditionally. Structural validation mirrors
+   * that rule; every read here must tolerate `undefined`.
+   */
+  until?: string;
   max_iterations: number;
   fresh_context: boolean;
   until_bash?: string;
+  /**
+   * Structured completion channel (#2563): names a declared boolean in the node's
+   * `output_format` (carried as a base field) whose `true` ends the loop. `loop:`
+   * only — a `loop_group` has no such channel.
+   */
+  until_field?: string;
   interactive?: boolean;
   gate_message?: string;
 }
@@ -112,11 +124,20 @@ export interface ScriptNodeData {
   runtime: 'bun' | 'uv';
   deps?: string[];
   timeout?: number;
+  /**
+   * Node-local bindings (#2637). Opaque passthrough: the builder has no editor
+   * for them yet, but dropping the field on save would silently destroy a
+   * workflow's bindings, so it round-trips verbatim. String values and directive
+   * `from` refs are scanned by content validation.
+   */
+  with?: Record<string, unknown>;
 }
 
 /** Named-command node data. */
 export interface CommandNodeData {
   command: string;
+  /** Node-local bindings (#2637) — opaque passthrough, same contract as script. */
+  with?: Record<string, unknown>;
 }
 
 /** Inline-prompt node data. */

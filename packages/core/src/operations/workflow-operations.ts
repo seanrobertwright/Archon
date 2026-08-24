@@ -10,6 +10,7 @@ import {
   isApprovalContext,
   isGateResolved,
   isRunBlockedOnChild,
+  isRecognizedSuspendReason,
 } from '@archon/workflows/schemas/workflow-run';
 import type {
   WorkflowRun,
@@ -51,9 +52,15 @@ export interface RejectionOperationResult {
   codebaseId: string | null;
   /** Internal DB UUID — resolve via getConversationById() to get platform_conversation_id. */
   conversationId: string;
-  /** true = run cancelled; false = transitioning to failed for retry (has onRejectPrompt) */
+  /**
+   * true = run cancelled; false = staying paused/resumable for one of two
+   * reasons distinguished by `newMode` below — a legacy `on_reject` rework
+   * being staged, or (#2707 step 1) a new-mode gate resolving with structured
+   * output. Callers rendering a message MUST branch on `newMode`, not assume
+   * `cancelled === false` means "a rework prompt is about to run."
+   */
   cancelled: boolean;
-  /** true when cancelled specifically because max rejection attempts were reached */
+  /** true when cancelled specifically because max rejection attempts were reached (legacy on_reject only) */
   maxAttemptsReached: boolean;
   /**
    * true when this was the engine-level container write-back gate (Phase C). The
@@ -62,6 +69,15 @@ export interface RejectionOperationResult {
    * on_reject-rework message.
    */
   writeBack: boolean;
+  /**
+   * true when this rejection resolved a #2707 step-1 new-mode gate (author
+   * explicitly declared `approval.decisions:`) with structured
+   * `{decision:'reject', text}` output rather than staging a legacy
+   * `on_reject` rework. Only meaningful when `cancelled === false` and
+   * `writeBack === false` — distinguishes "resolved, run continues per the
+   * workflow's own `when:` wiring" from "a rework prompt is about to run."
+   */
+  newMode: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -71,20 +87,25 @@ export interface RejectionOperationResult {
 /** Safety bound on the abandon cascade walk (guards against corrupted run trees). */
 const MAX_CASCADE_RUNS = 500;
 
+type CancelWorkflowRun = (runId: string) => Promise<{ cancelled: boolean }>;
+
 /**
  * Cascade-cancel the `workflow:` sub-run tree under `rootId` (#2121 Phase 2 / D7).
  * A child sub-run shares the parent's conversation and runs in-process, so
- * abandoning the parent must flip every non-terminal DESCENDANT to cancelled — not
- * just direct children (a child may itself spawn grandchildren). Cooperative: each
- * cancelled run's executor between-layer status poll then aborts it (~10s; there is
- * no hard subprocess kill in slice 1). Best-effort — a per-run failure is logged,
- * never thrown, so the parent abandon always succeeds; the failure COUNT is
- * returned so callers can tell the user part of the tree may still be alive.
+ * abandoning the parent walks every DESCENDANT, not just direct children (a child
+ * may itself spawn grandchildren). `cancelRun` supplies the mutation used for
+ * each descendant. Best-effort — a per-run failure is logged, never thrown, so
+ * the parent abandon always succeeds; the failure COUNT is returned so callers
+ * can tell the user part of the tree may still be alive.
  */
-async function cascadeCancelChildren(rootId: string): Promise<{ failures: number }> {
+async function cascadeCancelChildren(
+  rootId: string,
+  cancelRun: CancelWorkflowRun
+): Promise<{ cancelled: number; failures: number }> {
   const queue: string[] = [rootId];
   const seen = new Set<string>([rootId]);
   let processed = 0;
+  let cancelled = 0;
   let failures = 0;
   while (queue.length > 0 && processed < MAX_CASCADE_RUNS) {
     const parentId = queue.shift();
@@ -104,7 +125,8 @@ async function cascadeCancelChildren(rootId: string): Promise<{ failures: number
       queue.push(child.id); // traverse deeper even under an already-terminal child
       if (child.status === 'completed' || child.status === 'cancelled') continue;
       try {
-        await workflowDb.cancelWorkflowRun(child.id);
+        const result = await cancelRun(child.id);
+        if (result.cancelled) cancelled++;
       } catch (err) {
         getLog().warn(
           { err, childId: child.id },
@@ -125,7 +147,7 @@ async function cascadeCancelChildren(rootId: string): Promise<{ failures: number
     );
     failures += queue.length;
   }
-  return { failures };
+  return { cancelled, failures };
 }
 
 /**
@@ -152,6 +174,22 @@ async function findParentBlockedOn(run: WorkflowRun): Promise<string | null> {
   }
 }
 
+/** Reclaim a container owned by a run this process successfully cancelled. */
+async function reclaimCancelledRunContainer(run: WorkflowRun): Promise<void> {
+  if (
+    run.metadata?.isolation !== 'container' ||
+    typeof run.metadata.isolation_env_id !== 'string'
+  ) {
+    return;
+  }
+  try {
+    const { reclaimContainerEnv } = await import('../services/cleanup-service');
+    await reclaimContainerEnv(run.metadata.isolation_env_id);
+  } catch (err) {
+    getLog().warn({ err, runId: run.id }, 'operations.workflow_abandon_container_reclaim_failed');
+  }
+}
+
 async function getRunOrThrow(runId: string, logEvent: string): Promise<WorkflowRun> {
   let run: WorkflowRun | null;
   try {
@@ -165,6 +203,133 @@ async function getRunOrThrow(runId: string, logEvent: string): Promise<WorkflowR
     throw new Error(`Workflow run not found: ${runId}`);
   }
   return run;
+}
+
+/**
+ * The five preconditions `approveWorkflow` enforces, as ONE reusable gate.
+ *
+ * Extracted so the CLI's read-only `--detach` precheck validates exactly what the
+ * child will enforce. A partial copy is worse than none: the parent acks
+ * `{ ok: true }` and the child then dies unseen in its log — precisely the failure
+ * `--detach` exists to prevent, on the surface nobody is watching.
+ *
+ * Pure and synchronous (the caller already holds the run), so both the operation
+ * and the CLI precheck can call it without a second DB round-trip.
+ *
+ * Returns the validated context so callers keep today's narrowing — `nodeId` is a
+ * required field on ApprovalContext, so no intersection type is needed.
+ */
+/**
+ * The `step_name` a gate resolution's `node_completed` event should be written
+ * under. Ordinarily just `approval.nodeId`. On an ESCALATED body-terminal-gate
+ * pause (#2707 step 3), `nodeId` holds the ENCLOSING loop_group's id instead —
+ * required so the top-level DAG's resume walk finds it — and `bodyGateId`
+ * carries the actual gate's own id. Namespacing the write as `<nodeId>.
+ * <bodyGateId>` matches the exact `<groupId>.<bodyId>` step name #2748's
+ * `outerNodeOutputs` pre-population already keys on, so the gate's own
+ * resolved decision is findable again after a resume the same way any other
+ * body node's output is. Every other pause kind has no `bodyGateId`, so this
+ * is a no-op there.
+ */
+function resolvedNodeCompletedStepName(approval: ApprovalContext): string {
+  return approval.bodyGateId !== undefined
+    ? `${approval.nodeId}.${approval.bodyGateId}`
+    : approval.nodeId;
+}
+
+export function assertApprovable(run: WorkflowRun): ApprovalContext {
+  if (run.status !== 'paused') {
+    throw new Error(
+      `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
+    );
+  }
+  const rawApproval = run.metadata.approval;
+  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
+    ? rawApproval
+    : undefined;
+  if (!approval?.nodeId) {
+    throw new Error('Workflow run is paused but missing approval context.');
+  }
+  if (!isRecognizedSuspendReason(approval.type)) {
+    // Shares this check with rejectWorkflow's precondition gate and with
+    // approveWorkflow's own exhaustive switch (#2489) so a --detach precheck
+    // success can never diverge from what resolution actually does — see
+    // isRecognizedSuspendReason's doc comment.
+    throw new Error(
+      `Run ${run.id} has an unrecognized gate type '${String(approval.type)}'. This Archon build cannot resolve it.`
+    );
+  }
+  if (approval.type === 'child_workflow') {
+    // A parent blocked on a `workflow:` sub-run has no approvable gate of its
+    // own — the pause resolves automatically when the child run completes.
+    // Falling through to the generic branch would stamp a node_completed for the
+    // parent's workflow node with empty output (the child's real output is then
+    // discarded on resume) and orphan the still-paused child. Redirect the
+    // operator to the child run, where the actual gate lives.
+    throw new Error(
+      `Run ${run.id} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
+        `('workflow:' node '${approval.nodeId}'). Approve or reject the child run instead` +
+        (approval.childRunId ? `: /workflow approve ${approval.childRunId}` : '.')
+    );
+  }
+  if (isGateResolved(approval)) {
+    // Fast-path friendly error for the common (sequential) case. The run stays
+    // 'paused' after a resolution, so the status check alone no longer blocks a
+    // second approve. This in-memory read can still race a concurrent approve —
+    // the resolveApprovalGate CAS is the real arbiter; a second approve that
+    // slips past this read loses the atomic UPDATE and throws the same way.
+    throw new Error(
+      `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
+    );
+  }
+  return approval;
+}
+
+/**
+ * The FOUR preconditions `rejectWorkflow` enforces. Deliberately NOT the same
+ * gate as `assertApprovable`: reject has no `nodeId` requirement — it falls back
+ * to `approval?.nodeId ?? 'unknown'` when writing its audit event, so a run whose
+ * approval metadata fails `isApprovalContext` (missing/malformed `nodeId`/`message`)
+ * is still legitimately rejectable. A well-formed context with an unrecognized
+ * `type` is NOT one of those cases — it throws via the suspend-reason check below,
+ * same as approve. Merging the two gates would either break reject or over-permit
+ * approve.
+ */
+export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined {
+  if (run.status !== 'paused') {
+    throw new Error(
+      `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
+    );
+  }
+  const rawApproval = run.metadata.approval;
+  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
+    ? rawApproval
+    : undefined;
+  if (!isRecognizedSuspendReason(approval?.type)) {
+    // Shares this check with assertApprovable and with rejectWorkflow's own
+    // exhaustive switch (#2489) — see isRecognizedSuspendReason's doc comment.
+    throw new Error(
+      `Run ${run.id} has an unrecognized gate type '${String(approval?.type)}'. This Archon build cannot resolve it.`
+    );
+  }
+  if (approval?.type === 'child_workflow') {
+    // Same redirect as assertApprovable: the parent's pause is not a rejectable
+    // gate — cancelling the parent here would silently orphan the still-paused
+    // child run. Reject the child (its own gate) or abandon the parent (which
+    // cascade-cancels the subtree) instead.
+    throw new Error(
+      `Run ${run.id} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
+        `('workflow:' node '${approval.nodeId}'). Reject the child run instead` +
+        (approval.childRunId ? `: /workflow reject ${approval.childRunId}` : '.') +
+        ' To discard the whole tree, abandon this run.'
+    );
+  }
+  if (approval && isGateResolved(approval)) {
+    throw new Error(
+      `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
+    );
+  }
+  return approval;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +377,45 @@ export interface AbandonWorkflowResult {
   blockedParentRunId: string | null;
 }
 
+interface AbandonAttemptResult extends AbandonWorkflowResult {
+  cancelled: boolean;
+  cancelledDescendants: number;
+}
+
+async function cancelRunAndCleanup(
+  run: WorkflowRun,
+  cancelRun: CancelWorkflowRun
+): Promise<AbandonAttemptResult> {
+  let cancelled: boolean;
+  try {
+    ({ cancelled } = await cancelRun(run.id));
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, errorType: err.constructor.name, runId: run.id },
+      'operations.workflow_abandon_failed'
+    );
+    throw new Error(`Failed to abandon workflow run ${run.id}: ${err.message}`);
+  }
+
+  // The same cancellation policy applies to descendants. This keeps `/reset`'s
+  // resumable-only ownership boundary intact through the complete run tree.
+  let cascadeFailures = 0;
+  let cancelledDescendants = 0;
+  if (cancelled) {
+    ({ cancelled: cancelledDescendants, failures: cascadeFailures } = await cascadeCancelChildren(
+      run.id,
+      cancelRun
+    ));
+  }
+  const blockedParentRunId = cancelled ? await findParentBlockedOn(run) : null;
+
+  // Reclaim only when our cancel won the CAS. A miss means another lifecycle
+  // owner now controls the run and its environment.
+  if (cancelled) await reclaimCancelledRunContainer(run);
+  return { run, cancelled, cancelledDescendants, cascadeFailures, blockedParentRunId };
+}
+
 /**
  * Abandon a workflow run (marks it as cancelled).
  *
@@ -227,54 +431,59 @@ export async function abandonWorkflow(runId: string): Promise<AbandonWorkflowRes
       `Cannot abandon run with status '${run.status}'. Only running, paused, or failed runs can be abandoned.`
     );
   }
-  let cancelled: boolean;
-  try {
-    ({ cancelled } = await workflowDb.cancelWorkflowRun(runId));
-  } catch (error) {
-    const err = error as Error;
-    getLog().error(
-      { err, errorType: err.constructor.name, runId },
-      'operations.workflow_abandon_failed'
+  const result = await cancelRunAndCleanup(run, workflowDb.cancelWorkflowRun);
+  return {
+    run: result.run,
+    cascadeFailures: result.cascadeFailures,
+    blockedParentRunId: result.blockedParentRunId,
+  };
+}
+
+export interface AbandonConversationRunsResult {
+  /** Runs this call actually took to 'cancelled'. */
+  abandoned: number;
+  /**
+   * First cancelled run that left a parent outside the conversation-scoped
+   * mutation paused blocked-on-child (stranded parent id), or null. The user
+   * must resume or abandon that parent to unstick the tree.
+   */
+  blockedParentRunId: string | null;
+}
+
+/**
+ * Abandon every RESUMABLE run belonging to a conversation.
+ *
+ * Backs `/reset`: with these gone, the resume lookups find nothing, so the next
+ * message starts fresh instead of continuing a stale run.
+ *
+ * The DB owns selection and cancellation in one transaction. This matters when
+ * selected paused roots overlap through an unselected running intermediate:
+ * traversing each tree independently can visit the same descendant twice and
+ * retain a transient first failure after the second visit succeeds. The bulk
+ * mutation returns exactly the rows it cancelled, so counts and final parent
+ * diagnostics come from one operation-wide outcome. Explicit `/workflow
+ * abandon` keeps its broader running/paused/failed cascading policy.
+ */
+export async function abandonResumableRunsForConversation(
+  conversationId: string
+): Promise<AbandonConversationRunsResult> {
+  const runs = await workflowDb.cancelResumableRunsForConversation(conversationId);
+  let blockedParentRunId: string | null = null;
+  for (const run of runs) {
+    await reclaimCancelledRunContainer(run);
+    const blocked = await findParentBlockedOn(run);
+    if (blockedParentRunId === null) blockedParentRunId = blocked;
+  }
+  if (runs.length > 0) {
+    getLog().info(
+      { conversationId, abandoned: runs.length, blockedParentRunId },
+      'operations.workflow_abandon_for_conversation_completed'
     );
-    throw new Error(`Failed to abandon workflow run ${runId}: ${err.message}`);
   }
-  // Cascade-cancel the sub-run tree — ONLY when OUR cancel won the CAS (same guard as
-  // the container reclaim below): a false `cancelled` means a concurrent transition
-  // already took the run terminal, so its children are not ours to cancel.
-  let cascadeFailures = 0;
-  if (cancelled) {
-    ({ failures: cascadeFailures } = await cascadeCancelChildren(runId));
-  }
-  // Abandoning a CHILD strands a parent paused on it (the auto-resume hook only
-  // fires from inside the child's own execution) — detect and surface that so the
-  // caller can point the user at the blocked parent.
-  const blockedParentRunId = cancelled ? await findParentBlockedOn(run) : null;
-  // M2 — reclaim a container run's container + upper volume immediately, in the SHARED
-  // op so EVERY abandon surface (CLI, web API, chat, manage_run, Slack-cancel) frees the
-  // resources now rather than waiting for the scheduled reaper. Best-effort: a reclaim
-  // failure is logged (the reaper retries) — never thrown. Runs wherever the op executes
-  // (CLI/server), which is where docker is reachable.
-  //
-  // ONLY when OUR cancel actually won the CAS (`cancelled === true`). cancelWorkflowRun
-  // is `UPDATE … WHERE status NOT IN (completed, cancelled)`, so a false result means a
-  // concurrent transition (a resume or completion) already took the run terminal and now
-  // OWNS the environment — reclaiming here would pull the container out from under it.
-  if (
-    cancelled &&
-    run.metadata?.isolation === 'container' &&
-    typeof run.metadata.isolation_env_id === 'string'
-  ) {
-    try {
-      // Lazy import: `cleanup-service` pulls the docker/isolation/git chain, which the
-      // operations module (and its lightweight tests) otherwise never need — load it
-      // only when a container run is actually abandoned.
-      const { reclaimContainerEnv } = await import('../services/cleanup-service');
-      await reclaimContainerEnv(run.metadata.isolation_env_id);
-    } catch (err) {
-      getLog().warn({ err, runId }, 'operations.workflow_abandon_container_reclaim_failed');
-    }
-  }
-  return { run, cascadeFailures, blockedParentRunId };
+  return {
+    abandoned: runs.length,
+    blockedParentRunId,
+  };
 }
 
 /**
@@ -291,48 +500,13 @@ export async function approveWorkflow(
   comment?: string
 ): Promise<ApprovalOperationResult> {
   const run = await getRunOrThrow(runId, 'operations.workflow_approve_lookup_failed');
-  if (run.status !== 'paused') {
-    throw new Error(
-      `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
-    );
-  }
-  const rawApproval = run.metadata.approval;
-  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
-    ? rawApproval
-    : undefined;
-  if (!approval?.nodeId) {
-    throw new Error('Workflow run is paused but missing approval context.');
-  }
-  if (approval.type === 'child_workflow') {
-    // A parent blocked on a `workflow:` sub-run has no approvable gate of its
-    // own — the pause resolves automatically when the child run completes.
-    // Falling through to the generic branch would stamp a node_completed for the
-    // parent's workflow node with empty output (the child's real output is then
-    // discarded on resume) and orphan the still-paused child. Redirect the
-    // operator to the child run, where the actual gate lives.
-    throw new Error(
-      `Run ${runId} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
-        `('workflow:' node '${approval.nodeId}'). Approve or reject the child run instead` +
-        (approval.childRunId ? `: /workflow approve ${approval.childRunId}` : '.')
-    );
-  }
-  if (isGateResolved(approval)) {
-    // Fast-path friendly error for the common (sequential) case. The run stays
-    // 'paused' after a resolution, so the status check alone no longer blocks a
-    // second approve. This in-memory read can still race a concurrent approve —
-    // the resolveApprovalGate CAS below is the real arbiter; a second approve
-    // that slips past this read loses the atomic UPDATE and throws the same way.
-    throw new Error(
-      `Workflow run ${runId} was already ${String(approval.resolved)} and is awaiting resume.`
-    );
-  }
+  const approval = assertApprovable(run);
 
   // Whitespace-only comments count as absent (mirrors feedbackProvided below):
   // HTTP/CLI/chat pass the raw comment through since #2074, so '   ' would
   // otherwise be recorded verbatim where the documented default is 'Approved'.
   const approvalComment = comment !== undefined && comment.trim().length > 0 ? comment : 'Approved';
   const isInteractiveLoop = approval.type === 'interactive_loop';
-  const isWriteBack = approval.type === 'writeback';
 
   // Build the resolution metadata AND the audit events for this gate type.
   // IMPORTANT: metadata is MERGED (not replaced) and the approval context is
@@ -340,72 +514,114 @@ export async function approveWorkflow(
   // executor's startIteration detection. Both are handed to the CAS below, which
   // stamps the metadata and writes the events in ONE transaction — the atomic
   // double-resolution guard (#2113) and the atomic audit trail (#2146).
+  //
+  // Exhaustively switched on the suspend reason (#2489) so a future reason value
+  // fails loudly here instead of silently taking the generic 'approval' shape
+  // below. `assertApprovable` (above) already redirects `child_workflow` before
+  // this point — its arm here is an unreachable fail-loud backstop, not live code.
   let metadataPayload: Record<string, unknown>;
   let events: workflowDb.GateResolutionEvent[];
-  if (isWriteBack) {
-    // Engine-level container write-back gate (Phase C): record the approval so the
-    // resumed executor applies the overlay diff to the live root. The gate discriminates
-    // on the gate's OWN `metadata.approval.resolved` (set here) — NOT the run-wide
-    // `approval_response`, which is kept only for backward-compat/telemetry (H1). NO
-    // node_completed event — there is no DAG node behind this gate (`nodeId` is synthetic).
-    metadataPayload = {
-      approval: { ...approval, resolved: 'approved' },
-      approval_response: 'approved',
-    };
-    events = [
-      {
-        event_type: 'approval_received',
-        step_name: approval.nodeId,
-        data: { decision: 'approved', comment: approvalComment, gate: 'writeback' },
-      },
-    ];
-  } else if (isInteractiveLoop) {
-    // Finalize-vs-iterate discriminator (#2074): derived from the RAW comment,
-    // not approvalComment (which defaults to 'Approved') — a bare approve on a
-    // signal-bearing gate finalizes at resume; real feedback runs another iteration.
-    const feedbackProvided = comment !== undefined && comment.trim().length > 0;
-    // loop_user_input keeps the 'Approved' default so the iterate path (non-signaled
-    // gates) still feeds the AI an approval token via $LOOP_USER_INPUT. Typed via
-    // LoopGateRunMetadata so the key spellings match the executor's resume-time
-    // read sites (a typo here is a compile error).
-    const gateRunMetadata: LoopGateRunMetadata = {
-      loop_user_input: approvalComment,
-      loop_feedback_given: feedbackProvided,
-    };
-    metadataPayload = { approval: { ...approval, resolved: 'approved' }, ...gateRunMetadata };
-    // Interactive loop gate — user input already stored in metadata for the next
-    // iteration. Note: node_completed is NOT written here. The executor writes it
-    // when the AI emits the completion signal (meaning the user actually approved)
-    // — or, for a signal-bearing gate approved without feedback, at resume time
-    // from the persisted signaledOutput (#2074). Writing it here would cause the
-    // resume to skip the loop node entirely.
-    events = [
-      {
-        event_type: 'approval_received',
-        step_name: approval.nodeId,
-        data: { decision: 'approved', comment: approvalComment, iteration: approval.iteration },
-      },
-    ];
-  } else {
-    metadataPayload = {
-      approval: { ...approval, resolved: 'approved' },
-      approval_response: 'approved',
-      rejection_reason: '',
-      rejection_count: 0,
-    };
-    const nodeOutput = approval.captureResponse === true ? approvalComment : '';
-    events = [
-      {
-        event_type: 'node_completed',
-        step_name: approval.nodeId,
-        data: { node_output: nodeOutput, approval_decision: 'approved' },
-      },
-      {
-        event_type: 'approval_received',
-        step_name: approval.nodeId,
-        data: { decision: 'approved', comment: approvalComment },
-      },
-    ];
+  switch (approval.type) {
+    case 'writeback': {
+      // Engine-level container write-back gate (Phase C): record the approval so the
+      // resumed executor applies the overlay diff to the live root. The gate discriminates
+      // on the gate's OWN `metadata.approval.resolved` (set here) — NOT the run-wide
+      // `approval_response`, which is kept only for backward-compat/telemetry (H1). NO
+      // node_completed event — there is no DAG node behind this gate (`nodeId` is synthetic).
+      metadataPayload = {
+        approval: { ...approval, resolved: 'approved' },
+        approval_response: 'approved',
+      };
+      events = [
+        {
+          event_type: 'approval_received',
+          step_name: approval.nodeId,
+          data: { decision: 'approved', comment: approvalComment, gate: 'writeback' },
+        },
+      ];
+      break;
+    }
+    case 'interactive_loop': {
+      // Finalize-vs-iterate discriminator (#2074): derived from the RAW comment,
+      // not approvalComment (which defaults to 'Approved') — a bare approve on a
+      // signal-bearing gate finalizes at resume; real feedback runs another iteration.
+      const feedbackProvided = comment !== undefined && comment.trim().length > 0;
+      // loop_user_input keeps the 'Approved' default so the iterate path (non-signaled
+      // gates) still feeds the AI an approval token via $LOOP_USER_INPUT. Typed via
+      // LoopGateRunMetadata so the key spellings match the executor's resume-time
+      // read sites (a typo here is a compile error).
+      const gateRunMetadata: LoopGateRunMetadata = {
+        loop_user_input: approvalComment,
+        loop_feedback_given: feedbackProvided,
+      };
+      metadataPayload = { approval: { ...approval, resolved: 'approved' }, ...gateRunMetadata };
+      // Interactive loop gate — user input already stored in metadata for the next
+      // iteration. Note: node_completed is NOT written here. The executor writes it
+      // when the AI emits the completion signal (meaning the user actually approved)
+      // — or, for a signal-bearing gate approved without feedback, at resume time
+      // from the persisted signaledOutput (#2074). Writing it here would cause the
+      // resume to skip the loop node entirely.
+      events = [
+        {
+          event_type: 'approval_received',
+          step_name: approval.nodeId,
+          data: { decision: 'approved', comment: approvalComment, iteration: approval.iteration },
+        },
+      ];
+      break;
+    }
+    case 'approval':
+    case undefined: {
+      metadataPayload = {
+        approval: { ...approval, resolved: 'approved' },
+        approval_response: 'approved',
+        rejection_reason: '',
+        rejection_count: 0,
+      };
+      // New-mode resolution is opt-in: only a gate whose author explicitly
+      // wrote `approval.decisions:` (decisionsAuthored) — never merely "no
+      // on_reject" — gets structured output. No workflow authored before
+      // #2707 step 1 can have written `decisions:`, so every already-authored
+      // gate (bare, or `capture_response`-only) keeps its exact pre-PR plain-
+      // text/empty output regardless of on_reject. `text` is the raw comment
+      // (possibly empty), not `approvalComment`'s display default.
+      const isNewMode = approval.onRejectPrompt == null && approval.decisionsAuthored === true;
+      const nodeOutput = isNewMode
+        ? JSON.stringify({ decision: 'approve', text: comment ?? '' })
+        : approval.captureResponse === true
+          ? approvalComment
+          : '';
+      events = [
+        {
+          event_type: 'node_completed',
+          step_name: resolvedNodeCompletedStepName(approval),
+          data: {
+            node_output: nodeOutput,
+            approval_decision: 'approved',
+            ...(isNewMode
+              ? { structured_output: { decision: 'approve', text: comment ?? '' } }
+              : {}),
+          },
+        },
+        {
+          event_type: 'approval_received',
+          step_name: approval.nodeId,
+          data: { decision: 'approved', comment: approvalComment },
+        },
+      ];
+      break;
+    }
+    case 'child_workflow':
+      // Unreachable: assertApprovable already redirects a child_workflow gate to the
+      // child run before this point. Fail loud rather than silently falling through
+      // to the generic 'approval' shape above if that guard is ever bypassed.
+      throw new Error(
+        `approveWorkflow: unexpected child_workflow gate reached resolution for run ${runId}`
+      );
+    default: {
+      const unreachable: never = approval.type;
+      throw new Error(`approveWorkflow: unhandled gate type '${String(unreachable)}'`);
+    }
   }
 
   // Compare-and-swap: stamp the resolution AND write the audit events ONLY while
@@ -447,81 +663,100 @@ export async function rejectWorkflow(
   reason?: string
 ): Promise<RejectionOperationResult> {
   const run = await getRunOrThrow(runId, 'operations.workflow_reject_lookup_failed');
-  if (run.status !== 'paused') {
-    throw new Error(
-      `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
-    );
-  }
-  const rawApproval = run.metadata.approval;
-  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
-    ? rawApproval
-    : undefined;
-  if (approval?.type === 'child_workflow') {
-    // Same redirect as approveWorkflow: the parent's pause is not a rejectable
-    // gate — cancelling the parent here would silently orphan the still-paused
-    // child run. Reject the child (its own gate) or abandon the parent (which
-    // cascade-cancels the subtree) instead.
-    throw new Error(
-      `Run ${runId} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
-        `('workflow:' node '${approval.nodeId}'). Reject the child run instead` +
-        (approval.childRunId ? `: /workflow reject ${approval.childRunId}` : '.') +
-        ' To discard the whole tree, abandon this run.'
-    );
-  }
-  if (approval && isGateResolved(approval)) {
-    // Fast-path friendly error, same as approveWorkflow — the run stays 'paused'
-    // after a resolution, so status alone no longer blocks a second reject. The
-    // CAS below is the real arbiter for the concurrent case.
-    throw new Error(
-      `Workflow run ${runId} was already ${String(approval.resolved)} and is awaiting resume.`
-    );
-  }
-  const isWriteBack = approval?.type === 'writeback';
+  const approval = assertRejectable(run);
 
-  // Engine-level container write-back gate (Phase C): reject means DISCARD the
-  // overlay, but the RUN itself succeeded — keep it resumable (never cancel) so
-  // the resumed executor discards + completes with a note. Distinct from a DAG
-  // approval reject (which cancels or stages an on_reject rework).
-  if (isWriteBack && approval) {
-    const rejectionEvent: workflowDb.GateResolutionEvent = {
-      event_type: 'approval_received',
-      step_name: approval.nodeId,
-      data: { decision: 'rejected', gate: 'writeback' },
-    };
-    const { resolved: won } = await workflowDb.resolveApprovalGate(
-      runId,
-      { approval: { ...approval, resolved: 'rejected' }, approval_response: 'rejected' },
-      [rejectionEvent]
-    );
-    if (!won) {
-      throw new Error(`Workflow run ${runId} was already resolved and is awaiting resume.`);
+  // Exhaustively switched on the suspend reason (#2489) so a future reason value
+  // fails loudly here instead of silently taking the generic rework/cancel path
+  // below. `assertRejectable` (above) already redirects `child_workflow` before
+  // this point — its arm here is an unreachable fail-loud backstop, not live code.
+  // Guarding on `approval !== undefined` first (rather than switching on
+  // `approval?.type`) narrows `approval` for free inside `case 'writeback'` — an
+  // undefined approval falls through to the generic path below exactly as
+  // `case undefined` does for a defined approval with no `type`.
+  if (approval !== undefined) {
+    switch (approval.type) {
+      case 'writeback': {
+        // Engine-level container write-back gate (Phase C): reject means DISCARD the
+        // overlay, but the RUN itself succeeded — keep it resumable (never cancel) so
+        // the resumed executor discards + completes with a note. Distinct from a DAG
+        // approval reject (which cancels or stages an on_reject rework).
+        const rejectionEvent: workflowDb.GateResolutionEvent = {
+          event_type: 'approval_received',
+          step_name: approval.nodeId,
+          data: { decision: 'rejected', gate: 'writeback' },
+        };
+        const { resolved: won } = await workflowDb.resolveApprovalGate(
+          runId,
+          { approval: { ...approval, resolved: 'rejected' }, approval_response: 'rejected' },
+          [rejectionEvent]
+        );
+        if (!won) {
+          throw new Error(`Workflow run ${runId} was already resolved and is awaiting resume.`);
+        }
+        captureApprovalResolved({ resolution: 'rejected' });
+        return {
+          workflowName: run.workflow_name,
+          workingPath: run.working_path,
+          userMessage: run.user_message,
+          codebaseId: run.codebase_id,
+          conversationId: run.conversation_id,
+          cancelled: false,
+          maxAttemptsReached: false,
+          writeBack: true,
+          newMode: false,
+        };
+      }
+      case 'child_workflow':
+        // Unreachable: assertRejectable already redirects a child_workflow gate to
+        // the child run before this point. Fail loud rather than silently falling
+        // through to the generic rework/cancel path below if that guard is ever
+        // bypassed.
+        throw new Error(
+          `rejectWorkflow: unexpected child_workflow gate reached resolution for run ${runId}`
+        );
+      case 'approval':
+      case 'interactive_loop':
+      case undefined:
+        break;
+      default: {
+        const unreachable: never = approval.type;
+        throw new Error(`rejectWorkflow: unhandled gate type '${String(unreachable)}'`);
+      }
     }
-    captureApprovalResolved({ resolution: 'rejected' });
-    return {
-      workflowName: run.workflow_name,
-      workingPath: run.working_path,
-      userMessage: run.user_message,
-      codebaseId: run.codebase_id,
-      conversationId: run.conversation_id,
-      cancelled: false,
-      maxAttemptsReached: false,
-      writeBack: true,
-    };
   }
 
   const rejectReason = reason ?? 'Rejected';
   const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
   const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
-  // `!= null` (not `!== undefined`): pauseWorkflowRun now explicit-nulls this field
-  // on every pause when the gate has no on_reject (L1 dialect-parity reset), so a
-  // null must read as "not configured" exactly like an absent key.
+  // `!= null` (not `!== undefined`): "no on_reject" reaches this read in two stored
+  // shapes. Absent — every pause since #2673 (the approval object is replaced
+  // wholesale, so an unset field is simply not there), and every SQLite pause before
+  // it too, since json_patch is RFC 7396 and DELETED the key the old explicit-null
+  // reset patched. An explicit JSON null — Postgres runs paused before #2673, where
+  // `||` stored the null as written. Keep the loose check: `null !== undefined` is
+  // true, so tightening would read such a run as HAVING an on_reject and stage a
+  // rework the workflow never declared — and the resume path takes its prompt from
+  // `node.approval.on_reject` (dag-executor), which is exactly what is missing.
   const onRejectConfigured = approval?.onRejectPrompt != null;
   const maxAttemptsReached = onRejectConfigured && currentCount + 1 >= maxAttempts;
-  // The on_reject rework is staged (run stays 'paused') only when a prompt is
-  // set AND we're under the attempt cap; every other case cancels the run.
+  // The legacy on_reject rework is staged (run stays 'paused') only when a
+  // prompt is set AND we're under the attempt cap.
   const willStageRework = onRejectConfigured && !maxAttemptsReached;
+  // New mechanism (#2707 step 1): resolves immediately with structured
+  // {decision,text} output — no staging, no attempt counter, the run just
+  // stays 'paused' awaiting resume like any other completed node (see #2714:
+  // this is why hydrateResumableRun needs no special-casing for it). Opt-in
+  // ONLY (mirrors approveWorkflow's isNewMode — see its comment): requires
+  // the author to have explicitly written `approval.decisions:`, not merely
+  // "no on_reject", so an already-authored gate's reject keeps cancelling the
+  // run exactly as before this PR. Within an explicitly-decisions-authored
+  // gate, one declaring no 'reject' id (an approve-only gate) still falls
+  // through to the cancel path below — that vocabulary gap is deliberate.
+  const decisionsAuthored = approval?.decisionsAuthored === true;
+  const hasRejectDecision = approval?.decisions?.some(d => d.id === 'reject') ?? false;
+  const willResolveNewMode = !onRejectConfigured && decisionsAuthored && hasRejectDecision;
 
-  // The audit event is identical for all three reject outcomes; the CAS writes it
+  // The audit event is identical for every reject outcome; the CAS writes it
   // in the SAME transaction as the resolution (#2146).
   const rejectionEvent: workflowDb.GateResolutionEvent = {
     event_type: 'approval_received',
@@ -531,26 +766,46 @@ export async function rejectWorkflow(
 
   // Compare-and-swap resolution guard — a concurrent second reject loses here
   // (resolved=false) and throws BEFORE any events, so the gate events can't
-  // duplicate (#2113). Stage-rework stamps the resolution + rework metadata and
-  // keeps the run 'paused' (the approval context is rewritten whole so the resumed
-  // executor still sees nodeId/onRejectPrompt; `...approval` tolerates a malformed
-  // context exactly as the 'unknown' nodeId fallback below). The terminal outcomes
-  // flip paused→'cancelled' in a SINGLE atomic UPDATE, so there is never a
-  // resolved-but-not-cancelled state that a failed second write could strand
-  // (which a reject retry could not self-heal past the guard above). Either way
-  // the audit event rides the same transaction, so a failed event write rolls the
-  // resolution/cancellation back rather than losing the audit trail (#2146).
-  const { resolved: won } = willStageRework
-    ? await workflowDb.resolveApprovalGate(
-        runId,
-        {
-          approval: { ...approval, resolved: 'rejected' },
-          rejection_reason: rejectReason,
-          rejection_count: currentCount + 1,
-        },
-        [rejectionEvent]
-      )
-    : await workflowDb.resolveAndCancelApprovalGate(runId, [rejectionEvent]);
+  // duplicate (#2113). Stage-rework and new-mode resolution both keep the run
+  // 'paused' (the approval context is rewritten whole so a resumed executor
+  // still sees nodeId/onRejectPrompt/decisions; `...approval` tolerates a
+  // malformed context exactly as the 'unknown' nodeId fallback below). The
+  // terminal cancel outcome flips paused→'cancelled' in a SINGLE atomic
+  // UPDATE, so there is never a resolved-but-not-cancelled state that a failed
+  // second write could strand (which a reject retry could not self-heal past
+  // the guard above). Every path's audit event(s) ride the same transaction,
+  // so a failed event write rolls the resolution/cancellation back rather than
+  // losing the audit trail (#2146).
+  let won: boolean;
+  if (willResolveNewMode && approval) {
+    const structuredOutput = { decision: 'reject', text: reason ?? '' };
+    const nodeCompletedEvent: workflowDb.GateResolutionEvent = {
+      event_type: 'node_completed',
+      step_name: resolvedNodeCompletedStepName(approval),
+      data: {
+        node_output: JSON.stringify(structuredOutput),
+        approval_decision: 'rejected',
+        structured_output: structuredOutput,
+      },
+    };
+    ({ resolved: won } = await workflowDb.resolveApprovalGate(
+      runId,
+      { approval: { ...approval, resolved: 'rejected' } },
+      [nodeCompletedEvent, rejectionEvent]
+    ));
+  } else if (willStageRework) {
+    ({ resolved: won } = await workflowDb.resolveApprovalGate(
+      runId,
+      {
+        approval: { ...approval, resolved: 'rejected' },
+        rejection_reason: rejectReason,
+        rejection_count: currentCount + 1,
+      },
+      [rejectionEvent]
+    ));
+  } else {
+    ({ resolved: won } = await workflowDb.resolveAndCancelApprovalGate(runId, [rejectionEvent]));
+  }
   if (!won) {
     throw new Error(`Workflow run ${runId} was already resolved and is awaiting resume.`);
   }
@@ -565,10 +820,130 @@ export async function rejectWorkflow(
     userMessage: run.user_message,
     codebaseId: run.codebase_id,
     conversationId: run.conversation_id,
-    cancelled: !willStageRework,
+    cancelled: !willStageRework && !willResolveNewMode,
     maxAttemptsReached,
     writeBack: false,
+    newMode: willResolveNewMode,
   };
+}
+
+/**
+ * Validate that `decision` is legal for the gate `run` is paused at, WITHOUT
+ * mutating anything (mirrors `assertApprovable`'s read-only-precheck role for
+ * CLI `--detach`). `approve`/`reject` are always legal (delegated to the
+ * existing `approveWorkflow`/`rejectWorkflow` machinery by `respondToWorkflow`
+ * — this function is not consulted for those two ids). Any OTHER decision is
+ * legal only for a plain gate node (`approval`/`undefined` suspend type) whose
+ * author explicitly declared `approval.decisions:` (`decisionsAuthored`) —
+ * `writeback`/`interactive_loop`/`child_workflow` pauses have no author-
+ * declared vocabulary and accept only approve/reject; a legacy gate (no
+ * `decisions:` authored) also only ever has the synthesized approve/reject
+ * pair (#2707 step 2).
+ */
+export function assertRespondable(run: WorkflowRun, decision: string): ApprovalContext {
+  const approval = assertApprovable(run);
+  if (approval.type !== 'approval' && approval.type !== undefined) {
+    throw new Error(
+      `Run ${run.id}'s gate ('${approval.type}') only accepts 'approve' or 'reject' — ` +
+        `'${decision}' is not a valid response here.`
+    );
+  }
+  if (approval.decisionsAuthored !== true) {
+    throw new Error(
+      `Run ${run.id}'s gate only accepts 'approve' or 'reject' — '${decision}' is not one of its ` +
+        'declared decisions. Declare `approval.decisions:` on the gate node to author a broader vocabulary.'
+    );
+  }
+  const declaredIds = (approval.decisions ?? []).map(d => d.id);
+  if (!declaredIds.includes(decision)) {
+    throw new Error(
+      `Run ${run.id}'s gate does not declare decision '${decision}'. Declared decisions: ` +
+        `${declaredIds.join(', ')}.`
+    );
+  }
+  return approval;
+}
+
+/**
+ * Resolve a paused gate with an author-declared decision beyond approve/reject
+ * (#2707 step 2 — the general `workflow respond <id> <decision> [text]` verb).
+ * `approve`/`reject` are NOT handled here — `respondToWorkflow` delegates those
+ * to the existing `approveWorkflow`/`rejectWorkflow` functions unchanged, so
+ * every gate shape that existed before this PR keeps its exact prior behavior
+ * (legacy `on_reject` rework/cancel, `capture_response`, interactive_loop,
+ * writeback). This function only ever resolves a new-mode plain gate node
+ * (`decisionsAuthored: true`) immediately with structured `{decision, text}`
+ * output — the same shape `approveWorkflow`'s new-mode branch writes, just
+ * with a caller-supplied `decision` instead of the literal `'approve'`.
+ */
+async function respondToWorkflowWithDeclaredDecision(
+  runId: string,
+  decision: string,
+  text?: string
+): Promise<ApprovalOperationResult> {
+  const run = await getRunOrThrow(runId, 'operations.workflow_respond_lookup_failed');
+  const approval = assertRespondable(run, decision);
+
+  const structuredOutput = { decision, text: text ?? '' };
+  const events: workflowDb.GateResolutionEvent[] = [
+    {
+      event_type: 'node_completed',
+      step_name: resolvedNodeCompletedStepName(approval),
+      data: {
+        node_output: JSON.stringify(structuredOutput),
+        approval_decision: decision,
+        structured_output: structuredOutput,
+      },
+    },
+    {
+      event_type: 'approval_received',
+      step_name: approval.nodeId,
+      data: { decision, comment: text !== undefined && text.trim().length > 0 ? text : decision },
+    },
+  ];
+  const { resolved: won } = await workflowDb.resolveApprovalGate(
+    runId,
+    { approval: { ...approval, resolved: 'approved' }, approval_response: decision },
+    events
+  );
+  if (!won) {
+    throw new Error(`Workflow run ${runId} was already resolved and is awaiting resume.`);
+  }
+
+  // Anonymous telemetry: binary resolution only — no ids/comments/names. A
+  // custom decision still records as 'approved' since it resolved the gate
+  // (as opposed to leaving it open) — mirrors the existing 'approved'/'rejected'
+  // vocabulary rather than adding a third telemetry bucket for one caller.
+  captureApprovalResolved({ resolution: 'approved' });
+  return {
+    workflowName: run.workflow_name,
+    workingPath: run.working_path,
+    userMessage: run.user_message,
+    codebaseId: run.codebase_id,
+    conversationId: run.conversation_id,
+    type: 'approval_gate',
+  };
+}
+
+/**
+ * Resolve a paused gate with any author-declared decision (#2707 step 2's
+ * general drive verb — `workflow respond <run-id> <decision> [text]`).
+ * `approve`/`reject` are sugar: they delegate to the existing
+ * `approveWorkflow`/`rejectWorkflow` functions UNCHANGED, so every gate shape
+ * that existed before this PR (legacy `on_reject`, `capture_response`,
+ * `interactive_loop`, `writeback`, and step-1's new-mode 2-decision gates)
+ * keeps its exact prior behavior byte-for-byte. Any other decision resolves
+ * through `respondToWorkflowWithDeclaredDecision`, which only accepts a
+ * decision the gate actually declared.
+ */
+export async function respondToWorkflow(
+  runId: string,
+  decision: string,
+  text?: string
+): Promise<ApprovalOperationResult | RejectionOperationResult> {
+  if (decision === 'approve') return approveWorkflow(runId, text);
+  if (decision === 'reject') return rejectWorkflow(runId, text);
+  return respondToWorkflowWithDeclaredDecision(runId, decision, text);
 }
 
 /**

@@ -6,6 +6,7 @@ import { insertWorkflowEvent } from './workflow-events';
 import type { IDatabase, SqlDialect } from './adapters/types';
 import type {
   WorkflowRun,
+  WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
 } from '@archon/workflows/schemas/workflow-run';
@@ -78,10 +79,9 @@ function resumableStatusClause(dialect: SqlDialect, dayParamIndex: number): stri
  * not need it — the adapter serializes transactions on one connection, and a
  * cross-process writer that commits between our read and our write makes the
  * deferred BEGIN's read→write upgrade fail with SQLITE_BUSY rather than let a
- * stale snapshot through). Used by resumeWorkflowRun to pin the row across its
- * read-then-CAS pair so the value it reads is the value the CAS acts on.
- * Dialect-branched here rather than in SqlDialect: this is the only caller, and
- * the branch mirrors unresolvedGateClause's local getDatabaseType() check.
+ * stale snapshot through). Used to pin rows across a read-then-write pair so
+ * the values read are the values the mutation acts on. Dialect-branched here
+ * rather than in SqlDialect because this lock is local DB policy.
  */
 function rowLockClause(): string {
   return getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : '';
@@ -127,6 +127,32 @@ function unresolvedGateClause(): string {
 }
 
 /**
+ * SQL expression writing a fresh approval gate: merge the caller's run-level
+ * metadata into the column at the TOP level, then set `metadata.approval` to the
+ * bound value WHOLESALE. Dialect-aware and kept in ONE place beside
+ * unresolvedGateClause so the two forms cannot drift.
+ *
+ * Deliberately NOT dialect.jsonMerge, because the two merge operators disagree
+ * one level down: Postgres `||` is shallow, so `approval` is replaced; SQLite's
+ * json_patch is RFC 7396 and RECURSES, so a nested object like
+ * `approval.signaledTokens` was merged key by key and interior keys the new gate
+ * omitted survived from the previous gate — fabricating cache-token counts no
+ * provider reported (#2673). Replacing the whole object makes "this gate's
+ * context, and only this gate's" structural on both dialects instead of a list
+ * of resets that every new nested field re-arms.
+ *
+ * @param mergeParamIndex - param holding top-level run metadata (may be `{}`)
+ * @param approvalParamIndex - param holding the complete ApprovalContext
+ */
+function writeApprovalMetadata(mergeParamIndex: number, approvalParamIndex: number): string {
+  const merge = `$${String(mergeParamIndex)}`;
+  const approval = `$${String(approvalParamIndex)}`;
+  return getDatabaseType() === 'postgresql'
+    ? `jsonb_set(metadata || ${merge}::jsonb, '{approval}', ${approval}::jsonb, true)`
+    : `json_set(json_patch(metadata, ${merge}), '$.approval', json(${approval}))`;
+}
+
+/**
  * An audit event written atomically with a gate resolution (#2146). The winning
  * resolver inserts these in the SAME transaction as the resolution UPDATE, so a
  * failed event write rolls the resolution back — a resolved gate can never be
@@ -159,6 +185,13 @@ export interface GateResolutionEvent {
  * Wrapping the resolution and its audit rows in one transaction closes the
  * separate gap where a post-commit event-write failure stranded a resolved gate
  * with no audit event and no way to retry (#2146).
+ *
+ * This one merges (unlike the wholesale pause write — writeApprovalMetadata) and
+ * is safe to, because it stamps the SAME gate rather than opening a new one:
+ * every caller passes `{ ...approval, resolved }`, the stored context plus fields,
+ * so SQLite's deep-merge and a replace produce identical rows. A caller that ever
+ * passed a PARTIAL approval would silently keep the stored values on SQLite and
+ * drop them on Postgres — pass the whole context, or use the pause write's form.
  */
 export async function resolveApprovalGate(
   id: string,
@@ -255,6 +288,13 @@ export class WorkflowNotResumableError extends Error {
 }
 
 export async function createWorkflowRun(data: {
+  /**
+   * Caller-reserved row id. Supplied when something had to exist at this run's own
+   * paths before the row could be written — today that is the workflow-source capture,
+   * which is frozen (and, for a container, bind-mounted) before the workflow is even
+   * selected. Omitted, the database generates one as it always has.
+   */
+  id?: string;
   workflow_name: string;
   conversation_id: string;
   codebase_id?: string;
@@ -297,9 +337,14 @@ export async function createWorkflowRun(data: {
 
   try {
     const result = await pool.query<WorkflowRun>(
-      `INSERT INTO remote_agent_workflow_runs
+      data.id === undefined
+        ? `INSERT INTO remote_agent_workflow_runs
        (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id, user_id, parent_run_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`
+        : `INSERT INTO remote_agent_workflow_runs
+       (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id, user_id, parent_run_id, id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
       [
         data.workflow_name,
@@ -311,6 +356,7 @@ export async function createWorkflowRun(data: {
         data.parent_conversation_id ?? null,
         data.user_id ?? null,
         data.parent_run_id ?? null,
+        ...(data.id === undefined ? [] : [data.id]),
       ]
     );
     const row = result.rows[0];
@@ -428,7 +474,8 @@ export async function getActiveWorkflowRun(conversationId: string): Promise<Work
 
 /**
  * Find a paused workflow run for a conversation (or its parent).
- * Used by the message handler to detect approval gates awaiting a natural-language response.
+ * Used by the message handler to give the chat agent the open approval gate as
+ * context for the turn (#2565).
  * Non-throwing: returns null on DB error so the caller can fall through to normal routing.
  */
 export async function getPausedWorkflowRun(conversationId: string): Promise<WorkflowRun | null> {
@@ -445,6 +492,71 @@ export async function getPausedWorkflowRun(conversationId: string): Promise<Work
     const err = error as Error;
     getLog().error({ err, conversationId }, 'db.workflow_run_get_paused_failed');
     return null;
+  }
+}
+
+/**
+ * Atomically cancel every RESUMABLE run belonging to a conversation.
+ *
+ * Used by `/reset` to give the user a real escape hatch: after these are
+ * abandoned, the resume lookups find nothing, so the next dispatch starts fresh
+ * instead of continuing a stale run.
+ *
+ * The status set is exactly what the two resume lookups can return —
+ * findResumableRunByParentConversation ('failed'/'paused') and
+ * getPausedWorkflowRun ('paused'). `pending` and `running` are deliberately NOT
+ * matched: neither lookup can ever return them, so leaving them alone cannot
+ * cause the stale continuation this exists to prevent, while cancelling them
+ * would stop live work that may belong to another process entirely (a CLI run,
+ * a webhook-triggered run, a scheduled dispatch).
+ *
+ * The transaction first locks every existing run in the conversation, including
+ * running intermediates. That makes the paused/failed snapshot and the bulk
+ * UPDATE one ownership decision: a concurrent resume either wins before the
+ * lock or waits until reset has cancelled the run. Locking the running rows too
+ * prevents a status-gap run from becoming paused between the snapshot and the
+ * UPDATE and being cancelled without appearing in the returned outcomes.
+ *
+ * SQLite deliberately cannot use UPDATE RETURNING. Returning the locked
+ * snapshot and verifying UPDATE rowCount preserves the same contract in both
+ * dialects; any phantom or stale-snapshot mismatch throws and rolls back rather
+ * than reporting a false all-clear.
+ */
+export async function cancelResumableRunsForConversation(
+  conversationId: string
+): Promise<WorkflowRun[]> {
+  const dialect = getDialect();
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const snapshot = await query<WorkflowRun>(
+        `SELECT * FROM remote_agent_workflow_runs
+         WHERE conversation_id = $1 OR parent_conversation_id = $2
+         ORDER BY started_at DESC${rowLockClause()}`,
+        [conversationId, conversationId]
+      );
+      const resumable = snapshot.rows.filter(
+        run => run.status === 'paused' || run.status === 'failed'
+      );
+      if (resumable.length === 0) return [];
+
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'cancelled', completed_at = ${dialect.now()}
+         WHERE (conversation_id = $1 OR parent_conversation_id = $2)
+           AND status IN ('paused', 'failed')`,
+        [conversationId, conversationId]
+      );
+      if (result.rowCount !== resumable.length) {
+        throw new Error(
+          `Resumable run snapshot changed during reset (expected ${String(resumable.length)}, cancelled ${String(result.rowCount)})`
+        );
+      }
+      return resumable.map(run => normalizeWorkflowRun(run));
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, conversationId }, 'db.workflow_run_cancel_resumable_for_conv_failed');
+    throw new Error(`Failed to cancel resumable runs for conversation: ${err.message}`);
   }
 }
 
@@ -868,7 +980,9 @@ export async function getWorkflowRunByWorkerPlatformId(
  */
 export async function updateWorkflowRun(
   id: string,
-  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata'>>
+  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+    outcome?: WorkflowRunOutcome;
+  }
 ): Promise<void> {
   const dialect = getDialect();
   const setClauses: string[] = [];
@@ -894,6 +1008,20 @@ export async function updateWorkflowRun(
     const paramIndex = values.length + 1;
     values.push(JSON.stringify(updates.metadata));
     setClauses.push(`metadata = ${dialect.jsonMerge('metadata', paramIndex)}`);
+  }
+  if (updates.outcome !== undefined) {
+    values.push(updates.outcome);
+    setClauses.push(`outcome = $${values.length}`);
+  }
+  if (updates.output_root !== undefined) {
+    values.push(updates.output_root);
+    // COALESCE makes write-once structural rather than doc-only (#2200): the
+    // first non-null write sticks and every later one is a no-op, so a resume
+    // that re-derived a different root (renamed codebase, #1192) can never
+    // orphan the artifacts this run actually wrote. No behaviour change for the
+    // executor, which already guards on a null pointer — this is the backstop
+    // for any future caller that forgets to.
+    setClauses.push(`output_root = COALESCE(output_root, $${values.length})`);
   }
 
   if (setClauses.length === 0) return;
@@ -951,6 +1079,16 @@ export async function completeWorkflowRun(
   }
 }
 
+/**
+ * Mark a run failed.
+ *
+ * Matches `pending` as well as `running`. A run can fail BEFORE it ever transitions to
+ * running — source capture, artifact setup, and credential resolution all happen against
+ * a freshly inserted `pending` row — and a `running`-only guard left those rows pending
+ * forever: no terminal state, no error recorded, and nothing to tell the operator the run
+ * is dead. Both are non-terminal states owned by this process, so failing either is the
+ * same decision. Terminal rows still never transition.
+ */
 export async function failWorkflowRun(id: string, error: string): Promise<void> {
   const dialect = getDialect();
   let result: Awaited<ReturnType<IDatabase['query']>>;
@@ -958,7 +1096,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
     result = await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status = 'running'`,
+       WHERE id = $1 AND status IN ('running', 'pending')`,
       [id, JSON.stringify({ error })]
     );
   } catch (dbError) {
@@ -968,7 +1106,7 @@ export async function failWorkflowRun(id: string, error: string): Promise<void> 
   }
   if (result.rowCount === 0) {
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_fail_no_match');
-    throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    throw new Error(`Workflow run not found or already terminal (id: ${id})`);
   }
 }
 
@@ -1009,57 +1147,35 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
  * Sets status to 'paused' and stores approval context in metadata.
  * Does NOT set completed_at — the run is not finished.
  *
- * `resolved`, `completionSignaled`, and `signaledOutput` are reset to an
- * explicit null on every fresh pause so a prior gate's resolution or signal
- * state can never leak into this one: SQLite's json_patch deep-merges the new
- * context into the stored one (an omitted key would keep the old value —
- * JSON.stringify drops undefined, so the values are computed explicitly), and
- * RFC 7396 null removes the key; Postgres `||` replaces the approval object
- * wholesale. See ApprovalContext.resolved / .completionSignaled.
+ * The stored `metadata.approval` is REPLACED with `approvalContext` wholesale
+ * (writeApprovalMetadata), never merged into. So a fresh pause stores exactly
+ * the keys the caller set — at every depth — and nothing a prior gate of the
+ * same run left behind can survive, on either dialect (#2673). Readers treat an
+ * absent key exactly like a JSON null (`!= null`, `=== true`, `?? ''`), and
+ * unresolvedGateClause's `IS NULL` matches both, so omission is the reset.
+ *
+ * `extraMetadata` still merges at the TOP level, so run-level keys the pause
+ * does not own (e.g. `pending_writeback`, `rejection_count`) are preserved.
  */
 export async function pauseWorkflowRun(
   id: string,
   approvalContext: ApprovalContext,
   extraMetadata?: Record<string, unknown>
 ): Promise<void> {
-  const dialect = getDialect();
   try {
     const result = await pool.query(
       `UPDATE remote_agent_workflow_runs
-       SET status = 'paused', metadata = ${dialect.jsonMerge('metadata', 2)}
+       SET status = 'paused', metadata = ${writeApprovalMetadata(2, 3)}
        WHERE id = $1 AND status = 'running'`,
       [
         id,
-        JSON.stringify({
-          approval: {
-            ...approvalContext,
-            resolved: null,
-            // Explicit-null reset of EVERY optional approval sub-field on each fresh
-            // pause (L1) — SQLite's json_patch deep-merges the new approval into the
-            // stored one, so a field the caller omits would otherwise inherit a stale
-            // value from a PRIOR gate in the same run (e.g. an earlier node's
-            // onRejectPrompt misrouting this gate's reject). RFC 7396 null removes the
-            // key; Postgres `||` replaces the approval object wholesale. Readers treat
-            // null as absent (`!= null`).
-            completionSignaled: approvalContext.completionSignaled ?? null,
-            signaledOutput: approvalContext.signaledOutput ?? null,
-            signaledTokens: approvalContext.signaledTokens ?? null,
-            onRejectPrompt: approvalContext.onRejectPrompt ?? null,
-            onRejectMaxAttempts: approvalContext.onRejectMaxAttempts ?? null,
-            captureResponse: approvalContext.captureResponse ?? null,
-            iteration: approvalContext.iteration ?? null,
-            sessionId: approvalContext.sessionId ?? null,
-            sessionProvider: approvalContext.sessionProvider ?? null,
-            commandSnapshot: approvalContext.commandSnapshot ?? null,
-            // #2121 Phase 2: the child_workflow gate's target child. Reset explicitly
-            // like every other optional sub-field so a prior gate's childRunId can't
-            // leak into a later non-child gate via SQLite json_patch deep-merge.
-            childRunId: approvalContext.childRunId ?? null,
-          },
-          // Fold caller-supplied run-level metadata (e.g. `pending_writeback`) into the
-          // SAME atomic write so there is no window where the run is paused without it (M3).
-          ...(extraMetadata ?? {}),
-        }),
+        // Caller-supplied run-level metadata (e.g. `pending_writeback`) rides the SAME
+        // atomic write so there is no window where the run is paused without it (M3).
+        JSON.stringify(extraMetadata ?? {}),
+        // The complete gate context. JSON.stringify drops undefined, and the write
+        // replaces rather than merges, so an optional field the caller left unset is
+        // simply absent — no explicit-null reset list to keep in sync.
+        JSON.stringify(approvalContext),
       ]
     );
     if (result.rowCount === 0) {

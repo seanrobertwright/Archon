@@ -16,9 +16,25 @@ import '@archon/paths/strip-cwd-env-boot';
 import { loadArchonEnv } from '@archon/paths/env-loader';
 loadArchonEnv(process.cwd());
 
+// Install the pipe-safe `console.log` shim BEFORE any command module imports.
+// `console.log` reaches fd 1 via a non-blocking pipe (pino opens it that way at
+// module load via `@archon/paths/strip-cwd-env-boot` above), and short writes
+// are silently dropped against a slow reader. The shim delegates through
+// `writeStdout` so the stream layer queues short writes and retries `EAGAIN`
+// instead of dropping the tail — but delivery is fire-and-forget, so the
+// patched `console.log` returns synchronously and the exit path below must
+// await `flushPendingWrites()` before `process.exit()`. See
+// `utils/exit-with-drain.ts` (the call site that owns the drain) and
+// `utils/safe-console.ts` for the underlying shim, and #2400 for the full
+// rationale.
+import { installPipeSafeConsole } from './utils/safe-console';
+import { withDrainedExit } from './utils/exit-with-drain';
+installPipeSafeConsole();
+
 import { parseArgs } from 'util';
 import { resolve } from 'path';
 import { existsSync, realpathSync } from 'fs';
+import { stat } from 'fs/promises';
 
 // Smart defaults for Claude auth
 // If no explicit tokens, default to global auth from `claude /login`
@@ -47,6 +63,7 @@ import {
   workflowAbandonCommand,
   workflowApproveCommand,
   workflowRejectCommand,
+  workflowRespondCommand,
   workflowCleanupCommand,
   workflowResetSessionsCommand,
   workflowEventEmitCommand,
@@ -96,6 +113,15 @@ import {
 } from '@archon/paths';
 import * as git from '@archon/git';
 
+/** True when `path` exists and is a directory (used to validate `--workflow-source`). */
+async function isPathDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -122,6 +148,9 @@ Commands:
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
   workflow resume <run-id>   Resume a failed or paused run from completed nodes
+  workflow respond <run-id> <decision> [text]
+                             Resolve a paused gate with any of its declared decisions
+                             ('approve'/'reject' are sugar for the dedicated commands)
   workflow search [query]    Search the workflow marketplace
   workflow install <slug>    Install a workflow from the marketplace
   isolation list             List all active worktrees/environments
@@ -156,15 +185,24 @@ Options:
   --branch, -b <name>        Create worktree for branch (or reuse existing)
   --from, --from-branch <name> Create new branch from specific start point
   --base <branch>            Per-dispatch base override for epic slices (worktree cut-from + PR target)
+  --workflow-source <path>   Read the workflow, its commands and scripts from this directory
+                             instead of --cwd (which stays the workspace the run acts on)
   --no-worktree              Run on branch directly without worktree isolation
   --folder                   Register the current non-git directory as a folder project and run in place
+  --input <name>=<value>     Supply a declared workflow input; repeat per input (mutually exclusive with --resume)
   --resume                   Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)
+  --dry-run                  Simulate workflow DAG control flow without creating a run or contacting a provider
+  --stubs <path>             YAML node-output map for --dry-run
+  --stubs-init <path>        Write a complete dry-run stub scaffold and exit
+  --default-stubs            Fill missing reached nodes with validated placeholders during --dry-run
+  --exec-code                Execute trusted bash/script nodes during --dry-run (default: require stubs)
+  --pause-at-gates           Stop a dry-run at approval gates instead of auto-approving
   --spawn                    Open setup wizard in a new terminal window (for setup command)
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
-  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/abandon/resume)
+  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/respond/abandon/resume)
   --events                   For verbose JSON status/get: output raw event rows instead of node summaries
-  --detach                   Run 'workflow run' in a detached background child (returns immediately)
+  --detach                   Run 'workflow run'/'approve'/'reject'/'respond'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
   --limit <n>                For 'workflow runs': max rows (default 20)
@@ -185,6 +223,7 @@ Examples:
   archon workflow run quick-fix --no-worktree "Fix typo"
   archon workflow run assist --folder "List every repo under this multi-repo root"
   archon workflow run archon-assist --detach "Investigate the flaky test"
+  archon workflow run assist --dry-run --stubs ./stubs.yaml --json
   archon workflow runs --json
   archon workflow get <run-id> --json
   archon workflow resume <run-id>
@@ -281,6 +320,7 @@ async function main(): Promise<number> {
         from: { type: 'string' },
         'from-branch': { type: 'string' },
         base: { type: 'string' },
+        'workflow-source': { type: 'string' },
         'no-worktree': { type: 'boolean' },
         folder: { type: 'boolean' },
         container: { type: 'boolean' },
@@ -295,6 +335,7 @@ async function main(): Promise<number> {
         data: { type: 'string' },
         comment: { type: 'string' },
         reason: { type: 'string' },
+        text: { type: 'string' },
         workflow: { type: 'string' },
         'no-context': { type: 'boolean' },
         port: { type: 'string' },
@@ -310,6 +351,14 @@ async function main(): Promise<number> {
         limit: { type: 'string' },
         effort: { type: 'string' },
         full: { type: 'boolean' },
+        'dry-run': { type: 'boolean' },
+        stubs: { type: 'string' },
+        'stubs-init': { type: 'string' },
+        'default-stubs': { type: 'boolean' },
+        'exec-code': { type: 'boolean' },
+        'pause-at-gates': { type: 'boolean' },
+        // Repeatable: `--input a=1 --input b=2` yields ['a=1', 'b=2'] (#2554).
+        input: { type: 'string', multiple: true },
       },
       allowPositionals: true,
       strict: false, // Allow unknown flags to pass through
@@ -329,6 +378,7 @@ async function main(): Promise<number> {
   const fromBranch =
     (values.from as string | undefined) ?? (values['from-branch'] as string | undefined);
   const baseBranch = values.base as string | undefined;
+  const workflowSourceFlag = values['workflow-source'] as string | undefined;
   const noWorktree = values['no-worktree'] as boolean | undefined;
   const folderFlag = values.folder as boolean | undefined;
   const containerFlag = values.container as boolean | undefined;
@@ -336,6 +386,12 @@ async function main(): Promise<number> {
   const spawnFlag = values.spawn as boolean | undefined;
   const jsonFlag = values.json as boolean | undefined;
   const detachFlag = values.detach as boolean | undefined;
+  const dryRunFlag = values['dry-run'] as boolean | undefined;
+  const stubsPath = values.stubs as string | undefined;
+  const stubsInitPath = values['stubs-init'] as string | undefined;
+  const defaultStubsFlag = values['default-stubs'] as boolean | undefined;
+  const execCodeFlag = values['exec-code'] as boolean | undefined;
+  const pauseAtGatesFlag = values['pause-at-gates'] as boolean | undefined;
   // Handle help flag
   if (values.help) {
     printUsage();
@@ -412,6 +468,10 @@ async function main(): Promise<number> {
       if (repoRoot) {
         // Use repo root as working directory (handles subdirectory case)
         effectiveCwd = repoRoot;
+      } else if (dryRunFlag && command === 'workflow' && subcommand === 'run') {
+        // Dry-run only discovers workflow files and simulates in memory. It does
+        // not need project registration, a database lookup, or a git worktree.
+        effectiveCwd = cwd;
       } else {
         // Not a git repo. It may still be a registered FOLDER project (a
         // multi-repo root or plain ops folder). Consult the DB before rejecting.
@@ -566,10 +626,50 @@ async function main(): Promise<number> {
               );
               return 1;
             }
+            // `--workflow-source` picks the authoring directory. It is fresh-run only:
+            // a resume executes the source its run already captured, so accepting a
+            // different one here would promise a swap that cannot happen.
+            let workflowSource: string | undefined;
+            if (workflowSourceFlag !== undefined) {
+              if (resumeFlag) {
+                console.error(
+                  'Error: --workflow-source and --resume are mutually exclusive.\n' +
+                    '  A resumed run executes the source it captured when it started.\n' +
+                    '  Drop --workflow-source, or start a fresh run to pick up new source.'
+                );
+                return 1;
+              }
+              if (containerFlag) {
+                // A container run executes inside the container, which mounts the folder
+                // project and nothing else. The capture lives outside that mount, so a
+                // separate source root could be frozen but never read — the run would
+                // fail looking for its own commands. Refuse the combination rather than
+                // ship a flag that silently does not apply.
+                console.error(
+                  'Error: --workflow-source and --container are mutually exclusive.\n' +
+                    '  A container run reads source from the project it mounts.\n' +
+                    '  Run without --container to execute source from another directory.'
+                );
+                return 1;
+              }
+              workflowSource = resolve(workflowSourceFlag);
+              if (!(await isPathDirectory(workflowSource))) {
+                console.error(
+                  `Error: --workflow-source is not a directory: ${workflowSource}\n` +
+                    '  Point it at the checkout holding .archon/workflows/.'
+                );
+                return 1;
+              }
+            }
             const options = {
               branchName,
               fromBranch,
               baseBranch,
+              // `--workflow-source` selects WHERE the workflow is read from; `--cwd`
+              // continues to select what it acts on. Reusing `discoveryCwd` keeps one
+              // internal concept: the directory discovery searches, which the run then
+              // freezes as its source.
+              discoveryCwd: workflowSource,
               noWorktree,
               folder: folderFlag,
               container: containerFlag,
@@ -583,12 +683,27 @@ async function main(): Promise<number> {
               conversationId: values['conversation-id'] as string | undefined,
               detach: detachFlag,
               json: jsonFlag,
+              dryRun: dryRunFlag,
+              stubsPath,
+              stubsInitPath,
+              defaultStubs: defaultStubsFlag,
+              execCode: execCodeFlag,
+              pauseAtGates: pauseAtGatesFlag,
+              // Raw `name=value` assignments; parsed at the invocation gate (#2554).
+              inputs: values.input as string[] | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;
           }
 
           case 'status':
+            if (positionals[2] !== undefined) {
+              console.error(
+                'Usage: archon workflow status [--json] [--verbose] [--events]\n' +
+                  'To show a single run, use: archon workflow get <run-id>'
+              );
+              return 1;
+            }
             await workflowStatusCommand(
               jsonFlag,
               values.verbose as boolean | undefined,
@@ -598,7 +713,7 @@ async function main(): Promise<number> {
 
           case 'get': {
             const getRunId = positionals[2];
-            if (!getRunId) {
+            if (!getRunId || positionals[3] !== undefined) {
               console.error('Usage: archon workflow get <run-id> [--json] [--verbose] [--events]');
               return 1;
             }
@@ -638,7 +753,7 @@ async function main(): Promise<number> {
               console.error('Usage: archon workflow resume <run-id>');
               return 1;
             }
-            await workflowResumeCommand(resumeRunId, jsonFlag, effectiveCwd);
+            await workflowResumeCommand(resumeRunId, jsonFlag, effectiveCwd, detachFlag);
             break;
           }
 
@@ -665,7 +780,13 @@ async function main(): Promise<number> {
             const rawApproveComment =
               (values.comment as string | undefined) || positionals.slice(3).join(' ');
             const approveComment = rawApproveComment.length > 0 ? rawApproveComment : undefined;
-            await workflowApproveCommand(approveRunId, approveComment, jsonFlag, effectiveCwd);
+            await workflowApproveCommand(
+              approveRunId,
+              approveComment,
+              jsonFlag,
+              effectiveCwd,
+              detachFlag
+            );
             break;
           }
 
@@ -678,7 +799,38 @@ async function main(): Promise<number> {
             const rawRejectReason =
               (values.reason as string | undefined) || positionals.slice(3).join(' ');
             const rejectReason = rawRejectReason.length > 0 ? rawRejectReason : undefined;
-            await workflowRejectCommand(rejectRunId, rejectReason, jsonFlag, effectiveCwd);
+            await workflowRejectCommand(
+              rejectRunId,
+              rejectReason,
+              jsonFlag,
+              effectiveCwd,
+              detachFlag
+            );
+            break;
+          }
+
+          case 'respond': {
+            const respondRunId = positionals[2];
+            const decision = positionals[3];
+            if (!respondRunId || !decision) {
+              console.error('Usage: archon workflow respond <run-id> <decision> [text]');
+              console.error(
+                "  'approve' and 'reject' are sugar for the equivalent dedicated commands; " +
+                  'any other decision must be one the gate actually declared.'
+              );
+              return 1;
+            }
+            const rawRespondText =
+              (values.text as string | undefined) || positionals.slice(4).join(' ');
+            const respondText = rawRespondText.length > 0 ? rawRespondText : undefined;
+            await workflowRespondCommand(
+              respondRunId,
+              decision,
+              respondText,
+              jsonFlag,
+              effectiveCwd,
+              detachFlag
+            );
             break;
           }
 
@@ -741,14 +893,14 @@ async function main(): Promise<number> {
             const eventType = values.type as string | undefined;
             if (!runId) {
               console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
               );
               console.error('Error: --run-id is required');
               return 1;
             }
             if (!eventType) {
               console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
               );
               console.error('Error: --type is required');
               return 1;
@@ -769,7 +921,7 @@ async function main(): Promise<number> {
                 );
               }
             }
-            await workflowEventEmitCommand(runId, eventType, eventData);
+            await workflowEventEmitCommand(runId, eventType, eventData, effectiveCwd);
             break;
           }
 
@@ -1049,17 +1201,28 @@ async function main(): Promise<number> {
 // Exit explicitly so a lingering handle (DB pool, spawned child, timer) can
 // never leave the CLI hanging after its work is done.
 //
-// This is safe for piped output because every machine-readable payload is
-// emitted through `writeStdout()`/`writeJsonLine()` (src/utils/stdout.ts), which
-// resolves only once the bytes have reached the OS. The #2384 truncation
-// happened inside `console.log` at call time — not at exit — so deferring the
-// exit would not have recovered it.
-main()
-  .then(exitCode => {
-    process.exit(exitCode);
-  })
-  .catch((error: unknown) => {
-    const err = error as Error;
-    console.error('Fatal error:', err.message);
-    process.exit(1);
-  });
+// `flushPendingWrites()` is awaited BEFORE `process.exit()` because every
+// `console.log` written through the pipe-safe shim is fire-and-forget
+// (src/utils/safe-console.ts): the stream callback that resolves the per-
+// write promise fires asynchronously, and `process.exit()` does not drain
+// `process.stdout`'s pending writes. Without this flush a very-slow reader
+// (e.g. `archon … | { sleep 1; cat; }`) would re-introduce the silent-exit-0
+// truncation the shim is meant to eliminate — see R1 in the review report.
+//
+// The `--json` paths do not need this because every JSON emitter already
+// awaits `writeStdout` / `writeJsonLine` at the call site
+// (src/utils/stdout.ts); the shim only adds the fire-and-forget shape that
+// the human-readable call surface requires.
+//
+// The drain runs on BOTH exits — success and fatal — so a `main()` rejection
+// does not get to drop queued stdout bytes just because it is exiting non-
+// zero. Splitting the two arms' exit logic would re-open the R9 latency:
+// a fatal rejection against a slow reader would truncate and exit 1,
+// producing the same silent stdout loss the patch is meant to eliminate.
+// The chain wiring — `main().then(exitWithDrain).catch(...)` — lives in
+// `withDrainedExit` (`./utils/exit-with-drain.ts`) so cli.ts and the R9
+// regression test fixture share a single source of truth. A regression
+// that swaps this call for a direct `process.exit` is caught by the
+// static-contract test in `safe-console.test.ts`, which reads this file
+// as text.
+withDrainedExit(main);

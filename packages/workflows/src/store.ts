@@ -7,19 +7,32 @@
  */
 import type {
   WorkflowRun,
+  WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
   WorkflowNodeSession,
+  WorkflowRunNodeSession,
 } from './schemas';
+import type { TokenUsage } from '@archon/providers/types';
 
-export type { WorkflowNodeSession } from './schemas';
+export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
+
+/**
+ * One completed node's persisted result, as rehydrated for resume (#2637).
+ * `structuredOutput` is the logical value the node's `node_completed` event carried
+ * under `structured_output`; absent for text-only nodes and rows persisted before
+ * the key existed — those degrade to text re-parsing, the pre-#2637 behavior.
+ */
+export interface PersistedNodeOutput {
+  output: string;
+  structuredOutput?: unknown;
+}
 
 export interface DagResumeSnapshot {
-  completedNodeOutputs: Map<string, string>;
-  tokens: {
-    input: number;
-    output: number;
-  };
+  completedNodeOutputs: Map<string, PersistedNodeOutput>;
+  tokens?: TokenUsage;
+  /** Cumulative USD cost persisted by completed and failed node attempts across prior passes. */
+  costUsd: number;
 }
 
 /** Composite primary key identifying a single persisted node session row. */
@@ -45,6 +58,14 @@ export const WORKFLOW_EVENT_TYPES = [
   'node_failed',
   'node_skipped',
   'node_skipped_prior_success',
+  // #2402 — written when a cached prior-success node is invalidated because a
+  // dependency re-executed during the current resume (e.g. an `always_run: true`
+  // upstream, or any dep that re-ran with fresh output). `data.prior_output` is the
+  // stale cached value being thrown away; `data.invalidating_deps` lists the
+  // upstream node ids whose current output no longer matches the prior snapshot.
+  // The audit counterpart to the resume cache invalidation; absence never implies
+  // the cache was honored — a skipped node only writes `node_skipped_prior_success`.
+  'node_prior_cache_invalidated',
   'node_always_run_reset',
   'loop_iteration_started',
   'loop_iteration_completed',
@@ -80,6 +101,12 @@ export const WORKFLOW_EVENT_TYPES = [
   // `$ARTIFACTS_DIR/evidence.json` was absent at completion time — the run was
   // refused terminal `completed` and marked failed. Data carries the expected path.
   'evidence_validation_failed',
+  // #2213 — keys the engine dropped from this run's workflow YAML. Written by the
+  // executor at run start for EVERY run that has them, whatever surface started
+  // it, so the record does not depend on a chat/console notification being
+  // deliverable. `data.warnings` is the message list. Absence means the YAML was
+  // clean OR the run predates this event type — never that delivery failed.
+  'workflow_parse_warnings',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
@@ -106,9 +133,25 @@ export interface IRunTreeStore {
   getRunAncestry(runId: string): Promise<WorkflowRun[]>;
 }
 
-export interface IWorkflowStore extends IRunTreeStore {
+export interface IWorkflowRunNodeSessionStore {
+  listWorkflowRunNodeSessions(workflowRunId: string): Promise<readonly WorkflowRunNodeSession[]>;
+  upsertWorkflowRunNodeSession(params: {
+    workflow_run_id: string;
+    node_id: string;
+    provider: string;
+    provider_session_id: string;
+  }): Promise<void>;
+}
+
+export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionStore {
   // Run lifecycle
   createWorkflowRun(data: {
+    /**
+     * Caller-reserved row id, from `prepareWorkflowSource`. Supplied when the run's
+     * frozen workflow source had to be written at this run's own artifacts path before
+     * the row existed. Omitted, the store generates one.
+     */
+    id?: string;
     workflow_name: string;
     conversation_id: string;
     codebase_id?: string;
@@ -153,9 +196,17 @@ export interface IWorkflowStore extends IRunTreeStore {
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
   failOrphanedRuns(): Promise<{ count: number }>;
   resumeWorkflowRun(id: string): Promise<WorkflowRun>;
+  /**
+   * `output_root` (#2200) is write-once: the executor sets it at run start only
+   * when the persisted value is null. Re-writing it on resume would re-derive
+   * the path from a possibly-renamed codebase and orphan the run's artifacts,
+   * defeating the whole point of persisting it.
+   */
   updateWorkflowRun(
     id: string,
-    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata'>>
+    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+      outcome?: WorkflowRunOutcome;
+    }
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
@@ -172,6 +223,26 @@ export interface IWorkflowStore extends IRunTreeStore {
     approvalContext: ApprovalContext,
     extraMetadata?: Record<string, unknown>
   ): Promise<void>;
+
+  /**
+   * Rewrite the approval context of an ALREADY-paused, still-open gate — unlike
+   * `pauseWorkflowRun`, which requires the run to currently be `'running'` and so
+   * cannot be used once a pause has already landed. CAS-guarded on the gate still
+   * being unresolved: a human who resolves the gate first wins the race, and this
+   * returns `resolved: false` instead of clobbering their resolution.
+   *
+   * Built for #2707 step 3's pause escalation: a `loop_group` body gate pauses
+   * generically (via `pauseWorkflowRun`, `nodeId` = the gate's own bare id), and
+   * this then rewrites `nodeId` to the enclosing loop_group's id (so the
+   * top-level DAG's resume walk finds it) and adds `bodyGateId` (the gate's
+   * original id, otherwise lost). Pass the COMPLETE rewritten `ApprovalContext`,
+   * not a partial one — the write merges into stored metadata, and an omitted
+   * field can survive from the prior context on one dialect and not the other.
+   */
+  rewriteApprovalContext(
+    id: string,
+    approvalContext: ApprovalContext
+  ): Promise<{ resolved: boolean }>;
 
   /**
    * Atomically CLAIM the container write-back apply before the live root is mutated

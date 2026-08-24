@@ -24,6 +24,7 @@ import {
   toRepoPath,
   toWorktreePath,
   toBranchName,
+  CanonicalRepoPathUnavailableError,
 } from '@archon/git';
 import type { WorktreeBaseOverride } from '@archon/git';
 import { getArchonWorkspacesPath } from '@archon/paths';
@@ -47,6 +48,35 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('isolation.worktree');
   return cachedLog;
+}
+
+/**
+ * Resolve the anchors from which Git worktree commands should run.
+ *
+ * External `--separate-git-dir` repositories do not record a reverse path to
+ * their primary checkout. The exact linked checkout is valid while it exists;
+ * its common Git directory remains usable after that checkout is removed.
+ */
+interface GitCommandAnchors {
+  active: RepoPath;
+  durable: RepoPath;
+}
+
+async function getGitCommandAnchors(path: string): Promise<GitCommandAnchors> {
+  try {
+    const canonicalPath = await getCanonicalRepoPath(path);
+    return { active: canonicalPath, durable: canonicalPath };
+  } catch (error) {
+    if (error instanceof CanonicalRepoPathUnavailableError) {
+      return {
+        active: toRepoPath(path),
+        // The exact checkout may be removed by destroy(), while Git's common
+        // directory remains a valid anchor for prune and branch cleanup.
+        durable: toRepoPath(error.commonGitDir),
+      };
+    }
+    throw error;
+  }
 }
 
 /**
@@ -210,9 +240,9 @@ export class WorktreeProvider implements IIsolationProvider {
     // Get canonical repo path - use provided path or derive from worktree
     let repoPath: string;
     if (options?.canonicalRepoPath) {
-      repoPath = options.canonicalRepoPath;
+      repoPath = (await getGitCommandAnchors(options.canonicalRepoPath)).durable;
     } else if (pathExists) {
-      repoPath = await getCanonicalRepoPath(worktreePath);
+      repoPath = (await getGitCommandAnchors(worktreePath)).durable;
     } else {
       // Path doesn't exist and no canonicalRepoPath provided - can't clean up branch
       // This is expected when worktree was already fully cleaned up externally
@@ -432,7 +462,7 @@ export class WorktreeProvider implements IIsolationProvider {
     let repoPath: RepoPath;
     let worktrees: WorktreeInfo[];
     try {
-      repoPath = await getCanonicalRepoPath(worktreePath);
+      repoPath = (await getGitCommandAnchors(worktreePath)).active;
       worktrees = await listWorktrees(repoPath);
     } catch (error) {
       getLog().error({ err: error, worktreePath }, 'worktree_query_failed');
@@ -498,7 +528,7 @@ export class WorktreeProvider implements IIsolationProvider {
     let repoPath: RepoPath;
     let worktrees: WorktreeInfo[];
     try {
-      repoPath = await getCanonicalRepoPath(path);
+      repoPath = (await getGitCommandAnchors(path)).active;
       worktrees = await listWorktrees(repoPath);
     } catch (error) {
       const err = error as Error;
@@ -913,15 +943,24 @@ export class WorktreeProvider implements IIsolationProvider {
    * Returns `configLoadFailed: true` when no config was provided and the
    * internal fallback load of the config fails — so the caller can surface
    * a warning without blocking worktree creation.
+   *
+   * `.archon` used to be copied unconditionally, because it was the only way a
+   * workflow's own commands and scripts could be seen from inside the worktree it
+   * executed against. That is now handled by the run's own source capture
+   * (`@archon/workflows` `workflow-source.ts`), which keeps the source outside the
+   * target entirely. The implicit copy is gone because it was never scoped to
+   * executable source: it also carried `.archon/.env`, cross-run `state/`, and any
+   * other ignored content, overwrote the worktree's own tracked `.archon` files, and
+   * put all of it into the target's `git status` and its validators' inputs.
+   *
+   * An operator who still wants `.archon` (or anything else) in a worktree lists it
+   * under `worktree.copyFiles`, which is unchanged and still honored verbatim.
    */
   private async copyConfiguredFiles(
     canonicalRepoPath: string,
     worktreePath: string,
     worktreeConfig?: { baseBranch?: string; copyFiles?: string[] } | null
   ): Promise<{ configLoadFailed: boolean }> {
-    // Default files to always copy
-    const defaultCopyFiles = ['.archon'];
-
     // Load user config - log errors and set configLoadFailed, but don't fail worktree creation
     let userCopyFiles: string[] = [];
     let configLoadFailed = false;
@@ -944,8 +983,8 @@ export class WorktreeProvider implements IIsolationProvider {
       }
     }
 
-    // Merge defaults with user config (Set deduplicates)
-    const copyFiles = [...new Set([...defaultCopyFiles, ...userCopyFiles])];
+    // Only what the operator explicitly configured. Set deduplicates a repeated entry.
+    const copyFiles = [...new Set(userCopyFiles)];
 
     if (copyFiles.length === 0) {
       return { configLoadFailed };

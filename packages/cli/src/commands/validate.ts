@@ -22,6 +22,7 @@ import type {
   ScriptValidationResult,
 } from '@archon/workflows/validator';
 import { loadConfig, loadRepoConfig } from '@archon/core';
+import { parseClaudeSettingSources } from '@archon/providers';
 
 /**
  * Build ValidationConfig from the repo's .archon/config.yaml
@@ -107,7 +108,7 @@ export async function validateWorkflowsCommand(
   }
 
   // Validate successfully parsed workflows (Level 3)
-  for (const { workflow, source } of workflowEntries) {
+  for (const { workflow, source, parseWarnings } of workflowEntries) {
     const issues = await validateWorkflowResources(
       workflow,
       cwd,
@@ -117,9 +118,25 @@ export async function validateWorkflowsCommand(
         assistant: mergedConfig.assistant,
         aliases: mergedConfig.aliases,
         tiers: mergedConfig.tiers,
+        // Normalize through the provider's own parser: config YAML is not schema
+        // -validated, so an unrecognized entry must be dropped here exactly as it
+        // is at run time, or validation and execution disagree about the node's
+        // effective sources.
+        claudeSettingSources: parseClaudeSettingSources(
+          mergedConfig.assistants.claude?.settingSources
+        ).value,
+        claudeConfigDir: mergedConfig.envVars?.CLAUDE_CONFIG_DIR,
       },
       defaultProvider
     );
+
+    // Surface parse-time unknown-key warnings (#2213) as validation issues
+    if (parseWarnings && parseWarnings.length > 0) {
+      for (const warning of parseWarnings) {
+        issues.push({ level: 'warning', field: 'unknown_key', message: warning });
+      }
+    }
+
     results.push(makeWorkflowResult(workflow.name, issues));
   }
 

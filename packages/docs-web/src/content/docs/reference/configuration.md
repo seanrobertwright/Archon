@@ -29,7 +29,7 @@ Archon supports a layered configuration system with sensible defaults, optional 
 └── config.yaml             # Global configuration (optional)
 ```
 
-Home-scoped `workflows/`, `commands/`, and `scripts/` apply to every project on the machine. Repo-local files at `<repoRoot>/.archon/{workflows,commands,scripts}/` override them by filename (or script name). Each directory supports one level of subfolders for grouping; deeper nesting is ignored. See [Global Workflows](/guides/global-workflows/) for details and dotfiles-sync examples.
+Home-scoped `workflows/`, `commands/`, and `scripts/` apply to every project on the machine. Repo-local legacy/shared files at `<repoRoot>/.archon/{workflows,commands,scripts}/` override them by filename (or script name). Shared/grouped layouts support one subfolder; packaged workflows use exactly `workflows/<pack>/<workflow>/` with one YAML directly inside. Package-owned commands and scripts do not fall through across scopes. See [Global Workflows](/guides/global-workflows/) for details and dotfiles-sync examples.
 
 ### Repository-Level (.archon/)
 
@@ -138,7 +138,7 @@ commands:
 worktree:
   baseBranch: main  # Optional: auto-detected from git when not set
   copyFiles:  # Optional: Gitignored files/dirs to copy into new worktrees.
-              # `.archon/` is always copied automatically — don't list it.
+              # Nothing is copied unless you list it here.
     - .env
     - .vscode               # Copy entire directory
     - plans/                # Local plans not committed to the team repo
@@ -186,7 +186,18 @@ without a `tiers:` block. Other providers must configure any tier they use, or r
 
 ### Claude settingSources
 
-Controls which sources the Claude Agent SDK loads during sessions — `CLAUDE.md`, skills, commands, agents, and hooks:
+Controls which sources the Claude Agent SDK discovers during sessions — `CLAUDE.md`, skills, commands, agents, and hooks. In workflow nodes, discovery does not activate ambient skills: the node's `skills:` list remains the exact active set, and omission/`[]` selects none.
+
+A declared skill that is installed on disk must live under a source that remains
+enabled — `settingSources: ['project']` cannot select a user-global skill, for
+instance — and Archon rejects that mismatch before provider spend. Names that are
+absent from disk entirely, such as Claude's built-in skills and plugin-qualified
+`plugin:skill` entries, are left to the SDK to resolve.
+
+Unrecognized entries are dropped rather than ignored: `settingSources: ['projct']`
+resolves to no sources and logs `claude.setting_sources_invalid_entries`. A typo
+therefore narrows and reports itself, instead of falling back to the permissive
+`['project', 'user']` default.
 
 | Value | Description |
 |-------|-------------|
@@ -210,7 +221,23 @@ Set in `~/.archon/config.yaml` (global) or `.archon/config.yaml` (repo-specific)
 
 `git worktree add` only copies **tracked** files into a new worktree. Anything gitignored — secrets, local planning docs, agent reports, IDE settings, data fixtures — is absent by default. Archon's `worktree.copyFiles` closes that gap: after the worktree is created, each listed path is copied from the canonical repo into the worktree via raw filesystem copy (not git), so gitignored content comes along for the ride.
 
-**Defaults — no config needed for the common case.** `.archon/` is always copied automatically. If you gitignore `.archon/` (or it's just not committed), your custom commands, workflows, and scripts still reach every worktree. You do not need to list `.archon/` in `copyFiles` — it's merged in for you.
+**Nothing is copied unless you list it.** Archon used to copy `.archon/` into every worktree automatically, because that was the only way a workflow's own commands and scripts could be found from inside the worktree it was running against. Runs now carry their own source (see below), so the implicit copy is gone.
+
+If you relied on it — most often for a gitignored `.archon/config.yaml` holding local settings — add it explicitly:
+
+```yaml
+worktree:
+  copyFiles:
+    - .archon
+```
+
+You do **not** need this for workflows, commands, or scripts. Those are captured by the run itself, including uncommitted ones.
+
+**Workflow source no longer travels through the worktree.** When a run starts, Archon freezes the workflow's own `.archon/workflows`, `.archon/commands`, and `.archon/scripts` — plus your home-scoped `~/.archon/` source, so a statically included global workflow is frozen too — into that run's artifacts directory, and resolves them from there for the run's whole life. Three consequences:
+
+- The worktree stays clean. Authoring files never appear in its `git status`, and repo validators no longer see packages that came from somewhere else.
+- Editing or deleting the authoring checkout mid-run does not change a run already in flight. A resumed run executes the source it started with; the next fresh run picks up your edits.
+- Uncommitted workflows work against any target, with no commit, push, or merge — see `--workflow-source` in the [CLI reference](/reference/cli/).
 
 **Common entries:**
 
@@ -233,7 +260,7 @@ worktree:
 - Per-entry failures are isolated — one bad entry won't abort the rest. Non-ENOENT failures (permissions, disk full) are surfaced as warnings on the environment.
 - Path-traversal attempts (entries resolving outside the repo root, or absolute paths on a different drive) are rejected — the entry is logged and skipped.
 
-**Interaction with `worktree.path`:** The copy step runs identically whether worktrees live under `~/.archon/workspaces/<owner>/<repo>/worktrees/` (default) or inside the repo at `<repoRoot>/<worktree.path>/` (repo-local). Both layouts get the same gitignored-file treatment.
+**Interaction with `worktree.path`:** The copy step runs identically (and is still a no-op with no `copyFiles`) whether worktrees live under `~/.archon/workspaces/<owner>/<repo>/worktrees/` (default) or inside the repo at `<repoRoot>/<worktree.path>/` (repo-local). Both layouts get the same gitignored-file treatment.
 
 **Defaults behavior:** The app's bundled default commands and workflows are loaded at runtime and merged with repo-specific ones. Repo commands/workflows override app defaults by name. Set `defaults.loadDefaultCommands: false` or `defaults.loadDefaultWorkflows: false` to disable runtime loading.
 
@@ -299,7 +326,36 @@ container:
   write_back: approve # 'approve' (default) pauses at a write-back gate; 'auto' applies without pausing
 ```
 
-**Prerequisites:** Docker, and the runner image built once with `bun run build:runner-image` (tags `archon-runner:<version>` + `:latest`). Container mode is **folder-project-only** (a repo project errors). Pausing workflows (approval/interactive gates) **are** supported — a pause `docker stop`s the container (near-zero resources while awaiting a decision) and resume rediscovers and restarts it. `$ARTIFACTS_DIR` is not mounted into the container (see [variables](/reference/variables/)). For the full flow, pause economics, and security posture, see the [Container isolation guide](/guides/container-isolation/) and `packages/isolation/docker/SECURITY.md`.
+**Prerequisites:** Docker, and the runner image built once with `bun run build:runner-image` (tags `archon-runner:<version>` + `:latest`). Container mode is **folder-project-only** (a repo project errors). Pausing workflows (approval/interactive gates) **are** supported — a pause `docker stop`s the container (near-zero resources while awaiting a decision) and resume rediscovers and restarts it. Neither `$ARTIFACTS_DIR` nor `$STATE_DIR` is mounted into the container — see [Container runs and run output](#container-runs-and-run-output) below. For the full flow, pause economics, and security posture, see the [Container isolation guide](/guides/container-isolation/) and `packages/isolation/docker/SECURITY.md`.
+
+### Container runs and run output
+
+Container runs are the one place where a run's output is **not** addressable from the host
+filesystem by run id. This is a documented limitation, not an oversight — the accurate
+picture:
+
+- A container run has exactly two mounts: the project root at `/mnt/lower` (read-only) and
+  the per-run overlay volume at `/mnt/upper`. `ARCHON_HOME` is never mounted.
+- `ARTIFACTS_DIR` and `STATE_DIR` reach the container only as environment variables, so a
+  node that writes to either from *inside* the container writes into the container's own
+  ephemeral layer, not to the host.
+- The container is **not** destroyed when the run completes. It is removed by the cleanup
+  service (7-day stale window by default) or by an explicit teardown, and `destroy()`
+  removes the container *and* its volume. Until then those files remain readable with
+  `docker exec`.
+
+Net effect: container-run output is a roughly 7-day TTL on an ephemeral container layer,
+reachable by `docker exec`, and **not** addressable by run id from the host. Retrieval is
+therefore non-uniform — "point an agent at run X's artifacts" is a filesystem path for
+every other run, and a `docker exec` into a specific container within the cleanup window
+for a container run. The blast radius is bounded: container mode is folder-projects-only
+and works only with `containerExec`-capable providers.
+
+**Workaround.** A node whose output must reach the host should write into the **project
+root** — the node's working directory inside the container, which is the overlay mount —
+rather than into `$ARTIFACTS_DIR` / `$STATE_DIR`. A plain relative path does this. Writes
+there ride the existing overlay diff plus the approval-gated write-back, so they do land on
+the host.
 
 ## Environment Variables
 
@@ -463,7 +519,7 @@ Signup uses email + password (no email verification by default). **Signup postur
 
 ### Telemetry
 
-Archon sends a few anonymous events — `archon_started` (once per process), `archon_active` (daily server heartbeat), `chat_turn_handled` (direct chat turn — platform, provider, model, duration, and usage totals; never message content), `workflow_invoked` (workflow start), `workflow_completed`/`workflow_failed` (run outcome), `workflow_approval_resolved` (binary approve/reject), and `codebase_registered` (pure count — no name/path/URL). Categorical only: workflow name (real for bundled workflows, `"custom"` for your own), platform, provider id (model id on `workflow_invoked`), node shape and feature flags, outcome/duration, aggregate usage totals (tokens/cost/loop iterations), a fixed-enum failure class (never error text), deployment shape (adapter/db/auth booleans), OS/arch/version, and a random install UUID. No code, prompts, paths, IP, geo, or error text. Any one of the variables below disables it. See `archon telemetry status` to inspect the live state.
+Archon sends a few anonymous events — `archon_started` (once per process), `archon_active` (daily server heartbeat), `chat_turn_handled` (direct chat turn — platform, provider, model, duration, and usage totals; never message content), `workflow_invoked` (workflow start), `workflow_completed`/`workflow_failed` (run outcome), `workflow_approval_resolved` (binary approve/reject), and `codebase_registered` (pure count — no name/path/URL). Categorical only: workflow name (real for bundled workflows, `"custom"` for your own), platform, provider id (model id on `workflow_invoked`), node shape and feature flags, outcome/duration, aggregate provider-reported usage (gross input, output, optional cache-read/cache-write totals plus a flag when those totals are a floor, cost, and loop iterations), a fixed-enum failure class (never error text), deployment shape (adapter/db/auth booleans), OS/arch/version, and a random install UUID. No code, prompts, paths, IP, geo, or error text. Any one of the variables below disables it. See `archon telemetry status` to inspect the live state.
 
 | Variable | Description | Default |
 | --- | --- | --- |

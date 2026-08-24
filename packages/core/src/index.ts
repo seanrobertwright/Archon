@@ -69,6 +69,10 @@ export {
   registerGitHubAppAuthProvider,
 } from './workflows/store-adapter';
 
+// Per-child isolation resolver factory (#2121 slice 2, PR-A)
+export { createChildWorktreeResolver } from './workflows/child-isolation-resolver';
+export type { ChildWorktreeResolverConfig } from './workflows/child-isolation-resolver';
+
 // Workflow Events DB
 export * as workflowEventDb from './db/workflow-events';
 
@@ -266,4 +270,4 @@ export { isPathWithinWorkspace, validateAndResolvePath } from './utils/path-vali
 export { getPort } from './utils/port-allocation';
 
 // Worktree sync
-export { syncArchonToWorktree } from './utils/worktree-sync';
+export { resolveWorkflowSourceRoot } from './utils/workflow-source-root';

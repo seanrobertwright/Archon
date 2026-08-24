@@ -31,6 +31,7 @@ import {
   updateWorkflowActivity,
   findResumableRun,
   findResumableRunByParentConversation,
+  cancelResumableRunsForConversation,
   resumeWorkflowRun,
   pauseWorkflowRun,
   cancelWorkflowRun,
@@ -260,6 +261,65 @@ describe('workflows database', () => {
       ]);
     });
 
+    test('updates authored outcome without touching lifecycle columns', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', { outcome: 'succeeded' });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('outcome = $1');
+      expect(query).not.toContain('status =');
+      expect(query).not.toContain('completed_at');
+      expect(params).toEqual(['succeeded', 'workflow-run-123']);
+    });
+
+    // output_root (#2200) is the durable pointer to a run's storage tree. It is
+    // write-once at the DB layer via COALESCE so a caller that forgets the
+    // null-guard cannot repoint a run mid-life and orphan its artifacts.
+    test('writes output_root through COALESCE so the first value wins', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', { output_root: '/home/u/.archon/ws/acme/x' });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('output_root = COALESCE(output_root, $1)');
+      expect(params).toEqual(['/home/u/.archon/ws/acme/x', 'workflow-run-123']);
+    });
+
+    test('output_root placeholder is numbered correctly alongside other fields', async () => {
+      // The SET clause is built by hand with positional placeholders, so an
+      // off-by-one here would silently bind the wrong value.
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', {
+        status: 'running',
+        metadata: { step: 'plan' },
+        outcome: 'failed',
+        output_root: '/root/x',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('status = $1');
+      expect(query).toContain('outcome = $3');
+      expect(query).toContain('output_root = COALESCE(output_root, $4)');
+      expect(params).toEqual([
+        'running',
+        JSON.stringify({ step: 'plan' }),
+        'failed',
+        '/root/x',
+        'workflow-run-123',
+      ]);
+    });
+
+    test('omitting output_root leaves it out of the SET clause entirely', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', { status: 'completed' });
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).not.toContain('output_root');
+    });
+
     test('updates multiple fields', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
@@ -282,7 +342,7 @@ describe('workflows database', () => {
   });
 
   describe('pauseWorkflowRun', () => {
-    test('pauses a running run and resets the gate resolution marker', async () => {
+    test('replaces the approval object rather than merging into it', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
       await pauseWorkflowRun('workflow-run-123', {
@@ -294,28 +354,27 @@ describe('workflows database', () => {
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'paused'");
       expect(query).toContain("AND status = 'running'");
-      // resolved must be an EXPLICIT null on every fresh pause: SQLite's
-      // json_patch deep-merges the new approval context into the stored one, so
-      // an omitted key would let a stale 'approved' from the previous gate
-      // survive and falsely block this gate (#2075).
-      const payload = JSON.parse(params[1] as string) as {
-        approval: Record<string, unknown>;
-      };
-      expect(payload.approval.resolved).toBeNull();
-      expect(payload.approval.nodeId).toBe('review');
-      // completionSignaled/signaledOutput follow the same explicit-null rule
-      // (#2074): standard approval pauses never set them, so they must be
-      // written as null (never omitted — JSON.stringify drops undefined and
-      // SQLite would keep a stale value from a previous interactive-loop gate).
-      expect(payload.approval.completionSignaled).toBeNull();
-      expect(payload.approval.signaledOutput).toBeNull();
-      // commandSnapshot (command-backed interactive loops) follows the same
-      // rule — a stale snapshot from a prior loop gate must never survive
-      // into an unrelated pause.
-      expect(payload.approval.commandSnapshot).toBeNull();
+      // The approval object is SET wholesale, never folded into the stored one —
+      // this suite runs the Postgres dialect, so it pins that branch of
+      // writeApprovalMetadata (#2673). Top-level run metadata still merges.
+      expect(query).toContain(
+        "metadata = jsonb_set(metadata || $2::jsonb, '{approval}', $3::jsonb, true)"
+      );
+
+      // $2 is run-level metadata (empty here); $3 is the complete gate context,
+      // bound separately so the replace can target it.
+      expect(JSON.parse(params[1] as string)).toEqual({});
+      // Exactly what the caller passed — no explicit-null reset list. Every field
+      // this gate leaves unset is absent, which is what makes a prior gate's value
+      // unable to survive at any depth.
+      expect(JSON.parse(params[2] as string)).toEqual({
+        nodeId: 'review',
+        message: 'Please review',
+        type: 'approval',
+      });
     });
 
-    test('preserves completionSignaled/signaledOutput when the gate provides them (#2074)', async () => {
+    test('preserves interactive-loop signal and usage fields when the gate provides them', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
       await pauseWorkflowRun('workflow-run-123', {
@@ -325,17 +384,40 @@ describe('workflows database', () => {
         iteration: 1,
         completionSignaled: true,
         signaledOutput: 'REPORT',
+        signaledTokens: { input: 40, output: 4, cacheRead: 20, cacheWrite: 0 },
+        signaledCostUsd: 0.02,
         commandSnapshot: 'Loaded command body',
       });
 
       const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      const payload = JSON.parse(params[1] as string) as {
-        approval: Record<string, unknown>;
-      };
-      expect(payload.approval.completionSignaled).toBe(true);
-      expect(payload.approval.signaledOutput).toBe('REPORT');
-      expect(payload.approval.commandSnapshot).toBe('Loaded command body');
-      expect(payload.approval.resolved).toBeNull();
+      const approval = JSON.parse(params[2] as string) as Record<string, unknown>;
+      expect(approval.completionSignaled).toBe(true);
+      expect(approval.signaledOutput).toBe('REPORT');
+      expect(approval.signaledTokens).toEqual({
+        input: 40,
+        output: 4,
+        cacheRead: 20,
+        cacheWrite: 0,
+      });
+      expect(approval.signaledCostUsd).toBe(0.02);
+      expect(approval.commandSnapshot).toBe('Loaded command body');
+      expect(approval.resolved).toBeUndefined();
+    });
+
+    test('folds caller-supplied run metadata into the same write', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await pauseWorkflowRun(
+        'workflow-run-123',
+        { nodeId: '__writeback__', message: 'Apply changes?', type: 'writeback' },
+        { pending_writeback: true }
+      );
+
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // Same atomic UPDATE, so there is no window where the run is paused
+      // without the marker (M3) — it merges at the top level, beside `approval`.
+      expect(JSON.parse(params[1] as string)).toEqual({ pending_writeback: true });
+      expect((JSON.parse(params[2] as string) as { nodeId: string }).nodeId).toBe('__writeback__');
     });
 
     test('throws when the run is not running', async () => {
@@ -410,7 +492,9 @@ describe('workflows database', () => {
         expect.any(Array)
       );
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining("AND status = 'running'"),
+        // Pending too: capture, artifact setup, and credential resolution all run before
+        // the row goes running, and a running-only guard left those failures pending forever.
+        expect.stringContaining("AND status IN ('running', 'pending')"),
         expect.any(Array)
       );
     });
@@ -428,7 +512,7 @@ describe('workflows database', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
 
       await expect(failWorkflowRun('workflow-run-123', 'some error')).rejects.toThrow(
-        'not found or not in running state'
+        'not found or already terminal'
       );
     });
   });
@@ -679,6 +763,62 @@ describe('workflows database', () => {
 
       await expect(findResumableRunByParentConversation('piv', 'conv-1', 'cb')).rejects.toThrow(
         'Failed to find resumable run by parent conversation: Connection refused'
+      );
+    });
+  });
+
+  describe('cancelResumableRunsForConversation', () => {
+    test('locks the conversation snapshot and atomically cancels only paused/failed rows', async () => {
+      const paused = { ...mockWorkflowRun, id: 'run-a', status: 'paused' as const };
+      const running = { ...mockWorkflowRun, id: 'run-b', status: 'running' as const };
+      const failed = { ...mockWorkflowRun, id: 'run-c', status: 'failed' as const };
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([paused, running, failed]))
+        .mockResolvedValueOnce(createQueryResult([], 2));
+
+      const result = await cancelResumableRunsForConversation('conv-1');
+
+      expect(result).toEqual([paused, failed]);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      const [selectSql, selectParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(selectSql).toContain('SELECT * FROM remote_agent_workflow_runs');
+      expect(selectSql).toContain('conversation_id = $1 OR parent_conversation_id = $2');
+      expect(selectSql).toContain('FOR UPDATE');
+      expect(selectParams).toEqual(['conv-1', 'conv-1']);
+      const [updateSql, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(updateSql).toContain("status IN ('paused', 'failed')");
+      expect(updateSql).not.toContain("'running'");
+      expect(updateSql).not.toContain("'pending'");
+      expect(updateSql).not.toContain('RETURNING');
+      expect(updateParams).toEqual(['conv-1', 'conv-1']);
+    });
+
+    test('returns without writing when the locked snapshot has nothing resumable', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
+      );
+
+      expect(await cancelResumableRunsForConversation('conv-1')).toEqual([]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('rolls back instead of reporting a stale snapshot count', async () => {
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([{ ...mockWorkflowRun, status: 'paused' as const }])
+        )
+        .mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Resumable run snapshot changed during reset'
+      );
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Failed to cancel resumable runs for conversation: Connection refused'
       );
     });
   });

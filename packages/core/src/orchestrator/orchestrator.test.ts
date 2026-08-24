@@ -5,7 +5,11 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import { createMockLogger } from '../test/mocks/logger';
-import { makeTestWorkflow, makeTestWorkflowList } from '@archon/workflows/test-utils';
+import {
+  makeTestWorkflow,
+  makeTestWorkflowList,
+  withObservableCapturedSource,
+} from '@archon/workflows/test-utils';
 import type { Conversation, Codebase, Session } from '../types';
 import { ConversationNotFoundError } from '../types';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
@@ -109,6 +113,11 @@ const mockGetProviderCapabilities = mock(() => ({
 mock.module('@archon/providers', () => ({
   getAgentProvider: mockGetAgentProvider,
   getProviderCapabilities: mockGetProviderCapabilities,
+  // `validEffortsForProvider` (@archon/workflows/model-validation) reads the
+  // registry to decide whether a tier's `effort` reaches this provider (#2556).
+  // Without this the REAL implementation runs against an empty registry and
+  // every provider looks unregistered.
+  isRegisteredProvider: mock(() => true),
   getRegisteredProviders: mock(() => []),
   // credentials/delivery (#1955) imports these from '@archon/providers'.
   PI_PROVIDER_ENV_VARS: { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY' },
@@ -146,13 +155,19 @@ const mockLoadConfig = mock(() =>
 
 mock.module('../config/config-loader', () => ({
   loadConfig: mockLoadConfig,
+  // orchestrator.ts imports createChildWorktreeResolver, which imports
+  // loadRepoConfig by name. This factory replaces the module process-wide, so
+  // omitting it fails that import at module-eval even though no test calls it.
+  loadRepoConfig: mock(() => Promise.resolve(null)),
 }));
 
-// Worktree sync mock
-const mockSyncArchonToWorktree = mock(() => Promise.resolve(false));
+// Workflow source root: undefined = "read the cwd", the non-worktree behavior.
+const mockResolveWorkflowSourceRoot = mock((_cwd: string) =>
+  Promise.resolve<string | undefined>(undefined)
+);
 
-mock.module('../utils/worktree-sync', () => ({
-  syncArchonToWorktree: mockSyncArchonToWorktree,
+mock.module('../utils/workflow-source-root', () => ({
+  resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
 }));
 
 // Orchestrator (isolation & dispatch) mocks
@@ -191,12 +206,52 @@ mock.module('../utils/error-formatter', () => ({
 mock.module('@archon/workflows/workflow-discovery', () => ({
   discoverWorkflowsWithConfig: mockDiscoverWorkflows,
 }));
+/** Ownership calls the dispatch path makes on its capture, in order. */
+const capturedSourceOwnerCalls: string[] = [];
+
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   hydrateResumableRun: mock(() => Promise.resolve(null)),
+  // Source capture runs before dispatch and does real filesystem work; stub it so these
+  // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
+  // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
+  prepareWorkflowSource: mock(() =>
+    Promise.resolve({
+      runId: 'prepared-run-id',
+      captureRoot: '/capture',
+      origin: '/origin',
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/origin',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/capture/project',
+        globalWorkflows: '/capture/global/workflows',
+        globalCommands: '/capture/global/commands',
+        globalScripts: '/capture/global/scripts',
+        bundledWorkflows: '/capture/bundled',
+      },
+    })
+  ),
+  recordSelectedWorkflow: mock(() => Promise.resolve()),
+  disposeWorkflowSource: mock(() => Promise.resolve()),
+  resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
+  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
+    withObservableCapturedSource(capturedSourceOwnerCalls, body)
+  ),
 }));
 mock.module('@archon/workflows/router', () => ({
   findWorkflow: mockFindWorkflow,
+  // Statically imported by the background dispatch path (see orchestrator.ts).
+  resolveWorkflowName: mock((name: string, workflows: { name: string }[]) =>
+    workflows.find(w => w.name === name)
+  ),
 }));
 mock.module('@archon/workflows/utils/tool-formatter', () => ({
   formatToolCall: mock((toolName: string, _toolInput: unknown) => `🔧 ${toolName.toUpperCase()}`),
@@ -326,7 +381,8 @@ function clearAllMocks(): void {
   mockDiscoverWorkflows.mockClear();
   mockExecuteWorkflow.mockClear();
   mockFindWorkflow.mockClear();
-  mockSyncArchonToWorktree.mockClear();
+  mockResolveWorkflowSourceRoot.mockClear();
+  mockResolveWorkflowSourceRoot.mockImplementation(() => Promise.resolve(undefined));
   mockValidateAndResolveIsolation.mockClear();
   mockDispatchBackgroundWorkflow.mockClear();
   mockBuildOrchestratorPrompt.mockClear();
@@ -620,7 +676,8 @@ describe('orchestrator-agent handleMessage', () => {
 
       expect(mockDiscoverWorkflows).toHaveBeenCalledWith(
         '/workspace/test-project',
-        expect.any(Function)
+        expect.any(Function),
+        undefined // non-worktree cwd: source root is the cwd itself
       );
       expect(platform.sendMessage).toHaveBeenCalledWith(
         'chat-456',
@@ -868,7 +925,9 @@ describe('orchestrator-agent handleMessage', () => {
         expect.anything(),
         expect.objectContaining({
           model: 'gpt-5.5',
-          assistantConfig: expect.objectContaining({ modelReasoningEffort: 'high' }),
+          // #2556: a tier's `effort` goes on the one nodeConfig channel for
+          // every provider; Codex translates it to modelReasoningEffort itself.
+          nodeConfig: expect.objectContaining({ effort: 'high' }),
         })
       );
       expect(mockGenerateAndSetTitle).toHaveBeenCalledWith(
@@ -1344,33 +1403,38 @@ describe('orchestrator-agent handleMessage', () => {
       expect(mockDiscoverWorkflows).toHaveBeenCalledTimes(2);
       expect(mockDiscoverWorkflows).toHaveBeenCalledWith(
         '/workspace/project',
-        expect.any(Function)
+        expect.any(Function),
+        undefined // non-worktree cwd: source root is the cwd itself
       );
     });
 
-    test('syncs .archon to worktree before repo workflow discovery', async () => {
+    test('discovers repo workflows from the authoring root, not the worktree', async () => {
+      // The old behavior copied the canonical repo's `.archon` INTO the worktree and then
+      // discovered from the worktree. Reading the authoring root directly finds the same
+      // workflows and writes nothing into the target.
       mockGetOrCreateConversation.mockResolvedValue(mockConversationWithProject);
       mockGetCodebase.mockResolvedValue(mockCodebase);
       mockClient.sendQuery.mockImplementation(async function* () {
         yield { type: 'assistant', content: 'Response' };
         yield { type: 'result', sessionId: 'session-id' };
       });
+      mockResolveWorkflowSourceRoot.mockImplementation(() =>
+        Promise.resolve('/workspace/canonical')
+      );
 
-      const callOrder: string[] = [];
-      mockSyncArchonToWorktree.mockImplementation(async () => {
-        callOrder.push('sync');
-        return false;
-      });
-      mockDiscoverWorkflows.mockImplementation(async (cwd: string) => {
-        // Only track repo-specific calls (those for the project path)
-        if (cwd === '/workspace/project') callOrder.push('discover-repo');
-        return { workflows: [], errors: [] };
-      });
+      const seenRoots: (string | undefined)[] = [];
+      mockDiscoverWorkflows.mockImplementation(
+        async (cwd: string, _loadConfig: unknown, roots?: { project: string | null }) => {
+          if (cwd === '/workspace/project') seenRoots.push(roots?.project ?? undefined);
+          return { workflows: [], errors: [] };
+        }
+      );
 
       await handleMessage(platform, 'chat-456', 'help');
 
-      expect(mockSyncArchonToWorktree).toHaveBeenCalledWith('/workspace/project');
-      expect(callOrder).toEqual(['sync', 'discover-repo']);
+      expect(mockResolveWorkflowSourceRoot).toHaveBeenCalledWith('/workspace/project');
+      // Discovery is pointed at the canonical repo's source, not the worktree's.
+      expect(seenRoots).toEqual(['/workspace/canonical']);
     });
 
     test('handles workflow discovery failure gracefully', async () => {

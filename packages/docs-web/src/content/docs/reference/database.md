@@ -37,6 +37,11 @@ DATABASE_URL=postgresql://user:password@host:5432/dbname
 
 **No manual migration step is required.** On startup, the Postgres adapter applies the bundled `migrations/000_combined.sql` inside an advisory-lock transaction. The SQL is idempotent (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`), so both fresh installs and version upgrades converge automatically — including new tables and columns added in later releases.
 
+Upgrades are verified, not assumed: CI applies the current schema on top of a database built from
+every distinct schema Archon has ever released, re-applies it to confirm idempotence, and compares
+the result against a fresh install — columns, indexes, column comments, constraints and sequences.
+Run the same check yourself against any PostgreSQL with `bun run check:schema-upgrades`.
+
 If schema application fails (permissions, syntax error, network), the process aborts at the first DB operation with the underlying Postgres error logged at `db.pg_schema_init_failed`.
 
 ## Local PostgreSQL via Docker
@@ -93,7 +98,7 @@ The database has 18 tables, all prefixed with `remote_agent_`:
 
 5. **`remote_agent_workflow_runs`** - Workflow execution tracking
    - Tracks active workflows per conversation
-   - Locks concurrent execution per `working_path`: a second dispatch on a path with an active run (status `pending`/`running`/`paused`) is auto-cancelled with an actionable message. Stale `pending` rows older than 5 minutes are treated as orphaned and ignored. A `workflow:` sub-run shares its parent's checkout, so the path-lock excludes the run's ancestor chain (via `parent_run_id`).
+   - Locks concurrent execution per `working_path`: a second dispatch on a path with an active run (status `pending`/`running`/`paused`) is auto-cancelled with an actionable message. Stale `pending` rows older than 5 minutes are treated as orphaned and ignored. A `workflow:` sub-run shares its parent's checkout unless the node declares `isolation: worktree`, so the path-lock excludes both the run's ancestor chain and its descendants (via `parent_run_id`) — a child never contends with its own parent. Siblings are **not** excluded.
    - Stores workflow state, step progress, and parent conversation linkage
    - Nullable `user_id` records which user triggered the run
    - Nullable `parent_run_id` (#2121 Phase 2) — self-referential FK (`ON DELETE SET NULL`) linking a `workflow:` sub-run to the run that spawned it; null for top-level runs. Makes the run tree walkable (`findChildRuns`/`getRunAncestry`) for the abandon cascade and cost roll-up.

@@ -26,7 +26,9 @@ export interface ClaudeProviderDefaults {
 export interface CodexProviderDefaults {
   [key: string]: unknown;
   model?: string;
-  /** Structurally matches @archon/workflows ModelReasoningEffort */
+  /** The Codex SDK's `ModelReasoningEffort`, restated by hand because this file
+   *  may not import an SDK. `CODEX_EFFORTS` in ./codex/config.ts pins the same
+   *  values to the SDK's own type, so upstream drift fails type-check there. */
   modelReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   /** Structurally matches @archon/workflows WebSearchMode */
   webSearchMode?: 'disabled' | 'cached' | 'live';
@@ -165,10 +167,61 @@ export type ProviderDefaultsMap = Record<string, ProviderDefaults>;
  * Token usage statistics from AI provider responses.
  */
 export interface TokenUsage {
+  /** Gross prompt input, including cache reads and writes reported separately. */
   input: number;
   output: number;
+  /** Provider-reported cached input. Absent means unsupported or unknown; zero is known. */
+  cacheRead?: number;
+  /** Provider-reported cache-creation input. Absent means unsupported or unknown; zero is known. */
+  cacheWrite?: number;
+  /**
+   * Set only by aggregation ({@link mergeTokenUsage}), never by a provider. When true the
+   * cache axes on this usage are a FLOOR: at least one contributing usage did not report
+   * that axis, so true cache use is at least the reported total and
+   * `input - cacheRead - cacheWrite` is an UPPER bound on full-price input rather than an
+   * exact figure. Absent means the cache totals are complete, or that no axis is present
+   * at all (#2662).
+   */
+  cachePartial?: true;
+  /** Total of gross input, output, and any provider-reported reasoning tokens. */
   total?: number;
   cost?: number;
+}
+
+/**
+ * Sum usages into one aggregate, keeping every cache figure that was actually reported.
+ *
+ * `input` and `output` always sum across every entry. Each cache axis sums over only the
+ * entries that define it and is emitted when at least one did, so a silent contributor
+ * NARROWS the total instead of erasing it; `cachePartial` then marks the result as a floor.
+ * Withholding the axis entirely, as this once did, left gross `input` standing beside no
+ * cache context at all and read as "nothing was cached" (#2662).
+ *
+ * An axis no entry reports stays absent, which already encodes "unknown" — that case is not
+ * flagged. The two axes are decided independently.
+ *
+ * Pure by design: callers own validation and logging, because their contexts differ (persisted
+ * JSON in @archon/core, non-finite guarding in @archon/workflows). Entries are expected to have
+ * finite `input`/`output` already; `total` and `cost` are not aggregated here.
+ */
+export function mergeTokenUsage(usages: readonly TokenUsage[]): TokenUsage | undefined {
+  if (usages.length === 0) return undefined;
+  const merged: TokenUsage = {
+    input: usages.reduce((sum, usage) => sum + usage.input, 0),
+    output: usages.reduce((sum, usage) => sum + usage.output, 0),
+  };
+  // A contribution that is itself a floor keeps the whole aggregate a floor.
+  let partial = usages.some(usage => usage.cachePartial === true);
+  for (const axis of ['cacheRead', 'cacheWrite'] as const) {
+    const reporters = usages.filter(usage => usage[axis] !== undefined);
+    if (reporters.length === 0) continue;
+    merged[axis] = reporters.reduce((sum, usage) => sum + (usage[axis] ?? 0), 0);
+    if (reporters.length < usages.length) partial = true;
+  }
+  if (partial && (merged.cacheRead !== undefined || merged.cacheWrite !== undefined)) {
+    merged.cachePartial = true;
+  }
+  return merged;
 }
 
 /** Concrete model identifier reported by a provider after a request completes. */
@@ -428,42 +481,6 @@ export const CONTAINER_ENV_DENYLIST: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Value-independent secret shapes, used to scrub text that may embed a credential.
- *
- * Lives here, beside the denylist, because the two are the same policy seen from
- * opposite ends: the denylist decides what is forwarded INTO a container, this
- * decides what must not survive on the way back OUT. It also has to live in a
- * package both `@archon/workflows` and `@archon/core` can import — core depends on
- * workflows, so the reverse import would be circular.
- *
- * 1. Issuer-anchored provider tokens.
- * 2. Any `-e NAME=value` whose NAME ends in a secret-ish word — the value-agnostic
- *    net, so a credential added later is covered without editing this list.
- */
-const SECRET_PATTERNS: readonly RegExp[] = [
-  /sk-ant-[A-Za-z0-9_-]{20,}/g,
-  /(-e\s+\w*(?:TOKEN|KEY|SECRET|PASSWORD)=)\S+/gi,
-];
-
-/**
- * Replace credential-shaped substrings with `[REDACTED]`, keeping the `-e NAME=`
- * prefix so a redacted command line still shows WHICH variable was passed — the
- * part that is useful when diagnosing a failure — without its value.
- */
-export function redactSecrets(input: string): string {
-  let result = input;
-  for (const pattern of SECRET_PATTERNS) {
-    // `replace` passes capture groups before the offset, so a pattern WITHOUT a
-    // group hands us the match offset (a number) as arg 2. Test the type, not
-    // truthiness — treating that offset as a prefix splices it into the output.
-    result = result.replace(pattern, (_match, prefix: unknown) =>
-      typeof prefix === 'string' ? `${prefix}[REDACTED]` : '[REDACTED]'
-    );
-  }
-  return result;
-}
-
-/**
  * Universal request options accepted by all providers.
  * Provider-specific fields go through `nodeConfig` and `assistantConfig` in SendQueryOptions.
  */
@@ -473,9 +490,20 @@ export interface AgentRequestOptions {
   systemPrompt?: SystemPromptInput;
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   env?: Record<string, string>;
+  /**
+   * Names in `env` whose values Archon injected as credentials rather than
+   * loading from project configuration. Custom provider configuration must not
+   * be allowed to select them.
+   */
+  protectedEnvKeys?: readonly string[];
   maxBudgetUsd?: number;
   fallbackModel?: string;
-  /** Session fork flag — when true, copies prior session history before appending. */
+  /**
+   * Request an immutable fork of `resumeSessionId`. Exact-fork callers such as
+   * named workflow resume must first verify `sessionFork === true`. Legacy session
+   * reuse may still send this flag to resume-only providers, where behavior is
+   * provider-specific and immutability is not guaranteed.
+   */
   forkSession?: boolean;
   /** When false, skip writing session transcript to disk. */
   persistSession?: boolean;
@@ -613,6 +641,11 @@ export interface SendQueryOptions extends AgentRequestOptions {
  */
 export interface ProviderCapabilities {
   sessionResume: boolean;
+  /**
+   * Given a session ID, create a new session containing the source history
+   * while leaving the source unchanged. Omission means unsupported.
+   */
+  sessionFork?: boolean;
   mcp: boolean;
   hooks: boolean;
   skills: boolean;

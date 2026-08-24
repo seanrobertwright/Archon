@@ -9,20 +9,28 @@
  * REST API can use it.
  */
 
-import { join, resolve, isAbsolute } from 'path';
-import { access, readFile } from 'fs/promises';
+import { dirname, join, resolve, isAbsolute } from 'path';
+import { access, readFile, stat } from 'fs/promises';
 import {
   createLogger,
   getCommandFolderSearchPaths,
   getDefaultCommandsPath,
+  getDefaultWorkflowsPath,
   getHomeCommandsPath,
+  getHomeWorkflowsPath,
   findMarkdownFilesRecursive,
 } from '@archon/paths';
 import { execFileAsync } from '@archon/git';
-import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
+import { BUNDLED_COMMANDS, BUNDLED_WORKFLOWS, isBinaryBuild } from './defaults/bundled-defaults';
 import { isValidCommandName } from './command-validation';
 import { levenshtein, findSimilar } from './utils/fuzzy-match';
-import { getProviderCapabilities, isRegisteredProvider, skillSearchRoots } from '@archon/providers';
+import {
+  claudeSkillSearchRoots,
+  findInstalledSkillNames,
+  getProviderCapabilities,
+  isRegisteredProvider,
+  skillSearchRoots,
+} from '@archon/providers';
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -30,12 +38,22 @@ function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.validator');
   return cachedLog;
 }
-import { isBashNode, isLoopNode, isLoopGroupNode, isScriptNode, isIncludeNode } from './schemas';
-import type { WorkflowDefinition, DagNode, WorkflowSource } from './schemas';
+import {
+  isAgentNode,
+  isExecNode,
+  isLoopNode,
+  isLoopGroupNode,
+  isIncludeDirective,
+  isWorkflowNode,
+} from './schemas';
+import { parseWorkflow } from './loader';
+import { resolveWorkflowName } from './router';
+import type { WorkflowDefinition, DagNode, IncludeDirective, WorkflowSource } from './schemas';
 import type { ScriptRuntime } from './script-discovery';
 import { discoverScriptsForCwd } from './script-discovery';
 import { isInlineScript } from './executor-shared';
-import { buildAiProfile, resolveModelSpec } from './model-validation';
+import { buildAiProfile, isLiteralSpec, resolveModelSpec } from './model-validation';
+import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
 import type { RawAliasesConfig, RawTiersConfig, ResolvedAiProfile } from './model-validation';
 
 // =============================================================================
@@ -89,6 +107,8 @@ export interface ValidationConfig {
   assistant?: string;
   aliases?: RawAliasesConfig;
   tiers?: RawTiersConfig;
+  claudeSettingSources?: ('project' | 'user')[];
+  claudeConfigDir?: string;
 }
 
 // Levenshtein distance and fuzzy matching now live in ./utils/fuzzy-match so lean
@@ -152,7 +172,7 @@ export async function discoverAvailableCommands(
   if (loadDefaults) {
     if (isBinaryBuild()) {
       for (const name of Object.keys(BUNDLED_COMMANDS)) {
-        names.add(name);
+        if (parsePackagedResourceReference(name) === null) names.add(name);
       }
     } else {
       const defaultsPath = getDefaultCommandsPath();
@@ -195,6 +215,38 @@ async function resolveCommand(
   cwd: string,
   config?: ValidationConfig
 ): Promise<string | null> {
+  const packaged = parsePackagedResourceReference(commandName);
+  if (packaged !== null) {
+    if (packaged.owner.source === 'bundled') {
+      if (config?.loadDefaultCommands === false) return null;
+      if (isBinaryBuild()) {
+        return commandName in BUNDLED_COMMANDS ? `[bundled:${commandName}]` : null;
+      }
+    }
+    let workflowsRoot: string;
+    if (packaged.owner.source === 'project') {
+      workflowsRoot = join(cwd, '.archon', 'workflows');
+    } else if (packaged.owner.source === 'global') {
+      workflowsRoot = getHomeWorkflowsPath();
+    } else {
+      workflowsRoot = dirname(getDefaultWorkflowsPath());
+    }
+    const path = join(
+      getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
+      `${packaged.name}.md`
+    );
+    try {
+      return (await stat(path)).isFile() ? path : null;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (err.code === 'ENOENT') return null;
+      getLog().error({ err, path, commandName }, 'packaged_command_inspection_failed');
+      throw new Error(`Cannot inspect packaged command '${commandName}': ${err.message}`, {
+        cause: err,
+      });
+    }
+  }
+
   // Each scope is walked 1 subfolder deep by basename — so `triage/review.md`
   // is resolvable as `review`. This matches the workflows/scripts discovery
   // convention and makes the listed commands in `discoverAvailableCommands`
@@ -282,6 +334,44 @@ function resolveProvider(
   return workflowProvider ?? defaultProvider;
 }
 
+function resolveValidationProvider(
+  node: DagNode,
+  workflowProvider: string | undefined,
+  defaultProvider: string | undefined,
+  aiProfile: ResolvedAiProfile | undefined
+): string | undefined {
+  let provider = resolveProvider(node, workflowProvider, defaultProvider);
+  if (!aiProfile || !('model' in node) || !node.model) return provider;
+
+  try {
+    const modelSpec = resolveModelSpec(aiProfile, node.model);
+    if (!isLiteralSpec(modelSpec)) provider = modelSpec.provider;
+  } catch {
+    // validateModelRef reports the actionable model error separately.
+  }
+  return provider;
+}
+
+/**
+ * Bundled workflow definitions, parsed once and cached (#2470). Used only by the
+ * bundled-set-only `workflow:` target check below — a bundled workflow's sub-run target
+ * must itself resolve within the bundled set (a bundled workflow can't depend on a
+ * project/global workflow that may not exist on another install). Resolution reuses the
+ * runtime fuzzy `resolveWorkflowName` so a legal suffix/substring ref isn't reported broken.
+ * parseWorkflow never expands includes, so `workflow.name` is the authoritative id here.
+ */
+let bundledWorkflowDefsCache: WorkflowDefinition[] | undefined;
+function getBundledWorkflowDefs(): WorkflowDefinition[] {
+  if (bundledWorkflowDefsCache) return bundledWorkflowDefsCache;
+  const defs: WorkflowDefinition[] = [];
+  for (const [filename, content] of Object.entries(BUNDLED_WORKFLOWS)) {
+    const { workflow } = parseWorkflow(content, filename);
+    if (workflow) defs.push(workflow);
+  }
+  bundledWorkflowDefsCache = defs;
+  return defs;
+}
+
 /**
  * Validate a workflow's external resource references (Level 3).
  *
@@ -340,29 +430,49 @@ export async function validateWorkflowResources(
   }
   if (workflow.model) validateModelRef(workflow.model);
 
+  let effectiveWorkflowProvider = workflow.provider ?? defaultProvider;
+  if (workflow.model && aiProfile) {
+    try {
+      const workflowModelSpec = resolveModelSpec(aiProfile, workflow.model);
+      if (!isLiteralSpec(workflowModelSpec)) {
+        effectiveWorkflowProvider = workflowModelSpec.provider;
+      }
+    } catch {
+      // validateModelRef reports the actionable model error separately.
+    }
+  }
+
   // Flatten top-level nodes plus every loop_group body (recursing into nested
   // loop_groups) so resource checks (commands, mcp, skills, scripts) validate
   // body nodes too. ID-uniqueness/cycle checks are the loader's job; the validator
   // only checks referenced resources exist, so flattening is safe here.
-  const allNodes: DagNode[] = [];
-  const collectNodes = (nodes: readonly DagNode[]): void => {
+  const allNodes: (DagNode | IncludeDirective)[] = [];
+  const collectNodes = (nodes: readonly (DagNode | IncludeDirective)[]): void => {
     for (const n of nodes) {
       allNodes.push(n);
-      if (isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
+      if (!isIncludeDirective(n) && isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
     }
   };
   collectNodes(workflow.nodes);
 
   for (const node of allNodes) {
-    // Include nodes carry no resources to check — the target workflow is resolved and
-    // inlined at DISCOVERY time (see include-expander.ts), so discovery-fed validation
-    // (CLI `validate workflows`) sees the already-expanded nodes and checks their
-    // commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current caller reaches
-    // it with an unexpanded include node (POST /api/workflows/validate only runs
-    // parseWorkflow, not this resource pass). Kept so a future raw caller can't crash here.
-    if (isIncludeNode(node)) continue;
+    // Include directives carry no resources to check — the target workflow is resolved
+    // and inlined at DISCOVERY time (see include-expander.ts), so discovery-fed
+    // validation (CLI `validate workflows`) sees the already-expanded nodes and checks
+    // their commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current
+    // caller reaches it with an unexpanded include (POST /api/workflows/validate only
+    // runs parseWorkflow, not this resource pass). Kept so a future raw caller can't
+    // crash here.
+    if (isIncludeDirective(node)) continue;
 
-    const provider = resolveProvider(node, workflow.provider, defaultProvider);
+    const provider = resolveValidationProvider(
+      node,
+      effectiveWorkflowProvider,
+      defaultProvider,
+      aiProfile
+    );
+    const providerCaps =
+      provider && isRegisteredProvider(provider) ? getProviderCapabilities(provider) : undefined;
 
     if (requiresPortableModelRefs && 'model' in node && node.model?.startsWith('@')) {
       issues.push({
@@ -375,31 +485,66 @@ export async function validateWorkflowResources(
     }
     if ('model' in node && node.model) validateModelRef(node.model, node.id);
 
+    // --- Bundled `workflow:` sub-run target check (#2470) ---
+    // A BUNDLED workflow ships with the binary and runs on any install, so its sub-run
+    // targets must resolve within the bundled set — a reference to a project/global
+    // workflow could be absent elsewhere. Only the bundled set is checked at load/CI;
+    // project sub-run targets stay RUNTIME-resolved on purpose (a load-time existence
+    // check would silently kill mid-flight authoring — constitution case-law), and the
+    // check uses the SAME fuzzy resolver as runtime so a legal suffix ref isn't flagged.
+    if (config?.workflowSource === 'bundled' && isWorkflowNode(node)) {
+      let resolvedTarget: WorkflowDefinition | undefined;
+      let ambiguityMessage: string | undefined;
+      try {
+        resolvedTarget = resolveWorkflowName(node.workflow, getBundledWorkflowDefs());
+      } catch (err) {
+        ambiguityMessage = (err as Error).message;
+      }
+      if (ambiguityMessage !== undefined) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'workflow',
+          message: `Node '${node.id}' sub-run target '${node.workflow}' is ambiguous within the bundled set: ${ambiguityMessage}`,
+          hint: 'Use the full bundled workflow name.',
+        });
+      } else if (!resolvedTarget) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'workflow',
+          message: `Node '${node.id}' targets sub-run '${node.workflow}', which is not a bundled workflow`,
+          hint: 'A bundled workflow may only reference other bundled workflows (project/global targets are not guaranteed to exist on every install).',
+        });
+      }
+    }
+
     // --- Command nodes: check file exists ---
-    if ('command' in node && typeof node.command === 'string') {
-      if (!isValidCommandName(node.command)) {
+    if (isAgentNode(node) && node.source.kind === 'command') {
+      const commandName = node.source.name;
+      if (!isValidCommandName(commandName)) {
         issues.push({
           level: 'error',
           nodeId: node.id,
           field: 'command',
-          message: `Invalid command name '${node.command}' — must not contain '/', '\\', '..', or start with '.'`,
+          message: `Invalid command name '${commandName}' — must not contain '/', '\\', '..', or start with '.'`,
           hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
         });
         continue;
       }
 
-      const resolved = await resolveCommand(node.command, cwd, config);
+      const resolved = await resolveCommand(commandName, cwd, config);
       if (!resolved) {
-        const similar = findSimilar(node.command, availableCommands);
+        const similar = findSimilar(commandName, availableCommands);
         const issue: ValidationIssue = {
           level: 'error',
           nodeId: node.id,
           field: 'command',
-          message: `Command '${node.command}' not found`,
-          hint: `Create .archon/commands/${node.command}.md or use an existing command name`,
+          message: `Command '${commandName}' not found`,
+          hint: `Create .archon/commands/${commandName}.md or use an existing command name`,
         };
         if (similar.length > 0) {
-          issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${node.command}.md`;
+          issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${commandName}.md`;
           issue.suggestions = similar;
         }
         issues.push(issue);
@@ -476,64 +621,114 @@ export async function validateWorkflowResources(
       }
 
       // Warn if using MCP with a provider that doesn't support it
-      if (provider && isRegisteredProvider(provider)) {
-        const caps = getProviderCapabilities(provider);
-        if (!caps.mcp) {
-          issues.push({
-            level: 'warning',
-            nodeId: node.id,
-            field: 'mcp',
-            message: `MCP servers are not supported by provider '${provider}' — this will be ignored`,
-            hint: 'Remove the mcp field or switch to a provider that supports MCP',
-          });
-        }
+      if (providerCaps?.mcp === false) {
+        issues.push({
+          level: 'warning',
+          nodeId: node.id,
+          field: 'mcp',
+          message: `MCP servers are not supported by provider '${provider}' — this will be ignored`,
+          hint: 'Remove the mcp field or switch to a provider that supports MCP',
+        });
       }
     }
 
     // --- Skills nodes: check skill directories exist ---
     if ('skills' in node && Array.isArray(node.skills)) {
-      const searchRoots = skillSearchRoots(cwd);
-      for (const skillName of node.skills) {
-        let found = false;
-        for (const root of searchRoots) {
-          const skillPath = join(root, skillName, 'SKILL.md');
-          if (await fileExists(skillPath)) {
-            found = true;
-            break;
+      // Only validate filesystem names when the provider actually consumes the
+      // YAML list. In particular, Codex's native roots/metadata rules do not
+      // match Archon's shared four-root resolver, so accepting a `.claude`
+      // match here would falsely imply that Codex can invoke it.
+      if (providerCaps?.skills !== false) {
+        const settingSources =
+          'settingSources' in node && node.settingSources !== undefined
+            ? node.settingSources
+            : (config?.claudeSettingSources ?? ['project', 'user']);
+        const searchRoots =
+          provider === 'claude'
+            ? claudeSkillSearchRoots(cwd, {
+                ...(config?.claudeConfigDir ? { userConfigDir: config.claudeConfigDir } : {}),
+                includeProject: settingSources.includes('project'),
+                includeUser: settingSources.includes('user'),
+              })
+            : skillSearchRoots(cwd);
+        for (const skillName of node.skills) {
+          let found = false;
+          for (const root of searchRoots) {
+            const skillPath = join(root, skillName, 'SKILL.md');
+            if (await fileExists(skillPath)) {
+              found = true;
+              break;
+            }
           }
-        }
 
-        if (!found) {
-          issues.push({
-            level: 'warning',
-            nodeId: node.id,
-            field: 'skills',
-            message: `Skill '${skillName}' not found in .agents/skills/ or .claude/skills/ (project or user scope)`,
-            hint: `Install with: npx skills add <repo> — or create manually at .agents/skills/${skillName}/SKILL.md`,
-          });
+          if (!found) {
+            // Mirror the provider's rule (claude/provider.ts): a Claude skill
+            // that exists under some other root is installed but unreachable, so
+            // it is an error. A name that exists nowhere on disk may be one of
+            // Claude's built-in or `plugin:skill` entries, which no filesystem
+            // root contains — warn there rather than failing a workflow that runs.
+            // Same helper the provider preflight uses, over the same roots, so
+            // validation and execution always agree on which case this is.
+            const installedButUnusable =
+              provider === 'claude' &&
+              findInstalledSkillNames(
+                [
+                  ...searchRoots,
+                  ...skillSearchRoots(cwd),
+                  ...claudeSkillSearchRoots(cwd, {
+                    ...(config?.claudeConfigDir ? { userConfigDir: config.claudeConfigDir } : {}),
+                    includeProject: true,
+                    includeUser: true,
+                  }),
+                ],
+                [skillName]
+              ).length > 0;
+
+            if (installedButUnusable) {
+              issues.push({
+                level: 'error',
+                nodeId: node.id,
+                field: 'skills',
+                message: `Claude skill '${skillName}' not found in an enabled .claude/skills/ directory, though it is installed elsewhere`,
+                hint: `Claude reads .claude/skills/ only (never .agents/skills/), and only from scopes settingSources enables. Ensure .claude/skills/${skillName}/SKILL.md exists in an enabled scope`,
+              });
+            } else {
+              issues.push({
+                level: 'warning',
+                nodeId: node.id,
+                field: 'skills',
+                message:
+                  provider === 'claude'
+                    ? `Claude skill '${skillName}' not found on disk — expected for built-in and plugin-qualified skills, which Claude resolves itself`
+                    : `Skill '${skillName}' not found in .agents/skills/ or .claude/skills/ (project or user scope)`,
+                hint:
+                  provider === 'claude'
+                    ? `If this is not a built-in or plugin:skill name, check the spelling or create .claude/skills/${skillName}/SKILL.md`
+                    : `Install with: npx skills add <repo> — or create manually at .agents/skills/${skillName}/SKILL.md`,
+              });
+            }
+          }
         }
       }
 
       // Warn if using skills with a provider that doesn't support them
-      if (provider && isRegisteredProvider(provider)) {
-        const caps = getProviderCapabilities(provider);
-        if (!caps.skills) {
-          issues.push({
-            level: 'warning',
-            nodeId: node.id,
-            field: 'skills',
-            message: `Skills are not supported by provider '${provider}' — this will be ignored`,
-            hint: 'Remove the skills field or switch to a provider that supports skills',
-          });
-        }
+      if (providerCaps?.skills === false && node.skills.length > 0) {
+        issues.push({
+          level: 'warning',
+          nodeId: node.id,
+          field: 'skills',
+          message: `The skills field is not supported by provider '${provider}' — this will be ignored`,
+          hint:
+            provider === 'codex'
+              ? 'Invoke an installed Codex skill explicitly in the command or prompt with $skill-name'
+              : 'Remove the skills field or switch to a provider that supports skills',
+        });
       }
     }
 
     // --- Capability-driven warnings for hooks and tool restrictions ---
-    if (provider && isRegisteredProvider(provider)) {
-      const caps = getProviderCapabilities(provider);
-
-      if ('hooks' in node && node.hooks && !caps.hooks) {
+    if (providerCaps) {
+      if ('hooks' in node && node.hooks && !providerCaps.hooks) {
         issues.push({
           level: 'warning',
           nodeId: node.id,
@@ -543,7 +738,7 @@ export async function validateWorkflowResources(
         });
       }
 
-      if ('agents' in node && node.agents && !caps.agents) {
+      if ('agents' in node && node.agents && !providerCaps.agents) {
         issues.push({
           level: 'warning',
           nodeId: node.id,
@@ -553,7 +748,7 @@ export async function validateWorkflowResources(
         });
       }
 
-      if (!caps.toolRestrictions) {
+      if (!providerCaps.toolRestrictions) {
         if (
           ('allowed_tools' in node && node.allowed_tools !== undefined) ||
           ('denied_tools' in node && node.denied_tools !== undefined)
@@ -566,7 +761,10 @@ export async function validateWorkflowResources(
             hint: 'Remove tool restriction fields or switch to a provider that supports them',
           });
         }
-      } else if (caps.knownToolNames !== undefined && caps.knownToolNames.length > 0) {
+      } else if (
+        providerCaps.knownToolNames !== undefined &&
+        providerCaps.knownToolNames.length > 0
+      ) {
         // Warn on tool names outside the provider's audited built-in vocabulary
         // (#2084): the SDK matches names as opaque strings, so a misspelled or
         // stale name (e.g. `Task` after the Claude SDK renamed it to `Agent`)
@@ -574,7 +772,7 @@ export async function validateWorkflowResources(
         // tools added by a newer SDK can't be proven invalid, so this must
         // never hard-fail validation. Providers without a declared vocabulary
         // skip the check entirely.
-        const known = caps.knownToolNames;
+        const known = providerCaps.knownToolNames;
         const toolLists = [
           ['allowed_tools', 'allowed_tools' in node ? node.allowed_tools : undefined],
           ['denied_tools', 'denied_tools' in node ? node.denied_tools : undefined],
@@ -587,7 +785,7 @@ export async function validateWorkflowResources(
             // are dynamic per-install — never flag them.
             if (base === '' || base.startsWith('mcp__') || known.includes(base)) continue;
 
-            const renamed = caps.renamedTools?.[base];
+            const renamed = providerCaps.renamedTools?.[base];
             if (renamed !== undefined) {
               issues.push({
                 level: 'warning',
@@ -619,7 +817,7 @@ export async function validateWorkflowResources(
     }
 
     // --- Script nodes: check named script file exists + runtime available ---
-    if (isScriptNode(node)) {
+    if (isExecNode(node) && node.runtime !== 'sh') {
       const script = node.script;
 
       // Named script: validate file exists in repo or home scope.
@@ -697,7 +895,7 @@ export async function validateWorkflowResources(
         });
       }
     };
-    if (isBashNode(node)) warnDoubleQuoted(node.bash, 'bash');
+    if (isExecNode(node) && node.runtime === 'sh') warnDoubleQuoted(node.script, 'bash');
     if (isLoopNode(node) && node.loop.until_bash) {
       warnDoubleQuoted(node.loop.until_bash, 'loop.until_bash');
     }
@@ -790,21 +988,16 @@ export interface ScriptValidationResult {
 }
 
 /**
- * Discover all script names from the repo and home scopes.
- * Returns a list of { name, path, runtime } entries. Repo-scoped scripts
- * silently override same-named home-scoped entries.
+ * Discover all shared and packaged script names.
+ * Returns a list of { name, path, runtime } entries. Repo-scoped shared
+ * scripts override same-named home entries; packaged names retain ownership.
+ * Filesystem failures propagate so validation cannot report a false success.
  */
 export async function discoverAvailableScripts(
   cwd: string
 ): Promise<{ name: string; path: string; runtime: ScriptRuntime }[]> {
-  try {
-    const scripts = await discoverScriptsForCwd(cwd);
-    return [...scripts.values()].map(s => ({ name: s.name, path: s.path, runtime: s.runtime }));
-  } catch (error) {
-    const err = error as Error;
-    getLog().warn({ err, cwd }, 'script_discovery_failed');
-    return [];
-  }
+  const scripts = await discoverScriptsForCwd(cwd);
+  return [...scripts.values()].map(s => ({ name: s.name, path: s.path, runtime: s.runtime }));
 }
 
 /**

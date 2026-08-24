@@ -3,7 +3,13 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
-import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import type {
+  AgentSessionEvent,
+  CreateAgentSessionOptions,
+  CreateAgentSessionResult,
+  ModelRegistry,
+} from '@earendil-works/pi-coding-agent';
+import type { Api, Model } from '@earendil-works/pi-ai';
 
 // Typed against the real registration shape (config: ProviderConfig) so the
 // mock runtime drifts loudly, not silently, if the SDK/type changes — same
@@ -35,7 +41,7 @@ type FakeEvent = AgentSessionEvent;
 let capturedListener: ((event: FakeEvent) => void) | undefined;
 
 const scriptedEvents: FakeEvent[] = [];
-const mockPrompt = mock(async () => {
+const mockPrompt = mock(async (_prompt: string): Promise<void> => {
   for (const ev of scriptedEvents) capturedListener?.(ev);
 });
 const mockAbort = mock(async () => undefined);
@@ -65,16 +71,28 @@ const mockSession = {
   sessionId: 'mock-session-uuid',
 };
 
-const mockCreateAgentSession = mock(async (_options?: unknown) => ({
-  session: mockSession,
-  extensionsResult: { extensions: [], errors: [], runtime: {} },
-  modelFallbackMessage: undefined,
-}));
+function createMockSessionResult(modelFallbackMessage?: string): CreateAgentSessionResult {
+  return {
+    session: mockSession,
+    extensionsResult: { extensions: [], errors: [], runtime: {} },
+    modelFallbackMessage,
+  } as unknown as CreateAgentSessionResult;
+}
+
+const mockCreateAgentSession = mock<
+  typeof import('@earendil-works/pi-coding-agent').createAgentSession
+>(
+  async (_options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> =>
+    createMockSessionResult()
+);
 
 // Per-test state backing the AuthStorage mock. `fileCreds` emulates what's
 // in ~/.pi/agent/auth.json; `runtimeOverrides` emulates env-var passthrough
 // via setRuntimeApiKey. Tests mutate these via helpers.
-let fileCreds: Record<string, { type: 'api_key' | 'oauth'; key?: string }> = {};
+let fileCreds: Record<
+  string,
+  { type: 'api_key' | 'oauth'; key?: string; env?: Record<string, string> }
+> = {};
 let runtimeOverrides: Record<string, string> = {};
 
 const mockSetRuntimeApiKey = mock((providerId: string, key: string) => {
@@ -90,29 +108,77 @@ const mockGetApiKey = mock(async (providerId: string): Promise<string | undefine
   if (cred?.type === 'oauth') return 'sk-ant-oat01-file-stub';
   return undefined;
 });
+const mockGetCredential = mock((providerId: string) => fileCreds[providerId]);
+const mockGetProviderEnv = mock((providerId: string) => fileCreds[providerId]?.env);
+const mockHasAuth = mock(
+  (providerId: string) =>
+    runtimeOverrides[providerId] !== undefined || fileCreds[providerId] !== undefined
+);
 const mockAuthCreate = mock(() => ({
   setRuntimeApiKey: mockSetRuntimeApiKey,
   getApiKey: mockGetApiKey,
+  get: mockGetCredential,
+  getProviderEnv: mockGetProviderEnv,
+  hasAuth: mockHasAuth,
 }));
 
-const mockModelRegistryFind = mock((provider: string, modelId: string) => {
+function createMockModel(provider: string, modelId: string): Model<Api> {
+  return {
+    id: modelId,
+    provider,
+    name: `${provider}/${modelId}`,
+    api: 'openai-completions',
+    baseUrl: 'https://example.invalid',
+    reasoning: false,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 8_192,
+  };
+}
+
+const mockModelRegistryFind = mock<ModelRegistry['find']>((provider, modelId) => {
   if (provider === 'nonexistent') return undefined;
-  return { id: modelId, provider, name: `${provider}/${modelId}` };
+  return createMockModel(provider, modelId);
 });
-const mockModelRegistryCreate = mock(() => ({
-  find: mockModelRegistryFind,
-}));
+type MockModelRegistry = Pick<ModelRegistry, 'find'> &
+  Partial<
+    Pick<
+      ModelRegistry,
+      'getApiKeyAndHeaders' | 'getError' | 'hasConfiguredAuth' | 'registerProvider'
+    >
+  >;
+type MockModelRegistryCreate = (
+  ...args: Parameters<typeof import('@earendil-works/pi-coding-agent').ModelRegistry.create>
+) => MockModelRegistry;
+const mockModelRegistryCreate = mock<MockModelRegistryCreate>(
+  (authStorage): MockModelRegistry => ({
+    find: mockModelRegistryFind,
+    hasConfiguredAuth: mock(model => authStorage.hasAuth(model.provider)),
+    getApiKeyAndHeaders: mock(async model => {
+      const apiKey = await authStorage.getApiKey(model.provider, { includeFallback: false });
+      return {
+        ok: true as const,
+        apiKey,
+        env: authStorage.getProviderEnv(model.provider),
+      };
+    }),
+  })
+);
 
 // SessionManager mocks. Each returns a tagged session-manager stub so tests
 // can assert whether resume resolved to an existing session or fell through
 // to a fresh one.
 const mockSessionCreate = mock((_cwd: string) => ({ __smKind: 'created' }));
 const mockSessionOpen = mock((_path: string) => ({ __smKind: 'opened' }));
+const mockSessionForkFrom = mock((_path: string, _cwd: string): { __smKind: string } => ({
+  __smKind: 'forked',
+}));
 const mockSessionList = mock(
   async (_cwd: string) => [] as { id: string; path: string; cwd: string }[]
 );
 
-const mockSettingsManagerDrainErrors = mock(() => []);
+const mockSettingsManagerDrainErrors = mock((): { scope: string; error: Error }[] => []);
 const mockSettingsManagerGetGlobalSettings = mock(() => ({}));
 const mockSettingsManagerGetProjectSettings = mock(() => ({}));
 const mockSettingsManagerCreate = mock(() => ({
@@ -162,6 +228,7 @@ mock.module('@earendil-works/pi-coding-agent', () => ({
   SessionManager: {
     create: mockSessionCreate,
     open: mockSessionOpen,
+    forkFrom: mockSessionForkFrom,
     list: mockSessionList,
   },
   SettingsManager: {
@@ -215,6 +282,10 @@ function resetScript(events: FakeEvent[]): void {
   scriptedEvents.push(...events);
 }
 
+function readEnv(name: string): string | undefined {
+  return process.env[name];
+}
+
 // ─── Test suite ─────────────────────────────────────────────────────────
 
 describe('PiProvider', () => {
@@ -241,6 +312,8 @@ describe('PiProvider', () => {
     mockModelRegistryFind.mockClear();
     mockSetRuntimeApiKey.mockClear();
     mockGetApiKey.mockClear();
+    mockGetCredential.mockClear();
+    mockGetProviderEnv.mockClear();
     MockDefaultResourceLoader.mockClear();
     mockCreateReadTool.mockClear();
     mockCreateBashTool.mockClear();
@@ -251,6 +324,7 @@ describe('PiProvider', () => {
     mockCreateLsTool.mockClear();
     mockSessionCreate.mockClear();
     mockSessionOpen.mockClear();
+    mockSessionForkFrom.mockClear();
     mockSessionList.mockClear();
     mockSessionList.mockImplementation(async () => []);
     mockSettingsManagerInMemory.mockClear();
@@ -294,14 +368,14 @@ describe('PiProvider', () => {
     delete process.env.PI_PACKAGE_DIR;
     expect(process.env.PI_PACKAGE_DIR).toBeUndefined();
     await consume(new PiProvider().sendQuery('hi', '/tmp'));
-    expect(process.env.PI_PACKAGE_DIR).toBeDefined();
-    expect(process.env.PI_PACKAGE_DIR).toContain('archon-pi-shim');
+    expect(readEnv('PI_PACKAGE_DIR')).toBeDefined();
+    expect(readEnv('PI_PACKAGE_DIR')).toContain('archon-pi-shim');
 
     // Stub contents are load-bearing: Pi reads `version` to populate its
     // user-agent and `piConfig` (even when empty) to opt into the defaults
     // path instead of erroring on missing config. Asserting on shape so a
     // regression here surfaces in the test suite, not in a Pi runtime crash.
-    const shimDir = process.env.PI_PACKAGE_DIR;
+    const shimDir = readEnv('PI_PACKAGE_DIR');
     expect(shimDir).toBe(join(tmpdir(), 'archon-pi-shim'));
     const stub = JSON.parse(readFileSync(join(shimDir!, 'package.json'), 'utf8')) as {
       name: string;
@@ -363,6 +437,34 @@ describe('PiProvider', () => {
     expect(mockModelRegistryCreate).toHaveBeenCalledTimes(1);
     const authInstance = mockAuthCreate.mock.results[0]?.value;
     expect(mockModelRegistryCreate).toHaveBeenCalledWith(authInstance);
+  });
+
+  test('custom provider receives request env without acting-user provider credentials', async () => {
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'mygw/demo',
+        env: {
+          MYGW_API_KEY: 'request-secret',
+          ANTHROPIC_API_KEY: 'acting-user-secret',
+        },
+        protectedEnvKeys: ['ANTHROPIC_API_KEY'],
+      })
+    );
+
+    const requestAuthStorage = mockModelRegistryCreate.mock.calls[0]?.[0];
+    const fileAuthStorage = mockAuthCreate.mock.results[0]?.value as typeof requestAuthStorage;
+    expect(requestAuthStorage).toBe(fileAuthStorage);
+    expect(requestAuthStorage?.getProviderEnv('mygw')).toEqual({
+      MYGW_API_KEY: 'request-secret',
+    });
+    expect(requestAuthStorage?.hasAuth('mygw')).toBe(true);
+    expect(requestAuthStorage?.getProviderEnv('anthropic')).toBeUndefined();
+    const requestRegistry = mockModelRegistryCreate.mock.results[0]?.value as
+      | MockModelRegistry
+      | undefined;
+    expect(requestRegistry?.getApiKeyAndHeaders).not.toHaveBeenCalled();
   });
 
   test('AuthStorage.create reads ARCHON_PI_AUTH_PATH from requestOptions.env (per-user channel)', async () => {
@@ -476,9 +578,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -526,11 +633,9 @@ describe('PiProvider', () => {
     // Phase 1: model not in static catalog (extension provider path).
     // Phase 2: extension registers the model during bindExtensions() and find() succeeds.
     mockModelRegistryFind.mockImplementationOnce(() => undefined);
-    mockModelRegistryFind.mockImplementationOnce(() => ({
-      id: 'custom-model',
-      provider: 'extension-provider',
-      name: 'extension-provider/custom-model',
-    }));
+    mockModelRegistryFind.mockImplementationOnce(() =>
+      createMockModel('extension-provider', 'custom-model')
+    );
     resetScript(scriptedAgentEnd());
 
     const { error } = await consume(
@@ -552,9 +657,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -590,9 +700,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -624,9 +739,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -655,9 +775,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -691,9 +816,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -722,24 +852,34 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'message_update',
-        message: { role: 'assistant' },
-        assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'Hello', partial: {} },
+        message: { role: 'assistant' } as never,
+        assistantMessageEvent: {
+          type: 'text_delta',
+          contentIndex: 0,
+          delta: 'Hello',
+          partial: {} as never,
+        },
       },
       {
         type: 'message_update',
-        message: { role: 'assistant' },
+        message: { role: 'assistant' } as never,
         assistantMessageEvent: {
           type: 'text_delta',
           contentIndex: 0,
           delta: ' world',
-          partial: {},
+          partial: {} as never,
         },
       },
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 2,
@@ -788,9 +928,14 @@ describe('PiProvider', () => {
       },
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -833,9 +978,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -881,9 +1031,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -906,6 +1061,7 @@ describe('PiProvider', () => {
     );
     expect(error).toBeUndefined();
     expect(mockSessionOpen).toHaveBeenCalledWith('/sessions/existing-id.jsonl');
+    expect(mockSessionForkFrom).not.toHaveBeenCalled();
     expect(mockSessionCreate).not.toHaveBeenCalled();
     // No resume_failed warning
     const systemChunks = chunks.filter(
@@ -916,6 +1072,29 @@ describe('PiProvider', () => {
     // A warm resume reports resumed:true on the result chunk.
     expect(chunks.find(c => (c as { type?: string }).type === 'result')).toMatchObject({
       resumed: true,
+    });
+  });
+
+  test('forkSession resumes into a distinct branch without opening the source', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    mockSessionList.mockImplementationOnce(async () => [
+      { id: 'source-id', path: '/sessions/source-id.jsonl', cwd: '/tmp' },
+    ]);
+    resetScript(scriptedAgentEnd());
+
+    const { chunks, error } = await consume(
+      new PiProvider().sendQuery('hi', '/tmp', 'source-id', {
+        model: 'google/gemini-2.5-pro',
+        forkSession: true,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(mockSessionForkFrom).toHaveBeenCalledWith('/sessions/source-id.jsonl', '/tmp');
+    expect(mockSessionOpen).not.toHaveBeenCalled();
+    expect(chunks.find(c => (c as { type?: string }).type === 'result')).toMatchObject({
+      resumed: true,
+      sessionId: 'mock-session-uuid',
     });
   });
 
@@ -942,9 +1121,14 @@ describe('PiProvider', () => {
     resetScript([
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -974,9 +1158,14 @@ describe('PiProvider', () => {
     return [
       {
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -1605,9 +1794,14 @@ describe('PiProvider', () => {
       controller.abort();
       capturedListener?.({
         type: 'agent_end',
+        willRetry: false,
         messages: [
           {
             role: 'assistant',
+            api: 'test',
+            provider: 'test',
+            model: 'test',
+            timestamp: 0,
             usage: {
               input: 1,
               output: 1,
@@ -1634,11 +1828,10 @@ describe('PiProvider', () => {
 
   test('modelFallbackMessage yields a system chunk before the agent runs', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
-    mockCreateAgentSession.mockImplementationOnce(async () => ({
-      session: mockSession,
-      extensionsResult: { extensions: [], errors: [], runtime: {} },
-      modelFallbackMessage: 'Requested sonnet-5 not available, using haiku.',
-    }));
+    mockCreateAgentSession.mockImplementationOnce(
+      async (): Promise<CreateAgentSessionResult> =>
+        createMockSessionResult('Requested sonnet-5 not available, using haiku.')
+    );
     resetScript(scriptedAgentEnd());
 
     const { chunks } = await consume(
@@ -2088,8 +2281,8 @@ describe('PiProvider', () => {
         })
       );
 
-      expect(process.env.PI_TEST_ONE).toBe('one');
-      expect(process.env.PI_TEST_TWO).toBe('two');
+      expect(readEnv('PI_TEST_ONE')).toBe('one');
+      expect(readEnv('PI_TEST_TWO')).toBe('two');
     } finally {
       delete process.env.PI_TEST_ONE;
       delete process.env.PI_TEST_TWO;
@@ -2395,22 +2588,17 @@ describe('PiProvider', () => {
      * registered into it — like the real one, whose static catalog does not
      * contain extension providers such as 'cursor'.
      */
-    function fakeExtensionAwareRegistry(): {
-      registered: Map<string, unknown>;
-      find: (
-        provider: string,
-        modelId: string
-      ) => { id: string; provider: string; name: string } | undefined;
-      registerProvider: (name: string, config: unknown) => void;
+    type ExtensionProviderConfig = Parameters<ModelRegistry['registerProvider']>[1];
+
+    function fakeExtensionAwareRegistry(): MockModelRegistry & {
+      registered: Map<string, ExtensionProviderConfig>;
     } {
-      const registered = new Map<string, unknown>();
+      const registered = new Map<string, ExtensionProviderConfig>();
       return {
         registered,
         find: (provider: string, modelId: string) =>
-          registered.has(provider)
-            ? { id: modelId, provider, name: `${provider}/${modelId}` }
-            : undefined,
-        registerProvider: (name: string, config: unknown) => {
+          registered.has(provider) ? createMockModel(provider, modelId) : undefined,
+        registerProvider: (name: string, config: ExtensionProviderConfig): void => {
           registered.set(name, config);
         },
       };
@@ -2422,20 +2610,17 @@ describe('PiProvider', () => {
      * registry, then clear it (the SDK reassigns to []).
      */
     function drainQueueOnceIntoSessionRegistry(): void {
-      mockCreateAgentSession.mockImplementationOnce(async (options?: unknown) => {
-        const { modelRegistry } = options as {
-          modelRegistry: { registerProvider: (name: string, config: unknown) => void };
-        };
-        for (const { name, config } of mockLoaderRuntime.pendingProviderRegistrations) {
-          modelRegistry.registerProvider(name, config);
+      mockCreateAgentSession.mockImplementationOnce(
+        async (options?: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
+          const modelRegistry = options?.modelRegistry;
+          if (!modelRegistry) throw new Error('Expected a model registry');
+          for (const { name, config } of mockLoaderRuntime.pendingProviderRegistrations) {
+            modelRegistry.registerProvider(name, config);
+          }
+          mockLoaderRuntime.pendingProviderRegistrations = [];
+          return createMockSessionResult();
         }
-        mockLoaderRuntime.pendingProviderRegistrations = [];
-        return {
-          session: mockSession,
-          extensionsResult: { extensions: [], errors: [], runtime: {} },
-          modelFallbackMessage: undefined,
-        };
-      });
+      );
     }
 
     test('extension-registered model resolves on the 2nd+ sendQuery (the issue #2064 scenario)', async () => {

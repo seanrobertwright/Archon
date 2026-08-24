@@ -27,9 +27,10 @@ import {
   logWorkflowStart,
   logAssistant,
   logTool,
-  logValidation,
   logWorkflowError,
   logWorkflowComplete,
+  logNodeComplete,
+  logNodeError,
   type WorkflowEvent,
 } from './logger';
 
@@ -128,6 +129,89 @@ describe('Workflow Logger', () => {
     });
   });
 
+  describe('logNodeComplete', () => {
+    it('preserves gross input and reported cache counters', async () => {
+      await logNodeComplete(testDir, 'cache-test', 'step1', 'implement', {
+        tokens: { input: 120, output: 10, cacheRead: 80, cacheWrite: 0 },
+      });
+
+      const events = await readLogFile('cache-test');
+      expect(events[0].tokens).toEqual({
+        input: 120,
+        output: 10,
+        cacheRead: 80,
+        cacheWrite: 0,
+      });
+    });
+
+    it('records the reported cost alongside the tokens', async () => {
+      await logNodeComplete(testDir, 'cost-test', 'step1', 'implement', {
+        durationMs: 1200,
+        tokens: { input: 120, output: 10 },
+        cost_usd: 0.0042,
+      });
+
+      const events = await readLogFile('cost-test');
+      expect(events[0].cost_usd).toBe(0.0042);
+      expect(events[0].duration_ms).toBe(1200);
+      expect(events[0].tokens).toEqual({ input: 120, output: 10 });
+    });
+
+    it('keeps a reported zero cost distinct from an unreported one', async () => {
+      // Codex reports no cost at all (#2334), so the absent key has to mean exactly
+      // that. A provider that reports 0 spent nothing, and must still say so.
+      await logNodeComplete(testDir, 'zero-cost', 'step1', 'implement', { cost_usd: 0 });
+      await logNodeComplete(testDir, 'no-cost', 'step1', 'implement', {
+        tokens: { input: 5, output: 1 },
+      });
+
+      const [zero] = await readLogFile('zero-cost');
+      const [absent] = await readLogFile('no-cost');
+      expect(zero.cost_usd).toBe(0);
+      expect('cost_usd' in absent).toBe(false);
+    });
+  });
+
+  describe('logNodeError', () => {
+    it('records what the node spent before it failed', async () => {
+      await logNodeError(testDir, 'fail-cost', 'step1', 'provider stream died', {
+        tokens: { input: 120, output: 10, cacheRead: 80, cacheWrite: 0 },
+        cost_usd: 0.02,
+      });
+
+      const [event] = await readLogFile('fail-cost');
+      expect(event.type).toBe('node_error');
+      expect(event.error).toBe('provider stream died');
+      expect(event.cost_usd).toBe(0.02);
+      expect(event.tokens).toEqual({ input: 120, output: 10, cacheRead: 80, cacheWrite: 0 });
+    });
+
+    it('keeps a reported zero cost distinct from an unreported one', async () => {
+      // Same distinction the completion row protects: Codex reports no cost at all
+      // (#2334), so an absent key must not be readable as "spent nothing".
+      await logNodeError(testDir, 'fail-zero', 'step1', 'boom', { cost_usd: 0 });
+      await logNodeError(testDir, 'fail-unreported', 'step1', 'boom', {
+        tokens: { input: 5, output: 1 },
+      });
+
+      const [zero] = await readLogFile('fail-zero');
+      const [absent] = await readLogFile('fail-unreported');
+      expect(zero.cost_usd).toBe(0);
+      expect('cost_usd' in absent).toBe(false);
+    });
+
+    it('writes no usage keys for a failure that could not have spent anything', async () => {
+      // A missing command file, a substitution error, a bash exit code: these fail
+      // before any provider call, and their callers pass nothing.
+      await logNodeError(testDir, 'fail-bare', 'step1', 'command file not found');
+
+      const [event] = await readLogFile('fail-bare');
+      expect(event.error).toBe('command file not found');
+      expect('cost_usd' in event).toBe(false);
+      expect('tokens' in event).toBe(false);
+    });
+  });
+
   describe('logAssistant', () => {
     it('should log assistant message content', async () => {
       await logAssistant(testDir, 'assistant-test', 'Here is my response to your request.');
@@ -173,21 +257,6 @@ Line 3`;
     });
   });
 
-  describe('logValidation', () => {
-    it('should log validation event with check/result', async () => {
-      await logValidation(testDir, 'validation-test', {
-        check: 'type-check',
-        result: 'fail',
-        error: 'tsc not found',
-      });
-
-      const events = await readLogFile('validation-test');
-      expect(events[0].type).toBe('validation');
-      expect(events[0].check).toBe('type-check');
-      expect(events[0].result).toBe('fail');
-    });
-  });
-
   describe('logWorkflowError', () => {
     it('should log error message', async () => {
       await logWorkflowError(testDir, 'error-test', 'Step prompt not found: missing-step.md');
@@ -206,6 +275,20 @@ Line 3`;
       const events = await readLogFile('complete-test');
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe('workflow_complete');
+      // A run with no AI usage carries no usage keys at all.
+      expect('cost_usd' in events[0]).toBe(false);
+      expect('tokens' in events[0]).toBe(false);
+    });
+
+    it('records what the whole run spent', async () => {
+      await logWorkflowComplete(testDir, 'complete-usage-test', {
+        cost_usd: 0.19,
+        tokens: { input: 900, output: 120, cacheRead: 400 },
+      });
+
+      const events = await readLogFile('complete-usage-test');
+      expect(events[0].cost_usd).toBe(0.19);
+      expect(events[0].tokens).toEqual({ input: 900, output: 120, cacheRead: 400 });
     });
   });
 

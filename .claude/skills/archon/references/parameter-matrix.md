@@ -20,7 +20,7 @@ There are **eight** node types. Exactly one of `command`, `prompt`, `bash`, `scr
 | `timeout` (total, not idle)                  | —       | —       | yes     | yes     | —                            | — (on body bash/script nodes) | —             | —       |
 | `model` / `provider`                         | yes     | yes     | ignored | ignored | **yes — forwarded to every iteration** | **yes — default for body AI nodes** | ignored | ignored |
 | `context: fresh` \| `shared`                 | yes     | yes     | ignored | ignored | ignored (use `loop.fresh_context`) | ignored (use `fresh_context`) | ignored  | ignored |
-| `output_format`                              | yes     | yes     | ignored | ignored | ignored                      | ignored (works on body nodes) | ignored       | ignored |
+| `output_format`                              | yes     | yes     | ignored | ignored | **yes** (pairs with `loop.until_field`) | ignored (works on body nodes) | ignored       | ignored |
 | `allowed_tools` / `denied_tools`             | yes     | yes     | ignored | ignored | ignored                      | ignored (works on body nodes) | ignored       | ignored |
 | `hooks` / `mcp` / `skills` / `agents`        | yes     | yes     | ignored | ignored | ignored                      | ignored (work on body nodes) | ignored        | ignored |
 | `retry`                                      | yes (default: 2× transient) | yes (default: 2× transient) | explicit block only (#2088)¹ | explicit block only (#2088)¹ | **hard error** | **hard error**  | ignored² | ignored |
@@ -40,7 +40,7 @@ There are **eight** node types. Exactly one of `command`, `prompt`, `bash`, `scr
 - **ignored** — field is accepted by the parser but has no effect at runtime. Loader emits a warning (`<node-type>_node_ai_fields_ignored`).
 - **hard error** — workflow fails to load. Only `retry` on a loop/loop_group node does this.
 
-Most AI features work on `command` and `prompt` nodes. Loop and loop_group nodes are iteration controllers — but their `model`/`provider` ARE honored (forwarded to iterations / body defaults). A loop_group **body node** is a full node of its own type, so per-node AI fields work normally inside the body. `bash` and `script` nodes ignore AI fields with a warning. `approval` and `cancel` nodes don't invoke AI (except `approval.on_reject.prompt`).
+Most AI features work on `command` and `prompt` nodes. Loop and loop_group nodes are iteration controllers — but their `model`/`provider` ARE honored (forwarded to iterations / body defaults), and a **`loop:`** additionally honors `output_format`, because it makes its own provider call (#2563). A loop_group **body node** is a full node of its own type, so per-node AI fields work normally inside the body. `bash` and `script` nodes ignore AI fields with a warning. `approval` and `cancel` nodes don't invoke AI (except `approval.on_reject.prompt`).
 
 ## Parameter Selection by Intent
 
@@ -54,7 +54,8 @@ Organized by what you're trying to do, not by field name. Useful when you know t
 | Route based on upstream output                   | Upstream `output_format: {...}` + downstream `when:`         |
 | Join after mutually-exclusive routes             | `trigger_rule: none_failed_min_one_success` or `one_success` |
 | Run two independent branches in parallel         | Two nodes with no shared `depends_on`                        |
-| Iterate until tests pass                         | `loop: {until_bash: "bun run test", max_iterations: N}`      |
+| Iterate until tests pass                         | `loop: {until_bash: "bun run test", max_iterations: N}` — no `until:`, so nothing matches prose |
+| Iterate until the model judges it done            | `output_format: {...done: boolean...}` + `loop: {until_field: done, max_iterations: N}` — a validated boolean, not a sentinel |
 | Iterate a multi-node unit (implement → test → review per cycle) | `loop_group: {nodes: [...], until: ..., max_iterations: N}` |
 | Read the previous iteration's per-node output    | `$LOOP_PREV.<nodeId>.output` (loop_group body) or `$LOOP_PREV_OUTPUT` (loop) |
 | Iterate through a backlog without memory bleed   | `loop: {fresh_context: true}`, state written to `$ARTIFACTS_DIR` |
@@ -89,7 +90,7 @@ Organized by what you're trying to do, not by field name. Useful when you know t
 
 Things that don't fail parsing but don't do what you'd expect:
 
-1. **`hooks` / `mcp` / `skills` / `output_format` / `allowed_tools` / `denied_tools` on a loop, loop_group, bash, script, approval, or cancel node** → silently ignored. (NOT `model`/`provider` on loop/loop_group — those work: forwarded per iteration / as body defaults.)
+1. **`hooks` / `mcp` / `skills` / `allowed_tools` / `denied_tools` on a loop, loop_group, bash, script, approval, or cancel node** → silently ignored. (NOT `model`/`provider` on loop/loop_group — those work: forwarded per iteration / as body defaults. NOT `output_format` on a `loop:` — that works too since #2563: the loop runs its own provider call, so the schema is honored and `loop.until_field` can terminate on a declared boolean. It IS still ignored on `loop_group`.)
 2. **`context: fresh` on a loop / loop_group** → ignored. Use the loop config's `fresh_context: true` instead.
 3. **`output_format` on a bash or script node** → schema is accepted but bash/script output is whatever stdout says; no JSON coercion.
 4. **Unknown `$nodeId.output` (whole-text) reference at runtime** → resolves to empty string + warning. But `$nodeId.output.field` is STRICT — an unresolvable field (not in the producer's schema, non-JSON schemaless output, missing key, or producer skipped) **fails the consuming node loudly**, it does not resolve empty. And load-time validation rejects refs to node ids that don't exist at all.
@@ -188,7 +189,7 @@ Use this matrix to find the right parameter. Use these references for the full e
 | `agents`                        | yes           | no                                      | no                                   | **yes**              | **yes**             |
 | `sandbox` / `maxBudgetUsd` / `fallbackModel` | yes | no                                | no                                   | no                   | no                  |
 | Model naming                    | `haiku`, `sonnet`, `opus`, `opus[1m]`   | Codex model ID (e.g. `gpt-5.6-sol`)   | `<vendor>/<model>` (e.g. `anthropic/claude-opus-4-5`, `openrouter/qwen/qwen3-coder`) | OpenCode catalog ref | Copilot model id |
-| `effort` / `thinking`           | yes           | use `modelReasoningEffort` for reasoning models | via `effort:` (maps to thinking level) | no (opencode.json agent config) | yes (maps like Pi) |
+| `effort` / `thinking`           | yes           | `effort:` yes (→ `modelReasoningEffort`, `max`→`xhigh`); no `thinking` | via `effort:` (all six rungs native, nothing clamped) | no (opencode.json agent config) | yes, but clamps both ends (`max`→`xhigh`, `minimal`→`low`) |
 | Provider session resume (`persist_session`, `context: shared` threading) | yes | yes            | yes                                  | yes                  | yes                 |
 
 This table is kept in sync by hand with the canonical, generated [Provider Capability Matrix](https://archon.diy/reference/provider-capabilities/) (produced from each provider's `capabilities.ts` via `bun run generate:capability-matrix`) — treat that page as the source of truth if the two ever disagree.

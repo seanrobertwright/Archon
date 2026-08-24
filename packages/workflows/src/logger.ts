@@ -16,6 +16,12 @@ function getLog(): ReturnType<typeof createLogger> {
 // Track whether we've warned about logging failures (warn once per session)
 let logWarningShown = false;
 
+/**
+ * A row in a run's JSONL log. Some variants are historical: nothing has emitted
+ * `'validation'` (with `check`/`result`) since #805 removed its call site along with
+ * sequential execution mode, and its writer is now deleted too. It stays because logs
+ * already on disk contain those rows — keep it when reading, never write a new one.
+ */
 export interface WorkflowEvent {
   type:
     | 'workflow_start'
@@ -36,11 +42,35 @@ export interface WorkflowEvent {
   tool_input?: Record<string, unknown>;
   duration_ms?: number;
   tokens?: WorkflowTokenUsage;
+  cost_usd?: number;
   check?: string;
   result?: 'pass' | 'fail' | 'warn' | 'unknown';
   error?: string;
   ts: string;
 }
+
+/**
+ * What a node or a whole run spent, in the transcript's own field names.
+ *
+ * One carrier, passed whole. The same payload used to be spelled out by hand at every
+ * sink, and cost was simply forgotten at the transcript one — an axis added here now
+ * reaches the JSONL row and the DB event together or not at all (#2674). A node that
+ * failed after spending reports that spend the same way a node that completed does
+ * (#2693).
+ *
+ * That symmetry holds per SINK, not yet across every node type. A `loop:` node's
+ * cumulative totals reach its transcript row on failure and its persisted event on
+ * either outcome, but no success exit writes a terminal transcript row for the loop's
+ * own id — only per-iteration rows, which carry duration and no usage. `workflow:` and
+ * fan-out nodes write no transcript rows at all. So do not read an absent `cost_usd` on
+ * a run's transcript as "the whole run was free"; read it per row, where it means the
+ * provider reported no cost. Completing that coverage is #2614's audit.
+ *
+ * Each axis is omitted when nothing was reported for it, so an absent `cost_usd` means
+ * the provider reported no cost (Codex reports none at all — #2334) and `0` means it
+ * reported zero. Build it with `!== undefined` tests, never truthiness.
+ */
+export type WorkflowUsage = Pick<WorkflowEvent, 'tokens' | 'cost_usd'>;
 
 /**
  * Get log file path for a workflow run.
@@ -133,28 +163,6 @@ export async function logTool(
 }
 
 /**
- * Log validation check result
- */
-export async function logValidation(
-  logDir: string,
-  workflowRunId: string,
-  payload: {
-    check: string;
-    result: 'pass' | 'fail' | 'warn' | 'unknown';
-    error?: string;
-    step?: string;
-  }
-): Promise<void> {
-  await logWorkflowEvent(logDir, workflowRunId, {
-    type: 'validation',
-    check: payload.check,
-    result: payload.result,
-    error: payload.error,
-    step: payload.step,
-  });
-}
-
-/**
  * Log workflow error
  */
 export async function logWorkflowError(
@@ -169,11 +177,16 @@ export async function logWorkflowError(
 }
 
 /**
- * Log workflow completion
+ * Log workflow completion, with what the whole run spent.
  */
-export async function logWorkflowComplete(logDir: string, workflowRunId: string): Promise<void> {
+export async function logWorkflowComplete(
+  logDir: string,
+  workflowRunId: string,
+  usage?: WorkflowUsage
+): Promise<void> {
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'workflow_complete',
+    ...usage,
   });
 }
 
@@ -197,14 +210,17 @@ export async function logNodeComplete(
   workflowRunId: string,
   nodeId: string,
   commandName: string,
-  meta?: { durationMs?: number; tokens?: WorkflowTokenUsage }
+  meta?: { durationMs?: number } & WorkflowUsage
 ): Promise<void> {
+  const { durationMs, ...usage } = meta ?? {};
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'node_complete',
     step: nodeId,
     content: commandName,
-    ...(meta?.durationMs !== undefined ? { duration_ms: meta.durationMs } : {}),
-    ...(meta?.tokens ? { tokens: meta.tokens } : {}),
+    ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
+    // Spread whole: the caller already omitted every unreported axis, and a guard here
+    // would have to re-decide that per field — which is how `0` becomes absent.
+    ...usage,
   });
 }
 
@@ -222,16 +238,27 @@ export async function logNodeSkip(
   });
 }
 
-/** Log DAG node error */
+/**
+ * Log DAG node error, with what the node spent before it failed.
+ *
+ * A node that fails mid-stream keeps the usage it already burned, so the failure row
+ * carries spend for the same reason the completion row does (#2693). Callers whose
+ * failure happens before any provider call — a missing command file, a substitution
+ * error, a bash exit code — pass nothing, and the absent keys mean exactly that.
+ */
 export async function logNodeError(
   logDir: string,
   workflowRunId: string,
   nodeId: string,
-  error: string
+  error: string,
+  usage?: WorkflowUsage
 ): Promise<void> {
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'node_error',
     step: nodeId,
     error,
+    // Spread whole: the caller already omitted every unreported axis, and a guard here
+    // would have to re-decide that per field — which is how `0` becomes absent.
+    ...usage,
   });
 }

@@ -95,8 +95,30 @@ function checkRequiredFields(node: BuilderNode): Issue[] {
           missing('loop.command', 'loop requires a command name');
       } else if ((node.data.prompt ?? '').trim().length === 0)
         missing('loop.prompt', 'loop requires a prompt (or a command file)');
-      if (node.data.until.trim().length === 0)
-        missing('loop.until', "loop requires an 'until' signal");
+      // Completion channels (#2563) — a hand-written mirror of the two rules in
+      // the engine's `loopControlSchema`, because @archon/web cannot import
+      // @archon/workflows. Keep the pair in step; verify by parsing both, not by
+      // reading them — `scripts/node-ref-parity.test.ts` does exactly that, in CI.
+      //
+      // 1. A declared channel must be non-blank. Blank is broken at runtime, not
+      //    just untidy: `bash -c "   "` exits 0, and a blank signal matches any
+      //    whitespace-only line in the model's output.
+      if (node.data.until?.trim().length === 0)
+        missing('loop.until', "loop requires a non-blank 'until' signal");
+      if (node.data.until_bash?.trim().length === 0)
+        missing('loop.until_bash', "loop requires a non-blank 'until_bash' check");
+      if (node.data.until_field?.trim().length === 0)
+        missing('loop.until_field', "loop requires a non-blank 'until_field' name");
+      // 2. At least one channel must be declared at all.
+      if (
+        node.data.until === undefined &&
+        node.data.until_bash === undefined &&
+        node.data.until_field === undefined
+      )
+        missing(
+          'loop.until',
+          "loop requires a completion channel: an 'until' signal, an 'until_bash' check, or an 'until_field' name"
+        );
       if (!Number.isInteger(node.data.max_iterations) || node.data.max_iterations <= 0)
         invalid('loop.max_iterations', 'loop requires a positive integer max_iterations');
       break;

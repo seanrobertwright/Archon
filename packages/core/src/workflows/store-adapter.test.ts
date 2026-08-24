@@ -15,6 +15,11 @@ const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
+// Backs createWorkflowStore()'s rewriteApprovalContext (#2707 step 3 pause
+// escalation) — per AGENTS.md's mock.module rule, an export the factory omits
+// keeps its REAL implementation, so this must be listed even though no test
+// here calls rewriteApprovalContext yet.
+const mockResolveApprovalGate = mock(() => Promise.resolve({ resolved: true }));
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
@@ -30,6 +35,7 @@ mock.module('../db/workflows', () => ({
   failWorkflowRun: mockFailWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
+  resolveApprovalGate: mockResolveApprovalGate,
   claimWriteback: mock(() => Promise.resolve({ claimed: true })),
   releaseWritebackClaim: mock(() => Promise.resolve()),
 }));
@@ -71,6 +77,11 @@ mock.module('@archon/providers', () => ({
 
 mock.module('../config/config-loader', () => ({
   loadConfig: mock(() => Promise.resolve({ assistant: 'claude' })),
+  // Required even though nothing here calls it: this factory replaces the module
+  // for the whole process, and child-isolation-resolver.ts (same `bun test
+  // src/workflows/` batch) does `import { loadRepoConfig }`. Omit it and that
+  // import fails at module-eval with "Export named 'loadRepoConfig' not found".
+  loadRepoConfig: mock(() => Promise.resolve(null)),
 }));
 
 // Per-user provider credentials mocks
@@ -101,9 +112,19 @@ mock.module('../db/env-vars', () => ({
 }));
 mock.module('../db/workflow-node-sessions', () => ({
   getWorkflowNodeSession: mock(() => Promise.resolve(null)),
-  setWorkflowNodeSession: mock(() => Promise.resolve()),
+  upsertWorkflowNodeSession: mock(() => Promise.resolve()),
   deleteWorkflowNodeSessions: mock(() => Promise.resolve()),
 }));
+mock.module(
+  '../db/workflow-run-node-sessions',
+  (): {
+    listWorkflowRunNodeSessions: () => Promise<never[]>;
+    upsertWorkflowRunNodeSession: () => Promise<void>;
+  } => ({
+    listWorkflowRunNodeSessions: mock((): Promise<never[]> => Promise.resolve([])),
+    upsertWorkflowRunNodeSession: mock((): Promise<void> => Promise.resolve()),
+  })
+);
 
 const { createWorkflowStore, createWorkflowDeps } = await import('./store-adapter');
 
@@ -130,6 +151,11 @@ describe('createWorkflowStore', () => {
       'getDagResumeSnapshot',
       'getCodebase',
       'getCodebaseEnvVars',
+      'getWorkflowNodeSession',
+      'upsertWorkflowNodeSession',
+      'deleteWorkflowNodeSessions',
+      'listWorkflowRunNodeSessions',
+      'upsertWorkflowRunNodeSession',
     ];
     for (const method of requiredMethods) {
       expect(typeof store[method]).toBe('function');

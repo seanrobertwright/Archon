@@ -9,6 +9,10 @@ import type { MergedConfig } from '../config/config-types';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
 import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
+import {
+  listWorkflowRunNodeSessions,
+  upsertWorkflowRunNodeSession,
+} from '../db/workflow-run-node-sessions';
 import * as codebaseDb from '../db/codebases';
 import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
@@ -59,6 +63,8 @@ export function createWorkflowStore(): IWorkflowStore {
     completeWorkflowRun: workflowDb.completeWorkflowRun,
     failWorkflowRun: workflowDb.failWorkflowRun,
     pauseWorkflowRun: workflowDb.pauseWorkflowRun,
+    rewriteApprovalContext: (id, approvalContext) =>
+      workflowDb.resolveApprovalGate(id, { approval: approvalContext }, []),
     claimWriteback: workflowDb.claimWriteback,
     releaseWritebackClaim: workflowDb.releaseWritebackClaim,
     cancelWorkflowRun: workflowDb.cancelWorkflowRun,
@@ -80,6 +86,8 @@ export function createWorkflowStore(): IWorkflowStore {
     getWorkflowNodeSession: workflowNodeSessionDb.getWorkflowNodeSession,
     upsertWorkflowNodeSession: workflowNodeSessionDb.upsertWorkflowNodeSession,
     deleteWorkflowNodeSessions: workflowNodeSessionDb.deleteWorkflowNodeSessions,
+    listWorkflowRunNodeSessions,
+    upsertWorkflowRunNodeSession,
   };
 }
 

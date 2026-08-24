@@ -49,8 +49,26 @@ import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
+import {
+  prepareWorkflowSource,
+  recordSelectedWorkflow,
+  withCapturedSource,
+  type CapturedSourceOwner,
+  type PreparedWorkflowSource,
+} from '@archon/workflows/executor';
+import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
+import { resolveWorkflowName } from '@archon/workflows/router';
+import { loadConfig } from '../config/config-loader';
+import {
+  assertComposedGateDriveable,
+  assertInteractiveClassNotBackgrounded,
+} from '@archon/workflows/utils/workflow-requirements';
+import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
+import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import { createWorkflowDeps } from '../workflows/store-adapter';
+import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import {
   cleanupToMakeRoom,
   getWorktreeStatusBreakdown,
@@ -283,6 +301,20 @@ export interface WorkflowRoutingContext {
    * to the privacy-safe "custom" treatment when not provided.
    */
   readonly source?: WorkflowSource;
+  /**
+   * Keys the engine dropped from the workflow's YAML (#2213). Forwarded to the
+   * executor so a background (web/console) run records them on the run like any
+   * other, independently of the chat notification.
+   */
+  readonly parseWarnings?: readonly string[];
+  /**
+   * Declared inputs supplied by the caller (#2554), already validated at the dispatch
+   * gate. This path PRE-CREATES the run row (so the UI can fetch it immediately), which
+   * means the executor's own row-creation branch never runs — the values are stamped on
+   * the pre-created row below, and also passed to `executeWorkflow` for the fallback
+   * path where pre-creation failed and the executor creates the row itself.
+   */
+  readonly inputs?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -290,7 +322,8 @@ export interface WorkflowRoutingContext {
  * Creates a hidden worker conversation, sets up event bridging from worker to parent,
  * and fires-and-forgets the workflow execution.
  */
-export async function dispatchBackgroundWorkflow(
+async function dispatchBackgroundWorkflowOwned(
+  owner: CapturedSourceOwner,
   ctx: WorkflowRoutingContext,
   workflow: WorkflowDefinition,
   isolationContext?: {
@@ -300,6 +333,22 @@ export async function dispatchBackgroundWorkflow(
     prBranch?: string;
   }
 ): Promise<void> {
+  // 0. A backgrounded run cannot present a pause inline. Two checks, covering the two
+  // things the class declaration can and cannot see (#2707 step 2): the workflow's OWN
+  // declared class (`interactive: true` — refused unconditionally, whether or not it
+  // happens to contain a pause node right now) and a gate that arrived through `include:`
+  // in a workflow that omits `interactive: true` — written by someone looking at a
+  // different file (#1764), so the class declaration alone cannot catch it. Checked HERE,
+  // in the one function that backgrounds a run, rather than at each caller — this has two
+  // entrypoints (the console's default dispatch and the `manage_run` tool's startWorkflow,
+  // which reaches every platform with native tools), and a rule enforced per caller is a
+  // rule that fails open the moment a third appears. Throws before the worker conversation
+  // exists, so a refusal leaves nothing behind.
+  assertInteractiveClassNotBackgrounded(workflow);
+  // Already-expanded — discoverWorkflowsWithConfig's output never contains an
+  // IncludeDirective (#2486).
+  assertComposedGateDriveable(workflow.nodes as DagNode[]);
+
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
@@ -323,6 +372,10 @@ export async function dispatchBackgroundWorkflow(
   // is then fatal (never fall back to running in a shared/parent worktree).
   let workerCwd: string;
   let codebaseBaseBranch: string | undefined;
+  // Per-child isolation resolver (#2121 slice 2, PR-A): a `workflow:` node with
+  // `isolation: 'worktree'` gets its own worktree per child. Built for git-repo
+  // codebases only; undefined otherwise → the engine fails such a node fast.
+  let resolveChildIsolation: ReturnType<typeof createChildWorktreeResolver> | undefined;
   if (ctx.codebaseId) {
     const codebase = await getCodebase(ctx.codebaseId);
     if (!codebase) {
@@ -331,6 +384,16 @@ export async function dispatchBackgroundWorkflow(
       );
     }
     codebaseBaseBranch = codebase.default_branch?.trim() || undefined;
+    if (codebase.kind !== 'folder') {
+      resolveChildIsolation = createChildWorktreeResolver({
+        codebaseId: codebase.id,
+        codebaseName: codebase.name,
+        canonicalRepoPath: codebase.default_cwd,
+        baseBranch: codebaseBaseBranch,
+        createdByPlatform: ctx.platform.getPlatformType(),
+        createdByUserId: ctx.userId,
+      });
+    }
     if (workflow.worktree?.enabled === false) {
       // Respect an explicit worktree opt-out: skip isolation and run in the parent's cwd.
       getLog().info(
@@ -399,19 +462,76 @@ export async function dispatchBackgroundWorkflow(
     unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformId, ctx.conversationId);
   }
 
+  const workflowDeps = createWorkflowDeps();
+
+  // Freeze this run's executable source, then re-resolve the workflow FROM the frozen
+  // copy so the definition executed and the commands and scripts beside it are one
+  // consistent set of bytes. This background path calls `executeWorkflow` directly, so
+  // without its own capture it would be the one surface still reading live source.
+  //
+  // `workerCwd` is frequently a worktree, whose `.archon` belongs to whatever branch it
+  // is on rather than to the author; the canonical repo is what gets captured.
+  const workflowSourceRoot = await resolveWorkflowSourceRoot(workerCwd);
+  let preparedSource: PreparedWorkflowSource | undefined;
+  try {
+    preparedSource = await prepareWorkflowSource(workflowDeps, {
+      sourceRoot: workflowSourceRoot ?? workerCwd,
+    });
+    // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+    owner.hold(preparedSource);
+    // See the note in orchestrator-agent.ts: an empty capture means the definition came
+    // from a binary's embedded bundled set, which has nothing on disk to re-read.
+    if (preparedSource.manifest.scopes.length > 0) {
+      const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
+        workerCwd,
+        loadConfig,
+        preparedSource.roots
+      );
+      const reResolved = resolveWorkflowName(
+        workflow.name,
+        capturedWorkflows.map(w => w.workflow)
+      );
+      if (!reResolved) {
+        throw new Error(`workflow '${workflow.name}' is not present in the captured source`);
+      }
+      workflow = reResolved;
+    }
+    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+  } catch (error) {
+    const err = error as Error;
+    // Reclaim before returning: this branch is the console's default dispatch path, and
+    // leaving the tree behind here leaks one capture per failed dispatch.
+    getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+    await ctx.platform.sendMessage(
+      ctx.conversationId,
+      `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
+        'Nothing has been started.'
+    );
+    return;
+  }
+
   // 7. Pre-create workflow run row so the UI can fetch it immediately.
   // Without this, navigating to the execution page before executeWorkflow's
   // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
-  const workflowDeps = createWorkflowDeps();
   let preCreatedRun: Awaited<ReturnType<typeof workflowDeps.store.createWorkflowRun>> | undefined;
   try {
     preCreatedRun = await workflowDeps.store.createWorkflowRun({
+      // The id its already-written source capture is filed under.
+      id: preparedSource.runId,
       workflow_name: workflow.name,
       conversation_id: workerConv.id,
       codebase_id: ctx.codebaseId,
       user_message: ctx.originalMessage,
       working_path: workerCwd,
-      metadata: ctx.issueContext ? { github_context: ctx.issueContext } : {},
+      metadata: {
+        ...(ctx.issueContext ? { github_context: ctx.issueContext } : {}),
+        // Declared inputs supplied by this invocation (#2554). Stamped here because the
+        // executor only writes them when IT creates the row, and this path hands it a
+        // pre-created one.
+        ...(ctx.inputs && Object.keys(ctx.inputs).length > 0
+          ? { [SUBRUN_METADATA_KEYS.inputs]: { ...ctx.inputs } }
+          : {}),
+      },
       parent_conversation_id: ctx.conversationDbId,
       user_id: ctx.userId,
     });
@@ -421,10 +541,18 @@ export async function dispatchBackgroundWorkflow(
     // Non-fatal: executeWorkflow will create its own row as fallback
   }
 
-  // 8. Fire-and-forget: run workflow in background
-  void (async (): Promise<void> => {
+  // 8. Fire-and-forget: transfer the capture into a second ownership scope whose
+  // lifetime encloses the detached execution. `withCapturedSource` invokes its body
+  // synchronously, so the new owner holds the capture before the dispatch owner adopts
+  // and returns. The detached scope then reclaims on any pre-rename failure or stops
+  // tracking only when executeWorkflow adopts after the rename succeeds.
+  const backgroundExecution = withCapturedSource(async backgroundOwner => {
+    backgroundOwner.hold(preparedSource);
     try {
       try {
+        // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+        // executor adopts for us there (see #2690). Until then a rename failure leaves
+        // the staged directory un-adopted so the wrap reclaims it on the way out.
         const result = await executeWorkflow(
           workflowDeps,
           ctx.platform,
@@ -441,7 +569,15 @@ export async function dispatchBackgroundWorkflow(
             preCreatedRun,
             userId: ctx.userId,
             source: ctx.source,
+            parseWarnings: ctx.parseWarnings,
             baseBranch: codebaseBaseBranch,
+            resolveChildIsolation,
+            preparedSource,
+            capturedSourceOwner: backgroundOwner,
+            // Only consumed when `preCreatedRun` is undefined (pre-creation failed and
+            // the executor creates the row itself); otherwise the row above already
+            // carries them.
+            inputs: ctx.inputs,
           }
         );
         // Surface workflow output to parent conversation as a result card
@@ -527,7 +663,31 @@ export async function dispatchBackgroundWorkflow(
     } catch (outerError) {
       getLog().error({ err: toError(outerError) }, 'background_workflow_unhandled_error');
     }
-  })();
+  });
+  owner.adopt();
+  void backgroundExecution;
+}
+
+/**
+ * Dispatch a workflow in the background, owning any capture it takes.
+ *
+ * Same owner as the CLI and chat. This path previously reclaimed with a manual dispose in
+ * one catch, which covered that one branch and nothing else — three shapes for one
+ * invariant is how the busiest surface ended up with none.
+ */
+export async function dispatchBackgroundWorkflow(
+  ctx: WorkflowRoutingContext,
+  workflow: WorkflowDefinition,
+  isolationContext?: {
+    branchName?: string;
+    isPrReview?: boolean;
+    prSha?: string;
+    prBranch?: string;
+  }
+): Promise<void> {
+  await withCapturedSource(owner =>
+    dispatchBackgroundWorkflowOwned(owner, ctx, workflow, isolationContext)
+  );
 }
 
 /**
