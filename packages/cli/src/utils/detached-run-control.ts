@@ -358,6 +358,7 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
                 const cleanup = (): void => {
                   socket.off('data', onData);
                   socket.off('error', onError);
+                  socket.off('end', onEnd);
                   socket.off('close', onClose);
                   socket.off('timeout', onTimeout);
                 };
@@ -386,6 +387,11 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
                 const onError = (error: Error): void => {
                   failReady(error);
                 };
+                const onEnd = (): void => {
+                  failReady(
+                    new Error('Detached workflow owner ended before committing termination')
+                  );
+                };
                 const onClose = (): void => {
                   failReady(
                     new Error('Detached workflow owner closed before committing termination')
@@ -398,6 +404,7 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
                 };
                 socket.on('data', onData);
                 socket.once('error', onError);
+                socket.once('end', onEnd);
                 socket.once('close', onClose);
                 socket.once('timeout', onTimeout);
                 socket.setTimeout(IPC_TIMEOUT_MS);

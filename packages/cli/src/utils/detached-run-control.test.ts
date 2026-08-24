@@ -66,7 +66,7 @@ describe('detached run control', () => {
 
     try {
       const target = await requestDetachedRunStop(runId);
-      await expect(target.stop()).rejects.toThrow(/closed before committing termination/);
+      await expect(target.stop()).rejects.toThrow(/(?:ended|closed) before committing termination/);
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
       if (process.platform !== 'win32') rmSync(path, { force: true });
