@@ -9,6 +9,9 @@ import { makeIssue } from './make-issue';
 
 const waitTimestampPattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?Z$/;
 const wholeInputsRefPattern = /^\$INPUTS\.[a-zA-Z_][a-zA-Z0-9_-]*$/;
+// @archon/web cannot import workflow runtime values. Keep aligned with
+// MAX_DURABLE_WAIT_MS in @archon/workflows/schemas/dag-node.
+const MAX_DURABLE_WAIT_MS = 1_000 * 365 * 24 * 60 * 60 * 1_000;
 
 function isValidWaitTimestamp(value: string): boolean {
   if (new RegExp(OUTPUT_REF_SOURCE).test(value) || wholeInputsRefPattern.test(value.trim())) {
@@ -157,9 +160,14 @@ function checkRequiredFields(node: BuilderNode): Issue[] {
       }
       if (
         node.data.duration_ms !== undefined &&
-        (!Number.isInteger(node.data.duration_ms) || node.data.duration_ms <= 0)
+        (!Number.isInteger(node.data.duration_ms) ||
+          node.data.duration_ms <= 0 ||
+          node.data.duration_ms > MAX_DURABLE_WAIT_MS)
       ) {
-        invalid('wait.duration_ms', 'wait duration must be a positive integer');
+        invalid(
+          'wait.duration_ms',
+          'wait duration must be a positive integer no greater than 1000 years'
+        );
       }
       if (node.data.until?.trim().length === 0) {
         missing('wait.until', 'wait timestamp must not be empty');
@@ -175,9 +183,13 @@ function checkRequiredFields(node: BuilderNode): Issue[] {
         node.data.event !== undefined &&
         (node.data.deadline_ms === undefined ||
           !Number.isInteger(node.data.deadline_ms) ||
-          node.data.deadline_ms <= 0)
+          node.data.deadline_ms <= 0 ||
+          node.data.deadline_ms > MAX_DURABLE_WAIT_MS)
       ) {
-        invalid('wait.deadline_ms', 'event waits require a positive integer deadline');
+        invalid(
+          'wait.deadline_ms',
+          'event waits require a positive integer deadline no greater than 1000 years'
+        );
       }
       if (node.data.event === undefined && node.data.deadline_ms !== undefined) {
         invalid('wait.deadline_ms', 'deadline is only supported for event waits');

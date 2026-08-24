@@ -22,6 +22,7 @@ import type {
   ProviderDefaultsMap,
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from '@archon/workflows/model-validation';
+import { MAX_DURABLE_WAIT_MS } from '@archon/workflows/schemas/dag-node';
 
 export type {
   ClaudeProviderDefaults,
@@ -186,9 +187,9 @@ export interface GlobalConfig {
 
 export const workflowContinuationConfigSchema = z.object({
   autoResumeOnQuotaReset: z.boolean().optional(),
-  quotaFallbackDelayMs: z.number().finite().positive().optional(),
+  quotaFallbackDelayMs: z.number().finite().positive().max(MAX_DURABLE_WAIT_MS).optional(),
   quotaMaxAttempts: z.number().int().positive().optional(),
-  quotaDeadlineMs: z.number().finite().positive().optional(),
+  quotaDeadlineMs: z.number().finite().positive().max(MAX_DURABLE_WAIT_MS).optional(),
 });
 export type WorkflowContinuationConfig = z.infer<typeof workflowContinuationConfigSchema>;
 

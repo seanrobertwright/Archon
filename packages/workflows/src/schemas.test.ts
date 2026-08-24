@@ -16,6 +16,7 @@ import {
   BASH_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
+  MAX_DURABLE_WAIT_MS,
   waitConfigSchema,
   inputEnvKey,
   readSubrunMetadata,
@@ -163,6 +164,25 @@ describe('dagNodeSchema — durable wait', () => {
     ).toBe(true);
     expect(
       dagNodeSchema.safeParse({ id: 'date-only', wait: { until: '2026-08-25' } }).success
+    ).toBe(false);
+  });
+
+  test('bounds persisted delays before they can overflow their timestamps', () => {
+    expect(waitConfigSchema.safeParse({ duration_ms: MAX_DURABLE_WAIT_MS }).success).toBe(true);
+    expect(waitConfigSchema.safeParse({ duration_ms: MAX_DURABLE_WAIT_MS + 1 }).success).toBe(
+      false
+    );
+    expect(
+      waitConfigSchema.safeParse({
+        event: 'checks.complete',
+        deadline_ms: MAX_DURABLE_WAIT_MS,
+      }).success
+    ).toBe(true);
+    expect(
+      waitConfigSchema.safeParse({
+        event: 'checks.complete',
+        deadline_ms: MAX_DURABLE_WAIT_MS + 1,
+      }).success
     ).toBe(false);
   });
 });

@@ -568,35 +568,48 @@ describe('workflows database', () => {
       expect(
         await signalWorkflowWait(
           'workflow-run-123',
-          'checks.complete',
-          { conclusion: 'success' },
           {
-            event_type: 'wait_signaled',
-            step_name: 'await-ci',
-            data: { event: 'checks.complete' },
-          }
+            owner: 'node',
+            nodeId: 'await-ci',
+            kind: 'event',
+            event: 'checks.complete',
+            waitingSince: '2026-08-24T10:00:00.000Z',
+            resumeAt: '2026-08-25T10:00:00.000Z',
+          },
+          { conclusion: 'success' }
         )
       ).toEqual({ signaled: true });
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("metadata->'wait'->>'event' = $2");
+      expect(query).toContain("metadata->'wait'->>'nodeId' = $3");
+      expect(query).toContain("metadata->'wait'->>'resumeAt' = $4");
       expect(query).toContain("metadata->'wait'->>'signaledAt' IS NULL");
-      expect(query).toContain("metadata->'wait'->>'resumeAt' > $3");
+      expect(query).toContain("metadata->'wait'->>'resumeAt' > $5");
       expect(params[1]).toBe('checks.complete');
-      expect(JSON.parse(params[3] as string)).toEqual({ conclusion: 'success' });
+      expect(params[2]).toBe('await-ci');
+      expect(params[3]).toBe('2026-08-25T10:00:00.000Z');
+      expect(JSON.parse(params[5] as string)).toEqual({ conclusion: 'success' });
       expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
     });
 
     test('preserves an omitted signal payload as absent', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
-      await expect(signalWorkflowWait('workflow-run-123', 'checks.complete')).resolves.toEqual({
-        signaled: true,
-      });
+      await expect(
+        signalWorkflowWait('workflow-run-123', {
+          owner: 'node',
+          nodeId: 'await-ci',
+          kind: 'event',
+          event: 'checks.complete',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          resumeAt: '2026-08-25T10:00:00.000Z',
+        })
+      ).resolves.toEqual({ signaled: true });
 
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("'{wait,signaledAt}'");
       expect(query).not.toContain("'{wait,payload}'");
-      expect(params).toHaveLength(3);
+      expect(params).toHaveLength(5);
     });
   });
 

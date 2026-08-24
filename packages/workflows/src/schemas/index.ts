@@ -64,6 +64,7 @@ export {
   gateNodeSchema,
   approvalOnRejectSchema,
   haltNodeSchema,
+  MAX_DURABLE_WAIT_MS,
   waitConfigSchema,
   waitUntilTimestampSchema,
   waitNodeSchema,

@@ -97,7 +97,6 @@ import {
   isApprovalContext,
   isGateResolved,
   isWorkflowWaitContext,
-  workflowWaitStepName,
 } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { MessageRow } from '@archon/core/schemas/message';
@@ -3708,11 +3707,7 @@ export function registerApiRoutes(
       if (wait?.kind !== 'event' || wait.event !== event) {
         return apiError(c, 400, `Run is not waiting on event '${event}'`);
       }
-      const { signaled } = await workflowDb.signalWorkflowWait(runId, event, payload, {
-        event_type: 'wait_signaled',
-        step_name: workflowWaitStepName(wait),
-        data: { event, ...(payload !== undefined ? { payload } : {}) },
-      });
+      const { signaled } = await workflowDb.signalWorkflowWait(runId, wait, payload);
       if (!signaled) {
         return apiError(c, 400, `Run is not waiting on event '${event}'`);
       }

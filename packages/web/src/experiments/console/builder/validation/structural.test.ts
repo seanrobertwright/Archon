@@ -199,6 +199,38 @@ describe('validateStructural', () => {
     }
   });
 
+  test('wait delays mirror the engine persisted timestamp bound', () => {
+    const maximum = 1_000 * 365 * 24 * 60 * 60 * 1_000;
+    const accepted = validateStructural(
+      wf([
+        { id: 'duration', variant: 'wait', base: {}, data: { duration_ms: maximum } },
+        {
+          id: 'event',
+          variant: 'wait',
+          base: {},
+          data: { event: 'checks.complete', deadline_ms: maximum },
+        },
+      ])
+    );
+    expect(accepted.filter(issue => issue.path.field?.startsWith('wait.'))).toEqual([]);
+
+    const rejected = validateStructural(
+      wf([
+        { id: 'duration', variant: 'wait', base: {}, data: { duration_ms: maximum + 1 } },
+        {
+          id: 'event',
+          variant: 'wait',
+          base: {},
+          data: { event: 'checks.complete', deadline_ms: maximum + 1 },
+        },
+      ])
+    );
+    expect(rejected.map(issue => issue.path.field)).toEqual([
+      'wait.duration_ms',
+      'wait.deadline_ms',
+    ]);
+  });
+
   test('cancel missing reason is flagged', () => {
     const issues = validateStructural(
       wf([{ id: 'c', variant: 'cancel', base: {}, data: { reason: '' } }])

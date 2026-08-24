@@ -618,11 +618,13 @@ export const haltNodeSchema = dagNodeBaseSchema.extend({
 export type HaltNode = z.infer<typeof haltNodeSchema>;
 
 /** Engine-visible condition that may suspend a run without occupying a worker slot. */
+export const MAX_DURABLE_WAIT_MS = 1_000 * 365 * 24 * 60 * 60 * 1_000;
+
 export const waitConfigFlatSchema = z.object({
-  duration_ms: z.number().int().positive().optional(),
+  duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS).optional(),
   until: z.string().min(1, "'wait.until' must not be empty").optional(),
   event: z.string().trim().min(1, "'wait.event' must not be empty").optional(),
-  deadline_ms: z.number().int().positive().optional(),
+  deadline_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS).optional(),
 });
 export const waitUntilTimestampSchema = z.string().datetime();
 const waitUntilValueSchema = z
@@ -640,7 +642,7 @@ const waitUntilValueSchema = z
 // `never` in the inferred type, so widened programmatic objects cannot combine variants.
 export const waitConfigSchema = z.union([
   z
-    .strictObject({ duration_ms: z.number().int().positive() })
+    .strictObject({ duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS) })
     .transform(
       value => value as typeof value & { until?: never; event?: never; deadline_ms?: never }
     ),
@@ -652,7 +654,7 @@ export const waitConfigSchema = z.union([
   z
     .strictObject({
       event: z.string().trim().min(1, "'wait.event' must not be empty"),
-      deadline_ms: z.number().int().positive(),
+      deadline_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS),
     })
     .transform(value => value as typeof value & { duration_ms?: never; until?: never }),
 ]);

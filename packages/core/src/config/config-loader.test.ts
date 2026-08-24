@@ -115,6 +115,34 @@ workflows:
       expect(mockLogger.error).toHaveBeenCalled();
     });
 
+    test('rejects quota continuation delays beyond the persisted timestamp range', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  quotaFallbackDelayMs: 31536000000001
+  quotaDeadlineMs: 31536000000001
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config).toEqual({});
+      expect(mockLogger.error).toHaveBeenCalled();
+    });
+
+    test('accepts quota continuation delays at the persisted timestamp bound', async () => {
+      mockFsReadFile.mockResolvedValue(`
+workflows:
+  quotaFallbackDelayMs: 31536000000000
+  quotaDeadlineMs: 31536000000000
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config.workflows).toEqual({
+        quotaFallbackDelayMs: 31_536_000_000_000,
+        quotaDeadlineMs: 31_536_000_000_000,
+      });
+    });
+
     test('caches config on subsequent calls', async () => {
       mockFsReadFile.mockResolvedValue('defaultAssistant: claude');
 

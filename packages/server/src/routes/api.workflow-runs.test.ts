@@ -296,11 +296,9 @@ const mockResolveAndCancelApprovalGate = mock(async (_id: string, _events?: unkn
   resolved: true,
 }));
 const mockFindChildRuns = mock(async (_parentRunId: string): Promise<unknown[]> => []);
-const mockSignalWorkflowWait = mock(
-  async (_id: string, _event: string, _payload?: unknown, _audit?: unknown) => ({
-    signaled: true,
-  })
-);
+const mockSignalWorkflowWait = mock(async (_id: string, _wait: unknown, _payload?: unknown) => ({
+  signaled: true,
+}));
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mockListWorkflowRuns,
@@ -1729,13 +1727,15 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     expect(response.status).toBe(200);
     expect(mockSignalWorkflowWait).toHaveBeenCalledWith(
       'run-wait-1',
-      'checks.complete',
-      { conclusion: 'success' },
       {
-        event_type: 'wait_signaled',
-        step_name: 'checks',
-        data: { event: 'checks.complete', payload: { conclusion: 'success' } },
-      }
+        owner: 'node',
+        nodeId: 'checks',
+        kind: 'event',
+        event: 'checks.complete',
+        waitingSince: '2026-08-24T10:00:00.000Z',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+      },
+      { conclusion: 'success' }
     );
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
     expect(mockHandleMessage).not.toHaveBeenCalled();
@@ -1777,7 +1777,7 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     expect(mockGetConversationById).not.toHaveBeenCalled();
   });
 
-  test('attributes a loop-owned signal to the body wait step', async () => {
+  test('forwards the exact loop-owned wait occurrence to the signal CAS', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_RUNNING_RUN,
       id: 'run-loop-wait',
@@ -1808,9 +1808,15 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     expect(response.status).toBe(200);
     expect(mockSignalWorkflowWait).toHaveBeenCalledWith(
       'run-loop-wait',
-      'checks.complete',
-      undefined,
-      expect.objectContaining({ step_name: 'release.checks' })
+      expect.objectContaining({
+        owner: 'loop_group',
+        nodeId: 'release',
+        bodyWaitId: 'checks',
+        iteration: 2,
+        event: 'checks.complete',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+      }),
+      undefined
     );
   });
 

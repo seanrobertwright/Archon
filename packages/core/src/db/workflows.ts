@@ -16,6 +16,7 @@ import {
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
   scheduledWorkflowResumeSchema,
+  workflowWaitStepName,
   workflowWaitContextSchema,
   TERMINAL_WORKFLOW_STATUSES,
 } from '@archon/workflows/schemas/workflow-run';
@@ -1480,14 +1481,21 @@ export async function deferWorkflowContinuation(
 /** Atomically record the signal for one exact paused event wait. */
 export async function signalWorkflowWait(
   id: string,
-  event: string,
-  payload?: unknown,
-  auditEvent?: GateResolutionEvent
+  waitContext: Extract<WorkflowWaitContext, { kind: 'event' }>,
+  payload?: unknown
 ): Promise<{ signaled: boolean }> {
+  const parsedWaitContext = workflowWaitContextSchema.parse(waitContext);
+  if (parsedWaitContext.kind !== 'event') {
+    throw new Error('Cannot signal a non-event workflow wait');
+  }
   const eventExpr =
     getDatabaseType() === 'postgresql'
       ? "metadata->'wait'->>'event'"
       : "json_extract(metadata, '$.wait.event')";
+  const nodeExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'nodeId'"
+      : "json_extract(metadata, '$.wait.nodeId')";
   const signaledExpr =
     getDatabaseType() === 'postgresql'
       ? "metadata->'wait'->>'signaledAt'"
@@ -1500,31 +1508,56 @@ export async function signalWorkflowWait(
   const metadataWrite =
     payload === undefined
       ? getDatabaseType() === 'postgresql'
-        ? "jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($3::text), true)"
-        : "json_set(metadata, '$.wait.signaledAt', $3)"
+        ? "jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($5::text), true)"
+        : "json_set(metadata, '$.wait.signaledAt', $5)"
       : getDatabaseType() === 'postgresql'
-        ? "jsonb_set(jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($3::text), true), '{wait,payload}', $4::jsonb, true)"
-        : "json_set(metadata, '$.wait.signaledAt', $3, '$.wait.payload', json($4))";
+        ? "jsonb_set(jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($5::text), true), '{wait,payload}', $6::jsonb, true)"
+        : "json_set(metadata, '$.wait.signaledAt', $5, '$.wait.payload', json($6))";
   try {
     return await getDatabase().withTransaction(async query => {
       const result = await query(
         `UPDATE remote_agent_workflow_runs
          SET metadata = ${metadataWrite}
          WHERE id = $1 AND status = 'paused' AND ${eventExpr} = $2
-           AND ${signaledExpr} IS NULL AND ${resumeAtExpr} > $3`,
+           AND ${nodeExpr} = $3 AND ${resumeAtExpr} = $4
+           AND ${signaledExpr} IS NULL AND ${resumeAtExpr} > $5`,
         payload === undefined
-          ? [id, event, signaledAt]
-          : [id, event, signaledAt, JSON.stringify(payload)]
+          ? [
+              id,
+              parsedWaitContext.event,
+              parsedWaitContext.nodeId,
+              parsedWaitContext.resumeAt,
+              signaledAt,
+            ]
+          : [
+              id,
+              parsedWaitContext.event,
+              parsedWaitContext.nodeId,
+              parsedWaitContext.resumeAt,
+              signaledAt,
+              JSON.stringify(payload),
+            ]
       );
       const signaled = (result.rowCount ?? 0) > 0;
-      if (signaled && auditEvent !== undefined) {
-        await insertWorkflowEvent(query, { workflow_run_id: id, ...auditEvent });
+      if (signaled) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'wait_signaled',
+          step_name: workflowWaitStepName(parsedWaitContext),
+          data: {
+            event: parsedWaitContext.event,
+            ...(payload !== undefined ? { payload } : {}),
+          },
+        });
       }
       return { signaled };
     });
   } catch (error) {
     const err = error as Error;
-    getLog().error({ err, workflowRunId: id, event }, 'db.workflow_wait_signal_failed');
+    getLog().error(
+      { err, workflowRunId: id, event: parsedWaitContext.event },
+      'db.workflow_wait_signal_failed'
+    );
     throw new Error(`Failed to signal workflow wait: ${err.message}`);
   }
 }

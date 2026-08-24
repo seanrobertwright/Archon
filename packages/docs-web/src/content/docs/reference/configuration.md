@@ -712,9 +712,9 @@ DISCORD_STREAMING_MODE=batch
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `autoResumeOnQuotaReset` | `false` | Schedule a failed workflow for continuation when its node error proves provider quota-window exhaustion |
-| `quotaFallbackDelayMs` | unset | Explicit delay to use only when the provider error has no machine-readable reset time. When unset, Archon records that automatic continuation was skipped instead of guessing |
+| `quotaFallbackDelayMs` | unset | Explicit delay to use only when the provider error has no machine-readable reset time, capped at 1000 years. When unset, Archon records that automatic continuation was skipped instead of guessing |
 | `quotaMaxAttempts` | `1` | Maximum number of scheduled continuation attempts for one run |
-| `quotaDeadlineMs` | `86400000` | Maximum window from the first quota failure in which a continuation may be scheduled |
+| `quotaDeadlineMs` | `86400000` | Maximum window from the first quota failure in which a continuation may be scheduled, capped at 1000 years |
 
 This policy is separate from per-node `retry:`. Quota exhaustion is terminal for the current attempt because retrying in the same provider window only repeats the failure. When enabled, Archon leaves the run `failed`, records the scheduled time in run metadata, and the server claims and resumes it when due. The claim is durable and bounded, so two server scans cannot launch the same attempt and an early resume failure does not create a rapid retry loop.
 
