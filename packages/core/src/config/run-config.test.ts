@@ -33,7 +33,7 @@ describe('workflow run config', () => {
     const parsed = parseWorkflowRunConfig(
       {
         defaultAssistant: 'pi',
-        assistants: { pi: { model: 'minimax/MiniMax-M3', apiKey: 'secret' } },
+        assistants: { pi: { model: 'minimax/MiniMax-M3', enableExtensions: false } },
         tiers: { large: { provider: 'codex', model: 'gpt-5.6-sol' } },
         aliases: { '@planner': { provider: 'claude', model: 'opus' } },
         workflows: { quotaMaxAttempts: 3 },
@@ -47,7 +47,7 @@ describe('workflow run config', () => {
       source: { kind: 'http', label: 'inline' },
       layer: {
         assistant: 'pi',
-        assistants: { pi: { model: 'minimax/MiniMax-M3', apiKey: 'secret' } },
+        assistants: { pi: { model: 'minimax/MiniMax-M3', enableExtensions: false } },
         tiers: { large: { provider: 'codex', model: 'gpt-5.6-sol' } },
         aliases: { '@planner': { provider: 'claude', model: 'opus' } },
         workflows: { quotaMaxAttempts: 3 },
@@ -130,10 +130,42 @@ describe('workflow run config', () => {
     }
   });
 
+  it('rejects provider defaults that execution would silently discard', () => {
+    for (const [provider, defaults, path] of [
+      ['codex', { modelReasoningEffort: 'banana' }, 'assistants.codex.modelReasoningEffort'],
+      ['codex', { webSearchMode: 'realtime' }, 'assistants.codex.webSearchMode'],
+      ['codex', { typo: true }, 'assistants.codex.typo'],
+      ['claude', { settingSources: 'project' }, 'assistants.claude.settingSources'],
+      ['pi', { apiKey: 'secret' }, 'assistants.pi.apiKey'],
+    ] as const) {
+      expect(() =>
+        parseWorkflowRunConfig(
+          { assistants: { [provider]: defaults } },
+          { kind: 'http', label: 'inline' }
+        )
+      ).toThrow(`Invalid run config at '${path}'`);
+    }
+  });
+
+  it('persists the provider-normalized value consumed by execution', () => {
+    const parsed = parseWorkflowRunConfig(
+      { assistants: { copilot: { modelReasoningEffort: 'max' } } },
+      { kind: 'http', label: 'inline' }
+    );
+
+    expect(parsed.layer.assistants?.copilot).toEqual({ modelReasoningEffort: 'xhigh' });
+    expect(
+      parseWorkflowRunConfig(
+        { assistants: { opencode: { agent: 'general' } } },
+        { kind: 'http', label: 'inline' }
+      ).layer.assistants?.opencode
+    ).toEqual({ agent: 'general' });
+  });
+
   it('seals secrets for replay while exposing only attribution and key paths', () => {
     const input = parseWorkflowRunConfig(
       {
-        assistants: { pi: { apiKey: 'provider-secret' } },
+        assistants: { pi: { extensionFlags: { auth: 'provider-secret' } } },
         env: { TOKEN: 'env-secret' },
       },
       { kind: 'cli', label: 'config.minimax.yaml' }
@@ -143,7 +175,7 @@ describe('workflow run config', () => {
 
     expect(serialized).not.toContain('provider-secret');
     expect(serialized).not.toContain('env-secret');
-    expect(metadata.keys).toEqual(['assistants.pi.apiKey', 'env.TOKEN']);
+    expect(metadata.keys).toEqual(['assistants.pi.extensionFlags', 'env.TOKEN']);
     expect(unsealWorkflowRunConfig(metadata)).toEqual(input.layer);
   });
 

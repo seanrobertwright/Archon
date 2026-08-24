@@ -68,7 +68,9 @@ mock.module('../db/codebases', () => ({
 mock.module('@archon/providers', () => ({
   getAgentProvider: mock(() => ({})),
   getRegisteredProviders: mock(() => []),
+  getRegistration: mock(() => ({ parseRunConfig: (raw: Record<string, unknown>) => raw })),
   isRegisteredProvider: mock(() => false),
+  InvalidProviderRunConfigError: class InvalidProviderRunConfigError extends Error {},
   getProviderCapabilities: mock(() => ({ supportedEfforts: [] })),
   // Vendor → env-var map consumed by credentials/delivery (#1955). A realistic
   // subset of the generated map (incl. HF_TOKEN, the upstream var).

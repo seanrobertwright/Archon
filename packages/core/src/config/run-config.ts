@@ -1,5 +1,10 @@
 import { basename } from 'node:path';
-import { getRegisteredProviders, isRegisteredProvider } from '@archon/providers';
+import {
+  getRegisteredProviders,
+  getRegistration,
+  InvalidProviderRunConfigError,
+  isRegisteredProvider,
+} from '@archon/providers';
 import {
   isEffortValidForProvider,
   validEffortsForProvider,
@@ -98,13 +103,25 @@ function assertValidPreset(path: string, preset: { provider: string; effort?: st
   }
 }
 
-/** Validate semantic constraints that depend on the live provider registry and lifecycle. */
-function assertRunConfigSemantics(layer: WorkflowRunConfigLayer): void {
+/** Validate and normalize constraints owned by the live provider registry and lifecycle. */
+function normalizeRunConfigSemantics(layer: WorkflowRunConfigLayer): WorkflowRunConfigLayer {
   if (layer.assistant !== undefined) {
     assertRegisteredProvider(layer.assistant, 'assistant');
   }
+  const assistants: Record<string, Record<string, unknown>> = {};
   for (const [provider, defaults] of Object.entries(layer.assistants ?? {})) {
     assertRegisteredProvider(provider, `assistants.${provider}`);
+    try {
+      assistants[provider] = getRegistration(provider).parseRunConfig(defaults);
+    } catch (error) {
+      if (error instanceof InvalidProviderRunConfigError) {
+        const suffix = error.fieldPath ? `.${error.fieldPath}` : '';
+        throw new Error(
+          `Invalid run config at 'assistants.${provider}${suffix}': ${error.message}.`
+        );
+      }
+      throw error;
+    }
     if (provider === 'pi' && Object.hasOwn(defaults, 'env')) {
       throw new Error(
         "Run config key 'assistants.pi.env' cannot apply: Pi extension environment mutates " +
@@ -124,6 +141,7 @@ function assertRunConfigSemantics(layer: WorkflowRunConfigLayer): void {
   for (const [alias, preset] of Object.entries(layer.aliases ?? {})) {
     assertValidPreset(`aliases.${alias}`, preset);
   }
+  return layer.assistants === undefined ? layer : { ...layer, assistants };
 }
 
 /** Parse one explicitly selected sparse run config. Unlike shared config loading, this is fail-fast. */
@@ -175,8 +193,7 @@ export function parseWorkflowRunConfig(
   };
   const parsed = workflowRunConfigLayerSchema.safeParse(candidate);
   if (!parsed.success) throw validationError(parsed.error);
-  assertRunConfigSemantics(parsed.data);
-  return { layer: parsed.data, source };
+  return { layer: normalizeRunConfigSemantics(parsed.data), source };
 }
 
 export async function loadWorkflowRunConfigFile(path: string): Promise<WorkflowRunConfigInput> {
@@ -248,6 +265,5 @@ export function unsealWorkflowRunConfig(
   if (!parsed.success) {
     throw new Error('Workflow run config payload is invalid.');
   }
-  assertRunConfigSemantics(parsed.data);
-  return parsed.data;
+  return normalizeRunConfigSemantics(parsed.data);
 }

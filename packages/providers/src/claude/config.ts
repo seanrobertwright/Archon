@@ -4,6 +4,7 @@
  */
 import { createLogger } from '@archon/paths';
 import type { ClaudeProviderDefaults } from '../types';
+import { assertKnownRunConfigKeys, invalidRunConfigValue } from '../shared/run-config';
 
 // Re-export so consumers can import the type from either location
 export type { ClaudeProviderDefaults } from '../types';
@@ -75,4 +76,27 @@ export function parseClaudeConfig(raw: Record<string, unknown>): ClaudeProviderD
   }
 
   return result;
+}
+
+/** Strict counterpart used only for an explicitly selected per-run layer. */
+export function parseClaudeRunConfig(raw: Record<string, unknown>): ClaudeProviderDefaults {
+  assertKnownRunConfigKeys(raw, ['model', 'settingSources', 'claudeBinaryPath']);
+  if (raw.model !== undefined && typeof raw.model !== 'string') {
+    invalidRunConfigValue('model', 'a string');
+  }
+  if (raw.settingSources !== undefined) {
+    if (!Array.isArray(raw.settingSources)) {
+      invalidRunConfigValue('settingSources', "an array containing only 'project' or 'user'");
+    }
+    const invalidIndex = raw.settingSources.findIndex(
+      source => source !== 'project' && source !== 'user'
+    );
+    if (invalidIndex >= 0) {
+      invalidRunConfigValue(`settingSources.${invalidIndex}`, "'project' or 'user'");
+    }
+  }
+  if (raw.claudeBinaryPath !== undefined && typeof raw.claudeBinaryPath !== 'string') {
+    invalidRunConfigValue('claudeBinaryPath', 'a string');
+  }
+  return parseClaudeConfig(raw);
 }

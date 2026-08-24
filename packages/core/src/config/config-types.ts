@@ -187,7 +187,9 @@ export interface GlobalConfig {
   workflows?: WorkflowContinuationConfig;
 }
 
-export const workflowContinuationConfigSchema = workflowRunContinuationConfigSchema;
+// Ordinary global/repo config remains forward-compatible: unlike the explicitly
+// selected run layer, it strips extension keys it does not understand yet.
+export const workflowContinuationConfigSchema = workflowRunContinuationConfigSchema.strip();
 export type WorkflowContinuationConfig = NonNullable<WorkflowRunConfigLayer['workflows']>;
 
 /**

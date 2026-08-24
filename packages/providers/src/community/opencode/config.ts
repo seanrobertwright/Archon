@@ -1,4 +1,5 @@
 import type { OpencodeProviderDefaults } from '../../types';
+import { assertKnownRunConfigKeys, invalidRunConfigValue } from '../../shared/run-config';
 
 export type { OpencodeProviderDefaults };
 
@@ -30,10 +31,20 @@ export function parseOpencodeConfig(raw: Record<string, unknown>): OpencodeProvi
     result.baseUrl = raw.baseUrl;
   }
 
-  const opencodeConfig = raw.opencode as Record<string, unknown> | undefined;
-  if (typeof opencodeConfig?.agent === 'string') {
-    result.agent = opencodeConfig.agent;
+  if (typeof raw.agent === 'string') {
+    result.agent = raw.agent;
   }
 
   return result;
+}
+
+/** Strict counterpart used only for an explicitly selected per-run layer. */
+export function parseOpencodeRunConfig(raw: Record<string, unknown>): OpencodeProviderDefaults {
+  assertKnownRunConfigKeys(raw, ['model', 'baseUrl', 'agent']);
+  for (const key of ['model', 'baseUrl', 'agent'] as const) {
+    if (raw[key] !== undefined && typeof raw[key] !== 'string') {
+      invalidRunConfigValue(key, 'a string');
+    }
+  }
+  return parseOpencodeConfig(raw);
 }

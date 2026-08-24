@@ -15,6 +15,8 @@ import type {
 } from './types';
 import { ClaudeProvider } from './claude/provider';
 import { CodexProvider } from './codex/provider';
+import { parseClaudeRunConfig } from './claude/config';
+import { parseCodexRunConfig } from './codex/config';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
 import { registerCopilotProvider } from './community/copilot/registration';
@@ -122,6 +124,7 @@ export function registerBuiltinProviders(): void {
       factory: () => new ClaudeProvider(),
       capabilities: CLAUDE_CAPABILITIES,
       builtIn: true,
+      parseRunConfig: parseClaudeRunConfig,
       credentials: {
         kind: 'static',
         specs: [
@@ -139,6 +142,7 @@ export function registerBuiltinProviders(): void {
       factory: () => new CodexProvider(),
       capabilities: CODEX_CAPABILITIES,
       builtIn: true,
+      parseRunConfig: parseCodexRunConfig,
       credentials: {
         kind: 'static',
         specs: [

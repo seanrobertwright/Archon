@@ -6229,6 +6229,7 @@ nodes:
         displayName: 'No Resume Skip Test',
         builtIn: false,
         credentials: { kind: 'static', specs: [] },
+        parseRunConfig: raw => raw,
         capabilities: {
           sessionResume: false,
           mcp: false,
@@ -6298,6 +6299,7 @@ nodes:
         displayName: 'No Resume Test',
         builtIn: false,
         credentials: { kind: 'static', specs: [] },
+        parseRunConfig: raw => raw,
         capabilities: {
           sessionResume: false,
           mcp: false,
