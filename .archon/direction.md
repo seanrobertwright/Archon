@@ -1,6 +1,6 @@
 # Archon Direction
 
-The maintainer-standup workflow consults this document when triaging PRs and issues to suggest which contributions align with the project and which are likely polite-decline candidates.
+The project's product-direction document, for maintainers and agents alike: PR/issue triage (the maintainer-standup workflow consults it to flag polite-decline candidates), grounding for agent runs, and a direction sidecar any workflow can read.
 
 This file is **committed and shared by all maintainers**. Edit deliberately — direction calls live here so that PR triage stays consistent across runs and across maintainers. When declining a PR, cite the specific clause (e.g., `direction.md §single-tenant-per-install`).
 
@@ -8,14 +8,14 @@ This file is **committed and shared by all maintainers**. Edit deliberately — 
 
 ## What Archon IS
 
-- **A governed agentic automation engine.** Runs multi-step workflows that mix deterministic steps (bash/scripts) with AI agents (Claude Code SDK, Codex SDK, Pi community provider), with human approval gates and audit trails — driven remotely from Slack, Telegram, GitHub, Discord, CLI, and Web UI. Its most mature surface today is agentic **coding**; the same engine is being extended to drive general **business-operations** automation.
+- **A governed agentic automation engine.** Runs multi-step workflows that mix deterministic steps (bash/scripts) with AI agents (Claude Code SDK, Codex SDK, and community providers), with human approval gates and audit trails — driven remotely from Slack, Telegram, GitHub, Discord, CLI, and Web UI. Its most mature surface today is agentic **coding**; the same engine is being extended to drive general **business-operations** automation.
 - **Single-tenant per install.** One isolated instance per operator or client (the deployment model is one install/VPS per client, not one install serving many tenants). Data model and runtime stay single-tenant — client isolation is at the deployment layer, not in code. Multi-**user** within an install (several humans sharing one instance, each with their own identity/credentials) is supported and is distinct from multi-**tenant**.
 - **Heading toward always-on automation.** Native scheduling and event/webhook triggers are a planned primitive (tracked in the workflow-triggers PRD), enabling scheduled, event-driven, and unattended runs — including operational, non-coding work. PRs toward this direction align.
 - **Platform-agnostic at the conversation layer.** Unified interface across adapters via `IPlatformAdapter`. Stream/batch AI responses in real time.
 - **Workflow-driven.** Reproducible AI execution chains defined as YAML DAGs in `.archon/workflows/`. Workflows run in isolated git worktrees by default.
 - **Type-safe.** Strict TypeScript everywhere. No `any` without justification.
 - **Composable.** Scripts in `.archon/scripts/`, commands in `.archon/commands/`, workflows compose them.
-- **Bundled defaults are reference implementations — composition is how we author them, not a stability contract we offer.** "Reference patterns" is the user-facing posture; "composable" is the authoring technique. The set demonstrates capabilities and authoring best practice, stack-agnostic so it runs on any project (rewrite: #2123). `include:` blocks stay internally consistent within a bundle release, never guaranteed across releases (declare `returns:` once #2470 lands). User copies are expected to diverge; building on a bundled block is allowed but neither mandatory nor the recommendation — the best workflows are project-specific. Repo-override by name is the pinning mechanism. Cite as `direction.md §defaults-reference-implementations`.
+- **Bundled defaults are reference implementations — composition is how we author them, not a stability contract we offer.** "Reference patterns" is the user-facing posture; "composable" is the authoring technique. The set demonstrates capabilities and authoring best practice, stack-agnostic so it runs on any project (rewrite: #2123). `include:` blocks stay internally consistent within a bundle release, never guaranteed across releases (declare `returns:` — #2470). User copies are expected to diverge; building on a bundled block is allowed but neither mandatory nor the recommendation — the best workflows are project-specific. Repo-override by name is the pinning mechanism. Cite as `direction.md §defaults-reference-implementations`.
 - **Has a community workflow marketplace.** A place for the community to share their workflows — the registry at `packages/docs-web/src/data/marketplace.ts` (each entry pinned to a commit SHA), surfaced on the docs site.
 - **Self-hostable.** Bun + TypeScript runtime. SQLite by default; PostgreSQL optional. Zero external service dependencies for core operation.
 - **Forge-agnostic.** GitHub is the primary forge, but Gitea and GitLab are community supported targets via community adapters at `packages/adapters/src/community/forge/`. Long-term home for outbound forge operations (PR/issue/review CRUD) is the same per-forge adapter that handles inbound webhooks. New forges land as new community adapters that implement the shared interface.
@@ -33,7 +33,7 @@ This file is **committed and shared by all maintainers**. Edit deliberately — 
 
 ## Community providers
 
-Archon ships built-in providers for Claude (`@anthropic-ai/claude-agent-sdk`) and Codex (`@openai/codex-sdk`). Pi (`@mariozechner/pi-coding-agent`) is the reference community provider and sets the pattern others should follow.
+Archon ships built-in providers for Claude (`@anthropic-ai/claude-agent-sdk`) and Codex (`@openai/codex-sdk`). Pi (`@earendil-works/pi-coding-agent`) is the reference community provider and sets the pattern others should follow.
 
 **Acceptance criteria** for new community providers:
 
