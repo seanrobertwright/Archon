@@ -5,6 +5,7 @@ import { mkdir, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
+import { MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS } from './deps';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
@@ -12,6 +13,7 @@ import { createLogger, captureWorkflowInvoked, captureWorkflowCompleted } from '
 import { getDefaultBranch, toRepoPath } from '@archon/git';
 import type {
   DagNode,
+  IncludeDirective,
   WorkflowDefinition,
   WorkflowRun,
   WorkflowExecutionResult,
@@ -21,13 +23,15 @@ import type {
 import {
   isLoopNode,
   isLoopGroupNode,
-  isApprovalNode,
-  isScriptNode,
-  isBashNode,
+  isGateNode,
+  isExecNode,
   isApprovalContext,
   isRunBlockedOnChild,
+  reRunsOwnNodeOnResume,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
+  RUN_METADATA_KEYS,
+  readIdentityUnresolved,
   WORKFLOW_SOURCE_METADATA_KEY,
   readWorkflowSourceState,
 } from './schemas';
@@ -232,44 +236,63 @@ async function resolveUserGithubEnvForWorkflow(
 }
 
 /**
+ * Remove file-delivered credentials left by an earlier invocation of this run.
+ * A resume must not keep a readable credential after it has been disconnected
+ * or after fresh credential resolution fails.
+ */
+async function clearManagedProviderCredentialFiles(artifactsDir: string): Promise<void> {
+  for (const relativePath of MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS) {
+    await rm(join(artifactsDir, relativePath), { force: true });
+  }
+}
+
+/**
  * Resolve per-user AI-provider credential env (Phase 2) for a run, and write
  * any file-based deliveries (e.g. Codex `CODEX_HOME/auth.json`) under the
  * run's artifacts directory. Returns the env bag to merge LAST into
  * `config.envVars` so a connected user's keys win over file/db/bot-github
- * env. Returns `{}` when per-user provider keys are disabled, no userId is
- * present, or the deps adapter is absent.
+ * env, plus exact credential values for failure-path redaction. Returns empty
+ * bags when per-user provider keys are disabled, no userId is present, or the
+ * deps adapter is absent.
  *
- * Contract: NEVER THROWS. Adapter failures are logged and yield `{}` so the
- * workflow continues with whatever env inheritance was already in place.
+ * Contract: NEVER THROWS. Adapter failures are logged and yield empty bags so the
+ * workflow continues with whatever env inheritance was already in place. File
+ * write failures also drop the resolved env, but retain the credential values:
+ * an earlier file may already contain them and still needs failure-path redaction.
  */
 async function resolveUserProviderEnvForWorkflow(
   deps: WorkflowDeps,
   userId: string | undefined,
   artifactsDir: string
-): Promise<Record<string, string>> {
+): Promise<{ env: Record<string, string>; protectedValues: string[] }> {
   const perUserEnabled = deps.isPerUserProviderKeysEnabled?.() ?? false;
-  if (!perUserEnabled || !userId || !deps.getUserProviderEnv) return {};
+  if (!perUserEnabled || !userId || !deps.getUserProviderEnv) {
+    return { env: {}, protectedValues: [] };
+  }
+  let resolved: Awaited<ReturnType<NonNullable<WorkflowDeps['getUserProviderEnv']>>>;
   try {
-    // TODO(#1891 PR-3): when Codex OAuth delivery is enabled, file-write failures
-    // must drop only the affected provider's env keys, not all of them. Move file
-    // writes into getUserProviderEnv per-delivery so env + write are atomic
-    // per-provider, or wrap each write in a per-file try-catch that strips the
-    // matching env keys on failure. Currently safe: no OAuth rows can be created
-    // in PR-1 so `files` is always empty and this loop never executes.
-    const { env, files } = await deps.getUserProviderEnv(userId, artifactsDir);
+    resolved = await deps.getUserProviderEnv(userId, artifactsDir);
+  } catch (err) {
+    getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_env_resolve_failed');
+    return { env: {}, protectedValues: [] };
+  }
+
+  const { env, files, protectedValues } = resolved;
+  try {
     for (const f of files) {
       await mkdir(dirname(f.path), { recursive: true });
       await writeFile(f.path, f.contents, { encoding: 'utf8', mode: 0o600 });
     }
-    const envKeys = Object.keys(env);
-    if (envKeys.length > 0) {
-      getLog().debug({ userId, keys: envKeys }, 'workflow.user_provider_env_injected');
-    }
-    return env;
   } catch (err) {
-    getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_env_resolve_failed');
-    return {};
+    getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_files_write_failed');
+    return { env: {}, protectedValues };
   }
+
+  const envKeys = Object.keys(env);
+  if (envKeys.length > 0) {
+    getLog().debug({ userId, keys: envKeys }, 'workflow.user_provider_env_injected');
+  }
+  return { env, protectedValues };
 }
 
 /**
@@ -305,6 +328,25 @@ export interface ResolvedProjectPaths {
   stateDir: string;
   /** The project root persisted to `workflow_runs.output_root`. */
   outputRoot: string;
+  /**
+   * How the run's project identity was determined (#2304). Three states; collapsing
+   * any two is a correctness bug:
+   *  - `'resolved'`     — `getCodebase` returned a row whose identity resolves to a
+   *                      repo / folder / `_local` key.
+   *  - `'unregistered'` — `getCodebase` returned a row, but no owner/repo nor a
+   *                      `_local` identity could be derived from it; the run still
+   *                      gets external storage, keyed on cwd (`codebase_project_identity_unresolved`
+   *                      WARN). This is a legitimate outcome of a registered codebase,
+   *                      NOT a fault.
+   *  - `'faulted'`      — `getCodebase` threw on BOTH retry attempts; the run fell
+   *                      through to the cwd fallback (`project_paths_resolve_failed_using_fallback`
+   *                      ERROR). The persistence block must NOT write `output_root`
+   *                      for these runs — see `executeWorkflow`.
+   *
+   * Undefined on the persisted-`output_root` short-circuit branch (a resume reading
+   * an existing root re-derives nothing and there is nothing to flag).
+   */
+  identityResolution?: 'resolved' | 'unregistered' | 'faulted';
 }
 
 /**
@@ -356,13 +398,16 @@ export async function resolveProjectPaths(
   }
 
   let key: archonPaths.ProjectStorageKey | undefined;
+  let identityResolution: 'resolved' | 'unregistered' | 'faulted' | undefined;
   if (codebaseId) {
     // Retried once (#2304). A failing lookup drops the run onto the `_cwd/<basename>`
-    // pseudo-project, and because `output_root` is write-once that location is then
-    // pinned for the run's whole life — including its `$STATE_DIR`, so a stateful
-    // workflow silently reads an empty state directory. Failing the run instead was
-    // considered and rejected: the fallback exists precisely because a registry blip
-    // must not kill a run.
+    // pseudo-project. The fallback itself stays — a registry blip must not kill a run.
+    // What changed is what happens to the row afterwards: a faulted run no longer
+    // has its fault-derived location PERSISTED as `output_root` (so the rename hazard
+    // #1192 protects stays scoped to rows with real roots), and the run carries
+    // `metadata.identity_unresolved = true` so "unregistered" and "we could not tell"
+    // are distinguishable after the fact. See the persistence block in `executeWorkflow`
+    // and `ResolvedProjectPaths.identityResolution`.
     //
     // What the retry is worth, honestly, differs by dialect:
     //   • Postgres — it earns its place. A stale or broken pooled connection is exactly
@@ -374,19 +419,17 @@ export async function resolveProjectPaths(
     //     contention have already elapsed, so what reaches us is by construction not
     //     transient, and retrying at that instant retries the moment least likely to
     //     have cleared. Kept because it costs one attempt and cannot make things worse.
-    //
-    // The deeper question — whether an unresolved identity should be recorded on the
-    // row so "unregistered" and "we could not tell" are distinguishable — stays open
-    // in #2304.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const codebase = await deps.store.getCodebase(codebaseId);
         if (codebase) {
           key = archonPaths.resolveProjectStorageKey(codebase, cwd);
+          identityResolution = key.kind === 'cwd' ? 'unregistered' : 'resolved';
           if (key.kind === 'cwd') {
             // The codebase exists but neither an owner/repo nor a _local identity
             // could be derived from it — the run still gets external storage, but
-            // keyed on the working directory rather than the project.
+            // keyed on the working directory rather than the project. NOT a fault;
+            // the persistence block writes the cwd fallback as `output_root` here.
             getLog().warn(
               { codebaseName: codebase.name, cwd: codebase.default_cwd },
               'codebase_project_identity_unresolved'
@@ -402,6 +445,7 @@ export async function resolveProjectPaths(
           );
           continue;
         }
+        identityResolution = 'faulted';
         getLog().error(
           { err: error as Error, codebaseId, cwd },
           'project_paths_resolve_failed_using_fallback'
@@ -410,10 +454,20 @@ export async function resolveProjectPaths(
     }
   }
 
-  return composeRunPaths(
-    archonPaths.getProjectStoragePaths(key ?? { kind: 'cwd', cwd }),
-    workflowRunId
-  );
+  // When the lookup returned null (no codebase row) or no `codebaseId` was provided,
+  // `key` is undefined and the cwd fallback is used. Both are legitimate — neither is
+  // a fault — so they read as `'unregistered'`. A `'faulted'` outcome overrides this.
+  if (identityResolution === undefined) {
+    identityResolution = 'unregistered';
+  }
+
+  return {
+    ...composeRunPaths(
+      archonPaths.getProjectStoragePaths(key ?? { kind: 'cwd', cwd }),
+      workflowRunId
+    ),
+    identityResolution,
+  };
 }
 
 /** Project-level roots → the run-scoped view the executor threads downstream. */
@@ -439,7 +493,11 @@ function composeRunPaths(
  * default behavior unchanged.
  */
 export function resolveScopeArtifactsDir(
-  workflow: { name: string; nodes: readonly DagNode[]; persist_sessions?: boolean },
+  workflow: {
+    name: string;
+    nodes: readonly (DagNode | IncludeDirective)[];
+    persist_sessions?: boolean;
+  },
   conversationId: string | null | undefined,
   artifactsRoot: string
 ): string | undefined {
@@ -537,8 +595,8 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * Archon user UUID for attribution on the workflow_run row. Resolved by
    * chat/forge adapters via findOrCreateUserByPlatformIdentity. Web/CLI paths
    * pass undefined until their own auth surfaces are wired.
-   * Ignored when `preCreatedRun` is set — the original creator's attribution
-   * is preserved on resume.
+   * Ignored when `preCreatedRun` is set — the persisted creator remains both
+   * the run attribution and the credential/prefs execution identity on resume.
    */
   userId?: string;
   /**
@@ -594,6 +652,16 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * Ignored on a resume: the run resolves the source it recorded at start.
    */
   preparedSource?: PreparedWorkflowSource;
+  /**
+   * The owner's adopt/hold handle from the surrounding `withCapturedSource`. When set,
+   * `executeWorkflow` calls `adopt()` itself — at the rename success site — so a rename
+   * failure leaves the staged directory un-adopted and the wrap's `finally` reclaims
+   * it. Optional: omitting it preserves the legacy behavior where callers own adoption
+   * (used by `executeWorkflow` paths that move the staged capture themselves, and by
+   * tests that mock `executeWorkflow`). Never set by callers that did not wrap
+   * themselves in `withCapturedSource`.
+   */
+  capturedSourceOwner?: CapturedSourceOwner;
 };
 
 /**
@@ -693,7 +761,14 @@ export interface CapturedSourceOwner {
    * would leave the real one behind while looking like it cleaned up.
    */
   hold: (prepared: Pick<PreparedWorkflowSource, 'captureRoot'>) => void;
-  /** A run now owns the bytes and their lifetime; stop tracking them. */
+  /**
+   * A run now owns the bytes and their lifetime; stop tracking them. Called by the
+   * caller from `executeWorkflow`'s rename success site (via
+   * `ExecuteWorkflowOptions.capturedSourceOwner`) once the staged capture has been moved
+   * under the run's artifacts directory. Earlier call sites — before the rename — could
+   * leave the staged directory orphaned when the rename itself failed (#2690); adoption
+   * at the rename site means a failed move leaves the wrap's `finally` to reclaim.
+   */
   adopt: () => void;
 }
 
@@ -924,14 +999,15 @@ export async function hydrateResumableRun(
   const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
   const priorCompletedNodes = snapshot.completedNodeOutputs;
   // A gate whose node deliberately writes NO node_completed on pause must still be
-  // resumable with zero completed nodes: interactive loops, and a `workflow:` node
-  // blocked on a child (#2121 Phase 2) whose child is the very first node.
-  const approvalType =
-    candidate.metadata?.approval !== undefined
-      ? (candidate.metadata.approval as Record<string, unknown>).type
-      : undefined;
-  const hasReRunGateState =
-    approvalType === 'interactive_loop' || approvalType === 'child_workflow';
+  // resumable with zero completed nodes: interactive loops, a `workflow:` node
+  // blocked on a child (#2121 Phase 2) whose child is the very first node, and a
+  // legacy on_reject gate with a genuinely staged rework (#2714) — see
+  // reRunsOwnNodeOnResume's doc for the exhaustive per-reason breakdown. A
+  // new-mode gate (#2707 step 1) needs no carve-out here: both approve and
+  // reject write node_completed immediately.
+  const rawApproval = candidate.metadata?.approval;
+  const approvalContext = isApprovalContext(rawApproval) ? rawApproval : undefined;
+  const hasReRunGateState = reRunsOwnNodeOnResume(approvalContext, candidate.metadata);
   if (priorCompletedNodes.size === 0 && !hasReRunGateState) {
     getLog().info(
       { resumableRunId: candidate.id },
@@ -1309,17 +1385,28 @@ async function runChildWorkflow(
   // 5. Run the child in-process (reuses the whole lifecycle) in its resolved cwd
   //    (its own worktree when isolated, else the parent's checkout). Its terminal
   //    output + cost + tokens land in the child run metadata on completion.
+  //
+  //    Wrapped in `withCapturedSource` so the staged capture above is reclaimed by
+  //    the wrap's `finally` if `executeWorkflow`'s move-into-artifacts rename fails
+  //    (#2690 recursive path). `failOutcome` already covers early-refusal paths
+  //    before this point; the rename failure inside the recursive call is the one
+  //    path the wrap is the only thing that can see — `executeWorkflow` returns
+  //    `{success: false}` from that branch rather than throwing, so without the
+  //    wrap the staged directory sits for the hourly age sweep.
   try {
-    await executeWorkflow(
-      deps,
-      platform,
-      conversationId,
-      childCwd,
-      childWorkflow,
-      input,
-      conversationDbId,
-      childOpts
-    );
+    await withCapturedSource(async owner => {
+      owner.hold(childSource);
+      await executeWorkflow(
+        deps,
+        platform,
+        conversationId,
+        childCwd,
+        childWorkflow,
+        input,
+        conversationDbId,
+        { ...childOpts, capturedSourceOwner: owner }
+      );
+    });
 
     // 6. Read the child back for the node-facing outcome (status + summary + cost +
     //    tokens). Works for synchronous completion AND a child paused at its gate.
@@ -1596,6 +1683,8 @@ export async function executeWorkflow(
     preparedSource,
   } = opts;
 
+  const executionUserId = preCreatedRun ? (preCreatedRun.user_id ?? undefined) : userId;
+
   if (preCreatedRun !== undefined) {
     const foreignPriorNodeSession = priorNodeSessions?.find(
       row => row.workflow_run_id !== preCreatedRun.id
@@ -1642,7 +1731,7 @@ export async function executeWorkflow(
   // time in the GitHub adapter), but the env injection is enough for the
   // typical <1h workflow.
   const botGitHubEnv = await resolveBotGitHubEnvForWorkflow(deps, codebaseId);
-  const userGitHubEnv = await resolveUserGithubEnvForWorkflow(deps, userId);
+  const userGitHubEnv = await resolveUserGithubEnvForWorkflow(deps, executionUserId);
   const config: WorkflowConfig = {
     ...fileConfig,
     // Order: file < db < bot-token < per-user. Per-codebase env vars are
@@ -1698,17 +1787,20 @@ export async function executeWorkflow(
   // non-throwing, but a third-party deps impl might throw anyway — guard so a
   // prefs failure can never abort a run; `{}` keeps config-only behavior.
   let userAiPrefs: UserAiPrefsLayer = {};
-  if (userId && deps.getUserAiPrefs) {
+  if (executionUserId && deps.getUserAiPrefs) {
     try {
-      userAiPrefs = await deps.getUserAiPrefs(userId);
+      userAiPrefs = await deps.getUserAiPrefs(executionUserId);
     } catch (error) {
-      getLog().warn({ err: error as Error, userId }, 'workflow.user_ai_prefs_resolve_failed');
+      getLog().warn(
+        { err: error as Error, userId: executionUserId },
+        'workflow.user_ai_prefs_resolve_failed'
+      );
     }
   }
   if (userAiPrefs.tiers || userAiPrefs.aliases || userAiPrefs.defaultProvider) {
     getLog().debug(
       {
-        userId,
+        userId: executionUserId,
         tierKeys: Object.keys(userAiPrefs.tiers ?? {}),
         aliasKeys: Object.keys(userAiPrefs.aliases ?? {}),
         defaultProvider: userAiPrefs.defaultProvider,
@@ -1728,7 +1820,10 @@ export async function executeWorkflow(
     // Structurally invalid STORED prefs (corrupt DB row) must not kill the run
     // before its record exists — degrade to config-only. A broken config layer
     // still fails fast: the rebuild below rethrows the same error.
-    getLog().error({ err: error as Error, userId }, 'workflow.user_ai_prefs_profile_invalid');
+    getLog().error(
+      { err: error as Error, userId: executionUserId },
+      'workflow.user_ai_prefs_profile_invalid'
+    );
     aiProfile = buildAiProfile(config.assistant, {
       repoTiers: config.tiers,
       repoAliases: config.aliases,
@@ -2005,13 +2100,10 @@ export async function executeWorkflow(
 
   // Resolve external artifact, log, and state directories. A resumed run
   // carries its `output_root` and short-circuits identity resolution entirely.
-  const { artifactsDir, logDir, artifactsRoot, stateDir, outputRoot } = await resolveProjectPaths(
-    deps,
-    cwd,
-    workflowRun.id,
-    codebaseId,
-    { persistedOutputRoot: workflowRun.output_root }
-  );
+  const { artifactsDir, logDir, artifactsRoot, stateDir, outputRoot, identityResolution } =
+    await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
+      persistedOutputRoot: workflowRun.output_root,
+    });
 
   // Record the resolved root ONCE, so every later reader (artifact routes, CLI)
   // addresses this run's output by a durable pointer instead of re-deriving it
@@ -2019,20 +2111,69 @@ export async function executeWorkflow(
   // overwritten — a resumed run already has one, and the store additionally
   // enforces write-once via COALESCE.
   //
-  // A failure here is NOT retried: the guard is `if (!output_root)`, so this run
-  // keeps a NULL pointer for its whole lifetime and permanently stays on the
-  // re-derive path — the exact orphaning #1192 makes possible. It does not
+  // Faulted-identity exception (#2304): when `resolveProjectPaths` returned the
+  // cwd fallback BECAUSE both `getCodebase` attempts threw (not because a registered
+  // codebase simply lacked an owner/repo or `_local` identity), the cwd location is
+  // fault-shaped — persisting it here would pin this run's `output_root` AND
+  // `$STATE_DIR` to that empty, fault-derived tree for the run's whole life. We
+  // instead leave `output_root` NULL and stamp `metadata.identity_unresolved = true`,
+  // so:
+  //   • a later resume re-derives once the registry is healthy and the
+  //     `!workflowRun.output_root` guard above writes the now-correct root;
+  //   • the state-preflight gate (#2200), maintainer-triage, and anyone reading the
+  //     row can tell "unregistered" apart from "we could not tell";
+  //   • the write-once invariant is preserved everywhere else (a row with a
+  //     resolved or unregistered identity is still protected across a #1192
+  //     rename — only the empty faulted shape is scoped differently).
+  //
+  // A failure to persist here is NOT retried: the guard is `if (!output_root)`, so
+  // this run keeps a NULL pointer for its whole lifetime and permanently stays on
+  // the re-derive path — the exact orphaning #1192 makes possible. That does not
   // justify failing an otherwise healthy run (re-derivation works today), but it
-  // is a durable per-run degradation, so it logs at ERROR rather than WARN.
+  // is a durable per-run degradation, so the healed-arm persist failure below
+  // (`workflow.output_root_persist_failed`) logs at ERROR rather than WARN. The
+  // faulted arm's two logs stay at WARN by design: the underlying fault was
+  // already logged at ERROR inside `resolveProjectPaths`, so these only report a
+  // secondary bookkeeping failure (stamping the flag, noting the skipped persist),
+  // not the fault itself.
   if (!workflowRun.output_root) {
-    await deps.store
-      .updateWorkflowRun(workflowRun.id, { output_root: outputRoot })
-      .catch((err: Error) => {
+    if (identityResolution === 'faulted') {
+      workflowRun.metadata = {
+        ...workflowRun.metadata,
+        [RUN_METADATA_KEYS.identityUnresolved]: true,
+      };
+      try {
+        await deps.store.updateWorkflowRun(workflowRun.id, {
+          metadata: { [RUN_METADATA_KEYS.identityUnresolved]: true },
+        });
+      } catch (err) {
+        getLog().warn(
+          { err: err as Error, workflowRunId: workflowRun.id },
+          'workflow.identity_unresolved_flag_persist_failed'
+        );
+      }
+      getLog().warn(
+        { workflowRunId: workflowRun.id, outputRoot },
+        'workflow.output_root_not_persisted_identity_faulted'
+      );
+    } else {
+      const updates: Parameters<typeof deps.store.updateWorkflowRun>[1] = {
+        output_root: outputRoot,
+      };
+      // The faulted arm stamped `identity_unresolved = true`; this is the heal
+      // half of the same write — once a later resume's identity lookup succeeds,
+      // a row that has healed must stop reading as faulted. The `false` rides the
+      // same atomic metadata merge as the faulted arm's `true`.
+      if (readIdentityUnresolved(workflowRun.metadata) === true) {
+        updates.metadata = { [RUN_METADATA_KEYS.identityUnresolved]: false };
+      }
+      await deps.store.updateWorkflowRun(workflowRun.id, updates).catch((err: Error) => {
         getLog().error(
           { err, workflowRunId: workflowRun.id, outputRoot },
           'workflow.output_root_persist_failed'
         );
       });
+    }
   }
 
   // Detect (never move) legacy repo-local `.archon/` output directories. State was a
@@ -2182,6 +2323,12 @@ export async function executeWorkflow(
         await rm(finalCaptureRoot, { recursive: true, force: true });
         await rename(preparedSource.captureRoot, finalCaptureRoot);
       }
+      // The staged capture is now under the run's artifacts directory — the run owns
+      // the bytes from this point on. Adopting here (not earlier, at the call site) is
+      // what closes the race in #2690: a rename failure above returns without reaching
+      // this line, so the wrap's `finally` reclaims the staged directory instead of
+      // leaving it to the hourly age-based sweep.
+      opts.capturedSourceOwner?.adopt();
     } catch (error) {
       return await failRunOnSource(
         `Could not move this run's captured workflow source into place: ${(error as Error).message}`
@@ -2243,17 +2390,55 @@ export async function executeWorkflow(
 
   // Per-user AI-provider credentials (Phase 2). Resolved AFTER artifactsDir is
   // created because file-based deliveries (Codex `CODEX_HOME/auth.json`) live
-  // under it. Merged LAST into config.envVars so the originating user's keys
+  // under it. Clear files from an earlier invocation first: a disconnected
+  // credential or failed refresh must not leave stale secrets readable on resume.
+  // Merged LAST into config.envVars so the originating user's keys
   // win over file/db/bot-github env — preserves the GitHub merge order and
   // keeps the no-key path byte-for-byte unchanged (resolveUserProviderEnvForWorkflow
-  // returns {} when the feature is disabled or no userId is present).
-  const userProviderEnv = await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
+  // returns empty bags when the feature is disabled or no userId is present).
+  try {
+    await clearManagedProviderCredentialFiles(artifactsDir);
+  } catch (error) {
+    const err = error as Error;
+    const message = `Could not safely prepare provider credentials: ${err.message}`;
+    getLog().error(
+      { err, workflowRunId: workflowRun.id },
+      'workflow.user_provider_files_cleanup_failed'
+    );
+    await deps.store.failWorkflowRun(workflowRun.id, message).catch((dbErr: Error) => {
+      getLog().error(
+        { err: dbErr, workflowRunId: workflowRun.id },
+        'workflow.user_provider_files_cleanup_fail_db_record_failed'
+      );
+    });
+    await sendCriticalMessage(
+      platform,
+      conversationId,
+      'Workflow blocked: Unable to safely prepare provider credentials. Please retry.'
+    );
+    return { success: false, workflowRunId: workflowRun.id, error: message };
+  }
+
+  const { env: userProviderEnv, protectedValues } = await resolveUserProviderEnvForWorkflow(
+    deps,
+    executionUserId,
+    artifactsDir
+  );
   config.envVars = { ...config.envVars, ...userProviderEnv };
   for (const key of Object.keys(userProviderEnv)) {
     protectedEnvKeys.add(key);
   }
   if (protectedEnvKeys.size > 0) {
     config.protectedEnvKeys = [...protectedEnvKeys];
+  }
+  const effectiveDbCredentialValues = Object.entries(dbEnvVars).flatMap(([key, value]) =>
+    config.envVars?.[key] === value ? [value] : []
+  );
+  const protectedCredentialValues = [
+    ...new Set([...effectiveDbCredentialValues, ...protectedValues]),
+  ];
+  if (protectedCredentialValues.length > 0) {
+    config.protectedCredentialValues = protectedCredentialValues;
   }
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error.
@@ -2291,25 +2476,29 @@ export async function executeWorkflow(
     // workflows report their real name, custom ones report "custom". No PII —
     // descriptions/prompts/paths are never sent. Machine context + version ride
     // along as super-properties. Opt out: ARCHON_TELEMETRY_DISABLED=1 / DO_NOT_TRACK=1.
+    // Already-expanded — the run is about to execute this workflow, so `workflow.nodes`
+    // never actually holds an `IncludeDirective` here even though the type admits one
+    // for the general pre-expansion case (#2486).
+    const telemetryNodes = workflow.nodes as DagNode[];
     captureWorkflowInvoked({
       workflowName: workflow.name,
       workflowSource: source,
       platform: platform.getPlatformType(),
       provider: resolvedProvider,
       model: resolvedModel,
-      nodeCount: workflow.nodes.length,
-      usesLoop: workflow.nodes.some(isLoopNode),
-      usesLoopGroup: workflow.nodes.some(isLoopGroupNode),
-      usesApproval: workflow.nodes.some(isApprovalNode),
-      usesScript: workflow.nodes.some(isScriptNode),
-      usesBash: workflow.nodes.some(isBashNode),
-      usesOutputFormat: workflow.nodes.some(n => n.output_format !== undefined),
-      usesOutputType: workflow.nodes.some(n => n.output_type !== undefined),
+      nodeCount: telemetryNodes.length,
+      usesLoop: telemetryNodes.some(isLoopNode),
+      usesLoopGroup: telemetryNodes.some(isLoopGroupNode),
+      usesApproval: telemetryNodes.some(isGateNode),
+      usesScript: telemetryNodes.some(n => isExecNode(n) && n.runtime !== 'sh'),
+      usesBash: telemetryNodes.some(n => isExecNode(n) && n.runtime === 'sh'),
+      usesOutputFormat: telemetryNodes.some(n => n.output_format !== undefined),
+      usesOutputType: telemetryNodes.some(n => n.output_type !== undefined),
       usesPersistSession:
-        workflow.persist_sessions === true || workflow.nodes.some(n => n.persist_session === true),
-      usesMcp: workflow.nodes.some(n => n.mcp !== undefined),
-      usesSkills: workflow.nodes.some(n => n.skills !== undefined),
-      usesFreshContext: workflow.nodes.some(n => isLoopNode(n) && n.loop.fresh_context),
+        workflow.persist_sessions === true || telemetryNodes.some(n => n.persist_session === true),
+      usesMcp: telemetryNodes.some(n => n.mcp !== undefined),
+      usesSkills: telemetryNodes.some(n => n.skills !== undefined),
+      usesFreshContext: telemetryNodes.some(n => isLoopNode(n) && n.loop.fresh_context),
       interactive: workflow.interactive ?? false,
       usedIsolation: isolationContext !== undefined,
       isResume: dagPriorCompletedNodes !== undefined,
@@ -2486,13 +2675,15 @@ export async function executeWorkflow(
         }
       : workflowRun;
 
-    // Execute the DAG workflow
+    // Execute the DAG workflow. Already-expanded (see `telemetryNodes` above) — the
+    // executor's own `DagNode[]` parameter type is correctly narrow; this boundary
+    // cast reflects that invariant, not a new one.
     const dagSummary = await executeDagWorkflow(
       deps,
       platform,
       conversationId,
       cwd,
-      workflow,
+      { ...workflow, nodes: telemetryNodes },
       runForDag,
       resolvedProvider,
       resolvedModel,

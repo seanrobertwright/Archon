@@ -5,13 +5,15 @@ import {
   assertComposedGateDriveable,
   ComposedApprovalGateError,
   findComposedApprovalGate,
+  assertInteractiveClassNotBackgrounded,
+  InteractiveClassBackgroundError,
   resolveTopLevelInputs,
   WorkflowMissingInputsError,
 } from './workflow-requirements';
 import { WorkflowInputContractError } from '../workflow-inputs';
 import { expandWorkflowIncludes } from '../include-expander';
 import { dagNodeSchema } from '../schemas';
-import type { WorkflowDefinition } from '../schemas';
+import type { WorkflowDefinition, DagNode } from '../schemas';
 
 describe('assertWorkflowRequirementsMet', () => {
   test('passes when there are no requirements', () => {
@@ -141,7 +143,12 @@ describe('assertComposedGateDriveable', () => {
   const gateBlock = (): WorkflowDefinition => ({
     name: 'gate-blk',
     description: 'gate-blk',
-    nodes: [dagNodeSchema.parse({ id: 'gate', approval: { message: 'Approve?' } })],
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'gate',
+        approval: { message: 'Approve?', capture_response: false },
+      }),
+    ],
   });
 
   const wf = (name: string, nodes: unknown[], extra: object = {}): WorkflowDefinition =>
@@ -152,10 +159,16 @@ describe('assertComposedGateDriveable', () => {
       ...extra,
     }) as WorkflowDefinition;
 
-  function expand(defs: readonly WorkflowDefinition[], name: string): WorkflowDefinition {
+  function expand(
+    defs: readonly WorkflowDefinition[],
+    name: string
+  ): Omit<WorkflowDefinition, 'nodes'> & { nodes: DagNode[] } {
     const { workflows, errors } = expandWorkflowIncludes(new Map(defs.map(d => [d.name, d])));
     expect(errors).toEqual([]);
-    return workflows.get(name)!;
+    const workflow = workflows.get(name)!;
+    // Already-expanded — expandWorkflowIncludes' output never contains an
+    // `IncludeDirective` (#2486).
+    return { ...workflow, nodes: workflow.nodes as DagNode[] };
   }
 
   test('refuses a composed gate, naming the block, the gate and the fix', () => {
@@ -191,7 +204,9 @@ describe('assertComposedGateDriveable', () => {
   });
 
   test("a workflow's OWN approval node is never refused", () => {
-    const own = wf('own', [{ id: 'gate', approval: { message: 'Approve?' } }]);
+    const own = wf('own', [
+      { id: 'gate', approval: { message: 'Approve?', capture_response: false } },
+    ]);
     expect(() => assertComposedGateDriveable(expand([own], 'own').nodes)).not.toThrow();
   });
 
@@ -202,7 +217,7 @@ describe('assertComposedGateDriveable', () => {
         loop_group: {
           until: 'DONE',
           max_iterations: 2,
-          nodes: [{ id: 'gate', approval: { message: 'Approve?' } }],
+          nodes: [{ id: 'gate', approval: { message: 'Approve?', capture_response: false } }],
         },
       },
     ]);
@@ -218,5 +233,35 @@ describe('assertComposedGateDriveable', () => {
     const parent = expand([block, wf('parent', [{ id: 'inc', include: 'plain' }])], 'parent');
     expect(findComposedApprovalGate(parent.nodes)).toBeNull();
     expect(() => assertComposedGateDriveable(parent.nodes)).not.toThrow();
+  });
+});
+
+// #2707 step 2 / #1991 — the workflow's own declared class, checked independently at
+// every background-dispatch entrypoint. `dispatchBackgroundWorkflowOwned` (@archon/core)
+// is the shared entrypoint both the web console's default dispatch and the `manage_run`
+// tool's `startWorkflow` funnel through — the actual issue #1991 repro was reached via
+// `manage_run` from a background-capable chat agent. This unit-tests the pure assertion
+// both callers invoke; `packages/cli/src/commands/workflow.test.ts`'s
+// "detach refuses an interactive-class workflow" suite covers the CLI `--detach` entrypoint
+// end to end.
+describe('assertInteractiveClassNotBackgrounded (#2707 step 2 / #1991)', () => {
+  test('passes for an unattended (interactive absent/false) workflow', () => {
+    expect(() => assertInteractiveClassNotBackgrounded({ name: 'ship' })).not.toThrow();
+    expect(() =>
+      assertInteractiveClassNotBackgrounded({ name: 'ship', interactive: false })
+    ).not.toThrow();
+  });
+
+  test('throws InteractiveClassBackgroundError naming the workflow for an interactive-class workflow', () => {
+    let thrown: unknown;
+    try {
+      assertInteractiveClassNotBackgrounded({ name: 'guided', interactive: true });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(InteractiveClassBackgroundError);
+    expect((thrown as InteractiveClassBackgroundError).workflowName).toBe('guided');
+    expect((thrown as Error).message).toContain("Workflow 'guided'");
+    expect((thrown as Error).message).toContain('interactive-class');
   });
 });

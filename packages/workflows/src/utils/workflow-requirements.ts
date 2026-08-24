@@ -11,7 +11,7 @@
  */
 import type { WorkflowRequirement, WorkflowInputSpec } from '../schemas/workflow';
 import type { DagNode } from '../schemas/dag-node';
-import { isApprovalNode, isLoopGroupNode } from '../schemas/dag-node';
+import { isGateNode, isLoopGroupNode } from '../schemas/dag-node';
 import { readComposedMeta } from '../compiled-command';
 import { resolveDeclaredInputs, WorkflowInputContractError } from '../workflow-inputs';
 
@@ -79,9 +79,11 @@ export interface ComposedApprovalGate {
 export function findComposedApprovalGate(nodes: readonly DagNode[]): ComposedApprovalGate | null {
   for (const node of nodes) {
     const origin = readComposedMeta(node)?.origin;
-    if (origin !== undefined && isApprovalNode(node)) return { nodeId: node.id, origin };
+    if (origin !== undefined && isGateNode(node)) return { nodeId: node.id, origin };
     if (isLoopGroupNode(node)) {
-      const nested = findComposedApprovalGate(node.loop_group.nodes);
+      // Invoked at run dispatch, against an already-expanded workflow (#2486) — the
+      // body never actually holds an `IncludeDirective` here.
+      const nested = findComposedApprovalGate(node.loop_group.nodes as DagNode[]);
       if (nested !== null) return nested;
     }
   }
@@ -124,6 +126,54 @@ export class ComposedApprovalGateError extends Error {
 export function assertComposedGateDriveable(nodes: readonly DagNode[]): void {
   const gate = findComposedApprovalGate(nodes);
   if (gate !== null) throw new ComposedApprovalGateError(gate);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive-class background-dispatch refusal (#2707 step 2)
+// ---------------------------------------------------------------------------
+
+/** Minimal shape needed to evaluate the class check — avoids a full WorkflowDefinition dep. */
+export interface ClassBearingWorkflow {
+  name: string;
+  interactive?: boolean;
+}
+
+/**
+ * Thrown when an interactive-class workflow (`interactive: true`) is about to be dispatched
+ * to the background, on any surface. `message` names the workflow and the class, and points
+ * at a foreground alternative — the fix a `requires:` refusal has always given, applied here.
+ */
+export class InteractiveClassBackgroundError extends Error {
+  constructor(public readonly workflowName: string) {
+    super(
+      `Workflow '${workflowName}' is interactive-class ('interactive: true') and may pause for ` +
+        'human input — it cannot be dispatched in the background. Run it in the foreground ' +
+        "instead (the CLI without '--detach', chat, or the web console in foreground mode), " +
+        "or declare 'interactive: false' (or omit the field) if it should never pause."
+    );
+    this.name = 'InteractiveClassBackgroundError';
+  }
+}
+
+/**
+ * Refuse a background dispatch of an interactive-class workflow. Pure and synchronous — no
+ * I/O, unlike `assertWorkflowRequirementsMet` — so every dispatch surface can call it
+ * independently, right before it would otherwise background a run: CLI `workflow run
+ * --detach` (before the fork), and `dispatchBackgroundWorkflowOwned` (@archon/core — the
+ * shared entrypoint reached by both the web console's default dispatch and the `manage_run`
+ * tool's `startWorkflow`, alongside `assertComposedGateDriveable`, which answers the same
+ * "can this backgrounded run present a pause?" question for a gate the class declaration
+ * cannot see: one that arrived via `include:` in a workflow that itself omits `interactive:
+ * true`).
+ *
+ * This is what closes issue #1991: dispatching a workflow shaped like its repro
+ * (`interactive: true`, launched via a background-capable agent or `--detach`) now fails
+ * fast with a class-naming error instead of hanging indefinitely with nothing to resume it.
+ */
+export function assertInteractiveClassNotBackgrounded(workflow: ClassBearingWorkflow): void {
+  if (workflow.interactive === true) {
+    throw new InteractiveClassBackgroundError(workflow.name);
+  }
 }
 
 // ---------------------------------------------------------------------------

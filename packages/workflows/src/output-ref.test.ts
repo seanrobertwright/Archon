@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 
 import {
+  assertProducerNotFailed,
   canonicalValueText,
   declaredFieldsFromSchema,
   jsonValueSchema,
@@ -139,6 +140,71 @@ describe('resolveNodeOutputField — producer did not run', () => {
     expect(() => resolveNodeOutputField({ state: 'pending', output: '' }, 'n', 'field')).toThrow(
       OutputRefError
     );
+  });
+});
+
+describe('resolveNodeOutputField — producer failed (#2713)', () => {
+  it("throws producer-failed even when the failed producer's leftover output is real, valid JSON", () => {
+    // Mirrors a loop_group's failure paths: lastIterationOutput is real, non-empty text
+    // that happens to be valid JSON — exactly the shape that let the failed producer's
+    // stale output silently resolve before this fix (run 6607bf20 / #2696).
+    const failed: NodeOutput = {
+      state: 'failed',
+      output: JSON.stringify({ ready: true }),
+      error: 'loop failed at max_iterations',
+    };
+    try {
+      resolveNodeOutputField(failed, 'corrections', 'ready');
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(OutputRefError);
+      expect((e as OutputRefError).reason).toBe('producer-failed');
+      expect((e as OutputRefError).message).toContain("'corrections' failed");
+    }
+  });
+
+  it('throws producer-failed even when structuredOutput carries the field', () => {
+    const failed: NodeOutput = {
+      state: 'failed',
+      output: '',
+      error: 'boom',
+      structuredOutput: { ready: true },
+    };
+    expect(() => resolveNodeOutputField(failed, 'corrections', 'ready')).toThrow(OutputRefError);
+  });
+});
+
+// #2722 — the shared guard every whole-text $node.output reader routes through, mirroring
+// resolveNodeOutputField's own state === 'failed' guard for the fielded form.
+describe('assertProducerNotFailed', () => {
+  it.each(['completed', 'running', 'pending', 'skipped'] as const)(
+    'does not throw for a %s producer',
+    state => {
+      const nodeOutput: NodeOutput =
+        state === 'completed' || state === 'running'
+          ? { state, output: 'ok' }
+          : { state, output: '' };
+      expect(() => assertProducerNotFailed(nodeOutput, () => 'unreachable')).not.toThrow();
+    }
+  );
+
+  it("throws with the caller's message for a failed producer", () => {
+    const failed: NodeOutput = { state: 'failed', output: 'stale', error: 'boom' };
+    expect(() =>
+      assertProducerNotFailed(failed, f => `custom message referencing ${f.error}`)
+    ).toThrow('custom message referencing boom');
+  });
+
+  it('passes the narrowed failed NodeOutput to buildMessage (error accessible without a cast)', () => {
+    const failed: NodeOutput = { state: 'failed', output: '', error: 'loop failed' };
+    let seenError: string | undefined;
+    expect(() =>
+      assertProducerNotFailed(failed, f => {
+        seenError = f.error;
+        return 'x';
+      })
+    ).toThrow();
+    expect(seenError).toBe('loop failed');
   });
 });
 

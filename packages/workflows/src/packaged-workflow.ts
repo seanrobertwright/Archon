@@ -1,6 +1,12 @@
 import { join } from 'path';
 import type { WorkflowDefinition, WorkflowSource } from './schemas';
-import { isCommandNode, isLoopGroupNode, isLoopNode, isScriptNode } from './schemas';
+import {
+  isAgentNode,
+  isExecNode,
+  isIncludeDirective,
+  isLoopGroupNode,
+  isLoopNode,
+} from './schemas';
 import { isValidCommandName } from './command-validation';
 
 const PACKAGED_RESOURCE_PREFIX = '__archon_pack__';
@@ -94,10 +100,13 @@ function qualifyNodeResources(
   node: WorkflowDefinition['nodes'][number],
   owner: WorkflowResourceOwner
 ): void {
-  if (isCommandNode(node)) {
-    node.command = qualifyResourceReference(node.command, owner);
+  // An include directive carries no resources of its own to qualify here (matches
+  // prior behavior — it fell through every check unmutated before #2486 too).
+  if (isIncludeDirective(node)) return;
+  if (isAgentNode(node) && node.source.kind === 'command') {
+    node.source.name = qualifyResourceReference(node.source.name, owner);
   }
-  if (isScriptNode(node) && isNamedScript(node.script)) {
+  if (isExecNode(node) && node.runtime !== 'sh' && isNamedScript(node.script)) {
     node.script = qualifyResourceReference(node.script, owner);
   }
   if (isLoopNode(node) && node.loop.command !== undefined) {

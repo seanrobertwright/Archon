@@ -461,6 +461,10 @@ when: "$INPUTS.mode == 'fast' && $check.output.ok == 'true'"
 - Numeric operators fail-closed if either side is not a finite number
 - Parentheses are not supported — use standard AND/OR precedence to structure conditions
 - Skipped nodes propagate their skipped state to dependants
+- A **failed** producer's output is never evaluated, fielded or whole-text — a `when:`
+  joined past a failure via `trigger_rule: all_done` must branch on a different node's
+  output; referencing the failed producer's own output fails the condition's node loudly
+  (see [Reading across a skipped branch](#reading-across-a-skipped-branch))
 
 :::danger[You cannot compare a whole AI output to a literal]
 A `when:` that compares the **entire output** of a `prompt:` or `command:` node with no
@@ -528,6 +532,11 @@ nodes:
 Variable substitution order:
 1. Standard variables (`$WORKFLOW_ID`, `$USER_MESSAGE`, `$ARTIFACTS_DIR`, etc.)
 2. Node output references (`$nodeId.output`, `$nodeId.output.field`)
+
+A reference to a **failed** producer — fielded or whole-text — fails the node doing the
+substitution instead of splicing in the failed producer's leftover output; a `bash:`/
+`prompt:`/`command:` body must not assume a dependency succeeded just because it was
+allowed to run (`trigger_rule: all_done`).
 
 :::caution[Double-quoting `$node.output` in `bash:` nodes is a silent footgun]
 In `bash:` nodes, `$nodeId.output` and `$nodeId.output.field` are injected pre-quoted by Archon. For small outputs, values are **single-quoted inline** — the quoting is already provided by the substitution. For outputs exceeding 32 KB, Archon spills to the run-owned `$ARTIFACTS_DIR/.archon/node-output-spills/<node>[.<field>].nodeoutput` file and substitutes `$(cat '<path>')` instead. These files follow the [run-artifact retention lifecycle](/reference/archon-directories/#user-level-archon). Wrapping the substitution in double quotes breaks the **small (inline) case**: `var="$n.output"` becomes `var="'value'"`, embedding the literal single-quotes as part of the value. (For the large `$(cat ...)` case, double-quoting is harmless — `var="$(cat ...)"` is correct bash — but you can't know the output's size at author time, so the rule is unconditional: never double-quote.)
@@ -733,8 +742,9 @@ When a `nodes:` (DAG) workflow fails, the prior run stays in the database as a c
 
 **Crashed servers / orphaned runs**: Archon does **not** auto-fail `running` rows on server startup — that would kill workflows actively executing in another process (CLI, adapter). If a server crash leaves a row stuck as `running`, it remains visible in the dashboard (the Dashboard nav tab shows a count of running workflows). Transition it to a terminal status explicitly:
 
-- **Web UI**: click the Abandon or Cancel button on the workflow card. Abandon marks the run `cancelled` and keeps completed-node history. Cancel also terminates any in-flight subprocess.
-- **CLI**: `archon workflow abandon <run-id>` (equivalent to the dashboard Abandon button). Run IDs are listed by `archon workflow status`.
+- **Web UI**: click Abandon on the workflow card to mark the row `cancelled` and keep completed-node history.
+- **CLI orphan cleanup**: after verifying the owner is gone, use `archon workflow abandon <run-id>`.
+- **Live detached CLI run**: use `archon workflow cancel <run-id>` to terminate the exact run's host process tree before marking it `cancelled`.
 
 Once the row reaches a terminal status, you can resume it explicitly via the paths above. Plain `archon workflow run` never resumes implicitly.
 
@@ -940,6 +950,15 @@ coalescing decision ("ready if either branch said so") stays in the consuming sc
 is the [constitution's](/reference/workflow-language-constitution/) YAML-coordinates /
 code-computes split. A skipped producer with **no** `if_skipped` fails the node with the
 binding, producer, and fix named — a binding never silently resolves to `''`.
+
+`if_skipped` only ever covers a producer that **did not run**. A producer that ran and
+**failed** always fails the binding too, whether or not `if_skipped` is declared — a
+`loop_group`'s failure paths in particular can leave real, non-empty output behind (its last
+completed iteration's text), so this is an explicit check, not an accident of empty output.
+There is no way to opt a binding out of this: declaring `if_skipped` never papers over a real
+failure, and neither `when:` nor an inline `$node.output` reference in a prompt/bash/command
+body can substitute for it — every one of them fails the same way against a failed producer,
+whether the reference is fielded or whole-text.
 
 Two guarantees the loader enforces: every bound producer must be reachable through
 `depends_on` (a binding can never race its producer), and two binding names may not fold to
@@ -1775,8 +1794,9 @@ statement about the children:
 
 One constraint applies however the checkouts are arranged: **one blocking child gate at a
 time.** Two children in the same layer that both pause for approval contend for the parent
-run's single approval slot — the second pause fails its node. Sequence gated sub-runs with
-`depends_on` until a later slice adds real concurrent gating.
+run's single approval slot — the second pause is silently dropped, and that child stays
+unmentioned until a later resume re-pauses on it. Sequence gated sub-runs with `depends_on`
+until a later slice adds real concurrent gating.
 
 ### Fanning out over a list with `fan_out:`
 

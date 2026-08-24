@@ -32,9 +32,11 @@ import * as workflowDb from '../db/workflows';
 import {
   approveWorkflow,
   rejectWorkflow,
+  respondToWorkflow,
   getWorkflowStatus,
   resumeWorkflow,
   abandonWorkflow,
+  abandonResumableRunsForConversation,
   resetWorkflowNodeSessions,
 } from '../operations/workflow-operations';
 import { safeDeactivateSession } from '../state/session-transitions';
@@ -275,9 +277,11 @@ function findWorkflowLoadError(
  *
  * Shared by `/workflow resume`, `/workflow approve` and `/workflow reject`
  * (#2565): a gate decision that does not continue the run leaves it stranded, so
- * all three resolve the same continuation the same way.
+ * all three resolve the same continuation the same way. Also reused by the HTTP
+ * `resumeRunHeadless` fallback (packages/server) for runs with no parent
+ * conversation to dispatch a chat message through (#2008).
  */
-async function resolveRunContinuation(
+export async function resolveRunContinuation(
   runId: string,
   workflowCwd: string
 ): Promise<
@@ -386,7 +390,7 @@ async function withRunContinuation(
   runId: string,
   workflowCwd: string,
   headline: string,
-  action: 'approve' | 'reject'
+  action: 'approve' | 'reject' | 'respond'
 ): Promise<CommandResult> {
   let continuation: Awaited<ReturnType<typeof resolveRunContinuation>>;
   try {
@@ -1024,18 +1028,77 @@ async function handleWorkflowCommand(
             message: `Workflow \`${result.workflowName}\` rejected and cancelled${suffix}.`,
           };
         }
-        // Not cancelled means an on_reject rework is staged — continue the run so
-        // the rework actually happens (#2565).
+        // Not cancelled means either a legacy on_reject rework is staged, or
+        // (#2707 step 1) a new-mode gate resolved with structured output —
+        // continue the run either way so the resolution actually takes effect
+        // (#2565).
         return await withRunContinuation(
           runId,
           workflowCwd,
-          `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
+          result.newMode
+            ? `Workflow \`${result.workflowName}\` rejected. Continuing...`
+            : `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
           'reject'
         );
       } catch (error) {
         const err = error as Error;
         getLog().error({ err, runId }, 'cmd.workflow_reject_failed');
         return { success: false, message: `Failed to reject workflow run: ${err.message}` };
+      }
+    }
+
+    case 'respond': {
+      // General drive verb (#2707 step 2): resolves a paused gate with any of its
+      // author-declared decisions. 'approve'/'reject' behave identically to the
+      // dedicated commands above — respondToWorkflow delegates those two ids to the
+      // exact same approveWorkflow/rejectWorkflow functions — this handler just
+      // formats whichever result shape comes back.
+      const runId = args[1];
+      const decision = args[2];
+      if (!runId || !decision) {
+        return {
+          success: false,
+          message:
+            'Usage: /workflow respond <id> <decision> [text]\n\n' +
+            "Resolves a paused gate with any of its declared decisions ('approve'/'reject' " +
+            'are sugar for the dedicated /workflow approve|reject commands).',
+        };
+      }
+      const rawText = args.slice(3).join(' ');
+      // Mirrors the dedicated /workflow reject command's default: an empty reason
+      // becomes 'Rejected' rather than reaching a new-mode gate's structured
+      // output as ''. Only for decision === 'reject' — respond's other decisions
+      // (including 'approve', which stays optional/undefined) are unaffected.
+      const text = rawText.length > 0 ? rawText : decision === 'reject' ? 'Rejected' : undefined;
+      try {
+        const result = await respondToWorkflow(runId, decision, text);
+        if ('cancelled' in result) {
+          if (result.cancelled) {
+            const suffix = result.maxAttemptsReached ? ' (max attempts reached)' : '';
+            return {
+              success: true,
+              message: `Workflow \`${result.workflowName}\` rejected and cancelled${suffix}.`,
+            };
+          }
+          return await withRunContinuation(
+            runId,
+            workflowCwd,
+            result.newMode
+              ? `Workflow \`${result.workflowName}\` rejected. Continuing...`
+              : `Workflow \`${result.workflowName}\` rejected. Reworking with your feedback...`,
+            'respond'
+          );
+        }
+        const pathInfo = result.workingPath ? `\nPath: \`${result.workingPath}\`` : '';
+        const headline =
+          result.type === 'interactive_loop'
+            ? `Workflow \`${result.workflowName}\` loop input received.${pathInfo}`
+            : `Workflow \`${result.workflowName}\` responded '${decision}'.${pathInfo}`;
+        return await withRunContinuation(runId, workflowCwd, headline, 'respond');
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, runId, decision }, 'cmd.workflow_respond_failed');
+        return { success: false, message: `Failed to respond to workflow run: ${err.message}` };
       }
     }
 
@@ -1320,18 +1383,94 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
     }
 
     case 'reset': {
-      const session = await sessionDb.getActiveSession(conversation.id);
-      if (session) {
-        await safeDeactivateSession(session.id, 'reset');
-        return {
-          success: true,
-          message:
-            'Session cleared. Starting fresh on next message.\n\nCodebase configuration preserved.',
-        };
+      // /reset is an explicit "start fresh" intent, and deactivating the AI
+      // session alone does not deliver it: the execution binding (cwd +
+      // isolation env) survives, and so does every resumable run, so the next
+      // message can continue an old run on an old worktree instead of starting
+      // over. This clears all three.
+      //
+      // `codebase_id` is deliberately PRESERVED. The resulting row —
+      // {codebase_id: <kept>, cwd: null, isolation_env_id: null} — is byte-for-
+      // byte what /setproject already writes, so this is a well-trodden state,
+      // not a novel one. Detaching the project is /setproject none's job.
+      let hadActiveSession = false;
+      let sessionError: string | null = null;
+      try {
+        const session = await sessionDb.getActiveSession(conversation.id);
+        hadActiveSession = session !== null;
+        if (session) {
+          await safeDeactivateSession(session.id, 'reset');
+        }
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_clear_session_failed');
+        sessionError = err.message;
       }
+
+      // Three independent effects, three independent try blocks. Sharing the
+      // run and binding effects would mean that a binding-clear failure AFTER
+      // a successful abandon swallows
+      // the count and reports only the failure — precisely the case where the
+      // user most needs to know that N runs were already cancelled.
+      let abandoned = 0;
+      let abandonBlockedParentRunId: string | null = null;
+      let abandonError: string | null = null;
+      try {
+        ({ abandoned, blockedParentRunId: abandonBlockedParentRunId } =
+          await abandonResumableRunsForConversation(conversation.id));
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_abandon_failed');
+        abandonError = err.message;
+      }
+
+      let bindingCleared = true;
+      let bindingError: string | null = null;
+      try {
+        await db.updateConversation(conversation.id, { cwd: null, isolation_env_id: null });
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_clear_binding_failed');
+        bindingCleared = false;
+        bindingError = err.message;
+      }
+
+      const parts = [
+        sessionError !== null
+          ? `Could not clear the AI session: ${sessionError}`
+          : hadActiveSession
+            ? 'Session cleared.'
+            : 'No active session.',
+      ];
+      parts.push(
+        bindingCleared
+          ? 'Cleared workspace binding (worktree + isolation env).'
+          : `Could not clear the workspace binding: ${bindingError ?? 'unknown error'}`
+      );
+      if (abandoned > 0) parts.push(`Abandoned ${String(abandoned)} resumable run(s).`);
+      if (abandonBlockedParentRunId !== null) {
+        parts.push(
+          `⚠️ Parent run ${abandonBlockedParentRunId} was blocked on an abandoned sub-run and stays paused. Resume it to fail the node cleanly, or abandon it too.`
+        );
+      }
+      if (abandonError !== null) {
+        parts.push(`⚠️ Could not look up resumable runs: ${abandonError}`);
+      }
+
+      const resetComplete =
+        sessionError === null &&
+        bindingCleared &&
+        abandonError === null &&
+        abandonBlockedParentRunId === null;
+      parts.push(
+        resetComplete
+          ? 'Project attachment preserved — next message starts fresh.'
+          : 'Project attachment preserved. Reset is incomplete — retry /reset before sending the next message.'
+      );
+
       return {
-        success: true,
-        message: 'No active session to reset.',
+        success: resetComplete,
+        message: parts.join(' '),
       };
     }
 

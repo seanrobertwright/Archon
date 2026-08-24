@@ -88,13 +88,16 @@ import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emit
 import { loadMcpConfig } from '@archon/providers/mcp/config';
 import type {
   DagNode,
-  CommandNode,
-  BashNode,
-  ScriptNode,
+  AgentNode,
+  ExecNode,
+  LoopGroupNode,
+  IncludeDirective,
   NodeOutput,
   WorkflowRun,
   WorkflowRunNodeSession,
   WorkflowDefinition,
+  WorkflowRunStatus,
+  ApprovalContext,
 } from './schemas';
 import { dagNodeSchema, workflowDefinitionSchema } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
@@ -169,6 +172,9 @@ function createMockStore(): MockWorkflowStore {
     failWorkflowRun: mock<IWorkflowStore['failWorkflowRun']>(async (_id, _error) => {}),
     pauseWorkflowRun: mock<IWorkflowStore['pauseWorkflowRun']>(
       async (_id, _approvalContext, _extraMetadata) => {}
+    ),
+    rewriteApprovalContext: mock<IWorkflowStore['rewriteApprovalContext']>(
+      async (_id, _approvalContext) => ({ resolved: true })
     ),
     claimWriteback: mock<IWorkflowStore['claimWriteback']>(async _id => ({ claimed: true })),
     releaseWritebackClaim: mock<IWorkflowStore['releaseWritebackClaim']>(async _id => {}),
@@ -321,8 +327,36 @@ const minimalConfig: WorkflowConfig = {
 
 // --- Helpers ---
 
-function node(id: string, depends_on?: string[], opts?: Partial<CommandNode>): CommandNode {
-  return { id, command: id, ...(depends_on?.length ? { depends_on } : {}), ...opts };
+/**
+ * A parsed `WorkflowDefinition`'s `nodes` admits `IncludeDirective` for the general
+ * pre-expansion case (#2486); every workflow built for these tests is a flat,
+ * already-expanded fixture with no `include:` nodes, so this narrows it back to what
+ * `executeDagWorkflow` actually requires.
+ */
+function ready(wf: WorkflowDefinition): Omit<WorkflowDefinition, 'nodes'> & { nodes: DagNode[] } {
+  return { ...wf, nodes: wf.nodes as DagNode[] };
+}
+
+function node(id: string, depends_on?: string[], opts?: Partial<AgentNode>): AgentNode {
+  return {
+    id,
+    kind: 'agent',
+    source: { kind: 'command', name: id },
+    ...(depends_on?.length ? { depends_on } : {}),
+    ...opts,
+  };
+}
+
+/** The inline prompt text of an agent node, or undefined for any other kind
+ * or a command-sourced agent node (formerly the bare `'prompt' in node` idiom, #2486). */
+function inlinePrompt(node: DagNode | undefined): string | undefined {
+  return node && 'source' in node && node.source.kind === 'inline' ? node.source.prompt : undefined;
+}
+
+/** The shell script text of a `runtime: 'sh'` exec node, or undefined for any other
+ * kind (formerly the bare `'bash' in node` idiom, #2486). */
+function bashScript(node: DagNode | undefined): string | undefined {
+  return node && 'script' in node && node.runtime === 'sh' ? node.script : undefined;
 }
 
 /**
@@ -404,6 +438,19 @@ function loaderBypassingWorkflow(
 }
 
 // --- Tests ---
+
+/**
+ * A run's JSONL transcript, parsed. Module-scoped so every describe reads a run's
+ * transcript the same way.
+ */
+const readTranscript = async (
+  logDir: string,
+  runId: string
+): Promise<Array<Record<string, unknown>>> =>
+  (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
+    .trim()
+    .split('\n')
+    .map(line => JSON.parse(line) as Record<string, unknown>);
 
 describe('buildTopologicalLayers', () => {
   it('single node with no dependencies -> one layer', () => {
@@ -764,7 +811,7 @@ nodes:
     const wf = result.workflows[0].workflow;
     expect(wf.nodes).toHaveLength(4);
     expect(wf.nodes[0].id).toBe('classify');
-    expect(wf.nodes[0].output_format).toBeDefined();
+    expect((wf.nodes[0] as DagNode).output_format).toBeDefined();
     expect(wf.nodes[1].when).toBe("$classify.output.type == 'BUG'");
     expect(wf.nodes[3].trigger_rule).toBe('none_failed_min_one_success');
   });
@@ -793,7 +840,8 @@ nodes:
 
     const wf = result.workflows[0].workflow;
     expect(wf.nodes).toBeDefined();
-    expect(wf.nodes[0].prompt).toBe('Output exactly: hello from A');
+    const stepA = wf.nodes[0] as AgentNode;
+    expect(stepA.source).toEqual({ kind: 'inline', prompt: 'Output exactly: hello from A' });
     expect(wf.nodes[1].depends_on).toEqual(['step-a']);
   });
 
@@ -875,15 +923,16 @@ nodes:
       .find(w => w.name === 'tool-restriction-test');
     expect(wf).toBeDefined();
     if (!wf) return;
+    const toolNodes = wf.nodes as AgentNode[];
 
-    expect(wf.nodes[0].allowed_tools).toEqual(['Read', 'Grep', 'Glob']);
-    expect(wf.nodes[0].denied_tools).toBeUndefined();
+    expect(toolNodes[0].allowed_tools).toEqual(['Read', 'Grep', 'Glob']);
+    expect(toolNodes[0].denied_tools).toBeUndefined();
 
-    expect(wf.nodes[1].denied_tools).toEqual(['WebSearch', 'WebFetch']);
-    expect(wf.nodes[1].allowed_tools).toBeUndefined();
+    expect(toolNodes[1].denied_tools).toEqual(['WebSearch', 'WebFetch']);
+    expect(toolNodes[1].allowed_tools).toBeUndefined();
 
     // Empty array must be preserved (distinct from absent)
-    expect(wf.nodes[2].allowed_tools).toEqual([]);
+    expect(toolNodes[2].allowed_tools).toEqual([]);
   });
 });
 
@@ -958,6 +1007,28 @@ describe('substituteNodeOutputRefs', () => {
     expect(() => substituteNodeOutputRefs('echo $missing.output.field', outputs, true)).toThrow(
       OutputRefError
     );
+  });
+
+  it('failed producer (#2713): whole-text $node.output throws instead of splicing stale output', () => {
+    // Mirrors a loop_group's failure paths: real, non-empty leftover text — not the
+    // '' a plain node's failure usually leaves — must never be spliced into a
+    // consumer's prompt/bash body as though the producer had succeeded.
+    const outputs = new Map([['corrections', makeOutput('failed', 'CORRECTIONS_APPLIED')]]);
+    expect(() => substituteNodeOutputRefs('Result: $corrections.output', outputs)).toThrow();
+  });
+
+  it('failed producer (#2713): fielded $node.output.field throws even on valid JSON leftover output', () => {
+    const outputs = new Map([
+      ['corrections', makeOutput('failed', JSON.stringify({ ready: true }))],
+    ]);
+    let caught: unknown;
+    try {
+      substituteNodeOutputRefs('$corrections.output.ready', outputs);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(OutputRefError);
+    expect((caught as OutputRefError).reason).toBe('producer-failed');
   });
 });
 
@@ -1337,7 +1408,14 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'dag-tool-restriction',
-        nodes: [{ id: 'review', command: 'my-cmd', allowed_tools: ['Read', 'Grep'] }],
+        nodes: [
+          {
+            id: 'review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            allowed_tools: ['Read', 'Grep'],
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1368,7 +1446,14 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'dag-setting-sources',
-        nodes: [{ id: 'lean-review', command: 'my-cmd', settingSources: ['project'] }],
+        nodes: [
+          {
+            id: 'lean-review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            settingSources: ['project'],
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1410,7 +1495,15 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'dag-setting-sources-codex',
-        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'codex', settingSources: ['project'] }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            provider: 'codex',
+            settingSources: ['project'],
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1455,7 +1548,14 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'codex-tier-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'medium',
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1517,7 +1617,15 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'codex-explicit-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium', effort: 'high' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'medium',
+            effort: 'high',
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1568,7 +1676,7 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'inherited-workflow-tier-test',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
       },
       workflowRun,
       'codex',
@@ -1622,7 +1730,14 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'opencode-tier-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'medium',
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1676,7 +1791,15 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'opencode-declared-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'opencode', effort: 'high' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            provider: 'opencode',
+            effort: 'high',
+          },
+        ],
       },
       workflowRun,
       'opencode',
@@ -1721,7 +1844,14 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'claude-tier-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', model: 'large' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'large',
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1771,7 +1901,7 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       {
         name: 'workflow-level-tier-test',
         model: 'medium',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
       },
       workflowRun,
       'claude',
@@ -1810,7 +1940,15 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'literal-model-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'claude', model: 'opus' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            provider: 'claude',
+            model: 'opus',
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1855,7 +1993,15 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       testDir,
       {
         name: 'alias-provider-conflict-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'claude', model: '@fast' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            provider: 'claude',
+            model: '@fast',
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -1902,7 +2048,13 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       {
         name: 'dag-codex-denied',
         nodes: [
-          { id: 'review', command: 'my-cmd', provider: 'codex', denied_tools: ['WebSearch'] },
+          {
+            id: 'review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            provider: 'codex',
+            denied_tools: ['WebSearch'],
+          },
         ],
       },
       workflowRun,
@@ -1934,7 +2086,17 @@ describe('executeDagWorkflow -- tool restrictions', () => {
       platform,
       'conv-dag',
       testDir,
-      { name: 'dag-empty-tools', nodes: [{ id: 'review', command: 'my-cmd', allowed_tools: [] }] },
+      {
+        name: 'dag-empty-tools',
+        nodes: [
+          {
+            id: 'review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            allowed_tools: [],
+          },
+        ],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -1967,7 +2129,8 @@ describe('executeDagWorkflow -- tool restrictions', () => {
         nodes: [
           {
             id: 'review',
-            command: 'my-cmd',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
             hooks: {
               PreToolUse: [{ matcher: 'Bash', response: { decision: 'block' } }],
             },
@@ -2014,7 +2177,8 @@ describe('executeDagWorkflow -- tool restrictions', () => {
         nodes: [
           {
             id: 'review',
-            command: 'my-cmd',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
             provider: 'codex',
             hooks: {
               PreToolUse: [{ response: { decision: 'block' } }],
@@ -2074,7 +2238,13 @@ describe('executeDagWorkflow -- AI node prompt substitution failure', () => {
       testDir,
       {
         name: 'subst-fail',
-        nodes: [{ id: 'needs-base', prompt: 'Diff the branch against $BASE_BRANCH and review.' }],
+        nodes: [
+          {
+            id: 'needs-base',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Diff the branch against $BASE_BRANCH and review.' },
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -2144,9 +2314,11 @@ describe('executeDagWorkflow -- bash nodes', () => {
       user_message: 'bash test message',
     });
 
-    const bashNode: BashNode = {
+    const bashNode: ExecNode = {
       id: 'stats',
-      bash: 'echo "hello world"',
+      kind: 'exec',
+      runtime: 'sh',
+      script: 'echo "hello world"',
     };
 
     await executeDagWorkflow(
@@ -2185,8 +2357,13 @@ describe('executeDagWorkflow -- bash nodes', () => {
     await writeFile(join(commandsDir, 'my-cmd.md'), 'Process: $stats.output');
 
     const nodes: DagNode[] = [
-      { id: 'stats', bash: 'echo "42 files"' },
-      { id: 'process', command: 'my-cmd', depends_on: ['stats'] },
+      { id: 'stats', kind: 'exec', runtime: 'sh', script: 'echo "42 files"' },
+      {
+        id: 'process',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
+        depends_on: ['stats'],
+      },
     ];
 
     await executeDagWorkflow(
@@ -2222,9 +2399,11 @@ describe('executeDagWorkflow -- bash nodes', () => {
       user_message: 'bash test message',
     });
 
-    const bashNode: BashNode = {
+    const bashNode: ExecNode = {
       id: 'fail',
-      bash: 'exit 1',
+      kind: 'exec',
+      runtime: 'sh',
+      script: 'exit 1',
     };
 
     await executeDagWorkflow(
@@ -2264,9 +2443,11 @@ describe('executeDagWorkflow -- bash nodes', () => {
     // Marker is echoed to stdout only (so it lands in the command line embedded
     // in err.message but never in stderr). If it shows up in errorMsg the
     // prefix line was not stripped.
-    const bashNode: BashNode = {
+    const bashNode: ExecNode = {
       id: 'fail-bash-1389',
-      bash: 'echo UNIQUE_CMDLINE_MARKER_1389; echo "diagnostic from stderr" >&2; exit 1',
+      kind: 'exec',
+      runtime: 'sh',
+      script: 'echo UNIQUE_CMDLINE_MARKER_1389; echo "diagnostic from stderr" >&2; exit 1',
     };
 
     await executeDagWorkflow(
@@ -2310,9 +2491,11 @@ describe('executeDagWorkflow -- bash nodes', () => {
       user_message: 'bash test message',
     });
 
-    const bashNode: BashNode = {
+    const bashNode: ExecNode = {
       id: 'vars',
-      bash: 'echo "$ARGUMENTS"',
+      kind: 'exec',
+      runtime: 'sh',
+      script: 'echo "$ARGUMENTS"',
     };
 
     await executeDagWorkflow(
@@ -2351,8 +2534,8 @@ describe('executeDagWorkflow -- bash nodes', () => {
     await writeFile(join(commandsDir, 'my-cmd.md'), 'Do something');
 
     const nodes: DagNode[] = [
-      { id: 'bash-a', bash: 'echo "from bash"' },
-      { id: 'ai-b', command: 'my-cmd' },
+      { id: 'bash-a', kind: 'exec', runtime: 'sh', script: 'echo "from bash"' },
+      { id: 'ai-b', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } },
     ];
 
     await executeDagWorkflow(
@@ -2387,7 +2570,10 @@ describe('executeDagWorkflow -- bash nodes', () => {
       platform,
       'conv-bash-env',
       testDir,
-      { name: 'bash-env-test', nodes: [{ id: 'stats', bash: 'echo ok' }] },
+      {
+        name: 'bash-env-test',
+        nodes: [{ id: 'stats', kind: 'exec', runtime: 'sh', script: 'echo ok' }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -2422,10 +2608,12 @@ describe('executeDagWorkflow -- bash nodes', () => {
     // downstream: embeds $upstream.output literally in a bash script
     // If injection were present, the semicolon would split into two commands and INJECTED would print
     const nodes: DagNode[] = [
-      { id: 'upstream', bash: 'printf "%s" "safe; echo INJECTED"' },
+      { id: 'upstream', kind: 'exec', runtime: 'sh', script: 'printf "%s" "safe; echo INJECTED"' },
       {
         id: 'downstream',
-        bash: 'result=$upstream.output; echo "got: $result"',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'result=$upstream.output; echo "got: $result"',
         depends_on: ['upstream'],
       },
     ];
@@ -2469,9 +2657,11 @@ describe('executeDagWorkflow -- bash nodes', () => {
         user_message: '$(rm -rf /)',
       });
 
-      const bashNode: BashNode = {
+      const bashNode: ExecNode = {
         id: 'safe',
-        bash: 'echo $USER_MESSAGE',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'echo $USER_MESSAGE',
       };
 
       await executeDagWorkflow(
@@ -2538,8 +2728,9 @@ describe('executeDagWorkflow -- script node injection hardening (#2115)', () => 
         user_message: '"); require("child_process").execSync("touch pwned"); //',
       });
 
-      const scriptNode: ScriptNode = {
+      const scriptNode: ExecNode = {
         id: 'safe',
+        kind: 'exec',
         script: 'console.log(process.env.ARGUMENTS)',
         runtime: 'bun',
       };
@@ -2588,8 +2779,9 @@ describe('executeDagWorkflow -- script node injection hardening (#2115)', () => 
         user_message: '$(rm -rf /)',
       });
 
-      const scriptNode: ScriptNode = {
+      const scriptNode: ExecNode = {
         id: 'legacy',
+        kind: 'exec',
         script: 'console.log("value: $ARGUMENTS")',
         runtime: 'bun',
       };
@@ -2629,8 +2821,9 @@ describe('executeDagWorkflow -- script node injection hardening (#2115)', () => 
         user_message: 'py-message',
       });
 
-      const scriptNode: ScriptNode = {
+      const scriptNode: ExecNode = {
         id: 'py',
+        kind: 'exec',
         script: "import os; print(os.environ['ARGUMENTS'])",
         runtime: 'uv',
       };
@@ -2679,8 +2872,9 @@ describe('executeDagWorkflow -- script node injection hardening (#2115)', () => 
         user_message: 'the-real-arguments',
       });
 
-      const scriptNode: ScriptNode = {
+      const scriptNode: ExecNode = {
         id: 'collide',
+        kind: 'exec',
         script: 'console.log(process.env.ARGUMENTS)',
         runtime: 'bun',
       };
@@ -2739,9 +2933,10 @@ describe('executeDagWorkflow -- script node injection hardening (#2115)', () => 
       });
 
       const nodes: DagNode[] = [
-        { id: 'upstream', bash: 'printf UPSTREAM_RAW' },
+        { id: 'upstream', kind: 'exec', runtime: 'sh', script: 'printf UPSTREAM_RAW' },
         {
           id: 'downstream',
+          kind: 'exec',
           script: 'const v = "$upstream.output"; console.log(v)',
           runtime: 'bun',
           depends_on: ['upstream'],
@@ -2786,8 +2981,9 @@ describe('executeDagWorkflow -- script node injection hardening (#2115)', () => 
         user_message: 'hi',
       });
 
-      const scriptNode: ScriptNode = {
+      const scriptNode: ExecNode = {
         id: 'legacy',
+        kind: 'exec',
         script: 'console.log("$ARGUMENTS and $CONTEXT")',
         runtime: 'bun',
       };
@@ -2832,9 +3028,10 @@ describe('executeDagWorkflow -- script node injection hardening (#2115)', () => 
         user_message: 'hi',
       });
 
-      const scriptNode: ScriptNode = {
+      const scriptNode: ExecNode = {
         id: 'modern',
         // Contains the substring "ARGUMENTS" but not the literal $ARGUMENTS ref.
+        kind: 'exec',
         script: 'console.log(process.env.ARGUMENTS ?? "")',
         runtime: 'bun',
       };
@@ -2911,7 +3108,8 @@ describe('executeDagWorkflow -- output_format structured output', () => {
     const nodes: DagNode[] = [
       {
         id: 'classify',
-        command: 'classify',
+        kind: 'agent',
+        source: { kind: 'command', name: 'classify' },
         output_format: {
           type: 'object',
           properties: {
@@ -2922,13 +3120,15 @@ describe('executeDagWorkflow -- output_format structured output', () => {
       },
       {
         id: 'review',
-        prompt: 'Review the code',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'Review the code' },
         depends_on: ['classify'],
         when: "$classify.output.run_code_review == 'true'",
       },
       {
         id: 'test',
-        prompt: 'Run tests',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'Run tests' },
         depends_on: ['classify'],
         when: "$classify.output.run_tests == 'true'",
       },
@@ -2971,10 +3171,11 @@ describe('executeDagWorkflow -- output_format structured output', () => {
     });
 
     const nodes: DagNode[] = [
-      { id: 'a', command: 'classify' },
+      { id: 'a', kind: 'agent', source: { kind: 'command', name: 'classify' } },
       {
         id: 'b',
-        prompt: 'Got: $a.output',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'Got: $a.output' },
         depends_on: ['a'],
       },
     ];
@@ -3018,10 +3219,11 @@ describe('executeDagWorkflow -- output_format structured output', () => {
     });
 
     const nodes: DagNode[] = [
-      { id: 'a', command: 'classify' },
+      { id: 'a', kind: 'agent', source: { kind: 'command', name: 'classify' } },
       {
         id: 'b',
-        prompt: 'Use output: $a.output',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'Use output: $a.output' },
         depends_on: ['a'],
       },
     ];
@@ -3073,7 +3275,8 @@ describe('executeDagWorkflow -- output_format structured output', () => {
     const nodes: DagNode[] = [
       {
         id: 'classify',
-        command: 'classify',
+        kind: 'agent',
+        source: { kind: 'command', name: 'classify' },
         output_format: {
           type: 'object',
           properties: {
@@ -3084,13 +3287,15 @@ describe('executeDagWorkflow -- output_format structured output', () => {
       },
       {
         id: 'review',
-        prompt: 'Review the code',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'Review the code' },
         depends_on: ['classify'],
         when: "$classify.output.run_code_review == 'true'",
       },
       {
         id: 'test',
-        prompt: 'Run tests',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'Run tests' },
         depends_on: ['classify'],
         when: "$classify.output.run_tests == 'true'",
       },
@@ -3145,7 +3350,8 @@ describe('executeDagWorkflow -- output_format structured output', () => {
     const nodes: DagNode[] = [
       {
         id: 'check',
-        command: 'classify',
+        kind: 'agent',
+        source: { kind: 'command', name: 'classify' },
         output_format: { type: 'object', properties: { status: { type: 'string' } } },
       },
     ];
@@ -3218,11 +3424,12 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
     const workflowRun = makeWorkflowRun('parse-err-skip-run');
 
     const nodes: DagNode[] = [
-      { id: 'unconditional', command: 'my-cmd' },
+      { id: 'unconditional', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } },
       // Single = is not valid syntax — will fail to parse
       {
         id: 'guarded',
-        command: 'my-cmd',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
         depends_on: ['unconditional'],
         when: "$unconditional.output = 'yes'",
       },
@@ -3255,7 +3462,14 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('parse-err-warn-run');
 
-    const nodes: DagNode[] = [{ id: 'gate', command: 'my-cmd', when: 'not a valid condition' }];
+    const nodes: DagNode[] = [
+      {
+        id: 'gate',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
+        when: 'not a valid condition',
+      },
+    ];
 
     await executeDagWorkflow(
       mockDeps,
@@ -3287,7 +3501,14 @@ describe('executeDagWorkflow -- when condition parse errors (fail-closed)', () =
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('parse-err-all-skip-run');
 
-    const nodes: DagNode[] = [{ id: 'only', command: 'my-cmd', when: 'bad expression' }];
+    const nodes: DagNode[] = [
+      {
+        id: 'only',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
+        when: 'bad expression',
+      },
+    ];
 
     await expect(
       executeDagWorkflow(
@@ -3375,7 +3596,12 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     const workflowRun = makeWorkflowRun('dag-retry-succeed-run');
 
     const nodes: DagNode[] = [
-      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+      {
+        id: 'my-node',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
+        retry: { max_attempts: 2, delay_ms: 1 },
+      },
     ];
 
     await executeDagWorkflow(
@@ -3421,7 +3647,12 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     const workflowRun = makeWorkflowRun('dag-retry-exhaust-run');
 
     const nodes: DagNode[] = [
-      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+      {
+        id: 'my-node',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
+        retry: { max_attempts: 2, delay_ms: 1 },
+      },
     ];
 
     await executeDagWorkflow(
@@ -3458,7 +3689,12 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     const workflowRun = makeWorkflowRun('dag-retry-fatal-run');
 
     const nodes: DagNode[] = [
-      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+      {
+        id: 'my-node',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
+        retry: { max_attempts: 2, delay_ms: 1 },
+      },
     ];
 
     await executeDagWorkflow(
@@ -3499,7 +3735,12 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     const workflowRun = makeWorkflowRun('dag-retry-notify-run');
 
     const nodes: DagNode[] = [
-      { id: 'my-node', command: 'my-cmd', retry: { max_attempts: 2, delay_ms: 1 } },
+      {
+        id: 'my-node',
+        kind: 'agent',
+        source: { kind: 'command', name: 'my-cmd' },
+        retry: { max_attempts: 2, delay_ms: 1 },
+      },
     ];
 
     await executeDagWorkflow(
@@ -3592,7 +3833,9 @@ describe('executeDagWorkflow -- retry on deterministic (bash/script) nodes (#208
       {
         id: 'flaky',
         // Attempt 1: no marker → create it, fail. Attempt 2: marker present → succeed.
-        bash: `printf 'a' >> '${attempts}'; if [ -e '${marker}' ]; then echo ok; else printf x > '${marker}'; echo 'boom' >&2; exit 1; fi`,
+        kind: 'exec',
+        runtime: 'sh',
+        script: `printf 'a' >> '${attempts}'; if [ -e '${marker}' ]; then echo ok; else printf x > '${marker}'; echo 'boom' >&2; exit 1; fi`,
         retry: { max_attempts: 3, delay_ms: 1, on_error: 'all' },
       },
     ];
@@ -3611,7 +3854,9 @@ describe('executeDagWorkflow -- retry on deterministic (bash/script) nodes (#208
     const nodes: DagNode[] = [
       {
         id: 'always-fails',
-        bash: `printf 'a' >> '${attempts}'; echo 'boom' >&2; exit 1`,
+        kind: 'exec',
+        runtime: 'sh',
+        script: `printf 'a' >> '${attempts}'; echo 'boom' >&2; exit 1`,
         retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
       },
     ];
@@ -3630,7 +3875,9 @@ describe('executeDagWorkflow -- retry on deterministic (bash/script) nodes (#208
     const nodes: DagNode[] = [
       {
         id: 'no-retry',
-        bash: `printf 'a' >> '${attempts}'; echo 'boom' >&2; exit 1`,
+        kind: 'exec',
+        runtime: 'sh',
+        script: `printf 'a' >> '${attempts}'; echo 'boom' >&2; exit 1`,
       },
     ];
     const { mockDeps } = await runNodes(nodes);
@@ -3648,7 +3895,9 @@ describe('executeDagWorkflow -- retry on deterministic (bash/script) nodes (#208
     const nodes: DagNode[] = [
       {
         id: 'fatal',
-        bash: `printf 'a' >> '${attempts}'; echo 'unauthorized' >&2; exit 1`,
+        kind: 'exec',
+        runtime: 'sh',
+        script: `printf 'a' >> '${attempts}'; echo 'unauthorized' >&2; exit 1`,
         retry: { max_attempts: 3, delay_ms: 1, on_error: 'all' },
       },
     ];
@@ -3667,6 +3916,7 @@ describe('executeDagWorkflow -- retry on deterministic (bash/script) nodes (#208
     const nodes: DagNode[] = [
       {
         id: 'flaky-script',
+        kind: 'exec',
         script: `require('fs').appendFileSync('${attempts}', 'a'); process.exit(1)`,
         runtime: 'bun',
         retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
@@ -3687,7 +3937,9 @@ describe('executeDagWorkflow -- retry on deterministic (bash/script) nodes (#208
     const nodes: DagNode[] = [
       {
         id: 'notify',
-        bash: `printf 'a' >> '${attempts}'; echo 'boom' >&2; exit 1`,
+        kind: 'exec',
+        runtime: 'sh',
+        script: `printf 'a' >> '${attempts}'; echo 'boom' >&2; exit 1`,
         retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
       },
     ];
@@ -4391,7 +4643,14 @@ describe('executeDagWorkflow -- skills options', () => {
       testDir,
       {
         name: 'dag-skills',
-        nodes: [{ id: 'review', command: 'my-cmd', skills: ['codebase-search', 'test-runner'] }],
+        nodes: [
+          {
+            id: 'review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            skills: ['codebase-search', 'test-runner'],
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -4426,7 +4685,8 @@ describe('executeDagWorkflow -- skills options', () => {
         nodes: [
           {
             id: 'review',
-            command: 'my-cmd',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
             skills: ['codebase-search'],
             allowed_tools: ['Read', 'Grep'],
           },
@@ -4470,7 +4730,13 @@ describe('executeDagWorkflow -- skills options', () => {
       {
         name: 'dag-codex-skills',
         nodes: [
-          { id: 'review', command: 'my-cmd', provider: 'codex', skills: ['codebase-search'] },
+          {
+            id: 'review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            provider: 'codex',
+            skills: ['codebase-search'],
+          },
         ],
       },
       workflowRun,
@@ -4513,7 +4779,14 @@ describe('executeDagWorkflow -- skills options', () => {
       testDir,
       {
         name: 'dag-agents',
-        nodes: [{ id: 'review', command: 'my-cmd', agents: agentsMap }],
+        nodes: [
+          {
+            id: 'review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            agents: agentsMap,
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -4553,7 +4826,8 @@ describe('executeDagWorkflow -- skills options', () => {
         nodes: [
           {
             id: 'review',
-            command: 'my-cmd',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
             provider: 'codex',
             agents: {
               'brief-gen': { description: 'd', prompt: 'p' },
@@ -4600,7 +4874,7 @@ nodes:
     expect(result.workflow).not.toBeNull();
     const wf = result.workflow!;
     expect(wf.nodes).toBeDefined();
-    expect(wf.nodes[0].skills).toEqual(['codebase-search', 'test-runner']);
+    expect((wf.nodes[0] as DagNode).skills).toEqual(['codebase-search', 'test-runner']);
   });
 
   it('rejects non-string skills array entries', () => {
@@ -4629,7 +4903,7 @@ nodes:
 `;
     const result = parseWorkflow(yaml, 'empty.yaml');
     expect(result.error).toBeNull();
-    expect(result.workflow?.nodes[0].skills).toEqual([]);
+    expect((result.workflow?.nodes[0] as DagNode | undefined)?.skills).toEqual([]);
   });
 
   it('ignores skills on bash nodes with warning', () => {
@@ -4648,7 +4922,7 @@ nodes:
     const wf = result.workflow!;
     expect(wf.nodes).toBeDefined();
     // Bash nodes don't get the skills field
-    expect(wf.nodes[0].skills).toBeUndefined();
+    expect((wf.nodes[0] as DagNode).skills).toBeUndefined();
   });
 
   it('node with no skills has undefined skills field', () => {
@@ -4663,7 +4937,7 @@ nodes:
     expect(result.error).toBeNull();
     const wf = result.workflow!;
     expect(wf.nodes).toBeDefined();
-    expect(wf.nodes[0].skills).toBeUndefined();
+    expect((wf.nodes[0] as DagNode).skills).toBeUndefined();
   });
 });
 
@@ -4690,7 +4964,7 @@ nodes:
     expect(result.error).toBeNull();
     expect(result.workflow).not.toBeNull();
     const wf = result.workflow!;
-    const node = wf.nodes[0];
+    const node = wf.nodes[0] as DagNode;
     expect(node.agents).toBeDefined();
     expect(node.agents!['brief-gen'].description).toBe('Summarises an issue');
     expect(node.agents!['brief-gen'].model).toBe('haiku');
@@ -4775,7 +5049,7 @@ nodes:
     const result = parseWorkflow(yaml, 'bash-agents.yaml');
     expect(result.error).toBeNull();
     const wf = result.workflow!;
-    expect(wf.nodes[0].agents).toBeUndefined();
+    expect((wf.nodes[0] as DagNode).agents).toBeUndefined();
   });
 
   it('ignores agents on script nodes (field stripped, no error)', () => {
@@ -4794,7 +5068,7 @@ nodes:
     const result = parseWorkflow(yaml, 'script-agents.yaml');
     expect(result.error).toBeNull();
     const wf = result.workflow!;
-    expect(wf.nodes[0].agents).toBeUndefined();
+    expect((wf.nodes[0] as DagNode).agents).toBeUndefined();
   });
 
   it('ignores agents on loop nodes (field stripped, no error)', () => {
@@ -4815,7 +5089,7 @@ nodes:
     const result = parseWorkflow(yaml, 'loop-agents.yaml');
     expect(result.error).toBeNull();
     const wf = result.workflow!;
-    expect(wf.nodes[0].agents).toBeUndefined();
+    expect((wf.nodes[0] as DagNode).agents).toBeUndefined();
   });
 
   it('node with no agents field is undefined', () => {
@@ -4829,7 +5103,7 @@ nodes:
     const result = parseWorkflow(yaml, 'no-agents.yaml');
     expect(result.error).toBeNull();
     const wf = result.workflow!;
-    expect(wf.nodes[0].agents).toBeUndefined();
+    expect((wf.nodes[0] as DagNode).agents).toBeUndefined();
   });
 });
 
@@ -4925,7 +5199,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       createMockPlatform(),
       'conv-resume',
       testDir,
-      rawLoopGroupWorkflow(field),
+      ready(rawLoopGroupWorkflow(field)),
       makeWorkflowRun(runId),
       'claude',
       undefined,
@@ -4962,8 +5236,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       {
         name: 'two-step',
         nodes: [
-          { id: 'step1', command: 'step1' },
-          { id: 'step2', command: 'step2', depends_on: ['step1'] },
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'command', name: 'step2' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -5007,8 +5286,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       {
         name: 'two-step',
         nodes: [
-          { id: 'step1', command: 'step1' },
-          { id: 'step2', prompt: 'Use this: $step1.output', depends_on: ['step1'] },
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Use this: $step1.output' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -5045,8 +5329,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       {
         name: 'two-step',
         nodes: [
-          { id: 'step1', command: 'step1' },
-          { id: 'step2', command: 'step2', depends_on: ['step1'] },
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'command', name: 'step2' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -5074,6 +5363,73 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(skippedEvent[0].data.node_output).toBe('prior output');
   });
 
+  it('bounds a large prior output when re-emitting node_skipped_prior_success (#2726)', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('resume-run-id-large-skip');
+    const artifactsDir = join(testDir, 'artifacts');
+
+    // Simulates what a fixed getDagResumeSnapshot now hands the executor: the FULL,
+    // untruncated value (read back from a spill by a prior resume), not a preview.
+    // Without the fix, re-emitting this verbatim would write an unbounded row again.
+    const largeOutput = 'y'.repeat(40_000);
+    const priorCompletedNodes = new Map([['step1', { output: largeOutput }]]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-resume-large-skip',
+      testDir,
+      {
+        name: 'two-step',
+        nodes: [
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'command', name: 'step2' },
+            depends_on: ['step1'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const skippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'step1'
+    );
+    expect(skippedEvent).toBeDefined();
+    if (!skippedEvent) throw new Error('Expected prior-success skip event');
+    const data = skippedEvent[0].data as {
+      node_output: string;
+      node_output_truncated: boolean;
+      node_output_original_bytes: number;
+      node_output_spill_path: string;
+    };
+    expect(Buffer.byteLength(data.node_output, 'utf8')).toBeLessThanOrEqual(32_768);
+    expect(data.node_output_truncated).toBe(true);
+    expect(data.node_output_original_bytes).toBe(40_000);
+    expect(data.node_output_spill_path).toBe(
+      join(artifactsDir, '.archon', 'node-output-spills', 'persisted', 'step1.nodeoutput')
+    );
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe(largeOutput);
+  });
+
   it('emits node_skipped_prior_success with empty output when node ID not in map', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
@@ -5093,8 +5449,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       {
         name: 'two-step',
         nodes: [
-          { id: 'step1', command: 'step1' },
-          { id: 'step2', command: 'step2', depends_on: ['step1'] },
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'command', name: 'step2' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -5137,8 +5498,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       {
         name: 'two-step',
         nodes: [
-          { id: 'step1', command: 'step1' },
-          { id: 'step2', command: 'step2', depends_on: ['step1'] },
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'command', name: 'step2' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -5167,9 +5533,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const workflow = {
       name: 'resume-token-reconciliation',
       nodes: [
-        { id: 'step1', command: 'step1' },
-        { id: 'step2', command: 'step2', depends_on: ['step1'] },
-      ],
+        { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } },
+        {
+          id: 'step2',
+          kind: 'agent',
+          source: { kind: 'command', name: 'step2' },
+          depends_on: ['step1'],
+        },
+      ] as DagNode[],
     };
 
     let firstInvocationCall = 0;
@@ -5406,6 +5777,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
               properties: { done: { type: 'boolean' }, note: { type: 'string' } },
               required: ['done'],
             },
+            kind: 'loop',
             loop: {
               prompt: 'iterate',
               until_field: 'done',
@@ -5415,7 +5787,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           },
           {
             id: 'consumer',
-            prompt: 'note=[$iterate.output.note]',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'note=[$iterate.output.note]' },
             depends_on: ['iterate'],
           },
         ],
@@ -5468,14 +5841,20 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         nodes: [
           {
             id: 'step1',
-            prompt: 'produce json',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'produce json' },
             output_format: {
               type: 'object',
               properties: { type: { type: 'string' }, note: { type: 'string' } },
               required: ['type'],
             },
           },
-          { id: 'step2', prompt: 'note=[$step1.output.note]', depends_on: ['step1'] },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'note=[$step1.output.note]' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -5517,14 +5896,20 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         nodes: [
           {
             id: 'step1',
-            prompt: 'produce json',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'produce json' },
             output_format: {
               type: 'object',
               properties: { type: { type: 'string' } },
               required: ['type'],
             },
           },
-          { id: 'step2', prompt: 'extra=[$step1.output.extra]', depends_on: ['step1'] },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'extra=[$step1.output.extra]' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -5562,7 +5947,12 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('bash-output-persist-run');
 
-    const bashNode: BashNode = { id: 'stats', bash: 'echo "bash output"' };
+    const bashNode: ExecNode = {
+      id: 'stats',
+      kind: 'exec',
+      runtime: 'sh',
+      script: 'echo "bash output"',
+    };
 
     await executeDagWorkflow(
       mockDeps,
@@ -5609,7 +5999,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         testDir,
         {
           name: `bash-output-${nodeId}`,
-          nodes: [{ id: nodeId, bash: `printf '%${String(byteCount)}s' '' | tr ' ' x` }],
+          nodes: [
+            {
+              id: nodeId,
+              kind: 'exec',
+              runtime: 'sh',
+              script: `printf '%${String(byteCount)}s' '' | tr ' ' x`,
+            },
+          ],
         },
         workflowRun,
         'claude',
@@ -5651,7 +6048,9 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       testDir,
       {
         name: 'bash-output-over-cap',
-        nodes: [{ id: 'over-cap', bash: "printf '%32769s' '' | tr ' ' x" }],
+        nodes: [
+          { id: 'over-cap', kind: 'exec', runtime: 'sh', script: "printf '%32769s' '' | tr ' ' x" },
+        ],
       },
       workflowRun,
       'claude',
@@ -5676,6 +6075,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           node_output: string;
           node_output_truncated: boolean;
           node_output_original_bytes: number;
+          node_output_spill_path: string;
         };
       }
     ).data;
@@ -5683,8 +6083,19 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(data.node_output).toEndWith('\n\n… [truncated; original output was 32769 bytes]');
     expect(data.node_output_truncated).toBe(true);
     expect(data.node_output_original_bytes).toBe(32_769);
-    // Resume deliberately rehydrates this bounded node_output preview; preserving
-    // complete cross-process output requires a separately managed artifact.
+    // The full bytes are spilled alongside the bounded preview (#2726) so a resumed run
+    // rehydrates the same value a fresh run's in-process consumer would have seen.
+    expect(data.node_output_spill_path).toBe(
+      join(
+        testDir,
+        'artifacts',
+        '.archon',
+        'node-output-spills',
+        'persisted',
+        'over-cap.nodeoutput'
+      )
+    );
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe('x'.repeat(32_769));
   });
 
   it('keeps a persisted UTF-8 preview valid when the byte cap splits a code point', async () => {
@@ -5699,7 +6110,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       testDir,
       {
         name: 'bash-output-utf8-cap',
-        nodes: [{ id: 'utf8-cap', bash: `bun -e "process.stdout.write('🙂'.repeat(8193))"` }],
+        nodes: [
+          {
+            id: 'utf8-cap',
+            kind: 'exec',
+            runtime: 'sh',
+            script: `bun -e "process.stdout.write('🙂'.repeat(8193))"`,
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -5718,10 +6136,133 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         (call[0] as { event_type: string }).event_type === 'node_completed' &&
         (call[0] as { step_name: string }).step_name === 'utf8-cap'
     );
-    const data = (completedEvent![0] as { data: { node_output: string } }).data;
+    const data = (
+      completedEvent![0] as { data: { node_output: string; node_output_spill_path: string } }
+    ).data;
     expect(Buffer.byteLength(data.node_output, 'utf8')).toBeLessThanOrEqual(32_768);
     expect(data.node_output).not.toContain('\ufffd');
     expect(data.node_output).toEndWith('\n\n… [truncated; original output was 32772 bytes]');
+    // The spilled full copy needs no boundary splitting -- it round-trips byte-for-byte.
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe('🙂'.repeat(8193));
+  });
+
+  it('persists script output at or below the byte cap unchanged without truncation metadata (#2726)', async () => {
+    for (const [nodeId, byteCount] of [
+      ['script-below-cap', 32_767],
+      ['script-exact-cap', 32_768],
+    ] as const) {
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const workflowRun = makeWorkflowRun(`script-output-${nodeId}`);
+
+      await executeDagWorkflow(
+        mockDeps,
+        createMockPlatform(),
+        `conv-${nodeId}`,
+        testDir,
+        {
+          name: `script-output-${nodeId}`,
+          nodes: [
+            {
+              id: nodeId,
+              kind: 'exec',
+              runtime: 'bun',
+              script: `process.stdout.write('x'.repeat(${String(byteCount)}))`,
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const completedEvent = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as { event_type: string }).event_type === 'node_completed' &&
+          (call[0] as { step_name: string }).step_name === nodeId
+      );
+      const data = (
+        completedEvent![0] as {
+          data: Record<string, unknown> & { node_output: string };
+        }
+      ).data;
+      expect(data.node_output).toBe('x'.repeat(byteCount));
+      expect(data.node_output_truncated).toBeUndefined();
+      expect(data.node_output_original_bytes).toBeUndefined();
+      expect(data.node_output_spill_path).toBeUndefined();
+    }
+  });
+
+  it('caps over-limit persisted script output with a marker, byte metadata, and a spill file (#2726)', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const workflowRun = makeWorkflowRun('script-output-over-cap');
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-script-over-cap',
+      testDir,
+      {
+        name: 'script-output-over-cap',
+        nodes: [
+          {
+            id: 'script-over-cap',
+            kind: 'exec',
+            runtime: 'bun',
+            script: `process.stdout.write('x'.repeat(32769))`,
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'script-over-cap'
+    );
+    const data = (
+      completedEvent![0] as {
+        data: {
+          node_output: string;
+          node_output_truncated: boolean;
+          node_output_original_bytes: number;
+          node_output_spill_path: string;
+        };
+      }
+    ).data;
+    expect(Buffer.byteLength(data.node_output, 'utf8')).toBeLessThanOrEqual(32_768);
+    expect(data.node_output).toEndWith('\n\n… [truncated; original output was 32769 bytes]');
+    expect(data.node_output_truncated).toBe(true);
+    expect(data.node_output_original_bytes).toBe(32_769);
+    expect(data.node_output_spill_path).toBe(
+      join(
+        testDir,
+        'artifacts',
+        '.archon',
+        'node-output-spills',
+        'persisted',
+        'script-over-cap.nodeoutput'
+      )
+    );
+    expect(await readFile(data.node_output_spill_path, 'utf8')).toBe('x'.repeat(32_769));
   });
 
   it('uses full bash output for same-run when and downstream substitution despite persistence cap', async () => {
@@ -5744,11 +6285,15 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         nodes: [
           {
             id: 'producer',
-            bash: `printf '{"status":"PASS","padding":"'; printf '%${String(paddingBytes)}s' '' | tr ' ' x; printf '"}'`,
+            kind: 'exec',
+            runtime: 'sh',
+            script: `printf '{"status":"PASS","padding":"'; printf '%${String(paddingBytes)}s' '' | tr ' ' x; printf '"}'`,
           },
           {
             id: 'consumer',
-            bash: 'value=$producer.output; printf %s "${#value}"',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'value=$producer.output; printf %s "${#value}"',
             depends_on: ['producer'],
             when: "$producer.output.status == 'PASS'",
           },
@@ -5791,6 +6336,199 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(await Bun.file(join(logDir, 'producer.nodeoutput')).exists()).toBe(false);
   });
 
+  it('resolves $node.output.field on a resumed exec node whose prior output is a large JSON blob (#2726)', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const paddingBytes = 40_000;
+    // Simulates a fixed getDagResumeSnapshot: the FULL text read back from the spill,
+    // not the 32KB-truncated preview a resumed run saw before this fix. Truncated JSON
+    // here would not parse, and the consumer's `when:` field access would throw
+    // (OutputRefError) instead of resolving -- exactly the naive-fix regression #2726
+    // warns against.
+    const producerOutput = `{"status":"PASS","padding":"${'z'.repeat(paddingBytes)}"}`;
+    const priorCompletedNodes = new Map([['producer', { output: producerOutput }]]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-resume-large-field',
+      testDir,
+      {
+        name: 'resume-large-field',
+        nodes: [
+          { id: 'producer', kind: 'exec', runtime: 'sh', script: 'echo unused' },
+          {
+            id: 'consumer',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'value=$producer.output; printf %s "${#value}"',
+            depends_on: ['producer'],
+            when: "$producer.output.status == 'PASS'",
+          },
+        ],
+      },
+      makeWorkflowRun('resume-large-field'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    // producer was resumed (skipped), so it must never re-execute.
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    const producerSkipped = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'producer'
+    );
+    expect(producerSkipped).toBeDefined();
+    // The consumer's `when:` needed .field access on the full resumed value to
+    // evaluate true and run at all -- had it thrown, no node_completed event for
+    // 'consumer' would exist.
+    const consumerEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerEvent).toBeDefined();
+    if (!consumerEvent) throw new Error('Expected consumer to run after resolving .field access');
+    expect((consumerEvent[0] as { data: { node_output: string } }).data.node_output).toBe(
+      String(producerOutput.length)
+    );
+  });
+
+  it('resolves $node.output.field on resume for a REAL script:/runtime bun producer, via its actual spilled write (#2726)', async () => {
+    // The test above proves the generic resume-read mechanism (resolveNodeOutputField
+    // doesn't branch on producer kind). This test closes the gap the earlier naive/
+    // reverted fix broke specifically: executeScriptNode's own write-side call to
+    // formatPersistedNodeOutput, combined end-to-end with a resumed .field access —
+    // by actually running a runtime: 'bun' producer, spilling for real, and feeding the
+    // exact bytes read back from that real spill file (not a hand-authored string) into
+    // a second, simulated-resume run.
+    const artifactsDir = join(testDir, 'artifacts');
+    const paddingBytes = 40_000;
+
+    // Pass 1: a real script node produces an over-cap JSON output and spills for real.
+    const freshStore = createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(freshStore),
+      createMockPlatform(),
+      'conv-script-fresh-large-field',
+      testDir,
+      {
+        name: 'script-fresh-large-field',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'exec',
+            runtime: 'bun',
+            script: `process.stdout.write(JSON.stringify({status:'PASS',padding:'z'.repeat(${String(paddingBytes)})}))`,
+          },
+        ],
+      },
+      makeWorkflowRun('script-fresh-large-field'),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const freshEventCalls = (freshStore.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const producerEvent = freshEventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'producer'
+    );
+    expect(producerEvent).toBeDefined();
+    if (!producerEvent) throw new Error('Expected producer to complete on the fresh pass');
+    const producerData = producerEvent[0].data as {
+      node_output_truncated: boolean;
+      node_output_spill_path: string;
+    };
+    expect(producerData.node_output_truncated).toBe(true);
+    // This is exactly what getDagResumeSnapshot reads back on resume (packages/core).
+    const spilledFullOutput = await readFile(producerData.node_output_spill_path, 'utf8');
+    expect(JSON.parse(spilledFullOutput)).toEqual({
+      status: 'PASS',
+      padding: 'z'.repeat(paddingBytes),
+    });
+
+    // Pass 2: simulate the resume, seeding priorCompletedNodes with the REAL spilled
+    // bytes (not a hand-authored string), and prove a downstream consumer's .field
+    // access on it resolves rather than hard-failing.
+    const resumedStore = createMockStore();
+    const priorCompletedNodes = new Map([['producer', { output: spilledFullOutput }]]);
+    await executeDagWorkflow(
+      createMockDeps(resumedStore),
+      createMockPlatform(),
+      'conv-script-resumed-large-field',
+      testDir,
+      {
+        name: 'script-resumed-large-field',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'exec',
+            runtime: 'bun',
+            script: `process.stdout.write('unused')`,
+          },
+          {
+            id: 'consumer',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'value=$producer.output; printf %s "${#value}"',
+            depends_on: ['producer'],
+            when: "$producer.output.status == 'PASS'",
+          },
+        ],
+      },
+      makeWorkflowRun('script-resumed-large-field'),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const resumedEventCalls = (resumedStore.createWorkflowEvent as ReturnType<typeof mock>).mock
+      .calls;
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    const producerSkipped = resumedEventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'producer'
+    );
+    expect(producerSkipped).toBeDefined();
+    const consumerEvent2 = resumedEventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerEvent2).toBeDefined();
+    if (!consumerEvent2) throw new Error('Expected consumer to run after resolving .field access');
+    expect((consumerEvent2[0] as { data: { node_output: string } }).data.node_output).toBe(
+      String(spilledFullOutput.length)
+    );
+  });
+
   it('stores node_output in node_completed event data for AI nodes', async () => {
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
@@ -5814,7 +6552,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       testDir,
       {
         name: 'single-node',
-        nodes: [{ id: 'step1', command: 'step1', model: 'requested-model' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'step1' },
+            model: 'requested-model',
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -5866,7 +6611,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       createMockPlatform(),
       'conv-no-usage',
       testDir,
-      { name: 'no-usage', nodes: [{ id: 'step1', command: 'step1' }] },
+      {
+        name: 'no-usage',
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } }],
+      },
       makeWorkflowRun('no-usage-run'),
       'claude',
       undefined,
@@ -5909,7 +6657,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       createMockPlatform(),
       'conv-shape',
       testDir,
-      { name: 'token-shape', nodes: [{ id: 'step1', command: 'step1' }] },
+      {
+        name: 'token-shape',
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } }],
+      },
       makeWorkflowRun('token-shape-run'),
       'claude',
       undefined,
@@ -5944,7 +6695,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       createMockPlatform(),
       'conv-nan',
       testDir,
-      { name: 'nan-tokens', nodes: [{ id: 'step1', command: 'step1' }] },
+      {
+        name: 'nan-tokens',
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } }],
+      },
       makeWorkflowRun('nan-tokens-run'),
       'claude',
       undefined,
@@ -5968,15 +6722,6 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
     expect(completedEvent?.[0].data).not.toHaveProperty('tokens');
   });
 
-  const readTranscript = async (
-    logDir: string,
-    runId: string
-  ): Promise<Array<Record<string, unknown>>> =>
-    (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
-
   it('writes node and run cost to the transcript, matching the persisted events', async () => {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'out' };
@@ -5997,7 +6742,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       createMockPlatform(),
       'conv-transcript-cost',
       testDir,
-      { name: 'transcript-cost', nodes: [{ id: 'step1', command: 'step1' }] },
+      {
+        name: 'transcript-cost',
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } }],
+      },
       makeWorkflowRun('transcript-cost-run'),
       'claude',
       undefined,
@@ -6046,7 +6794,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       createMockPlatform(),
       'conv-transcript-no-cost',
       testDir,
-      { name: 'transcript-no-cost', nodes: [{ id: 'step1', command: 'step1' }] },
+      {
+        name: 'transcript-no-cost',
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } }],
+      },
       makeWorkflowRun('transcript-no-cost-run'),
       'claude',
       undefined,
@@ -6086,7 +6837,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         platform,
         'conv-bg-tasks',
         testDir,
-        { name: 'bg-task-test', nodes: [{ id: 'step1', command: 'step1' }] },
+        {
+          name: 'bg-task-test',
+          nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'step1' } }],
+        },
         workflowRun,
         'claude',
         undefined,
@@ -6302,6 +7056,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             nodes: [
               {
                 id: 'my-loop',
+                kind: 'loop',
                 loop: {
                   fresh_context: false,
                   prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6379,6 +7134,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             nodes: [
               {
                 id: 'my-loop',
+                kind: 'loop',
                 loop: {
                   fresh_context: false,
                   prompt: 'Complete the task.',
@@ -6443,6 +7199,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6510,6 +7267,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'my-loop',
               model: 'large',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6581,6 +7339,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6647,6 +7406,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6705,6 +7465,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6760,6 +7521,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6839,6 +7601,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6903,6 +7666,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
@@ -6974,6 +7738,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             nodes: [
               {
                 id: 'my-loop',
+                kind: 'loop',
                 loop: {
                   fresh_context: false,
                   prompt: 'Do tasks.',
@@ -7043,6 +7808,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do next task.',
@@ -7096,6 +7862,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'fix-loop',
+              kind: 'loop',
               loop: {
                 prompt: 'Previous output: <<$LOOP_PREV_OUTPUT>>. Fix and emit COMPLETE.',
                 until: 'COMPLETE',
@@ -7160,6 +7927,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'fix-loop',
+              kind: 'loop',
               loop: {
                 prompt: 'PREV=[$LOOP_PREV_OUTPUT]',
                 until: 'COMPLETE',
@@ -7217,6 +7985,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt:
@@ -7288,6 +8057,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt:
@@ -7348,6 +8118,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do task.',
@@ -7405,6 +8176,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'fix-and-review',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Fix and review. When done, output <COMPLETE>ALL_CLEAN</COMPLETE>.',
@@ -7483,6 +8255,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'impl',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do task. Output <promise>COMPLETE</promise> when done.',
@@ -7492,7 +8265,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             },
             {
               id: 'report',
-              prompt: 'Summarize: $impl.output',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'Summarize: $impl.output' },
               depends_on: ['impl'],
             },
           ],
@@ -7538,6 +8312,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 prompt: 'Do stuff.',
                 until: 'DONE',
@@ -7592,6 +8367,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 prompt: 'Do stuff.',
                 until: 'DONE',
@@ -7654,6 +8430,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Keep working.',
@@ -7704,10 +8481,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'producer',
-              bash: 'head -c 33000 /dev/zero | tr "\\0" x',
+              kind: 'exec',
+              runtime: 'sh',
+              script: 'head -c 33000 /dev/zero | tr "\\0" x',
             },
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Keep working.',
@@ -7771,6 +8551,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Keep working.',
@@ -7824,6 +8605,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do work, emit DONE.',
@@ -7893,6 +8675,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'my-loop',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Work until done.',
@@ -7939,6 +8722,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'my-loop',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: { fresh_context: false, prompt: 'go', max_iterations: 2, until_field: 'done' },
             },
           ],
@@ -7983,6 +8767,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'my-loop',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: { fresh_context: false, prompt: 'go', max_iterations: 5, until_field: 'done' },
             },
           ],
@@ -8036,6 +8821,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
               id: 'my-loop',
               provider: 'pi',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: { fresh_context: false, prompt: 'go', max_iterations: 4, until_field: 'done' },
             },
           ],
@@ -8109,6 +8895,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
               id: 'my-loop',
               provider: 'pi',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: {
                 prompt: 'go',
                 max_iterations: 5,
@@ -8176,6 +8963,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
               id: 'my-loop',
               provider: 'pi',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: { prompt: 'go', max_iterations: 5, until_field: 'done', fresh_context: false },
             },
           ],
@@ -8234,9 +9022,16 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
               id: 'my-loop',
               provider: 'pi',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: { prompt: 'go', max_iterations: 3, until_field: 'done', fresh_context: false },
             },
-            { id: 'after', provider: 'pi', prompt: 'continue', depends_on: ['my-loop'] },
+            {
+              id: 'after',
+              provider: 'pi',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'continue' },
+              depends_on: ['my-loop'],
+            },
           ],
         },
         workflowRun,
@@ -8277,6 +9072,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
               id: 'my-loop',
               provider: 'pi',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: { fresh_context: false, prompt: 'go', max_iterations: 4, until_field: 'done' },
             },
           ],
@@ -8343,6 +9139,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'judge',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'judge',
@@ -8356,7 +9153,9 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'report',
               depends_on: ['judge'],
-              bash: 'echo "note=[$judge.output.note]"',
+              kind: 'exec',
+              runtime: 'sh',
+              script: 'echo "note=[$judge.output.note]"',
             },
           ],
         },
@@ -8409,6 +9208,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'my-loop',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'go',
@@ -8463,6 +9263,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'my-loop',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'go',
@@ -8512,12 +9313,15 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'my-loop',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: { fresh_context: false, prompt: 'go', max_iterations: 3, until_field: 'done' },
             },
             {
               id: 'report',
               depends_on: ['my-loop'],
-              bash: 'echo "note=$my-loop.output.note"',
+              kind: 'exec',
+              runtime: 'sh',
+              script: 'echo "note=$my-loop.output.note"',
             },
           ],
         },
@@ -8556,6 +9360,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: { fresh_context: false, prompt: 'Task.', until: 'COMPLETE', max_iterations: 3 },
             },
           ],
@@ -8612,6 +9417,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do tasks.',
@@ -8655,6 +9461,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do task.',
@@ -8704,6 +9511,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do task.',
@@ -8757,6 +9565,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: { fresh_context: false, prompt: 'Work.', until: 'COMPLETE', max_iterations: 2 },
             },
           ],
@@ -8808,6 +9617,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'User said: $LOOP_USER_INPUT. Refine the plan.',
@@ -8872,6 +9682,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Validate.',
@@ -8928,6 +9739,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'refine',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Judge completion.',
@@ -8984,6 +9796,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             {
               id: 'refine',
               output_format: untilFieldSchema,
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Judge completion.',
@@ -9039,6 +9852,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Refine.',
@@ -9121,6 +9935,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'User said: $LOOP_USER_INPUT. Refine.',
@@ -9185,6 +10000,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'User said: $LOOP_USER_INPUT. Refine the plan.',
@@ -9237,6 +10053,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'validate',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Validate. Emit VALIDATED on pass.',
@@ -9317,6 +10134,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Refine.',
@@ -9389,6 +10207,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       const loopNodes: DagNode[] = [
         {
           id: 'refine',
+          kind: 'loop',
           loop: {
             fresh_context: false,
             prompt: 'Refine.',
@@ -9505,6 +10324,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Refine.',
@@ -9578,6 +10398,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Refine.',
@@ -9662,6 +10483,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'User said: $LOOP_USER_INPUT. Refine.',
@@ -9748,6 +10570,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Refine.',
@@ -9808,6 +10631,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'User said: $LOOP_USER_INPUT. Refine.',
@@ -9867,6 +10691,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'work',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do the work. Say DONE.',
@@ -9948,6 +10773,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'work',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do the work. Say DONE.',
@@ -9996,6 +10822,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'my-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do task.',
@@ -10079,6 +10906,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'read-once-loop',
+              kind: 'loop',
               loop: {
                 command: 'read-once-loop',
                 until: 'COMPLETE',
@@ -10144,6 +10972,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'missing-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 command: 'does-not-exist-anywhere',
@@ -10211,6 +11040,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'empty-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 command: 'empty-loop',
@@ -10264,6 +11094,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'unsafe-loop',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 command: '../escape',
@@ -10336,6 +11167,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'subst-loop',
+              kind: 'loop',
               loop: {
                 command: 'subst-loop',
                 until: 'COMPLETE',
@@ -10396,6 +11228,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         nodes: [
           {
             id: 'gated-loop',
+            kind: 'loop',
             loop: {
               fresh_context: false,
               command: 'gated-loop',
@@ -10497,9 +11330,14 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       const blockWorkflow = {
         name: 'materialized-loop-block',
         description: 'Command-backed loop block',
+        // Own class declaration (#2707 step 2): this file natively authors the
+        // interactive-loop pause node, independent of whether a composing parent
+        // also declares it.
+        interactive: true,
         nodes: [
           {
             id: 'gated-loop',
+            kind: 'loop',
             loop: {
               fresh_context: false,
               command: 'materialized-loop-command',
@@ -10514,7 +11352,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       const parentWorkflow = {
         name: 'materialized-loop-gated',
         description: 'Includes the command-backed loop',
-        nodes: [{ id: 'included', include: 'materialized-loop-block' } satisfies DagNode],
+        nodes: [{ id: 'included', include: 'materialized-loop-block' } satisfies IncludeDirective],
       } satisfies WorkflowDefinition;
       const workflowDir = join(testDir, '.archon', 'workflows');
       const commandPath = join(testDir, '.archon', 'commands', 'materialized-loop-command.md');
@@ -10536,7 +11374,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         platform,
         'conv-dag',
         testDir,
-        originalWorkflow!,
+        ready(originalWorkflow!),
         makeWorkflowRun(),
         'claude',
         undefined,
@@ -10576,7 +11414,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         platform,
         'conv-dag',
         testDir,
-        rediscoveredWorkflow!,
+        ready(rediscoveredWorkflow!),
         makeWorkflowRun('fresh-invalid-command-run'),
         'claude',
         undefined,
@@ -10609,7 +11447,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         platform,
         'conv-dag',
         testDir,
-        rediscoveredWorkflow!,
+        ready(rediscoveredWorkflow!),
         resumedRun,
         'claude',
         undefined,
@@ -10644,7 +11482,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         testDir,
         {
           name: 'malformed-compiled-command-workflow',
-          nodes: [{ id: 'repeat', loop }],
+          nodes: [{ id: 'repeat', kind: 'loop', loop }],
         },
         makeWorkflowRun('malformed-compiled-command-run'),
         'claude',
@@ -10679,6 +11517,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             nodes: [
               {
                 id: 'repeat',
+                kind: 'loop',
                 loop: {
                   fresh_context: false,
                   command: 'empty-included-loop',
@@ -10712,7 +11551,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         createMockPlatform(),
         'conv-dag',
         testDir,
-        workflow!,
+        ready(workflow!),
         makeWorkflowRun('empty-included-loop-run'),
         'claude',
         undefined,
@@ -10763,6 +11602,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
           nodes: [
             {
               id: 'exhaust-loop',
+              kind: 'loop',
               loop: {
                 command: 'exhaust-loop',
                 until: 'COMPLETE',
@@ -10854,8 +11694,18 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
       {
         name: 'always-run-producer',
         nodes: [
-          { id: 'producer', command: 'producer', always_run: true },
-          { id: 'consumer', command: 'consumer', depends_on: ['producer'] },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
         ],
       },
       workflowRun,
@@ -10895,6 +11745,75 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
     );
   });
 
+  it('bounds a large prior output in the node_always_run_reset audit event (#2726)', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const artifactsDir = join(testDir, 'artifacts');
+    const largeOutput = 'w'.repeat(40_000);
+
+    const priorCompletedNodes = new Map([['producer', { output: largeOutput }]]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-always-run-large',
+      testDir,
+      {
+        name: 'always-run-producer-large',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const resetEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_always_run_reset' &&
+        (call[0] as { step_name: string }).step_name === 'producer'
+    );
+    expect(resetEvent).toBeDefined();
+    if (!resetEvent) throw new Error('Expected an always_run reset event');
+    const data = resetEvent[0].data as {
+      prior_output: string;
+      prior_output_truncated: boolean;
+      prior_output_original_bytes: number;
+      prior_output_spill_path: string;
+    };
+    expect(Buffer.byteLength(data.prior_output, 'utf8')).toBeLessThanOrEqual(32_768);
+    expect(data.prior_output_truncated).toBe(true);
+    expect(data.prior_output_original_bytes).toBe(40_000);
+    expect(data.prior_output_spill_path).toBe(
+      join(artifactsDir, '.archon', 'node-output-spills', 'persisted', 'producer.nodeoutput')
+    );
+    expect(await readFile(data.prior_output_spill_path, 'utf8')).toBe(largeOutput);
+  });
+
   it('still skips non-always_run nodes in the same priorCompletedNodes set', async () => {
     await writeFile(join(testDir, '.archon', 'commands', 'cached.md'), 'Cached prompt');
     const store = createMockStore();
@@ -10915,8 +11834,13 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
       {
         name: 'mixed',
         nodes: [
-          { id: 'producer', command: 'producer', always_run: true },
-          { id: 'cached', command: 'cached' },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          { id: 'cached', kind: 'agent', source: { kind: 'command', name: 'cached' } },
         ],
       },
       workflowRun,
@@ -10974,8 +11898,18 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
       {
         name: 'always-run-fresh',
         nodes: [
-          { id: 'producer', command: 'producer', always_run: true },
-          { id: 'consumer', prompt: 'See: $producer.output', depends_on: ['producer'] },
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'See: $producer.output' },
+            depends_on: ['producer'],
+          },
         ],
       },
       workflowRun,
@@ -10996,6 +11930,815 @@ describe('executeDagWorkflow -- always_run resume opt-out', () => {
     const consumerPrompt = seenPrompts[1];
     expect(consumerPrompt).toContain('fresh producer output');
     expect(consumerPrompt).not.toContain('STALE_CACHED_VALUE');
+  });
+});
+
+describe('executeDagWorkflow -- prior-success cache invalidated by dep re-execution (#2402)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-2402-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(testDir, '.archon', 'commands', 'producer.md'), 'Producer prompt');
+    await writeFile(
+      join(testDir, '.archon', 'commands', 'consumer.md'),
+      'Consumer prompt $producer.output'
+    );
+
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('invalidates a cached downstream when an always_run dep re-runs with fresh output', async () => {
+    // Bug shape from #2402: producer is `always_run` so it re-executes on resume; consumer
+    // is also cached from the prior run. The naive resume used to skip consumer and read
+    // the stale cached value, reporting success over synthesis made against the OLD
+    // producer. After the fix, consumer must re-execute against the fresh producer.
+    const seenPrompts: string[] = [];
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      seenPrompts.push(prompt);
+      queryCount++;
+      yield {
+        type: 'assistant',
+        content: queryCount === 1 ? 'fresh producer output' : 'consumer result',
+      };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Both producer and consumer were completed in the prior run — this is the
+    // scenario the bug report describes.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['producer', { output: 'STALE_CACHED_PRODUCER' }],
+      ['consumer', { output: 'STALE_CACHED_CONSUMER' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-always-run',
+      testDir,
+      {
+        name: 'stale-cache-always-run',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer re-runs (always_run) AND consumer re-runs (cache invalidated by dep) —
+    // before the fix, consumer was skipped and only 1 sendQuery call happened.
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+
+    // Consumer's prompt must contain the FRESH producer output, not the stale cached
+    // value the resume snapshot carried.
+    const consumerPrompt = seenPrompts[1];
+    expect(consumerPrompt).toContain('fresh producer output');
+    expect(consumerPrompt).not.toContain('STALE_CACHED_PRODUCER');
+
+    // Audit: producer emits node_always_run_reset; consumer emits
+    // node_prior_cache_invalidated naming producer as the invalidating dep.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeUndefined();
+
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.reason).toBe('stale_dependency');
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_output).toBe('STALE_CACHED_CONSUMER');
+  });
+
+  it('does NOT invalidate when a cached dep actually re-runs and produces text-identical output (#2705 R3)', async () => {
+    // The comparison is conservative: a dep that re-ran with byte-identical text
+    // and structured output is NOT flagged as stale. The cached downstream's value
+    // is semantically equivalent, so honouring the cache is correct (and avoids an
+    // unnecessary re-execution). This pins that contract for #2402.
+    //
+    // Producer MUST actually re-execute this resume for the contract to mean
+    // anything — `always_run: true` forces that. (A prior version of this test used
+    // a non-always_run producer that was itself skipped via the ordinary prior-cache
+    // path, so the "re-ran... identical output" comparison this test claims to pin
+    // was never reached — flagged as #2705 R3.)
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      yield { type: 'assistant', content: 'identical output' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Producer was completed in the prior run with output "identical output" AND is
+    // `always_run`, so it actually re-executes this resume — and its fresh output
+    // matches the prior snapshot byte-for-byte.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['producer', { output: 'identical output' }],
+      ['consumer', { output: 'cached consumer output' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-identical',
+      testDir,
+      {
+        name: 'stale-cache-identical',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer re-runs (always_run) with output identical to its prior snapshot;
+    // consumer stays cached because the comparison found no diff. A regression that
+    // makes the check over-eager (flagging every re-run dep regardless of value)
+    // would call consumer's sendQuery too, pushing this past 1.
+    expect(queryCount).toBe(1);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated'
+    );
+    expect(invalidatedEvent).toBeUndefined();
+
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeDefined();
+  });
+
+  it('invalidates a cached downstream when a dep that was never cached completes fresh this resume', async () => {
+    // A dep can be missing from priorCompletedNodes for two reasons: it never completed
+    // in the prior run, or it completed but its row was lost. The pre-populate loop
+    // never seeds nodeOutputs for such a dep, so case 1 of the staleness check fires:
+    // "dep missing from prior + nodeOutputs now completed => ran fresh this resume".
+    // Pin that contract — it can otherwise regress into the same staleness class.
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      yield { type: 'assistant', content: queryCount === 1 ? 'fresh producer' : 'fresh consumer' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Consumer is cached; producer is NOT cached (e.g. it failed in the prior run and
+    // is being re-attempted this resume).
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['consumer', { output: 'stale consumer output' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-uncached-dep',
+      testDir,
+      {
+        name: 'stale-cache-uncached-dep',
+        nodes: [
+          { id: 'producer', kind: 'agent', source: { kind: 'command', name: 'producer' } },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer ran fresh + consumer was invalidated and re-ran = 2 sendQuery calls.
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.invalidating_deps).toEqual(['producer']);
+  });
+
+  it('bounds a large prior output in the node_prior_cache_invalidated audit event (#2726)', async () => {
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      yield { type: 'assistant', content: queryCount === 1 ? 'fresh producer' : 'fresh consumer' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const artifactsDir = join(testDir, 'artifacts');
+    const largeOutput = 'v'.repeat(40_000);
+
+    // Consumer is cached with a large prior value; producer is NOT cached, so it runs
+    // fresh and invalidates consumer's cache (same trigger as the test above).
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['consumer', { output: largeOutput }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-large-invalidated',
+      testDir,
+      {
+        name: 'stale-cache-large-invalidated',
+        nodes: [
+          { id: 'producer', kind: 'agent', source: { kind: 'command', name: 'producer' } },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    if (!invalidatedEvent) throw new Error('Expected a cache-invalidated event');
+    const data = invalidatedEvent[0].data as {
+      prior_output: string;
+      prior_output_truncated: boolean;
+      prior_output_original_bytes: number;
+      prior_output_spill_path: string;
+    };
+    expect(Buffer.byteLength(data.prior_output, 'utf8')).toBeLessThanOrEqual(32_768);
+    expect(data.prior_output_truncated).toBe(true);
+    expect(data.prior_output_original_bytes).toBe(40_000);
+    expect(data.prior_output_spill_path).toBe(
+      join(artifactsDir, '.archon', 'node-output-spills', 'persisted', 'consumer.nodeoutput')
+    );
+    expect(await readFile(data.prior_output_spill_path, 'utf8')).toBe(largeOutput);
+  });
+
+  it('invalidates a cached downstream when a dep that re-ran fresh failed (case 1 \"failed\" arm)', async () => {
+    // Pin case 1's `current?.state === 'failed'` arm of getStaleCachedDependencies
+    // (the #2402 bug surface on the failure path). A dep that was not in the prior
+    // snapshot and re-runs this resume is normally stale via case 1's
+    // `'completed'` check. The exact same dep shape on the failure path — producer
+    // re-attempted this resume and crashed — must also be flagged stale: honouring
+    // the cached downstream would silently report success over synthesis built
+    // against the prior run's view of a now-failed dep. Test 3 above pins the
+    // `'completed'` half of case 1; this one pins the `'failed'` half so a future
+    // refactor that drops `|| current?.state === 'failed'` is structurally caught
+    // (the regression is observationally indistinguishable from test 3 without it).
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      if (queryCount === 1) {
+        // Producer's only attempt fails. The catch arm in executeNodeInternal
+        // converts this to { state: 'failed', output: '', error: '...' } and the
+        // layer aggregation writes that into nodeOutputs['producer']. After this,
+        // any prior-cached consumer that depends on producer must be invalidated,
+        // not silently skipped. The error string is intentionally FATAL-class
+        // (matches `classifyError`'s 'auth error' fallback) so the default retry
+        // loop yields immediately — one attempt, no retries — keeping queryCount
+        // deterministic against the assertion.
+        throw new Error('producer crashed: provider auth error');
+      }
+      yield { type: 'assistant', content: 'fresh consumer output' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // #2713: this test's shared consumer.md fixture inlines $producer.output, which
+    // itself now throws when producer is 'failed' (the sibling gap this test
+    // predates) — override it so this test measures ONLY the #2402
+    // staleness-invalidation behavior, not the unrelated #2713 guard.
+    await writeFile(join(testDir, '.archon', 'commands', 'consumer.md'), 'Consumer prompt');
+
+    // Consumer is cached (it ran in the prior run). Producer is NOT cached —
+    // it failed in the prior run and is being re-attempted this resume. Same
+    // shape as test 3 (case 1 with `'completed'`); the producer's FINAL state
+    // in nodeOutputs is `'failed'` instead.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['consumer', { output: 'STALE_CACHED_CONSUMER' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-fresh-failed-dep',
+      testDir,
+      {
+        name: 'stale-cache-fresh-failed-dep',
+        nodes: [
+          { id: 'producer', kind: 'agent', source: { kind: 'command', name: 'producer' } },
+          // `all_done` (not the default `all_success`) so the consumer's trigger
+          // rule permits re-execution against a failed producer. Without this,
+          // the default rule would silently skip consumer on the failure path —
+          // exercising the staleness arm but never landing the consumer's query,
+          // which would erase the queryCount === 2 discriminator between
+          // AFTER and BEFORE the fix.
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+            trigger_rule: 'all_done',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer failed (1 sendQuery attempt) + consumer was invalidated by the
+    // failed-dep arm and re-ran = 2 sendQuery calls in total. A regression that
+    // drops `|| current?.state === 'failed'` leaves case 1 unable to flag the
+    // failed dep; the consumer is then prior-skipped, sendQuery is only called
+    // for the producer's failed attempt, and queryCount lands at 1 — failing.
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+
+    // The cached-skip arm MUST NOT fire for the consumer. A regression that
+    // drops the `'failed'` arm (or narrows case 1 back to `=== 'completed'`)
+    // lets the prior-completed skip take over and emits
+    // node_skipped_prior_success — this assertion catches that exact fallback.
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeUndefined();
+
+    // The invalidation audit MUST fire for the consumer, naming the failed dep.
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.reason).toBe('stale_dependency');
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_output).toBe('STALE_CACHED_CONSUMER');
+  });
+
+  it('invalidates a cached downstream when a PREVIOUSLY-CACHED dep fails fresh with output matching its prior success (#2705 R1)', async () => {
+    // Every failure arm in the executor returns `output: ''`. When a dependency WAS
+    // cached from a prior success — the ordinary shape for an `always_run: true` gate
+    // on a second-or-later resume — and that prior success also carried `output: ''`
+    // (a bash gate with no stdout), a value-equality-only staleness check finds the
+    // fresh failure's `''` indistinguishable from the prior success's `''` and reports
+    // "not stale." The cached consumer is then skipped via node_skipped_prior_success
+    // BEFORE checkTriggerRule ever runs, silently reporting success over a live
+    // failure produced on THIS resume. Unlike the case-1 "failed arm" test above
+    // (producer had NO prior entry), this producer WAS in priorCompletedNodes —
+    // the shape cases 2/3 govern, and the one the fix must also cover.
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      if (queryCount === 1) {
+        // Producer's only attempt fails this resume. FATAL-class error message so
+        // the retry loop yields immediately — one attempt, deterministic queryCount.
+        throw new Error('producer crashed: provider auth error');
+      }
+      yield { type: 'assistant', content: 'fresh consumer output' };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // #2713: this test's shared consumer.md fixture inlines $producer.output, which
+    // itself now throws when producer is 'failed' (the sibling gap this test
+    // predates) — override it so this test measures ONLY the #2402
+    // staleness-invalidation behavior, not the unrelated #2713 guard.
+    await writeFile(join(testDir, '.archon', 'commands', 'consumer.md'), 'Consumer prompt');
+
+    // Producer WAS cached from a prior success with EMPTY output — the exact value
+    // its fresh failure also produces. Consumer was cached too.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['producer', { output: '' }],
+      ['consumer', { output: 'STALE_CACHED_CONSUMER' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2705-r1-cached-dep-fresh-fail',
+      testDir,
+      {
+        name: 'stale-cache-cached-dep-fresh-fail',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'consumer' },
+            depends_on: ['producer'],
+            trigger_rule: 'all_done',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer's failed attempt (1) + consumer invalidated and re-ran (1) = 2. A
+    // regression that judges a previously-cached dep by value alone leaves consumer
+    // prior-skipped and queryCount stuck at 1 — failing.
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeUndefined();
+
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.reason).toBe('stale_dependency');
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_output).toBe('STALE_CACHED_CONSUMER');
+  });
+
+  it('invalidates when a dep’s structured output changes even though text is stable', async () => {
+    // Case 3 of the staleness check: a `$dep.output.field` consumer must be invalidated
+    // when the structured value changes, even if the text form is identical. Otherwise
+    // the #2637 logical-value surface would silently read stale data through the cache.
+    // The dep must actually re-run for the comparison to fire — `always_run: true`
+    // forces that without contaminating the case with text-staleness.
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      queryCount++;
+      yield {
+        type: 'assistant',
+        content: queryCount === 1 ? 'producer text' : 'consumer result',
+      };
+      yield {
+        type: 'result',
+        sessionId: 'session-id',
+        // Simulate a provider that attaches a logical value alongside the text.
+        // Producer: same text as the cache, different structured payload. This is
+        // the case-3 trigger — the dep's nodeOutputs entry will have the new
+        // structuredOutput even though its text is identical.
+        structuredOutput: queryCount === 1 ? { status: 'PASS_NEW', count: 7 } : { ok: true },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      // Text matches the new producer run, but the structured payload is the OLD
+      // shape — a `$producer.output.status` consumer would read the stale
+      // string "PASS_OLD" through the cache.
+      ['producer', { output: 'producer text', structuredOutput: { status: 'PASS_OLD', count: 3 } }],
+      // The consumer's own cached value also carries a structured payload so the
+      // audit log can record what was thrown away on the invalidated side too.
+      ['consumer', { output: 'cached consumer', structuredOutput: { stale: true } }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-structured',
+      testDir,
+      {
+        name: 'stale-cache-structured',
+        nodes: [
+          // always_run forces the producer re-execution that surfaces case 3.
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Run producer' },
+            always_run: true,
+          },
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Use $producer.output.status' },
+            depends_on: ['producer'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Producer re-ran (always_run) + consumer was invalidated (text-stable but
+    // structured-output differs) = 2 sendQuery calls.
+    expect(queryCount).toBe(2);
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_structured_output).toEqual({ stale: true });
+  });
+
+  it('invalidates a cached downstream when ONE of its multiple deps re-ran (any-stale triggers re-execution)', async () => {
+    // Pin the "any stale dep invalidates" trigger for cached consumers with >= 2 deps
+    // (#2402). The single-dep cases above can't catch a regression to "re-run only when
+    // ALL deps are stale" (`if (staleDeps.length === deps.length)`), which would
+    // re-introduce the original bug for any cached consumer that has at least one
+    // fresh dep and one stable one. The shape: producer re-runs (always_run, fresh
+    // output) + side stays cached (text-identical to prior) -> consumer is cached
+    // but reads `$producer.output` in its prompt. The fresh producer MUST invalidate
+    // the cached consumer even though side is stable.
+    const seenPrompts: string[] = [];
+    let queryCount = 0;
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      seenPrompts.push(prompt);
+      queryCount++;
+      // queryCount 1: producer re-runs (always_run).
+      // queryCount 2: consumer re-runs after cache invalidation.
+      // Side is in priorCompletedNodes with text-identical-to-prior output, so the
+      // pre-populate loop seeds it and the resume-skip arm fires for it — side is
+      // never sent to sendQuery.
+      yield {
+        type: 'assistant',
+        content: queryCount === 1 ? 'FRESH producer output' : 'consumer result',
+      };
+      yield { type: 'result', sessionId: 'session-id' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // All three nodes cached in the prior run. Side's cached output matches what its
+    // pre-populated nodeOutputs entry will carry, so case 2 (text diff) reports no
+    // staleness for side. Producer's cached output is the stale value — the fresh
+    // always_run execution will surface case 2 and invalidate consumer.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['producer', { output: 'STALE producer output' }],
+      ['side', { output: 'stable side output' }],
+      ['consumer', { output: 'STALE consumer output' }],
+    ]);
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-2402-multi-dep',
+      testDir,
+      {
+        name: 'stale-cache-multi-dep',
+        nodes: [
+          // always_run forces producer to re-execute this resume (case 2 fires).
+          {
+            id: 'producer',
+            kind: 'agent',
+            source: { kind: 'command', name: 'producer' },
+            always_run: true,
+          },
+          // Stable dep — text matches prior so case 2 doesn't flag it.
+          { id: 'side', kind: 'agent', source: { kind: 'command', name: 'side' } },
+          // Consumer reads producer; its dep list has BOTH producer and side.
+          {
+            id: 'consumer',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Use $producer.output and $side.output' },
+            depends_on: ['producer', 'side'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Exactly two queries: producer re-runs (always_run), consumer re-runs
+    // (cache invalidated). Side is skipped via the pre-populate prior-success arm,
+    // so it never reaches sendQuery.
+    expect(queryCount).toBe(2);
+
+    // Consumer's prompt must contain the FRESH producer output (not the stale cached
+    // value the resume snapshot carried). Side's stable output is also fine.
+    const consumerPrompt = seenPrompts[1];
+    expect(consumerPrompt).toContain('FRESH producer output');
+    expect(consumerPrompt).not.toContain('STALE producer output');
+    expect(consumerPrompt).toContain('stable side output');
+
+    // Consumer emits node_prior_cache_invalidated naming ONLY the stale dep. If a
+    // future refactor flagged every dep in the list (or stopped pushing after the
+    // first dep), invalidating_deps would either be ['producer','side'] or []
+    // respectively — both would fail this length-1 assertion.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const consumerSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(consumerSkippedEvent).toBeUndefined();
+
+    const invalidatedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_prior_cache_invalidated' &&
+        (call[0] as { step_name: string }).step_name === 'consumer'
+    );
+    expect(invalidatedEvent).toBeDefined();
+    const data = (invalidatedEvent![0] as { data: Record<string, unknown> }).data;
+    expect(data.reason).toBe('stale_dependency');
+    // Length 1 (not 2) — pinning the "any stale dep invalidates" trigger; pinning
+    // that only the actually-stale dep is reported (not the stable side).
+    expect(data.invalidating_deps).toEqual(['producer']);
+    expect(data.prior_output).toBe('STALE consumer output');
+
+    // Side stayed cached, so it should emit node_skipped_prior_success exactly once.
+    const sideSkippedEvent = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_skipped_prior_success' &&
+        (call[0] as { step_name: string }).step_name === 'side'
+    );
+    expect(sideSkippedEvent).toBeDefined();
   });
 });
 
@@ -11056,7 +12799,10 @@ describe('executeDagWorkflow -- break after result (no hang on subprocess exit)'
         platform,
         'conv-dag',
         testDir,
-        { name: 'break-test', nodes: [{ id: 'n1', command: 'my-cmd' }] },
+        {
+          name: 'break-test',
+          nodes: [{ id: 'n1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
+        },
         workflowRun,
         'claude',
         undefined,
@@ -11098,6 +12844,7 @@ describe('executeDagWorkflow -- break after result (no hang on subprocess exit)'
           nodes: [
             {
               id: 'loop1',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'Do the thing. Say COMPLETE when done.',
@@ -11183,8 +12930,13 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       {
         name: 'linear-dag',
         nodes: [
-          { id: 'step1', command: 'my-cmd' },
-          { id: 'step2', command: 'my-cmd', depends_on: ['step1'] },
+          { id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -11225,7 +12977,10 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       platform,
       'conv-dag',
       testDir,
-      { name: 'empty-dag', nodes: [{ id: 'only', command: 'my-cmd' }] },
+      {
+        name: 'empty-dag',
+        nodes: [{ id: 'only', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -11294,7 +13049,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'Classify this',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Classify this' },
             output_format: { type: 'object', properties: {} },
           },
         ],
@@ -11355,7 +13111,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            command: 'my-cmd',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
             idle_timeout: 50,
             // Disable retries so the test doesn't wait for retry delays (the
             // "timed out" message matches TRANSIENT patterns, which would trigger
@@ -11414,7 +13171,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'classify it',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'classify it' },
             output_format: {
               type: 'object',
               properties: { verdict: { type: 'string' } },
@@ -11467,7 +13225,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'classify it',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'classify it' },
             output_format: {
               type: 'object',
               properties: { verdict: { type: 'string' }, confidence: { type: 'number' } },
@@ -11522,7 +13281,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'gate',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             output_format: {
               type: 'object',
               properties: { verdict: { type: 'string' } },
@@ -11532,7 +13292,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
           },
           {
             id: 'runme',
-            prompt: 'go',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'go' },
             depends_on: ['gate'],
             when: "$gate.output.nonexistent == 'x'",
             retry: { max_attempts: 0 },
@@ -11600,7 +13361,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             provider: 'pi',
             output_format: {
               type: 'object',
@@ -11680,9 +13442,9 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       {
         name: 'three-node-fold',
         nodes: [
-          { id: 'a', prompt: 'a' },
-          { id: 'b', prompt: 'b', depends_on: ['a'] },
-          { id: 'c', prompt: 'c', depends_on: ['b'] },
+          { id: 'a', kind: 'agent', source: { kind: 'inline', prompt: 'a' } },
+          { id: 'b', kind: 'agent', source: { kind: 'inline', prompt: 'b' }, depends_on: ['a'] },
+          { id: 'c', kind: 'agent', source: { kind: 'inline', prompt: 'c' }, depends_on: ['b'] },
         ],
       },
       workflowRun,
@@ -11745,7 +13507,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             provider: 'pi',
             output_format: {
               type: 'object',
@@ -11823,7 +13586,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             provider: 'pi',
             output_format: {
               type: 'object',
@@ -11874,7 +13638,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             provider: 'pi',
             output_format: {
               type: 'object',
@@ -11930,7 +13695,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             provider: 'claude',
             output_format: {
               type: 'object',
@@ -11985,7 +13751,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             provider: 'pi',
             output_format: {
               type: 'object',
@@ -12047,7 +13814,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'classify',
-            prompt: 'decide',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'decide' },
             provider: 'pi',
             idle_timeout: 50,
             output_format: {
@@ -12110,7 +13878,15 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       testDir,
       {
         name: 'idle-timeout-with-output',
-        nodes: [{ id: 'step1', command: 'my-cmd', idle_timeout: 50, retry: { max_attempts: 0 } }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            idle_timeout: 50,
+            retry: { max_attempts: 0 },
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -12157,7 +13933,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'bad',
-            command: 'my-cmd',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
             provider: 'claud', // typo
           },
         ],
@@ -12204,7 +13981,8 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         nodes: [
           {
             id: 'fail-node',
-            command: 'my-cmd',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
             provider: 'nonexistent',
           },
         ],
@@ -12252,9 +14030,14 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       {
         name: 'fanin-dag',
         nodes: [
-          { id: 'a', command: 'my-cmd' },
-          { id: 'b', command: 'my-cmd' },
-          { id: 'c', command: 'my-cmd', depends_on: ['a', 'b'] },
+          { id: 'a', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } },
+          { id: 'b', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } },
+          {
+            id: 'c',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            depends_on: ['a', 'b'],
+          },
         ],
       },
       workflowRun,
@@ -12320,8 +14103,8 @@ describe('executeDagWorkflow -- cancel node', () => {
       {
         name: 'cancel-test',
         nodes: [
-          { id: 'check', bash: 'echo blocked' },
-          { id: 'stop', depends_on: ['check'], cancel: 'Precondition failed' },
+          { id: 'check', kind: 'exec', runtime: 'sh', script: 'echo blocked' },
+          { id: 'stop', depends_on: ['check'], kind: 'halt', reason: 'Precondition failed' },
         ],
       },
       workflowRun,
@@ -12360,8 +14143,14 @@ describe('executeDagWorkflow -- cancel node', () => {
       {
         name: 'cancel-skip-test',
         nodes: [
-          { id: 'check', bash: 'echo ok' },
-          { id: 'stop', depends_on: ['check'], cancel: 'Should not fire', when: '1 == 0' },
+          { id: 'check', kind: 'exec', runtime: 'sh', script: 'echo ok' },
+          {
+            id: 'stop',
+            depends_on: ['check'],
+            kind: 'halt',
+            reason: 'Should not fire',
+            when: '1 == 0',
+          },
         ],
       },
       workflowRun,
@@ -12439,7 +14228,13 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
       testDir,
       {
         name: 'credit-test',
-        nodes: [{ id: 'investigate', prompt: 'Investigate the issue' }],
+        nodes: [
+          {
+            id: 'investigate',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Investigate the issue' },
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -12510,11 +14305,17 @@ describe('executeDagWorkflow -- approval node', () => {
         nodes: [
           {
             id: 'review',
-            approval: {
-              message: 'Approve this plan?',
-              capture_response: true,
-              on_reject: { prompt: 'Fix based on: $REJECTION_REASON', max_attempts: 3 },
-            },
+            kind: 'gate',
+            message: 'Approve this plan?',
+            decisions: [
+              { id: 'approve' },
+              {
+                id: 'reject',
+                rework: { prompt: 'Fix based on: $REJECTION_REASON', maxAttempts: 3 },
+              },
+            ],
+            captureResponse: true,
+            decisionsAuthored: false,
           },
         ],
       },
@@ -12562,7 +14363,11 @@ describe('executeDagWorkflow -- approval node', () => {
         nodes: [
           {
             id: 'review',
-            approval: { message: 'Approve?' },
+            kind: 'gate',
+            message: 'Approve?',
+            decisions: [{ id: 'approve' }, { id: 'reject' }],
+            captureResponse: false,
+            decisionsAuthored: false,
           },
         ],
       },
@@ -12577,7 +14382,8 @@ describe('executeDagWorkflow -- approval node', () => {
       minimalConfig
     );
 
-    // pauseWorkflowRun context should NOT have captureResponse
+    // GateNode.captureResponse is a required boolean (#2486) — an undeclared
+    // capture_response resolves to false, not undefined.
     const pauseCalls = (store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>).mock
       .calls;
     expect(pauseCalls.length).toBe(1);
@@ -12585,9 +14391,8 @@ describe('executeDagWorkflow -- approval node', () => {
       type: 'approval',
       nodeId: 'review',
       message: 'Approve?',
+      captureResponse: false,
     });
-    // captureResponse should be undefined (not set)
-    expect(pauseCalls[0][1].captureResponse).toBeUndefined();
   });
 
   it('on_reject runs AI prompt and re-pauses on rejection resume', async () => {
@@ -12625,11 +14430,17 @@ describe('executeDagWorkflow -- approval node', () => {
         nodes: [
           {
             id: 'review',
-            approval: {
-              message: 'Approve this plan?',
-              capture_response: true,
-              on_reject: { prompt: 'Fix based on: $REJECTION_REASON', max_attempts: 3 },
-            },
+            kind: 'gate',
+            message: 'Approve this plan?',
+            decisions: [
+              { id: 'approve' },
+              {
+                id: 'reject',
+                rework: { prompt: 'Fix based on: $REJECTION_REASON', maxAttempts: 3 },
+              },
+            ],
+            captureResponse: true,
+            decisionsAuthored: false,
           },
         ],
       },
@@ -12690,10 +14501,17 @@ describe('executeDagWorkflow -- approval node', () => {
         nodes: [
           {
             id: 'review',
-            approval: {
-              message: 'Approve this plan?',
-              on_reject: { prompt: 'Fix based on: $REJECTION_REASON', max_attempts: 3 },
-            },
+            kind: 'gate',
+            message: 'Approve this plan?',
+            decisions: [
+              { id: 'approve' },
+              {
+                id: 'reject',
+                rework: { prompt: 'Fix based on: $REJECTION_REASON', maxAttempts: 3 },
+              },
+            ],
+            captureResponse: false,
+            decisionsAuthored: false,
           },
         ],
       },
@@ -12757,10 +14575,14 @@ describe('executeDagWorkflow -- approval node', () => {
         nodes: [
           {
             id: 'review',
-            approval: {
-              message: 'Approve this plan?',
-              on_reject: { prompt: 'Fix: $REJECTION_REASON', max_attempts: 3 },
-            },
+            kind: 'gate',
+            message: 'Approve this plan?',
+            decisions: [
+              { id: 'approve' },
+              { id: 'reject', rework: { prompt: 'Fix: $REJECTION_REASON', maxAttempts: 3 } },
+            ],
+            captureResponse: false,
+            decisionsAuthored: false,
           },
         ],
       },
@@ -12817,10 +14639,14 @@ describe('executeDagWorkflow -- approval node', () => {
         nodes: [
           {
             id: 'review',
-            approval: {
-              message: 'Approve?',
-              on_reject: { prompt: 'Fix: $REJECTION_REASON', max_attempts: 1 },
-            },
+            kind: 'gate',
+            message: 'Approve?',
+            decisions: [
+              { id: 'approve' },
+              { id: 'reject', rework: { prompt: 'Fix: $REJECTION_REASON', maxAttempts: 1 } },
+            ],
+            captureResponse: false,
+            decisionsAuthored: false,
           },
         ],
       },
@@ -12875,7 +14701,8 @@ describe('executeDagWorkflow -- approval node', () => {
         nodes: [
           {
             id: 'gather-context',
-            command: 'gather-context',
+            kind: 'agent',
+            source: { kind: 'command', name: 'gather-context' },
             output_format: {
               type: 'object',
               properties: {
@@ -12888,10 +14715,12 @@ describe('executeDagWorkflow -- approval node', () => {
           {
             id: 'confirm',
             depends_on: ['gather-context'],
-            approval: {
-              message:
-                'Repo: $gather-context.output.repo_name | App: $gather-context.output.app_code | Port: $gather-context.output.frontend_port',
-            },
+            kind: 'gate',
+            message:
+              'Repo: $gather-context.output.repo_name | App: $gather-context.output.app_code | Port: $gather-context.output.frontend_port',
+            decisions: [{ id: 'approve' }, { id: 'reject' }],
+            captureResponse: false,
+            decisionsAuthored: false,
           },
         ],
       },
@@ -12989,7 +14818,10 @@ describe('executeDagWorkflow -- env var injection', () => {
       platform,
       'conv-dag',
       testDir,
-      { name: 'dag-env-test', nodes: [{ id: 'task', command: 'my-cmd' }] },
+      {
+        name: 'dag-env-test',
+        nodes: [{ id: 'task', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -13024,7 +14856,10 @@ describe('executeDagWorkflow -- env var injection', () => {
       platform,
       'conv-dag',
       testDir,
-      { name: 'dag-no-env', nodes: [{ id: 'task', command: 'my-cmd' }] },
+      {
+        name: 'dag-no-env',
+        nodes: [{ id: 'task', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -13099,7 +14934,14 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'budget-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', maxBudgetUsd: 2.5 }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            maxBudgetUsd: 2.5,
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -13151,8 +14993,14 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       {
         name: 'budget-msg-test',
         nodes: [
-          { id: 'ok', prompt: 'do work first' },
-          { id: 'capped', command: 'my-cmd', maxBudgetUsd: 2.5, depends_on: ['ok'] },
+          { id: 'ok', kind: 'agent', source: { kind: 'inline', prompt: 'do work first' } },
+          {
+            id: 'capped',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            maxBudgetUsd: 2.5,
+            depends_on: ['ok'],
+          },
         ],
       },
       workflowRun,
@@ -13200,7 +15048,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'err-exec-test',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
       },
       workflowRun,
       'claude',
@@ -13272,7 +15120,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'success-stop-seq-test',
-        nodes: [{ id: 'classify', command: 'my-cmd' }],
+        nodes: [{ id: 'classify', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
       },
       workflowRun,
       'claude',
@@ -13307,7 +15155,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'workflow-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
         effort: 'high',
       },
       workflowRun,
@@ -13339,7 +15187,14 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'node-effort-override-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', effort: 'max' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            effort: 'max',
+          },
+        ],
         effort: 'low',
       },
       workflowRun,
@@ -13380,7 +15235,15 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'codex-claude-opts-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'codex', effort: 'high' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            provider: 'codex',
+            effort: 'high',
+          },
+        ],
       },
       workflowRun,
       'codex',
@@ -13422,7 +15285,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'codex-workflow-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
         effort: 'xhigh',
       },
       workflowRun,
@@ -13464,7 +15327,14 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       loaderBypassingWorkflow({
         name: 'codex-node-effort-beats-deprecated-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', effort: 'minimal' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            effort: 'minimal',
+          },
+        ],
         modelReasoningEffort: 'high',
       }),
       workflowRun,
@@ -13500,7 +15370,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'codex-workflow-options-test',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
         // #2556: the loader translates `modelReasoningEffort:` into `effort:`,
         // so the executor only ever sees the canonical field. `webSearchMode:`
         // keeps its Codex gate and its assistantConfig home.
@@ -13548,7 +15418,14 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'codex-workflow-beats-preset-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'medium',
+          },
+        ],
         effort: 'xhigh',
       },
       workflowRun,
@@ -13596,7 +15473,14 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       loaderBypassingWorkflow({
         name: 'mixed-provider-preset-effort-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'medium',
+          },
+        ],
         // A definition that still carries the deprecated field — only a
         // loader-bypassing caller can produce one. It affects nothing: the
         // executor never reads it (the loader translates it away).
@@ -13637,7 +15521,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'codex-options-on-claude-test',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
         webSearchMode: 'live',
       },
       workflowRun,
@@ -13684,7 +15568,7 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       loaderBypassingWorkflow({
         name: 'codex-effort-telemetry-test',
-        nodes: [{ id: 'step1', command: 'my-cmd' }],
+        nodes: [{ id: 'step1', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
         effort: 'max',
         modelReasoningEffort: 'low',
       }),
@@ -13731,7 +15615,14 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
       testDir,
       {
         name: 'codex-workflow-node-resolves-to-claude-test',
-        nodes: [{ id: 'step1', command: 'my-cmd', model: 'medium' }],
+        nodes: [
+          {
+            id: 'step1',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'medium',
+          },
+        ],
         webSearchMode: 'live',
       },
       workflowRun,
@@ -13807,7 +15698,10 @@ describe('executeDagWorkflow -- cost tracking', () => {
       platform,
       'conv-dag',
       testDir,
-      { name: 'dag-cost', nodes: [{ id: 'step', prompt: 'Do thing.' }] },
+      {
+        name: 'dag-cost',
+        nodes: [{ id: 'step', kind: 'agent', source: { kind: 'inline', prompt: 'Do thing.' } }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -13853,8 +15747,13 @@ describe('executeDagWorkflow -- cost tracking', () => {
       {
         name: 'dag-cost-multi',
         nodes: [
-          { id: 'step1', prompt: 'Step 1.' },
-          { id: 'step2', prompt: 'Step 2.', depends_on: ['step1'] },
+          { id: 'step1', kind: 'agent', source: { kind: 'inline', prompt: 'Step 1.' } },
+          {
+            id: 'step2',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Step 2.' },
+            depends_on: ['step1'],
+          },
         ],
       },
       workflowRun,
@@ -13887,7 +15786,10 @@ describe('executeDagWorkflow -- cost tracking', () => {
       platform,
       'conv-dag',
       testDir,
-      { name: 'dag-no-cost', nodes: [{ id: 'step', prompt: 'Do thing.' }] },
+      {
+        name: 'dag-no-cost',
+        nodes: [{ id: 'step', kind: 'agent', source: { kind: 'inline', prompt: 'Do thing.' } }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -13947,6 +15849,7 @@ describe('executeDagWorkflow -- cost tracking', () => {
         nodes: [
           {
             id: 'my-loop',
+            kind: 'loop',
             loop: { fresh_context: false, prompt: 'Work.', until: 'COMPLETE', max_iterations: 5 },
           },
         ],
@@ -14033,8 +15936,13 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       {
         name: 'usage-on-failure',
         nodes: [
-          { id: 'spend', prompt: 'Burn some tokens.' },
-          { id: 'die', prompt: 'Fail here.', depends_on: ['spend'] },
+          { id: 'spend', kind: 'agent', source: { kind: 'inline', prompt: 'Burn some tokens.' } },
+          {
+            id: 'die',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Fail here.' },
+            depends_on: ['spend'],
+          },
         ],
       },
       makeWorkflowRun(),
@@ -14059,6 +15967,222 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
         total_cache_write_tokens: 0,
       },
     ]);
+  });
+
+  it('a node that fails mid-stream reports its spend in the transcript, not just the DB', async () => {
+    // #2609's worked example. Node A completes at $0.01; node B burns $0.02 and then
+    // the provider throws. The DB row has carried that $0.02 since #2654 — the JSONL
+    // failure row did not, because logNodeError had no usage parameter. The two sinks
+    // disagreeing about what a node cost is the bug.
+    let call = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      call++;
+      if (call === 1) {
+        yield { type: 'assistant', content: 'node A output' };
+        yield { type: 'result', sessionId: 'sid-a', cost: 0.01, tokens: { input: 10, output: 1 } };
+        return;
+      }
+      // Node B streams, reports what it burned, and the same result chunk carries the
+      // provider's error — so the node throws with its usage already accumulated. This
+      // is the ordering that makes the bug reachable: the spend is real and the node
+      // still ends at a failure writer.
+      yield { type: 'assistant', content: 'node B got this far' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-b',
+        cost: 0.02,
+        tokens: { input: 20, output: 2 },
+        isError: true,
+        errorSubtype: 'stream_error',
+      };
+    });
+
+    const store = createMockStore();
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('spend-transcript-run');
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-spend',
+      testDir,
+      {
+        name: 'spend-transcript',
+        nodes: [
+          { id: 'a', kind: 'agent', source: { kind: 'inline', prompt: 'Cheap work.' } },
+          {
+            id: 'b',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Expensive work that dies.' },
+            depends_on: ['a'],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const rows = await readTranscript(logDir, workflowRun.id);
+
+    const failureRow = rows.find(row => row.type === 'node_error' && row.step === 'b');
+    expect(failureRow?.cost_usd).toBe(0.02);
+    expect(failureRow?.tokens).toEqual({ input: 20, output: 2 });
+
+    // The completed node was already right; asserting it here proves the transcript
+    // now accounts for the whole run rather than trading one gap for another.
+    const completeRow = rows.find(row => row.type === 'node_complete' && row.step === 'a');
+    expect(completeRow?.cost_usd).toBe(0.01);
+
+    // Same figure in the persisted event: the fix closes the gap between the sinks
+    // rather than moving it.
+    const failedEvents = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+      (c: unknown[]) => {
+        const e = c[0] as { event_type: string; step_name?: string };
+        return e.event_type === 'node_failed' && e.step_name === 'b';
+      }
+    );
+    expect(failedEvents.length).toBe(1);
+    expect((failedEvents[0][0] as { data: Record<string, unknown> }).data.cost_usd).toBe(0.02);
+
+    // And the run total is the money burned across both nodes.
+    expect(runUsageWrites(store)).toEqual([
+      { total_cost_usd: 0.03, total_tokens_in: 30, total_tokens_out: 3 },
+    ]);
+  });
+
+  it('a node cancelled by the user leaves its spend in the transcript', async () => {
+    // The abort branch called no logNodeError at all, so a cancelled node produced no
+    // transcript row whatsoever — not even one without usage (#2693). It is the only
+    // terminal outcome in executeNodeInternal that was missing from the transcript.
+    //
+    // The cancel is driven the way production drives it: the throttled mid-stream
+    // status check sees a non-running run and aborts. setSystemTime jumps past
+    // CANCEL_CHECK_INTERVAL_MS between chunks so that check fires deterministically,
+    // and the usage-bearing result chunk is delivered BEFORE the jump so the node has
+    // something to report by the time it is torn down.
+    let usageDelivered = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      // A live background task keeps the stream open past the result chunk, which is
+      // what lets the node still be streaming once it has usage to report.
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't-live', taskType: 'local_agent', description: 'still running' }],
+      };
+      yield { type: 'assistant', content: 'partial work' };
+      yield { type: 'result', sessionId: 'sid-x', cost: 0.02, tokens: { input: 30, output: 3 } };
+      usageDelivered = true;
+      setSystemTime(new Date(Date.now() + 11_000));
+      yield { type: 'assistant', content: 'MUST NOT BE REACHED' };
+    });
+
+    const store = createMockStore();
+    (store.getWorkflowRunStatus as Mock<() => Promise<string | null>>).mockImplementation(() =>
+      Promise.resolve(usageDelivered ? 'cancelled' : 'running')
+    );
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('cancel-transcript-run');
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-cancel',
+        testDir,
+        {
+          name: 'cancel-transcript',
+          nodes: [{ id: 'only', kind: 'agent', source: { kind: 'inline', prompt: 'Work.' } }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      setSystemTime(); // restore the real clock
+    }
+
+    // Prove the abort branch is the one that ran: it is the only path that reports
+    // exactly 'Cancelled by user'.
+    const rows = await readTranscript(logDir, workflowRun.id);
+    const cancelRow = rows.find(row => row.type === 'node_error' && row.step === 'only');
+    expect(cancelRow?.error).toBe('Cancelled by user');
+    expect(cancelRow?.cost_usd).toBe(0.02);
+    expect(cancelRow?.tokens).toEqual({ input: 30, output: 3 });
+  });
+
+  it('a cancel that surfaces as a thrown error still leaves a transcript row', async () => {
+    // The abort has TWO exits. One returns from the streaming-cancel branch; the other
+    // reaches the outer catch, because an aborted node with `output_format` is refused a
+    // reask and throws instead. Only the first was fixed at first, which would have made
+    // a cancelled node's transcript row depend on whether the node declared
+    // `output_format` — the provider-shaped inconsistency #2693 exists to remove.
+    let usageDelivered = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't-live', taskType: 'local_agent', description: 'still running' }],
+      };
+      yield { type: 'assistant', content: 'prose, not the declared JSON' };
+      yield { type: 'result', sessionId: 'sid-of', cost: 0.02, tokens: { input: 30, output: 3 } };
+      usageDelivered = true;
+      setSystemTime(new Date(Date.now() + 11_000));
+      yield { type: 'assistant', content: 'MUST NOT BE REACHED' };
+    });
+
+    const store = createMockStore();
+    (store.getWorkflowRunStatus as Mock<() => Promise<string | null>>).mockImplementation(() =>
+      Promise.resolve(usageDelivered ? 'cancelled' : 'running')
+    );
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('cancel-throw-run');
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-cancel-throw',
+        testDir,
+        {
+          name: 'cancel-throw',
+          nodes: [
+            {
+              id: 'only',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'Work.' },
+              output_format: { type: 'object', properties: { status: { type: 'string' } } },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      setSystemTime();
+    }
+
+    const rows = await readTranscript(logDir, workflowRun.id);
+    const cancelRow = rows.find(row => row.type === 'node_error' && row.step === 'only');
+    expect(cancelRow?.error).toBe('Cancelled by user');
+    expect(cancelRow?.cost_usd).toBe(0.02);
   });
 
   it('records usage when the run is CANCELLED out of band mid-flight', async () => {
@@ -14096,7 +16220,12 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       createMockPlatform(),
       'conv-usage',
       testDir,
-      { name: 'usage-on-cancel', nodes: [{ id: 'spend', prompt: 'Burn some tokens.' }] },
+      {
+        name: 'usage-on-cancel',
+        nodes: [
+          { id: 'spend', kind: 'agent', source: { kind: 'inline', prompt: 'Burn some tokens.' } },
+        ],
+      },
       makeWorkflowRun(),
       'claude',
       undefined,
@@ -14147,8 +16276,16 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       {
         name: 'usage-on-pause',
         nodes: [
-          { id: 'analyze', prompt: 'Analyze.' },
-          { id: 'review', approval: { message: 'Ship it?' }, depends_on: ['analyze'] },
+          { id: 'analyze', kind: 'agent', source: { kind: 'inline', prompt: 'Analyze.' } },
+          {
+            id: 'review',
+            kind: 'gate',
+            message: 'Ship it?',
+            decisions: [{ id: 'approve' }, { id: 'reject' }],
+            captureResponse: false,
+            decisionsAuthored: false,
+            depends_on: ['analyze'],
+          },
         ],
       },
       makeWorkflowRun(),
@@ -14201,8 +16338,13 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       {
         name: 'usage-nan-cost',
         nodes: [
-          { id: 'good', prompt: 'Spend normally.' },
-          { id: 'bad', prompt: 'Report a broken cost.', depends_on: ['good'] },
+          { id: 'good', kind: 'agent', source: { kind: 'inline', prompt: 'Spend normally.' } },
+          {
+            id: 'bad',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Report a broken cost.' },
+            depends_on: ['good'],
+          },
         ],
       },
       makeWorkflowRun(),
@@ -14257,7 +16399,12 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
       createMockPlatform(),
       'conv-usage',
       testDir,
-      { name: 'usage-write-fails', nodes: [{ id: 'spend', prompt: 'Burn some tokens.' }] },
+      {
+        name: 'usage-write-fails',
+        nodes: [
+          { id: 'spend', kind: 'agent', source: { kind: 'inline', prompt: 'Burn some tokens.' } },
+        ],
+      },
       makeWorkflowRun(),
       'claude',
       undefined,
@@ -14364,14 +16511,15 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
           nodes: [
             {
               id: 'spend',
-              prompt: 'Burn some tokens.',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'Burn some tokens.' },
               output_format: {
                 type: 'object',
                 properties: { green: { type: 'boolean' } },
                 required: ['green'],
               },
             },
-            { id: 'stop', cancel: 'platform is gone' },
+            { id: 'stop', kind: 'halt', reason: 'platform is gone' },
           ],
         },
         makeWorkflowRun(),
@@ -14447,8 +16595,9 @@ describe('executeDagWorkflow -- script nodes', () => {
       user_message: 'script test message',
     });
 
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'inline-bun',
+      kind: 'exec',
       script: 'console.log("hello from bun")',
       runtime: 'bun',
     };
@@ -14489,8 +16638,13 @@ describe('executeDagWorkflow -- script nodes', () => {
     await writeFile(join(commandsDir, 'use-result.md'), 'Use: $compute.output');
 
     const nodes: DagNode[] = [
-      { id: 'compute', script: 'console.log("42")', runtime: 'bun' },
-      { id: 'use', command: 'use-result', depends_on: ['compute'] },
+      { id: 'compute', kind: 'exec', script: 'console.log("42")', runtime: 'bun' },
+      {
+        id: 'use',
+        kind: 'agent',
+        source: { kind: 'command', name: 'use-result' },
+        depends_on: ['compute'],
+      },
     ];
 
     await executeDagWorkflow(
@@ -14525,8 +16679,9 @@ describe('executeDagWorkflow -- script nodes', () => {
       user_message: 'uv test message',
     });
 
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'inline-uv',
+      kind: 'exec',
       script: 'print("hello from python")',
       runtime: 'uv',
     };
@@ -14566,8 +16721,9 @@ describe('executeDagWorkflow -- script nodes', () => {
     await mkdir(scriptsDir, { recursive: true });
     await writeFile(join(scriptsDir, 'greet.ts'), 'console.log("named script output")');
 
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'run-greet',
+      kind: 'exec',
       script: 'greet',
       runtime: 'bun',
     };
@@ -14601,8 +16757,9 @@ describe('executeDagWorkflow -- script nodes', () => {
       user_message: 'fail test',
     });
 
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'fail-script',
+      kind: 'exec',
       script: 'process.exit(1)',
       runtime: 'bun',
     };
@@ -14644,8 +16801,9 @@ describe('executeDagWorkflow -- script nodes', () => {
     // assertion below. Block-comment padding (no newlines) avoids Windows execFile
     // arg truncation at \n that would cause bun to exit 0 on the comment-only prefix.
     const paddingAboveMax = '/* p */'.repeat(500);
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'fail-script-1389',
+      kind: 'exec',
       script: `${paddingAboveMax} this is not valid javascript`,
       runtime: 'bun',
     };
@@ -14695,9 +16853,10 @@ describe('executeDagWorkflow -- script nodes', () => {
       user_message: 'timeout test',
     });
 
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'slow-script',
       // Bun inline script that sleeps longer than the timeout
+      kind: 'exec',
       script: 'await new Promise(r => setTimeout(r, 30000))',
       runtime: 'bun',
       timeout: 500,
@@ -14736,9 +16895,10 @@ describe('executeDagWorkflow -- script nodes', () => {
       user_message: 'stderr test',
     });
 
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'stderr-script',
       // Write to both stderr and stdout
+      kind: 'exec',
       script: 'process.stderr.write("error detail\\n"); console.log("done")',
       runtime: 'bun',
     };
@@ -14787,10 +16947,16 @@ describe('executeDagWorkflow -- script nodes', () => {
       {
         id: 'script-out',
         // Print the run ID and artifacts dir — after substitution these are real values
+        kind: 'exec',
         script: 'console.log("id=$WORKFLOW_ID artifacts=$ARTIFACTS_DIR")',
         runtime: 'bun',
       },
-      { id: 'check', command: 'check-output', depends_on: ['script-out'] },
+      {
+        id: 'check',
+        kind: 'agent',
+        source: { kind: 'command', name: 'check-output' },
+        depends_on: ['script-out'],
+      },
     ];
 
     await executeDagWorkflow(
@@ -14846,9 +17012,19 @@ describe('executeDagWorkflow -- script nodes', () => {
       // the bash body survives substitution (the engine replaces the exact
       // string `$STATE_DIR`) and is expanded by the shell from the env bag —
       // which also keeps a Windows path out of the script text entirely.
-      { id: 'from-script', script: 'console.log(process.env.STATE_DIR)', runtime: 'bun' },
-      { id: 'from-bash', bash: 'printf %s "${STATE_DIR}"' },
-      { id: 'check', command: 'check-state', depends_on: ['from-script', 'from-bash'] },
+      {
+        id: 'from-script',
+        kind: 'exec',
+        script: 'console.log(process.env.STATE_DIR)',
+        runtime: 'bun',
+      },
+      { id: 'from-bash', kind: 'exec', runtime: 'sh', script: 'printf %s "${STATE_DIR}"' },
+      {
+        id: 'check',
+        kind: 'agent',
+        source: { kind: 'command', name: 'check-state' },
+        depends_on: ['from-script', 'from-bash'],
+      },
     ];
 
     await executeDagWorkflow(
@@ -14899,9 +17075,19 @@ describe('executeDagWorkflow -- script nodes', () => {
     const nodes: DagNode[] = [
       // Neither body contains the literal `$WORKFLOW_ID`, so the textual
       // substitution path cannot make this pass — only the env bag can.
-      { id: 'from-script', script: 'console.log(process.env.WORKFLOW_ID)', runtime: 'bun' },
-      { id: 'from-bash', bash: 'printf %s "${WORKFLOW_ID}"' },
-      { id: 'check', command: 'check-wfid', depends_on: ['from-script', 'from-bash'] },
+      {
+        id: 'from-script',
+        kind: 'exec',
+        script: 'console.log(process.env.WORKFLOW_ID)',
+        runtime: 'bun',
+      },
+      { id: 'from-bash', kind: 'exec', runtime: 'sh', script: 'printf %s "${WORKFLOW_ID}"' },
+      {
+        id: 'check',
+        kind: 'agent',
+        source: { kind: 'command', name: 'check-wfid' },
+        depends_on: ['from-script', 'from-bash'],
+      },
     ];
 
     await executeDagWorkflow(
@@ -14937,8 +17123,9 @@ describe('executeDagWorkflow -- script nodes', () => {
     });
 
     // Do NOT create .archon/scripts/missing.ts — the script should fail to resolve
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'gone-script',
+      kind: 'exec',
       script: 'missing',
       runtime: 'bun',
     };
@@ -14980,8 +17167,9 @@ describe('executeDagWorkflow -- script nodes', () => {
     // Write a .env with a marker in the script execution cwd
     await writeFile(join(testDir, '.env'), 'LEAKED_REPO_SECRET=should_not_appear\n');
 
-    const scriptNode: ScriptNode = {
+    const scriptNode: ExecNode = {
       id: 'env-check',
+      kind: 'exec',
       script: 'console.log(process.env.LEAKED_REPO_SECRET ?? "CLEAN")',
       runtime: 'bun',
     };
@@ -15029,7 +17217,7 @@ describe('executeDagWorkflow -- script nodes', () => {
       testDir,
       {
         name: 'script-env-test',
-        nodes: [{ id: 'inline-bun', script: 'console.log("ok")', runtime: 'bun' }],
+        nodes: [{ id: 'inline-bun', kind: 'exec', script: 'console.log("ok")', runtime: 'bun' }],
       },
       workflowRun,
       'claude',
@@ -15207,7 +17395,14 @@ describe('executeDagWorkflow -- MCP failure filtering', () => {
       testDir,
       {
         name: 'mcp-filter-test',
-        nodes: [{ id: 'review', command: 'my-cmd', ...(nodeMcpPath ? { mcp: nodeMcpPath } : {}) }],
+        nodes: [
+          {
+            id: 'review',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            ...(nodeMcpPath ? { mcp: nodeMcpPath } : {}),
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -15307,7 +17502,10 @@ describe('shouldContinueStreamingForStatus', () => {
   it('aborts on any unrecognized state', async () => {
     const { shouldContinueStreamingForStatus } = await import('./dag-executor');
     expect(shouldContinueStreamingForStatus('pending')).toBe(false);
-    expect(shouldContinueStreamingForStatus('invalid-status')).toBe(false);
+    // Simulates a corrupted/unexpected DB status value — the column isn't compile-time
+    // checked, so the runtime fallback-to-abort still matters even though the
+    // parameter type is now WorkflowRunStatus | null.
+    expect(shouldContinueStreamingForStatus('invalid-status' as WorkflowRunStatus)).toBe(false);
   });
 });
 
@@ -15316,7 +17514,8 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
 
   const resultNode = (alwaysRun = false): DagNode => ({
     id: 'result',
-    prompt: 'author the result',
+    kind: 'agent',
+    source: { kind: 'inline', prompt: 'author the result' },
     ...(alwaysRun ? { always_run: true } : {}),
     output_format: {
       type: 'object',
@@ -15427,7 +17626,12 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
 
     const runPromise = run(store, [
       resultNode(),
-      { id: 'later', prompt: 'wait for release', depends_on: ['result'] },
+      {
+        id: 'later',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'wait for release' },
+        depends_on: ['result'],
+      },
     ]);
     await laterStarted;
 
@@ -15442,7 +17646,13 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
 
     await run(store, [
       resultNode(),
-      { id: 'later-failure', bash: 'exit 1', depends_on: ['result'] },
+      {
+        id: 'later-failure',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'exit 1',
+        depends_on: ['result'],
+      },
     ]);
 
     expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
@@ -15454,7 +17664,10 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
     mockStructuredVerdict(true);
     const store = createMockStore();
 
-    await run(store, [resultNode(), { id: 'sibling-failure', bash: 'exit 1' }]);
+    await run(store, [
+      resultNode(),
+      { id: 'sibling-failure', kind: 'exec', runtime: 'sh', script: 'exit 1' },
+    ]);
 
     expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
     expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
@@ -15471,7 +17684,15 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
 
     await run(store, [
       resultNode(),
-      { id: 'review', approval: { message: 'Ship?' }, depends_on: ['result'] },
+      {
+        id: 'review',
+        kind: 'gate',
+        message: 'Ship?',
+        decisions: [{ id: 'approve' }, { id: 'reject' }],
+        captureResponse: false,
+        decisionsAuthored: false,
+        depends_on: ['result'],
+      },
     ]);
 
     expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
@@ -15492,7 +17713,7 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
 
     await run(store, [
       resultNode(),
-      { id: 'stop', cancel: 'not shipping', depends_on: ['result'] },
+      { id: 'stop', kind: 'halt', reason: 'not shipping', depends_on: ['result'] },
     ]);
 
     expect(authoredOutcomeWrites(store)).toEqual(['succeeded']);
@@ -15602,8 +17823,8 @@ describe('executeDagWorkflow -- final status derivation', () => {
     const workflowRun = makeWorkflowRun('dag-status-run-1');
 
     const nodes: DagNode[] = [
-      { id: 'pass', bash: 'echo ok' } as BashNode,
-      { id: 'fail', bash: 'exit 1' } as BashNode,
+      { id: 'pass', kind: 'exec', runtime: 'sh', script: 'echo ok' } as ExecNode,
+      { id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' } as ExecNode,
     ];
 
     await executeDagWorkflow(
@@ -15644,10 +17865,10 @@ describe('executeDagWorkflow -- final status derivation', () => {
     const workflowRun = makeWorkflowRun('dag-status-run-2');
 
     const nodes: DagNode[] = [
-      { id: 'a', bash: 'echo a' } as BashNode,
-      { id: 'b', bash: 'echo b' } as BashNode,
-      { id: 'c', bash: 'echo c' } as BashNode,
-      { id: 'fail', bash: 'exit 1' } as BashNode,
+      { id: 'a', kind: 'exec', runtime: 'sh', script: 'echo a' } as ExecNode,
+      { id: 'b', kind: 'exec', runtime: 'sh', script: 'echo b' } as ExecNode,
+      { id: 'c', kind: 'exec', runtime: 'sh', script: 'echo c' } as ExecNode,
+      { id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' } as ExecNode,
     ];
 
     await executeDagWorkflow(
@@ -15690,14 +17911,16 @@ describe('executeDagWorkflow -- final status derivation', () => {
     // Layer 2: C depends on B with trigger_rule: none_failed_min_one_success — so C is skipped.
     // Expected: anyFailed=true (from B), so run must be marked failed even though C is only skipped.
     const nodes: DagNode[] = [
-      { id: 'a', bash: 'echo a' } as BashNode,
-      { id: 'b', bash: 'exit 1' } as BashNode,
+      { id: 'a', kind: 'exec', runtime: 'sh', script: 'echo a' } as ExecNode,
+      { id: 'b', kind: 'exec', runtime: 'sh', script: 'exit 1' } as ExecNode,
       {
         id: 'c',
-        bash: 'echo c',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'echo c',
         depends_on: ['b'],
         trigger_rule: 'none_failed_min_one_success',
-      } as BashNode,
+      } as ExecNode,
     ];
 
     await executeDagWorkflow(
@@ -15760,7 +17983,9 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
   }): Promise<void> {
     const mockDeps = createMockDeps(opts.store);
     const workflowRun = makeWorkflowRun('dag-evidence-run');
-    const nodes: DagNode[] = [{ id: 'work', bash: 'echo done' } as BashNode];
+    const nodes: DagNode[] = [
+      { id: 'work', kind: 'exec', runtime: 'sh', script: 'echo done' } as ExecNode,
+    ];
 
     await executeDagWorkflow(
       mockDeps,
@@ -15996,7 +18221,14 @@ describe('provider resolution -- regression for #1610', () => {
       // Node has model: opus[1m] but NO provider: — must inherit workflowProvider
       {
         name: 'provider-regression',
-        nodes: [{ id: 'implement', command: 'my-cmd', model: 'opus[1m]' }],
+        nodes: [
+          {
+            id: 'implement',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'opus[1m]',
+          },
+        ],
       },
       workflowRun,
       'codex', // workflowProvider (simulates defaultAssistant: codex)
@@ -16028,7 +18260,15 @@ describe('provider resolution -- regression for #1610', () => {
       // Node has both model: opus[1m] AND provider: claude
       {
         name: 'provider-explicit',
-        nodes: [{ id: 'implement', command: 'my-cmd', model: 'opus[1m]', provider: 'claude' }],
+        nodes: [
+          {
+            id: 'implement',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            model: 'opus[1m]',
+            provider: 'claude',
+          },
+        ],
       },
       workflowRun,
       'codex', // workflowProvider
@@ -16124,7 +18364,14 @@ describe('executeDagWorkflow -- typed artifacts (output_type)', () => {
       testDir,
       {
         name: 'typed-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', output_type: 'plan' }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            output_type: 'plan',
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16161,7 +18408,15 @@ describe('executeDagWorkflow -- typed artifacts (output_type)', () => {
       testDir,
       {
         name: 'bash-typed',
-        nodes: [{ id: 'metrics', bash: 'echo "result-data"', output_type: 'metrics' }],
+        nodes: [
+          {
+            id: 'metrics',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'echo "result-data"',
+            output_type: 'metrics',
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16201,7 +18456,14 @@ describe('executeDagWorkflow -- typed artifacts (output_type)', () => {
       testDir,
       {
         name: 'typed-fail',
-        nodes: [{ id: 'planner', command: 'my-cmd', output_type: 'plan' }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            output_type: 'plan',
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16226,7 +18488,7 @@ describe('executeDagWorkflow -- typed artifacts (output_type)', () => {
       testDir,
       {
         name: 'untyped-test',
-        nodes: [{ id: 'planner', command: 'my-cmd' }],
+        nodes: [{ id: 'planner', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
       },
       makeWorkflowRun(),
       'claude',
@@ -16290,7 +18552,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16348,7 +18617,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16407,7 +18683,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16480,7 +18763,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16536,7 +18826,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16574,7 +18871,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16610,7 +18914,15 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true, output_type: 'plan' }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+            output_type: 'plan',
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16656,7 +18968,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       {
         name: 'persist-test',
         // scope dir present (another node opted in), but THIS node doesn't persist.
-        nodes: [{ id: 'planner', command: 'my-cmd', output_type: 'plan' }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            output_type: 'plan',
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16701,7 +19020,15 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true, output_type: 'plan' }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+            output_type: 'plan',
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16742,7 +19069,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16783,7 +19117,7 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'no-persist',
-        nodes: [{ id: 'planner', command: 'my-cmd' }],
+        nodes: [{ id: 'planner', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
       },
       makeWorkflowRun(),
       'claude',
@@ -16812,7 +19146,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'wf-default-on',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: false }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: false,
+          },
+        ],
         persist_sessions: true,
       },
       makeWorkflowRun(),
@@ -16851,7 +19192,15 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true, context: 'fresh' }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+            context: 'fresh',
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16891,7 +19240,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -16923,7 +19279,7 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'wf-inherit',
-        nodes: [{ id: 'planner', command: 'my-cmd' }],
+        nodes: [{ id: 'planner', kind: 'agent', source: { kind: 'command', name: 'my-cmd' } }],
         persist_sessions: true,
       },
       makeWorkflowRun(),
@@ -16971,7 +19327,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -17011,7 +19374,14 @@ describe('executeDagWorkflow -- persist_session', () => {
       testDir,
       {
         name: 'persist-test',
-        nodes: [{ id: 'planner', command: 'my-cmd', persist_session: true }],
+        nodes: [
+          {
+            id: 'planner',
+            kind: 'agent',
+            source: { kind: 'command', name: 'my-cmd' },
+            persist_session: true,
+          },
+        ],
       },
       makeWorkflowRun(),
       'claude',
@@ -17097,7 +19467,10 @@ describe('executeDagWorkflow -- completion telemetry', () => {
       yield { type: 'result', sessionId: 'sid-ok' };
     });
 
-    await runDag({ name: 'dag-ok', nodes: [{ id: 'step', prompt: 'Do thing.' }] });
+    await runDag({
+      name: 'dag-ok',
+      nodes: [{ id: 'step', kind: 'agent', source: { kind: 'inline', prompt: 'Do thing.' } }],
+    });
 
     // Exactly once — guards against the double-count risk the PR flagged.
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
@@ -17128,7 +19501,10 @@ describe('executeDagWorkflow -- completion telemetry', () => {
       };
     });
 
-    await runDag({ name: 'dag-usage', nodes: [{ id: 'step', prompt: 'Do thing.' }] });
+    await runDag({
+      name: 'dag-usage',
+      nodes: [{ id: 'step', kind: 'agent', source: { kind: 'inline', prompt: 'Do thing.' } }],
+    });
 
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
@@ -17159,8 +19535,13 @@ describe('executeDagWorkflow -- completion telemetry', () => {
     await runDag({
       name: 'dag-nan',
       nodes: [
-        { id: 'node1', prompt: 'First.' },
-        { id: 'node2', prompt: 'Second.', depends_on: ['node1'] },
+        { id: 'node1', kind: 'agent', source: { kind: 'inline', prompt: 'First.' } },
+        {
+          id: 'node2',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'Second.' },
+          depends_on: ['node1'],
+        },
       ],
     });
 
@@ -17176,7 +19557,10 @@ describe('executeDagWorkflow -- completion telemetry', () => {
       yield { type: 'result', sessionId: 'sid-empty' };
     });
 
-    await runDag({ name: 'dag-empty', nodes: [{ id: 'only', prompt: 'Do thing.' }] });
+    await runDag({
+      name: 'dag-empty',
+      nodes: [{ id: 'only', kind: 'agent', source: { kind: 'inline', prompt: 'Do thing.' } }],
+    });
 
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
@@ -17209,8 +19593,13 @@ describe('executeDagWorkflow -- completion telemetry', () => {
     await runDag({
       name: 'dag-partial',
       nodes: [
-        { id: 'node1', prompt: 'First.' },
-        { id: 'node2', prompt: 'Second.', depends_on: ['node1'] },
+        { id: 'node1', kind: 'agent', source: { kind: 'inline', prompt: 'First.' } },
+        {
+          id: 'node2',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'Second.' },
+          depends_on: ['node1'],
+        },
       ],
     });
 
@@ -17269,11 +19658,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'fixer',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work, emit DONE when finished', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work, emit DONE when finished' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -17349,7 +19746,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       createMockPlatform(),
       'conv-lg',
       testDir,
-      expanded,
+      ready(expanded),
       makeWorkflowRun('dag-loopgroup-included'),
       'claude',
       undefined,
@@ -17420,7 +19817,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       createMockPlatform(),
       'conv-lg',
       testDir,
-      expanded,
+      ready(expanded),
       makeWorkflowRun('dag-loopgroup-typed-included'),
       'claude',
       undefined,
@@ -17482,6 +19879,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
         nodes: [
           {
             id: 'outer',
+            kind: 'loop_group',
             loop_group: {
               until: 'OUTER_DONE',
               max_iterations: 2,
@@ -17489,6 +19887,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
               nodes: [
                 {
                   id: 'inner',
+                  kind: 'loop_group',
                   loop_group: {
                     until: 'INNER_DONE',
                     max_iterations: 1,
@@ -17496,7 +19895,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
                     nodes: [
                       {
                         id: 'leaf',
-                        prompt: 'produce nested result',
+                        kind: 'agent',
+                        source: { kind: 'inline', prompt: 'produce nested result' },
                         output_type: 'findings',
                       },
                     ],
@@ -17543,6 +19943,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       nodes: [
         {
           id: 'refine',
+          kind: 'loop_group',
           loop_group: {
             until: 'DONE',
             max_iterations: 3,
@@ -17551,7 +19952,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
             nodes: [
               {
                 id: 'work',
-                prompt: 'produce a typed result',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'produce a typed result' },
                 output_type: 'findings',
               },
             ],
@@ -17705,7 +20107,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       createMockPlatform(),
       'conv-lg',
       testDir,
-      expanded,
+      ready(expanded),
       makeWorkflowRun('dag-nested-loopgroup-included-prev'),
       'claude',
       undefined,
@@ -17751,6 +20153,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'grp',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
@@ -17758,6 +20161,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
           nodes: [
             {
               id: 'inner-loop',
+              kind: 'loop',
               loop: {
                 command: 'body-loop-cmd',
                 until: 'INNER_DONE',
@@ -17828,6 +20232,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       const nodes: DagNode[] = [
         {
           id: 'grp',
+          kind: 'loop_group',
           loop_group: {
             until: 'DONE',
             max_iterations: 3,
@@ -17837,6 +20242,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
             nodes: [
               {
                 id: 'emit',
+                kind: 'exec',
                 script: 'console.log("$LOOP_USER_INPUT"); console.log("DONE")',
                 runtime: 'bun',
                 depends_on: [],
@@ -17878,6 +20284,85 @@ describe('executeDagWorkflow -- loop_group node', () => {
     }
   });
 
+  it('delivers $LOOP_USER_INPUT to a resumed body bash node via env (#2725)', async () => {
+    // A body bash node's literal "$LOOP_USER_INPUT" token is already resolved by the
+    // loop_group-level shell-quoted splice (applyLoopPrevToBodyNode) before executeBashNode
+    // ever runs, so a script using that exact literal form is not a regression test for
+    // this fix. This test targets a script that reads the variable WITHOUT that literal
+    // token — `printenv`, matching how `${LOOP_USER_INPUT}` (braced form) or any other
+    // indirect env read behaves — which the splice cannot touch and which previously read
+    // as empty because executeBashNode's subprocess env hardcoded LOOP_USER_INPUT: ''.
+    const feedback = 'looks good, ship it';
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'DONE\n', stderr: '' });
+    try {
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('lg-userinput-bash', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'grp',
+            iteration: 0,
+            message: 'Review and provide feedback.',
+          },
+          loop_user_input: feedback,
+          loop_feedback_given: true,
+        },
+      });
+
+      const nodes: DagNode[] = [
+        {
+          id: 'grp',
+          kind: 'loop_group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 3,
+            fresh_context: true,
+            interactive: true,
+            gate_message: 'Review and provide feedback.',
+            nodes: [
+              {
+                id: 'emit',
+                kind: 'exec',
+                script: 'printenv LOOP_USER_INPUT; echo "DONE"',
+                runtime: 'sh',
+                depends_on: [],
+              },
+            ],
+          },
+          depends_on: [],
+        },
+      ];
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-lg-userinput-bash',
+        testDir,
+        { name: 'lg-userinput-bash', nodes },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const bashCall = execSpy.mock.calls.find(
+        c => (c[0] as string) === git.resolveBashPath() && (c[1] as string[])[0] === '-c'
+      ) as [string, string[], { env: NodeJS.ProcessEnv }] | undefined;
+      expect(bashCall).toBeDefined();
+      // The per-iteration feedback reaches the bash node through the environment —
+      // previously always '' regardless of what the reviewer typed at the gate.
+      expect(bashCall?.[2].env.LOOP_USER_INPUT).toBe(feedback);
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
   it('fails the loop_group when max_iterations is exceeded without the until signal', async () => {
     let callCount = 0;
     mockSendQueryDag.mockImplementation(async function* () {
@@ -17893,11 +20378,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'fixer',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work, never emit DONE', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work, never emit DONE' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -17944,16 +20437,33 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'fix-loop',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
           fresh_context: false,
           nodes: [
-            { id: 'implement', bash: 'echo "editing files"', depends_on: [] },
-            { id: 'test', bash: 'echo "running tests"', depends_on: ['implement'] },
+            {
+              id: 'implement',
+              kind: 'exec',
+              runtime: 'sh',
+              script: 'echo "editing files"',
+              depends_on: [],
+            },
+            {
+              id: 'test',
+              kind: 'exec',
+              runtime: 'sh',
+              script: 'echo "running tests"',
+              depends_on: ['implement'],
+            },
             {
               id: 'review',
-              prompt: 'Review the test results. Emit DONE only when all tests pass.',
+              kind: 'agent',
+              source: {
+                kind: 'inline',
+                prompt: 'Review the test results. Emit DONE only when all tests pass.',
+              },
               depends_on: ['test'],
             },
           ],
@@ -17984,6 +20494,88 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(result).toContain('all tests green now');
   });
 
+  it('overwrites the persisted-output spill file per iteration, keyed by the shared step_name (#2726)', async () => {
+    // A loop_group body node's step_name is the SAME across every iteration
+    // (stepNamePrefix + node.id, no iteration suffix) -- formatPersistedNodeOutput's
+    // spill file is therefore keyed identically each iteration too, by design (see its
+    // doc comment). This test proves that design empirically: each iteration's own DB
+    // row keeps ITS OWN preview text frozen at write time, but the shared spill file on
+    // disk ends the run holding only the LATEST iteration's full bytes -- which is
+    // correct, because getDagResumeSnapshot's completedNodeOutputs map is itself
+    // last-write-wins per step_name, so only the latest row (and therefore the latest
+    // spill content) is ever actually consulted on resume.
+    const counterFile = join(testDir, 'lg-spill-counter');
+    const counterRef = `"${counterFile.replace(/\\/g, '/')}"`;
+    const artifactsDir = join(testDir, 'artifacts');
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('lg-spill-overwrite');
+
+    const nodes: DagNode[] = [
+      {
+        id: 'group',
+        kind: 'loop_group',
+        loop_group: {
+          until_bash: `test "$(cat ${counterRef})" -ge 2`,
+          max_iterations: 5,
+          fresh_context: false,
+          nodes: [
+            {
+              id: 'emit',
+              kind: 'exec',
+              runtime: 'sh',
+              script: `n=$(cat ${counterRef} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${counterRef}; if [ "$n" = "1" ]; then printf '%40000s' '' | tr ' ' a; else printf '%40000s' '' | tr ' ' b; fi`,
+              depends_on: [],
+            },
+          ],
+        },
+        depends_on: [],
+      },
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-lg-spill',
+      testDir,
+      { name: 'lg-spill-overwrite', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect((await readFile(counterFile, 'utf8')).trim()).toBe('2');
+
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const emitEvents = eventCalls.filter(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'group.emit'
+    );
+    expect(emitEvents).toHaveLength(2);
+    const [iter1, iter2] = emitEvents.map(
+      call => (call[0] as { data: { node_output: string; node_output_spill_path: string } }).data
+    );
+    // Each row's OWN preview reflects its OWN iteration's content -- frozen at write time.
+    expect(iter1.node_output.startsWith('a')).toBe(true);
+    expect(iter2.node_output.startsWith('b')).toBe(true);
+    // Both rows point at the SAME spill path, by design.
+    expect(iter1.node_output_spill_path).toBe(iter2.node_output_spill_path);
+    expect(iter1.node_output_spill_path).toBe(
+      join(artifactsDir, '.archon', 'node-output-spills', 'persisted', 'group.emit.nodeoutput')
+    );
+    // The file on disk, after the run, holds only the LATEST iteration's content.
+    const finalSpillContent = await readFile(iter1.node_output_spill_path, 'utf8');
+    expect(finalSpillContent).toBe('b'.repeat(40_000));
+  });
+
   it('INSTANCE 2: $LOOP_PREV cross-iteration ref sees prior iteration output', async () => {
     // The body prompt references $LOOP_PREV.work.output. We assert the mock receives a
     // prompt that contains the PREVIOUS iteration's output on iteration 2+ (and empty
@@ -18006,6 +20598,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'draft-loop',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
@@ -18013,7 +20606,12 @@ describe('executeDagWorkflow -- loop_group node', () => {
           nodes: [
             {
               id: 'work',
-              prompt: 'Previous draft:\n$LOOP_PREV.work.output\nImprove it. Emit DONE when final.',
+              kind: 'agent',
+              source: {
+                kind: 'inline',
+                prompt:
+                  'Previous draft:\n$LOOP_PREV.work.output\nImprove it. Emit DONE when final.',
+              },
               depends_on: [],
             },
           ],
@@ -18065,14 +20663,21 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'grp',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
           nodes: [
-            { id: 'gen', prompt: 'Draft or DONE.', depends_on: [] },
+            {
+              id: 'gen',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'Draft or DONE.' },
+              depends_on: [],
+            },
             {
               id: 'consume',
+              kind: 'exec',
               script: [
                 "const prev = process.env.INPUTS_PREV ?? 'unset';",
                 "const now = process.env.INPUTS_NOW ?? 'unset';",
@@ -18142,6 +20747,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
         nodes: [
           {
             id: 'draft-loop',
+            kind: 'loop_group',
             loop_group: {
               until: 'DONE',
               max_iterations: 2,
@@ -18149,7 +20755,9 @@ describe('executeDagWorkflow -- loop_group node', () => {
               nodes: [
                 {
                   id: 'work',
-                  bash:
+                  kind: 'exec',
+                  runtime: 'sh',
+                  script:
                     'previous=$LOOP_PREV.work.output; ' +
                     'if [ -z "$previous" ]; then head -c 33000 /dev/zero | tr "\\0" x; ' +
                     'else printf "%s\\nDONE\\n" "${#previous}"; fi',
@@ -18196,6 +20804,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'bash-loop',
+        kind: 'loop_group',
         loop_group: {
           // No `until` at all (#2563). Before that the schema forced a decoy signal
           // here; a pure-bash body emits no model text, so declaring one described a
@@ -18206,7 +20815,9 @@ describe('executeDagWorkflow -- loop_group node', () => {
           nodes: [
             {
               id: 'bump',
-              bash: 'head -c 33000 /dev/zero | tr "\\0" x',
+              kind: 'exec',
+              runtime: 'sh',
+              script: 'head -c 33000 /dev/zero | tr "\\0" x',
               depends_on: [],
             },
           ],
@@ -18258,11 +20869,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'once',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
-          nodes: [{ id: 'only', prompt: 'do it, emit DONE', depends_on: [] }],
+          nodes: [
+            {
+              id: 'only',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do it, emit DONE' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -18310,11 +20929,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'flaky',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -18365,9 +20992,16 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const workflowRun = makeWorkflowRun('lg-outer-dep');
 
     const nodes: DagNode[] = [
-      { id: 'setup', bash: 'echo "setup-context-123"', depends_on: [] },
+      {
+        id: 'setup',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'echo "setup-context-123"',
+        depends_on: [],
+      },
       {
         id: 'consumer',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
@@ -18375,7 +21009,11 @@ describe('executeDagWorkflow -- loop_group node', () => {
           nodes: [
             {
               id: 'work',
-              prompt: 'Outer setup said: $setup.output\nNow act on it. Emit DONE.',
+              kind: 'agent',
+              source: {
+                kind: 'inline',
+                prompt: 'Outer setup said: $setup.output\nNow act on it. Emit DONE.',
+              },
               depends_on: [],
             },
           ],
@@ -18531,7 +21169,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
       applyLoopPrevToBodyNode(
         {
           id: 'review',
-          prompt: 'act on $LOOP_PREV.reviw.output.verdict',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'act on $LOOP_PREV.reviw.output.verdict' },
           depends_on: [],
         } as DagNode,
         undefined,
@@ -18549,12 +21188,18 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nestedGroup = applyLoopPrevToBodyNode(
       {
         id: 'refine',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 2,
           fresh_context: false,
           nodes: [
-            { id: 'polish', prompt: 'refine on $LOOP_PREV.polish.output.draft', depends_on: [] },
+            {
+              id: 'polish',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'refine on $LOOP_PREV.polish.output.draft' },
+              depends_on: [],
+            },
           ],
         },
         depends_on: [],
@@ -18567,16 +21212,15 @@ describe('executeDagWorkflow -- loop_group node', () => {
     );
     if (!('loop_group' in nestedGroup) || nestedGroup.loop_group === undefined)
       throw new Error('expected loop_group node');
-    const polishNode = nestedGroup.loop_group.nodes[0];
-    expect('prompt' in polishNode && polishNode.prompt).toBe(
-      'refine on $LOOP_PREV.polish.output.draft'
-    );
+    const polishNode = nestedGroup.loop_group.nodes[0] as DagNode;
+    expect(inlinePrompt(polishNode)).toBe('refine on $LOOP_PREV.polish.output.draft');
 
     // A ref to an OUTER-direct id (`review`) inside the nested body IS resolved now, at the
     // outer granularity — here to '' (iteration 1, no prior output), not preserved.
     const nestedReadsOuter = applyLoopPrevToBodyNode(
       {
         id: 'refine',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 2,
@@ -18584,7 +21228,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
           nodes: [
             {
               id: 'polish',
-              prompt: 'saw outer [$LOOP_PREV.review.output.verdict]',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'saw outer [$LOOP_PREV.review.output.verdict]' },
               depends_on: [],
             },
           ],
@@ -18599,20 +21244,26 @@ describe('executeDagWorkflow -- loop_group node', () => {
     );
     if (!('loop_group' in nestedReadsOuter) || nestedReadsOuter.loop_group === undefined)
       throw new Error('expected loop_group node');
-    const polishReadsOuter = nestedReadsOuter.loop_group.nodes[0];
-    expect('prompt' in polishReadsOuter && polishReadsOuter.prompt).toBe('saw outer []');
+    const polishReadsOuter = nestedReadsOuter.loop_group.nodes[0] as DagNode;
+    expect(inlinePrompt(polishReadsOuter)).toBe('saw outer []');
 
     // But a typo INSIDE the nested body (id in no body node) still throws through the recursion.
     expect(() =>
       applyLoopPrevToBodyNode(
         {
           id: 'refine',
+          kind: 'loop_group',
           loop_group: {
             until: 'DONE',
             max_iterations: 2,
             fresh_context: false,
             nodes: [
-              { id: 'polish', prompt: 'refine on $LOOP_PREV.reviw.output.verdict', depends_on: [] },
+              {
+                id: 'polish',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'refine on $LOOP_PREV.reviw.output.verdict' },
+                depends_on: [],
+              },
             ],
           },
           depends_on: [],
@@ -18652,6 +21303,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'outer',
+        kind: 'loop_group',
         loop_group: {
           until: 'OUTER_DONE',
           // One outer iteration is enough to run the inner group to its own completion.
@@ -18660,6 +21312,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
           nodes: [
             {
               id: 'inner',
+              kind: 'loop_group',
               loop_group: {
                 until: 'INNER_DONE',
                 max_iterations: 3,
@@ -18667,7 +21320,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
                 nodes: [
                   {
                     id: 'w',
-                    prompt: 'prev=[$LOOP_PREV.w.output] do work',
+                    kind: 'agent',
+                    source: { kind: 'inline', prompt: 'prev=[$LOOP_PREV.w.output] do work' },
                     depends_on: [],
                   },
                 ],
@@ -18714,16 +21368,23 @@ describe('executeDagWorkflow -- loop_group node', () => {
 
     // bash: shell-bound → value arrives shell-quoted.
     const bashNode = applyLoopPrevToBodyNode(
-      { id: 'b', bash: 'echo $LOOP_PREV.work.output', depends_on: [] } as DagNode,
+      {
+        id: 'b',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'echo $LOOP_PREV.work.output',
+        depends_on: [],
+      } as DagNode,
       prev,
       ''
     );
-    expect('bash' in bashNode && bashNode.bash).toBe("echo 'it'\\''s done'");
+    expect(bashScript(bashNode)).toBe("echo 'it'\\''s done'");
 
     // script: runs via execFile argv (no shell) → raw value, no quote artifacts in source.
     const scriptNode = applyLoopPrevToBodyNode(
       {
         id: 's',
+        kind: 'exec',
         script: 'console.log(`$LOOP_PREV.work.output`)',
         runtime: 'bun',
         depends_on: [],
@@ -18735,11 +21396,16 @@ describe('executeDagWorkflow -- loop_group node', () => {
 
     // cancel: display text → raw value.
     const cancelNode = applyLoopPrevToBodyNode(
-      { id: 'c', cancel: 'stopping: $LOOP_PREV.work.output', depends_on: [] } as DagNode,
+      {
+        id: 'c',
+        kind: 'halt',
+        reason: 'stopping: $LOOP_PREV.work.output',
+        depends_on: [],
+      } as DagNode,
       prev,
       ''
     );
-    expect('cancel' in cancelNode && cancelNode.cancel).toBe("stopping: it's done");
+    expect('reason' in cancelNode ? cancelNode.reason : undefined).toBe("stopping: it's done");
   });
 
   it('EDGE H (#2623): resolves namespaced $LOOP_PREV across AI config and compiled loop prompts', () => {
@@ -18751,7 +21417,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const aiNode = applyLoopPrevToBodyNode(
       {
         id: 'use',
-        prompt: `main=${ref}`,
+        kind: 'agent',
+        source: { kind: 'inline', prompt: `main=${ref}` },
         systemPrompt: `system=${ref}`,
         agents: {
           helper: {
@@ -18765,7 +21432,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       ''
     );
 
-    expect('prompt' in aiNode && aiNode.prompt).toBe('main=PRIOR');
+    expect(inlinePrompt(aiNode)).toBe('main=PRIOR');
     expect(aiNode.systemPrompt).toBe('system=PRIOR');
     expect(aiNode.agents?.helper?.description).toBe('description=PRIOR');
     expect(aiNode.agents?.helper?.prompt).toBe('agent=PRIOR');
@@ -18790,15 +21457,18 @@ describe('executeDagWorkflow -- loop_group node', () => {
       id: 'gate',
       approval: {
         message: `approve=${ref}`,
+        capture_response: false,
         on_reject: { prompt: `retry=${ref}` },
       },
       depends_on: [],
     });
-    const substitutedGate = applyLoopPrevToBodyNode(gate, prev, '');
-    if (!('approval' in substitutedGate) || substitutedGate.approval === undefined)
-      throw new Error('expected approval node');
-    expect(substitutedGate.approval.message).toBe('approve=PRIOR');
-    expect(substitutedGate.approval.on_reject?.prompt).toBe('retry=PRIOR');
+    const substitutedGate = applyLoopPrevToBodyNode(gate as DagNode, prev, '');
+    if (!('kind' in substitutedGate) || substitutedGate.kind !== 'gate')
+      throw new Error('expected gate node');
+    expect(substitutedGate.message).toBe('approve=PRIOR');
+    expect(substitutedGate.decisions.find(d => d.id === 'reject')?.rework?.prompt).toBe(
+      'retry=PRIOR'
+    );
 
     const script = dagNodeSchema.parse({
       id: 'script',
@@ -18810,19 +21480,20 @@ describe('executeDagWorkflow -- loop_group node', () => {
       origin: 'review-block',
       inputs: { previous: ref },
     };
-    const substitutedScript = applyLoopPrevToBodyNode(script, prev, '');
+    const substitutedScript = applyLoopPrevToBodyNode(script as DagNode, prev, '');
     expect(readComposedMeta(substitutedScript)?.inputs).toEqual({ previous: 'PRIOR' });
   });
 
   it('EDGE H: never splices $LOOP_USER_INPUT into a script body — env delivery only (#2115)', () => {
     // Malicious approval-gate free-text. Raw-spliced into TS source it would close the
     // string literal and execute; it must stay an inert literal token in the script so
-    // executeScriptNode delivers the value out-of-band via env instead.
+    // executeExecNode delivers the value out-of-band via env instead.
     const injection = '"); require("child_process").execSync("touch pwned"); //';
 
     const scriptNode = applyLoopPrevToBodyNode(
       {
         id: 's',
+        kind: 'exec',
         script: 'console.log("$LOOP_USER_INPUT")',
         runtime: 'bun',
         depends_on: [],
@@ -18835,12 +21506,18 @@ describe('executeDagWorkflow -- loop_group node', () => {
 
     // bash stays shell-quoted (the existing safe channel) — proving only scripts changed.
     const bashNode = applyLoopPrevToBodyNode(
-      { id: 'b', bash: 'echo $LOOP_USER_INPUT', depends_on: [] } as DagNode,
+      {
+        id: 'b',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'echo $LOOP_USER_INPUT',
+        depends_on: [],
+      } as DagNode,
       undefined,
       injection
     );
     // No single quotes in the payload → shellQuote wraps it verbatim in single quotes.
-    expect('bash' in bashNode && bashNode.bash).toBe(`echo '${injection}'`);
+    expect(bashScript(bashNode)).toBe(`echo '${injection}'`);
   });
 
   it('EDGE H: nested loop until_bash gets $LOOP_PREV substituted shell-safely (unit)', () => {
@@ -18850,6 +21527,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nestedLoop = applyLoopPrevToBodyNode(
       {
         id: 'inner',
+        kind: 'loop',
         loop: {
           fresh_context: false,
           prompt: 'iterate on $LOOP_PREV.work.output',
@@ -18870,12 +21548,15 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nestedGroup = applyLoopPrevToBodyNode(
       {
         id: 'inner-grp',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 2,
           fresh_context: false,
           until_bash: 'test $LOOP_PREV.work.output = PASS',
-          nodes: [{ id: 'w', prompt: 'p', depends_on: [] }],
+          nodes: [
+            { id: 'w', kind: 'agent', source: { kind: 'inline', prompt: 'p' }, depends_on: [] },
+          ],
         },
         depends_on: [],
       } as DagNode,
@@ -18914,13 +21595,24 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'multi',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
           nodes: [
-            { id: 'a', prompt: 'I am node-a. Emit DONE.', depends_on: [] },
-            { id: 'b', prompt: 'I am node-b. Do work.', depends_on: [] },
+            {
+              id: 'a',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'I am node-a. Emit DONE.' },
+              depends_on: [],
+            },
+            {
+              id: 'b',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'I am node-b. Do work.' },
+              depends_on: [],
+            },
           ],
         },
         depends_on: [],
@@ -18969,11 +21661,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'fresh',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: true,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19024,11 +21724,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'cancellable',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19076,6 +21784,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'either',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
@@ -19083,7 +21792,14 @@ describe('executeDagWorkflow -- loop_group node', () => {
           // Creates a sentinel file + exits 0. If this runs, the file exists; if the
           // until-signal short-circuits, the file is never created.
           until_bash: `touch ${sentinel}`,
-          nodes: [{ id: 'work', prompt: 'do work, emit DONE', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work, emit DONE' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19135,11 +21851,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'once',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 1,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work, emit DONE', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work, emit DONE' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19188,6 +21912,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'outer',
+        kind: 'loop_group',
         loop_group: {
           until: 'OUTER_DONE',
           max_iterations: 3,
@@ -19195,19 +21920,26 @@ describe('executeDagWorkflow -- loop_group node', () => {
           nodes: [
             {
               id: 'inner',
+              kind: 'loop_group',
               loop_group: {
                 until: 'INNER_DONE',
                 max_iterations: 2,
                 fresh_context: false,
                 nodes: [
-                  { id: 'inner-work', prompt: 'inner work, emit INNER_DONE', depends_on: [] },
+                  {
+                    id: 'inner-work',
+                    kind: 'agent',
+                    source: { kind: 'inline', prompt: 'inner work, emit INNER_DONE' },
+                    depends_on: [],
+                  },
                 ],
               },
               depends_on: [],
             },
             {
               id: 'review',
-              prompt: 'review inner result, emit OUTER_DONE',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'review inner result, emit OUTER_DONE' },
               depends_on: ['inner'],
             },
           ],
@@ -19254,13 +21986,21 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'refine',
+        kind: 'loop_group',
         loop_group: {
           until: 'APPROVED',
           max_iterations: 5,
           fresh_context: false,
           interactive: true,
           gate_message: 'Review the result.',
-          nodes: [{ id: 'work', prompt: 'produce a draft', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'produce a draft' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19319,6 +22059,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
         nodes: [
           {
             id: 'refine',
+            kind: 'loop_group',
             loop_group: {
               until: 'UNTIL_DONE',
               until_bash: 'exit 0',
@@ -19326,7 +22067,14 @@ describe('executeDagWorkflow -- loop_group node', () => {
               fresh_context: false,
               interactive: true,
               gate_message: 'Review the checks.',
-              nodes: [{ id: 'work', prompt: 'validate', depends_on: [] }],
+              nodes: [
+                {
+                  id: 'work',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'validate' },
+                  depends_on: [],
+                },
+              ],
             },
             depends_on: [],
           },
@@ -19369,13 +22117,21 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'refine',
+        kind: 'loop_group',
         loop_group: {
           until: 'APPROVED',
           max_iterations: 5,
           fresh_context: false,
           interactive: true,
           gate_message: 'Review the result.',
-          nodes: [{ id: 'work', prompt: 'validate', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'validate' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19430,6 +22186,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'refine',
+        kind: 'loop_group',
         loop_group: {
           until: 'APPROVED',
           max_iterations: 5,
@@ -19437,7 +22194,14 @@ describe('executeDagWorkflow -- loop_group node', () => {
           interactive: true,
           gate_message: 'Review the result.',
           signal_completes: true,
-          nodes: [{ id: 'work', prompt: 'validate', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'validate' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19506,13 +22270,21 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'refine',
+        kind: 'loop_group',
         loop_group: {
           until: 'APPROVED',
           max_iterations: 5,
           fresh_context: false,
           interactive: true,
           gate_message: 'Review the result.',
-          nodes: [{ id: 'work', prompt: 'validate', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'validate' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19569,6 +22341,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       nodes: [
         {
           id: 'refine',
+          kind: 'loop_group',
           loop_group: {
             until: 'APPROVED',
             max_iterations: 5,
@@ -19578,7 +22351,8 @@ describe('executeDagWorkflow -- loop_group node', () => {
             nodes: [
               {
                 id: 'work',
-                prompt: 'produce verdict',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'produce verdict' },
                 depends_on: [],
                 output_format: { type: 'object', properties: { verdict: { type: 'string' } } },
               },
@@ -19589,7 +22363,9 @@ describe('executeDagWorkflow -- loop_group node', () => {
         // Reads a key the payload does NOT carry: lenient tier → '', strict tier → throw.
         {
           id: 'after',
-          bash: 'echo "[$refine.output.confidence]"',
+          kind: 'exec',
+          runtime: 'sh',
+          script: 'echo "[$refine.output.confidence]"',
           depends_on: ['refine'],
         },
       ] as DagNode[],
@@ -19690,6 +22466,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       nodes: [
         {
           id: 'refine',
+          kind: 'loop_group',
           loop_group: {
             until: 'APPROVED',
             max_iterations: 5,
@@ -19697,7 +22474,12 @@ describe('executeDagWorkflow -- loop_group node', () => {
             interactive: true,
             gate_message: 'Review.',
             nodes: [
-              { id: 'work', prompt: 'User: $LOOP_USER_INPUT. Draft or APPROVED.', depends_on: [] },
+              {
+                id: 'work',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'User: $LOOP_USER_INPUT. Draft or APPROVED.' },
+                depends_on: [],
+              },
             ],
           },
           depends_on: [],
@@ -19786,12 +22568,13 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(pauseCalls2.length).toBe(0);
   });
 
-  it('INTERACTIVE resume: $LOOP_PREV is NOT preserved across the pause/resume boundary (v1 known limitation)', async () => {
-    // v1 behavior: on interactive resume, loopPrevOutputs resets to undefined (the prior
-    // process's body-output snapshot is not persisted in ApprovalContext). So the resumed
-    // iteration's $LOOP_PREV.<bodyNode>.output resolves to '' — NOT to the paused run's
-    // iteration-1 output. This test locks the current behavior; persisting $LOOP_PREV
-    // across resume is a tracked follow-up (CodeRabbit finding #5).
+  it('INTERACTIVE resume: $LOOP_PREV resolves to the prior iteration real body output (#2748)', async () => {
+    // On interactive resume, executeLoopGroupNode is a fresh call whose local
+    // loopPrevOutputs starts undefined — but the paused run's iteration-1 body output
+    // was already persisted as a `refine.work` node_completed row. The resumed
+    // executeDagWorkflow call re-derives loopPrevOutputs from that persisted row (via
+    // outerNodeOutputs, pre-populated from the priorCompletedNodes snapshot passed in
+    // below), so $LOOP_PREV.<bodyNode>.output resolves to the real prior output, not ''.
     mockSendQueryDag.mockImplementationOnce(async function* () {
       yield { type: 'assistant', content: 'iter1 body output XYZ' };
       yield { type: 'result', sessionId: 'lg-prev-sess-1' };
@@ -19803,6 +22586,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       nodes: [
         {
           id: 'refine',
+          kind: 'loop_group',
           loop_group: {
             until: 'APPROVED',
             max_iterations: 5,
@@ -19812,7 +22596,12 @@ describe('executeDagWorkflow -- loop_group node', () => {
             nodes: [
               {
                 id: 'work',
-                prompt: 'PREV=<<$LOOP_PREV.work.output>> USER=$LOOP_USER_INPUT. Draft or APPROVED.',
+                kind: 'agent',
+                source: {
+                  kind: 'inline',
+                  prompt:
+                    'PREV=<<$LOOP_PREV.work.output>> USER=$LOOP_USER_INPUT. Draft or APPROVED.',
+                },
                 depends_on: [],
               },
             ],
@@ -19842,7 +22631,11 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const iter1Prompt = mockSendQueryDag.mock.calls[0][0] as string;
     expect(iter1Prompt).toContain('PREV=<<>>');
 
-    // ---- Resume: iteration 2.
+    // ---- Resume: iteration 2. priorCompletedNodes carries the persisted iteration-1
+    // body row (the `refine.work` node_completed row a real DB would return from
+    // getDagResumeSnapshot) — this is what a real resume threads in via
+    // hydrateResumableRun before calling executeDagWorkflow.
+    const priorCompletedNodes = new Map([['refine.work', { output: 'iter1 body output XYZ' }]]);
     mockSendQueryDag.mockImplementationOnce(async function* () {
       yield { type: 'assistant', content: 'final\nAPPROVED' };
       yield { type: 'result', sessionId: 'lg-prev-sess-2' };
@@ -19872,15 +22665,262 @@ describe('executeDagWorkflow -- loop_group node', () => {
       join(testDir, 'logs'),
       'main',
       'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Resumed iteration 2: $LOOP_PREV resolves to the real persisted iteration-1 output.
+    const resumePrompt = mockSendQueryDag.mock.calls[1][0] as string;
+    expect(resumePrompt).toContain('PREV=<<iter1 body output XYZ>>');
+    expect(resumePrompt).toContain('USER=ok');
+  });
+
+  it('INTERACTIVE resume: re-derives declaredFields so an undeclared $LOOP_PREV field fails the consumer (not-in-schema) (#2748 R1)', async () => {
+    // Mirrors the top-level 're-derives declaredFields on resume...' test (this file,
+    // ~line 5876) at the loop_group body level: a resumed body node's restored NodeOutput
+    // must keep the SAME schema-typo strictness a live in-process iteration has. Without
+    // re-deriving declaredFields from the body node's own current output_format, an
+    // undeclared field silently resolves to '' instead of throwing.
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+
+    // Prior iteration's persisted body output carries an `extra` key the schema does
+    // NOT declare.
+    const priorCompletedNodes = new Map([
+      ['refine.work', { output: '{"type":"BUG","extra":"x"}' }],
+    ]);
+
+    const workflow = {
+      name: 'lg-resume-declared-fields',
+      nodes: [
+        {
+          id: 'refine',
+          kind: 'loop_group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 5,
+            fresh_context: false,
+            interactive: true,
+            gate_message: 'Review.',
+            nodes: [
+              {
+                id: 'work',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'produce json' },
+                output_format: {
+                  type: 'object',
+                  properties: { type: { type: 'string' } },
+                  required: ['type'],
+                },
+                depends_on: [],
+              },
+              {
+                id: 'consumer',
+                kind: 'agent',
+                source: {
+                  kind: 'inline',
+                  prompt: 'extra=[$LOOP_PREV.work.output.extra]',
+                },
+                depends_on: ['work'],
+              },
+            ],
+          },
+          depends_on: [],
+        },
+      ] as DagNode[],
+    };
+
+    mockSendQueryDag.mockImplementationOnce(async function* () {
+      yield { type: 'assistant', content: '{"type":"BUG"}' };
+      yield { type: 'result', sessionId: 'lg-declared-fields-sess' };
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-lg-declared-fields',
+      testDir,
+      workflow,
+      makeWorkflowRun('lg-resume-declared-fields', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            message: 'Review.',
+          },
+          loop_user_input: '',
+        },
+      }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // The undeclared `extra` field must fail loudly (not-in-schema) on the resumed
+    // iteration — exactly as it would fail an in-process iteration — instead of
+    // silently resolving to '' the way a genuinely schemaless body node's absent
+    // field would.
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failedEvent = eventCalls.find((call: unknown[]) => {
+      const event = call[0] as { event_type: string; data?: { error?: string } };
+      return (
+        event.event_type === 'node_failed' && event.data?.error?.includes('is not declared in node')
+      );
+    });
+    expect(failedEvent).toBeDefined();
+  });
+
+  it('INTERACTIVE resume: $LOOP_PREV resolves an oversized (>32KB) prior body output via the spill path (#2748)', async () => {
+    // Mirrors 'reads oversized $LOOP_PREV output from the run-owned spill directory'
+    // (same file, in-process case) but crosses a real pause/resume boundary: a bash
+    // body node spills a real oversized output on iteration 1, the group pauses, then
+    // a SEPARATE resumed executeDagWorkflow call — seeded with priorCompletedNodes the
+    // way a real resume threads it in via hydrateResumableRun — reads
+    // $LOOP_PREV.work.output back and proves the full byte length survived the pause.
+    const artifactsDir = join(testDir, 'lg-prev-large-artifacts');
+    const logDir = join(testDir, 'lg-prev-large-logs');
+    const paddingBytes = 40_000;
+    const freshStore = createMockStore();
+
+    const freshWorkflow = {
+      name: 'lg-resume-prev-large',
+      nodes: [
+        {
+          id: 'refine',
+          kind: 'loop_group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 5,
+            fresh_context: false,
+            interactive: true,
+            gate_message: 'Review.',
+            nodes: [
+              {
+                id: 'work',
+                kind: 'exec',
+                runtime: 'sh',
+                script: `head -c ${String(paddingBytes)} /dev/zero | tr "\\0" x`,
+                depends_on: [],
+              },
+            ],
+          },
+          depends_on: [],
+        },
+      ] as DagNode[],
+    };
+
+    await executeDagWorkflow(
+      createMockDeps(freshStore),
+      createMockPlatform(),
+      'conv-lg-large',
+      testDir,
+      freshWorkflow,
+      makeWorkflowRun('lg-prev-large-fresh'),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
       minimalConfig
     );
 
-    // Resumed iteration 2: $LOOP_PREV is '' (v1 does not persist the prior body snapshot
-    // across resume), NOT 'iter1 body output XYZ'.
-    const resumePrompt = mockSendQueryDag.mock.calls[1][0] as string;
-    expect(resumePrompt).toContain('PREV=<<>>');
-    expect(resumePrompt).not.toContain('iter1 body output XYZ');
-    expect(resumePrompt).toContain('USER=ok');
+    const freshEventCalls = (freshStore.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const bodyEvent = freshEventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'refine.work'
+    );
+    expect(bodyEvent).toBeDefined();
+    if (!bodyEvent) throw new Error('Expected refine.work to complete on the fresh pass');
+    const bodyData = bodyEvent[0].data as {
+      node_output_truncated: boolean;
+      node_output_spill_path: string;
+    };
+    expect(bodyData.node_output_truncated).toBe(true);
+    const spilledFullOutput = await readFile(bodyData.node_output_spill_path, 'utf8');
+    expect(spilledFullOutput.length).toBe(paddingBytes);
+
+    // The group paused after iteration 1 (interactive: true, no 'DONE' signal yet).
+    const pauseCalls = (freshStore.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>)
+      .mock.calls;
+    expect(pauseCalls.length).toBe(1);
+
+    // ---- Resume: seed priorCompletedNodes with the REAL spilled bytes (not a
+    // hand-authored string) and prove the resumed body script sees the full value.
+    const priorCompletedNodes = new Map([['refine.work', { output: spilledFullOutput }]]);
+    const resumedWorkflow = {
+      name: 'lg-resume-prev-large',
+      nodes: [
+        {
+          id: 'refine',
+          kind: 'loop_group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 5,
+            fresh_context: false,
+            interactive: true,
+            gate_message: 'Review.',
+            nodes: [
+              {
+                id: 'work',
+                kind: 'exec',
+                runtime: 'sh',
+                script: 'previous=$LOOP_PREV.work.output; printf "%s\\nDONE\\n" "${#previous}"',
+                depends_on: [],
+              },
+            ],
+          },
+          depends_on: [],
+        },
+      ] as DagNode[],
+    };
+    const result = await executeDagWorkflow(
+      createMockDeps(createMockStore()),
+      createMockPlatform(),
+      'conv-lg-large-resume',
+      testDir,
+      resumedWorkflow,
+      makeWorkflowRun('lg-prev-large-resume', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            message: 'Review.',
+          },
+          loop_user_input: '',
+        },
+      }),
+      'claude',
+      undefined,
+      artifactsDir,
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // The resumed body script measured $LOOP_PREV.work.output's length as the FULL
+    // padding size — proving the real spilled bytes (not a truncated preview) survived
+    // the pause/resume boundary.
+    expect(result).toContain(String(paddingBytes));
   });
 
   // --- Dimension 3: cost/token accumulation across iterations ---
@@ -19906,11 +22946,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'paid',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -19988,11 +23036,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'paid',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -20069,13 +23125,21 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'refine',
+        kind: 'loop_group',
         loop_group: {
           until: 'APPROVED',
           max_iterations: 5,
           fresh_context: false,
           interactive: true,
           gate_message: 'Review the result.',
-          nodes: [{ id: 'work', prompt: 'validate', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'validate' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -20177,11 +23241,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'no-usage-group',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -20235,11 +23307,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'stateful',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -20284,11 +23364,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'stateless',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
           fresh_context: true,
-          nodes: [{ id: 'work', prompt: 'do work', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -20340,15 +23428,22 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'gated',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: true,
           nodes: [
-            { id: 'gate', prompt: 'GATE: decide', depends_on: [] },
+            {
+              id: 'gate',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'GATE: decide' },
+              depends_on: [],
+            },
             {
               id: 'work',
-              prompt: 'do the work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do the work' },
               depends_on: ['gate'],
               when: "$gate.output == 'go'",
             },
@@ -20401,13 +23496,24 @@ describe('executeDagWorkflow -- loop_group node', () => {
     const nodes: DagNode[] = [
       {
         id: 'pipeline',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
           nodes: [
-            { id: 'implement', prompt: 'IMPLEMENT: fix it', depends_on: [] },
-            { id: 'verify', prompt: 'verify the fix', depends_on: ['implement'] },
+            {
+              id: 'implement',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'IMPLEMENT: fix it' },
+              depends_on: [],
+            },
+            {
+              id: 'verify',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'verify the fix' },
+              depends_on: ['implement'],
+            },
           ],
         },
         depends_on: [],
@@ -20464,11 +23570,19 @@ describe('executeDagWorkflow -- loop_group node', () => {
       {
         id: 'producer',
         output_type: 'result',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 3,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'produce output', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'produce output' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
@@ -20557,14 +23671,22 @@ describe('executeDagWorkflow -- loop_group body step_name namespacing (#2090)', 
 
     const nodes: DagNode[] = [
       // Top-level bash node — its events must NOT be namespaced and must NOT carry iteration.
-      { id: 'setup', bash: 'echo ready', depends_on: [] },
+      { id: 'setup', kind: 'exec', runtime: 'sh', script: 'echo ready', depends_on: [] },
       {
         id: 'fixer',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work, emit DONE when done', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work, emit DONE when done' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: ['setup'],
       },
@@ -20633,6 +23755,7 @@ describe('executeDagWorkflow -- loop_group body step_name namespacing (#2090)', 
     const nodes: DagNode[] = [
       {
         id: 'outer',
+        kind: 'loop_group',
         loop_group: {
           until: 'OUTER_DONE',
           max_iterations: 3,
@@ -20640,15 +23763,28 @@ describe('executeDagWorkflow -- loop_group body step_name namespacing (#2090)', 
           nodes: [
             {
               id: 'inner',
+              kind: 'loop_group',
               loop_group: {
                 until: 'INNER_DONE',
                 max_iterations: 2,
                 fresh_context: false,
-                nodes: [{ id: 'leaf', prompt: 'inner work, emit INNER_DONE', depends_on: [] }],
+                nodes: [
+                  {
+                    id: 'leaf',
+                    kind: 'agent',
+                    source: { kind: 'inline', prompt: 'inner work, emit INNER_DONE' },
+                    depends_on: [],
+                  },
+                ],
               },
               depends_on: [],
             },
-            { id: 'review', prompt: 'review, emit OUTER_DONE', depends_on: ['inner'] },
+            {
+              id: 'review',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'review, emit OUTER_DONE' },
+              depends_on: ['inner'],
+            },
           ],
         },
         depends_on: [],
@@ -20716,11 +23852,19 @@ describe('executeDagWorkflow -- loop_group body step_name namespacing (#2090)', 
           nodes: [
             {
               id: 'fixer',
+              kind: 'loop_group',
               loop_group: {
                 until: 'DONE',
                 max_iterations: 3,
                 fresh_context: false,
-                nodes: [{ id: 'work', prompt: 'do work, emit DONE', depends_on: [] }],
+                nodes: [
+                  {
+                    id: 'work',
+                    kind: 'agent',
+                    source: { kind: 'inline', prompt: 'do work, emit DONE' },
+                    depends_on: [],
+                  },
+                ],
               },
               depends_on: [],
             },
@@ -20774,15 +23918,28 @@ describe('executeDagWorkflow -- loop_group body step_name namespacing (#2090)', 
     const nodes: DagNode[] = [
       {
         id: 'fixer',
+        kind: 'loop_group',
         loop_group: {
           until: 'DONE',
           max_iterations: 5,
           fresh_context: false,
-          nodes: [{ id: 'work', prompt: 'do work, emit DONE', depends_on: [] }],
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work, emit DONE' },
+              depends_on: [],
+            },
+          ],
         },
         depends_on: [],
       },
-      { id: 'finalize', prompt: 'finalize using $fixer.output', depends_on: ['fixer'] },
+      {
+        id: 'finalize',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'finalize using $fixer.output' },
+        depends_on: ['fixer'],
+      },
     ];
 
     let finalizePrompt = '';
@@ -20905,23 +24062,32 @@ describe('executeDagWorkflow -- addressable session resume', () => {
     });
 
     const store = await runAddressableWorkflow([
-      { id: 'writer1', prompt: 'writer1' },
-      { id: 'reviewer1', prompt: 'reviewer1', context: 'fresh', depends_on: ['writer1'] },
+      { id: 'writer1', kind: 'agent', source: { kind: 'inline', prompt: 'writer1' } },
+      {
+        id: 'reviewer1',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'reviewer1' },
+        context: 'fresh',
+        depends_on: ['writer1'],
+      },
       {
         id: 'writer2',
-        prompt: 'writer2',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'writer2' },
         context: { resume: 'writer1' },
         depends_on: ['reviewer1'],
       },
       {
         id: 'reviewer2',
-        prompt: 'reviewer2',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'reviewer2' },
         context: { resume: 'reviewer1' },
         depends_on: ['writer2'],
       },
       {
         id: 'writer3',
-        prompt: 'writer3',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'writer3' },
         context: { resume: 'writer2' },
         depends_on: ['reviewer2'],
       },
@@ -20974,22 +24140,25 @@ describe('executeDagWorkflow -- addressable session resume', () => {
     });
 
     await runAddressableWorkflow([
-      { id: 'source', prompt: 'source' },
+      { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'source' } },
       {
         id: 'lens-a',
-        prompt: 'lens-a',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'lens-a' },
         context: { resume: 'source' },
         depends_on: ['source'],
       },
       {
         id: 'lens-b',
-        prompt: 'lens-b',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'lens-b' },
         context: { resume: 'source' },
         depends_on: ['source'],
       },
       {
         id: 'synthesis',
-        prompt: 'synthesis',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'synthesis' },
         context: { resume: 'source' },
         depends_on: ['lens-a', 'lens-b'],
       },
@@ -21027,10 +24196,11 @@ describe('executeDagWorkflow -- addressable session resume', () => {
     });
 
     await runAddressableWorkflow([
-      { id: 'source', prompt: 'source', provider: 'pi' },
+      { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'source' }, provider: 'pi' },
       {
         id: 'consumer',
-        prompt: 'consumer',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'consumer' },
         provider: 'pi',
         context: { resume: 'source' },
         depends_on: ['source'],
@@ -21042,7 +24212,8 @@ describe('executeDagWorkflow -- addressable session resume', () => {
       },
       {
         id: 'final',
-        prompt: 'final',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'final' },
         provider: 'pi',
         context: { resume: 'consumer' },
         depends_on: ['consumer'],
@@ -21071,11 +24242,13 @@ describe('executeDagWorkflow -- addressable session resume', () => {
     const store = await runAddressableWorkflow([
       {
         id: 'loop-source',
+        kind: 'loop',
         loop: { prompt: 'iterate', until: 'DONE', max_iterations: 1, fresh_context: false },
       },
       {
         id: 'consumer',
-        prompt: 'consumer',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'consumer' },
         context: { resume: 'loop-source' },
         depends_on: ['loop-source'],
       },
@@ -21096,10 +24269,11 @@ describe('executeDagWorkflow -- addressable session resume', () => {
 
     await runAddressableWorkflow(
       [
-        { id: 'source', prompt: 'must be skipped' },
+        { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'must be skipped' } },
         {
           id: 'synthesis',
-          prompt: 'synthesize',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'synthesize' },
           context: { resume: 'source' },
           depends_on: ['source'],
         },
@@ -21146,10 +24320,11 @@ describe('executeDagWorkflow -- addressable session resume', () => {
 
     await runAddressableWorkflow(
       [
-        { id: 'source', prompt: 'source' },
+        { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'source' } },
         {
           id: 'consumer',
-          prompt: 'consumer',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'consumer' },
           context: { resume: 'source' },
           persist_session: true,
           depends_on: ['source'],
@@ -21171,10 +24346,11 @@ describe('executeDagWorkflow -- addressable session resume', () => {
       yield { type: 'result' };
     });
     const store = await runAddressableWorkflow([
-      { id: 'source', prompt: 'source' },
+      { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'source' } },
       {
         id: 'consumer',
-        prompt: 'consumer',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'consumer' },
         context: { resume: 'source' },
         depends_on: ['source'],
       },
@@ -21213,10 +24389,11 @@ describe('executeDagWorkflow -- addressable session resume', () => {
         }
       });
       const store = await runAddressableWorkflow([
-        { id: 'source', prompt: 'source' },
+        { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'source' } },
         {
           id: 'consumer',
-          prompt: 'consumer',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'consumer' },
           context: { resume: 'source' },
           depends_on: ['source'],
         },
@@ -21254,10 +24431,11 @@ describe('executeDagWorkflow -- addressable session resume', () => {
       updated_at: '2026-08-19T00:00:00Z',
     };
     const nodes: DagNode[] = [
-      { id: 'source', prompt: 'skipped' },
+      { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'skipped' } },
       {
         id: 'consumer',
-        prompt: 'consumer',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'consumer' },
         context: { resume: 'source' },
         depends_on: ['source'],
       },
@@ -21293,10 +24471,11 @@ describe('executeDagWorkflow -- addressable session resume', () => {
 
     await runAddressableWorkflow(
       [
-        { id: 'source', prompt: 'source' },
+        { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'source' } },
         {
           id: 'consumer',
-          prompt: 'consumer',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'consumer' },
           context: { resume: 'source' },
           depends_on: ['source'],
         },
@@ -21331,11 +24510,13 @@ describe('executeDagWorkflow -- addressable session resume', () => {
       [
         {
           id: 'loop-source',
+          kind: 'loop',
           loop: { prompt: 'iterate', until: 'DONE', max_iterations: 1, fresh_context: false },
         },
         {
           id: 'consumer',
-          prompt: 'consumer',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'consumer' },
           context: { resume: 'loop-source' },
           depends_on: ['loop-source'],
         },
@@ -21366,8 +24547,13 @@ describe('executeDagWorkflow -- addressable session resume', () => {
 
     await runAddressableWorkflow(
       [
-        { id: 'source', prompt: 'source' },
-        { id: 'later', prompt: 'later', depends_on: ['source'] },
+        { id: 'source', kind: 'agent', source: { kind: 'inline', prompt: 'source' } },
+        {
+          id: 'later',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'later' },
+          depends_on: ['source'],
+        },
       ],
       store
     );
@@ -21480,7 +24666,10 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
       'conv-prov-bound',
       {
         name: 'dag-provider-boundary',
-        nodes: [{ id: 'a', prompt: 'First step' }, secondNode],
+        nodes: [
+          { id: 'a', kind: 'agent', source: { kind: 'inline', prompt: 'First step' } },
+          secondNode,
+        ],
       },
       makeWorkflowRun('provider-boundary-run')
     );
@@ -21494,7 +24683,8 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
 
     await runTwoNodeWorkflow({
       id: 'b',
-      prompt: 'Second step',
+      kind: 'agent',
+      source: { kind: 'inline', prompt: 'Second step' },
       depends_on: ['a'],
       provider: 'codex',
     });
@@ -21511,7 +24701,12 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
       yield { type: 'result', sessionId: 'sess-a' };
     });
 
-    await runTwoNodeWorkflow({ id: 'b', prompt: 'Second step', depends_on: ['a'] });
+    await runTwoNodeWorkflow({
+      id: 'b',
+      kind: 'agent',
+      source: { kind: 'inline', prompt: 'Second step' },
+      depends_on: ['a'],
+    });
 
     expect(mockSendQueryDag.mock.calls.length).toBe(2);
     expect(mockSendQueryDag.mock.calls[0][2]).toBeUndefined();
@@ -21536,6 +24731,7 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
         nodes: [
           {
             id: 'work',
+            kind: 'loop',
             loop: {
               fresh_context: false,
               prompt: 'Iterate until done.',
@@ -21543,7 +24739,13 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
               max_iterations: 3,
             },
           },
-          { id: 'after', prompt: 'Summarize', depends_on: ['work'], provider: 'codex' },
+          {
+            id: 'after',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Summarize' },
+            depends_on: ['work'],
+            provider: 'codex',
+          },
         ],
       },
       makeWorkflowRun('provider-boundary-loop-run')
@@ -21573,6 +24775,7 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
         nodes: [
           {
             id: 'work',
+            kind: 'loop',
             loop: {
               fresh_context: false,
               prompt: 'Iterate until done.',
@@ -21580,7 +24783,12 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
               max_iterations: 3,
             },
           },
-          { id: 'after', prompt: 'Summarize', depends_on: ['work'] },
+          {
+            id: 'after',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Summarize' },
+            depends_on: ['work'],
+          },
         ],
       },
       makeWorkflowRun('same-provider-loop-run')
@@ -21615,15 +24823,22 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
         nodes: [
           {
             id: 'fixer',
+            kind: 'loop_group',
             loop_group: {
               until: 'DONE',
               max_iterations: 3,
               fresh_context: false,
               nodes: [
-                { id: 'x', prompt: 'analyze the failure', depends_on: [] },
+                {
+                  id: 'x',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'analyze the failure' },
+                  depends_on: [],
+                },
                 {
                   id: 'y',
-                  prompt: 'apply the fix, emit DONE when green',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'apply the fix, emit DONE when green' },
                   depends_on: ['x'],
                   provider: 'codex',
                 },
@@ -21667,13 +24882,24 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
         nodes: [
           {
             id: 'fixer',
+            kind: 'loop_group',
             loop_group: {
               until: 'DONE',
               max_iterations: 3,
               fresh_context: false,
               nodes: [
-                { id: 'x', prompt: 'analyze the failure', depends_on: [] },
-                { id: 'y', prompt: 'apply the fix, emit DONE when green', depends_on: ['x'] },
+                {
+                  id: 'x',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'analyze the failure' },
+                  depends_on: [],
+                },
+                {
+                  id: 'y',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'apply the fix, emit DONE when green' },
+                  depends_on: ['x'],
+                },
               ],
             },
             depends_on: [],
@@ -21708,13 +24934,21 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
         nodes: [
           {
             id: 'refine',
+            kind: 'loop_group',
             loop_group: {
               until: 'DONE',
               max_iterations: 5,
               fresh_context: false,
               interactive: true,
               gate_message: 'Review.',
-              nodes: [{ id: 'work', prompt: 'Refine the draft.', depends_on: [] }],
+              nodes: [
+                {
+                  id: 'work',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'Refine the draft.' },
+                  depends_on: [],
+                },
+              ],
             },
             depends_on: [],
           },
@@ -21758,6 +24992,7 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
         nodes: [
           {
             id: 'refine',
+            kind: 'loop_group',
             loop_group: {
               until: 'DONE',
               max_iterations: 5,
@@ -21765,8 +25000,18 @@ describe('executeDagWorkflow -- provider-boundary session threading (#1992)', ()
               interactive: true,
               gate_message: 'Review.',
               nodes: [
-                { id: 'lint', prompt: 'run lint checks', depends_on: [] },
-                { id: 'test', prompt: 'run test checks', depends_on: [] },
+                {
+                  id: 'lint',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'run lint checks' },
+                  depends_on: [],
+                },
+                {
+                  id: 'test',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'run test checks' },
+                  depends_on: [],
+                },
               ],
             },
             depends_on: [],
@@ -21841,7 +25086,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       ])
     );
     expect(errors).toHaveLength(0);
-    return [...workflows.get('inc-parent')!.nodes];
+    return [...(workflows.get('inc-parent')!.nodes as DagNode[])];
   }
 
   function expandedGatedParentNodes(
@@ -21904,7 +25149,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       ])
     );
     expect(errors).toHaveLength(0);
-    return [...workflows.get('gated-parent')!.nodes];
+    return [...(workflows.get('gated-parent')!.nodes as DagNode[])];
   }
 
   function expandedMultiSinkDependencyNodes(
@@ -21942,7 +25187,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       ])
     );
     expect(errors).toHaveLength(0);
-    return [...workflows.get('multi-sink-parent')!.nodes];
+    return [...(workflows.get('multi-sink-parent')!.nodes as DagNode[])];
   }
 
   function expandedMixedEntryTriggerNodes(): DagNode[] {
@@ -21972,7 +25217,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       ])
     );
     expect(errors).toHaveLength(0);
-    return [...workflows.get('mixed-entry-parent')!.nodes];
+    return [...(workflows.get('mixed-entry-parent')!.nodes as DagNode[])];
   }
 
   function eventList(deps: WorkflowDeps): Array<{ event_type: string; step_name: string }> {
@@ -22344,7 +25589,7 @@ describe('executeDagWorkflow -- unexpanded include node fail-fast guard', () => 
 
     // A raw include node reaching the executor with a resume entry for its own id: the
     // guard must fire BEFORE the resume-skip check, so it fails instead of being skipped.
-    const includeNode = dagNodeSchema.parse({ id: 'inc', include: 'some-block' });
+    const includeNode = dagNodeSchema.parse({ id: 'inc', include: 'some-block' }) as DagNode;
     const prior = new Map([['inc', { output: 'stale prior output' }]]);
 
     await executeDagWorkflow(
@@ -22397,7 +25642,9 @@ describe('executeDagWorkflow -- unexpanded include node fail-fast guard', () => 
       platform,
       'conv-inc-guard',
       testDir,
-      { name: 'inc-guard', nodes },
+      // Deliberately includes an unexpanded include directive — the test exercises the
+      // `when:` guard firing BEFORE the executor would ever need to resolve it.
+      { name: 'inc-guard', nodes: nodes as DagNode[] },
       workflowRun,
       'claude',
       undefined,
@@ -22473,7 +25720,7 @@ describe('executeDagWorkflow -- approval node inside an included block', () => {
 
     // capture_response (stored as $<approvalId>.output) is reachable via the namespaced id.
     const after = expanded.nodes.find(n => n.id === 'after');
-    expect(after && 'bash' in after ? after.bash : '').toBe('echo $rev__approve.output');
+    expect(after && 'script' in after ? after.script : '').toBe('echo $rev__approve.output');
 
     const store = createMockStore();
     const mockDeps = createMockDeps(store);
@@ -22485,7 +25732,7 @@ describe('executeDagWorkflow -- approval node inside an included block', () => {
       platform,
       'conv-inc-approval',
       testDir,
-      { name: 'apparent', nodes: expanded.nodes },
+      { name: 'apparent', nodes: expanded.nodes as DagNode[] },
       workflowRun,
       'claude',
       undefined,
@@ -22510,7 +25757,9 @@ describe('executeDagWorkflow -- approval node inside an included block', () => {
   });
 
   it('the same approval block included twice yields distinct namespaced approval ids', () => {
-    const block = buildWf('apblk', [{ id: 'approve', approval: { message: 'Approve?' } }]);
+    const block = buildWf('apblk', [
+      { id: 'approve', approval: { message: 'Approve?', capture_response: false } },
+    ]);
     const parent = {
       ...buildWf('apparent', [
         { id: 'a', include: 'apblk' },
@@ -22550,8 +25799,14 @@ describe('containerCommandName', () => {
 
 describe('collectContainerIncompatibleProviders', () => {
   const promptNode = (id: string, provider?: string): DagNode =>
-    ({ id, prompt: `do ${id}`, ...(provider ? { provider } : {}) }) as unknown as DagNode;
-  const bashNode = (id: string): DagNode => ({ id, bash: 'echo hi' }) as unknown as DagNode;
+    ({
+      id,
+      kind: 'agent',
+      source: { kind: 'inline', prompt: `do ${id}` },
+      ...(provider ? { provider } : {}),
+    }) as unknown as DagNode;
+  const bashNode = (id: string): DagNode =>
+    ({ id, kind: 'exec', runtime: 'sh', script: 'echo hi' }) as unknown as DagNode;
 
   it('is empty when all AI nodes resolve to claude (containerExec: true)', () => {
     const nodes = [promptNode('a'), promptNode('b', 'claude'), bashNode('c')];
@@ -22580,6 +25835,7 @@ describe('collectContainerIncompatibleProviders', () => {
   it('recurses loop_group bodies', () => {
     const group = {
       id: 'g',
+      kind: 'loop_group',
       loop_group: { max_iterations: 2, nodes: [promptNode('inner', 'codex')] },
     } as unknown as DagNode;
     const bad = collectContainerIncompatibleProviders([group], 'claude');
@@ -22647,6 +25903,255 @@ describe('buildSubprocessDockerArgs — bash/script env isolation', () => {
   });
 });
 
+describe('subprocess credential redaction', () => {
+  const execContext = { kind: 'container' as const, containerId: 'cid-redaction' };
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-container-redaction-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it('removes exact injected credentials from every rejection field before persistence', async () => {
+    const openAiSecret = 'sk-openai-not-shaped';
+    const otherInjectedSecret = 'credential-with-no-known-shape';
+    const projectSecret = 'project-secret-with-no-known-shape';
+    const databaseUrl = 'postgres://user:password@db.internal/archon';
+    const fileDeliveredSecret = 'oauth-token-only-present-in-auth-file';
+    const logDir = join(testDir, 'logs');
+    const workflowRun = makeWorkflowRun('container-redaction-run', {
+      workflow_name: 'container-redaction',
+      conversation_id: 'conv-container-redaction',
+    });
+    const store = createMockStore();
+    const platform = createMockPlatform();
+    let rejection:
+      | (Error & {
+          code: number;
+          killed: boolean;
+          cmd: string;
+          spawnargs: string[];
+          stdout: string;
+          stderr: string;
+        })
+      | undefined;
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (command: string, args: string[]) => {
+        const commandLine = [command, ...args].join(' ');
+        rejection = Object.assign(
+          new Error(`Command failed: ${commandLine}\nmessage echoed ${openAiSecret}`),
+          {
+            code: 1,
+            killed: false,
+            cmd: commandLine,
+            spawnargs: args,
+            stdout: `stdout echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, ${databaseUrl}, and ${fileDeliveredSecret}`,
+            stderr: `stderr echoed ${openAiSecret}, ${otherInjectedSecret}, ${projectSecret}, ${databaseUrl}, and ${fileDeliveredSecret}`,
+          }
+        );
+        throw rejection;
+      }
+    );
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        workflowRun.conversation_id,
+        testDir,
+        {
+          name: workflowRun.workflow_name,
+          nodes: [{ id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        logDir,
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          // Secret-suffixed keys redact automatically; BASE_BRANCH is the visible control.
+          envVars: {
+            OPENAI_API_KEY: openAiSecret,
+            CUSTOM_AUTH: otherInjectedSecret,
+            PROJECT_SECRET: projectSecret,
+            DATABASE_URL: databaseUrl,
+            BASE_BRANCH: 'main',
+          },
+          protectedEnvKeys: ['OPENAI_API_KEY', 'CUSTOM_AUTH', 'DATABASE_URL'],
+          protectedCredentialValues: [fileDeliveredSecret],
+        },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        execContext
+      );
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      const dockerArgs = execSpy.mock.calls[0]?.[1] as string[];
+      expect(dockerArgs.join(' ')).toContain(openAiSecret);
+      expect(dockerArgs.join(' ')).toContain(otherInjectedSecret);
+      expect(dockerArgs.join(' ')).toContain(projectSecret);
+      expect(dockerArgs.join(' ')).toContain(databaseUrl);
+
+      expect(rejection).toBeDefined();
+      expect(rejection?.code).toBe(1);
+      expect(rejection?.killed).toBe(false);
+      const rejectionText = [
+        rejection?.message,
+        rejection?.stack,
+        rejection?.cmd,
+        rejection?.spawnargs.join(' '),
+        rejection?.stdout,
+        rejection?.stderr,
+      ].join('\n');
+      expect(rejectionText).not.toContain(openAiSecret);
+      expect(rejectionText).not.toContain(otherInjectedSecret);
+      expect(rejectionText).not.toContain(projectSecret);
+      expect(rejectionText).not.toContain(databaseUrl);
+      expect(rejectionText).not.toContain(fileDeliveredSecret);
+      expect(rejection?.cmd).toContain('OPENAI_API_KEY=[REDACTED]');
+      expect(rejection?.cmd).toContain('CUSTOM_AUTH=[REDACTED]');
+      expect(rejection?.cmd).toContain('PROJECT_SECRET=[REDACTED]');
+      expect(rejection?.cmd).toContain('DATABASE_URL=[REDACTED]');
+      expect(rejection?.cmd).toContain('BASE_BRANCH=main');
+      expect(rejection?.spawnargs.join(' ')).toContain('OPENAI_API_KEY=[REDACTED]');
+      expect(rejection?.spawnargs.join(' ')).toContain('DATABASE_URL=[REDACTED]');
+      expect(rejection?.spawnargs.join(' ')).toContain('BASE_BRANCH=main');
+
+      const durableEventText = JSON.stringify(
+        (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls
+      );
+      const durableMessageText = JSON.stringify(platform.sendMessage.mock.calls);
+      const durableLogText = await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8');
+      for (const durableText of [durableEventText, durableMessageText, durableLogText]) {
+        expect(durableText).not.toContain(openAiSecret);
+        expect(durableText).not.toContain(otherInjectedSecret);
+        expect(durableText).not.toContain(projectSecret);
+        expect(durableText).not.toContain(databaseUrl);
+        expect(durableText).not.toContain(fileDeliveredSecret);
+      }
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('removes a protected credential echoed by a failed host subprocess', async () => {
+    const protectedSecret = 'host-file-delivered-oauth-secret';
+    const ambientSecret = 'host-ambient-anthropic-secret';
+    const ambientDatabaseUrl = 'postgres://ambient:password@db.internal/archon';
+    const originalAmbientSecret = process.env.ANTHROPIC_API_KEY;
+    const originalAmbientDatabaseUrl = process.env.DATABASE_URL;
+    process.env.ANTHROPIC_API_KEY = ambientSecret;
+    process.env.DATABASE_URL = ambientDatabaseUrl;
+    const logDir = join(testDir, 'host-logs');
+    const workflowRun = makeWorkflowRun('host-redaction-run', {
+      workflow_name: 'host-redaction',
+      conversation_id: 'conv-host-redaction',
+    });
+    const store = createMockStore();
+    const platform = createMockPlatform();
+    let rejection:
+      | (Error & { code: number; killed: boolean; cmd: string; stdout: string; stderr: string })
+      | undefined;
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (command: string, args: string[]) => {
+        const commandLine = [command, ...args].join(' ');
+        rejection = Object.assign(
+          new Error(
+            `Command failed: ${commandLine}\nmessage echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`
+          ),
+          {
+            code: 1,
+            killed: false,
+            cmd: commandLine,
+            stdout: `stdout echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`,
+            stderr: `stderr echoed ${protectedSecret}, ${ambientSecret}, and ${ambientDatabaseUrl}`,
+          }
+        );
+        throw rejection;
+      }
+    );
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        workflowRun.conversation_id,
+        testDir,
+        {
+          name: workflowRun.workflow_name,
+          nodes: [{ id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'host-artifacts'),
+        join(testDir, 'host-state'),
+        logDir,
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          envVars: { CODEX_HOME: '/run/codex-home', BASE_BRANCH: 'main' },
+          protectedEnvKeys: ['CODEX_HOME'],
+          protectedCredentialValues: [protectedSecret],
+        }
+      );
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      expect(execSpy.mock.calls[0]?.[0]).not.toBe('docker');
+      const rejectionText = [
+        rejection?.message,
+        rejection?.stack,
+        rejection?.cmd,
+        rejection?.stdout,
+        rejection?.stderr,
+      ].join('\n');
+      expect(rejectionText).not.toContain(protectedSecret);
+      expect(rejectionText).not.toContain(ambientSecret);
+      expect(rejectionText).not.toContain(ambientDatabaseUrl);
+
+      const durableEventText = JSON.stringify(
+        (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls
+      );
+      const durableMessageText = JSON.stringify(platform.sendMessage.mock.calls);
+      const durableLogText = await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8');
+      for (const durableText of [durableEventText, durableMessageText, durableLogText]) {
+        expect(durableText).not.toContain(protectedSecret);
+        expect(durableText).not.toContain(ambientSecret);
+        expect(durableText).not.toContain(ambientDatabaseUrl);
+      }
+    } finally {
+      execSpy.mockRestore();
+      if (originalAmbientSecret === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = originalAmbientSecret;
+      }
+      if (originalAmbientDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = originalAmbientDatabaseUrl;
+      }
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Container write-back gate + suspend-on-pause (Phase C)
 // ---------------------------------------------------------------------------
@@ -22689,7 +26194,7 @@ describe('executeDagWorkflow -- container write-back gate', () => {
       createMockPlatform(),
       'conv-wb',
       wbTestDir,
-      { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
+      { name: 'wb', nodes: [{ id: 'a', kind: 'exec', runtime: 'sh', script: 'echo hi' }] },
       makeWorkflowRun('wb-run'),
       'claude',
       undefined,
@@ -22749,6 +26254,42 @@ describe('executeDagWorkflow -- container write-back gate', () => {
     expect(extraMeta.pending_writeback?.envId).toBe('env-x');
     expect(backend.suspend).toHaveBeenCalledTimes(1);
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('a lost pause CAS during write-back stays fail-closed: throws, never suspends (#2489)', async () => {
+    // Unlike the other four gate types, a lost pause here must NEVER be tolerated —
+    // failClosed: true (dag-executor.ts raiseWriteBackGate) means this rejects
+    // straight through instead of being treated as a legitimate external
+    // transition, so the container teardown path preserves the overlay for retry.
+    // backend.suspend never firing proves the entire downstream sequence
+    // (suspend, then the user message) never runs — both are strictly sequential
+    // awaits after the pause call, with nothing to catch a throw in between.
+    const backend = makeWritebackBackend({
+      finalize: mock(async () => ({
+        requiresApproval: true,
+        changeSummary: {
+          added: ['x.md'],
+          modified: [],
+          deleted: [],
+          symlinks: [],
+          skipped: [],
+          totalCount: 1,
+          truncated: false,
+        },
+      })),
+    });
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(() => Promise.resolve('running' as const));
+    store.getWorkflowRun = mock(() => Promise.resolve(makeWorkflowRun('wb-run', { metadata: {} })));
+    store.claimWriteback = mock(() => Promise.resolve({ claimed: true }));
+    store.pauseWorkflowRun = mock(() =>
+      Promise.reject(new Error('Workflow run not found or not in running state (id: wb-run)'))
+    );
+
+    await expect(runGateWithStore(store, backend, 'approve')).rejects.toThrow(
+      /not found or not in running state/
+    );
+    expect(backend.suspend).not.toHaveBeenCalled();
   });
 
   it('non-empty diff + auto policy → applies without pausing, then completes', async () => {
@@ -22837,7 +26378,7 @@ describe('executeDagWorkflow -- container write-back gate', () => {
         createMockPlatform(),
         'conv-wb',
         wbTestDir,
-        { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
+        { name: 'wb', nodes: [{ id: 'a', kind: 'exec', runtime: 'sh', script: 'echo hi' }] },
         makeWorkflowRun('wb-run'),
         'claude',
         undefined,
@@ -22903,7 +26444,7 @@ describe('executeDagWorkflow -- container write-back gate', () => {
       createMockPlatform(),
       'conv-wb',
       wbTestDir,
-      { name: 'wb', nodes: [{ id: 'a', bash: 'echo hi' }] },
+      { name: 'wb', nodes: [{ id: 'a', kind: 'exec', runtime: 'sh', script: 'echo hi' }] },
       makeWorkflowRun('wb-run'),
       'claude',
       undefined,
@@ -23122,7 +26663,16 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
         testDir,
         {
           name: 'pause-race-approval',
-          nodes: [{ id: 'review', approval: { message: 'Approve this plan?' } }],
+          nodes: [
+            {
+              id: 'review',
+              kind: 'gate',
+              message: 'Approve this plan?',
+              decisions: [{ id: 'approve' }, { id: 'reject' }],
+              captureResponse: false,
+              decisionsAuthored: false,
+            },
+          ],
         },
         workflowRun,
         'claude',
@@ -23178,6 +26728,7 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
           nodes: [
             {
               id: 'refine',
+              kind: 'loop',
               loop: {
                 fresh_context: false,
                 prompt: 'User said: $LOOP_USER_INPUT. Refine the plan.',
@@ -23212,6 +26763,86 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it('workflow: child-pause gate that loses the pause CAS halts cleanly (#2489)', async () => {
+    // Unlike the other three gate types, this one never calls ctx.runChildWorkflow —
+    // findChildRuns already reports an existing PAUSED child, so executeWorkflowNode
+    // re-pauses the parent directly via pauseParentOnChild. Before #2489 this call site
+    // bypassed pauseGateRespectingExternalTransition, so a lost CAS here threw straight
+    // into a node_failed instead of tolerating the external transition like the other
+    // three sites. This proves the unification: the same tolerant outcome now holds.
+    const store = createExternallyFailedStore();
+    store.findChildRuns = mock(() =>
+      Promise.resolve([
+        makeWorkflowRun('child-run-id', {
+          workflow_name: 'child-wf',
+          status: 'paused',
+          metadata: { parent_node_id: 'sub' },
+        }),
+      ])
+    );
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const emitted: string[] = [];
+    const unsubscribe = getWorkflowEventEmitter().subscribe((event: WorkflowEmitterEvent) => {
+      if ('runId' in event && event.runId === workflowRun.id) emitted.push(event.type);
+    });
+
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-pause-race-child',
+        testDir,
+        {
+          name: 'pause-race-child',
+          nodes: [{ id: 'sub', kind: 'workflow', workflow: 'child-wf' } as DagNode],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        async () => {
+          throw new Error(
+            'runChildWorkflow should not be called — an existing paused child was found'
+          );
+        }
+      );
+    } finally {
+      unsubscribe();
+    }
+
+    // The re-pause never actually landed — no approval_pending signal to live UIs, and
+    // no stale "Blocked on sub-run" chat notification (gated on the pause having
+    // succeeded) — unlike the run-stopped notice below, which is unrelated to this
+    // gate and fires generically whenever the between-layer status check observes the
+    // run already left 'running'.
+    expect(emitted).not.toContain('approval_pending');
+    const sentMessages = platform.sendMessage.mock.calls.map(([, message]) => message);
+    expect(sentMessages.some(message => message.includes('Blocked on sub-run'))).toBe(false);
+    const events = (
+      store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
+    ).mock.calls.map((c: unknown[]) => (c[0] as { event_type: string }).event_type);
+    expect(events).not.toContain('node_failed');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
   it('gate pause failure with the run still running stays a genuine node failure', async () => {
     const store = createMockStore();
     // Pause fails but the run is still 'running' (default mock) — a real store
@@ -23229,7 +26860,16 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
       testDir,
       {
         name: 'pause-genuine-failure',
-        nodes: [{ id: 'review', approval: { message: 'Approve this plan?' } }],
+        nodes: [
+          {
+            id: 'review',
+            kind: 'gate',
+            message: 'Approve this plan?',
+            decisions: [{ id: 'approve' }, { id: 'reject' }],
+            captureResponse: false,
+            decisionsAuthored: false,
+          },
+        ],
       },
       workflowRun,
       'claude',
@@ -23294,12 +26934,16 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
   }
 
   function wfDef(name: string, nodes: unknown[], workflowLevel: object = {}): WorkflowDefinition {
-    return workflowDefinitionSchema.parse({
+    // Each node is already parsed (flat -> resolved) below — do NOT also route the
+    // whole object through workflowDefinitionSchema.parse(): its `nodes` field
+    // re-validates against the FLAT authored schema, which an already-resolved
+    // DagNode (kind/source) no longer satisfies (#2486).
+    return {
       name,
       description: name,
       nodes: nodes.map(n => dagNodeSchema.parse(n)),
       ...workflowLevel,
-    });
+    };
   }
 
   const collapseConfig: WorkflowConfig = {
@@ -23378,7 +27022,7 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
       createMockPlatform(),
       'conv-collapse',
       testDir,
-      workflow,
+      ready(workflow),
       makeWorkflowRun(`collapse-${runName}`, { workflow_name: runName }),
       workflowProvider,
       workflowModel,
@@ -23512,7 +27156,7 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
     );
     expect(errors).toEqual([]);
     const expanded = workflows.get('parent')!;
-    const byId = new Map(expanded.nodes.map(n => [n.id, n]));
+    const byId = new Map(expanded.nodes.map(n => [n.id, n as DagNode]));
     expect(byId.get('own')?.provider).toBe('claude');
     expect(byId.get('a__run')?.provider).toBe('pi');
     expect(byId.get('b__run')?.provider).toBe('codex');
@@ -23563,10 +27207,10 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
       ])
     );
     expect(errors).toEqual([]);
-    const group = workflows.get('top')!.nodes.find(n => n.id === 'm__in__group')!;
+    const group = workflows.get('top')!.nodes.find(n => n.id === 'm__in__group')! as LoopGroupNode;
     expect(group.provider).toBe('codex');
     // The body node carries the INNER file's provider, not mid's or top's.
-    const body = group.loop_group?.nodes[0];
+    const body = group.loop_group?.nodes[0] as DagNode | undefined;
     expect(body?.provider).toBe('codex');
     expect(body?.model).toBe('gpt-5.6-sol');
   });
@@ -23600,12 +27244,16 @@ describe('executeDagWorkflow -- composed-workflow run-time boundaries', () => {
   });
 
   function buildWf(name: string, nodes: unknown[], extra: object = {}): WorkflowDefinition {
-    return workflowDefinitionSchema.parse({
+    // Each node is already parsed (flat -> resolved) below — do NOT also route the
+    // whole object through workflowDefinitionSchema.parse(): its `nodes` field
+    // re-validates against the FLAT authored schema, which an already-resolved
+    // DagNode (kind/source) no longer satisfies (#2486).
+    return {
       name,
       description: name,
       nodes: nodes.map(n => dagNodeSchema.parse(n)),
       ...extra,
-    });
+    };
   }
 
   /** The `node_output` a completed node persisted, read from its node_completed event. */
@@ -23628,7 +27276,7 @@ describe('executeDagWorkflow -- composed-workflow run-time boundaries', () => {
       createMockPlatform(),
       'conv-dag',
       testDir,
-      workflows.get(runName)!,
+      ready(workflows.get(runName)!),
       makeWorkflowRun(`comp-${runName}`, { workflow_name: runName }),
       'claude',
       undefined,
@@ -23771,7 +27419,7 @@ describe('executeDagWorkflow -- composed-workflow run-time boundaries', () => {
       createMockPlatform(),
       'conv-dag',
       testDir,
-      workflows.get('env-parent')!,
+      ready(workflows.get('env-parent')!),
       makeWorkflowRun('comp-env', { workflow_name: 'env-parent', user_message: 'real-args' }),
       'claude',
       undefined,
@@ -23841,7 +27489,7 @@ describe('executeDagWorkflow -- systemPrompt and agents are runtime substitution
       createMockPlatform(),
       'conv-dag',
       testDir,
-      { name: 'aicfg', nodes: nodes.map(n => dagNodeSchema.parse(n)) },
+      { name: 'aicfg', nodes: nodes.map(n => dagNodeSchema.parse(n) as DagNode) },
       run,
       'claude',
       undefined,
@@ -23888,7 +27536,7 @@ describe('executeDagWorkflow -- systemPrompt and agents are runtime substitution
       id: 'use',
       prompt: 'go',
       systemPrompt: 'dir=$ARTIFACTS_DIR',
-    });
+    }) as DagNode;
     await executeDagWorkflow(
       createMockDeps(),
       createMockPlatform(),
@@ -23942,7 +27590,7 @@ describe('executeDagWorkflow -- systemPrompt and agents are runtime substitution
       createMockPlatform(),
       'conv-dag',
       testDir,
-      workflows.get('sp-parent')!,
+      ready(workflows.get('sp-parent')!),
       makeWorkflowRun('sp-composed'),
       'claude',
       undefined,
@@ -23986,12 +27634,16 @@ describe('executeDagWorkflow -- composition governance survives the collapse', (
   });
 
   function buildWf(name: string, nodes: unknown[], extra: object = {}): WorkflowDefinition {
-    return workflowDefinitionSchema.parse({
+    // Each node is already parsed (flat -> resolved) below — do NOT also route the
+    // whole object through workflowDefinitionSchema.parse(): its `nodes` field
+    // re-validates against the FLAT authored schema, which an already-resolved
+    // DagNode (kind/source) no longer satisfies (#2486).
+    return {
       name,
       description: name,
       nodes: nodes.map(n => dagNodeSchema.parse(n)),
       ...extra,
-    });
+    };
   }
 
   it('AC13 — a run paused BEFORE the collapse resumes with collapsed config afterwards', async () => {
@@ -24043,7 +27695,7 @@ describe('executeDagWorkflow -- composition governance survives the collapse', (
       createMockPlatform(),
       'conv-gov',
       testDir,
-      workflows.get('resume-parent')!,
+      ready(workflows.get('resume-parent')!),
       makeWorkflowRun('gov-resume', { workflow_name: 'resume-parent' }),
       'claude',
       undefined,
@@ -24074,7 +27726,11 @@ describe('executeDagWorkflow -- composition governance survives the collapse', (
   it('AC12 — a composed approval pauses the PARENT run, with no child run id', async () => {
     const block = buildWf('gate-blk', [
       { id: 'plan', prompt: 'plan' },
-      { id: 'gate', approval: { message: 'Approve?' }, depends_on: ['plan'] },
+      {
+        id: 'gate',
+        approval: { message: 'Approve?', capture_response: false },
+        depends_on: ['plan'],
+      },
     ]);
     const parent = buildWf('gate-parent', [{ id: 'inc', include: 'gate-blk' }], {
       interactive: true,
@@ -24095,7 +27751,7 @@ describe('executeDagWorkflow -- composition governance survives the collapse', (
       createMockPlatform(),
       'conv-gov',
       testDir,
-      workflows.get('gate-parent')!,
+      ready(workflows.get('gate-parent')!),
       makeWorkflowRun(runId, { workflow_name: 'gate-parent' }),
       'claude',
       undefined,
@@ -24148,7 +27804,11 @@ describe('executeDagWorkflow -- a workflow-level provider/model conflict is repo
       new Map([
         [
           'conflict',
-          workflowDefinitionSchema.parse({
+          // Each node is already parsed (flat -> resolved) — do NOT also route the
+          // whole object through workflowDefinitionSchema.parse(): its `nodes` field
+          // re-validates against the FLAT authored schema, which an already-resolved
+          // DagNode (kind/source) no longer satisfies (#2486).
+          {
             name: 'conflict',
             description: 'conflict',
             provider: 'claude',
@@ -24158,7 +27818,7 @@ describe('executeDagWorkflow -- a workflow-level provider/model conflict is repo
               dagNodeSchema.parse({ id: 'b', prompt: 'b', depends_on: ['a'] }),
               dagNodeSchema.parse({ id: 'c', prompt: 'c', depends_on: ['b'] }),
             ],
-          }),
+          },
         ],
       ])
     );
@@ -24170,7 +27830,7 @@ describe('executeDagWorkflow -- a workflow-level provider/model conflict is repo
       platform,
       'conv-conflict',
       testDir,
-      workflows.get('conflict')!,
+      ready(workflows.get('conflict')!),
       makeWorkflowRun('conflict-run', { workflow_name: 'conflict' }),
       'claude',
       undefined,
@@ -24449,24 +28109,36 @@ describe('TokenUsage axis seam guard', () => {
    * single run: the node event, the run metadata, the telemetry props, and the
    * JSONL transcript row.
    */
-  async function runSpecimenDag(): Promise<{
+  async function runSpecimenDag(outcome: 'completed' | 'failed' = 'completed'): Promise<{
     store: MockWorkflowStore;
     runId: string;
     logDir: string;
   }> {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'done' };
-      yield { type: 'result', sessionId: 'axis-sid', tokens: AXIS_SPECIMEN };
+      yield {
+        type: 'result',
+        sessionId: 'axis-sid',
+        tokens: AXIS_SPECIMEN,
+        // The provider reports its usage and its failure on the SAME chunk, so the
+        // node reaches a failure writer with the specimen already accumulated. Any
+        // earlier throw would leave nothing for the failure sink to carry, and the
+        // row would pass the guard by being empty on both sides.
+        ...(outcome === 'failed' ? { isError: true, errorSubtype: 'stream_error' } : {}),
+      };
     });
     const store = createMockStore();
     const logDir = join(testDir, 'logs');
-    const workflowRun = makeWorkflowRun('axis-seam-run');
+    const workflowRun = makeWorkflowRun(`axis-seam-run-${outcome}`);
     await executeDagWorkflow(
       createMockDeps(store),
       createMockPlatform(),
       'conv-dag',
       testDir,
-      { name: 'axis-seam', nodes: [{ id: 'step', prompt: 'Do thing.' }] },
+      {
+        name: 'axis-seam',
+        nodes: [{ id: 'step', kind: 'agent', source: { kind: 'inline', prompt: 'Do thing.' } }],
+      },
       workflowRun,
       'claude',
       undefined,
@@ -24545,15 +28217,26 @@ describe('TokenUsage axis seam guard', () => {
 
   it('JSONL transcript node_complete row carries every axis it claims', async () => {
     const { runId, logDir } = await runSpecimenDag();
-    const rows = (await readFile(join(logDir, `${runId}.jsonl`), 'utf-8'))
-      .trim()
-      .split('\n')
-      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const rows = await readTranscript(logDir, runId);
     const nodeComplete = rows.find(row => row.type === 'node_complete' && row.step === 'step');
     expectSeamCarriesAxes(
       'JSONL node_complete.tokens',
       WHOLE_OBJECT_AXIS_KEYS,
       nodeComplete?.tokens as Record<string, unknown>
+    );
+  });
+
+  it('JSONL transcript node_error row carries every axis it claims', async () => {
+    // The failure sink joins the guard here (#2693). It reuses the whole-object map
+    // because logNodeError spreads the same WorkflowUsage carrier logNodeComplete
+    // does — one decision, so a new axis either rides both rows or neither.
+    const { runId, logDir } = await runSpecimenDag('failed');
+    const rows = await readTranscript(logDir, runId);
+    const nodeError = rows.find(row => row.type === 'node_error' && row.step === 'step');
+    expectSeamCarriesAxes(
+      'JSONL node_error.tokens',
+      WHOLE_OBJECT_AXIS_KEYS,
+      nodeError?.tokens as Record<string, unknown>
     );
   });
 
@@ -24566,6 +28249,7 @@ describe('TokenUsage axis seam guard', () => {
     const loopNodes: DagNode[] = [
       {
         id: 'refine',
+        kind: 'loop',
         loop: {
           fresh_context: false,
           prompt: 'Refine.',
@@ -24723,7 +28407,7 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
       createMockPlatform(),
       'conv-2637',
       testDir,
-      workflow,
+      ready(workflow),
       makeWorkflowRun(runId, workflowRunOverrides),
       'claude',
       undefined,
@@ -24898,13 +28582,13 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
         dagNodeSchema.parse({
           id: 'consume',
           command: 'consume',
-          depends_on: ['producer'],
           with: {
             green: '$producer.output.green',
             typed: 42,
             items: '$producer.output.items',
             msg: 'count is $producer.output.count',
           },
+          depends_on: ['producer'],
         }),
       ],
     };
@@ -24970,8 +28654,8 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
         dagNodeSchema.parse({
           id: 'consume',
           command: 'consume',
-          depends_on: ['producer'],
           with: { green: '$producer.output.green' },
+          depends_on: ['producer'],
         }),
       ],
     };
@@ -25027,9 +28711,9 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
         dagNodeSchema.parse({
           id: 'gate',
           command: 'gate',
+          with: { ready: withValue },
           depends_on: ['maybe'],
           trigger_rule: 'all_done',
-          with: { ready: withValue },
         }),
       ],
     });
@@ -25070,8 +28754,8 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
         dagNodeSchema.parse({
           id: 'consume',
           command: 'consume',
-          depends_on: ['producer'],
           with: { green: '$producer.output.green', items: '$producer.output.items' },
+          depends_on: ['producer'],
         }),
       ],
     });
@@ -25195,5 +28879,674 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
     checkPrompts.length = 0;
     await runDag(deliverWorkflow('iteration'), 'transport-deliver-iteration');
     expect(checkPrompts).toEqual(['joined [initial=false|iteration=true]']);
+  });
+
+  // --- loop_group producer bindings, the real deliver topology (#2696) ---
+  //
+  // `deliver`'s `gate-ready` binds `{ from: '$corrections.output', if_skipped: null }`
+  // on a `loop_group` (not a plain node), joined via `trigger_rule: all_done`. Three
+  // cases: the group completes, the group is skipped, and the group fails. All three
+  // build the same shape — a bash-only `corrections` loop_group feeding a `gate-ready`
+  // script node — so each test constructs its own `nodes` array inline rather than a
+  // shared builder, keeping every producer state (completed/skipped/failed) visible at
+  // its call site.
+
+  it("loop_group binding (#2696): a completed group's output resolves through an all_done join, not the if_skipped default", async () => {
+    const nodes = [
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 0',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: [],
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        script: 'console.log(process.env.INPUTS_CORRECTIONS);',
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        with: {
+          corrections: { from: '$corrections.output', if_skipped: 'NO_CORRECTIONS_RAN' },
+        },
+      }),
+    ];
+
+    const result = await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-lg-binding',
+      testDir,
+      { name: 'lg-binding-completed', nodes: nodes as DagNode[] },
+      makeWorkflowRun('lg-binding-completed'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The group's real whole-ref output resolved — the `if_skipped` default never fired.
+    expect(result).toBe('CORRECTIONS_APPLIED');
+  });
+
+  it("loop_group binding (#2696): a skipped group's binding takes if_skipped", async () => {
+    const nodes = [
+      dagNodeSchema.parse({ id: 'gate', bash: "printf 'skip'", depends_on: [] }),
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 0',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: ['gate'],
+        when: "$gate.output == 'run'",
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        script: 'console.log(process.env.INPUTS_CORRECTIONS);',
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        with: {
+          corrections: { from: '$corrections.output', if_skipped: 'NO_CORRECTIONS_RAN' },
+        },
+      }),
+    ];
+
+    const result = await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-lg-binding',
+      testDir,
+      { name: 'lg-binding-skipped', nodes: nodes as DagNode[] },
+      makeWorkflowRun('lg-binding-skipped'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The group never ran — the binding took its declared default, unchanged by #2696.
+    expect(result).toBe('NO_CORRECTIONS_RAN');
+  });
+
+  it("loop_group binding (#2696): a failed group's binding fails the consumer instead of resolving stale output", async () => {
+    // Reproduces run 6607bf20 (issue #2696): the group fails via max_iterations
+    // exhaustion, but its one completed iteration left real, non-empty output behind
+    // (captured as `lastIterationOutput` before the completion check that then failed).
+    // Before the fix, `gate-ready` would resolve that stale text as if the group had
+    // succeeded and run its own body on it — the split-brain that flipped PR #2705.
+    const markerPath = join(testDir, 'gate-ready-ran.marker');
+
+    const nodes = [
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 1',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: [],
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        // A stand-in for `flip-ready`'s real public write: proves whether the
+        // consumer's own body ever ran, independent of the run's overall status.
+        script: `require('fs').writeFileSync(${JSON.stringify(markerPath)}, process.env.INPUTS_CORRECTIONS ?? '');`,
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        with: {
+          corrections: { from: '$corrections.output', if_skipped: null },
+        },
+      }),
+    ];
+
+    const platform = createMockPlatform();
+    await executeDagWorkflow(
+      createMockDeps(),
+      platform,
+      'conv-lg-binding',
+      testDir,
+      { name: 'lg-binding-failed', nodes: nodes as DagNode[] },
+      makeWorkflowRun('lg-binding-failed'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // gate-ready's body never executed — no public-write consequence from a failed group.
+    expect(await Bun.file(markerPath).exists()).toBe(false);
+
+    // The failure names both the failed producer and the node whose binding rejected it.
+    const sent = (platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>).mock.calls
+      .map(c => String(c[1]))
+      .join('\n');
+    expect(sent).toContain("Node 'gate-ready'");
+    expect(sent).toContain("'corrections' failed");
+  });
+
+  // --- sibling gaps to the #2710 binding-directive fix (#2713) ---
+  //
+  // #2710 fixed exactly one reader of a failed producer's output: the `{ from,
+  // if_skipped }` binding directive above. This test proves the sibling it explicitly
+  // deferred — a PLAIN (non-directive) `with:` value, which can never use the directive
+  // form and so never got #2710's protection — now fails the consumer too, using the
+  // same `deliver`-shaped topology and failure mode as the tests above.
+  it("sibling gaps (#2713): a failed group's PLAIN with: value fails the consumer instead of resolving stale output", async () => {
+    const markerPath = join(testDir, 'gate-ready-plain-with-ran.marker');
+
+    const nodes = [
+      dagNodeSchema.parse({
+        id: 'corrections',
+        loop_group: {
+          until_bash: 'exit 1',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'apply', bash: "printf 'CORRECTIONS_APPLIED'", depends_on: [] }],
+        },
+        depends_on: [],
+      }),
+      dagNodeSchema.parse({
+        id: 'gate-ready',
+        script: `require('fs').writeFileSync(${JSON.stringify(markerPath)}, process.env.INPUTS_CORRECTIONS ?? '');`,
+        runtime: 'bun',
+        depends_on: ['corrections'],
+        trigger_rule: 'all_done',
+        // Plain whole-ref value — NOT the { from, if_skipped } directive form. This
+        // is resolveWorkflowValue's whole-ref tier, not resolveBindingDirective.
+        with: {
+          corrections: '$corrections.output',
+        },
+      }),
+    ];
+
+    const platform = createMockPlatform();
+    await executeDagWorkflow(
+      createMockDeps(),
+      platform,
+      'conv-lg-binding-plain',
+      testDir,
+      { name: 'lg-binding-plain-with-failed', nodes: nodes as DagNode[] },
+      makeWorkflowRun('lg-binding-plain-with-failed'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // gate-ready's body never executed — no public-write consequence from a failed group.
+    expect(await Bun.file(markerPath).exists()).toBe(false);
+
+    const sent = (platform.sendMessage as Mock<(...args: unknown[]) => Promise<void>>).mock.calls
+      .map(c => String(c[1]))
+      .join('\n');
+    expect(sent).toContain("node 'corrections'");
+    expect(sent).toContain('failed');
+  });
+});
+
+// ─── #2707 step 3: gate-terminated loop_group pause escalation ─────────────
+
+/**
+ * A stateful (not static) IWorkflowStore for exercising the pause-escalation /
+ * resume-completion-recheck round trip: `pauseWorkflowRun`/`rewriteApprovalContext`
+ * actually mutate an in-memory status/metadata pair that `getWorkflowRunStatus`/
+ * `getWorkflowRun` subsequently observe — required because the escalation code
+ * under test reads status/metadata BACK after the body gate's own generic pause,
+ * which the file's default static mocks (always 'running') can never satisfy.
+ */
+function createEscalationStore(runId: string): MockWorkflowStore & {
+  getState: () => { status: WorkflowRunStatus; metadata: Record<string, unknown> };
+} {
+  const base = createMockStore();
+  let status: WorkflowRunStatus = 'running';
+  let metadata: Record<string, unknown> = {};
+  return {
+    ...base,
+    getWorkflowRunStatus: mock<IWorkflowStore['getWorkflowRunStatus']>(async _id => status),
+    getWorkflowRun: mock<IWorkflowStore['getWorkflowRun']>(async _id => ({
+      ...mockWorkflowRun(runId),
+      status,
+      metadata,
+    })),
+    pauseWorkflowRun: mock<IWorkflowStore['pauseWorkflowRun']>(
+      async (_id, approvalContext, extraMetadata) => {
+        status = 'paused';
+        metadata = { ...metadata, ...(extraMetadata ?? {}), approval: { ...approvalContext } };
+      }
+    ),
+    rewriteApprovalContext: mock<IWorkflowStore['rewriteApprovalContext']>(
+      async (_id, approvalContext) => {
+        const currentApproval = metadata.approval as { resolved?: string } | undefined;
+        if (status !== 'paused' || currentApproval?.resolved != null) {
+          return { resolved: false };
+        }
+        metadata = { ...metadata, approval: { ...approvalContext } };
+        return { resolved: true };
+      }
+    ),
+    getState: () => ({ status, metadata }),
+  };
+}
+
+/** A loop_group whose body ends in a gate — the canonical Design A shape. */
+function gateTerminatedLoopGroupWorkflow(): WorkflowDefinition {
+  return {
+    name: 'gate-terminated-loop-group',
+    description: 'Design A canonical shape',
+    interactive: true,
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'grp',
+        loop_group: {
+          // NOT '[ "$check.output.decision" = "approve" ]' — substituteNodeOutputRefs
+          // already shell-quotes the substituted value (e.g. 'approve'), so wrapping
+          // the ref in ITS OWN double quotes compares the literal string 'approve'
+          // (with embedded quote characters) against "approve" and never matches.
+          until_bash: '[ $check.output.decision = "approve" ]',
+          max_iterations: 5,
+          nodes: [
+            { id: 'work', prompt: 'do work. Prior feedback: $LOOP_PREV.check.output.text' },
+            {
+              id: 'check',
+              depends_on: ['work'],
+              approval: {
+                message: 'Continue?',
+                decisions: [{ id: 'approve' }, { id: 'revise' }],
+              },
+            },
+          ],
+        },
+      }),
+    ],
+  };
+}
+
+describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-gate-escalation-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('pauses correctly instead of barreling through remaining iterations', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'work done' };
+      yield { type: 'result', sessionId: 'work-session' };
+    });
+
+    const store = createEscalationStore('run-escalation-1');
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      platform,
+      'conv-dag',
+      testDir,
+      ready(gateTerminatedLoopGroupWorkflow()),
+      makeWorkflowRun('run-escalation-1'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Only 'work' ran once — proves the loop did NOT barrel through remaining
+    // iterations re-running the body every time the gate re-paused.
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    expect(store.getState().status).toBe('paused');
+
+    // The escalation rewrote the pause to point at the enclosing group, carrying
+    // the body gate's own id.
+    const rewriteCalls = (
+      store.rewriteApprovalContext as Mock<IWorkflowStore['rewriteApprovalContext']>
+    ).mock.calls;
+    expect(rewriteCalls.length).toBe(1);
+    expect(rewriteCalls[0][1]).toMatchObject({
+      nodeId: 'grp',
+      bodyGateId: 'check',
+      type: 'approval',
+      iteration: 1,
+    });
+    expect(store.getState().status).toBe('paused');
+  });
+
+  it('resuming after "approve" completes the group without re-running the body', async () => {
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'should not run' };
+      yield { type: 'result', sessionId: 'unexpected-session' };
+    });
+
+    const store = createEscalationStore('run-escalation-2');
+    const platform = createMockPlatform();
+    const approvedDecision = { decision: 'approve', text: '' };
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['grp.work', { output: 'work output' }],
+      [
+        'grp.check',
+        { output: JSON.stringify(approvedDecision), structuredOutput: approvedDecision },
+      ],
+    ]);
+    const workflowRun = makeWorkflowRun('run-escalation-2', {
+      metadata: {
+        approval: {
+          nodeId: 'grp',
+          message: 'Continue?',
+          type: 'approval',
+          bodyGateId: 'check',
+          iteration: 1,
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        } satisfies ApprovalContext,
+      },
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      platform,
+      'conv-dag',
+      testDir,
+      ready(gateTerminatedLoopGroupWorkflow()),
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // No fresh iteration ran — the resumed iteration's completion was decided
+    // from the reconstructed data, not by re-running the body.
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+    expect(
+      (store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>).mock.calls.length
+    ).toBe(1);
+
+    const completedEvents = (
+      store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
+    ).mock.calls
+      .map(call => call[0])
+      .filter(data => data.event_type === 'node_completed' && data.step_name === 'grp');
+    expect(completedEvents.length).toBe(1);
+    expect(completedEvents[0].data).toMatchObject({
+      structured_output: approvedDecision,
+    });
+  });
+
+  it('resuming after a non-completing decision advances to a fresh iteration, with the text available via $LOOP_PREV', async () => {
+    mockSendQueryDag.mockClear();
+    let seenPrompt: string | undefined;
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      seenPrompt = prompt;
+      yield { type: 'assistant', content: 'revised work' };
+      yield { type: 'result', sessionId: 'revised-session' };
+    });
+
+    const store = createEscalationStore('run-escalation-3');
+    const platform = createMockPlatform();
+    const revisedDecision = { decision: 'revise', text: 'please improve X' };
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['grp.work', { output: 'work output' }],
+      ['grp.check', { output: JSON.stringify(revisedDecision), structuredOutput: revisedDecision }],
+    ]);
+    const workflowRun = makeWorkflowRun('run-escalation-3', {
+      metadata: {
+        approval: {
+          nodeId: 'grp',
+          message: 'Continue?',
+          type: 'approval',
+          bodyGateId: 'check',
+          iteration: 1,
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        } satisfies ApprovalContext,
+      },
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      platform,
+      'conv-dag',
+      testDir,
+      ready(gateTerminatedLoopGroupWorkflow()),
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // A genuinely fresh iteration 2 ran (the "revise" decision did not satisfy
+    // until_bash), seeded with the human's feedback via the ordinary $LOOP_PREV
+    // channel — not the retired $LOOP_USER_INPUT.
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    expect(seenPrompt).toContain('please improve X');
+  });
+
+  it('resume completion recheck resolves an outer-DAG ref inside until_bash, not just the gate decision', async () => {
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'should not run' };
+      yield { type: 'result', sessionId: 'unexpected-session' };
+    });
+
+    const store = createEscalationStore('run-escalation-5');
+    const platform = createMockPlatform();
+    const approvedDecision = { decision: 'approve', text: '' };
+    // 'outer' is a bare top-level id (not namespaced) — it reaches the resumed
+    // until_bash only via outerNodeOutputs, exactly the path the merge fix covers.
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['outer', { output: 'ok' }],
+      ['grp.work', { output: 'work output' }],
+      [
+        'grp.check',
+        { output: JSON.stringify(approvedDecision), structuredOutput: approvedDecision },
+      ],
+    ]);
+    const workflowRun = makeWorkflowRun('run-escalation-5', {
+      metadata: {
+        approval: {
+          nodeId: 'grp',
+          message: 'Continue?',
+          type: 'approval',
+          bodyGateId: 'check',
+          iteration: 1,
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        } satisfies ApprovalContext,
+      },
+    });
+
+    const outerRefWorkflow: WorkflowDefinition = {
+      ...gateTerminatedLoopGroupWorkflow(),
+      nodes: [
+        dagNodeSchema.parse({ id: 'outer', bash: 'echo ok' }),
+        dagNodeSchema.parse({
+          id: 'grp',
+          depends_on: ['outer'],
+          loop_group: {
+            // Combines an outer-scope ref with the gate's own decision — the
+            // outer ref only resolves if resumedScope includes outerNodeOutputs.
+            until_bash: '[ $outer.output = "ok" ] && [ $check.output.decision = "approve" ]',
+            max_iterations: 5,
+            nodes: [
+              { id: 'work', prompt: 'do work' },
+              {
+                id: 'check',
+                depends_on: ['work'],
+                approval: {
+                  message: 'Continue?',
+                  decisions: [{ id: 'approve' }, { id: 'revise' }],
+                },
+              },
+            ],
+          },
+        }),
+      ],
+    };
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      platform,
+      'conv-dag',
+      testDir,
+      ready(outerRefWorkflow),
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // No fresh iteration ran — the outer ref resolved correctly on resume, so
+    // until_bash saw both halves satisfied and completed without re-running the body.
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+    expect(
+      (store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>).mock.calls.length
+    ).toBe(1);
+  });
+
+  it('falls through without erroring when a human resolves the original pause before the rewrite lands (CAS loss)', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'work done' };
+      yield { type: 'result', sessionId: 'work-session' };
+    });
+
+    const store = createEscalationStore('run-escalation-4');
+    // Simulate an astronomically narrow race: a human resolved the ORIGINAL
+    // bare-gate-id pause in the window between its own write and the
+    // escalation's rewrite attempt — resolveApprovalGate's real CAS guard
+    // (unresolvedGateClause) would report exactly this outcome.
+    (
+      store.rewriteApprovalContext as Mock<IWorkflowStore['rewriteApprovalContext']>
+    ).mockResolvedValue({ resolved: false });
+    const platform = createMockPlatform();
+
+    // max_iterations: 1 makes the fallthrough's outcome deterministic and
+    // assertable: without the escalation applying, the group's own terminal-
+    // sink selection finds no non-empty output (a gate's own output is always
+    // ''), so it never detects completion and exhausts max_iterations — a
+    // clean, expected failure, not a hang, crash, or corrupted state.
+    const singleIterationWorkflow: WorkflowDefinition = {
+      ...gateTerminatedLoopGroupWorkflow(),
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'grp',
+          loop_group: {
+            until_bash: '[ $check.output.decision = "approve" ]',
+            max_iterations: 1,
+            nodes: [
+              { id: 'work', prompt: 'do work' },
+              {
+                id: 'check',
+                depends_on: ['work'],
+                approval: {
+                  message: 'Continue?',
+                  decisions: [{ id: 'approve' }, { id: 'revise' }],
+                },
+              },
+            ],
+          },
+        }),
+      ],
+    };
+
+    // Must not throw — the fallthrough path is a normal, tolerated outcome.
+    await expect(
+      executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        'conv-dag',
+        testDir,
+        ready(singleIterationWorkflow),
+        makeWorkflowRun('run-escalation-4'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      )
+    ).resolves.toBeUndefined();
+
+    // The escalation was attempted and correctly observed the lost race.
+    expect(
+      (store.rewriteApprovalContext as Mock<IWorkflowStore['rewriteApprovalContext']>).mock.calls
+        .length
+    ).toBe(1);
+    // No corrupted state: the run stays exactly as the human's own resolution
+    // left it — 'paused' — never force-completed by the loop_group's own
+    // "max iterations exceeded" failure (the run being non-'running' by the
+    // time that failure is reported is what stops the top-level executor from
+    // clobbering the human's already-in-flight resolution with a 'failed'
+    // status).
+    expect(store.getState().status).toBe('paused');
+    expect(
+      (store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>).mock.calls.length
+    ).toBe(0);
   });
 });

@@ -11,6 +11,12 @@ import { isAbsolute } from 'path';
 // WorkflowRunStatus
 // ---------------------------------------------------------------------------
 
+/**
+ * `'paused'` is treated as a still-live status for in-flight sibling node streaming:
+ * a concurrent gate pausing the run must not tear down an unrelated node's
+ * already-streaming output in the same topological layer. See
+ * `shouldContinueStreamingForStatus` in dag-executor.ts, which encodes this policy.
+ */
 export const workflowRunStatusSchema = z.enum([
   'pending',
   'running',
@@ -77,7 +83,11 @@ export type NodeState = z.infer<typeof nodeStateSchema>;
 /**
  * Captured output from a completed DAG node.
  * `output` is the concatenated assistant text (or JSON-encoded string from the SDK
- * when output_format is set). Empty string for failed/skipped nodes.
+ * when output_format is set). Empty string for a skipped/pending node; for a FAILED
+ * node it is usually empty too, but not always — a `loop_group`'s failure paths
+ * (body-node failure, `max_iterations` exhaustion, cancellation) deliberately carry
+ * the last completed iteration's real, non-empty output. No reader of a 'failed'
+ * node's `output` may treat it as trustworthy regardless of content (#2713).
  * `error` is required when state is 'failed', absent on all other states.
  * `structuredOutput` carries the provider's parsed structured payload (set by Pi/Codex/Claude
  * when the result chunk includes one). Downstream `$nodeId.output.field` substitution and
@@ -239,6 +249,38 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
 }
 
 /**
+ * Keys the run-lifecycle machinery writes into a row's untyped `metadata` JSONB, and the
+ * shape of each value. `metadata` is `Record<string, unknown>`, so a typo in a string
+ * literal at either end silently no-ops — the write lands under a key nobody reads, or the
+ * read returns undefined and the row looks like it was never stamped. Naming them once
+ * gives the compiler the only handle it can have on an untyped column: writer and reader
+ * now share a symbol instead of agreeing by luck.
+ *
+ * `identity_unresolved` — TRUE on a fresh run whose `output_root` was deliberately NOT
+ *                       written because `resolveProjectPaths` returned the `_cwd/<basename>`
+ *                       fallback AFTER `getCodebase` threw on both retry attempts (#2304).
+ *                       Distinguishes "this run is on the cwd fallback because the codebase
+ *                       had no owner/repo or `_local` identity" (legitimate, the WARN arm
+ *                       of the same function) from "this run is on the cwd fallback
+ *                       because we couldn't reach the registry at all" (the ERROR arm).
+ *                       Absent on every other run — the existing `output_root` write-once
+ *                       invariant is preserved for them. Cleared by the same persistence
+ *                       block the moment a later resume writes a real root, so a row that
+ *                       heals stops reading as faulted.
+ */
+export const RUN_METADATA_KEYS = {
+  identityUnresolved: 'identity_unresolved',
+} as const;
+
+/** Typed view of the run-lifecycle keys on a run's metadata; undefined when unset. */
+export function readIdentityUnresolved(
+  metadata: Record<string, unknown> | undefined
+): boolean | undefined {
+  const raw = metadata?.[RUN_METADATA_KEYS.identityUnresolved];
+  return typeof raw === 'boolean' ? raw : undefined;
+}
+
+/**
  * Key under which a run records the executable SOURCE it was started from.
  *
  * A run reads its workflows, commands, and scripts from one directory and acts on
@@ -327,12 +369,50 @@ export function readWorkflowSourceState(
     : { kind: 'unreadable', detail: parsed.error.message };
 }
 
+/**
+ * The suspend reason vocabulary (#2489) — a Zod-backed enum, not a renamed union: the
+ * values are persisted verbatim into `workflow_runs.metadata.approval.type`, so they
+ * cannot change without breaking reads of already-paused runs. Every pause site now
+ * writes through one shared helper (`pauseGateRespectingExternalTransition` in
+ * dag-executor.ts), but each reason's RESUME path stays deliberately separate and
+ * lives at its own named site:
+ *  - `'approval'` / `'interactive_loop'` — resolved externally by a human decision:
+ *    `approveWorkflow`/`rejectWorkflow` (operations/workflow-operations.ts).
+ *  - `'writeback'` — also resolved by `approveWorkflow`/`rejectWorkflow`'s write-back
+ *    branch, then applied on parent resume by `runContainerWriteBackGate`
+ *    (dag-executor.ts, `raiseWriteBackGate`'s sibling).
+ *  - `'child_workflow'` — never resolved by the approve/reject endpoints directly
+ *    (redirected instead — `assertApprovable`/`assertRejectable`); re-inspected by
+ *    `executeWorkflowNode` re-running on parent resume (dag-executor.ts).
+ */
+export const suspendReasonSchema = z.enum([
+  'approval',
+  'interactive_loop',
+  'writeback',
+  'child_workflow',
+]);
+export type SuspendReason = z.infer<typeof suspendReasonSchema>;
+
+/**
+ * True when `type` is `undefined` (every pause before the field existed, or a plain
+ * approval gate that omits it) or a recognized `SuspendReason`. Shared by the CLI
+ * `--detach` precheck (`assertApprovable`/`assertRejectable`) and the real
+ * approve/reject resolution's exhaustive switches so a precheck success can never
+ * diverge from what resolution actually does — an unrecognized reason must be
+ * rejected at the SAME point by both, not silently absorbed by one and only later
+ * caught by the other (#2489).
+ */
+export function isRecognizedSuspendReason(type: string | undefined): boolean {
+  return type === undefined || suspendReasonSchema.safeParse(type).success;
+}
+
 /** Approval context stored in workflow run metadata when paused for human review. */
 export interface ApprovalContext {
   nodeId: string;
   message: string;
   /**
-   * Distinguishes the pause kind:
+   * Distinguishes the pause kind — see `SuspendReason` above for the resume-path
+   * pointer each variant carries:
    *  - `approval`         — a DAG approval node awaiting a human decision.
    *  - `interactive_loop` — an interactive loop gate.
    *  - `writeback`        — the ENGINE-level container write-back gate (Phase C):
@@ -348,13 +428,28 @@ export interface ApprovalContext {
    *    workflow node, finds the child terminal, and threads its output. NO
    *    node_completed is written for the parent's node on this pause.
    */
-  type?: 'approval' | 'interactive_loop' | 'writeback' | 'child_workflow';
+  type?: SuspendReason;
   /**
    * Child run id when `type === 'child_workflow'` — the specific paused sub-run
    * the parent is blocked on. Read by the parent auto-resume guard so a DIFFERENT
    * child of the same parent can't trigger the wrong re-entry.
    */
   childRunId?: string;
+  /**
+   * Set only on an ESCALATED pause: a `gate:` node that is the sole terminal sink
+   * of a `loop_group` body (#2707 step 3), still `type: 'approval'`. The enclosing
+   * loop_group's own id occupies `nodeId` — required for the top-level DAG's
+   * resume walk to find it (it only knows top-level node ids, never a nested body
+   * id) — so this field carries the body gate's own bare id, the one piece the
+   * rewrite would otherwise lose. `approveWorkflow`/`rejectWorkflow`/
+   * `respondToWorkflowWithDeclaredDecision` read it to namespace the resolution's
+   * `node_completed` event as `<nodeId>.<bodyGateId>` instead of bare `nodeId` —
+   * the exact `<groupId>.<bodyId>` step name #2748's `outerNodeOutputs`
+   * pre-population already keys on, so the gate's own resolved decision is
+   * findable again after a resume the same way any other body node's output is.
+   * Absent for every other pause kind, including an ordinary top-level gate.
+   */
+  bodyGateId?: string;
   /** Current loop iteration when paused (interactive loops only). */
   iteration?: number;
   /**
@@ -372,12 +467,36 @@ export interface ApprovalContext {
    * node, so the provider is the same by construction.
    */
   sessionProvider?: string | null;
-  /** When true, the user's approval comment is stored as `$nodeId.output`. */
+  /** When true, the user's approval comment is stored as `$nodeId.output`. Legacy-mode gates only (see `onRejectPrompt`). */
   captureResponse?: boolean;
   /** The on_reject prompt template (stored at pause time so reject handlers don't need the workflow def). */
   onRejectPrompt?: string;
   /** Max rejection attempts before cancellation (default 3). */
   onRejectMaxAttempts?: number;
+  /**
+   * The gate's declared decisions (#2707 step 1), snapshotted at pause time so
+   * approve/reject handlers don't need the workflow def to know the vocabulary
+   * — mirrors why `onRejectPrompt` is snapshotted rather than looked up.
+   * Always populated (synthesized default pair, `on_reject`-translated pair,
+   * or the authored array) regardless of mode — see `decisionsAuthored` for
+   * the actual mode signal. Absent on gates paused by builds that predate
+   * this field.
+   */
+  decisions?: { id: string; label?: string }[];
+  /**
+   * True only when the author wrote `approval.decisions:` explicitly in YAML
+   * (mirrors `GateNode.decisionsAuthored` — see its doc for the full
+   * rationale). THIS, not `onRejectPrompt`'s absence, is the signal
+   * `approveWorkflow`/`rejectWorkflow` use to pick the new structured-output
+   * resolution path: no workflow authored before #2707 step 1 can have
+   * written `decisions:`, so keying the new behavior on it — rather than on
+   * "no on_reject configured" — guarantees every already-authored gate
+   * (bare, or `capture_response`-only) keeps its exact pre-PR output shape
+   * AND reject-always-cancels behavior, unaffected by this PR. Absent (falsy)
+   * on gates paused by builds that predate this field, which resolves to
+   * legacy behavior — the safe default.
+   */
+  decisionsAuthored?: boolean;
   /**
    * Gate resolution marker. Set by approve/reject handlers while the run STAYS
    * 'paused' awaiting auto-resume (#2075): 'approved' = approval recorded,
@@ -478,6 +597,60 @@ export function isApprovalContext(val: unknown): val is ApprovalContext {
     typeof (val as Record<string, unknown>).nodeId === 'string' &&
     typeof (val as Record<string, unknown>).message === 'string'
   );
+}
+
+/**
+ * True when a paused run's gate state, on its own, is worth resuming even with
+ * ZERO completed DAG nodes — i.e. resolving the run left no `node_completed`
+ * row anywhere, but the executor still knows how to make forward progress.
+ * Exhaustively switched over `SuspendReason` (#2714) so a future fifth reason
+ * cannot silently repeat the gap this closes: a plain `approval` gate whose
+ * staged legacy `on_reject` rework was invisible to `hydrateResumableRun`
+ * because `rejectWorkflow`'s stage-rework path never writes `node_completed`
+ * (only `metadata.approval.resolved`/`rejection_reason`/`rejection_count`).
+ *
+ * - `interactive_loop` / `child_workflow` — always true: both kinds are
+ *   re-entered by the node executor's own re-read of `metadata.approval`,
+ *   independent of `priorCompletedNodes` (`executeLoopNode`/
+ *   `executeLoopGroupNode`/`executeWorkflowNode` in dag-executor.ts).
+ * - `writeback` — always false: there is no DAG node behind this gate to
+ *   re-run (`nodeId` is the synthetic `__writeback__`); resolving it flows
+ *   through the container write-back resume path, never a node re-run.
+ * - `approval` / `undefined` — true ONLY for a genuinely staged legacy
+ *   on_reject rework: `resolved === 'rejected'`, a non-empty top-level
+ *   `rejection_reason`, and `onRejectPrompt` still present on the approval
+ *   context (the same legacy-mode signal `executeApprovalNode` itself checks
+ *   before re-running the rework prompt). A new-mode gate (#2707 step 1)
+ *   never needs this carve-out: both approve and reject write
+ *   `node_completed` immediately, so `priorCompletedNodes` already contains
+ *   it by the time this function would be asked.
+ */
+export function reRunsOwnNodeOnResume(
+  approval: ApprovalContext | undefined,
+  metadata: Record<string, unknown> | undefined
+): boolean {
+  if (approval === undefined) return false;
+  switch (approval.type) {
+    case 'interactive_loop':
+    case 'child_workflow':
+      return true;
+    case 'writeback':
+      return false;
+    case 'approval':
+    case undefined: {
+      const rejectionReason = metadata?.rejection_reason;
+      return (
+        approval.resolved === 'rejected' &&
+        approval.onRejectPrompt !== undefined &&
+        typeof rejectionReason === 'string' &&
+        rejectionReason !== ''
+      );
+    }
+    default: {
+      const unreachable: never = approval.type;
+      throw new Error(`reRunsOwnNodeOnResume: unhandled gate type '${String(unreachable)}'`);
+    }
+  }
 }
 
 /**

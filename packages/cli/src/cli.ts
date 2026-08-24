@@ -16,7 +16,23 @@ import '@archon/paths/strip-cwd-env-boot';
 import { loadArchonEnv } from '@archon/paths/env-loader';
 loadArchonEnv(process.cwd());
 
+// Install the pipe-safe `console.log` shim BEFORE any command module imports.
+// `console.log` reaches fd 1 via a non-blocking pipe (pino opens it that way at
+// module load via `@archon/paths/strip-cwd-env-boot` above), and short writes
+// are silently dropped against a slow reader. The shim delegates through
+// `writeStdout` so the stream layer queues short writes and retries `EAGAIN`
+// instead of dropping the tail — but delivery is fire-and-forget, so the
+// patched `console.log` returns synchronously and the exit path below must
+// await `flushPendingWrites()` before `process.exit()`. See
+// `utils/exit-with-drain.ts` (the call site that owns the drain) and
+// `utils/safe-console.ts` for the underlying shim, and #2400 for the full
+// rationale.
+import { installPipeSafeConsole } from './utils/safe-console';
+import { withDrainedExit } from './utils/exit-with-drain';
+installPipeSafeConsole();
+
 import { parseArgs } from 'util';
+import { cliArgOptions } from './args';
 import { resolve } from 'path';
 import { existsSync, realpathSync } from 'fs';
 import { stat } from 'fs/promises';
@@ -45,9 +61,11 @@ import {
   workflowGetCommand,
   workflowRunsCommand,
   workflowResumeCommand,
+  workflowCancelCommand,
   workflowAbandonCommand,
   workflowApproveCommand,
   workflowRejectCommand,
+  workflowRespondCommand,
   workflowCleanupCommand,
   workflowResetSessionsCommand,
   workflowEventEmitCommand,
@@ -132,6 +150,11 @@ Commands:
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
   workflow resume <run-id>   Resume a failed or paused run from completed nodes
+  workflow cancel <run-id>   Stop a running workflow started with --detach
+  workflow abandon <run-id>  Mark a run cancelled without stopping host work
+  workflow respond <run-id> <decision> [text]
+                             Resolve a paused gate with any of its declared decisions
+                             ('approve'/'reject' are sugar for the dedicated commands)
   workflow search [query]    Search the workflow marketplace
   workflow install <slug>    Install a workflow from the marketplace
   isolation list             List all active worktrees/environments
@@ -181,9 +204,9 @@ Options:
   --spawn                    Open setup wizard in a new terminal window (for setup command)
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
-  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/abandon/resume)
+  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/respond/cancel/abandon/resume)
   --events                   For verbose JSON status/get: output raw event rows instead of node summaries
-  --detach                   Run 'workflow run'/'approve'/'reject'/'resume' in a detached background child (returns immediately)
+  --detach                   Run 'workflow run'/'approve'/'reject'/'respond'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
   --limit <n>                For 'workflow runs': max rows (default 20)
@@ -208,6 +231,7 @@ Examples:
   archon workflow runs --json
   archon workflow get <run-id> --json
   archon workflow resume <run-id>
+  archon workflow cancel <run-id>
   archon continue fix/issue-42 --workflow archon-smart-pr-review "Review the changes"
   archon skill install
   archon skill install /path/to/project
@@ -294,54 +318,11 @@ async function main(): Promise<number> {
   try {
     parsedArgs = parseArgs({
       args,
-      options: {
-        cwd: { type: 'string', default: process.cwd() },
-        help: { type: 'boolean', short: 'h' },
-        branch: { type: 'string', short: 'b' },
-        from: { type: 'string' },
-        'from-branch': { type: 'string' },
-        base: { type: 'string' },
-        'workflow-source': { type: 'string' },
-        'no-worktree': { type: 'boolean' },
-        folder: { type: 'boolean' },
-        container: { type: 'boolean' },
-        resume: { type: 'boolean' },
-        spawn: { type: 'boolean' },
-        quiet: { type: 'boolean', short: 'q' },
-        verbose: { type: 'boolean', short: 'v' },
-        json: { type: 'boolean' },
-        events: { type: 'boolean' },
-        'run-id': { type: 'string' },
-        type: { type: 'string' },
-        data: { type: 'string' },
-        comment: { type: 'string' },
-        reason: { type: 'string' },
-        workflow: { type: 'string' },
-        'no-context': { type: 'boolean' },
-        port: { type: 'string' },
-        'download-only': { type: 'boolean' },
-        scope: { type: 'string' },
-        node: { type: 'string' },
-        yes: { type: 'boolean' },
-        force: { type: 'boolean' },
-        'conversation-id': { type: 'string' },
-        detach: { type: 'boolean' },
-        all: { type: 'boolean' },
-        status: { type: 'string' },
-        limit: { type: 'string' },
-        effort: { type: 'string' },
-        full: { type: 'boolean' },
-        'dry-run': { type: 'boolean' },
-        stubs: { type: 'string' },
-        'stubs-init': { type: 'string' },
-        'default-stubs': { type: 'boolean' },
-        'exec-code': { type: 'boolean' },
-        'pause-at-gates': { type: 'boolean' },
-        // Repeatable: `--input a=1 --input b=2` yields ['a=1', 'b=2'] (#2554).
-        input: { type: 'string', multiple: true },
-      },
+      options: cliArgOptions,
       allowPositionals: true,
-      strict: false, // Allow unknown flags to pass through
+      // Strict mode rejects unknown flags so a mistyped option (e.g. `--dry-run`)
+      // errors here instead of being silently dropped before command validation.
+      strict: true,
     });
   } catch (error) {
     const err = error as Error;
@@ -747,6 +728,16 @@ async function main(): Promise<number> {
             break;
           }
 
+          case 'cancel': {
+            const cancelRunId = positionals[2];
+            if (!cancelRunId) {
+              console.error('Usage: archon workflow cancel <run-id>');
+              return 1;
+            }
+            await workflowCancelCommand(cancelRunId, jsonFlag, effectiveCwd);
+            break;
+          }
+
           case 'approve': {
             const approveRunId = positionals[2];
             if (!approveRunId) {
@@ -782,6 +773,31 @@ async function main(): Promise<number> {
             await workflowRejectCommand(
               rejectRunId,
               rejectReason,
+              jsonFlag,
+              effectiveCwd,
+              detachFlag
+            );
+            break;
+          }
+
+          case 'respond': {
+            const respondRunId = positionals[2];
+            const decision = positionals[3];
+            if (!respondRunId || !decision) {
+              console.error('Usage: archon workflow respond <run-id> <decision> [text]');
+              console.error(
+                "  'approve' and 'reject' are sugar for the equivalent dedicated commands; " +
+                  'any other decision must be one the gate actually declared.'
+              );
+              return 1;
+            }
+            const rawRespondText =
+              (values.text as string | undefined) || positionals.slice(4).join(' ');
+            const respondText = rawRespondText.length > 0 ? rawRespondText : undefined;
+            await workflowRespondCommand(
+              respondRunId,
+              decision,
+              respondText,
               jsonFlag,
               effectiveCwd,
               detachFlag
@@ -898,7 +914,7 @@ async function main(): Promise<number> {
               console.error(`Unknown workflow subcommand: ${subcommand}`);
             }
             console.error(
-              'Available: list, run, status, get, runs, resume, abandon, approve, reject, cleanup, event, search, install'
+              'Available: list, run, status, get, runs, resume, cancel, abandon, approve, reject, cleanup, event, search, install'
             );
             return 1;
         }
@@ -911,11 +927,10 @@ async function main(): Promise<number> {
             break;
 
           case 'cleanup': {
-            // Check for --merged flag in remaining args
-            const mergedFlag = args.includes('--merged') || positionals.includes('--merged');
-            if (mergedFlag) {
-              const includeClosed = args.includes('--include-closed');
-              await isolationCleanupMergedCommand({ includeClosed });
+            if (values.merged) {
+              await isolationCleanupMergedCommand({
+                includeClosed: Boolean(values['include-closed']),
+              });
             } else {
               const days = parseInt(positionals[2] ?? '7', 10);
               await isolationCleanupCommand(days);
@@ -962,7 +977,7 @@ async function main(): Promise<number> {
           console.error('Usage: archon complete <branch-name> [branch2 ...]');
           return 1;
         }
-        const forceFlag = args.includes('--force');
+        const forceFlag = Boolean(values.force);
         await isolationCompleteCommand(branches, { force: forceFlag, deleteRemote: true });
         break;
       }
@@ -1156,17 +1171,28 @@ async function main(): Promise<number> {
 // Exit explicitly so a lingering handle (DB pool, spawned child, timer) can
 // never leave the CLI hanging after its work is done.
 //
-// This is safe for piped output because every machine-readable payload is
-// emitted through `writeStdout()`/`writeJsonLine()` (src/utils/stdout.ts), which
-// resolves only once the bytes have reached the OS. The #2384 truncation
-// happened inside `console.log` at call time — not at exit — so deferring the
-// exit would not have recovered it.
-main()
-  .then(exitCode => {
-    process.exit(exitCode);
-  })
-  .catch((error: unknown) => {
-    const err = error as Error;
-    console.error('Fatal error:', err.message);
-    process.exit(1);
-  });
+// `flushPendingWrites()` is awaited BEFORE `process.exit()` because every
+// `console.log` written through the pipe-safe shim is fire-and-forget
+// (src/utils/safe-console.ts): the stream callback that resolves the per-
+// write promise fires asynchronously, and `process.exit()` does not drain
+// `process.stdout`'s pending writes. Without this flush a very-slow reader
+// (e.g. `archon … | { sleep 1; cat; }`) would re-introduce the silent-exit-0
+// truncation the shim is meant to eliminate — see R1 in the review report.
+//
+// The `--json` paths do not need this because every JSON emitter already
+// awaits `writeStdout` / `writeJsonLine` at the call site
+// (src/utils/stdout.ts); the shim only adds the fire-and-forget shape that
+// the human-readable call surface requires.
+//
+// The drain runs on BOTH exits — success and fatal — so a `main()` rejection
+// does not get to drop queued stdout bytes just because it is exiting non-
+// zero. Splitting the two arms' exit logic would re-open the R9 latency:
+// a fatal rejection against a slow reader would truncate and exit 1,
+// producing the same silent stdout loss the patch is meant to eliminate.
+// The chain wiring — `main().then(exitWithDrain).catch(...)` — lives in
+// `withDrainedExit` (`./utils/exit-with-drain.ts`) so cli.ts and the R9
+// regression test fixture share a single source of truth. A regression
+// that swaps this call for a direct `process.exit` is caught by the
+// static-contract test in `safe-console.test.ts`, which reads this file
+// as text.
+withDrainedExit(main);

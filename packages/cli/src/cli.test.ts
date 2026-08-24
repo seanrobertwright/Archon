@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { parseArgs } from 'util';
+import { cliArgOptions } from './args';
 import * as git from '@archon/git';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
@@ -27,6 +28,20 @@ describe('CLI help output', () => {
     );
   });
 
+  it('distinguishes active cancel from state-only abandon', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      'workflow cancel <run-id>   Stop a running workflow started with --detach'
+    );
+    expect(result.stdout).toContain(
+      'workflow abandon <run-id>  Mark a run cancelled without stopping host work'
+    );
+  });
+
   it('documents workflow dry-run flags', () => {
     const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
       encoding: 'utf8',
@@ -39,6 +54,30 @@ describe('CLI help output', () => {
     expect(result.stdout).toContain('--default-stubs');
     expect(result.stdout).toContain('--exec-code');
     expect(result.stdout).toContain('--pause-at-gates');
+  });
+});
+
+describe('unknown flag rejection (#2769)', () => {
+  it('exits non-zero naming the mistyped flag before any command runs', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'run', 'assist', '--dryrun', '--stubs', 'x.yaml'],
+      { encoding: 'utf8' }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--dryrun');
+  });
+
+  it('still accepts a valid workflow dry-run invocation', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'run', 'definitely-not-a-workflow', '--dry-run'],
+      { encoding: 'utf8', cwd: join(import.meta.dir, '../../../') }
+    );
+
+    // Fails on the unknown workflow name (after parsing), not on the flag.
+    expect(result.stderr).not.toContain('Error parsing arguments');
   });
 });
 
@@ -166,36 +205,24 @@ describe('CLI workflow event dispatch', () => {
 
 // Test the argument parsing logic used in cli.ts
 describe('CLI argument parsing', () => {
-  // Mirror the actual parseArgs options from cli.ts
   const parseCliArgs = (
     args: string[]
   ): { values: Record<string, unknown>; positionals: string[] } => {
     return parseArgs({
       args,
-      options: {
-        cwd: { type: 'string', default: process.cwd() },
-        help: { type: 'boolean', short: 'h' },
-        branch: { type: 'string', short: 'b' },
-        from: { type: 'string' },
-        'from-branch': { type: 'string' },
-        base: { type: 'string' },
-        'no-worktree': { type: 'boolean' },
-        spawn: { type: 'boolean' },
-        quiet: { type: 'boolean', short: 'q' },
-        verbose: { type: 'boolean', short: 'v' },
-        scope: { type: 'string' },
-        force: { type: 'boolean' },
-        'dry-run': { type: 'boolean' },
-        stubs: { type: 'string' },
-        'stubs-init': { type: 'string' },
-        'default-stubs': { type: 'boolean' },
-        'exec-code': { type: 'boolean' },
-        'pause-at-gates': { type: 'boolean' },
-      },
+      options: cliArgOptions,
       allowPositionals: true,
-      strict: false,
+      strict: true,
     });
   };
+
+  describe('isolation cleanup flags', () => {
+    it('parses --merged and --include-closed in strict mode', () => {
+      const { values } = parseCliArgs(['isolation', 'cleanup', '--merged', '--include-closed']);
+      expect(values.merged).toBe(true);
+      expect(values['include-closed']).toBe(true);
+    });
+  });
 
   describe('--cwd flag', () => {
     it('should parse --cwd with path', () => {
@@ -396,18 +423,13 @@ describe('CLI argument parsing', () => {
     });
   });
 
-  describe('unknown flags with strict: false', () => {
-    it('should pass through unknown flags', () => {
-      const result = parseCliArgs(['--unknown', 'workflow', 'list']);
-      // Unknown flag is ignored, positionals are preserved
-      expect(result.positionals).toEqual(['workflow', 'list']);
+  describe('unknown flags (#2769)', () => {
+    it('rejects an unknown flag instead of dropping it', () => {
+      expect(() => parseCliArgs(['--unknown', 'workflow', 'list'])).toThrow(/unknown option/i);
     });
 
-    it('should pass through typos like --cwdd', () => {
-      const result = parseCliArgs(['--cwdd', '/path', 'workflow', 'list']);
-      // Typo is ignored, --cwd defaults to process.cwd()
-      expect(result.values.cwd).toBe(process.cwd());
-      expect(result.positionals).toContain('/path'); // /path becomes positional
+    it('rejects a typoed flag like --cwdd', () => {
+      expect(() => parseCliArgs(['--cwdd', '/path', 'workflow', 'list'])).toThrow(/--cwdd/);
     });
   });
 

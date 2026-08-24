@@ -31,6 +31,7 @@ import {
   updateWorkflowActivity,
   findResumableRun,
   findResumableRunByParentConversation,
+  cancelResumableRunsForConversation,
   resumeWorkflowRun,
   pauseWorkflowRun,
   cancelWorkflowRun,
@@ -762,6 +763,62 @@ describe('workflows database', () => {
 
       await expect(findResumableRunByParentConversation('piv', 'conv-1', 'cb')).rejects.toThrow(
         'Failed to find resumable run by parent conversation: Connection refused'
+      );
+    });
+  });
+
+  describe('cancelResumableRunsForConversation', () => {
+    test('locks the conversation snapshot and atomically cancels only paused/failed rows', async () => {
+      const paused = { ...mockWorkflowRun, id: 'run-a', status: 'paused' as const };
+      const running = { ...mockWorkflowRun, id: 'run-b', status: 'running' as const };
+      const failed = { ...mockWorkflowRun, id: 'run-c', status: 'failed' as const };
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([paused, running, failed]))
+        .mockResolvedValueOnce(createQueryResult([], 2));
+
+      const result = await cancelResumableRunsForConversation('conv-1');
+
+      expect(result).toEqual([paused, failed]);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      const [selectSql, selectParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(selectSql).toContain('SELECT * FROM remote_agent_workflow_runs');
+      expect(selectSql).toContain('conversation_id = $1 OR parent_conversation_id = $2');
+      expect(selectSql).toContain('FOR UPDATE');
+      expect(selectParams).toEqual(['conv-1', 'conv-1']);
+      const [updateSql, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(updateSql).toContain("status IN ('paused', 'failed')");
+      expect(updateSql).not.toContain("'running'");
+      expect(updateSql).not.toContain("'pending'");
+      expect(updateSql).not.toContain('RETURNING');
+      expect(updateParams).toEqual(['conv-1', 'conv-1']);
+    });
+
+    test('returns without writing when the locked snapshot has nothing resumable', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
+      );
+
+      expect(await cancelResumableRunsForConversation('conv-1')).toEqual([]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('rolls back instead of reporting a stale snapshot count', async () => {
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([{ ...mockWorkflowRun, status: 'paused' as const }])
+        )
+        .mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Resumable run snapshot changed during reset'
+      );
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Failed to cancel resumable runs for conversation: Connection refused'
       );
     });
   });

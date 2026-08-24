@@ -54,7 +54,17 @@ export interface WorkflowEvent {
  *
  * One carrier, passed whole. The same payload used to be spelled out by hand at every
  * sink, and cost was simply forgotten at the transcript one — an axis added here now
- * reaches the JSONL row and the DB event together or not at all (#2674).
+ * reaches the JSONL row and the DB event together or not at all (#2674). A node that
+ * failed after spending reports that spend the same way a node that completed does
+ * (#2693).
+ *
+ * That symmetry holds per SINK, not yet across every node type. A `loop:` node's
+ * cumulative totals reach its transcript row on failure and its persisted event on
+ * either outcome, but no success exit writes a terminal transcript row for the loop's
+ * own id — only per-iteration rows, which carry duration and no usage. `workflow:` and
+ * fan-out nodes write no transcript rows at all. So do not read an absent `cost_usd` on
+ * a run's transcript as "the whole run was free"; read it per row, where it means the
+ * provider reported no cost. Completing that coverage is #2614's audit.
  *
  * Each axis is omitted when nothing was reported for it, so an absent `cost_usd` means
  * the provider reported no cost (Codex reports none at all — #2334) and `0` means it
@@ -228,16 +238,27 @@ export async function logNodeSkip(
   });
 }
 
-/** Log DAG node error */
+/**
+ * Log DAG node error, with what the node spent before it failed.
+ *
+ * A node that fails mid-stream keeps the usage it already burned, so the failure row
+ * carries spend for the same reason the completion row does (#2693). Callers whose
+ * failure happens before any provider call — a missing command file, a substitution
+ * error, a bash exit code — pass nothing, and the absent keys mean exactly that.
+ */
 export async function logNodeError(
   logDir: string,
   workflowRunId: string,
   nodeId: string,
-  error: string
+  error: string,
+  usage?: WorkflowUsage
 ): Promise<void> {
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'node_error',
     step: nodeId,
     error,
+    // Spread whole: the caller already omitted every unreported axis, and a guard here
+    // would have to re-decide that per field — which is how `0` becomes absent.
+    ...usage,
   });
 }

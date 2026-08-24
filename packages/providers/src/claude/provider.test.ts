@@ -23,7 +23,7 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
-import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
+import { ClaudeProvider, classifySubprocessError, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 
@@ -924,6 +924,143 @@ describe('ClaudeProvider', () => {
       // Phase 4 opt-in is for workflow nodes only. Direct chat keeps the
       // SDK default (false) so the chat surface is unchanged.
       expect(callArgs.options).not.toHaveProperty('agentProgressSummaries');
+    });
+
+    // --- Issue #2324 — tool-scoped hook frames must reach the audit stream -----
+
+    test('opts the SDK into lifecycle hook events for every surface (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        // Empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace')) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      // The SDK defaults `includeHookEvents` to false, which suppresses
+      // `hook_started` / `hook_response` for every hook type except
+      // SessionStart and Setup. Without an explicit opt-in, a node-level
+      // `PreToolUse` hook that denies Bash never reaches the workflow
+      // `hook_activity` stream.
+      expect(callArgs.options).toMatchObject({ includeHookEvents: true });
+    });
+
+    test('forwards a denied PreToolUse hook through the chunk pipeline (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_started',
+          hook_id: 'h-1',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+        };
+        yield {
+          type: 'system',
+          subtype: 'hook_response',
+          hook_id: 'h-1',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+          outcome: 'error',
+          exit_code: 2,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'hook_started',
+          hookId: 'h-1',
+          hookName: 'Bash',
+          hookEvent: 'PreToolUse',
+        },
+        {
+          type: 'hook_response',
+          hookId: 'h-1',
+          hookName: 'Bash',
+          hookEvent: 'PreToolUse',
+          outcome: 'error',
+          exitCode: 2,
+        },
+      ]);
+    });
+
+    test('forwards a PostToolUse hook lifecycle (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_started',
+          hook_id: 'h-2',
+          hook_name: 'Edit',
+          hook_event: 'PostToolUse',
+        };
+        yield {
+          type: 'system',
+          subtype: 'hook_response',
+          hook_id: 'h-2',
+          hook_name: 'Edit',
+          hook_event: 'PostToolUse',
+          outcome: 'success',
+          exit_code: 0,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'hook_started',
+          hookId: 'h-2',
+          hookName: 'Edit',
+          hookEvent: 'PostToolUse',
+        },
+        {
+          type: 'hook_response',
+          hookId: 'h-2',
+          hookName: 'Edit',
+          hookEvent: 'PostToolUse',
+          outcome: 'success',
+          exitCode: 0,
+        },
+      ]);
+    });
+
+    test('drops hook_progress frames (only emitted for async hooks — none registered) (#2324)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'hook_progress',
+          hook_id: 'h-3',
+          hook_name: 'Bash',
+          hook_event: 'PreToolUse',
+          stdout: 'still running...',
+          stderr: '',
+          output: '',
+        };
+        yield {
+          type: 'assistant',
+          message: {
+            content: [{ type: 'text', text: 'Real response' }],
+          },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      // The hook_progress frame is intentionally not surfaced: Archon
+      // registers only synchronous hooks, and the hooks guide documents
+      // the carve-out. Only the assistant message reaches the stream.
+      expect(chunks).toEqual([{ type: 'assistant', content: 'Real response' }]);
     });
 
     test('handles tool_use with empty input', async () => {
@@ -2966,5 +3103,52 @@ describe('API error surfaced as text (#1797)', () => {
     expect(chunks.filter(c => c.type === 'assistant')).toHaveLength(0);
     // billing_error classifies as auth → non-retryable
     expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('classifySubprocessError (#2715)', () => {
+  test('does not classify a bare "401"/"403" substring as auth', () => {
+    expect(classifySubprocessError('connect ECONNREFUSED 127.0.0.1:401', '')).not.toBe('auth');
+    expect(classifySubprocessError('timeout after 401ms', '')).not.toBe('auth');
+    expect(classifySubprocessError('proxy responded with 403', '')).not.toBe('auth');
+  });
+
+  test('still classifies genuine auth signals as auth', () => {
+    expect(classifySubprocessError('Unauthorized', '')).toBe('auth');
+    expect(classifySubprocessError('authentication failed', '')).toBe('auth');
+    expect(classifySubprocessError('invalid token provided', '')).toBe('auth');
+    expect(classifySubprocessError('Your credit balance is too low to access the API', '')).toBe(
+      'auth'
+    );
+    // Real-world provider shape: a 401 co-occurring with the word "Unauthorized" —
+    // the word carries the signal, not the digits.
+    expect(classifySubprocessError('exceeded retry limit, last status: 401 Unauthorized', '')).toBe(
+      'auth'
+    );
+  });
+
+  test('resolves a crash-pattern message carrying a stray digit to the retryable "crash" class, not silently to "unknown"', () => {
+    // Not classifying as 'auth' isn't sufficient on its own — shouldRetry =
+    // errorClass === 'rate_limit' || errorClass === 'crash', so a crash-shaped
+    // message must specifically land on 'crash' (retryable), not fall through
+    // to 'unknown' (also non-retryable), or a future reordering of
+    // SUBPROCESS_CRASH_PATTERNS/AUTH_PATTERNS could silently regress retry
+    // eligibility without any test catching it.
+    expect(classifySubprocessError('exited with code 401', '')).toBe('crash');
+  });
+
+  test('does not classify a bare "429" substring as rate_limit', () => {
+    expect(classifySubprocessError('connect ECONNREFUSED 127.0.0.1:4291', '')).not.toBe(
+      'rate_limit'
+    );
+    expect(
+      classifySubprocessError('operation timed out after 4293ms while establishing connection', '')
+    ).not.toBe('rate_limit');
+  });
+
+  test('still classifies genuine rate-limit signals as rate_limit', () => {
+    expect(classifySubprocessError('rate limit exceeded', '')).toBe('rate_limit');
+    expect(classifySubprocessError('too many requests, please slow down', '')).toBe('rate_limit');
+    expect(classifySubprocessError('server overloaded', '')).toBe('rate_limit');
   });
 });

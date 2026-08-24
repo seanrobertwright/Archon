@@ -10,6 +10,7 @@ import {
   makeTestComposedWorkflow,
   makeTestWorkflow,
   makeTestWorkflowWithSource,
+  withObservableCapturedSource,
 } from '@archon/workflows/test-utils';
 import type { WorkflowEventRow } from '@archon/core/schemas/workflow-event';
 import {
@@ -20,8 +21,10 @@ import {
   workflowRunsCommand,
   workflowResumeCommand,
   workflowAbandonCommand,
+  workflowCancelCommand,
   workflowApproveCommand,
   workflowRejectCommand,
+  workflowRespondCommand,
   workflowEventEmitCommand,
   workflowCleanupCommand,
   workflowResetSessionsCommand,
@@ -42,7 +45,70 @@ const mockLogger = {
   child: mock(() => mockLogger),
 };
 
+const mockDetachedTargetStop = mock((): Promise<void> => Promise.resolve());
+const mockDetachedTargetRelease = mock((): undefined => undefined);
+const mockReclaimContainerEnv = mock((): Promise<void> => Promise.resolve());
+const mockRequestDetachedRunStop = mock(
+  (): Promise<{
+    stop: typeof mockDetachedTargetStop;
+    release: typeof mockDetachedTargetRelease;
+  }> => Promise.resolve({ stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
+);
+const mockDetachedControlClose = mock((): Promise<void> => Promise.resolve());
+const mockAssertDetachedRunProcessOwner = mock((): undefined => undefined);
+let mockDetachedStopRequested = false;
+const mockStartDetachedRunControlServer = mock(
+  (
+    _runId: string
+  ): Promise<{
+    close: typeof mockDetachedControlClose;
+    isStopRequested: () => boolean;
+  }> =>
+    Promise.resolve({
+      close: mockDetachedControlClose,
+      isStopRequested: (): boolean => mockDetachedStopRequested,
+    })
+);
+
+mock.module(
+  '../utils/detached-run-control',
+  (): {
+    assertDetachedRunProcessOwner: typeof mockAssertDetachedRunProcessOwner;
+    DETACHED_RUN_OWNER_ENV: string;
+    requestDetachedRunStop: typeof mockRequestDetachedRunStop;
+    startDetachedRunControlServer: typeof mockStartDetachedRunControlServer;
+  } => ({
+    assertDetachedRunProcessOwner: mockAssertDetachedRunProcessOwner,
+    DETACHED_RUN_OWNER_ENV: 'ARCHON_DETACHED_RUN_OWNER',
+    requestDetachedRunStop: mockRequestDetachedRunStop,
+    startDetachedRunControlServer: mockStartDetachedRunControlServer,
+  })
+);
+
+mock.module(
+  '@archon/core/services/cleanup-service',
+  (): {
+    reclaimContainerEnv: typeof mockReclaimContainerEnv;
+  } => ({
+    reclaimContainerEnv: mockReclaimContainerEnv,
+  })
+);
+
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockFolderBackendPrepare = mock(() =>
+  Promise.resolve({
+    cwd: '/test/path',
+    execContext: { kind: 'host' as const },
+    envId: 'container-env-1',
+    overlayMode: 'volume-copy' as const,
+  })
+);
+const mockFolderBackendDestroy = mock(() => Promise.resolve());
+const mockResolveFolderBackend = mock(() => ({
+  prepare: mockFolderBackendPrepare,
+  resumeEnv: mockFolderBackendPrepare,
+  destroy: mockFolderBackendDestroy,
+}));
 
 // Mock @archon/paths (createLogger moved here from @archon/core)
 mock.module('@archon/paths', () => ({
@@ -58,6 +124,7 @@ mock.module('@archon/paths', () => ({
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
 mock.module('@archon/isolation', () => ({
   configureIsolation: mock(() => undefined),
+  classifyIsolationError: (error: Error) => error.message,
   getIsolationProvider: mock(() => ({
     create: mock(() =>
       Promise.resolve({
@@ -72,6 +139,7 @@ mock.module('@archon/isolation', () => ({
     ),
     healthCheck: mock(() => Promise.resolve(true)),
   })),
+  resolveFolderBackend: mockResolveFolderBackend,
 }));
 
 // Mock the @archon/core modules
@@ -126,23 +194,22 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 const capturedSourceOwnerCalls: string[] = [];
 
 mock.module('@archon/workflows/executor', () => ({
-  executeWorkflow: mock(() => Promise.resolve({ success: true, workflowRunId: 'test-run-id' })),
+  // Mirrors the real executor's adopt site (#2690): rename happens, then the wrap's
+  // `capturedSourceOwner.adopt()` is called. For a continuation (no `preparedSource`)
+  // the executor takes the legacy branch and does not adopt, so the wrap reclaims.
+  executeWorkflow: mock((...args: unknown[]) => {
+    const opts = args[7] as
+      | {
+          preparedSource?: unknown;
+          capturedSourceOwner?: { adopt: () => void };
+        }
+      | undefined;
+    if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
+    return Promise.resolve({ success: true, workflowRunId: 'test-run-id' });
+  }),
   hydrateResumableRun: mock(() => Promise.resolve(null)),
-  withCapturedSource: mock(
-    (
-      body: (owner: {
-        hold: (prepared: { captureRoot: string }) => void;
-        adopt: () => void;
-      }) => Promise<unknown>
-    ) =>
-      body({
-        hold: prepared => {
-          capturedSourceOwnerCalls.push(`hold:${prepared.captureRoot}`);
-        },
-        adopt: () => {
-          capturedSourceOwnerCalls.push('adopt');
-        },
-      })
+  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
+    withObservableCapturedSource(capturedSourceOwnerCalls, body)
   ),
   // Every resume form reaches this now, including `run <name> --resume`. Default: the run
   // predates captures, so the caller keeps live discovery — what the resume tests below
@@ -263,6 +330,8 @@ mock.module('@archon/core/db/codebases', () => ({
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({
+  createIsolationStore: mock(() => ({})),
+  getById: mock((): Promise<null> => Promise.resolve(null)),
   findActiveByWorkflow: mock(() => Promise.resolve(null)),
   create: mock(() => Promise.resolve({ id: 'iso-123' })),
   // Reached only by the --resume path. mock.module() MERGES over the real
@@ -1322,7 +1391,9 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
   it('hands the capture to the run that starts, and keeps holding it when none does', async () => {
     // The wrapper only protects anything if the run path actually calls its owner. Assert
     // both edges: a dropped `adopt()` deletes a live run's source, and a missing `hold()`
-    // strands a full frozen tree under staged-source on every refusal.
+    // strands a full frozen tree under staged-source on every refusal. Under #2690 the
+    // run path passes `capturedSourceOwner` through and the (mocked) executor adopts;
+    // the implementation override below mirrors that.
     const { executeWorkflow } = await import('@archon/workflows/executor');
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
 
@@ -1330,9 +1401,15 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
       workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
       errors: [],
     });
-    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
-      success: true,
-      workflowRunId: 'run-ok',
+    (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce((...args: unknown[]) => {
+      const opts = args[7] as
+        | {
+            preparedSource?: unknown;
+            capturedSourceOwner?: { adopt: () => void };
+          }
+        | undefined;
+      if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
+      return Promise.resolve({ success: true, workflowRunId: 'run-ok' });
     });
 
     await workflowRunCommand('/repo/root', 'assist', 'go', { noWorktree: true });
@@ -1347,7 +1424,58 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
     await expect(
       workflowRunCommand('/repo/root', 'assist', 'go', { noWorktree: true })
     ).rejects.toThrow('No workflows found');
-    expect(capturedSourceOwnerCalls).toEqual(['hold:/test/capture']);
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/test/capture', 'reclaim:/test/capture']);
+  });
+
+  it('reclaims the finalized container capture when backend preparation fails', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { finalizeWorkflowSource } = await import('@archon/workflows/executor');
+    const codebaseDb = await import('@archon/core/db/codebases');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: '/test/path',
+      default_branch: null,
+      kind: 'folder',
+    });
+    (finalizeWorkflowSource as ReturnType<typeof mock>).mockResolvedValueOnce({
+      runId: 'test-run-id',
+      captureRoot: '/test/finalized/workflow-source',
+      origin: '/test/path',
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/test/path',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/test/finalized/workflow-source/project',
+        globalWorkflows: '/test/finalized/workflow-source/global/workflows',
+        globalCommands: '/test/finalized/workflow-source/global/commands',
+        globalScripts: '/test/finalized/workflow-source/global/scripts',
+        bundledWorkflows: '/test/finalized/workflow-source/bundled',
+      },
+    });
+    mockFolderBackendPrepare.mockRejectedValueOnce(new Error('container unavailable'));
+
+    await expect(
+      workflowRunCommand('/test/path', 'assist', 'go', { container: true })
+    ).rejects.toThrow('container unavailable');
+
+    expect(capturedSourceOwnerCalls).toEqual([
+      'hold:/test/capture',
+      'hold:/test/finalized/workflow-source',
+      'reclaim:/test/finalized/workflow-source',
+    ]);
   });
 });
 
@@ -4793,14 +4921,26 @@ describe('workflowRunCommand — detach', () => {
     let spawnCallCount = 0;
     let spawnCmd: string[] = [];
     let spawnOptions:
-      | { cwd: string; cmd: string[]; detached?: boolean; windowsHide?: boolean }
+      | {
+          cwd: string;
+          cmd: string[];
+          detached?: boolean;
+          windowsHide?: boolean;
+          env?: Record<string, string | undefined>;
+        }
       | undefined;
     try {
       const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', { detach: true });
       await finishStartupWindow(commandPromise, spawnSpy);
       spawnCallCount = spawnSpy.mock.calls.length;
       spawnOptions = spawnSpy.mock.calls[0]?.[0] as
-        | { cwd: string; cmd: string[]; detached?: boolean; windowsHide?: boolean }
+        | {
+            cwd: string;
+            cmd: string[];
+            detached?: boolean;
+            windowsHide?: boolean;
+            env?: Record<string, string | undefined>;
+          }
         | undefined;
       spawnCmd = (spawnOptions?.cmd ?? []).slice();
     } finally {
@@ -4813,6 +4953,7 @@ describe('workflowRunCommand — detach', () => {
     // group, or the launching shell's teardown kills it (~1s in).
     expect(spawnOptions?.detached).toBe(true);
     expect(spawnOptions?.windowsHide).toBe(true);
+    expect(spawnOptions?.env?.ARCHON_DETACHED_RUN_OWNER).toBe('1');
     expect(spawnCmd).not.toContain('--detach');
     expect(spawnCmd).toContain('--branch');
     expect(spawnCmd).toContain('--conversation-id');
@@ -5104,6 +5245,110 @@ describe('workflowRunCommand — detach', () => {
     // The success ack must never have been printed.
     const logged = consoleSpy.mock.calls.map(call => String(call[0]));
     expect(logged).not.toContain("Started 'assist' in the background.");
+  });
+});
+
+// #2707 step 2 / #1991 — an interactive-class workflow dispatched via `--detach` used to
+// hang indefinitely: the detached child paused with nobody watching, exited 0, and nothing
+// ever resumed it. Refused synchronously now, before the fork.
+describe('workflowRunCommand — detach refuses an interactive-class workflow (#2707 step 2 / #1991)', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    jest.useFakeTimers();
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    consoleSpy.mockRestore();
+  });
+
+  it('refuses before the fork, naming the workflow and its class', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'guided', interactive: true }, 'project')],
+      errors: [],
+    });
+
+    const spawnSpy = spyOn(Bun, 'spawn');
+
+    try {
+      await expect(
+        workflowRunCommand('/test/path', 'guided', 'hello', { detach: true })
+      ).rejects.toThrow(/interactive-class/i);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+
+    // Refused before the fork — no child process, no "started" ack.
+    expect(spawnSpy).not.toHaveBeenCalled();
+    const logged = consoleSpy.mock.calls.map(call => String(call[0]));
+    expect(logged).not.toContain("Started 'guided' in the background.");
+  });
+
+  it('allows the same workflow to run in the foreground (no --detach)', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'guided', interactive: true }, 'project')],
+      errors: [],
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-ok',
+    });
+
+    await workflowRunCommand('/test/path', 'guided', 'hello', { noWorktree: true });
+
+    expect(executeWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not refuse a continuation (--resume --detach) on an already-paused interactive-class run', async () => {
+    // A continuation is exempt from the launch refusal (isContinuation guard) — proven by
+    // asserting the class error never fires, regardless of what (if anything) an
+    // unrelated missing mock throws afterward. Real timers: this test does not exercise
+    // the fake-timer-gated startup window the sibling tests in this block do.
+    jest.useRealTimers();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { hydrateResumableRun } = await import('@archon/workflows/executor');
+    const conversationDb = await import('@archon/core/db/conversations');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'guided', interactive: true }, 'project')],
+      errors: [],
+    });
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { id: 'run-paused', workflow_name: 'guided' },
+      priorCompletedNodes: new Map(),
+    });
+    (conversationDb.getOrCreateConversation as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'conv-resume',
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-paused',
+      workflow_name: 'guided',
+      working_path: null,
+    });
+    // Real spawn must never actually run — mock it even though this test doesn't assert
+    // on it, since --detach forks if every mock above happens to line up.
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+
+    try {
+      await workflowRunCommand('/test/path', 'guided', 'hello', {
+        resume: true,
+        detach: true,
+      });
+    } catch (error) {
+      expect((error as Error).message).not.toMatch(/interactive-class/i);
+    } finally {
+      spawnSpy.mockRestore();
+    }
   });
 });
 
@@ -6313,6 +6558,278 @@ describe('workflowAbandonCommand', () => {
   });
 });
 
+describe('workflowCancelCommand', () => {
+  const runId = '12345678-1234-1234-1234-123456789abc';
+  let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
+    mockRequestDetachedRunStop.mockReset();
+    mockRequestDetachedRunStop.mockResolvedValue({
+      stop: mockDetachedTargetStop,
+      release: mockDetachedTargetRelease,
+    });
+    mockDetachedTargetStop.mockReset();
+    mockDetachedTargetStop.mockResolvedValue();
+    mockDetachedTargetRelease.mockClear();
+    mockReclaimContainerEnv.mockReset();
+    mockReclaimContainerEnv.mockResolvedValue();
+
+    const workflowDb = require('@archon/core/db/workflows');
+    const isolationDb = require('@archon/core/db/isolation-environments');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockReset();
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockReset();
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      cancelled: true,
+    });
+    (workflowDb.findChildRuns as ReturnType<typeof mock>).mockReset();
+    (workflowDb.findChildRuns as ReturnType<typeof mock>).mockResolvedValue([]);
+    (isolationDb.getById as ReturnType<typeof mock>).mockReset();
+    (isolationDb.getById as ReturnType<typeof mock>).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
+  });
+
+  it('stops the live process tree before recording cancellation', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    const order: string[] = [];
+    const row = { id: runId, workflow_name: 'implement', status: 'running' };
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue(row);
+    mockRequestDetachedRunStop.mockImplementation(async () => {
+      order.push('owner');
+      return {
+        stop: async () => {
+          order.push('terminate');
+        },
+        release: mockDetachedTargetRelease,
+      };
+    });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockImplementation(async () => {
+      order.push('cancel-state');
+      return { cancelled: true };
+    });
+
+    await workflowCancelCommand(runId);
+
+    expect(order).toEqual(['owner', 'terminate', 'cancel-state']);
+    expect(mockRequestDetachedRunStop).toHaveBeenCalledWith(runId);
+    expect(consoleSpy).toHaveBeenCalledWith(
+      'Host process tree stopped before run state was changed.'
+    );
+  });
+
+  it('leaves run state unchanged when no live detached owner answers', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+    });
+    mockRequestDetachedRunStop.mockRejectedValue(
+      new Error('No live detached owner; run unchanged')
+    );
+
+    await workflowCancelCommand(runId, true);
+
+    expect(mockDetachedTargetStop).not.toHaveBeenCalled();
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      runId,
+      action: 'cancel',
+      error: 'No live detached owner; run unchanged',
+    });
+  });
+
+  it('leaves run state unchanged when process-tree termination fails', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+    });
+    mockDetachedTargetStop.mockRejectedValue(new Error('process still exists'));
+
+    await workflowCancelCommand(runId, true);
+
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'cancel',
+      error: 'process still exists',
+    });
+  });
+
+  it('confirms container teardown before recording cancellation', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    const isolationDb = require('@archon/core/db/isolation-environments');
+    const order: string[] = [];
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+      metadata: { isolation: 'container', isolation_env_id: 'container-env-1' },
+    });
+    (isolationDb.getById as ReturnType<typeof mock>).mockResolvedValue({
+      id: 'container-env-1',
+      provider: 'container',
+    });
+    mockDetachedTargetStop.mockImplementation(async (): Promise<void> => {
+      order.push('terminate-owner');
+    });
+    mockReclaimContainerEnv.mockImplementation(async (): Promise<void> => {
+      order.push('reclaim-container');
+    });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockImplementation(
+      async (): Promise<{ cancelled: boolean }> => {
+        order.push('cancel-state');
+        return { cancelled: true };
+      }
+    );
+
+    await workflowCancelCommand(runId, true);
+
+    expect(order).toEqual([
+      'terminate-owner',
+      'reclaim-container',
+      'cancel-state',
+      'reclaim-container',
+    ]);
+    expect(mockReclaimContainerEnv).toHaveBeenCalledTimes(2);
+    expect(mockReclaimContainerEnv).toHaveBeenCalledWith('container-env-1');
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: true,
+      processStopped: true,
+      status: 'cancelled',
+    });
+  });
+
+  it('leaves state unchanged when container teardown cannot be confirmed', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    const isolationDb = require('@archon/core/db/isolation-environments');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+      metadata: { isolation: 'container', isolation_env_id: 'container-env-1' },
+    });
+    (isolationDb.getById as ReturnType<typeof mock>).mockResolvedValue({
+      id: 'container-env-1',
+      provider: 'container',
+    });
+    mockReclaimContainerEnv.mockRejectedValue(new Error('docker daemon unavailable'));
+
+    await workflowCancelCommand(runId, true);
+
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'cancel',
+      error: expect.stringContaining(
+        'isolation container could not be confirmed stopped. Run state was not changed'
+      ),
+    });
+  });
+
+  it('does not stop the owner when container tracking is unavailable', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    const isolationDb = require('@archon/core/db/isolation-environments');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+      metadata: { isolation: 'container', isolation_env_id: 'missing-env' },
+    });
+    (isolationDb.getById as ReturnType<typeof mock>).mockResolvedValue(null);
+
+    await workflowCancelCommand(runId, true);
+
+    expect(mockRequestDetachedRunStop).not.toHaveBeenCalled();
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'cancel',
+      error: expect.stringContaining('Cannot confirm the isolation container'),
+    });
+  });
+
+  it('does not stop the owner when a container run has no tracking ID', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    const isolationDb = require('@archon/core/db/isolation-environments');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'running',
+      metadata: { isolation: 'container' },
+    });
+
+    await workflowCancelCommand(runId, true);
+
+    expect(isolationDb.getById).not.toHaveBeenCalled();
+    expect(mockRequestDetachedRunStop).not.toHaveBeenCalled();
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'cancel',
+      error: expect.stringContaining('container tracking ID is missing'),
+    });
+  });
+
+  it('does not report cancellation when the state transition loses a race', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>)
+      .mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'running',
+      })
+      .mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'running',
+      })
+      .mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'completed',
+      });
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      cancelled: false,
+    });
+
+    await workflowCancelCommand(runId, true);
+
+    expect(mockDetachedTargetStop).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'cancel',
+      error: expect.stringContaining(
+        'The run status is completed; it was not reported as cancelled'
+      ),
+    });
+  });
+
+  it('refuses a non-running run without contacting a process owner', async () => {
+    const workflowDb = require('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValue({
+      id: runId,
+      workflow_name: 'implement',
+      status: 'cancelled',
+    });
+
+    await expect(workflowCancelCommand(runId)).rejects.toThrow(
+      "Cannot actively cancel run with status 'cancelled'"
+    );
+    expect(mockRequestDetachedRunStop).not.toHaveBeenCalled();
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+  });
+});
+
 describe('workflowCleanupCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
 
@@ -6418,6 +6935,114 @@ describe('workflowRejectCommand', () => {
       },
     ]);
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Rejected and cancelled'));
+  });
+
+  it('plain mode: rejecting with no reason defaults structured output text to "Rejected" (#2740)', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-new-mode',
+      workflow_name: 'new-mode-wf',
+      status: 'paused',
+      user_message: 'build it',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+
+    try {
+      await workflowRejectCommand('run-new-mode');
+    } catch {
+      // A new-mode reject stays resumable and auto-resumes inline; the
+      // downstream workflowRunCommand failure (no workflow discovered in this
+      // unit test's fake cwd) is acceptable here — this test only cares about
+      // what was recorded before that point.
+    }
+
+    // No `reason` argument at all — the CLI must default it to 'Rejected'
+    // before it reaches rejectWorkflow, otherwise the new-mode structured
+    // output (#2707) records an empty string instead (#2740).
+    const structuredOutput = { decision: 'reject', text: 'Rejected' };
+    expect(workflowDb.resolveApprovalGate).toHaveBeenCalledWith(
+      'run-new-mode',
+      {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+          decisionsAuthored: true,
+          resolved: 'rejected',
+        },
+      },
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'gate',
+          data: {
+            node_output: JSON.stringify(structuredOutput),
+            approval_decision: 'rejected',
+            structured_output: structuredOutput,
+          },
+        },
+        {
+          event_type: 'approval_received',
+          step_name: 'gate',
+          data: { decision: 'rejected', reason: 'Rejected' },
+        },
+      ]
+    );
+  });
+
+  it('--json mode: rejecting with no reason defaults structured output text to "Rejected" (#2740)', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const jsonStdoutSpy = spyOnJsonStdout();
+
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-new-mode-json',
+      workflow_name: 'new-mode-wf',
+      status: 'paused',
+      user_message: 'build it',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'reject' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+
+    await workflowRejectCommand('run-new-mode-json', undefined, true);
+
+    const structuredOutput = { decision: 'reject', text: 'Rejected' };
+    expect(workflowDb.resolveApprovalGate).toHaveBeenCalledWith(
+      'run-new-mode-json',
+      expect.objectContaining({
+        approval: expect.objectContaining({ resolved: 'rejected' }),
+      }),
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'node_completed',
+          step_name: 'gate',
+          data: expect.objectContaining({ structured_output: structuredOutput }),
+        }),
+      ])
+    );
+    const parsed = JSON.parse(firstJsonPayload(jsonStdoutSpy)) as Record<string, unknown>;
+    expect(parsed).toMatchObject({ ok: true, runId: 'run-new-mode-json', action: 'reject' });
+    jsonStdoutSpy.mockRestore();
   });
 
   it('updates metadata and auto-resumes when on_reject configured and under limit', async () => {
@@ -6790,6 +7415,153 @@ describe('workflowRejectCommand', () => {
   });
 });
 
+// #2707 step 2 — the general drive verb. `approve`/`reject` are sugar (delegated
+// directly to the existing commands); any other decision resolves through the new
+// declared-decision path.
+describe('workflowRespondCommand', () => {
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  it("delegates 'approve' to the exact same resolution as workflowApproveCommand", async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-approve',
+      workflow_name: 'guided',
+      status: 'paused',
+      user_message: 'go',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+
+    try {
+      await workflowRespondCommand('run-respond-approve', 'approve', 'looks good');
+    } catch {
+      // downstream workflowRunCommand failure is acceptable in this unit test
+    }
+
+    expect(workflowDb.resolveApprovalGate).toHaveBeenCalledWith(
+      'run-respond-approve',
+      expect.objectContaining({
+        approval: expect.objectContaining({ resolved: 'approved' }),
+      }),
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'node_completed',
+          data: expect.objectContaining({
+            structured_output: { decision: 'approve', text: 'looks good' },
+          }),
+        }),
+      ])
+    );
+  });
+
+  it('resolves a declared non-default decision with the caller-supplied id', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-revise',
+      workflow_name: 'guided',
+      status: 'paused',
+      user_message: 'go',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+
+    try {
+      await workflowRespondCommand('run-respond-revise', 'revise', 'needs more detail');
+    } catch {
+      // downstream workflowRunCommand failure is acceptable in this unit test
+    }
+
+    expect(workflowDb.resolveApprovalGate).toHaveBeenCalledWith(
+      'run-respond-revise',
+      expect.objectContaining({ approval_response: 'revise' }),
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_type: 'node_completed',
+          data: expect.objectContaining({
+            structured_output: { decision: 'revise', text: 'needs more detail' },
+          }),
+        }),
+      ])
+    );
+  });
+
+  it('rejects a decision the gate does not declare, naming the actual options', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-invalid',
+      workflow_name: 'guided',
+      status: 'paused',
+      user_message: 'go',
+      working_path: '/repo',
+      codebase_id: null,
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'gate',
+          message: 'Approve?',
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        },
+      },
+    });
+    const resolveGateSpy = workflowDb.resolveApprovalGate as ReturnType<typeof mock>;
+    resolveGateSpy.mockClear();
+
+    await expect(
+      workflowRespondCommand('run-respond-invalid', 'escalate', 'not sure')
+    ).rejects.toThrow(/does not declare decision 'escalate'.*approve, revise/s);
+
+    expect(resolveGateSpy).not.toHaveBeenCalled();
+  });
+
+  it('--detach validates read-only via assertRespondable before forking', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-respond-detach',
+      workflow_name: 'guided',
+      status: 'completed',
+      working_path: '/repo',
+      metadata: {},
+    });
+    const spawnSpy = spyOn(Bun, 'spawn');
+
+    try {
+      await expect(
+        workflowRespondCommand('run-respond-detach', 'revise', undefined, false, undefined, true)
+      ).rejects.toThrow(/Only paused runs can be approved/);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+    expect(spawnSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe('workflowRunCommand — progress rendering', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let stderrSpy: ReturnType<typeof spyOn>;
@@ -6825,7 +7597,11 @@ describe('workflowRunCommand — progress rendering', () => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
     stderrSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
     capturedSubscribeHandler = null;
+    mockDetachedStopRequested = false;
     mockUnsubscribe.mockClear();
+    mockStartDetachedRunControlServer.mockClear();
+    mockDetachedControlClose.mockClear();
+    delete process.env.ARCHON_DETACHED_RUN_OWNER;
     mockLogger.info.mockClear();
     mockLogger.warn.mockClear();
   });
@@ -7251,6 +8027,11 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
     // handler in-process doesn't kill the test runner.
     exitSpy = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     capturedSubscribeHandler = null;
+    mockDetachedStopRequested = false;
+    mockAssertDetachedRunProcessOwner.mockReset();
+    mockAssertDetachedRunProcessOwner.mockImplementation(() => undefined);
+    mockStartDetachedRunControlServer.mockClear();
+    mockDetachedControlClose.mockClear();
     mockUnsubscribe.mockClear();
 
     const workflowsDb = require('@archon/core/db/workflows');
@@ -7264,6 +8045,7 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
     consoleSpy.mockRestore();
     stderrSpy.mockRestore();
     exitSpy.mockRestore();
+    delete process.env.ARCHON_DETACHED_RUN_OWNER;
   });
 
   it('removes SIGTERM/SIGINT handlers once executeWorkflow settles (no leak, no stacking)', async () => {
@@ -7356,6 +8138,47 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
       'Process terminated (SIGTERM)'
     );
     expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('lets an exact-run cancel controller own the lifecycle transition', async () => {
+    const workflowsDb = require('@archon/core/db/workflows');
+    process.env.ARCHON_DETACHED_RUN_OWNER = '1';
+
+    const sigtermBefore = process.listeners('SIGTERM');
+    const { executeWorkflow } = require('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce(async () => {
+      mockDetachedStopRequested = true;
+      const [handler] = addedSigtermListeners(sigtermBefore);
+      expect(handler).toBeDefined();
+      handler();
+      await settleCleanup();
+      return { success: false, workflowRunId: 'test-run-id', error: 'interrupted' };
+    });
+
+    setupWorkflowMocks();
+    await expect(workflowRunCommand('/test/path', 'plan', 'hello', {})).rejects.toThrow(
+      'Workflow failed'
+    );
+
+    expect(mockStartDetachedRunControlServer).toHaveBeenCalledWith('test-run-id');
+    expect(workflowsDb.getWorkflowRunStatus).not.toHaveBeenCalled();
+    expect(workflowsDb.failWorkflowRun).not.toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(mockDetachedControlClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a detached marker when this process does not own its process group', async () => {
+    process.env.ARCHON_DETACHED_RUN_OWNER = '1';
+    mockAssertDetachedRunProcessOwner.mockImplementationOnce(() => {
+      throw new Error('does not own process group');
+    });
+
+    await expect(workflowRunCommand('/test/path', 'plan', 'hello', {})).rejects.toThrow(
+      'does not own process group'
+    );
+
+    expect(mockStartDetachedRunControlServer).not.toHaveBeenCalled();
+    expect(process.env.ARCHON_DETACHED_RUN_OWNER).toBeUndefined();
   });
 
   it('never touches a run it does not own (no owned run id at signal time)', async () => {

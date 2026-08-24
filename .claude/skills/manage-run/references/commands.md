@@ -104,9 +104,18 @@ Reject a paused gate. `cancelled: false` means an `on_reject` rework pass is que
 ```
 
 ### `archon workflow abandon <run-id> [--json]`
-Cancel a non-terminal run. (There is no separate `cancel` verb.)
+Mark a non-terminal run cancelled without stopping host work. Use for paused runs or
+after independently verifying that a running owner is gone.
 ```json
 { "ok": true, "runId": "…", "action": "abandon", "status": "cancelled", "workflowName": "…" }
+```
+
+### `archon workflow cancel <run-id> [--json]`
+Actively stop a running CLI `--detach` owner. The command proves the exact live owner,
+terminates its process tree, and only then records `cancelled`. Failure leaves state unchanged.
+```json
+{ "ok": true, "runId": "…", "action": "cancel", "status": "cancelled",
+  "processStopped": true, "workflowName": "…" }
 ```
 
 ### `archon workflow resume <run-id> [--json]`

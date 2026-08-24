@@ -134,10 +134,34 @@ describe('evaluateCondition', () => {
     expect((caught as OutputRefError).message).toContain("'classify'");
   });
 
-  it('failed node: output is empty string, conditions evaluate accordingly', () => {
-    const outputs = new Map([['classify', makeOutput('', 'failed')]]);
-    expect(evaluateCondition("$classify.output == ''", outputs).result).toBe(true);
-    expect(evaluateCondition("$classify.output == 'BUG'", outputs).result).toBe(false);
+  it('failed producer (#2713): whole-text $node.output throws instead of evaluating stale output', () => {
+    // Mirrors a loop_group's failure paths: the stored output is real, non-empty text
+    // (lastIterationOutput), not '' — the premise the old version of this test assumed.
+    // A when: condition joined past the failure via trigger_rule: all_done must not
+    // silently evaluate that stale text as if the producer had succeeded.
+    const outputs = new Map([['corrections', makeOutput('CORRECTIONS_APPLIED', 'failed')]]);
+    expect(() =>
+      evaluateCondition("$corrections.output == 'CORRECTIONS_APPLIED'", outputs)
+    ).toThrow();
+    // Even an empty-output failed producer throws — state gates this, not content.
+    const emptyFailed = new Map([['classify', makeOutput('', 'failed')]]);
+    expect(() => evaluateCondition("$classify.output == ''", emptyFailed)).toThrow();
+  });
+
+  it('failed producer (#2713): fielded $node.output.field throws even on valid JSON leftover output', () => {
+    // The issue's own reproduction: a failed loop_group whose leftover output happens
+    // to be valid JSON must not resolve a field from it as if the group had succeeded.
+    const outputs = new Map([
+      ['corrections', makeOutput(JSON.stringify({ ready: true }), 'failed')],
+    ]);
+    let caught: unknown;
+    try {
+      evaluateCondition('$corrections.output.ready == true', outputs);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(OutputRefError);
+    expect((caught as OutputRefError).reason).toBe('producer-failed');
   });
 
   it('invalid expression: defaults to false (fail-closed) with parsed: false', () => {

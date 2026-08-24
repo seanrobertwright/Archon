@@ -10,6 +10,7 @@ import type {
   WorkflowSource,
 } from './schemas/workflow';
 import { expandWorkflowIncludes } from './include-expander';
+import type { CapturedSourceOwner } from './executor';
 
 const DEFAULT_NODE = { id: 'default', command: 'test-command' };
 
@@ -78,4 +79,31 @@ export function makeTestComposedWorkflow(
   const expanded = workflows.get(name);
   if (!expanded) throw new Error(`makeTestComposedWorkflow: no workflow named '${name}'`);
   return expanded;
+}
+
+/**
+ * Run a capture-owner body with the production hold/adopt/reclaim lifecycle while
+ * recording each transition. Cross-package tests use this as the observable
+ * implementation behind their mocked `withCapturedSource` export.
+ */
+export async function withObservableCapturedSource<T>(
+  calls: string[],
+  body: (owner: CapturedSourceOwner) => Promise<T>
+): Promise<T> {
+  let held: string | undefined;
+  let adopted = false;
+  try {
+    return await body({
+      hold: prepared => {
+        held = prepared.captureRoot;
+        calls.push(`hold:${prepared.captureRoot}`);
+      },
+      adopt: () => {
+        adopted = true;
+        calls.push('adopt');
+      },
+    });
+  } finally {
+    if (held && !adopted) calls.push(`reclaim:${held}`);
+  }
 }

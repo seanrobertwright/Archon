@@ -15,6 +15,11 @@ const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
+// Backs createWorkflowStore()'s rewriteApprovalContext (#2707 step 3 pause
+// escalation) — per AGENTS.md's mock.module rule, an export the factory omits
+// keeps its REAL implementation, so this must be listed even though no test
+// here calls rewriteApprovalContext yet.
+const mockResolveApprovalGate = mock(() => Promise.resolve({ resolved: true }));
 
 mock.module('../db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
@@ -30,6 +35,7 @@ mock.module('../db/workflows', () => ({
   failWorkflowRun: mockFailWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
+  resolveApprovalGate: mockResolveApprovalGate,
   claimWriteback: mock(() => Promise.resolve({ claimed: true })),
   releaseWritebackClaim: mock(() => Promise.resolve()),
 }));
@@ -252,11 +258,11 @@ describe('createWorkflowDeps', () => {
       expect(typeof deps.getUserProviderEnv).toBe('function');
     });
 
-    test('getUserProviderEnv returns { env: {}, files: [] } when list query throws', async () => {
+    test('getUserProviderEnv returns empty delivery bags when list query throws', async () => {
       mockListDecryptedUserProviderCredentials.mockRejectedValueOnce(new Error('db gone'));
       const deps = createWorkflowDeps();
       const result = await deps.getUserProviderEnv?.('u-1', '/tmp/art');
-      expect(result).toEqual({ env: {}, files: [] });
+      expect(result).toEqual({ env: {}, files: [], protectedValues: [] });
     });
 
     // Regression guard for #2035: enabling the credential vault (auto-key on by
@@ -268,7 +274,7 @@ describe('createWorkflowDeps', () => {
       mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([]);
       const deps = createWorkflowDeps();
       const result = await deps.getUserProviderEnv?.('u-unconnected', '/tmp/art');
-      expect(result).toEqual({ env: {}, files: [] });
+      expect(result).toEqual({ env: {}, files: [], protectedValues: [] });
     });
 
     test('getUserProviderEnv aggregates env from multiple providers', async () => {
@@ -279,6 +285,42 @@ describe('createWorkflowDeps', () => {
       const deps = createWorkflowDeps();
       const result = await deps.getUserProviderEnv?.('u-1', '/tmp/art');
       expect(result?.env).toMatchObject({ OPENROUTER_API_KEY: 'or-k', GEMINI_API_KEY: 'g-k' });
+      expect(result?.protectedValues).toEqual(['or-k', 'g-k']);
+    });
+
+    test('getUserProviderEnv protects OAuth secrets without hiding public metadata', async () => {
+      mockListDecryptedUserProviderCredentials.mockResolvedValueOnce([
+        {
+          provider: 'openai',
+          cred: {
+            kind: 'oauth',
+            oauthApiKey: 'derived-bearer',
+            rawCreds: {
+              type: 'oauth',
+              access: 'access-token',
+              refresh: 'refresh-token',
+              id_token: 'id-token',
+              accountId: 'account-id',
+              enterpriseUrl: 'company.ghe.com',
+              availableModelIds: ['claude-sonnet-4', 'gpt-5'],
+              expires: 123,
+            },
+          },
+        },
+      ]);
+      const deps = createWorkflowDeps();
+      const result = await deps.getUserProviderEnv?.('u-1', '/tmp/art');
+      expect(result?.protectedValues).toEqual([
+        'derived-bearer',
+        'access-token',
+        'refresh-token',
+        'id-token',
+      ]);
+      expect(result?.protectedValues).not.toContain('oauth');
+      expect(result?.protectedValues).not.toContain('account-id');
+      expect(result?.protectedValues).not.toContain('company.ghe.com');
+      expect(result?.protectedValues).not.toContain('claude-sonnet-4');
+      expect(result?.protectedValues).not.toContain('gpt-5');
     });
   });
 });

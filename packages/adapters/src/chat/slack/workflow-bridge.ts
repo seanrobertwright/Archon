@@ -479,12 +479,14 @@ export class SlackWorkflowBridge {
               ? 'recorded — finalizes if the gate paused after a completion condition was met, otherwise the loop runs another iteration on resume'
               : 'workflow resumed';
         } else {
-          const result = await workflowOperations.rejectWorkflow(runId);
+          const result = await workflowOperations.rejectWorkflow(runId, 'Rejected');
           outcomeNote = result.cancelled
             ? result.maxAttemptsReached
               ? 'cancelled — max reject attempts reached'
               : 'cancelled'
-            : 'recorded — workflow will retry with feedback';
+            : result.newMode
+              ? 'recorded — the run continues'
+              : 'recorded — workflow will retry with feedback';
         }
       } catch (error) {
         const err = error as Error;

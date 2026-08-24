@@ -132,6 +132,7 @@ mock.module('@opencode-ai/sdk', () => ({
 }));
 
 import { OpencodeProvider, resetEmbeddedRuntime } from './provider';
+import { classifyOpencodeError } from './errors';
 import type { NodeConfig } from '../../types';
 
 /** Default model for tests — satisfies the model-or-agent validation */
@@ -686,6 +687,96 @@ describe('OpencodeProvider', () => {
 
     expect(error).toBeUndefined();
     expect(chunks).toEqual([{ type: 'result', sessionId: 'session-1' }]);
+    expect(mockCreateOpencode).toHaveBeenCalledTimes(2);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      { attempt: 0, delayMs: 1, errorClass: 'rate_limit' },
+      'opencode.retrying_query'
+    );
+  });
+
+  test('retries a structured 429 from the single-agent session stream', async () => {
+    const sdkError = {
+      name: 'APIError',
+      data: { message: 'upstream request failed', statusCode: 429, isRetryable: true },
+    };
+    const retryRuntime = makeRuntime({
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          {
+            type: 'session.error',
+            properties: { sessionID: 'session-1', error: sdkError },
+          },
+        ]),
+      })),
+    });
+    const successRuntime = makeRuntime({
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          { type: 'session.idle', properties: { sessionID: 'session-1' } },
+        ]),
+      })),
+    });
+    runtimeQueue.push(retryRuntime, successRuntime);
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([{ type: 'result', sessionId: 'session-1' }]);
+    expect(mockCreateOpencode).toHaveBeenCalledTimes(2);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      { attempt: 0, delayMs: 1, errorClass: 'rate_limit' },
+      'opencode.retrying_query'
+    );
+  });
+
+  test('retries a structured 429 from the multi-agent session stream', async () => {
+    const cwd = await createTempProjectDir();
+    const sdkError = {
+      name: 'APIError',
+      data: { message: 'upstream request failed', statusCode: 429, isRetryable: true },
+    };
+    const retrySessionIds = ['scout-session', 'reviewer-session'];
+    const retryRuntime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: retrySessionIds.shift() } })),
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          {
+            type: 'session.error',
+            properties: { sessionID: 'scout-session', error: sdkError },
+          },
+        ]),
+      })),
+    });
+    const successSessionIds = ['scout-session', 'reviewer-session'];
+    const successRuntime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: successSessionIds.shift() } })),
+      subscribe: mock(async () => ({
+        stream: createEventStream([
+          { type: 'session.idle', properties: { sessionID: 'scout-session' } },
+          { type: 'session.idle', properties: { sessionID: 'reviewer-session' } },
+        ]),
+      })),
+    });
+    runtimeQueue.push(retryRuntime, successRuntime);
+
+    const { error } = await consume(
+      new OpencodeProvider({ retryBaseDelayMs: 1 }).sendQuery('hi', cwd, undefined, {
+        assistantConfig: TEST_MODEL,
+        nodeConfig: {
+          nodeId: 'research',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
     expect(mockCreateOpencode).toHaveBeenCalledTimes(2);
     expect(mockLogger.info).toHaveBeenCalledWith(
       { attempt: 0, delayMs: 1, errorClass: 'rate_limit' },
@@ -1435,5 +1526,78 @@ describe('OpencodeProvider', () => {
     expect(error?.message).toContain(
       "Invalid OpenCode agent model ref for 'bad-agent': 'invalid-no-slash-format'"
     );
+  });
+});
+
+describe('classifyOpencodeError (#2715)', () => {
+  test('does not classify a bare "401"/"403" substring as auth', () => {
+    expect(classifyOpencodeError(new Error('connect ECONNREFUSED 127.0.0.1:401'), false)).not.toBe(
+      'auth'
+    );
+    expect(classifyOpencodeError(new Error('timeout after 401ms'), false)).not.toBe('auth');
+    expect(classifyOpencodeError(new Error('proxy responded with 403'), false)).not.toBe('auth');
+  });
+
+  test('still classifies genuine auth signals as auth', () => {
+    expect(classifyOpencodeError(new Error('Unauthorized'), false)).toBe('auth');
+    expect(classifyOpencodeError(new Error('authentication failed'), false)).toBe('auth');
+    expect(classifyOpencodeError(new Error('invalid token provided'), false)).toBe('auth');
+    expect(classifyOpencodeError(new Error('provided api key is rejected'), false)).toBe('auth');
+    // Real-world provider shape: a 401 co-occurring with the word "Unauthorized" —
+    // the word carries the signal, not the digits.
+    expect(
+      classifyOpencodeError(new Error('exceeded retry limit, last status: 401 Unauthorized'), false)
+    ).toBe('auth');
+  });
+
+  test('classifies exact structured statuses across top-level, SDK, and wrapped shapes', () => {
+    const cases = [
+      [401, 'auth'],
+      [403, 'auth'],
+      [429, 'rate_limit'],
+    ] as const;
+
+    for (const [statusCode, expectedClass] of cases) {
+      expect(classifyOpencodeError({ statusCode }, false)).toBe(expectedClass);
+
+      const sdkError = {
+        name: 'APIError',
+        data: { message: 'request failed', statusCode, isRetryable: statusCode === 429 },
+      };
+      expect(classifyOpencodeError(sdkError, false)).toBe(expectedClass);
+
+      const wrappedError = new Error('request failed');
+      wrappedError.cause = sdkError;
+      expect(classifyOpencodeError(wrappedError, false)).toBe(expectedClass);
+    }
+  });
+
+  test('classifies the SDK auth discriminator through Error.cause', () => {
+    const authError = new Error('provider rejected request');
+    authError.cause = {
+      name: 'ProviderAuthError',
+      data: { providerID: 'anthropic', message: 'provider rejected request' },
+    };
+    expect(classifyOpencodeError(authError, false)).toBe('auth');
+  });
+
+  test('does not classify a bare "429" substring as rate_limit (#2509 R11 mirror)', () => {
+    expect(classifyOpencodeError(new Error('connect ECONNREFUSED 127.0.0.1:4291'), false)).not.toBe(
+      'rate_limit'
+    );
+    expect(
+      classifyOpencodeError(
+        new Error('operation timed out after 4293ms while establishing connection'),
+        false
+      )
+    ).not.toBe('rate_limit');
+  });
+
+  test('still classifies genuine rate-limit signals as rate_limit', () => {
+    expect(classifyOpencodeError(new Error('rate limit exceeded'), false)).toBe('rate_limit');
+    expect(classifyOpencodeError(new Error('too many requests, please slow down'), false)).toBe(
+      'rate_limit'
+    );
+    expect(classifyOpencodeError(new Error('server overloaded'), false)).toBe('rate_limit');
   });
 });

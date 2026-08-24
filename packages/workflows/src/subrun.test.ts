@@ -12,8 +12,8 @@
  * which does (mock.module is process-global and irreversible).
  */
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { mkdir, writeFile, rm, cp } from 'fs/promises';
-import { join } from 'path';
+import { mkdir, writeFile, rm, cp, readdir } from 'fs/promises';
+import { join, sep } from 'path';
 import { tmpdir } from 'os';
 
 // --- Mock logger + telemetry (passthrough real path utilities like loader.test.ts) ---
@@ -46,6 +46,43 @@ mock.module('@archon/git', () => ({
   toRepoPath: mock((p: string) => p),
 }));
 
+// --- Mock fs/promises.rename so a single test can force the rename the recursive
+//     executeWorkflow performs (moving the staged capture under the child's
+//     artifacts directory) to throw. The wrap's `finally` is the only thing that
+//     can reclaim that staged capture when the rename fails — without the fix
+//     in runChildWorkflow, the staged tree leaks until the hourly age-based
+//     sweep reaps it (review R1). Every other fs/promises function delegates
+//     to the real implementation so other tests are unaffected.
+//
+//     The forced failure targets ONLY the move-out-of-staging rename: source
+//     lives under `staged-source/`, destination does NOT. `captureWorkflowSource`
+//     also does a rename (staged-source/<uuid>.partial -> staged-source/<uuid>)
+//     and that one must keep working, otherwise `prepareWorkflowSource` itself
+//     throws before runChildWorkflow reaches the recursive call.
+//
+//     The path predicate uses `path.sep`, not a hardcoded forward slash:
+//     `fs/promises.rename` on Windows is called with backslash-separated paths
+//     produced by `path.join`, so a literal `'staged-source/'` substring check
+//     never matches there and the test fails to exercise the reclaim path it is
+//     here to prove. ---
+const realFsPromises = await import('fs/promises');
+let forceRenameFailure = false;
+const passthroughRename = realFsPromises.rename;
+const stagedSourcePathSep = `staged-source${sep}`;
+mock.module('fs/promises', () => ({
+  ...realFsPromises,
+  rename: async (src: string, dst: string): Promise<void> => {
+    if (
+      forceRenameFailure &&
+      src.includes(stagedSourcePathSep) &&
+      !dst.includes(stagedSourcePathSep)
+    ) {
+      throw new Error(`forced rename failure for test: ${src} -> ${dst}`);
+    }
+    return passthroughRename(src, dst);
+  },
+}));
+
 // --- Bootstrap provider registry (load-time isRegisteredProvider checks) ---
 import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
 clearRegistry();
@@ -63,6 +100,11 @@ import type {
   ChildIsolationRequest,
   ChildIsolationResult,
 } from './child-isolation';
+
+// A run in one of these statuses still holds the ancestor-aware path lock; this
+// must stay in lockstep with the production collision check in dag-executor.ts.
+const holdsPathLock = (status: WorkflowRun['status']): boolean =>
+  status === 'pending' || status === 'running' || status === 'paused';
 
 // ---------------------------------------------------------------------------
 // Stateful in-memory store — implements just enough of IWorkflowStore to drive
@@ -135,21 +177,17 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve(out);
   };
 
-  getActiveWorkflowRunByPath = (
+  // Prototype method (not an arrow-field) so store doubles can call it via `super`.
+  getActiveWorkflowRunByPath(
     workingPath: string,
     self?: { id: string; startedAt: Date; excludeRunIds?: string[] }
-  ): Promise<WorkflowRun | null> => {
+  ): Promise<WorkflowRun | null> {
     const exclude = new Set([self?.id, ...(self?.excludeRunIds ?? [])].filter(Boolean));
     const active = [...this.runs.values()]
-      .filter(
-        r =>
-          r.working_path === workingPath &&
-          (r.status === 'running' || r.status === 'paused' || r.status === 'pending') &&
-          !exclude.has(r.id)
-      )
+      .filter(r => r.working_path === workingPath && holdsPathLock(r.status) && !exclude.has(r.id))
       .sort((a, b) => a.started_at.getTime() - b.started_at.getTime());
     return Promise.resolve(active[0] ? this.clone(active[0]) : null);
-  };
+  }
 
   resumeWorkflowRun = (id: string): Promise<WorkflowRun> => {
     const r = this.runs.get(id);
@@ -211,6 +249,18 @@ class InMemoryStore implements IWorkflowStore {
       };
     }
     return Promise.resolve();
+  };
+
+  rewriteApprovalContext: IWorkflowStore['rewriteApprovalContext'] = (id, approvalContext) => {
+    const r = this.runs.get(id);
+    // Mirrors the real store's CAS guard (unresolvedGateClause): only while still
+    // paused and unresolved — a human resolving the gate first wins the race.
+    const approval = r?.metadata?.approval as { resolved?: string } | undefined;
+    if (r && r.status === 'paused' && approval?.resolved == null) {
+      r.metadata = { ...r.metadata, approval: { ...approvalContext } };
+      return Promise.resolve({ resolved: true });
+    }
+    return Promise.resolve({ resolved: false });
   };
 
   claimWriteback = (): Promise<{ claimed: boolean }> => Promise.resolve({ claimed: true });
@@ -2899,7 +2949,14 @@ nodes:
     ]);
   });
 
-  it('a fan-out child that pauses at a gate FAILS the node (#2180) and is cancelled', async () => {
+  it('a fan-out target that is interactive-class is refused before any child is created (#2707 step 2, #2474)', async () => {
+    // Superseded by the spawn-time interactive-class preflight: an interactive-class
+    // target (declared `interactive: true`, the simple case #2474 scoped as in-scope) is
+    // now refused before ANY child run row exists, rather than spawning and reactively
+    // cancelling a paused child. The reactive backstop this test used to exercise remains
+    // in place for the cases #2474 named out of scope (a gate nested inside a loop_group
+    // body, or a grandchild `workflow:` node's gate) — see the sibling
+    // 'GAP (#2180 Defect A)' describe block below for that backstop still working.
     await writeWorkflow(
       'fan-child-gated',
       `
@@ -2955,21 +3012,15 @@ nodes:
     // single gate slot (#2180); it fails instead.
     expect((parentRun?.metadata as Record<string, unknown>).approval).toBeUndefined();
 
-    // Every fan-out child that paused was cancelled — tagged `fan_out_gate` so removing
-    // the gate + resuming re-drives it (C2), not a bare cancel.
+    // No child ever gets a row — refused before spawn, not spawned-then-cancelled.
     const children = [...store.runs.values()].filter(r => r.workflow_name === 'fan-child-gated');
-    expect(children.length).toBeGreaterThanOrEqual(1);
-    for (const c of children) {
-      expect(c.status).toBe('cancelled');
-      expect((c.metadata as Record<string, unknown>).cancelled_reason).toBe('fan_out_gate');
-    }
+    expect(children).toHaveLength(0);
+
     const nodeFailed = store.events.find(
       e => e.event_type === 'node_failed' && e.step_name === 'work'
     );
-    // Enriched message (I4): names the offending child index + run id.
-    expect(String(nodeFailed?.data?.error)).toContain('autonomously');
-    expect(String(nodeFailed?.data?.error)).toContain('#2180');
-    expect(String(nodeFailed?.data?.error)).toMatch(/child \d+ \(run [\w-]+\)/);
+    expect(String(nodeFailed?.data?.error)).toContain("'fan-child-gated'");
+    expect(String(nodeFailed?.data?.error)).toContain('interactive-class');
   });
 
   it('a running fan-out child found on resume fails the node WITHOUT cancelling it (C1)', async () => {
@@ -3112,7 +3163,11 @@ nodes:
     );
   });
 
-  it('a fan-out-cancelled gate child is re-driven on resume once the gate is removed (C2)', async () => {
+  it('a fan-out refused for an interactive-class target recovers on resume once the class is removed (#2707 step 2)', async () => {
+    // Superseded by the spawn-time interactive-class preflight (like the sibling test
+    // above): run 1 is now refused BEFORE any child row exists, so there is nothing to
+    // "re-drive in place" — the C2 recovery story becomes a fresh spawn attempt on retry,
+    // once the author fixes the target's class declaration.
     const gatedChild = `
 name: fan-child-recover
 description: has an approval gate on the first pass
@@ -3157,7 +3212,7 @@ nodes:
     const deps = makeDeps(store);
     const parent = await discover('fan-c2-recover');
 
-    // Run 1: the first child pauses at its gate → node fails, that child cancelled (tagged).
+    // Run 1: refused before any child row is created.
     const r1 = await executeWorkflow(
       deps,
       makePlatform(),
@@ -3169,13 +3224,9 @@ nodes:
     );
     expect(r1.success).toBe(false);
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'fan-c2-recover');
-    const child0 = [...store.runs.values()].find(
-      r =>
-        r.workflow_name === 'fan-child-recover' &&
-        (r.metadata as Record<string, unknown>).child_index === 0
-    );
-    expect(child0?.status).toBe('cancelled');
-    expect((child0?.metadata as Record<string, unknown>).cancelled_reason).toBe('fan_out_gate');
+    expect(
+      [...store.runs.values()].filter(r => r.workflow_name === 'fan-child-recover')
+    ).toHaveLength(0);
 
     // Author removes the gate, then resumes the parent.
     await writeWorkflow('fan-child-recover', ungatedChild);
@@ -3197,8 +3248,7 @@ nodes:
 
     expect(r2.success).toBe(true);
     expect((await store.getWorkflowRun(parentRun!.id))?.status).toBe('completed');
-    // The gate-cancelled child was re-driven IN PLACE (same row) → completed; index 1 ran too.
-    expect((await store.getWorkflowRun(child0!.id))?.status).toBe('completed');
+    // Both children spawn fresh on this attempt — no rows existed before it.
     const recovered = [...store.runs.values()].filter(r => r.workflow_name === 'fan-child-recover');
     expect(recovered).toHaveLength(2);
     expect(recovered.every(r => r.status === 'completed')).toBe(true);
@@ -3757,6 +3807,10 @@ nodes:
     expect(result.workflows.map(w => w.workflow.name)).toContain('leaky-slot');
   });
 
+  // The rendezvous wait runs inside executeWorkflow's lock guard, so it counts
+  // fully against this test's clock: the timeout must exceed the rendezvous
+  // deadline (5s) or a loaded CI run dies as a bun-test timeout instead of the
+  // diagnostic rendezvous error.
   it('GAP: concurrent fan-out cancels a sibling unless the child sets mutates_checkout:false', async () => {
     // The path lock (executor.ts, "Siblings are intentionally NOT excluded") means two
     // `workflow:` nodes in one layer collide on the shared checkout: the loser
@@ -3803,7 +3857,42 @@ nodes:
     };
 
     // Default posture: the sibling is cancelled and the parent run fails.
-    const racyStore = new InMemoryStore();
+    // Whether the collision fires depends on both child rows coexisting in
+    // non-terminal state when either lock query runs; under CI load the children
+    // can serialize end-to-end and both succeed. This store holds each child's
+    // lock query until BOTH child rows exist and are live, so the overlap the test
+    // characterizes is a precondition instead of a chance interleaving.
+    class RendezvousStore extends InMemoryStore {
+      private overlapSeen = false;
+      getActiveWorkflowRunByPath: IWorkflowStore['getActiveWorkflowRunByPath'] = async (
+        path,
+        self
+      ) => {
+        const selfRow = self ? this.runs.get(self.id) : undefined;
+        if (!selfRow?.parent_run_id || this.overlapSeen) {
+          return super.getActiveWorkflowRunByPath(path, self);
+        }
+        const parent = this.runs.get(selfRow.parent_run_id);
+        if (!parent) return super.getActiveWorkflowRunByPath(path, self);
+        const deadline = Date.now() + 5000;
+        for (;;) {
+          const children = await this.findChildRuns(parent.id);
+          const live = children.filter(c => holdsPathLock(c.status));
+          if (live.length >= 2) {
+            this.overlapSeen = true;
+          }
+          if (this.overlapSeen) break;
+          if (Date.now() > deadline) {
+            throw new Error(
+              `rendezvous failed: ${children.length} child rows, ${live.length} live`
+            );
+          }
+          await new Promise(resolve => setTimeout(resolve, 1));
+        }
+        return super.getActiveWorkflowRunByPath(path, self);
+      };
+    }
+    const racyStore = new RendezvousStore();
     const racyResult = await executeWorkflow(
       makeDeps(racyStore),
       makePlatform(),
@@ -3829,7 +3918,7 @@ nodes:
     );
     expect(safeResult.success).toBe(true);
     expect(kids(safeStore, 'parent-fanout-safe-child')).toEqual(['completed', 'completed']);
-  });
+  }, 20000);
 
   it('GAP (#2180 Defect A): a GATING child loses the path lock before it ever reaches its gate', async () => {
     // Fan-out where both children would gate. What actually happens is the PATH LOCK
@@ -3844,18 +3933,22 @@ nodes:
     // pauser to lose. A faithful Defect-B test needs a store double that mirrors the
     // compare-and-set.
     //
-    // Note also that the two pause call sites behave DIFFERENTLY on collision, so a
-    // Defect-B test must pick one deliberately:
-    //   • `approval:` / interactive `loop:` gates → `pauseGateRespectingExternalTransition`
-    //     catches the throw, re-reads status, sees 'paused', and returns SUCCESS (the
-    //     collision is misclassified as a legitimate external transition, #1123).
-    //   • `pauseParentOnChild` (workflow: nodes) → bypasses that wrapper, so the throw
-    //     reaches the generic per-node catch and DOES emit node_failed.
+    // Before #2489, the two pause call sites behaved DIFFERENTLY on collision:
+    // `approval:`/interactive `loop:` gates tolerated a lost CAS via
+    // `pauseGateRespectingExternalTransition` (re-read status, see 'paused', return
+    // SUCCESS — the collision misclassified as a legitimate external transition,
+    // #1123), while `pauseParentOnChild` (workflow: nodes) bypassed that wrapper, so
+    // the throw reached the generic per-node catch and emitted node_failed instead.
+    // #2489 routed `pauseParentOnChild` through the same shared helper, so both call
+    // sites now behave the same way on a lost CAS — a faithful Defect-B test still
+    // needs the CAS-aware store double described above, but no longer needs to pick a
+    // gate type deliberately for this reason.
     await writeWorkflow(
       'gating-child',
       `
 name: gating-child
 description: pauses at a gate
+interactive: true
 nodes:
   - id: gate
     approval:
@@ -5399,5 +5492,105 @@ nodes:
         e.step_name === 'work'
     );
     expect(replayed?.data?.structured_output).toEqual([{ v: 'alpha' }, { v: 'beta' }]);
+  });
+});
+
+/**
+ * Regression for the recursive `workflow:` sub-run path inside runChildWorkflow
+ * (review R1). The wrap the new `capturedSourceOwner` field introduced in
+ * #2690 only fires when the field is wired on the child opts. The top-level
+ * entry points do; the recursive call from runChildWorkflow did not, so a
+ * rename failure inside the child re-leaked the staged capture that the
+ * field's docblock says the wrap's `finally` reclaims.
+ *
+ * The forced rename is what makes this a real regression test: without the
+ * wrap, the staged directory under ARCHON_HOME/staged-source/ survives the
+ * parent run and would only be reaped by the 6-hour age sweep. With the wrap,
+ * it is gone as soon as the recursive executeWorkflow returns.
+ */
+describe('sub-run staged capture is reclaimed when the recursive rename fails (#2690 R1)', () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subrun-rename-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true }).catch(() => {});
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+    forceRenameFailure = false;
+  });
+
+  it('reclaims the child staged capture when the recursive rename fails', async () => {
+    await writeWorkflow(
+      'child-rename-fail',
+      `
+name: child-rename-fail
+description: child whose staged capture rename will be forced to fail
+nodes:
+  - id: work
+    prompt: do work for $ARGUMENTS
+`
+    );
+    await writeWorkflow(
+      'parent-rename-fail',
+      `
+name: parent-rename-fail
+description: parent whose sub-run rename will be forced to fail
+nodes:
+  - id: sub
+    workflow: child-rename-fail
+    input: the-goal
+`
+    );
+
+    forceRenameFailure = true;
+    const store = new InMemoryStore();
+    try {
+      const parent = await discover('parent-rename-fail');
+      // The recursive executeWorkflow takes the rename-failure branch and returns
+      // {success: false}; runChildWorkflow reads the child back as failed and the
+      // `sub` node surfaces that. The parent's run is failed for the same reason.
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-plat',
+        cwd,
+        parent,
+        'goal',
+        'conv-db'
+      );
+      expect(result.success).toBe(false);
+
+      const child = [...store.runs.values()].find(r => r.workflow_name === 'child-rename-fail');
+      expect(child).toBeDefined();
+      expect(child?.status).toBe('failed');
+
+      // The assertion that proves the fix. Without the wrap around the recursive
+      // call, the child's UUID-named directory under ARCHON_HOME/staged-source/
+      // survives the parent run and only the hourly age sweep reclaims it. With
+      // the wrap, the wrap's `finally` reclaims the staged tree the moment
+      // executeWorkflow returns.
+      const stagedDir = join(cwd, 'home', 'staged-source');
+      const stagedEntries = await readdir(stagedDir).catch(() => [] as string[]);
+      expect(stagedEntries).toEqual([]);
+    } finally {
+      forceRenameFailure = false;
+    }
   });
 });

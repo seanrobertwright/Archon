@@ -112,14 +112,27 @@ export type WorkflowSaveSource = 'project' | 'global';
 export interface GetWorkflowResponse {
   workflow: WireWorkflowDefinition;
   filename: string;
-  source: WorkflowSource;
+  /**
+   * Where the workflow came from. `Workflow['source']` widens to
+   * `WorkflowSource | (string & {})` so an unrecognised value (#2578) is
+   * surfaced verbatim rather than silently collapsed — the single-endpoint
+   * wire shape and `LoadedWorkflow` must match `Workflow.source` for the
+   * load-state chain to type-check end-to-end without a cast.
+   */
+  source: Workflow['source'];
 }
 
 /** Normalized result of `loadWorkflow`. */
 export interface LoadedWorkflow {
   definition: WireWorkflowDefinition;
   filename: string;
-  source: WorkflowSource;
+  /**
+   * Where the workflow came from. Same widening rationale as
+   * `GetWorkflowResponse.source`: an unrecognised value reaches the editor
+   * verbatim and the downstream helpers (`isReadOnlySource`, `saveTargetFor`)
+   * — both accepting `string` — decide what to do with it.
+   */
+  source: Workflow['source'];
 }
 
 /**

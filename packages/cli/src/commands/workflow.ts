@@ -41,11 +41,12 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
 import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
+import { reclaimContainerEnv } from '@archon/core/services/cleanup-service';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
-  disposeWorkflowSource,
   executeWorkflow,
+  disposeWorkflowSource,
   finalizeWorkflowSource,
   hydrateResumableRun,
   prepareWorkflowSource,
@@ -57,6 +58,8 @@ import {
   type ResolvedContinuation,
 } from '@archon/workflows/executor';
 import {
+  assertComposedGateDriveable,
+  assertInteractiveClassNotBackgrounded,
   assertWorkflowRequirementsMet,
   resolveTopLevelInputs,
 } from '@archon/workflows/utils/workflow-requirements';
@@ -78,17 +81,20 @@ import type {
   WorkflowSource,
   WorkflowWithSource,
 } from '@archon/workflows/schemas/workflow';
+import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import { workflowRunStatusSchema, isApprovalContext } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import {
   approveWorkflow,
   rejectWorkflow,
+  respondToWorkflow,
   resumeWorkflow as resumeWorkflowOp,
   abandonWorkflow,
   getWorkflowStatus,
   resetWorkflowNodeSessions,
   assertApprovable,
   assertRejectable,
+  assertRespondable,
 } from '@archon/core/operations/workflow-operations';
 import * as conversationDb from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
@@ -101,6 +107,13 @@ import * as userDb from '@archon/core/db/users';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
 import { writeJsonLine, writeStdout } from '../utils/stdout';
+import { exitWithDrain } from '../utils/exit-with-drain';
+import {
+  assertDetachedRunProcessOwner,
+  DETACHED_RUN_OWNER_ENV,
+  requestDetachedRunStop,
+  startDetachedRunControlServer,
+} from '../utils/detached-run-control';
 import { resolveCliUserId } from './auth';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -425,7 +438,7 @@ async function spawnDetachedWorkflowRun(
     // next step. `windowsHide` keeps the child headless.
     const child = spawn(cmd[0], cmd.slice(1), {
       cwd,
-      env: process.env,
+      env: { ...process.env, [DETACHED_RUN_OWNER_ENV]: '1' },
       stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
       detached: true,
       windowsHide: true,
@@ -949,6 +962,9 @@ async function runWorkflowWithOwnedSource(
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
+  const detachedProcessOwner = process.env[DETACHED_RUN_OWNER_ENV] === '1';
+  if (detachedProcessOwner) Reflect.deleteProperty(process.env, DETACHED_RUN_OWNER_ENV);
+  if (detachedProcessOwner) assertDetachedRunProcessOwner();
   const effectiveDiscoveryCwd = options.discoveryCwd ?? cwd;
 
   // Freeze the source BEFORE discovering, then discover from the frozen copy. Discovering
@@ -998,9 +1014,15 @@ async function runWorkflowWithOwnedSource(
   const isContinuation = options.resume === true || continuationRun !== undefined;
 
   let preparedSource: PreparedWorkflowSource | undefined;
-  // Mirrors the owner's own flag, readable from the signal handler — which exits the
-  // process rather than returning, so it cannot consult the owner's closure.
-  let sourceAdopted = false;
+  // Pinned at the moment of prepare so the SIGINT/SIGTERM cleanup never rm's a
+  // path a live run is reading from. For `--container` folder-codebase runs,
+  // `finalizeWorkflowSource` (workflow.ts:1749) reassigns `preparedSource` to a
+  // new object whose `captureRoot` is the LIVE artifacts directory the run
+  // executes from — rm-ing `preparedSource.captureRoot` on Ctrl-C mid-run would
+  // destroy the run's source. The original staged path is renamed away by
+  // either `finalizeWorkflowSource` (container) or `executeWorkflow`'s rename
+  // (everything else), so an `rm` against it is a no-op once prep has moved it.
+  let originalStagedRoot: string | undefined;
   if (!isContinuation && !options.dryRun && !options.stubsInitPath) {
     try {
       preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
@@ -1008,6 +1030,7 @@ async function runWorkflowWithOwnedSource(
       });
       // From here the owner reclaims it unless a run adopts it, whichever way we leave.
       owner.hold(preparedSource);
+      originalStagedRoot = preparedSource.captureRoot;
     } catch (error) {
       throw new Error(
         `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
@@ -1323,6 +1346,30 @@ async function runWorkflowWithOwnedSource(
   // codebase lookup does happen here — see the folder-detection probe below —
   // to decide folder-vs-repo branch pinning before forking.
   if (options.detach) {
+    // Interactive-class refusal (#2707 step 2): a detached FRESH launch pauses with
+    // nobody watching and nothing to resume it — the exact #1991 hang. Checked here,
+    // synchronously, before the fork and before any worktree/clone/AI cost, mirroring
+    // the requirements gate immediately above. Two checks, like the orchestrator's
+    // shared background-dispatch gate (dispatchBackgroundWorkflowOwned): the
+    // workflow's own declared class, and a gate that arrived via `include:` in a
+    // workflow that omits `interactive: true` (the class declaration alone cannot see
+    // that case — see assertComposedGateDriveable's doc comment).
+    //
+    // Scoped to a genuinely FRESH dispatch (`!isContinuation`) — refusing this at
+    // "launch" only, per the issue's own wording. A run that has ALREADY proved it can
+    // pause (it paused once) is not launching; `resume <id> --detach` and `run --resume
+    // --detach` are legitimate continuation actions that must keep working, since the
+    // whole point of --detach on those is to drive one gate and let a background
+    // process continue to the next. If it pauses again, it sits paused again —
+    // discoverable via `workflow status`/`runs`, not a silent hang nobody knows exists.
+    if (!isContinuation) {
+      assertInteractiveClassNotBackgrounded(workflow);
+      // Already-expanded — discoverWorkflowsWithConfig's output never contains an
+      // IncludeDirective (#2486); the type admits one only for the pre-expansion display
+      // shape (`WorkflowWithSource.declared`), which `workflow` here is not.
+      assertComposedGateDriveable(workflow.nodes as DagNode[]);
+    }
+
     const childConversationId = options.conversationId ?? generateConversationId();
     const extraArgs: string[] = [];
     let pinnedBranch: string | undefined;
@@ -1725,6 +1772,10 @@ async function runWorkflowWithOwnedSource(
               cwd: folderCodebase.defaultCwd,
               codebaseId: folderCodebase.id,
             });
+            // Finalization moved the capture, so keep ownership on the path that now
+            // exists. If container preparation fails below, the wrap reclaims the
+            // finalized capture instead of the already-renamed staging path.
+            owner.hold(preparedSource);
           }
           prepared = await backend.prepare({
             codebase: folderCodebase,
@@ -1975,7 +2026,15 @@ async function runWorkflowWithOwnedSource(
   // the finally below once executeWorkflow returns, so a late signal can never
   // touch a settled run (and repeated workflowRunCommand calls in one process
   // don't stack handlers).
-  let ownedRunId: string | undefined = resumable?.id;
+  let ownedRunId: string | undefined =
+    resumable?.id ?? (detachedProcessOwner ? preparedSource?.runId : undefined);
+  let detachedRunControl: Awaited<ReturnType<typeof startDetachedRunControlServer>> | undefined;
+  if (detachedProcessOwner) {
+    if (ownedRunId === undefined) {
+      throw new Error('Detached workflow owner has no resolved run ID');
+    }
+    detachedRunControl = await startDetachedRunControlServer(ownedRunId);
+  }
   let terminating = false;
   const cleanup = (signal: string): void => {
     if (terminating) return;
@@ -1989,6 +2048,16 @@ async function runWorkflowWithOwnedSource(
         getLog().info(
           { conversationId: conversation.id, signal },
           'workflow.termination_no_owned_run'
+        );
+        return;
+      }
+      if (detachedRunControl?.isStopRequested()) {
+        // The exact-run controller has proved ownership and is terminating this
+        // process tree. It records `cancelled` only after termination succeeds;
+        // do not race it by translating the operator's stop into generic failure.
+        getLog().info(
+          { runId: interruptedRunId, signal },
+          'workflow.operator_stop_leaves_lifecycle_to_controller'
         );
         return;
       }
@@ -2016,7 +2085,7 @@ async function runWorkflowWithOwnedSource(
         );
       })
       // Destroy the isolation container so Ctrl-C / SIGTERM doesn't orphan a
-      // PRIVILEGED container — `process.exit(1)` below bypasses the teardown
+      // PRIVILEGED container — the forced exit below bypasses the teardown
       // `finally`, so we must tear it down explicitly here first.
       .then(async () => {
         if (containerBackend && containerEnvId) {
@@ -2032,17 +2101,30 @@ async function runWorkflowWithOwnedSource(
         }
       })
       // Reclaim the staged capture for the same reason the container is destroyed above:
-      // `process.exit(1)` never returns up the stack, so the ownership `finally` — whose
-      // whole premise is "whichever way we leave" — never runs. Ctrl-C during isolation
-      // resolution or worktree creation would otherwise strand a complete frozen tree.
+      // the forced exit below never returns up the stack, so the ownership `finally` —
+      // whose whole premise is "whichever way we leave" — never runs. Ctrl-C during
+      // isolation resolution or worktree creation would otherwise strand a complete
+      // frozen tree.
+      //
+      // The rm targets the ORIGINAL staged path pinned at prepare time, not
+      // `preparedSource.captureRoot` (see `originalStagedRoot`'s note above).
+      // For container runs that path was renamed away by `finalizeWorkflowSource`
+      // and `preparedSource.captureRoot` is now the LIVE artifacts directory —
+      // rm-ing it mid-execution would destroy the run's source.
       .then(async () => {
-        if (preparedSource && !sourceAdopted) {
-          await disposeWorkflowSource(preparedSource).catch(() => undefined);
+        if (originalStagedRoot) {
+          await disposeWorkflowSource({ captureRoot: originalStagedRoot });
         }
       })
       .catch(() => undefined)
       .finally(() => {
-        process.exit(1);
+        // Route through the same drain helper cli.ts's top-level exit chain
+        // uses so queued `console.log` output (this command streams progress
+        // through 101 call sites) reaches a slow reader before the process
+        // exits — a bare `process.exit(1)` here would reopen #2400's
+        // truncation on Ctrl-C/SIGTERM specifically. See R16 in the review
+        // report.
+        void exitWithDrain(1);
       });
   };
   const sigtermHandler = (): void => {
@@ -2181,12 +2263,12 @@ async function runWorkflowWithOwnedSource(
           // The frozen source this run executes, captured before the workflow was even
           // selected. A resume ignores it and loads the source recorded on its own row.
           preparedSource,
+          // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+          // executor adopts for us there (see #2690). Until then a rename failure
+          // leaves the staged directory un-adopted so the wrap reclaims it on the
+          // way out.
+          capturedSourceOwner: owner,
         };
-    // Handing the capture to a run: it now owns the bytes and their lifetime.
-    if (preparedSource) {
-      owner.adopt();
-      sourceAdopted = true;
-    }
     result = await executeWorkflow(
       deps,
       adapter,
@@ -2198,6 +2280,7 @@ async function runWorkflowWithOwnedSource(
       opts
     );
   } finally {
+    await detachedRunControl?.close();
     unsubscribe();
 
     // Deregister the signal handlers now that the run's lifecycle is settled
@@ -2884,7 +2967,7 @@ async function resolveRunIdArg(
  */
 async function runDetachedControlCommand(
   runId: string,
-  action: 'approve' | 'reject' | 'resume',
+  action: 'approve' | 'reject' | 'respond' | 'resume',
   json: boolean | undefined,
   cwd: string | undefined,
   precheck: () => Promise<WorkflowRun>
@@ -2943,7 +3026,7 @@ async function runDetachedControlCommand(
 async function resolveDiscoveryCwdForCodebase(
   runId: string,
   codebaseId: string,
-  action: 'resume' | 'approve' | 'reject'
+  action: 'resume' | 'approve' | 'reject' | 'respond'
 ): Promise<string> {
   try {
     const codebase = await codebaseDb.getCodebase(codebaseId);
@@ -3116,6 +3199,13 @@ export async function workflowAbandonCommand(
   const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
   console.log(`Abandoned workflow run: ${resolvedId}`);
   console.log(`Workflow: ${run.workflow_name}`);
+  printRunTreeCancellationWarnings(cascadeFailures, blockedParentRunId);
+}
+
+function printRunTreeCancellationWarnings(
+  cascadeFailures: number,
+  blockedParentRunId: string | null
+): void {
   if (cascadeFailures > 0) {
     console.log(
       `Warning: ${String(cascadeFailures)} sub-run(s) could not be cancelled and may still be running — check \`archon workflow status\`.`
@@ -3129,6 +3219,109 @@ export async function workflowAbandonCommand(
       `  Resume it to fail the node cleanly (archon workflow resume ${blockedParentRunId}) or abandon it too.`
     );
   }
+}
+
+/**
+ * Actively cancel a run owned by a detached CLI child.
+ *
+ * Ordering is the contract: prove the live exact-run owner, terminate its process
+ * tree, then record `cancelled`. An unreachable owner never falls back to a DB-only
+ * transition — operators use `abandon` separately after verifying an orphan.
+ */
+export async function workflowCancelCommand(
+  runId: string,
+  json?: boolean,
+  cwd?: string
+): Promise<void> {
+  const cancel = async (): Promise<{
+    resolvedId: string;
+    workflowName: string;
+    cascadeFailures: number;
+    blockedParentRunId: string | null;
+  }> => {
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    const current = await workflowDb.getWorkflowRun(resolvedId);
+    if (!current) throw new Error(`Workflow run not found: ${resolvedId}`);
+    if (current.status !== 'running') {
+      throw new Error(
+        `Cannot actively cancel run with status '${current.status}'. Only a running detached CLI run has live work to stop.`
+      );
+    }
+
+    let containerEnvId: string | undefined;
+    if (current.metadata?.isolation === 'container') {
+      const isolationEnvId = current.metadata.isolation_env_id;
+      if (typeof isolationEnvId !== 'string' || isolationEnvId.trim().length === 0) {
+        throw new Error(
+          `Cannot confirm the isolation container owned by run ${resolvedId}. ` +
+            'The run was not changed; its container tracking ID is missing.'
+        );
+      }
+      containerEnvId = isolationEnvId;
+      const containerEnv = await isolationDb.getById(containerEnvId);
+      if (containerEnv?.provider !== 'container') {
+        throw new Error(
+          `Cannot confirm the isolation container owned by run ${resolvedId}. ` +
+            'The run was not changed; inspect the managed containers before retrying or abandoning it.'
+        );
+      }
+    }
+
+    const target = await requestDetachedRunStop(resolvedId);
+    await target.stop();
+
+    if (containerEnvId) {
+      try {
+        await reclaimContainerEnv(containerEnvId);
+      } catch (error) {
+        throw new Error(
+          'Detached owner process stopped, but the isolation container could not be confirmed stopped. ' +
+            `Run state was not changed. ${(error as Error).message}`
+        );
+      }
+    }
+
+    const { run, cancelled, cascadeFailures, blockedParentRunId } =
+      await abandonWorkflow(resolvedId);
+    if (!cancelled) {
+      const latest = await workflowDb.getWorkflowRun(resolvedId);
+      throw new Error(
+        'Detached work stopped, but cancellation did not win the run state transition. ' +
+          `The run status is ${latest?.status ?? 'unknown'}; it was not reported as cancelled.`
+      );
+    }
+    return {
+      resolvedId,
+      workflowName: run.workflow_name,
+      cascadeFailures,
+      blockedParentRunId,
+    };
+  };
+
+  if (json) {
+    try {
+      const result = await cancel();
+      await writeJsonLine({
+        ok: true,
+        runId: result.resolvedId,
+        action: 'cancel',
+        status: 'cancelled',
+        processStopped: true,
+        workflowName: result.workflowName,
+        ...(result.cascadeFailures > 0 ? { cascadeFailures: result.cascadeFailures } : {}),
+        ...(result.blockedParentRunId ? { blockedParentRunId: result.blockedParentRunId } : {}),
+      });
+    } catch (error) {
+      await printJsonWriteError(runId, 'cancel', error);
+    }
+    return;
+  }
+
+  const result = await cancel();
+  console.log(`Cancelled detached workflow run: ${result.resolvedId}`);
+  console.log(`Workflow: ${result.workflowName}`);
+  console.log('Host process tree stopped before run state was changed.');
+  printRunTreeCancellationWarnings(result.cascadeFailures, result.blockedParentRunId);
 }
 
 /**
@@ -3297,6 +3490,11 @@ export async function workflowRejectCommand(
     return;
   }
 
+  // An empty or omitted reason still needs a meaningful value on the new-mode
+  // structured-output path (#2740) — rejectWorkflow's own internal default
+  // only covers the audit event and legacy rework/cancel path.
+  const rejectText = reason && reason.length > 0 ? reason : 'Rejected';
+
   // JSON mode records the rejection and returns a structured ack WITHOUT the
   // inline auto-resume (an on_reject rework executes the workflow and streams
   // to stdout, corrupting the JSON contract). When `cancelled` is false the run
@@ -3304,7 +3502,7 @@ export async function workflowRejectCommand(
   if (json) {
     try {
       const resolvedId = await resolveRunIdArg(runId, cwd);
-      const result = await rejectWorkflow(resolvedId, reason);
+      const result = await rejectWorkflow(resolvedId, rejectText);
       await writeJsonLine({
         ok: true,
         runId: resolvedId,
@@ -3321,7 +3519,7 @@ export async function workflowRejectCommand(
   }
 
   const resolvedId = await resolveRunIdArg(runId, cwd);
-  const result = await rejectWorkflow(resolvedId, reason);
+  const result = await rejectWorkflow(resolvedId, rejectText);
 
   if (result.cancelled) {
     const suffix = result.maxAttemptsReached ? ' (max attempts reached)' : '';
@@ -3329,9 +3527,10 @@ export async function workflowRejectCommand(
     return;
   }
 
-  // Not cancelled = either an on_reject rework (DAG approval gate) or a container
-  // write-back reject (discard the overlay). Both auto-resume; the resume drives
-  // the rework / the overlay discard + completion.
+  // Not cancelled = a legacy on_reject rework, a #2707 step-1 new-mode
+  // resolution, or a container write-back reject (discard the overlay). All
+  // three auto-resume; the resume drives the rework / continuation / the
+  // overlay discard + completion.
   if (!result.workingPath) {
     throw new Error(
       `Workflow run '${resolvedId}' has no working path recorded.\n` +
@@ -3342,7 +3541,9 @@ export async function workflowRejectCommand(
   console.log(
     result.writeBack
       ? 'Discarding container changes (live folder left untouched)...'
-      : 'Resuming with on_reject prompt...'
+      : result.newMode
+        ? 'Resuming...'
+        : 'Resuming with on_reject prompt...'
   );
 
   // Look up the original platform conversation ID to keep all messages in one thread
@@ -3389,6 +3590,131 @@ export async function workflowRejectCommand(
     throw new Error(
       `Rejected but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
         `The rejection was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
+    );
+  }
+}
+
+/**
+ * Resolve a paused workflow run with any of its gate's declared decisions (#2707 step 2).
+ * `approve`/`reject` delegate to the existing commands' exact behavior (the general-purpose
+ * function underneath is the same `respondToWorkflow`, which is sugar over
+ * `approveWorkflow`/`rejectWorkflow` for those two ids); any other declared decision always
+ * resolves immediately and auto-resumes, mirroring `approve`'s shape.
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
+ */
+export async function workflowRespondCommand(
+  runId: string,
+  decision: string,
+  text?: string,
+  json?: boolean,
+  cwd?: string,
+  detach?: boolean
+): Promise<void> {
+  if (decision === 'approve') return workflowApproveCommand(runId, text, json, cwd, detach);
+  if (decision === 'reject') return workflowRejectCommand(runId, text, json, cwd, detach);
+
+  // --detach: same shape as approve/reject — the parent validates read-only via the
+  // SAME gate respondToWorkflow enforces, then hands the whole command to a detached
+  // child. See runDetachedControlCommand's doc comment.
+  if (detach) {
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    await runDetachedControlCommand(resolvedId, 'respond', json, cwd, async () => {
+      const run = await workflowDb.getWorkflowRun(resolvedId);
+      if (!run) {
+        throw new Error(`Workflow run not found: ${resolvedId}`);
+      }
+      assertRespondable(run, decision);
+      if (!run.working_path) {
+        throw new Error(
+          `Workflow run '${resolvedId}' has no working path recorded.\n` +
+            'Cannot determine where to resume.'
+        );
+      }
+      return run;
+    });
+    return;
+  }
+
+  // JSON mode records the decision and returns a structured ack WITHOUT the inline
+  // auto-resume, mirroring approve/reject — drive it onward with a backgrounded
+  // `resume`/`run --resume`.
+  if (json) {
+    try {
+      const resolvedId = await resolveRunIdArg(runId, cwd);
+      const result = await respondToWorkflow(resolvedId, decision, text);
+      await writeJsonLine({
+        ok: true,
+        runId: resolvedId,
+        action: 'respond',
+        decision,
+        workflowName: result.workflowName,
+        resumable: true,
+      });
+    } catch (error) {
+      await printJsonWriteError(runId, 'respond', error);
+    }
+    return;
+  }
+
+  const resolvedId = await resolveRunIdArg(runId, cwd);
+  const result = await respondToWorkflow(resolvedId, decision, text);
+
+  if (!result.workingPath) {
+    throw new Error(
+      `Workflow run '${resolvedId}' has no working path recorded.\n` +
+        'Cannot determine where to resume.'
+    );
+  }
+  console.log(`Responded '${decision}' to workflow: ${result.workflowName}`);
+  console.log(`Path: ${result.workingPath}`);
+  console.log('');
+  console.log('Resuming workflow...');
+
+  // Look up the original platform conversation ID to keep all messages in one thread
+  let platformConversationId: string | undefined;
+  try {
+    const originalConversation = await conversationDb.getConversationById(result.conversationId);
+    platformConversationId = originalConversation?.platform_conversation_id ?? undefined;
+    if (!originalConversation) {
+      getLog().info(
+        { runId: resolvedId, conversationId: result.conversationId },
+        'cli.workflow_respond_conversation_not_found'
+      );
+    }
+  } catch (error) {
+    const err = error as Error;
+    getLog().warn(
+      { err, runId: resolvedId, conversationId: result.conversationId },
+      'cli.workflow_respond_conversation_lookup_failed'
+    );
+  }
+
+  try {
+    // Use the codebase's source path for workflow YAML discovery so the file is
+    // found even when working_path is a worktree or workspace clone that does
+    // not contain the user's local (often untracked) workflow YAML.
+    const discoveryCwd = result.codebaseId
+      ? await resolveDiscoveryCwdForCodebase(resolvedId, result.codebaseId, 'respond')
+      : undefined;
+
+    await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
+      // Continue from the source this run froze, not a fresh capture of the target.
+      continuationRun: (await workflowDb.getWorkflowRun(resolvedId)) ?? undefined,
+      resume: true,
+      codebaseId: result.codebaseId ?? undefined,
+      conversationId: platformConversationId,
+      discoveryCwd,
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, runId: resolvedId, workflowName: result.workflowName },
+      'cli.workflow_respond_resume_failed'
+    );
+    throw new Error(
+      `Response recorded but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
+        `The response was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
     );
   }
 }

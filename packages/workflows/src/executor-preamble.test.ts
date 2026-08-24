@@ -113,6 +113,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     updateWorkflowActivity: mock(async () => {}),
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
+    rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
     cancelWorkflowRun: mock(async () => ({ cancelled: false })),
@@ -154,7 +155,7 @@ function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefi
   return {
     name: 'test-workflow',
     description: 'Test',
-    nodes: [{ id: 'test', command: 'test' }],
+    nodes: [{ id: 'test', kind: 'agent', source: { kind: 'command', name: 'test' } }],
     ...overrides,
   };
 }

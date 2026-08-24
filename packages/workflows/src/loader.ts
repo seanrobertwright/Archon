@@ -1,18 +1,22 @@
 /**
  * Workflow loader - discovers and parses workflow YAML files
  */
-import type { WorkflowDefinition, WorkflowLoadError, DagNode, WorkflowNodeHooks } from './schemas';
+import type {
+  WorkflowDefinition,
+  WorkflowLoadError,
+  DagNode,
+  IncludeDirective,
+  WorkflowNodeHooks,
+} from './schemas';
 import {
-  isBashNode,
-  isCommandNode,
-  isPromptNode,
+  isExecNode,
+  isAgentNode,
   isLoopNode,
   isLoopGroupNode,
-  isApprovalNode,
-  isCancelNode,
-  isScriptNode,
-  isIncludeNode,
+  isGateNode,
+  isHaltNode,
   isWorkflowNode,
+  isIncludeDirective,
   isPersistableNode,
   isNodeContextResume,
 } from './schemas';
@@ -25,7 +29,6 @@ import {
 import {
   dagNodeSchema,
   BASH_NODE_AI_FIELDS,
-  SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
@@ -65,6 +68,26 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.loader');
   return cachedLog;
+}
+
+/**
+ * Filenames already warned about an inferred workflow-class declaration this process
+ * (#2736/#2738's grace period on `validateWorkflowClassPlacement`). `parseWorkflow` runs
+ * on every `/workflow list`, chat turn, and CLI invocation — a permanent process-wide
+ * latch keeps the WARN a one-time nudge to the author instead of log spam on a
+ * long-running server. Mirrors `hasWarnedLegacyHomePath` in `workflow-discovery.ts`: a
+ * plain latch (no in-flight-probe dance) is correct here because `parseWorkflow` is fully
+ * synchronous, so no concurrent caller can interleave mid-check. Keyed by the bare
+ * filename `parseWorkflow` receives (not a scope-qualified path), so two files sharing a
+ * basename across bundled/global/project scopes could under-warn on this channel — a
+ * cosmetic log-noise tradeoff only, since `parseWarnings` (the channel the workflow's
+ * actual author sees, via `/api/workflows` and `/workflow list`) is pushed unconditionally
+ * on every parse regardless of this Set.
+ */
+const warnedClassPlacementFiles = new Set<string>();
+/** Exported for tests that need to observe the warning fire more than once per process. */
+export function resetClassPlacementWarningForTests(): void {
+  warnedClassPlacementFiles.clear();
 }
 
 /**
@@ -155,7 +178,7 @@ export function validateWorkflowOutcomeDeclaration(
   if (selectedNode === undefined) {
     return `Workflow declares returns: '${workflow.returns}' but no top-level node has that id`;
   }
-  if (isIncludeNode(selectedNode)) return null;
+  if (isIncludeDirective(selectedNode)) return null;
   if (isLoopGroupNode(selectedNode)) {
     return `Workflow outcome_field: '${field}' cannot select loop_group node '${workflow.returns}' because loop_group output_format is ignored and its runtime output is raw text; select a schema-enforced collector node instead`;
   }
@@ -253,6 +276,21 @@ function collectUnknownConfigKeys(
   event: string,
   warnings: string[]
 ): void {
+  if (spec.kind === 'array') {
+    if (!Array.isArray(raw)) return;
+    raw.forEach((entry, i) => {
+      collectUnknownConfigKeys(
+        entry,
+        spec.entry,
+        id,
+        label,
+        `${keyPath}${String(i)}.`,
+        event,
+        warnings
+      );
+    });
+    return;
+  }
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return;
   const obj = raw as Record<string, unknown>;
 
@@ -334,6 +372,233 @@ function collectUnknownNodeKeys(raw: unknown, id: string, label: string, warning
 }
 
 /**
+ * True when `node`, used as a loop_group's body-terminal sink, can itself pause
+ * in a way that is invisible one level up (#2753) — either directly (a `gate:`
+ * node — the pattern #2707 step 3's escalation handles correctly for its OWN
+ * enclosing loop_group, but that escalation is bounded to that one level) or
+ * transitively (a `loop:` node with `interactive: true`, the legacy mechanism,
+ * or a `loop_group:` node that is itself `interactive: true` or whose own sole
+ * terminal sink recurses into this same case, following a chain of well-formed
+ * sole-terminal-sink nesting to any depth). A gate that is mid-body or
+ * co-terminal with another sink breaks the chain here too — the placement
+ * check in `collectGateAndLoopDeprecationWarnings` below already warns about
+ * that misplacement on its own. Mirrors `findLoopGroupTerminalGate`'s doc comment
+ * (dag-executor.ts:4153-4164): the runtime has no unambiguous way to escalate
+ * a pause through a sink that isn't a bare gate, so this only makes that gap
+ * visible at load time.
+ */
+function isUnescalatableInteractiveSink(node: DagNode | IncludeDirective): boolean {
+  if (isIncludeDirective(node)) return false;
+  if (isGateNode(node)) return true;
+  if (isLoopNode(node)) return node.loop.interactive === true;
+  if (!isLoopGroupNode(node)) return false;
+  if (node.loop_group.interactive === true) return true;
+  const dependedOn = new Set(node.loop_group.nodes.flatMap(n => n.depends_on ?? []));
+  const sinks = node.loop_group.nodes.filter(n => !dependedOn.has(n.id));
+  return sinks.length === 1 && isUnescalatableInteractiveSink(sinks[0]);
+}
+
+/**
+ * #2707 step 1 grow-then-deprecate warnings: `approval.capture_response`,
+ * `approval.on_reject`, and node-level loop `interactive:` still parse and
+ * function exactly as before (Migration section — these become load errors
+ * only after #2123), but warn so authors migrate ahead of that. `$REJECTION_REASON`
+ * and `$LOOP_USER_INPUT` are covered as a consequence rather than by a separate
+ * text scan: they are populated ONLY inside `on_reject.prompt` / an interactive
+ * loop body respectively, so warning on the enabling key covers their only
+ * sanctioned usage — any other usage was already a dead (always-empty)
+ * reference before this PR, with no behavior for a new warning to explain.
+ */
+function collectGateAndLoopDeprecationWarnings(
+  node: DagNode | IncludeDirective,
+  raw: unknown,
+  id: string,
+  warnings: string[]
+): void {
+  // An include directive has no gate/loop shape of its own — its expanded
+  // contents are scanned once inlined, like collectUnknownNodeKeys's own
+  // 'with:' handling for include nodes.
+  if (isIncludeDirective(node)) return;
+  if (isGateNode(node) && raw !== null && typeof raw === 'object') {
+    const rawApproval = (raw as Record<string, unknown>).approval;
+    if (rawApproval !== null && typeof rawApproval === 'object') {
+      const approvalObj = rawApproval as Record<string, unknown>;
+      // capture_response is genuinely ignored ONLY once the gate has also
+      // opted into the new mechanism by authoring 'decisions:' (GateNode.
+      // decisionsAuthored) — combined with 'on_reject', or on a bare gate with
+      // no 'decisions:' authored, it still fully controls whether the
+      // reviewer's comment becomes the node's output, exactly as before this
+      // PR. Warning unconditionally would be false in those cases.
+      if (approvalObj.capture_response !== undefined && node.decisionsAuthored) {
+        const message =
+          `Node '${id}': 'approval.capture_response' is deprecated. Gate output is now ` +
+          `always structured as {decision, text} — read '$${id}.output.text' downstream ` +
+          'instead. This field is ignored.';
+        warnings.push(message);
+        getLog().warn({ id, warning: message }, 'node_capture_response_deprecated');
+      }
+      if (approvalObj.on_reject !== undefined) {
+        const message =
+          `Node '${id}': 'approval.on_reject' is deprecated. Declare 'approval.decisions' ` +
+          `and wire a rework node with "when: \\"$${id}.output.decision == 'reject'\\"" ` +
+          'instead (loop it with loop_group if it should iterate). This gate keeps running ' +
+          'via the legacy mechanism until migrated.';
+        warnings.push(message);
+        getLog().warn({ id, warning: message }, 'node_on_reject_deprecated');
+      }
+    }
+  }
+  const interactiveLoop =
+    (isLoopNode(node) && node.loop.interactive === true) ||
+    (isLoopGroupNode(node) && node.loop_group.interactive === true);
+  if (interactiveLoop) {
+    const message =
+      `Node '${id}': node-level loop 'interactive:' is deprecated. A future release ` +
+      're-expresses the interactive loop as a gate + loop_group composition (#2707 step 3). ' +
+      'Continue using it for now.';
+    warnings.push(message);
+    getLog().warn({ id, warning: message }, 'node_loop_interactive_deprecated');
+  }
+
+  // The prose `until:` completion channel is deprecated for EVERY loop/loop_group,
+  // not only interactive ones (#2707 step 3, "What gets deleted"): its one stated
+  // reason to exist — "the iteration output is a message a human reads at an
+  // interactive gate" (#2563) — evaporates once that human interaction is a gate
+  // node with structured decision output rather than a prose sentinel. `until_bash`
+  // and (loop: only) `until_field` are the declared, structured replacements. This
+  // keeps running exactly as before; only the guidance is new.
+  if (isLoopNode(node) && node.loop.until !== undefined) {
+    const message =
+      `Node '${id}': the prose 'loop.until' completion signal is deprecated. Declare ` +
+      "'loop.until_bash' (deterministic check) or 'loop.until_field' (a declared boolean " +
+      'in output_format) instead (#2707 step 3). Continue using it for now.';
+    warnings.push(message);
+    getLog().warn({ id, warning: message }, 'node_loop_until_deprecated');
+  } else if (isLoopGroupNode(node) && node.loop_group.until !== undefined) {
+    const message =
+      `Node '${id}': the prose 'loop_group.until' completion signal is deprecated. ` +
+      "Declare 'loop_group.until_bash' instead — it can read a body node's structured " +
+      'output (e.g. \'test "$body-node.output.field" = true\') (#2707 step 3). Continue ' +
+      'using it for now.';
+    warnings.push(message);
+    getLog().warn({ id, warning: message }, 'node_loop_group_until_deprecated');
+  }
+
+  // A gate node inside a loop_group body only pauses the enclosing loop when it is
+  // the body's SOLE terminal sink (#2707 step 3, target-model decision (b)) — a
+  // mid-body or co-terminal gate has no defined resume semantics and silently does
+  // not stop iteration (mid-body resume-to-node is deferred to #2708). This is
+  // guidance for the new authoring pattern, not a rejection: the file keeps loading
+  // either way, matching the grow-then-deprecate posture used throughout this
+  // function — including for a gate placed here via the legacy `on_reject`
+  // mechanism, which predates and is unrelated to this pattern but is equally
+  // unable to stop the loop from this position.
+  if (isLoopGroupNode(node)) {
+    // Every body entry — including an unexpanded `include:` directive, which has
+    // the identical `depends_on` shape (both extend dagNodeBaseSchema) and is a
+    // real graph participant here, not yet inlined — contributes to and can BE a
+    // terminal sink. Excluding it would silently misclassify a gate a downstream
+    // include node depends on as "terminal", and miss an include node that is
+    // itself a second, co-terminal sink.
+    const bodyDependedOn = new Set(node.loop_group.nodes.flatMap(n => n.depends_on ?? []));
+    const bodySinks = node.loop_group.nodes.filter(n => !bodyDependedOn.has(n.id));
+    // Every gate in the body, not just the first: a body may legitimately contain
+    // more than one (e.g. an "approve to start" gate followed by work followed by
+    // a "review the result" gate) — only ONE can validly be the sole terminal sink,
+    // but each needs its own placement/completion-reference verdict, not just the
+    // first one found.
+    const gatesInBody = node.loop_group.nodes.filter(n => !isIncludeDirective(n) && isGateNode(n));
+    for (const gate of gatesInBody) {
+      if (bodyDependedOn.has(gate.id) || bodySinks.length > 1) {
+        const message =
+          `Node '${gate.id}': a gate node inside a loop_group body must be the ` +
+          "body's sole terminal sink to pause the enclosing loop (#2707 step 3) — this " +
+          'gate is not, so it will not stop loop iteration. Move it to the end of the ' +
+          'body with nothing else depending on it, and no other node left un-depended-on.';
+        warnings.push(message);
+        getLog().warn({ id: gate.id, warning: message }, 'loop_group_gate_not_terminal_sink');
+      } else {
+        // Gate is validly the sole terminal sink. Design A (#2707 step 3) is
+        // deliberately unopinionated about what a decision means — the group's own
+        // 'until_bash' is the completion channel, and it either reads the gate's
+        // '$<gateId>.output.decision'/'.text' or it doesn't. If it doesn't, the
+        // human's answer is captured (every resolution still writes node_completed)
+        // but never consulted for completion — the loop just runs to max_iterations,
+        // silently ignoring every response. Structural check (does the until_bash
+        // string reference the gate's node id), not prose-sniffing — no judgment
+        // about what the check DOES with it, only whether it looks at it at all.
+        const untilBash = node.loop_group.until_bash;
+        const untilBashRefsGate =
+          untilBash !== undefined &&
+          Array.from(untilBash.matchAll(new RegExp(OUTPUT_REF_SOURCE, 'g'))).some(
+            m => m[1] === gate.id
+          );
+        if (!untilBashRefsGate) {
+          const gateRef = `$${gate.id}.output`;
+          const message =
+            `Node '${gate.id}': this gate is the loop_group's terminal sink, but ` +
+            `'loop_group.until_bash' does not reference '${gateRef}' — the human's ` +
+            'decision is captured but never consulted for completion, so the loop only ' +
+            `ends via max_iterations. Declare 'until_bash' checking '${gateRef}.decision' ` +
+            `(e.g. '[ "${gateRef}.decision" = "approve" ]') so the gate's answer actually ` +
+            'drives completion (#2707 step 3).';
+          warnings.push(message);
+          getLog().warn(
+            { id: gate.id, warning: message },
+            'loop_group_gate_completion_not_referenced'
+          );
+        }
+      }
+    }
+
+    // A body-terminal sink that is itself an interactive loop/loop_group can pause
+    // without stopping THIS group (#2753) — a bare gate sink is excluded here since
+    // that case is already correctly handled above (and by #2707 step 3 at runtime);
+    // this covers a sink whose own pause is trapped one level down instead.
+    if (bodySinks.length === 1) {
+      const sink = bodySinks[0];
+      if (!isIncludeDirective(sink) && !isGateNode(sink) && isUnescalatableInteractiveSink(sink)) {
+        const message =
+          `Node '${id}': this loop_group's terminal sink ('${sink.id}') is itself an ` +
+          'interactive loop/loop_group — a pause inside it does not escalate to stop ' +
+          "this loop_group's own iteration (#2753). The outer loop can run further iterations " +
+          "while a human's answer to the inner pause is still pending. Only a gate node " +
+          'directly as the terminal sink correctly stops the enclosing loop_group ' +
+          '(#2707 step 3).';
+        warnings.push(message);
+        getLog().warn(
+          { id, sinkId: sink.id, warning: message },
+          'loop_group_nested_pause_not_escalated'
+        );
+      }
+    }
+  }
+
+  // Recurse into a loop_group body — mirrors collectUnknownNodeKeys's own body
+  // recursion. Resolved and raw body arrays share index order (Zod arrays
+  // preserve it), so they're zipped by position rather than by id.
+  if (isLoopGroupNode(node) && raw !== null && typeof raw === 'object') {
+    const rawGroup = (raw as Record<string, unknown>).loop_group;
+    const rawBody =
+      rawGroup !== null && typeof rawGroup === 'object'
+        ? (rawGroup as Record<string, unknown>).nodes
+        : undefined;
+    if (Array.isArray(rawBody)) {
+      // `id` is unused on the IncludeDirective early-return path above, so a
+      // cheap fallback is fine when the body entry isn't a plain DagNode.
+      node.loop_group.nodes.forEach((bodyNode, i) => {
+        collectGateAndLoopDeprecationWarnings(
+          bodyNode,
+          rawBody[i],
+          isIncludeDirective(bodyNode) ? `#${String(i)}` : bodyNode.id,
+          warnings
+        );
+      });
+    }
+  }
+}
+
+/**
  * Validate and parse a single DagNode from raw YAML data.
  * Replaces the former parseDagNode + parseRetryConfig + parseToolList +
  * parseNodeHooks + parseIdleTimeout functions.
@@ -343,7 +608,7 @@ function parseDagNode(
   index: number,
   errors: string[],
   warnings: string[]
-): DagNode | null {
+): DagNode | IncludeDirective | null {
   // Extract id early for error messages (may be empty/invalid — schema will catch it)
   const id = nodeIdForMessages(raw, index);
 
@@ -357,12 +622,12 @@ function parseDagNode(
 
   const node = result.data;
 
-  // `mutates_checkout:` on an include node is the fourth launch-only option (#1764), and
+  // `mutates_checkout:` on an include is the fourth launch-only option (#1764), and
   // the only one the schema cannot see: it is workflow-level, so Zod strips it before
   // superRefine runs. An author writes it on an `include:` believing the block declares
   // its own concurrency safety; composition has one checkout and one run, so the
   // declaration belongs to the composing workflow or to a genuinely separate sub-run.
-  if (isIncludeNode(node) && (raw as Record<string, unknown>).mutates_checkout !== undefined) {
+  if (isIncludeDirective(node) && (raw as Record<string, unknown>).mutates_checkout !== undefined) {
     errors.push(
       `Node '${id}': 'mutates_checkout' is not supported on an include node: a composed block shares the run's single checkout, so concurrency safety is the composing workflow's to declare. Set it at workflow level, or use a 'workflow:' node when you want a separate governed run.`
     );
@@ -370,18 +635,19 @@ function parseDagNode(
   }
 
   collectUnknownNodeKeys(raw, id, `Node '${id}'`, warnings);
+  collectGateAndLoopDeprecationWarnings(node, raw, id, warnings);
 
-  // `with:` is live on command/script (node-local bindings, #2637) and include/workflow
-  // (caller inputs). On every other node type Zod strips it silently — surface that
-  // through the parse-warnings channel (#2213) so an author learns the binding never
-  // attached, without rejecting YAML that loaded fine before.
-  if (
-    (raw as Record<string, unknown>).with !== undefined &&
-    !isCommandNode(node) &&
-    !isScriptNode(node) &&
-    !isIncludeNode(node) &&
-    !isWorkflowNode(node)
-  ) {
+  // `with:` is live on an agent node's command-sourced form (node-local bindings,
+  // #2637), on exec (script-runtime only), and on include/workflow (caller inputs).
+  // On every other node type Zod strips it silently — surface that through the
+  // parse-warnings channel (#2213) so an author learns the binding never attached,
+  // without rejecting YAML that loaded fine before.
+  const hasWithSupport =
+    isIncludeDirective(node) ||
+    isWorkflowNode(node) ||
+    (isExecNode(node) && node.runtime !== 'sh') ||
+    (isAgentNode(node) && node.source.kind === 'command');
+  if ((raw as Record<string, unknown>).with !== undefined && !hasWithSupport) {
     warnings.push(
       `Node '${id}': 'with' is only supported on command, script, include, and workflow nodes — it is ignored here`
     );
@@ -390,22 +656,20 @@ function parseDagNode(
 
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
   let nonAiNode: { type: string; fields: readonly string[] } | undefined;
-  if (isCancelNode(node)) {
-    nonAiNode = { type: 'cancel', fields: BASH_NODE_AI_FIELDS };
-  } else if (isIncludeNode(node)) {
+  if (isIncludeDirective(node)) {
     nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
+  } else if (isHaltNode(node)) {
+    nonAiNode = { type: 'cancel', fields: BASH_NODE_AI_FIELDS };
   } else if (isWorkflowNode(node)) {
     nonAiNode = { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
-  } else if (isApprovalNode(node)) {
+  } else if (isGateNode(node)) {
     nonAiNode = { type: 'approval', fields: BASH_NODE_AI_FIELDS };
   } else if (isLoopNode(node)) {
     nonAiNode = { type: 'loop', fields: LOOP_NODE_AI_FIELDS };
   } else if (isLoopGroupNode(node)) {
     nonAiNode = { type: 'loop_group', fields: LOOP_GROUP_NODE_AI_FIELDS };
-  } else if (isScriptNode(node)) {
-    nonAiNode = { type: 'script', fields: SCRIPT_NODE_AI_FIELDS };
-  } else if ('bash' in node && typeof node.bash === 'string') {
-    nonAiNode = { type: 'bash', fields: BASH_NODE_AI_FIELDS };
+  } else if (isExecNode(node)) {
+    nonAiNode = { type: node.runtime === 'sh' ? 'bash' : 'script', fields: BASH_NODE_AI_FIELDS };
   }
   if (nonAiNode) {
     const presentAiFields = nonAiNode.fields.filter(
@@ -464,7 +728,7 @@ function freeFormAiProducerKind(node: DagNode): 'schema-capable' | 'loop-group' 
   // verdict and the same remedy, and there is no longer a separate 'loop' kind. (A
   // `loop_group:` still has none of that: it never calls the provider itself.)
   if (isLoopGroupNode(node)) return 'loop-group';
-  if (!isLoopNode(node) && !isPromptNode(node) && !isCommandNode(node)) return null;
+  if (!isLoopNode(node) && !isAgentNode(node)) return null;
   return node.output_format === undefined ? 'schema-capable' : null;
 }
 
@@ -488,11 +752,11 @@ const GATE_ON_A_SHELL_NODE =
  * the free-form-AI check needs that producer's type and `output_format`.
  */
 export function validateDagStructure(
-  nodes: DagNode[],
-  enclosingNodes?: ReadonlyMap<string, DagNode>
+  nodes: (DagNode | IncludeDirective)[],
+  enclosingNodes?: ReadonlyMap<string, DagNode | IncludeDirective>
 ): string | null {
   // Check ID uniqueness
-  const nodesById = new Map<string, DagNode>();
+  const nodesById = new Map<string, DagNode | IncludeDirective>();
   for (const node of nodes) {
     if (nodesById.has(node.id)) {
       return `Duplicate node id: '${node.id}'`;
@@ -595,81 +859,99 @@ export function validateDagStructure(
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
   const whenRefPattern = new RegExp(WHEN_REF_SOURCE, 'g');
   for (const node of nodes) {
-    const sources: { field: string; text: string; bodyNodes?: readonly DagNode[] }[] = [];
-    if ('prompt' in node && typeof node.prompt === 'string') {
-      sources.push({ field: 'prompt', text: node.prompt });
-    }
-    // Node-level AI configuration, valid on every AI node mode — pushed outside the mode
-    // chain like `when:`. Substituted at run time since #1764, so a dangling ref here
-    // fails at load rather than reaching the provider as literal text.
-    if (node.systemPrompt !== undefined) {
-      sources.push({ field: 'systemPrompt', text: node.systemPrompt });
-    }
-    if (node.agents !== undefined) {
-      for (const [agentId, agent] of Object.entries(node.agents)) {
-        sources.push({ field: `agents.${agentId}.prompt`, text: agent.prompt });
-        sources.push({ field: `agents.${agentId}.description`, text: agent.description });
+    const sources: {
+      field: string;
+      text: string;
+      bodyNodes?: readonly (DagNode | IncludeDirective)[];
+    }[] = [];
+    // An include directive has no execution surface of its own — its `with:`
+    // values were never scanned by this function even before #2486 (they are the
+    // composed workflow's business once inlined). Its `when:` (below) IS still
+    // scanned, unlike its sources here.
+    if (!isIncludeDirective(node)) {
+      if (isAgentNode(node) && node.source.kind === 'inline') {
+        sources.push({ field: 'prompt', text: node.source.prompt });
       }
-    }
-    if (isBashNode(node)) sources.push({ field: 'bash', text: node.bash });
-    if (isScriptNode(node)) sources.push({ field: 'script', text: node.script });
-    // Node-local bindings (#2637): command/script `with:` string values are live ref
-    // surfaces (whole refs and templates), and a directive's `from` is one whole ref.
-    // KEEP IN SYNC item 1 — rewriteNodeOutputRefs and the builder scan walk the same
-    // surface. Non-string literals carry no refs.
-    if ((isCommandNode(node) || isScriptNode(node)) && node.with !== undefined) {
-      for (const [name, value] of Object.entries(node.with)) {
-        if (typeof value === 'string') {
-          sources.push({ field: `with.${name}`, text: value });
-        } else if (isBindingDirective(value)) {
-          sources.push({ field: `with.${name}.from`, text: value.from });
+      // Node-level AI configuration, valid on every AI node mode — pushed outside the mode
+      // chain like `when:`. Substituted at run time since #1764, so a dangling ref here
+      // fails at load rather than reaching the provider as literal text.
+      if (node.systemPrompt !== undefined) {
+        sources.push({ field: 'systemPrompt', text: node.systemPrompt });
+      }
+      if (node.agents !== undefined) {
+        for (const [agentId, agent] of Object.entries(node.agents)) {
+          sources.push({ field: `agents.${agentId}.prompt`, text: agent.prompt });
+          sources.push({ field: `agents.${agentId}.description`, text: agent.description });
         }
       }
-    }
-    // workflow.input is a live ref surface (a data string), scanned verbatim like
-    // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
-    // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
-    if (isWorkflowNode(node)) {
-      if (node.input) sources.push({ field: 'input', text: node.input });
-      if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
-      // A `workflow:` node's `with:` values (#2470) are live ref surfaces: unlike
-      // an `include:` node's `with:` (inlined by the macro and caught post-expansion
-      // by this same scan), sub-run `with:` values are never inlined — they resolve
-      // at runtime into `$INPUTS.<name>` — so scan them here for dangling refs.
-      // Only strings can carry refs (#2637); typed literals pass through untouched.
-      if (node.with) {
-        for (const [name, value] of Object.entries(node.with)) {
-          if (typeof value === 'string') sources.push({ field: `with.${name}`, text: value });
+      if (isExecNode(node)) {
+        sources.push({ field: node.runtime === 'sh' ? 'bash' : 'script', text: node.script });
+      }
+      // Node-local bindings (#2637): an agent's command-sourced `with:` and an exec
+      // node's `with:` string values are live ref surfaces (whole refs and
+      // templates), and a directive's `from` is one whole ref. KEEP IN SYNC item 1 —
+      // rewriteNodeOutputRefs and the builder scan walk the same surface. Non-string
+      // literals carry no refs.
+      const nodeWith = isExecNode(node)
+        ? node.with
+        : isAgentNode(node) && node.source.kind === 'command'
+          ? node.source.with
+          : undefined;
+      if (nodeWith !== undefined) {
+        for (const [name, value] of Object.entries(nodeWith)) {
+          if (typeof value === 'string') {
+            sources.push({ field: `with.${name}`, text: value });
+          } else if (isBindingDirective(value)) {
+            sources.push({ field: `with.${name}.from`, text: value.from });
+          }
         }
       }
-    }
-    if (isCancelNode(node)) sources.push({ field: 'cancel', text: node.cancel });
-    if (isApprovalNode(node)) {
-      sources.push({ field: 'approval.message', text: node.approval.message });
-      if (node.approval.on_reject !== undefined) {
+      // workflow.input is a live ref surface (a data string), scanned verbatim like
+      // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
+      // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
+      if (isWorkflowNode(node)) {
+        if (node.input) sources.push({ field: 'input', text: node.input });
+        if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
+        // A `workflow:` node's `with:` values (#2470) are live ref surfaces: unlike
+        // an `include:` node's `with:` (inlined by the macro and caught post-expansion
+        // by this same scan), sub-run `with:` values are never inlined — they resolve
+        // at runtime into `$INPUTS.<name>` — so scan them here for dangling refs.
+        // Only strings can carry refs (#2637); typed literals pass through untouched.
+        if (node.with) {
+          for (const [name, value] of Object.entries(node.with)) {
+            if (typeof value === 'string') sources.push({ field: `with.${name}`, text: value });
+          }
+        }
+      }
+      if (isHaltNode(node)) sources.push({ field: 'cancel', text: node.reason });
+      if (isGateNode(node)) {
+        sources.push({ field: 'approval.message', text: node.message });
+        const rework = node.decisions.find(d => d.rework !== undefined)?.rework;
+        if (rework !== undefined) {
+          sources.push({
+            field: 'approval.on_reject.prompt',
+            text: rework.prompt,
+          });
+        }
+      }
+      if (isLoopNode(node)) {
+        if (typeof node.loop.prompt === 'string') {
+          sources.push({ field: 'loop.prompt', text: node.loop.prompt });
+        }
+        if (node.loop.until_bash) {
+          sources.push({ field: 'loop.until_bash', text: node.loop.until_bash });
+        }
+      }
+      if (isLoopGroupNode(node) && node.loop_group.until_bash) {
+        // The group evaluates this field after each body iteration against the same output
+        // map the body populated, so its direct body nodes are visible here in addition to
+        // the current and enclosing DAG scopes.
         sources.push({
-          field: 'approval.on_reject.prompt',
-          text: node.approval.on_reject.prompt,
+          field: 'loop_group.until_bash',
+          text: node.loop_group.until_bash,
+          bodyNodes: node.loop_group.nodes,
         });
       }
-    }
-    if (isLoopNode(node)) {
-      if (typeof node.loop.prompt === 'string') {
-        sources.push({ field: 'loop.prompt', text: node.loop.prompt });
-      }
-      if (node.loop.until_bash) {
-        sources.push({ field: 'loop.until_bash', text: node.loop.until_bash });
-      }
-    }
-    if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-      // The group evaluates this field after each body iteration against the same output
-      // map the body populated, so its direct body nodes are visible here in addition to
-      // the current and enclosing DAG scopes.
-      sources.push({
-        field: 'loop_group.until_bash',
-        text: node.loop_group.until_bash,
-        bodyNodes: node.loop_group.nodes,
-      });
     }
     for (const source of sources) {
       let m: RegExpExecArray | null;
@@ -731,7 +1013,7 @@ export function validateDagStructure(
         if (atom?.ref.kind !== 'node' || atom.ref.field !== undefined) continue;
         const producerId = atom.ref.nodeId;
         const producer = nodesById.get(producerId) ?? enclosingNodes?.get(producerId);
-        if (!producer) continue;
+        if (!producer || isIncludeDirective(producer)) continue;
         const kind = freeFormAiProducerKind(producer);
         if (kind === null) continue;
         const problem = `Node '${node.id}' field 'when' compares the whole output of AI node '${producerId}' to a literal ('${atom.expected}'). That output is free-form prose, so the comparison silently fails and '${node.id}' is skipped.`;
@@ -752,6 +1034,7 @@ export function validateDagStructure(
   // A named session source must be in the same static scope and complete before its
   // consumer. Runtime validation owns provider/session facts that loading cannot know.
   for (const node of nodes) {
+    if (isIncludeDirective(node)) continue;
     if (!isNodeContextResume(node.context)) continue;
     if (enclosingNodes !== undefined) {
       return `Node '${node.id}' uses context.resume inside a loop_group body, which is not supported`;
@@ -761,7 +1044,7 @@ export function validateDagStructure(
     if (source === undefined) {
       return `Node '${node.id}' context.resume references unknown node '${sourceId}'`;
     }
-    if (!isCommandNode(source) && !isPromptNode(source) && !isLoopNode(source)) {
+    if (isIncludeDirective(source) || !(isAgentNode(source) || isLoopNode(source))) {
       return `Node '${node.id}' context.resume source '${sourceId}' is not a session-producing command, prompt, or loop node`;
     }
     if (!transitiveDepsOf(node.id).has(sourceId)) {
@@ -776,7 +1059,7 @@ export function validateDagStructure(
   // load time with an actionable message instead. A literal `items` with no `$…output`
   // ref is left to the runtime fail-closed check (it must still parse to an array).
   for (const node of nodes) {
-    if (!isWorkflowNode(node) || !node.fan_out) continue;
+    if (isIncludeDirective(node) || !isWorkflowNode(node) || !node.fan_out) continue;
     const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);
     const producerId = refMatch?.[1];
     if (producerId === undefined) continue; // no ref surface — runtime fail-closed owns it
@@ -791,8 +1074,14 @@ export function validateDagStructure(
   // enforced — a loop_group body node may read the enclosing scope, whose outputs are
   // settled before the group starts (existing body-ref semantics).
   for (const node of nodes) {
-    if (!(isCommandNode(node) || isScriptNode(node)) || node.with === undefined) continue;
-    for (const [name, value] of Object.entries(node.with)) {
+    if (isIncludeDirective(node)) continue;
+    const nodeWith = isExecNode(node)
+      ? node.with
+      : isAgentNode(node) && node.source.kind === 'command'
+        ? node.source.with
+        : undefined;
+    if (nodeWith === undefined) continue;
+    for (const [name, value] of Object.entries(nodeWith)) {
       const producerIds: string[] = [];
       if (typeof value === 'string') {
         const refPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
@@ -822,17 +1111,22 @@ export function validateDagStructure(
   // Outer-DAG cycle/depends_on checks above operate on the flattened top-level node
   // list and treat each loop_group as one outer node.
   for (const node of nodes) {
-    if (isLoopGroupNode(node)) {
+    if (!isIncludeDirective(node) && isLoopGroupNode(node)) {
       // `workflow:` (sub-run) inside a loop_group body is rejected (bounds the
       // interaction surface — see the plan's NOT Building). This wholesale rejection
       // also covers a fan-out (`fan_out:`) workflow node in a loop_group body (slice 2,
       // PR-C): a fan-out is a `workflow:` node, so nesting it per-iteration is likewise
       // out of scope.
-      const workflowInBody = node.loop_group.nodes.find(isWorkflowNode);
+      const workflowInBody = node.loop_group.nodes.find(
+        n => !isIncludeDirective(n) && isWorkflowNode(n)
+      );
       if (workflowInBody) {
         return `loop_group '${node.id}' body: 'workflow' (sub-run) is not supported inside a loop_group body`;
       }
-      const scopeNodes = new Map<string, DagNode>([...(enclosingNodes ?? []), ...nodesById]);
+      const scopeNodes = new Map<string, DagNode | IncludeDirective>([
+        ...(enclosingNodes ?? []),
+        ...nodesById,
+      ]);
       const bodyError = validateDagStructure(node.loop_group.nodes, scopeNodes);
       if (bodyError) {
         return `loop_group '${node.id}' body: ${bodyError}`;
@@ -841,6 +1135,92 @@ export function validateDagStructure(
   }
 
   return null; // valid
+}
+
+/**
+ * Workflow-class placement check (#2707 step 2): a workflow declared
+ * unattended (workflow-level `interactive` not `true`) should not NATIVELY
+ * author a pause node anywhere in its DAG — a gate (`approval:`) node, or a
+ * `loop`/`loop_group` node with node-level `interactive: true`. The
+ * declaration is the workflow's promise about the pause nodes IT authors.
+ *
+ * GRACE PERIOD (#2736): a violation here does NOT reject the file. Rejecting
+ * outright broke every workflow written before the class declaration
+ * existed, including ones that only ever ran in the foreground and were
+ * never actually unsafe — the hard error had no transition. `parseWorkflow`
+ * instead coerces `interactive` to `true` for the rest of this parse and
+ * warns once per file (see `warnedClassPlacementFiles`), which closes #1991
+ * for these workflows immediately: every dispatch surface reads the SAME
+ * parsed `interactive` value this function's result feeds
+ * (`assertInteractiveClassNotBackgrounded`, the fan-out spawn check, the web
+ * console's own background-vs-foreground branch), so the coercion protects
+ * them without waiting for the author to add the declaration. TODO(#2738):
+ * once the grace period ends, delete the coercion in `parseWorkflow` and
+ * restore the hard error — this function's return value already carries the
+ * exact message that error used to return, unchanged. Restoring the hard
+ * error also means a leaf gate-authoring block reachable only via `include:`
+ * can fail its OWN class check again, so #2738 must also resurrect the
+ * `WorkflowLoadError.name`/`failedNames` mechanism this grace-period commit
+ * removed (see its git history) — without it, every composer of that block
+ * regresses to a misleading "not found" instead of the real cause.
+ *
+ * Called ONLY from `parseWorkflow`, against ONE file's own unexpanded node
+ * list — deliberately NOT re-run against the post-`include:`-expansion node
+ * list (see `expandWorkflowIncludes`'s doc comment at its `validateDagStructure`
+ * call site for why): a reusable block can legitimately author a gate without
+ * declaring its own `interactive: true`, since the SAME block may be composed
+ * into an interactive parent, or independently discovered and invoked on its
+ * own — load time cannot tell which discovered workflow will actually own a
+ * given run (mirrors `findComposedApprovalGate`'s "one reader, one file"
+ * reasoning). Composed-gate drivability stays an INVOCATION-time question,
+ * answered by `assertComposedGateDriveable` against the run actually being
+ * dispatched.
+ *
+ * Runs on the same node list `validateDagStructure` walks, recursing into
+ * `loop_group` bodies (a body pause is governed by the SAME enclosing
+ * workflow's class, not a class of its own).
+ *
+ * A `workflow:` node is also deliberately NOT checked here: its target
+ * resolves at spawn, not load (#2200), so whether it can pause is unknowable
+ * at this point — see `resolveFanOutChildDefinition`'s interactive-class
+ * check in dag-executor.ts for the spawn-time equivalent (fan-out only; a 1:1
+ * `workflow:` child is unaffected by design, see #2474's acceptance criteria).
+ */
+export function validateWorkflowClassPlacement(
+  nodes: readonly (DagNode | IncludeDirective)[],
+  interactive: boolean | undefined
+): string | null {
+  if (interactive === true) return null;
+  for (const node of nodes) {
+    if (isIncludeDirective(node)) continue;
+    if (isGateNode(node)) {
+      return (
+        `Node '${node.id}' is a pause node ('approval:'), but this workflow does not declare ` +
+        "'interactive: true'. An unattended workflow may never contain a pause node — declare " +
+        "'interactive: true' at the workflow level, or remove this gate."
+      );
+    }
+    if (isLoopNode(node) && node.loop.interactive === true) {
+      return (
+        `Node '${node.id}' is a pause node ('loop.interactive: true'), but this workflow does not ` +
+        "declare 'interactive: true'. An unattended workflow may never contain a pause node — " +
+        "declare 'interactive: true' at the workflow level, or remove the node-level 'interactive:'."
+      );
+    }
+    if (isLoopGroupNode(node)) {
+      if (node.loop_group.interactive === true) {
+        return (
+          `Node '${node.id}' is a pause node ('loop_group.interactive: true'), but this workflow ` +
+          "does not declare 'interactive: true'. An unattended workflow may never contain a pause " +
+          "node — declare 'interactive: true' at the workflow level, or remove the node-level " +
+          "'interactive:'."
+        );
+      }
+      const bodyError = validateWorkflowClassPlacement(node.loop_group.nodes, interactive);
+      if (bodyError) return bodyError;
+    }
+  }
+  return null;
 }
 
 export type ParseResult =
@@ -924,7 +1304,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     const parseWarnings: string[] = [];
     const dagNodes = (raw.nodes as unknown[])
       .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors, parseWarnings))
-      .filter((n): n is DagNode => n !== null);
+      .filter((n): n is DagNode | IncludeDirective => n !== null);
 
     if (dagNodes.length !== (raw.nodes as unknown[]).length) {
       getLog().warn({ filename, validationErrors }, 'dag_node_validation_failed');
@@ -945,6 +1325,32 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         workflow: null,
         error: { filename, error: structureError, errorType: 'validation_error' },
       };
+    }
+
+    // Workflow-class placement (#2707 step 2) + the typed `interactive` field share
+    // one raw-value coercion, computed here so the class check and the field the
+    // engine actually reads can never disagree.
+    const rawInteractive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
+    if (raw.interactive !== undefined && typeof raw.interactive !== 'boolean') {
+      getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
+    }
+    const classError = validateWorkflowClassPlacement(dagNodes, rawInteractive);
+    // Grace period (#2736/#2738) — see this check's doc comment above `validateWorkflowClassPlacement`.
+    const interactive = classError ? true : rawInteractive;
+    if (classError) {
+      const classWarning =
+        `Workflow '${raw.name}': ${classError} 'interactive: true' has been applied for this run only ` +
+        '(this grace period ends in a future release — see #2738); add the declaration to the file to ' +
+        'silence this warning.';
+      parseWarnings.push(classWarning);
+      if (!warnedClassPlacementFiles.has(filename)) {
+        warnedClassPlacementFiles.add(filename);
+        // Carry the prose, not just the payload, so the warning is legible on both
+        // channels: the log stream, and `parseWarnings` — which `executeWorkflow`
+        // persists verbatim as a `workflow_parse_warnings` event (#2213) and
+        // `/api/workflows` surfaces per-workflow to the author (see AGENTS.md).
+        getLog().warn({ filename, warning: classWarning }, 'workflow_class_placement_inferred');
+      }
     }
 
     // Parse workflow-level fields using WorkflowBaseSchema for validation
@@ -971,6 +1377,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       };
     }
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (node.provider !== undefined && !isRegisteredProvider(node.provider)) {
         return {
           workflow: null,
@@ -986,10 +1393,11 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     }
 
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (!isNodeContextResume(node.context)) continue;
       const sourceNodeId = node.context.resume;
       const source = dagNodes.find(candidate => candidate.id === sourceNodeId);
-      if (source === undefined) continue; // validateDagStructure already reports this case.
+      if (source === undefined || isIncludeDirective(source)) continue; // validateDagStructure already reports this case.
 
       const consumerProvider = node.provider ?? provider;
       const sourceProvider = source.provider ?? provider;
@@ -1041,6 +1449,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
     // in via workflow-level `persist_sessions: true` and contains, e.g., a bash node.
     const workflowPersistSessions = raw.persist_sessions === true;
     for (const node of dagNodes) {
+      if (isIncludeDirective(node)) continue;
       if (!isPersistableNode(node)) continue;
       if ('context' in node && node.context === 'fresh') continue;
 
@@ -1084,38 +1493,18 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       { valid: webSearchModeSchema.options }
     );
 
-    const interactive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
-    if (raw.interactive !== undefined && typeof raw.interactive !== 'boolean') {
-      getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
-    }
-
-    // Warn if any interactive loop node exists in a non-interactive workflow
-    // (approval messages won't reach the user in web background runs)
-    if (!interactive) {
-      // Covers loop: and loop_group: gates, including loops nested inside loop_group bodies.
-      const hasInteractiveLoop = (ns: DagNode[]): boolean =>
-        ns.some(
-          n =>
-            (isLoopNode(n) && n.loop.interactive === true) ||
-            (isLoopGroupNode(n) &&
-              (n.loop_group.interactive === true || hasInteractiveLoop(n.loop_group.nodes)))
-        );
-      if (hasInteractiveLoop(dagNodes)) {
-        getLog().warn({ filename }, 'interactive_loop_in_non_interactive_workflow');
-      }
-    }
-
     // Warn (non-blocking) when signal_completes is set without interactive: the flag
     // only changes interactive-gate behavior — a non-interactive loop already
     // completes on the signal, so the author's intent is likely a missing
     // `interactive: true`. The workflow still loads.
-    const hasSignalCompletesWithoutInteractive = (ns: DagNode[]): boolean =>
+    const hasSignalCompletesWithoutInteractive = (ns: (DagNode | IncludeDirective)[]): boolean =>
       ns.some(
         n =>
-          (isLoopNode(n) && n.loop.signal_completes === true && n.loop.interactive !== true) ||
-          (isLoopGroupNode(n) &&
-            ((n.loop_group.signal_completes === true && n.loop_group.interactive !== true) ||
-              hasSignalCompletesWithoutInteractive(n.loop_group.nodes)))
+          !isIncludeDirective(n) &&
+          ((isLoopNode(n) && n.loop.signal_completes === true && n.loop.interactive !== true) ||
+            (isLoopGroupNode(n) &&
+              ((n.loop_group.signal_completes === true && n.loop_group.interactive !== true) ||
+                hasSignalCompletesWithoutInteractive(n.loop_group.nodes))))
       );
     if (hasSignalCompletesWithoutInteractive(dagNodes)) {
       getLog().warn({ filename }, 'signal_completes_without_interactive_ignored');

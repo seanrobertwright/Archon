@@ -36,6 +36,50 @@ export function classifyAndFormatError(error: Error): string {
     return `⚠️ AI usage limit reached${reset ? ` (${reset})` : ''}. Please wait and try again.`;
   }
 
+  // Codex-specific auth errors — OAuth token refresh failures and 401 retry
+  // exhaustion (GitHub #2509). The rate-limit branch above has already had a
+  // chance to match, so a `Codex rate_limit:` wrap routes to usage-cap
+  // guidance first (only when the inner text matches that branch's own
+  // substring list: "rate limit" / "hit your limit" / "usage limit" /
+  // "session limit").
+  //
+  // `Codex auth error:` means the provider's own AUTH_PATTERNS
+  // (packages/providers/src/codex/provider.ts) already classified this
+  // message as auth, so it routes unconditionally instead of being re-tested
+  // against a narrower, hand-written substring list — that mismatch is what
+  // let real auth errors like "unauthorized" and "invalid token" fall
+  // through (#2509 R1). That unconditional trust is warranted only because
+  // AUTH_PATTERNS itself requires a real auth word ("unauthorized" /
+  // "authentication" / "invalid token" / "credit balance") and deliberately
+  // excludes a bare "401"/"403" — a stray status-looking digit in unrelated
+  // text (a port, a timeout in ms) does not classify as auth there, so it
+  // never reaches this branch (#2509 R7; see the AUTH_PATTERNS comment in
+  // provider.ts). Every other Codex-side prefix was NOT classified as auth
+  // by the provider: some are a different class (`Codex crash:`), others are
+  // raw and never classified at all (`Codex query failed:`,
+  // `codex_turn_failed:`, `codex_stream_incomplete:`), so those still need a
+  // substring check below — for the same "bare digits aren't enough signal"
+  // reason, that check requires the specific word "unauthorized"
+  // (case-insensitive), not a bare "401" (#2509 R2, R8).
+  if (message.startsWith('Codex auth error:')) {
+    return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
+  }
+  const isCodexRawPrefixed =
+    message.startsWith('Codex query failed:') ||
+    message.startsWith('codex_turn_failed:') ||
+    message.startsWith('codex_stream_incomplete:');
+  if (
+    (message.startsWith('Codex ') || isCodexRawPrefixed) &&
+    (message.includes('refresh token') ||
+      message.includes('could not be refreshed') ||
+      message.includes('log out and sign in') ||
+      message.includes('OAuth token has expired') ||
+      message.includes('sign-in has expired') ||
+      lower.includes('unauthorized'))
+  ) {
+    return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
+  }
+
   // Claude-specific auth errors — OAuth token refresh failures
   // These come from Claude Code subprocess stderr or SDK result subtypes.
   // Recovery: `/login` in-session or `claude logout && claude login` in terminal.
@@ -62,22 +106,17 @@ export function classifyAndFormatError(error: Error): string {
     return '⚠️ Not logged in to the AI provider. Connect a subscription or API key in Settings → Agents, or set credentials in your environment (e.g. `claude /login` or `CLAUDE_API_KEY`).';
   }
 
-  // Codex-specific auth errors — 401 retry exhaustion
-  // Codex surfaces auth failures as "exceeded retry limit, last status: 401 Unauthorized"
-  // Recovery: `codex login` in terminal.
-  if (
-    message.includes('Codex query failed:') &&
-    (message.includes('401') || message.includes('Unauthorized'))
-  ) {
-    return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
-  }
-
-  // General AI/SDK authentication errors
+  // General AI/SDK authentication errors. Deliberately excludes a bare "401":
+  // same "bare digits aren't enough signal" reasoning as the Codex checks
+  // above (#2509 R2, R7, R8) — a stray status-looking digit in unrelated
+  // text (a port, a byte offset, a millisecond duration) is not a reliable
+  // auth indicator on its own, and this function has more accurate branches
+  // for exactly those shapes a few lines below (timeout, ECONNREFUSED). The
+  // three remaining checks already carry the real signal (#2509 R9).
   if (
     message.includes('API key') ||
     message.includes('authentication_error') ||
-    message.includes('authentication error') ||
-    message.includes('401')
+    message.includes('authentication error')
   ) {
     return '⚠️ AI service authentication error. Please check your API key or credentials.';
   }

@@ -1,9 +1,12 @@
-import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
 import { AXIS_SPECIMEN } from '../test/token-usage-axes';
 import { mergeTokenUsage } from '@archon/providers/types';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = createMockLogger();
@@ -401,6 +404,63 @@ describe('workflow-events', () => {
       ]);
     });
 
+    test('a later node_failed row supersedes an earlier node_completed row for the same step (#2705 R2)', async () => {
+      // Before #2705, a non-always_run node that once completed could never be
+      // re-attempted, so a node_completed → node_failed sequence for the same
+      // step_name was impossible. #2705's own invalidate-and-re-execute
+      // mechanism is the first thing that can produce that sequence: a cached
+      // node gets invalidated, re-executes, and the fresh attempt fails. If the
+      // earlier node_completed entry survives in the map, the NEXT resume's
+      // cache-eligibility check sees a stale success instead of the node's own
+      // most recent (failed) outcome.
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'flaky',
+            event_type: 'node_completed',
+            data: { node_output: 'first attempt succeeded' },
+          },
+          {
+            step_name: 'flaky',
+            event_type: 'node_failed',
+            data: { error: 'second attempt (re-executed via invalidation) crashed' },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-completed-then-failed');
+
+      // The failed row is the step's most recent real outcome; the stale
+      // node_completed entry must not survive the chronological walk.
+      expect(result.completedNodeOutputs.has('flaky')).toBe(false);
+    });
+
+    test('a node_completed row after a node_failed row for the same step re-adds it (chronological order wins)', async () => {
+      // Symmetric check: if the node later succeeds (a subsequent resume re-runs
+      // it and this time it completes), that success must be honoured — the
+      // delete on node_failed must not leave a permanent tombstone.
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'flaky',
+            event_type: 'node_failed',
+            data: { error: 'first attempt crashed' },
+          },
+          {
+            step_name: 'flaky',
+            event_type: 'node_completed',
+            data: { node_output: 'second attempt succeeded' },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-failed-then-completed');
+
+      expect(result.completedNodeOutputs.get('flaky')).toEqual({
+        output: 'second attempt succeeded',
+      });
+    });
+
     test('sums cache axes reported by a failed node into the resumed total', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
@@ -737,6 +797,128 @@ describe('workflow-events', () => {
       // than re-running the whole group.
       expect(result.completedNodeOutputs.get('group')).toEqual({ output: 'last iteration' });
       expect(result.completedNodeOutputs.get('group.body')).toEqual({ output: 'iteration 1' });
+    });
+
+    describe('node_output_spill_path preference (#2726)', () => {
+      let spillDir: string;
+
+      beforeEach(async () => {
+        spillDir = await mkdtemp(join(tmpdir(), 'archon-resume-snapshot-spill-'));
+      });
+
+      afterEach(async () => {
+        await rm(spillDir, { recursive: true, force: true });
+      });
+
+      test('reads the full spilled content instead of the truncated preview', async () => {
+        const fullOutput = 'x'.repeat(50_000);
+        const spillPath = join(spillDir, 'big-node.nodeoutput');
+        await writeFile(spillPath, fullOutput);
+
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'big-node',
+              event_type: 'node_completed',
+              data: {
+                node_output: 'x'.repeat(100) + '\n\n… [truncated; original output was 50000 bytes]',
+                node_output_truncated: true,
+                node_output_original_bytes: 50_000,
+                node_output_spill_path: spillPath,
+              },
+            },
+          ])
+        );
+
+        const result = await getDagResumeSnapshot('run-spill');
+
+        expect(result.completedNodeOutputs.get('big-node')?.output).toBe(fullOutput);
+        expect(result.completedNodeOutputs.get('big-node')?.output.length).toBe(50_000);
+      });
+
+      test('falls back to the preview when the spill file is missing, without throwing', async () => {
+        const missingPath = join(spillDir, 'does-not-exist.nodeoutput');
+
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'orphaned-node',
+              event_type: 'node_completed',
+              data: {
+                node_output: 'preview text' + '\n\n… [truncated; original output was 99999 bytes]',
+                node_output_truncated: true,
+                node_output_original_bytes: 99_999,
+                node_output_spill_path: missingPath,
+              },
+            },
+          ])
+        );
+
+        const snapshot = await getDagResumeSnapshot('run-spill-missing');
+
+        expect(snapshot.completedNodeOutputs.get('orphaned-node')?.output).toBe(
+          'preview text' + '\n\n… [truncated; original output was 99999 bytes]'
+        );
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ spillPath: missingPath }),
+          'db.workflow_dag_node_output_spill_read_failed'
+        );
+      });
+
+      test('falls back to the preview when the spill file no longer matches the recorded byte length (#2726)', async () => {
+        // Simulates the crash-window race: the spill file at this path was overwritten by
+        // a LATER execution of the same node (a resume re-execution via always_run or
+        // stale-dependency invalidation), but this row's own event insert is the one that
+        // ended up durable. The spill no longer describes what this row actually recorded.
+        const spillPath = join(spillDir, 'racy-node.nodeoutput');
+        await writeFile(spillPath, 'z'.repeat(12_345)); // a DIFFERENT execution's content
+
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'racy-node',
+              event_type: 'node_completed',
+              data: {
+                node_output: 'preview text' + '\n\n… [truncated; original output was 50000 bytes]',
+                node_output_truncated: true,
+                node_output_original_bytes: 50_000,
+                node_output_spill_path: spillPath,
+              },
+            },
+          ])
+        );
+
+        const snapshot = await getDagResumeSnapshot('run-spill-stale');
+
+        expect(snapshot.completedNodeOutputs.get('racy-node')?.output).toBe(
+          'preview text' + '\n\n… [truncated; original output was 50000 bytes]'
+        );
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            spillPath,
+            expectedBytes: 50_000,
+            actualBytes: 12_345,
+          }),
+          'db.workflow_dag_node_output_spill_stale'
+        );
+      });
+
+      test('does not attempt a spill read when no spill path is recorded', async () => {
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            {
+              step_name: 'small-node',
+              event_type: 'node_completed',
+              data: { node_output: 'small output' },
+            },
+          ])
+        );
+
+        const result = await getDagResumeSnapshot('run-no-spill');
+
+        expect(result.completedNodeOutputs.get('small-node')).toEqual({ output: 'small output' });
+        expect(mockLogger.warn).not.toHaveBeenCalled();
+      });
     });
 
     test('returns an empty snapshot when no events exist', async () => {

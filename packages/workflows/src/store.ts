@@ -58,6 +58,14 @@ export const WORKFLOW_EVENT_TYPES = [
   'node_failed',
   'node_skipped',
   'node_skipped_prior_success',
+  // #2402 — written when a cached prior-success node is invalidated because a
+  // dependency re-executed during the current resume (e.g. an `always_run: true`
+  // upstream, or any dep that re-ran with fresh output). `data.prior_output` is the
+  // stale cached value being thrown away; `data.invalidating_deps` lists the
+  // upstream node ids whose current output no longer matches the prior snapshot.
+  // The audit counterpart to the resume cache invalidation; absence never implies
+  // the cache was honored — a skipped node only writes `node_skipped_prior_success`.
+  'node_prior_cache_invalidated',
   'node_always_run_reset',
   'loop_iteration_started',
   'loop_iteration_completed',
@@ -215,6 +223,26 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     approvalContext: ApprovalContext,
     extraMetadata?: Record<string, unknown>
   ): Promise<void>;
+
+  /**
+   * Rewrite the approval context of an ALREADY-paused, still-open gate — unlike
+   * `pauseWorkflowRun`, which requires the run to currently be `'running'` and so
+   * cannot be used once a pause has already landed. CAS-guarded on the gate still
+   * being unresolved: a human who resolves the gate first wins the race, and this
+   * returns `resolved: false` instead of clobbering their resolution.
+   *
+   * Built for #2707 step 3's pause escalation: a `loop_group` body gate pauses
+   * generically (via `pauseWorkflowRun`, `nodeId` = the gate's own bare id), and
+   * this then rewrites `nodeId` to the enclosing loop_group's id (so the
+   * top-level DAG's resume walk finds it) and adds `bodyGateId` (the gate's
+   * original id, otherwise lost). Pass the COMPLETE rewritten `ApprovalContext`,
+   * not a partial one — the write merges into stored metadata, and an omitted
+   * field can survive from the prior context on one dialect and not the other.
+   */
+  rewriteApprovalContext(
+    id: string,
+    approvalContext: ApprovalContext
+  ): Promise<{ resolved: boolean }>;
 
   /**
    * Atomically CLAIM the container write-back apply before the live root is mutated

@@ -60,9 +60,13 @@ import {
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { loadConfig } from '../config/config-loader';
-import { assertComposedGateDriveable } from '@archon/workflows/utils/workflow-requirements';
+import {
+  assertComposedGateDriveable,
+  assertInteractiveClassNotBackgrounded,
+} from '@archon/workflows/utils/workflow-requirements';
 import { SUBRUN_METADATA_KEYS } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowDefinition, WorkflowSource } from '@archon/workflows/schemas/workflow';
+import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import {
@@ -329,14 +333,21 @@ async function dispatchBackgroundWorkflowOwned(
     prBranch?: string;
   }
 ): Promise<void> {
-  // 0. A backgrounded run cannot present an approval gate inline, and a gate that arrived
-  // through `include:` was written by someone looking at a different file (#1764). Checked
-  // HERE, in the one function that backgrounds a run, rather than at each caller — this has
-  // two entrypoints (the console's default dispatch and the `manage_run` tool's
-  // startWorkflow, which reaches every platform with native tools), and a rule enforced per
-  // caller is a rule that fails open the moment a third appears. Throws before the worker
-  // conversation exists, so a refusal leaves nothing behind.
-  assertComposedGateDriveable(workflow.nodes);
+  // 0. A backgrounded run cannot present a pause inline. Two checks, covering the two
+  // things the class declaration can and cannot see (#2707 step 2): the workflow's OWN
+  // declared class (`interactive: true` — refused unconditionally, whether or not it
+  // happens to contain a pause node right now) and a gate that arrived through `include:`
+  // in a workflow that omits `interactive: true` — written by someone looking at a
+  // different file (#1764), so the class declaration alone cannot catch it. Checked HERE,
+  // in the one function that backgrounds a run, rather than at each caller — this has two
+  // entrypoints (the console's default dispatch and the `manage_run` tool's startWorkflow,
+  // which reaches every platform with native tools), and a rule enforced per caller is a
+  // rule that fails open the moment a third appears. Throws before the worker conversation
+  // exists, so a refusal leaves nothing behind.
+  assertInteractiveClassNotBackgrounded(workflow);
+  // Already-expanded — discoverWorkflowsWithConfig's output never contains an
+  // IncludeDirective (#2486).
+  assertComposedGateDriveable(workflow.nodes as DagNode[]);
 
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
@@ -530,12 +541,18 @@ async function dispatchBackgroundWorkflowOwned(
     // Non-fatal: executeWorkflow will create its own row as fallback
   }
 
-  // 8. Fire-and-forget: run workflow in background
-  void (async (): Promise<void> => {
+  // 8. Fire-and-forget: transfer the capture into a second ownership scope whose
+  // lifetime encloses the detached execution. `withCapturedSource` invokes its body
+  // synchronously, so the new owner holds the capture before the dispatch owner adopts
+  // and returns. The detached scope then reclaims on any pre-rename failure or stops
+  // tracking only when executeWorkflow adopts after the rename succeeds.
+  const backgroundExecution = withCapturedSource(async backgroundOwner => {
+    backgroundOwner.hold(preparedSource);
     try {
       try {
-        // Handing the capture to a run: it owns the bytes and their lifetime now.
-        if (preparedSource) owner.adopt();
+        // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+        // executor adopts for us there (see #2690). Until then a rename failure leaves
+        // the staged directory un-adopted so the wrap reclaims it on the way out.
         const result = await executeWorkflow(
           workflowDeps,
           ctx.platform,
@@ -556,6 +573,7 @@ async function dispatchBackgroundWorkflowOwned(
             baseBranch: codebaseBaseBranch,
             resolveChildIsolation,
             preparedSource,
+            capturedSourceOwner: backgroundOwner,
             // Only consumed when `preCreatedRun` is undefined (pre-creation failed and
             // the executor creates the row itself); otherwise the row above already
             // carries them.
@@ -645,7 +663,9 @@ async function dispatchBackgroundWorkflowOwned(
     } catch (outerError) {
       getLog().error({ err: toError(outerError) }, 'background_workflow_unhandled_error');
     }
-  })();
+  });
+  owner.adopt();
+  void backgroundExecution;
 }
 
 /**

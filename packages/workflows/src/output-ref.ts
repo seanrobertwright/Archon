@@ -6,6 +6,9 @@
  * — so the contract is identical in both.
  *
  * Resolution table for a known producer:
+ *   0. Producer's `state` is `'failed'` → THROW ('producer-failed', #2713), before any
+ *      of the branches below ever run — a failed producer's leftover output is never
+ *      trusted, however JSON-shaped or non-empty it looks.
  *   1. Producer HAS `declaredFields` (an `output_format` with `properties`) — enforce it:
  *        field ∈ declaredFields, value present      → value
  *        field ∈ declaredFields, value absent/null  → '' (declared-optional / explicit null)
@@ -27,8 +30,12 @@
  *      key is expected; anything else is a drop they must see:
  *        output not a JSON object → THROW ;  key present → value ;  key absent → THROW
  *
- * The whole-text `$node.output` form (no `.field`) is never routed here — it is
- * unchanged and never throws.
+ * The whole-text `$node.output` form (no `.field`) is never routed through THIS
+ * function — but it is no longer unconditionally lenient: every caller (#2713) now
+ * guards it, before ever reading the producer's output, through `assertProducerNotFailed`
+ * below — the same `state === 'failed'` case this function guards for the fielded form,
+ * as one shared function every caller routes through (#2722), replacing the enumeration
+ * of independently-worded call sites that each had to remember the check.
  *
  * The UNKNOWN-node case (`$typo.output.field` where nothing in the outputs map
  * resolves — a typo, or a real node that has not run before the reference) is
@@ -167,6 +174,7 @@ export type OutputRefErrorReason =
   | 'array-aggregate'
   | 'missing-key'
   | 'producer-not-run'
+  | 'producer-failed'
   | 'unknown-node';
 
 export class OutputRefError extends Error {
@@ -201,6 +209,8 @@ export class OutputRefError extends Error {
         return `'${ref}' references field '${field}', but node '${nodeId}'s JSON output has no such key. Emit '${field}' in the output, or fix the reference.`;
       case 'producer-not-run':
         return `'${ref}' references field '${field}', but node '${nodeId}' did not run (skipped or pending), so it has no output to read. Guard this reference with a 'when:' condition, or fix the dependency.`;
+      case 'producer-failed':
+        return `'${ref}' references field '${field}', but node '${nodeId}' failed, so its output cannot be trusted. Guard this reference with a 'when:' condition, or fix the failure.`;
       case 'unknown-node': {
         const hint =
           candidates.length > 0
@@ -302,6 +312,15 @@ export function resolveNodeOutputField(
     throw new OutputRefError(nodeId, field, 'producer-not-run');
   }
 
+  // A failed producer never resolves a field, however JSON-shaped its leftover
+  // output looks (#2713): a loop_group's failure paths carry the last completed
+  // iteration's real, often-valid-JSON text, which would otherwise be read here
+  // as if the group had succeeded — the same class of bug #2696/#2710 fixed for
+  // the `{ from, if_skipped }` binding directive.
+  if (nodeOutput.state === 'failed') {
+    throw new OutputRefError(nodeId, field, 'producer-failed');
+  }
+
   const declaredFields = 'declaredFields' in nodeOutput ? nodeOutput.declaredFields : undefined;
   const structured = 'structuredOutput' in nodeOutput ? nodeOutput.structuredOutput : undefined;
   const structuredObj = asPlainObject(structured);
@@ -351,4 +370,29 @@ export function resolveNodeOutputField(
   }
   if (!(field in obj)) throw new OutputRefError(nodeId, field, 'missing-key');
   return { kind: 'value', value: obj[field] };
+}
+
+/**
+ * Guard the whole-text `$node.output` form against a failed producer's stale output
+ * (#2696/#2710/#2713): a `loop_group`'s failure paths carry the last completed
+ * iteration's real, often-valid-JSON output text, which must never be read as if the
+ * producer had succeeded. Mirrors the `state === 'failed'` guard already built into
+ * `resolveNodeOutputField` above for the fielded form, so every whole-text reader
+ * routes through this one function instead of repeating the check (#2722), replacing
+ * the KEEP-IN-SYNC enumeration this module doc used to carry. This is a runtime check,
+ * not a type-level one — nothing stops a future caller from reading `nodeOutput.output`
+ * directly without calling this function first; the value is having one place to route
+ * through, not a compiler-enforced guarantee against bypass.
+ *
+ * `buildMessage` lets each caller keep its own wording — a binding directive names
+ * `if_skipped`, a `when:` guard names the condition, and so on — only the
+ * check-and-throw mechanism is shared.
+ */
+export function assertProducerNotFailed(
+  nodeOutput: NodeOutput,
+  buildMessage: (failed: Extract<NodeOutput, { state: 'failed' }>) => string
+): void {
+  if (nodeOutput.state === 'failed') {
+    throw new Error(buildMessage(nodeOutput));
+  }
 }

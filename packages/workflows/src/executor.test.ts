@@ -4,7 +4,9 @@
  * that the inner dag-executor.test.ts cannot reach.
  */
 import { describe, it, expect, mock, beforeEach, spyOn } from 'bun:test';
-import { join } from 'path';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'path';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -162,7 +164,7 @@ import { keepAwake } from './utils/keep-awake';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './schemas';
-import { workflowDefinitionSchema } from './schemas';
+import { RUN_METADATA_KEYS, workflowDefinitionSchema } from './schemas';
 
 // --- Helpers ---
 
@@ -190,6 +192,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     updateWorkflowActivity: mock(async () => {}),
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
+    rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
     cancelWorkflowRun: mock(async () => ({ cancelled: false })),
@@ -233,7 +236,7 @@ function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefi
   return {
     name: 'test-workflow',
     description: 'Test',
-    nodes: [{ id: 'node1', prompt: 'Do something' }],
+    nodes: [{ id: 'node1', kind: 'agent', source: { kind: 'inline', prompt: 'Do something' } }],
     ...overrides,
   };
 }
@@ -1393,7 +1396,16 @@ describe('executeWorkflow', () => {
         makePlatform(),
         'conv-1',
         '/tmp',
-        makeWorkflow({ nodes: [{ id: 'node1', prompt: 'Do something', persist_session: true }] }),
+        makeWorkflow({
+          nodes: [
+            {
+              id: 'node1',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'Do something' },
+              persist_session: true,
+            },
+          ],
+        }),
         'test message',
         'db-conv-1'
       );
@@ -1514,7 +1526,11 @@ describe('executeWorkflow', () => {
 
   describe('user provider env injection', () => {
     it('skips injection when isPerUserProviderKeysEnabled returns false', async () => {
-      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const getUserProviderEnv = mock(async () => ({
+        env: { SHOULD_NOT_APPEAR: '1' },
+        files: [],
+        protectedValues: ['1'],
+      }));
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => false,
@@ -1534,7 +1550,11 @@ describe('executeWorkflow', () => {
     });
 
     it('skips injection when userId is absent even if feature is enabled', async () => {
-      const getUserProviderEnv = mock(async () => ({ env: { SHOULD_NOT_APPEAR: '1' }, files: [] }));
+      const getUserProviderEnv = mock(async () => ({
+        env: { SHOULD_NOT_APPEAR: '1' },
+        files: [],
+        protectedValues: ['1'],
+      }));
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => true,
@@ -1555,11 +1575,16 @@ describe('executeWorkflow', () => {
 
     it('merges user provider env LAST so it overrides DB env', async () => {
       const store = makeStore({
-        getCodebaseEnvVars: mock(async () => ({ DB_KEY: 'db_val', SHARED_KEY: 'db' })),
+        getCodebaseEnvVars: mock(async () => ({
+          DATABASE_URL: 'db_val',
+          BASE_BRANCH: 'reserved-db-secret',
+          SHARED_KEY: 'db',
+        })),
       });
       const getUserProviderEnv = mock(async () => ({
         env: { SHARED_KEY: 'user_wins', USER_KEY: 'u_val' },
         files: [] as { path: string; contents: string }[],
+        protectedValues: ['user_wins', 'u_val'],
       }));
       const deps: WorkflowDeps = {
         ...makeDeps(store),
@@ -1578,11 +1603,18 @@ describe('executeWorkflow', () => {
       );
       const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
       expect(configArg?.envVars).toMatchObject({
-        DB_KEY: 'db_val',
+        DATABASE_URL: 'db_val',
+        BASE_BRANCH: 'reserved-db-secret',
         SHARED_KEY: 'user_wins',
         USER_KEY: 'u_val',
       });
       expect(configArg?.protectedEnvKeys).toEqual(['SHARED_KEY', 'USER_KEY']);
+      expect(configArg?.protectedCredentialValues).toEqual([
+        'db_val',
+        'reserved-db-secret',
+        'user_wins',
+        'u_val',
+      ]);
     });
 
     it('protects bot and per-user GitHub credentials beside provider credentials', async () => {
@@ -1604,6 +1636,7 @@ describe('executeWorkflow', () => {
         getUserProviderEnv: mock(async () => ({
           env: { ANTHROPIC_API_KEY: 'provider-token' },
           files: [],
+          protectedValues: ['provider-token'],
         })),
       };
 
@@ -1631,9 +1664,17 @@ describe('executeWorkflow', () => {
         'COPILOT_GITHUB_TOKEN',
         'ANTHROPIC_API_KEY',
       ]);
+      expect(configArg?.protectedCredentialValues).toEqual(['provider-token']);
     });
 
-    it('returns {} and does not throw when getUserProviderEnv rejects', async () => {
+    it('removes stale credential files before a credential refresh failure', async () => {
+      const artifactsDir = wsPath('_cwd', 'tmp', 'artifacts', 'runs', 'run-123');
+      const codexAuthPath = join(artifactsDir, 'codex-home', 'auth.json');
+      const piAuthPath = join(artifactsDir, 'pi-home', 'auth.json');
+      await mkdir(dirname(codexAuthPath), { recursive: true });
+      await mkdir(dirname(piAuthPath), { recursive: true });
+      await writeFile(codexAuthPath, 'stale-codex-secret');
+      await writeFile(piAuthPath, 'stale-pi-secret');
       const deps: WorkflowDeps = {
         ...makeDeps(makeStore()),
         isPerUserProviderKeysEnabled: () => true,
@@ -1641,11 +1682,83 @@ describe('executeWorkflow', () => {
           throw new Error('network down');
         }),
       };
-      await expect(
-        executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
-          userId: 'u-1',
-        })
-      ).resolves.toBeDefined();
+      try {
+        await expect(
+          executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
+            userId: 'u-1',
+          })
+        ).resolves.toBeDefined();
+        await expect(readFile(codexAuthPath, 'utf8')).rejects.toThrow();
+        await expect(readFile(piAuthPath, 'utf8')).rejects.toThrow();
+      } finally {
+        await rm(join(artifactsDir, 'codex-home'), { recursive: true, force: true });
+        await rm(join(artifactsDir, 'pi-home'), { recursive: true, force: true });
+      }
+    });
+
+    it('retains protected values when a later credential file write fails', async () => {
+      const credentialValue = 'oauth-partial-write-secret';
+      const deliveryRoot = await mkdtemp(join(tmpdir(), 'archon-provider-delivery-'));
+      const firstFile = join(deliveryRoot, 'codex-auth.json');
+      const impossibleSecondFile = join(firstFile, 'pi-auth.json');
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async () => ({
+          env: { CODEX_HOME: deliveryRoot },
+          files: [
+            { path: firstFile, contents: credentialValue },
+            { path: impossibleSecondFile, contents: credentialValue },
+          ],
+          protectedValues: [credentialValue],
+        })),
+      };
+
+      try {
+        await expect(
+          executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
+            userId: 'u-1',
+          })
+        ).resolves.toBeDefined();
+
+        const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+        expect(await readFile(firstFile, 'utf8')).toBe(credentialValue);
+        expect(configArg?.envVars).not.toHaveProperty('CODEX_HOME');
+        expect(configArg?.protectedCredentialValues).toEqual([credentialValue]);
+      } finally {
+        await rm(deliveryRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('uses the persisted user identity to rebuild credential provenance on resume', async () => {
+      const getUserProviderEnv = mock(async () => ({
+        env: { CODEX_HOME: '/run/codex-home' },
+        files: [],
+        protectedValues: ['persisted-user-token'],
+      }));
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv,
+      };
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-c1',
+        {
+          preCreatedRun: makeRun({ user_id: 'persisted-user' }),
+          userId: 'transient-resumer',
+        }
+      );
+
+      expect(getUserProviderEnv).toHaveBeenCalledWith('persisted-user', expect.any(String));
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      expect(configArg?.protectedCredentialValues).toEqual(['persisted-user-token']);
     });
   });
 
@@ -1773,6 +1886,189 @@ describe('executeWorkflow', () => {
       expect(msg).toContain('Wait for it to finish');
     });
   });
+
+  // #2304 — the persistence block must distinguish three `identityResolution` outcomes:
+  //   • 'faulted'      → skip the `output_root` write, stamp the metadata flag
+  //                      (`metadata.identity_unresolved = true`). The row keeps
+  //                      `output_root` NULL so a later resume can self-heal.
+  //   • 'unregistered' → cwd fallback IS the correct location for this row;
+  //                      persist `output_root` exactly as before.
+  //   • 'resolved'     → repo/folder/_local key; persist `output_root` as before.
+  describe('output_root persistence branching (#2304)', () => {
+    it('does NOT write output_root when identityResolution is "faulted"; stamps the metadata flag instead', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        // Both attempts throw — the retry yields the same fault.
+        getCodebase: mock(async () => {
+          throw new Error('db down');
+        }),
+        updateWorkflowRun: updateSpy,
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-boom' }
+      );
+
+      const writesWithOutputRoot = updateSpy.mock.calls.filter(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(writesWithOutputRoot).toHaveLength(0);
+
+      const flagWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) =>
+          (call[1] as { metadata?: Record<string, unknown> })?.metadata?.[
+            RUN_METADATA_KEYS.identityUnresolved
+          ] === true
+      );
+      expect(flagWrite).toBeDefined();
+      // The patch must not also write `output_root` — a NULL `output_root`
+      // means a later resume can still self-heal.
+      const patch = (flagWrite as unknown as [unknown, { output_root?: unknown }] | undefined)?.[1];
+      expect(patch?.output_root).toBeUndefined();
+    });
+
+    it('persists output_root when identityResolution is "resolved" (a registered codebase)', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const write = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(write).toBeDefined();
+      // The metadata flag must NOT be stamped on a resolved row — that flag is the
+      // faulted-only signal.
+      const flagWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) =>
+          (call[1] as { metadata?: Record<string, unknown> })?.metadata?.[
+            RUN_METADATA_KEYS.identityUnresolved
+          ] !== undefined
+      );
+      expect(flagWrite).toBeUndefined();
+    });
+
+    // #2304 — the contract is "Cleared by the same persistence block the moment
+    // a later resume writes a real root". The faulted arm stamps `true`; the
+    // else arm MUST ride the same atomic metadata write with `false` on the
+    // heal, or a row that has resolved leaves the flag set and the
+    // state-preflight gate (#2200) / maintainer-triage read it as still faulted.
+    it('clears metadata.identity_unresolved when a faulted row heals (resolved on resume)', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+        // Simulate a previously-faulted row whose first run left `output_root`
+        // NULL and stamped the flag. The next run arrives on a healthy registry
+        // and hits the else-arm with that pre-existing metadata.
+        createWorkflowRun: mock(async () =>
+          makeRun({
+            metadata: { [RUN_METADATA_KEYS.identityUnresolved]: true },
+          })
+        ),
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const healWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(healWrite).toBeDefined();
+      const patch = (
+        healWrite as unknown as
+          | [unknown, { output_root?: unknown; metadata?: Record<string, unknown> }]
+          | undefined
+      )?.[1];
+      // The output_root write still happens — a row that has resolved
+      // gets a real root, that's the whole point of the resume.
+      expect(typeof patch?.output_root).toBe('string');
+      // AND the metadata flag rides the same write as `false`, not as
+      // the stale `true` from the faulted arm.
+      expect(patch?.metadata).toEqual({ [RUN_METADATA_KEYS.identityUnresolved]: false });
+    });
+
+    // Defensive neighbour: a row that never was faulted must not have its
+    // metadata touched by the else-arm writer. The cleared-flag stamp is
+    // conditional, not unconditional.
+    it('does not touch metadata when the row was never flagged as faulted', async () => {
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+        createWorkflowRun: mock(async () => makeRun({ metadata: {} })),
+      });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const outputRootWrite = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      expect(outputRootWrite).toBeDefined();
+      const patch = (
+        outputRootWrite as unknown as [unknown, { metadata?: Record<string, unknown> }] | undefined
+      )?.[1];
+      expect(patch?.metadata).toBeUndefined();
+    });
+  });
 });
 
 describe('finally backstop', () => {
@@ -1869,13 +2165,26 @@ describe('telemetry wiring', () => {
     const workflow = makeWorkflow({
       persist_sessions: true,
       nodes: [
-        { id: 'gen', prompt: 'Generate.', output_format: { type: 'object' }, mcp: 'mcp.json' },
+        {
+          id: 'gen',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'Generate.' },
+          output_format: { type: 'object' },
+          mcp: 'mcp.json',
+        },
         {
           id: 'iterate',
           depends_on: ['gen'],
+          kind: 'loop',
           loop: { prompt: 'Iterate.', until: 'DONE', fresh_context: true },
         },
-        { id: 'summarize', depends_on: ['iterate'], prompt: 'Summarize.', output_type: 'report' },
+        {
+          id: 'summarize',
+          depends_on: ['iterate'],
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'Summarize.' },
+          output_type: 'report',
+        },
       ],
     } as Partial<WorkflowDefinition>);
 
@@ -2220,7 +2529,9 @@ describe('hydrateResumableRun', () => {
     const candidate = makeRun({
       id: 'paused-loop',
       status: 'paused',
-      metadata: { approval: { type: 'interactive_loop', nodeId: 'loop-1', iteration: 2 } },
+      metadata: {
+        approval: { type: 'interactive_loop', nodeId: 'loop-1', message: 'Iterate?', iteration: 2 },
+      },
     });
     const resumed = makeRun({ id: 'paused-loop', status: 'running' });
     const store = makeStore({
@@ -2236,6 +2547,98 @@ describe('hydrateResumableRun', () => {
     expect(result).not.toBeNull();
     expect(result?.priorCompletedNodes.size).toBe(0);
     expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-loop');
+  });
+
+  it('#2714 regression: resumes a first-node legacy on_reject gate with a genuinely staged rework, even with zero completed nodes', async () => {
+    // rejectWorkflow's stage-rework path (workflow-operations.ts) never writes
+    // node_completed — it only stamps metadata.approval.resolved/rejection_reason
+    // on the run. Before the reRunsOwnNodeOnResume fix, a first-node gate in
+    // this state was unresumable: priorCompletedNodes.size === 0 and the old
+    // hasReRunGateState check omitted 'approval' entirely.
+    const candidate = makeRun({
+      id: 'paused-first-gate',
+      status: 'paused',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review',
+          message: 'Please review',
+          resolved: 'rejected',
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+        },
+        rejection_reason: 'needs more tests',
+        rejection_count: 1,
+      },
+    });
+    const resumed = makeRun({ id: 'paused-first-gate', status: 'running' });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).not.toBeNull();
+    expect(result?.priorCompletedNodes.size).toBe(0);
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('paused-first-gate');
+  });
+
+  it('#2714: an unresolved (not-yet-rejected) legacy on_reject gate with zero completed nodes is NOT resumable', async () => {
+    // A fresh pause (nobody has rejected it yet) has onRejectPrompt set but no
+    // rejection_reason and resolved !== 'rejected' — there is nothing staged
+    // to re-run, so this must still return null (approve/reject, not resume,
+    // is the correct next action).
+    const candidate = makeRun({
+      id: 'paused-unresolved-gate',
+      status: 'paused',
+      metadata: {
+        approval: {
+          type: 'approval',
+          nodeId: 'review',
+          message: 'Please review',
+          onRejectPrompt: 'Fix: $REJECTION_REASON',
+        },
+      },
+    });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).toBeNull();
+    expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('#2707 new-mode gate needs no carve-out: resolving it writes node_completed, so priorCompletedNodes already covers resume', async () => {
+    // A new-mode gate (no onRejectPrompt) never stages anything outside a
+    // node_completed event — this is the structural closure argument for
+    // #2714: the bug's mechanism (resolved-but-zero-completed-nodes) cannot
+    // occur for this path. Simulated here via the ORDINARY completed-nodes
+    // route, not the gate-state carve-out.
+    const candidate = makeRun({ id: 'paused-new-mode-gate', status: 'paused' });
+    const resumed = makeRun({ id: 'paused-new-mode-gate', status: 'running' });
+    const priorNodes = new Map([
+      ['review', { output: JSON.stringify({ decision: 'reject', text: 'needs changes' }) }],
+    ]);
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: priorNodes,
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+    const deps = makeDeps(store);
+    const result = await hydrateResumableRun(deps, candidate);
+    expect(result).not.toBeNull();
+    expect(result?.priorCompletedNodes).toBe(priorNodes);
   });
 
   it('propagates DB errors from getDagResumeSnapshot (no silent fallback)', async () => {
@@ -2492,6 +2895,115 @@ describe('resolveProjectPaths', () => {
 
     expect(result.outputRoot).toBe(wsPath('acme', 'widget'));
   });
+
+  // #2304: identityResolution is the row-level flag the persistence block reads to
+  // decide whether to write `output_root` or stamp `metadata.identity_unresolved`.
+  // The five cases below cover every branch in `resolveProjectPaths`:
+  //   • registered repo / folder / _local  → 'resolved'
+  //   • codebase row exists, no identity   → 'unregistered' (the WARN arm)
+  //   • no codebaseId                      → 'unregistered' (no lookup attempted)
+  //   • codebase lookup returns null       → 'unregistered' (no row)
+  //   • both attempts throw                → 'faulted' (the ERROR arm)
+  //   • persisted-output-root short-circuit → undefined (a resume, no fresh flag)
+  describe('identityResolution (#2304)', () => {
+    it('is "resolved" for a repo codebase', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo');
+
+      expect(result.identityResolution).toBe('resolved');
+    });
+
+    it('is "resolved" for a folder codebase', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-folder',
+          name: 'My Platform',
+          repository_url: null,
+          default_cwd: '/tmp/platform',
+          kind: 'folder' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/tmp/platform', RUN_ID, 'cb-folder');
+
+      expect(result.identityResolution).toBe('resolved');
+    });
+
+    it('is "unregistered" when the lookup returns a codebase row that resolves to a cwd key (WARN arm)', async () => {
+      // The fake resolver only falls back to { kind: 'cwd', cwd } when the basename
+      // is '.' or '..' (the corner that excludes owner/repo and `_local` derivation).
+      const store = makeStore({
+        getCodebase: mock(async () => ({
+          id: 'cb-noop',
+          name: 'orphan',
+          repository_url: null,
+          default_cwd: '/tmp/.',
+          kind: 'repo' as const,
+        })),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/tmp/.', RUN_ID, 'cb-noop');
+
+      expect(result.identityResolution).toBe('unregistered');
+    });
+
+    it('is "unregistered" when no codebaseId is provided (no lookup attempted)', async () => {
+      const deps = makeDeps();
+
+      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID);
+
+      expect(result.identityResolution).toBe('unregistered');
+    });
+
+    it('is "unregistered" when the lookup returns null (no codebase row)', async () => {
+      const store = makeStore({ getCodebase: mock(async () => null) });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'missing-id');
+
+      expect(result.identityResolution).toBe('unregistered');
+    });
+
+    it('is "faulted" when both getCodebase attempts throw (ERROR arm)', async () => {
+      const store = makeStore({
+        getCodebase: mock(async () => {
+          throw new Error('db down');
+        }),
+      });
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/some/cwd', RUN_ID, 'cb-boom');
+
+      expect(result.identityResolution).toBe('faulted');
+    });
+
+    it('is undefined on the persisted-output-root short-circuit (resume reading an existing row)', async () => {
+      // A resume reads its `output_root` from the row and re-derives nothing; the
+      // persistence block has nothing to flag on a branch that never resolved.
+      const store = makeStore();
+      const deps = makeDeps(store);
+
+      const result = await resolveProjectPaths(deps, '/repos/widget', RUN_ID, 'cb-repo', {
+        persistedOutputRoot: wsPath('acme', 'original'),
+      });
+
+      expect(result.identityResolution).toBeUndefined();
+      // The resolved paths still come from the persisted root, not from a fresh lookup.
+      expect(result.outputRoot).toBe(wsPath('acme', 'original'));
+    });
+  });
 });
 
 describe('resolveScopeArtifactsDir', () => {
@@ -2504,7 +3016,12 @@ describe('resolveScopeArtifactsDir', () => {
     const workflow = {
       name: 'feature-dev',
       nodes: [
-        { id: 'planner', prompt: 'plan', persist_session: true },
+        {
+          id: 'planner',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'plan' },
+          persist_session: true,
+        },
       ] as WorkflowDefinition['nodes'],
     };
     expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBe(
@@ -2516,7 +3033,9 @@ describe('resolveScopeArtifactsDir', () => {
     const workflow = {
       name: 'feature-dev',
       persist_sessions: true,
-      nodes: [{ id: 'planner', prompt: 'plan' }] as WorkflowDefinition['nodes'],
+      nodes: [
+        { id: 'planner', kind: 'agent', source: { kind: 'inline', prompt: 'plan' } },
+      ] as WorkflowDefinition['nodes'],
     };
     expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBe(
       scopeDir('feature-dev', 'conv-1')
@@ -2526,7 +3045,9 @@ describe('resolveScopeArtifactsDir', () => {
   it('returns undefined when the workflow uses no session persistence (opt-in)', () => {
     const workflow = {
       name: 'plain',
-      nodes: [{ id: 'a', prompt: 'x' }] as WorkflowDefinition['nodes'],
+      nodes: [
+        { id: 'a', kind: 'agent', source: { kind: 'inline', prompt: 'x' } },
+      ] as WorkflowDefinition['nodes'],
     };
     expect(resolveScopeArtifactsDir(workflow, 'conv-1', ROOT)).toBeUndefined();
   });

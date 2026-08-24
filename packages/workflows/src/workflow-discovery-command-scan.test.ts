@@ -4,7 +4,8 @@ import { join } from 'path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { discoverWorkflows } from './workflow-discovery';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
-import { isLoopGroupNode } from './schemas';
+import { isLoopGroupNode, isLoopNode } from './schemas';
+import type { DagNode } from './schemas';
 
 const tempDirectories: string[] = [];
 
@@ -72,16 +73,17 @@ describe('discoverWorkflows — nested included command compilation', () => {
 
     expect(result.errors.filter(error => error.filename === 'parent.yaml')).toHaveLength(0);
     const parent = result.workflows.find(item => item.workflow.name === 'parent')?.workflow;
-    const group = parent?.nodes.find(node => node.id === 'group');
+    const group = parent?.nodes.find(node => node.id === 'group') as DagNode | undefined;
     expect(group && isLoopGroupNode(group)).toBe(true);
     if (!group || !isLoopGroupNode(group)) throw new Error('expected loop_group');
-    const inner = group.loop_group.nodes.find(node => node.id === 'inner');
+    const inner = group.loop_group.nodes.find(node => node.id === 'inner') as DagNode | undefined;
     expect(inner && isLoopGroupNode(inner)).toBe(true);
     if (!inner || !isLoopGroupNode(inner)) throw new Error('expected nested loop_group');
     expect(inner.loop_group.nodes).toEqual([
       expect.objectContaining({
         id: 'block__review',
-        prompt: 'Review iteration and emit DONE.',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'Review iteration and emit DONE.' },
       }),
     ]);
   });
@@ -133,8 +135,11 @@ describe('discoverWorkflows — nested included command compilation', () => {
 
     expect(result.errors.filter(error => error.filename === 'parent.yaml')).toHaveLength(0);
     const parent = result.workflows.find(item => item.workflow.name === 'parent')?.workflow;
-    const group = parent?.nodes.find(node => node.id === 'inc__group');
-    const repeat = group?.loop_group?.nodes[0];
+    const group = parent?.nodes.find(node => node.id === 'inc__group') as DagNode | undefined;
+    const repeatNode = (group && isLoopGroupNode(group) ? group.loop_group.nodes[0] : undefined) as
+      | DagNode
+      | undefined;
+    const repeat = repeatNode && isLoopNode(repeatNode) ? repeatNode : undefined;
     const compiled = repeat?.loop
       ? (repeat.loop as typeof repeat.loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND]
       : undefined;

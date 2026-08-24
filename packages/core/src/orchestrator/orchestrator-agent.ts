@@ -827,7 +827,13 @@ async function dispatchOrchestratorWorkflowOwned(
   // For a fresh run: freeze, then re-resolve the workflow FROM the frozen copy, so the
   // definition executed and the resources beside it are one consistent set of bytes.
   const runCwd = conversation.cwd ?? codebase.default_cwd;
+  // `preparedSource` is the outer binding the resume branch reads (always undefined
+  // there — step 2 didn't run for a continuation). The two fresh dispatches read
+  // `freshCaptured` directly, so the helper's narrowed return type survives.
   let preparedSource: PreparedWorkflowSource | undefined;
+  let freshCaptured:
+    | { preparedSource: PreparedWorkflowSource; workflow: WorkflowDefinition }
+    | undefined;
 
   if (willContinueExistingRun && resumableRun) {
     // Continuing: execute the GRAPH this run froze, not the one on disk now. Skipping
@@ -858,48 +864,9 @@ async function dispatchOrchestratorWorkflowOwned(
   }
 
   if (!willContinueExistingRun) {
-    try {
-      const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);
-      preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
-        sourceRoot: workflowSourceRoot ?? runCwd,
-      });
-      // From here the owner reclaims it unless a run adopts it, whichever way we leave.
-      owner.hold(preparedSource);
-      // Re-resolve only when files were actually frozen. An empty capture means the
-      // definition came from the bundled set a binary embeds as constants — immutable for
-      // that binary, with nothing on disk to re-read.
-      if (preparedSource.manifest.scopes.length > 0) {
-        const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
-          runCwd,
-          loadConfig,
-          preparedSource.roots
-        );
-        const reResolved = resolveWorkflowName(
-          workflow.name,
-          capturedWorkflows.map(w => w.workflow)
-        );
-        if (!reResolved) {
-          // No manual cleanup: the owner reclaims anything unadopted on the way out.
-          await platform.sendMessage(
-            conversationId,
-            `Could not read workflow **${workflow.name}** from this run's captured source. ` +
-              'Nothing has been started.'
-          );
-          return;
-        }
-        workflow = reResolved;
-      }
-      await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
-    } catch (error) {
-      const err = error as Error;
-      getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
-      await platform.sendMessage(
-        conversationId,
-        `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
-          'Nothing has been started.'
-      );
-      return;
-    }
+    freshCaptured = await captureFreshSource(owner, runCwd, workflow, conversationId, platform);
+    if (!freshCaptured) return; // capture failed, message already sent
+    workflow = freshCaptured.workflow;
   }
 
   // Signature gate (#2470, #2554): resolve this invocation's declared inputs from the
@@ -1124,8 +1091,9 @@ async function dispatchOrchestratorWorkflowOwned(
             `(\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
         );
       }
-      // Handing the capture to a run: it owns the bytes and their lifetime now.
-      if (preparedSource) owner.adopt();
+      // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+      // executor adopts for us there (see #2690). Until then a rename failure leaves
+      // the staged directory un-adopted so the wrap reclaims it on the way out.
       await executeWorkflow(
         deps,
         platform,
@@ -1143,6 +1111,7 @@ async function dispatchOrchestratorWorkflowOwned(
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
+          capturedSourceOwner: owner,
           ...prepared,
         }
       );
@@ -1154,12 +1123,22 @@ async function dispatchOrchestratorWorkflowOwned(
         await platform.sendMessage(conversationId, deferredInputError.message);
         return;
       }
+      // This branch IS a fresh run, even though the outer block entered via the resume
+      // menu (#2686). Capture the source here so the run freezes the bytes it actually
+      // executes against; without this it would inherit the prior run's frozen graph
+      // and let the executor fall back to live command/script lookup, which is exactly
+      // the mixed-vintage shape #2660 exists to remove.
+      const captured = await captureFreshSource(owner, runCwd, workflow, conversationId, platform);
+      if (!captured) return; // capture failed, message already sent
+      workflow = captured.workflow;
       await platform.sendMessage(
         conversationId,
         `⚠️ Prior run for **${workflow.name}** had no completed nodes; starting fresh in the same worktree.`
       );
-      // Handing the capture to a run: it owns the bytes and their lifetime now.
-      if (preparedSource) owner.adopt();
+      // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+      // executor adopts for us there (see #2690). `captured.preparedSource` proves
+      // the helper has already run `owner.hold`, which is the only thing the wrap
+      // needs to know to reclaim if the rename fails.
       await executeWorkflow(
         deps,
         platform,
@@ -1173,10 +1152,11 @@ async function dispatchOrchestratorWorkflowOwned(
           parentConversationId: conversation.id,
           userId,
           source,
-          preparedSource,
+          preparedSource: captured.preparedSource,
           parseWarnings: options?.parseWarnings,
           baseBranch: codebaseBaseBranch,
           resolveChildIsolation,
+          capturedSourceOwner: owner,
           // This branch creates a FRESH run row (the prior run had nothing to resume),
           // so the supplied inputs still need stamping.
           inputs: resolvedInputs,
@@ -1220,9 +1200,23 @@ async function dispatchOrchestratorWorkflowOwned(
       throw err;
     }
   } else {
-    // Fresh foreground execution: web interactive workflows + all chat platforms
-    // Handing the capture to a run: it owns the bytes and their lifetime now.
-    if (preparedSource) owner.adopt();
+    // Fresh foreground execution: web interactive workflows + all chat platforms.
+    // Reaching this branch means `resumableRun?.working_path` is falsy, which implies
+    // `willContinueExistingRun` was false and step 2 above ran. `freshCaptured` is
+    // invariantly defined here — the capture-flow helper ran before this branch.
+    if (!freshCaptured) {
+      // Should never trigger; the reasoning above is the invariant. If it does, the
+      // dispatch returned a `preparedSource: undefined` to the executor and we are
+      // about to fall into the executor's `source_unprepared_live` branch — the
+      // mixed-vintage shape #2660 exists to remove — so refuse loudly rather than
+      // ship that regression silently.
+      throw new Error(
+        'orchestrator invariant violated: fresh-foreground dispatch reached without a captured source'
+      );
+    }
+    // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
+    // executor adopts for us there (see #2690). `freshCaptured` proves the prior
+    // `captureFreshSource` call already ran `owner.hold`.
     await executeWorkflow(
       createWorkflowDeps(),
       platform,
@@ -1236,13 +1230,84 @@ async function dispatchOrchestratorWorkflowOwned(
         parentConversationId: conversation.id,
         userId,
         source,
-        preparedSource,
+        preparedSource: freshCaptured.preparedSource,
         parseWarnings: options?.parseWarnings,
         baseBranch: codebaseBaseBranch,
         resolveChildIsolation,
+        capturedSourceOwner: owner,
         inputs: resolvedInputs,
       }
     );
+  }
+}
+
+/**
+ * Freeze the workflow source and re-resolve the workflow FROM the freeze.
+ *
+ * A fresh run row is created from the captured bytes — commands and scripts beside
+ * the DAG come from the same moment as the DAG itself. Without this, an edited
+ * workflow would silently run its new graph against pre-edit command bytes; this is
+ * the exact shape #2660 exists to remove, and the exact shape that must be avoided in
+ * the fresh-run-in-same-worktree fallback (#2686).
+ *
+ * On success: hands the staged capture to the owner (`hold`), records the selected
+ * workflow name, and returns both the prepared source and the freshly resolved graph.
+ * The caller adopts when a run takes over.
+ *
+ * On failure: sends the user-facing message and returns `undefined`. The caller MUST
+ * `return` immediately — the owner reclaims any unadopted capture on the way out, so
+ * no manual cleanup is needed.
+ */
+async function captureFreshSource(
+  owner: CapturedSourceOwner,
+  runCwd: string,
+  workflow: WorkflowDefinition,
+  conversationId: string,
+  platform: IPlatformAdapter
+): Promise<{ preparedSource: PreparedWorkflowSource; workflow: WorkflowDefinition } | undefined> {
+  try {
+    const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);
+    const preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
+      sourceRoot: workflowSourceRoot ?? runCwd,
+    });
+    // From here the owner reclaims it unless a run adopts it, whichever way we leave.
+    owner.hold(preparedSource);
+    // Re-resolve only when files were actually frozen. An empty capture means the
+    // definition came from the bundled set a binary embeds as constants — immutable for
+    // that binary, with nothing on disk to re-read.
+    let resolvedWorkflow = workflow;
+    if (preparedSource.manifest.scopes.length > 0) {
+      const { workflows: capturedWorkflows } = await discoverWorkflowsWithConfig(
+        runCwd,
+        loadConfig,
+        preparedSource.roots
+      );
+      const reResolved = resolveWorkflowName(
+        workflow.name,
+        capturedWorkflows.map(w => w.workflow)
+      );
+      if (!reResolved) {
+        // No manual cleanup: the owner reclaims anything unadopted on the way out.
+        await platform.sendMessage(
+          conversationId,
+          `Could not read workflow **${workflow.name}** from this run's captured source. ` +
+            'Nothing has been started.'
+        );
+        return undefined;
+      }
+      resolvedWorkflow = reResolved;
+    }
+    await recordSelectedWorkflow(preparedSource.captureRoot, resolvedWorkflow.name);
+    return { preparedSource, workflow: resolvedWorkflow };
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowName: workflow.name }, 'workflow.source_capture_failed');
+    await platform.sendMessage(
+      conversationId,
+      `Could not capture the workflow source for **${workflow.name}**: ${err.message}. ` +
+        'Nothing has been started.'
+    );
+    return undefined;
   }
 }
 
@@ -1286,7 +1351,7 @@ async function dispatchOrchestratorWorkflow(
 /** A human gate the chat agent resolved during a turn, awaiting continuation. */
 interface ResolvedGate {
   run: WorkflowRun;
-  action: 'approve' | 'reject';
+  action: 'approve' | 'reject' | 'respond';
 }
 
 /**
@@ -1314,11 +1379,12 @@ export async function continueResolvedGateRun(
   codebase: Codebase | null,
   workflowsWithSource: readonly WorkflowWithSource[],
   run: WorkflowRun,
-  action: 'approve' | 'reject',
+  action: 'approve' | 'reject' | 'respond',
   isolationHints?: HandleMessageContext['isolationHints'],
   userId?: string
 ): Promise<void> {
-  const decision = action === 'approve' ? 'Approved' : 'Rejected';
+  const decision =
+    action === 'approve' ? 'Approved' : action === 'reject' ? 'Rejected' : 'Responded';
   const notify = async (text: string): Promise<void> => {
     await platform.sendMessage(conversationId, text).catch((sendErr: unknown) => {
       getLog().warn(
