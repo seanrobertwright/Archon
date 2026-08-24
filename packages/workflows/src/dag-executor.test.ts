@@ -14451,6 +14451,41 @@ describe('executeDagWorkflow -- durable wait node', () => {
 
     expect(store.pauseWorkflowRunForWait).toHaveBeenCalledWith('wait-early-resume', persisted);
   });
+
+  it('tolerates cancellation that wins the wait pause CAS', async () => {
+    const store = createMockStore();
+    let pauseAttempted = false;
+    store.pauseWorkflowRunForWait = mock(async () => {
+      pauseAttempted = true;
+      throw new Error('Workflow run not found or not in running state');
+    });
+    store.getWorkflowRunStatus = mock(async () => (pauseAttempted ? 'cancelled' : 'running'));
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-wait-cancelled',
+      testDir,
+      {
+        name: 'wait-cancelled-race',
+        nodes: [{ id: 'delay', kind: 'wait', wait: { duration_ms: 60_000 } }],
+      },
+      makeWorkflowRun('wait-cancelled'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = store.createWorkflowEvent.mock.calls.map(call => call[0].event_type);
+    expect(events).not.toContain('node_failed');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
 });
 
 describe('executeDagWorkflow -- approval node', () => {

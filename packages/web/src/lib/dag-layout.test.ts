@@ -47,7 +47,7 @@ describe('resolveNodeDisplay', () => {
     });
   });
 
-  test('wait node returns its condition without falling through to Prompt', () => {
+  test('wait node returns its condition without falling through to Prompt', (): void => {
     const dn: DagNode = {
       id: 'n3',
       wait: { event: 'checks.complete', deadline_ms: 60_000 },

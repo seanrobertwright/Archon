@@ -7087,7 +7087,16 @@ async function executeWaitNode(
           );
         });
     }
-    await deps.store.pauseWorkflowRunForWait(workflowRun.id, context);
+    try {
+      await deps.store.pauseWorkflowRunForWait(workflowRun.id, context);
+    } catch (pauseError) {
+      const status = await deps.store.getWorkflowRunStatus(workflowRun.id);
+      if (status === 'running') throw pauseError;
+      getLog().warn(
+        { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
+        'dag.wait_pause_skipped_external_transition'
+      );
+    }
     return { state: 'completed', output: '' };
   }
 
