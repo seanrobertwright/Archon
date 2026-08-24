@@ -198,7 +198,6 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
     pauseWorkflowRunForWait: mock(async () => {}),
-    rewriteWorkflowWaitContext: mock(async () => ({ rewritten: true })),
     clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
@@ -2922,6 +2921,7 @@ describe('hydrateResumableRun', () => {
       'paused',
       {
         wait: {
+          owner: 'node',
           nodeId: 'delay',
           kind: 'time',
           waitingSince: '2026-08-24T10:00:00.000Z',

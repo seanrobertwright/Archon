@@ -14,18 +14,8 @@ import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import type { LoadCommandResult } from './schemas';
-import { INPUT_NAME_SOURCE } from './schemas/dag-node';
-import { similarNodeIds, canonicalValueText, type JsonValue } from './output-ref';
+import { substituteInputRefs, type JsonValue } from './output-ref';
 import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
-
-/**
- * Runtime `$INPUTS.<name>` reference — the sub-run twin of the include-expander's
- * load-time INPUTS_REF, built from the same identifier grammar so a name that
- * validates as a `with:` key can never fail to match here. Resolved only for
- * `workflow:` sub-runs (child runs get `metadata.inputs`), and only into non-shell
- * surfaces (shell nodes get `INPUTS_<UPPER_SNAKE>` env vars instead — see #2470).
- */
-const INPUTS_RUNTIME_REF = new RegExp(String.raw`\$INPUTS\.(${INPUT_NAME_SOURCE})`, 'g');
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -636,21 +626,7 @@ export function substituteWorkflowVariables(
     // source (#2115). Bash/script bodies read INPUTS_<UPPER_SNAKE> env vars instead.
     // An unknown name THROWS (mirrors $node.output.field strictness) rather than
     // substituting '' — a typo'd input silently emptying is worse than a load-visible error.
-    const inputs = options?.inputs;
-    result = result.replace(INPUTS_RUNTIME_REF, (_match, name: string) => {
-      // Canonical text (#2637): a typed input splices as its one deterministic
-      // representation — strings raw, everything else canonical JSON text.
-      if (inputs && Object.hasOwn(inputs, name)) return canonicalValueText(inputs[name]);
-      const known = inputs ? Object.keys(inputs) : [];
-      const hint = similarNodeIds(name, known);
-      const suffix =
-        hint.length > 0
-          ? ` Did you mean ${hint.map(h => `$INPUTS.${h}`).join(', ')}?`
-          : known.length > 0
-            ? ` Available inputs: ${known.map(k => `$INPUTS.${k}`).join(', ')}.`
-            : ' This run has no declared inputs.';
-      throw new Error(`Unknown input '$INPUTS.${name}'.${suffix}`);
-    });
+    result = substituteInputRefs(result, options?.inputs);
   }
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)

@@ -72,6 +72,9 @@ describe('dagNodeSchema — durable wait', () => {
       dagNodeSchema.safeParse({ id: 'event', wait: { event: 'checks.complete' } }).success
     ).toBe(false);
     expect(
+      dagNodeSchema.safeParse({ id: 'blank-event', wait: { event: '   ', deadline_ms: 1 } }).success
+    ).toBe(false);
+    expect(
       dagNodeSchema.safeParse({ id: 'duration', wait: { duration_ms: 1, deadline_ms: 2 } }).success
     ).toBe(false);
     expect(

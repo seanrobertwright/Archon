@@ -11,6 +11,7 @@ import type {
   WorkflowRunStatus,
   ApprovalContext,
   WorkflowWaitContext,
+  WorkflowWaitResult,
   ScheduledWorkflowResume,
   WorkflowNodeSession,
   WorkflowRunNodeSession,
@@ -40,11 +41,15 @@ export interface DagResumeSnapshot {
 /** Durable wait outcome committed atomically with consumption of its active cursor. */
 export interface WorkflowWaitCompletion {
   stepName: string;
-  status: 'satisfied' | 'expired';
-  waitedMs: number;
-  output: string;
-  result: Record<string, unknown>;
+  result: WorkflowWaitResult;
 }
+
+export type WorkflowWaitPause = { kind: 'started'; stepName: string } | { kind: 'continued' };
+
+/** Exact persisted cursor expected by an automatic continuation claim. */
+export type WorkflowResumeCursor =
+  | { kind: 'wait'; nodeId: string; resumeAt: string }
+  | { kind: 'quota'; attempt: number; resumeAt: string };
 
 /** Composite primary key identifying a single persisted node session row. */
 export interface WorkflowNodeSessionKey {
@@ -214,7 +219,7 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   ): Promise<WorkflowRun | null>;
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
   failOrphanedRuns(): Promise<{ count: number }>;
-  resumeWorkflowRun(id: string): Promise<WorkflowRun>;
+  resumeWorkflowRun(id: string, cursor?: WorkflowResumeCursor): Promise<WorkflowRun>;
   /**
    * `output_root` (#2200) is write-once: the executor sets it at run start only
    * when the persisted value is null. Re-writing it on resume would re-derive
@@ -233,7 +238,7 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   failWorkflowRun(
     id: string,
     error: string,
-    scheduledResume?: ScheduledWorkflowResume | null
+    scheduledResume?: ScheduledWorkflowResume
   ): Promise<void>;
   /**
    * Pause a running run for human review, stamping the approval context. Optional
@@ -246,12 +251,12 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     approvalContext: ApprovalContext,
     extraMetadata?: Record<string, unknown>
   ): Promise<void>;
-  /** Pause a running run on an engine-owned time/event wait. */
-  pauseWorkflowRunForWait(id: string, waitContext: WorkflowWaitContext): Promise<void>;
-  rewriteWorkflowWaitContext(
+  /** Pause a running run and record its engine-owned wait start atomically. */
+  pauseWorkflowRunForWait(
     id: string,
-    waitContext: WorkflowWaitContext
-  ): Promise<{ rewritten: boolean }>;
+    waitContext: WorkflowWaitContext,
+    pause: WorkflowWaitPause
+  ): Promise<void>;
   /** Consume the exact wait cursor and persist its completion snapshot atomically. */
   clearWorkflowWaitContext(
     id: string,

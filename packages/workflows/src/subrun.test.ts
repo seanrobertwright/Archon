@@ -260,15 +260,6 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve();
   };
 
-  rewriteWorkflowWaitContext: IWorkflowStore['rewriteWorkflowWaitContext'] = (id, waitContext) => {
-    const r = this.runs.get(id);
-    if (r?.status === 'paused') {
-      r.metadata = { ...r.metadata, wait: { ...waitContext } };
-      return Promise.resolve({ rewritten: true });
-    }
-    return Promise.resolve({ rewritten: false });
-  };
-
   clearWorkflowWaitContext: IWorkflowStore['clearWorkflowWaitContext'] = (id, waitContext) => {
     const r = this.runs.get(id);
     const wait = r?.metadata.wait as { nodeId?: string; resumeAt?: string } | undefined;

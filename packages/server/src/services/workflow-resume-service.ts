@@ -6,6 +6,7 @@ import { createLogger, getArchonWorkspacesPath } from '@archon/paths';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
 import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { WorkflowResumeCursor } from '@archon/workflows/store';
 import {
   isScheduledWorkflowResume,
   isWorkflowWaitContext,
@@ -19,9 +20,7 @@ const CONTINUATION_RETRY_DELAY_MS = 60_000;
 let continuationScheduler: ReturnType<typeof setInterval> | undefined;
 let scanInProgress = false;
 
-function continuationCursor(
-  run: WorkflowRun
-): Parameters<typeof workflowDb.deferWorkflowContinuation>[2] | undefined {
+function continuationCursor(run: WorkflowRun): WorkflowResumeCursor | undefined {
   if (run.status === 'paused' && isWorkflowWaitContext(run.metadata.wait)) {
     return {
       kind: 'wait',
@@ -87,7 +86,8 @@ export function workflowResumeTargetForConversation(
 export async function resumeWorkflowRunFromServer(
   run: WorkflowRun,
   actorUserId?: string,
-  target: WorkflowResumeTarget = { kind: 'headless' }
+  target: WorkflowResumeTarget = { kind: 'headless' },
+  cursor?: WorkflowResumeCursor
 ): Promise<boolean> {
   if (!run.working_path) {
     log.debug({ runId: run.id }, 'workflow_resume_headless_no_working_path');
@@ -119,7 +119,7 @@ export async function resumeWorkflowRunFromServer(
     const platformConversationId = destination?.conversationId ?? run.conversation_id;
     let hydrated: Awaited<ReturnType<typeof hydrateResumableRun>>;
     try {
-      hydrated = await hydrateResumableRun(deps, run);
+      hydrated = await hydrateResumableRun(deps, run, cursor);
     } catch (error) {
       if (error instanceof workflowDb.WorkflowNotResumableError) {
         log.info(
@@ -214,7 +214,8 @@ export async function resumeWorkflowRunFromServer(
 
 export async function scanDueWorkflowContinuations(
   now = new Date(),
-  resume: (run: WorkflowRun) => Promise<boolean> = resumeWorkflowRunFromServer
+  resume: (run: WorkflowRun, cursor: WorkflowResumeCursor) => Promise<boolean> = (run, cursor) =>
+    resumeWorkflowRunFromServer(run, undefined, { kind: 'headless' }, cursor)
 ): Promise<number> {
   if (scanInProgress) return 0;
   scanInProgress = true;
@@ -229,7 +230,7 @@ export async function scanDueWorkflowContinuations(
         }
         let resumed = false;
         try {
-          resumed = await resume(run);
+          resumed = await resume(run, cursor);
         } catch (error) {
           log.warn(
             { err: error as Error, runId: run.id },
@@ -263,11 +264,11 @@ export function startWorkflowContinuationScheduler(
   resolveDestination?: WorkflowResumeDestinationResolver
 ): void {
   if (continuationScheduler !== undefined) return;
-  const resume = async (run: WorkflowRun): Promise<boolean> => {
+  const resume = async (run: WorkflowRun, cursor: WorkflowResumeCursor): Promise<boolean> => {
     const target = resolveDestination
       ? await resolveDestination(run)
       : ({ kind: 'headless' } as const);
-    return resumeWorkflowRunFromServer(run, undefined, target);
+    return resumeWorkflowRunFromServer(run, undefined, target, cursor);
   };
   void scanDueWorkflowContinuations(new Date(), resume).catch((error: unknown) => {
     log.error({ err: error as Error }, 'workflow_continuation_scan_failed');

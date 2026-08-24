@@ -436,6 +436,7 @@ describe('workflows database', () => {
 
   describe('durable workflow waits', () => {
     const wait = {
+      owner: 'node' as const,
       nodeId: 'await-ci',
       kind: 'event' as const,
       event: 'checks.complete',
@@ -445,11 +446,30 @@ describe('workflows database', () => {
 
     test('pauses a running run with a distinct wait envelope', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
-      await pauseWorkflowRunForWait('workflow-run-123', wait);
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      await pauseWorkflowRunForWait('workflow-run-123', wait, {
+        kind: 'started',
+        stepName: 'await-ci',
+      });
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("SET status = 'paused'");
       expect(query).toContain("jsonb_set(metadata - 'approval', '{wait}'");
       expect(JSON.parse(params[1] as string)).toEqual(wait);
+      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+    });
+
+    test('fails the pause transaction when the wait-start audit cannot be recorded', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockRejectedValueOnce(new Error('event insert failed'));
+
+      await expect(
+        pauseWorkflowRunForWait('workflow-run-123', wait, {
+          kind: 'started',
+          stepName: 'await-ci',
+        })
+      ).rejects.toThrow('Failed to pause workflow run for wait: event insert failed');
+
+      expect(mockQuery.mock.calls).toHaveLength(2);
     });
 
     test('lists due paused waits and quota-failed continuations', async () => {
@@ -503,6 +523,7 @@ describe('workflows database', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       const wait = {
+        owner: 'node' as const,
         nodeId: 'await-ci',
         kind: 'event' as const,
         event: 'checks.complete',
@@ -513,9 +534,6 @@ describe('workflows database', () => {
       await expect(
         clearWorkflowWaitContext('workflow-run-123', wait, {
           stepName: 'await-ci',
-          status: 'satisfied',
-          waitedMs: 1000,
-          output: '{"status":"satisfied"}',
           result: { status: 'satisfied', waited_ms: 1000 },
         })
       ).resolves.toEqual({ cleared: true });
@@ -1366,7 +1384,11 @@ describe('workflows database', () => {
         createQueryResult([{ ...mockWorkflowRun, status: 'running' as const }])
       );
 
-      await resumeWorkflowRun('workflow-run-123');
+      await resumeWorkflowRun('workflow-run-123', {
+        kind: 'quota',
+        attempt: scheduled.attempt,
+        resumeAt: scheduled.resumeAt,
+      });
 
       const [, updateParams] = mockQuery.mock.calls[1] as [string, unknown[]];
       expect(JSON.parse(updateParams[2] as string)).toMatchObject({
@@ -1382,6 +1404,30 @@ describe('workflows database', () => {
       expect(eventParams[5]).toBe(
         JSON.stringify({ attempt: scheduled.attempt, resume_at: scheduled.resumeAt })
       );
+    });
+
+    test('refuses a stale quota cursor without claiming a newer scheduled attempt', async () => {
+      const current = {
+        reason: 'quota' as const,
+        resumeAt: '2026-08-25T12:00:00.000Z',
+        deadlineAt: '2026-08-26T10:00:00.000Z',
+        attempt: 2,
+        maxAttempts: 3,
+      };
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([{ status: 'failed', metadata: { scheduled_resume: current } }])
+      );
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ status: 'failed' }]));
+
+      await expect(
+        resumeWorkflowRun('workflow-run-123', {
+          kind: 'quota',
+          attempt: 1,
+          resumeAt: '2026-08-25T10:00:00.000Z',
+        })
+      ).rejects.toThrow(WorkflowNotResumableError);
+
+      expect(mockQuery.mock.calls.some(([sql]) => String(sql).startsWith('UPDATE'))).toBe(false);
     });
 
     test('writes no event when the CAS loses, even though an error was read', async () => {

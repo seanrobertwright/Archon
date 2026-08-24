@@ -621,9 +621,10 @@ export type HaltNode = z.infer<typeof haltNodeSchema>;
 export const waitConfigFlatSchema = z.object({
   duration_ms: z.number().int().positive().optional(),
   until: z.string().min(1, "'wait.until' must not be empty").optional(),
-  event: z.string().min(1, "'wait.event' must not be empty").optional(),
+  event: z.string().trim().min(1, "'wait.event' must not be empty").optional(),
   deadline_ms: z.number().int().positive().optional(),
 });
+export type WaitConfig = z.infer<typeof waitConfigFlatSchema>;
 export const waitUntilTimestampSchema = z.string().datetime();
 export const waitConfigSchema = waitConfigFlatSchema.superRefine((value, ctx) => {
   const conditions = [value.duration_ms, value.until, value.event].filter(
@@ -662,7 +663,33 @@ export const waitConfigSchema = waitConfigFlatSchema.superRefine((value, ctx) =>
     });
   }
 });
-export type WaitConfig = z.infer<typeof waitConfigSchema>;
+
+/** Validated engine condition used for exhaustive wait execution. */
+export type WaitCondition =
+  | { kind: 'duration'; durationMs: number }
+  | { kind: 'until'; timestamp: string }
+  | { kind: 'event'; event: string; deadlineMs: number };
+
+export function waitCondition(config: WaitConfig): WaitCondition {
+  if (config.duration_ms !== undefined) {
+    return { kind: 'duration', durationMs: config.duration_ms };
+  }
+  if (config.until !== undefined) {
+    return { kind: 'until', timestamp: config.until };
+  }
+  if (config.event !== undefined && config.deadline_ms !== undefined) {
+    return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };
+  }
+  throw new Error('Invalid wait condition reached execution after schema validation');
+}
+
+export const workflowWaitResultSchema = z.object({
+  status: z.enum(['satisfied', 'expired']),
+  waited_ms: z.number().nonnegative(),
+  event: z.string().optional(),
+  payload: z.unknown().optional(),
+});
+export type WorkflowWaitResult = z.infer<typeof workflowWaitResultSchema>;
 
 export const WAIT_NODE_OUTPUT_FORMAT = {
   type: 'object',

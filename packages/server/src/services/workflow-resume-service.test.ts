@@ -105,6 +105,7 @@ describe('workflow continuation scanner', () => {
     mockListDueWorkflowContinuations.mockResolvedValue([
       run('wait-1', 'paused', {
         wait: {
+          owner: 'node',
           nodeId: 'delay',
           kind: 'time',
           waitingSince: '2026-08-24T10:00:00.000Z',
@@ -119,6 +120,14 @@ describe('workflow continuation scanner', () => {
       scanDueWorkflowContinuations(new Date('2026-08-24T11:00:01.000Z'), resume)
     ).resolves.toBe(2);
     expect(resume).toHaveBeenCalledTimes(2);
+    expect(resume.mock.calls[0]).toEqual([
+      expect.objectContaining({ id: 'wait-1' }),
+      { kind: 'wait', nodeId: 'delay', resumeAt: '2026-08-24T11:00:00.000Z' },
+    ]);
+    expect(resume.mock.calls[1]).toEqual([
+      expect.objectContaining({ id: 'quota-1' }),
+      { kind: 'quota', attempt: 1, resumeAt: '2026-08-24T11:00:00.000Z' },
+    ]);
   });
 
   test('routes background web runs through the visible parent and refuses missing adapters', () => {
@@ -158,6 +167,7 @@ describe('workflow continuation scanner', () => {
     mockListDueWorkflowContinuations.mockResolvedValue([
       run('wait-after-quota', 'paused', {
         wait: {
+          owner: 'node',
           nodeId: 'delay',
           kind: 'time',
           waitingSince: '2026-08-24T10:31:00.000Z',
@@ -176,6 +186,11 @@ describe('workflow continuation scanner', () => {
 
   test('uses the originating platform destination when one is available', async () => {
     const paused = run('wait-platform', 'paused', {});
+    const cursor = {
+      kind: 'wait' as const,
+      nodeId: 'delay',
+      resumeAt: '2026-08-24T11:00:00.000Z',
+    };
     mockResolveRunContinuation.mockResolvedValueOnce({
       ok: true,
       workflowName: 'deliver',
@@ -194,12 +209,18 @@ describe('workflow continuation scanner', () => {
     } satisfies IWorkflowPlatform;
 
     await expect(
-      resumeWorkflowRunFromServer(paused, undefined, {
-        kind: 'platform',
-        destination: { platform, conversationId: 'slack-thread-123' },
-      })
+      resumeWorkflowRunFromServer(
+        paused,
+        undefined,
+        {
+          kind: 'platform',
+          destination: { platform, conversationId: 'slack-thread-123' },
+        },
+        cursor
+      )
     ).resolves.toBe(true);
 
+    expect(mockHydrateResumableRun).toHaveBeenCalledWith(expect.anything(), paused, cursor);
     expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
     expect(mockExecuteWorkflow.mock.calls[0]?.[1]).toBe(platform);
     expect(mockExecuteWorkflow.mock.calls[0]?.[2]).toBe('slack-thread-123');
@@ -266,6 +287,7 @@ describe('workflow continuation scanner', () => {
     mockListDueWorkflowContinuations.mockResolvedValueOnce([
       run('wait-poison', 'paused', {
         wait: {
+          owner: 'node',
           nodeId: 'delay',
           kind: 'time',
           waitingSince: '2026-08-24T10:00:00.000Z',
@@ -290,6 +312,7 @@ describe('workflow continuation scanner', () => {
     mockListDueWorkflowContinuations.mockResolvedValueOnce([
       run('wait-reject', 'paused', {
         wait: {
+          owner: 'node',
           nodeId: 'delay',
           kind: 'time',
           waitingSince: '2026-08-24T10:00:00.000Z',

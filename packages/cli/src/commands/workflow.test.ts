@@ -4200,6 +4200,7 @@ describe('workflowGetCommand', () => {
         started_at: new Date(),
         metadata: {
           wait: {
+            owner: 'node',
             nodeId: 'checks',
             kind: 'event',
             event: 'checks.complete',

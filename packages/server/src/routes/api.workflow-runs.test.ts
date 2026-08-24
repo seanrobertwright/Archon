@@ -1706,6 +1706,7 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
       working_path: '/tmp/worktrees/run-wait-1',
       metadata: {
         wait: {
+          owner: 'node',
           nodeId: 'checks',
           kind: 'event',
           event: 'checks.complete',
@@ -1753,6 +1754,7 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
       working_path: '/tmp/worktrees/run-wait-web',
       metadata: {
         wait: {
+          owner: 'node',
           nodeId: 'checks',
           kind: 'event',
           event: 'checks.complete',
@@ -1782,6 +1784,7 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
       status: 'paused',
       metadata: {
         wait: {
+          owner: 'node',
           nodeId: 'checks',
           kind: 'event',
           event: 'checks.complete',

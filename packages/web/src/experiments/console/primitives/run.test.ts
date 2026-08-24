@@ -325,6 +325,7 @@ describe('toRun — durable wait', () => {
         status: 'paused',
         metadata: {
           wait: {
+            owner: 'node',
             nodeId: 'checks',
             kind: 'event',
             event: 'checks.complete',

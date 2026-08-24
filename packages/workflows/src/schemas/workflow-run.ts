@@ -41,20 +41,34 @@ export const workflowRunOutcomeSchema = z.enum(['succeeded', 'failed']);
 
 export type WorkflowRunOutcome = z.infer<typeof workflowRunOutcomeSchema>;
 
-/** Persisted reason a run is waiting on the outside world rather than a person. */
-export const workflowWaitContextSchema = z.object({
-  nodeId: z.string().min(1),
+const workflowWaitContextBaseSchema = z.object({
   kind: z.enum(['time', 'event']),
   waitingSince: z.string().datetime(),
   resumeAt: z.string().datetime(),
   event: z.string().min(1).optional(),
   signaledAt: z.string().datetime().optional(),
   payload: z.unknown().optional(),
-  bodyWaitId: z.string().min(1).optional(),
-  iteration: z.number().int().positive().optional(),
-  sessionId: z.string().nullable().optional(),
-  sessionProvider: z.string().nullable().optional(),
 });
+
+/**
+ * Persisted reason a run is waiting on the outside world rather than a person.
+ * Loop-owned cursors carry their complete owner path in the initial pause write;
+ * there is no externally visible body-owned intermediate state.
+ */
+export const workflowWaitContextSchema = z.discriminatedUnion('owner', [
+  workflowWaitContextBaseSchema.extend({
+    owner: z.literal('node'),
+    nodeId: z.string().min(1),
+  }),
+  workflowWaitContextBaseSchema.extend({
+    owner: z.literal('loop_group'),
+    nodeId: z.string().min(1),
+    bodyWaitId: z.string().min(1),
+    iteration: z.number().int().positive(),
+    sessionId: z.string().nullable(),
+    sessionProvider: z.string().nullable(),
+  }),
+]);
 export type WorkflowWaitContext = z.infer<typeof workflowWaitContextSchema>;
 
 export function isWorkflowWaitContext(value: unknown): value is WorkflowWaitContext {
