@@ -522,6 +522,19 @@ describe('workflows database', () => {
       expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
     });
 
+    test('preserves an omitted signal payload as absent', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await expect(signalWorkflowWait('workflow-run-123', 'checks.complete')).resolves.toEqual({
+        signaled: true,
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("'{wait,signaledAt}'");
+      expect(query).not.toContain("'{wait,payload}'");
+      expect(params).toHaveLength(3);
+    });
+
     test('replaces a new quota schedule wholesale so a prior claim cannot survive', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       const scheduled = {

@@ -2494,6 +2494,26 @@ nodes:
       expect(result.errors[0].error).toContain("unknown node '$missing.output'");
     });
 
+    it('rejects suspension nodes that can run concurrently', () => {
+      const result = parseWorkflow(
+        `
+name: parallel-suspensions
+description: Two nodes cannot own the run cursor together
+nodes:
+  - id: wait-for-time
+    wait:
+      duration_ms: 60000
+  - id: review
+    approval:
+      message: Review this
+`,
+        'parallel-suspensions.yaml'
+      );
+
+      expect(result.workflow).toBeNull();
+      expect(result.error?.error).toContain("Suspending nodes 'wait-for-time' and 'review'");
+    });
+
     it('should accept a workflow where output refs use valid existing node IDs', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });

@@ -1409,9 +1409,13 @@ export async function signalWorkflowWait(
       : "json_extract(metadata, '$.wait.resumeAt')";
   const signaledAt = new Date().toISOString();
   const metadataWrite =
-    getDatabaseType() === 'postgresql'
-      ? "jsonb_set(jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($3::text), true), '{wait,payload}', $4::jsonb, true)"
-      : "json_set(metadata, '$.wait.signaledAt', $3, '$.wait.payload', json($4))";
+    payload === undefined
+      ? getDatabaseType() === 'postgresql'
+        ? "jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($3::text), true)"
+        : "json_set(metadata, '$.wait.signaledAt', $3)"
+      : getDatabaseType() === 'postgresql'
+        ? "jsonb_set(jsonb_set(metadata, '{wait,signaledAt}', to_jsonb($3::text), true), '{wait,payload}', $4::jsonb, true)"
+        : "json_set(metadata, '$.wait.signaledAt', $3, '$.wait.payload', json($4))";
   try {
     return await getDatabase().withTransaction(async query => {
       const result = await query(
@@ -1419,7 +1423,9 @@ export async function signalWorkflowWait(
          SET metadata = ${metadataWrite}
          WHERE id = $1 AND status = 'paused' AND ${eventExpr} = $2
            AND ${signaledExpr} IS NULL AND ${resumeAtExpr} > $3`,
-        [id, event, signaledAt, JSON.stringify(payload ?? null)]
+        payload === undefined
+          ? [id, event, signaledAt]
+          : [id, event, signaledAt, JSON.stringify(payload)]
       );
       const signaled = (result.rowCount ?? 0) > 0;
       if (signaled && auditEvent !== undefined) {

@@ -179,4 +179,20 @@ describe('workflow continuation scanner', () => {
       '2026-08-24T11:01:00.000Z'
     );
   });
+
+  test('logs and backs off a row when destination resolution rejects', async () => {
+    mockListDueWorkflowContinuations.mockResolvedValueOnce([run('wait-reject', 'paused', {})]);
+    const resume = mock(async () => {
+      throw new Error('conversation lookup failed');
+    });
+
+    await expect(
+      scanDueWorkflowContinuations(new Date('2026-08-24T11:00:00.000Z'), resume)
+    ).resolves.toBe(0);
+
+    expect(mockDeferWorkflowContinuation).toHaveBeenCalledWith(
+      'wait-reject',
+      '2026-08-24T11:01:00.000Z'
+    );
+  });
 });

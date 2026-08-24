@@ -854,6 +854,24 @@ export function validateDagStructure(
     return seen;
   };
 
+  const canSuspend = (node: DagNode | IncludeDirective): boolean => {
+    if (isIncludeDirective(node)) return false;
+    if (isGateNode(node) || isWaitNode(node)) return true;
+    return isLoopGroupNode(node) && node.loop_group.nodes.some(canSuspend);
+  };
+  const suspensionNodes = nodes.filter(canSuspend);
+  for (let index = 0; index < suspensionNodes.length; index++) {
+    const left = suspensionNodes[index];
+    if (left === undefined) continue;
+    for (const right of suspensionNodes.slice(index + 1)) {
+      const ordered =
+        transitiveDepsOf(left.id).has(right.id) || transitiveDepsOf(right.id).has(left.id);
+      if (!ordered) {
+        return `Suspending nodes '${left.id}' and '${right.id}' can run concurrently; add a dependency so only one wait or approval owns the run cursor at a time`;
+      }
+    }
+  }
+
   // Check $nodeId.output references across every public YAML field the executor substitutes at
   // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
   // (prompt, systemPrompt, agents.*.prompt/description, bash, script,

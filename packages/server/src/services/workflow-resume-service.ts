@@ -123,14 +123,33 @@ export async function scanDueWorkflowContinuations(
     const due = await workflowDb.listDueWorkflowContinuations(now, CONTINUATION_SCAN_BATCH_SIZE);
     const results = await Promise.allSettled(
       due.map(async run => {
-        const resumed = await resume(run);
-        if (!resumed) {
-          await workflowDb.deferWorkflowContinuation(
-            run.id,
-            new Date(now.getTime() + CONTINUATION_RETRY_DELAY_MS).toISOString()
+        try {
+          const resumed = await resume(run);
+          if (!resumed) {
+            await workflowDb.deferWorkflowContinuation(
+              run.id,
+              new Date(now.getTime() + CONTINUATION_RETRY_DELAY_MS).toISOString()
+            );
+          }
+          return resumed;
+        } catch (error) {
+          log.warn(
+            { err: error as Error, runId: run.id },
+            'workflow_continuation_resume_unexpected_error'
           );
+          await workflowDb
+            .deferWorkflowContinuation(
+              run.id,
+              new Date(now.getTime() + CONTINUATION_RETRY_DELAY_MS).toISOString()
+            )
+            .catch((deferError: unknown) => {
+              log.error(
+                { err: deferError as Error, runId: run.id },
+                'workflow_continuation_defer_after_error_failed'
+              );
+            });
+          return false;
         }
-        return resumed;
       })
     );
     return results.filter(result => result.status === 'fulfilled' && result.value).length;

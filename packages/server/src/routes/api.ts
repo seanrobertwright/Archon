@@ -2472,7 +2472,7 @@ export function registerApiRoutes(
    * command.
    *
    * **No parent conversation at all** (`parent_conversation_id` is `NULL` —
-   * every CLI-launched run): falls back to `resumeWorkflowRunHeadless`, which
+   * every CLI-launched run): falls back to `resumeWorkflowRunFromServer`, which
    * executes the run directly with no conversation involved (#2008).
    *
    * **Cross-adapter guard**: a run WITH a parent conversation only
