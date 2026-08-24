@@ -27,6 +27,20 @@ describe('CLI help output', () => {
     );
   });
 
+  it('distinguishes active cancel from state-only abandon', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(
+      'workflow cancel <run-id>   Stop a running workflow started with --detach'
+    );
+    expect(result.stdout).toContain(
+      'workflow abandon <run-id>  Mark a run cancelled without stopping host work'
+    );
+  });
+
   it('documents workflow dry-run flags', () => {
     const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
       encoding: 'utf8',

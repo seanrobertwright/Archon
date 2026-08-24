@@ -450,16 +450,38 @@ When you already hold a run id, prefer that exact-id form. `workflow run <name> 
 
 Adding `--detach` **inverts** that: the child is re-invoked without `--json`, so it takes the inline path and does re-execute the run — just outside your shell. The ack carries `continues: true` to say so. See [Detached control verbs](#detached-control-verbs).
 
+### `workflow cancel`
+
+Actively stop a running workflow started by the CLI with `--detach`. The command
+contacts the live process that owns that exact run, terminates its host process tree,
+confirms termination, and only then records the run as `cancelled`.
+
+```bash
+archon workflow cancel <run-id>
+archon workflow cancel <run-id> --json
+```
+
+If the detached owner cannot be reached or its process tree cannot be stopped, the
+command fails and leaves the run state unchanged. This is deliberate: a database
+transition cannot prove that host work stopped. After separately verifying that the
+owner process is gone, use `workflow abandon <run-id>` to clean up an orphaned row.
+
+`workflow cancel` applies only to a live detached CLI owner. Foreground runs remain
+owned by their terminal and should be interrupted there.
+
 ### `workflow abandon`
 
-Discard a workflow run (marks it as `cancelled`). Use this to unblock a worktree when you don't want to resume — the path lock is released immediately so a new workflow can start.
+Discard a workflow run by marking it `cancelled`. This is a state-only operation: it
+does not stop a live host process or subprocess. Use it for paused runs and for orphaned
+rows after verifying that their owner is gone. To stop a live `--detach` run, use
+`workflow cancel`.
 
 ```bash
 archon workflow abandon <run-id>
 archon workflow abandon <run-id> --json
 ```
 
-**Sub-run trees (#2121 Phase 2):** abandoning a parent that spawned `workflow:` sub-runs cascade-cancels every non-terminal descendant (children and grandchildren; already-terminal runs are left alone). The cancel is cooperative — each child's executor aborts at its next status check (~10s; no hard subprocess kill). If part of the tree could not be reached, the command reports the count so you know descendants may still be alive. Conversely, abandoning a **child** that its parent is paused-and-blocked on strands that parent (nothing re-fires the auto-resume hook); the command surfaces the blocked parent's run id so you can `resume` it (which fails the sub-run node cleanly) or abandon it too.
+**Sub-run trees (#2121 Phase 2):** abandoning a parent that spawned `workflow:` sub-runs cascade-cancels every non-terminal descendant (children and grandchildren; already-terminal runs are left alone). These are database transitions, not process termination; an in-flight host command can continue until it returns. If part of the tree could not be reached, the command reports the count so you know descendants may still be alive. Conversely, abandoning a **child** that its parent is paused-and-blocked on strands that parent (nothing re-fires the auto-resume hook); the command surfaces the blocked parent's run id so you can `resume` it (which fails the sub-run node cleanly) or abandon it too.
 
 ### `workflow approve`
 

@@ -107,6 +107,12 @@ import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
 import { writeJsonLine, writeStdout } from '../utils/stdout';
 import { exitWithDrain } from '../utils/exit-with-drain';
+import {
+  DETACHED_RUN_OWNER_ENV,
+  requestDetachedRunStop,
+  startDetachedRunControlServer,
+  terminateDetachedProcessTree,
+} from '../utils/detached-run-control';
 import { resolveCliUserId } from './auth';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -431,7 +437,7 @@ async function spawnDetachedWorkflowRun(
     // next step. `windowsHide` keeps the child headless.
     const child = spawn(cmd[0], cmd.slice(1), {
       cwd,
-      env: process.env,
+      env: { ...process.env, [DETACHED_RUN_OWNER_ENV]: '1' },
       stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
       detached: true,
       windowsHide: true,
@@ -955,6 +961,8 @@ async function runWorkflowWithOwnedSource(
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
+  const detachedProcessOwner = process.env[DETACHED_RUN_OWNER_ENV] === '1';
+  if (detachedProcessOwner) Reflect.deleteProperty(process.env, DETACHED_RUN_OWNER_ENV);
   const effectiveDiscoveryCwd = options.discoveryCwd ?? cwd;
 
   // Freeze the source BEFORE discovering, then discover from the frozen copy. Discovering
@@ -2016,7 +2024,18 @@ async function runWorkflowWithOwnedSource(
   // the finally below once executeWorkflow returns, so a late signal can never
   // touch a settled run (and repeated workflowRunCommand calls in one process
   // don't stack handlers).
-  let ownedRunId: string | undefined = resumable?.id;
+  let ownedRunId: string | undefined =
+    resumable?.id ?? (detachedProcessOwner ? preparedSource?.runId : undefined);
+  let operatorStopRequested = false;
+  let detachedRunControl: Awaited<ReturnType<typeof startDetachedRunControlServer>> | undefined;
+  if (detachedProcessOwner) {
+    if (ownedRunId === undefined) {
+      throw new Error('Detached workflow owner has no resolved run ID');
+    }
+    detachedRunControl = await startDetachedRunControlServer(ownedRunId, requested => {
+      operatorStopRequested = requested;
+    });
+  }
   let terminating = false;
   const cleanup = (signal: string): void => {
     if (terminating) return;
@@ -2030,6 +2049,16 @@ async function runWorkflowWithOwnedSource(
         getLog().info(
           { conversationId: conversation.id, signal },
           'workflow.termination_no_owned_run'
+        );
+        return;
+      }
+      if (operatorStopRequested) {
+        // The exact-run controller has proved ownership and is terminating this
+        // process tree. It records `cancelled` only after termination succeeds;
+        // do not race it by translating the operator's stop into generic failure.
+        getLog().info(
+          { runId: interruptedRunId, signal },
+          'workflow.operator_stop_leaves_lifecycle_to_controller'
         );
         return;
       }
@@ -2252,6 +2281,7 @@ async function runWorkflowWithOwnedSource(
       opts
     );
   } finally {
+    await detachedRunControl?.close();
     unsubscribe();
 
     // Deregister the signal handlers now that the run's lifecycle is settled
@@ -3170,6 +3200,13 @@ export async function workflowAbandonCommand(
   const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
   console.log(`Abandoned workflow run: ${resolvedId}`);
   console.log(`Workflow: ${run.workflow_name}`);
+  printRunTreeCancellationWarnings(cascadeFailures, blockedParentRunId);
+}
+
+function printRunTreeCancellationWarnings(
+  cascadeFailures: number,
+  blockedParentRunId: string | null
+): void {
   if (cascadeFailures > 0) {
     console.log(
       `Warning: ${String(cascadeFailures)} sub-run(s) could not be cancelled and may still be running — check \`archon workflow status\`.`
@@ -3183,6 +3220,75 @@ export async function workflowAbandonCommand(
       `  Resume it to fail the node cleanly (archon workflow resume ${blockedParentRunId}) or abandon it too.`
     );
   }
+}
+
+/**
+ * Actively cancel a run owned by a detached CLI child.
+ *
+ * Ordering is the contract: prove the live exact-run owner, terminate its process
+ * tree, then record `cancelled`. An unreachable owner never falls back to a DB-only
+ * transition — operators use `abandon` separately after verifying an orphan.
+ */
+export async function workflowCancelCommand(
+  runId: string,
+  json?: boolean,
+  cwd?: string
+): Promise<void> {
+  const cancel = async (): Promise<{
+    resolvedId: string;
+    workflowName: string;
+    cascadeFailures: number;
+    blockedParentRunId: string | null;
+  }> => {
+    const resolvedId = await resolveRunIdArg(runId, cwd);
+    const current = await workflowDb.getWorkflowRun(resolvedId);
+    if (!current) throw new Error(`Workflow run not found: ${resolvedId}`);
+    if (current.status !== 'running') {
+      throw new Error(
+        `Cannot actively cancel run with status '${current.status}'. Only a running detached CLI run has live work to stop.`
+      );
+    }
+
+    const target = await requestDetachedRunStop(resolvedId);
+    try {
+      await terminateDetachedProcessTree(target.pid);
+    } finally {
+      target.close();
+    }
+
+    const { run, cascadeFailures, blockedParentRunId } = await abandonWorkflow(resolvedId);
+    return {
+      resolvedId,
+      workflowName: run.workflow_name,
+      cascadeFailures,
+      blockedParentRunId,
+    };
+  };
+
+  if (json) {
+    try {
+      const result = await cancel();
+      await writeJsonLine({
+        ok: true,
+        runId: result.resolvedId,
+        action: 'cancel',
+        status: 'cancelled',
+        processStopped: true,
+        workflowName: result.workflowName,
+        ...(result.cascadeFailures > 0 ? { cascadeFailures: result.cascadeFailures } : {}),
+        ...(result.blockedParentRunId ? { blockedParentRunId: result.blockedParentRunId } : {}),
+      });
+    } catch (error) {
+      await printJsonWriteError(runId, 'cancel', error);
+    }
+    return;
+  }
+
+  const result = await cancel();
+  console.log(`Cancelled detached workflow run: ${result.resolvedId}`);
+  console.log(`Workflow: ${result.workflowName}`);
+  console.log('Host process tree stopped before run state was changed.');
+  printRunTreeCancellationWarnings(result.cascadeFailures, result.blockedParentRunId);
 }
 
 /**

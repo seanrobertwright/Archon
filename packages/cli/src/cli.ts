@@ -60,6 +60,7 @@ import {
   workflowGetCommand,
   workflowRunsCommand,
   workflowResumeCommand,
+  workflowCancelCommand,
   workflowAbandonCommand,
   workflowApproveCommand,
   workflowRejectCommand,
@@ -148,6 +149,8 @@ Commands:
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
   workflow resume <run-id>   Resume a failed or paused run from completed nodes
+  workflow cancel <run-id>   Stop a running workflow started with --detach
+  workflow abandon <run-id>  Mark a run cancelled without stopping host work
   workflow respond <run-id> <decision> [text]
                              Resolve a paused gate with any of its declared decisions
                              ('approve'/'reject' are sugar for the dedicated commands)
@@ -200,7 +203,7 @@ Options:
   --spawn                    Open setup wizard in a new terminal window (for setup command)
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
-  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/respond/abandon/resume)
+  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/respond/cancel/abandon/resume)
   --events                   For verbose JSON status/get: output raw event rows instead of node summaries
   --detach                   Run 'workflow run'/'approve'/'reject'/'respond'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
@@ -227,6 +230,7 @@ Examples:
   archon workflow runs --json
   archon workflow get <run-id> --json
   archon workflow resume <run-id>
+  archon workflow cancel <run-id>
   archon continue fix/issue-42 --workflow archon-smart-pr-review "Review the changes"
   archon skill install
   archon skill install /path/to/project
@@ -767,6 +771,16 @@ async function main(): Promise<number> {
             break;
           }
 
+          case 'cancel': {
+            const cancelRunId = positionals[2];
+            if (!cancelRunId) {
+              console.error('Usage: archon workflow cancel <run-id>');
+              return 1;
+            }
+            await workflowCancelCommand(cancelRunId, jsonFlag, effectiveCwd);
+            break;
+          }
+
           case 'approve': {
             const approveRunId = positionals[2];
             if (!approveRunId) {
@@ -943,7 +957,7 @@ async function main(): Promise<number> {
               console.error(`Unknown workflow subcommand: ${subcommand}`);
             }
             console.error(
-              'Available: list, run, status, get, runs, resume, abandon, approve, reject, cleanup, event, search, install'
+              'Available: list, run, status, get, runs, resume, cancel, abandon, approve, reject, cleanup, event, search, install'
             );
             return 1;
         }
