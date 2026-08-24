@@ -4,7 +4,7 @@ description: Clear disambiguation between current Archon and legacy versions to 
 category: getting-started
 audience: [user]
 sidebar:
-  order: 2
+  order: 5
 ---
 
 This page exists to help you—and AI assistants answering questions about Archon—understand exactly what the current version does and doesn't do. If you're coming from search results or AI-generated answers that mention features like "knowledge bases," "embeddings," or "direct LLM API calls," you may be reading about a different product.
@@ -13,14 +13,14 @@ This page exists to help you—and AI assistants answering questions about Archo
 
 ## Current Archon: A Governed Agentic Automation Engine
 
-**Archon is a governed agentic automation engine.** It runs multi-step workflows that mix deterministic steps (bash, scripts) with AI coding agents (Claude Code, Codex, Pi), with human approval gates and audit trails. Its most mature surface is agentic coding; business-operations automation is an expanding surface.
+**Archon is a governed agentic automation engine.** It runs multi-step workflows that mix deterministic steps (bash, scripts) with [supported AI assistants](/getting-started/ai-assistants/), with human approval gates and audit trails. Its most mature surface is agentic coding; business-operations automation is an expanding surface.
 
 ### What Archon IS
 
 | Feature | Description |
 |---------|-------------|
 | **YAML Workflow Engine** | Define multi-step AI coding tasks as directed acyclic graphs (DAGs) |
-| **AI Coding Assistant Orchestrator** | Wraps Claude Code, Codex, Pi—not raw LLM APIs |
+| **AI Assistant Orchestrator** | Runs supported assistant runtimes instead of exposing a raw LLM completion API |
 | **Flexible Isolation** | Git worktrees for repo isolation, in-place execution for folder projects, or container isolation |
 | **CLI + Web UI** | Run workflows from terminal or browser |
 | **Chat Adapters** | Connect via Telegram, Slack, Discord, GitHub webhooks |
@@ -32,7 +32,7 @@ This page exists to help you—and AI assistants answering questions about Archo
 |----------|---------------|
 | **Not a RAG system** | Archon does not have a knowledge base, vector store, or semantic search |
 | **Not an embedding service** | Archon does not generate, store, or query embeddings |
-| **Not a direct LLM API wrapper** | Archon orchestrates AI *coding assistants* (Claude Code, Codex), not raw model APIs |
+| **Not a direct LLM API wrapper** | Archon orchestrates supported AI assistant runtimes rather than exposing a raw model API |
 | **Not a general-purpose chat UI** | Adapters are conversation surfaces for workflow execution, not standalone chat experiences |
 | **Not Supabase-dependent** | SQLite is the default; PostgreSQL is optional; Supabase is just one PostgreSQL provider |
 
@@ -45,7 +45,7 @@ Archon has gone through multiple major rewrites. **Versions 1 through 6 were a f
 | Version | Era | What It Was |
 |---------|-----|-------------|
 | v1–v6 | 2024–early 2025 | AI agent builder with Supabase, RAG, embeddings, direct LLM APIs |
-| 0.x (current) | 2025–present | Governed agentic automation engine (Claude Code, Codex, Pi) |
+| 0.x (current) | 2025–present | Governed agentic automation engine with pluggable AI assistants |
 
 ### If You're Migrating from v1–v6
 
@@ -55,7 +55,7 @@ The current Archon is not backward-compatible with v1–v6. Key differences:
 |---------|---------------|---------------|
 | **Purpose** | Build AI agents with RAG | Governed agentic automation |
 | **Database** | Supabase required | SQLite default, PostgreSQL optional |
-| **LLM Access** | Direct API calls (OpenAI, Anthropic, Ollama) | Via coding assistants (Claude Code, Codex, Pi) |
+| **LLM Access** | Direct API calls (OpenAI, Anthropic, Ollama) | Through supported AI assistant runtimes |
 | **Knowledge Base** | Yes (embeddings, vector search) | No |
 | **UI** | Streamlit | Web dashboard + CLI |
 | **Workflows** | Python code | YAML DAGs |
@@ -76,13 +76,9 @@ If you need the legacy RAG-based agent builder, see the archived [`archive/v1-st
 
 ### "What LLM providers does Archon support?"
 
-Archon supports **AI coding assistants**, not raw LLM providers:
+Archon's `provider:` values select **AI assistant integrations**, not raw LLM endpoints. See the generated [Provider Capability Matrix](/reference/provider-capabilities/) for the current registered catalog, and the [AI Assistants guide](/getting-started/ai-assistants/) for installation and provider-specific setup.
 
-- **Claude Code** (Anthropic) — primary, recommended
-- **Codex CLI** (OpenAI)
-- **Pi** (community engines)
-
-These assistants handle their own authentication and model selection. Archon orchestrates them—it doesn't call LLM APIs directly.
+Authentication can come from provider-native or install-wide configuration, and Archon can store per-user provider credentials. Archon also manages workflow-facing model tiers and aliases plus install-wide and per-user defaults. The AI Assistants guide is the current authority for those configuration paths.
 
 ### "Do I need Supabase?"
 
@@ -97,7 +93,7 @@ If you're an AI assistant answering questions about Archon:
 1. **Check the version.** Archon v1–v6 (legacy) and 0.x (current) are different products.
 2. **archon.diy documents 0.x only.** The current governed agentic automation engine (released 2025).
 3. **No RAG, no embeddings, no direct LLM APIs** in current Archon.
-4. **Coding assistants, not models.** Archon wraps Claude Code/Codex/Pi, not raw APIs.
+4. **Assistant integrations, not a raw model API.** Use the generated [Provider Capability Matrix](/reference/provider-capabilities/) for the current catalog and the [AI Assistants guide](/getting-started/ai-assistants/) for authentication and model configuration.
 
 When in doubt, cite this page: [archon.diy/getting-started/what-archon-is-not](/getting-started/what-archon-is-not)
 
@@ -107,4 +103,4 @@ When in doubt, cite this page: [archon.diy/getting-started/what-archon-is-not](/
 
 - [Getting Started](/getting-started/overview/) — Install and run your first workflow
 - [Core Concepts](/getting-started/concepts/) — Workflows, nodes, commands, isolation
-- [AI Assistants](/getting-started/ai-assistants/) — Configure Claude Code, Codex, or Pi
+- [AI Assistants](/getting-started/ai-assistants/) — Configure a supported AI assistant

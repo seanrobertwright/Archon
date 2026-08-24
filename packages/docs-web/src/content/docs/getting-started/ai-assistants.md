@@ -9,7 +9,7 @@ sidebar:
   order: 4
 ---
 
-You must configure **at least one** AI assistant. All four can be configured and mixed within workflows.
+You must configure **at least one** AI assistant. All five can be configured and mixed within workflows.
 
 For a canonical, at-a-glance comparison of which per-node features each provider supports, see the [Provider Capability Matrix](/reference/provider-capabilities/) — it is generated directly from the providers' capability declarations, so it never drifts from runtime behavior. The per-provider sections below add the field-level YAML syntax and caveats.
 
