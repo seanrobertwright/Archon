@@ -39,6 +39,12 @@ const CLAUDE_CODE_AUTH_VARS = new Set([
  * Safe to call even when no CWD .env files exist.
  */
 export function stripCwdEnv(cwd: string = process.cwd()): void {
+  const preserveDetachedEncryptionContext = process.argv
+    .slice(2)
+    .includes('--internal-detached-run-config');
+  const inheritedTokenEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY;
+  const inheritedArchonHome = process.env.ARCHON_HOME;
+
   // --- Pass 1: CWD .env files ---
   const cwdKeys = new Set<string>();
   const strippedFiles: string[] = [];
@@ -71,6 +77,16 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
 
   for (const key of cwdKeys) {
     Reflect.deleteProperty(process.env, key);
+  }
+
+  // A detached parent already sealed the run config with this install context.
+  // Bun's target-repo .env stripping must not delete it before CLI boot can
+  // protect it from the later Archon-owned env layers too.
+  if (preserveDetachedEncryptionContext) {
+    if (inheritedTokenEncryptionKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
+    else process.env.TOKEN_ENCRYPTION_KEY = inheritedTokenEncryptionKey;
+    if (inheritedArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = inheritedArchonHome;
   }
 
   // Tell the operator what we just did — otherwise the delete loop is silent

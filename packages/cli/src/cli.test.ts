@@ -13,6 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { sealWorkflowRunConfig } from '@archon/core/config';
 
 const CLI_ENTRY = join(import.meta.dir, 'cli.ts');
 
@@ -155,21 +156,46 @@ describe('workflow run config argument', () => {
     const archonHome = join(repo, 'archon-home');
     mkdirSync(join(repo, '.archon'), { recursive: true });
     spawnSync('git', ['init', '-q', '.'], { cwd: repo });
-    writeFileSync(join(repo, '.archon', '.env'), 'ARCHON_INTERNAL_DETACHED_RUN_CONFIG=not-json\n');
+    writeFileSync(
+      join(repo, '.env'),
+      `TOKEN_ENCRYPTION_KEY=${'33'.repeat(32)}\nARCHON_HOME=${join(repo, 'wrong-home')}\n`
+    );
+    writeFileSync(join(repo, '.archon', '.env'), `TOKEN_ENCRYPTION_KEY=${'22'.repeat(32)}\n`);
+
+    const savedKey = process.env.TOKEN_ENCRYPTION_KEY;
+    process.env.TOKEN_ENCRYPTION_KEY = '11'.repeat(32);
+    const payload = JSON.stringify(
+      sealWorkflowRunConfig({ docsPath: 'accepted' }, { kind: 'cli', label: 'config.minimax.yaml' })
+    );
+    if (savedKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
+    else process.env.TOKEN_ENCRYPTION_KEY = savedKey;
 
     try {
       const result = spawnSync(
         process.execPath,
-        [CLI_ENTRY, 'workflow', 'run', 'x', '--internal-detached-run-config', '{"version":1}'],
+        [
+          CLI_ENTRY,
+          'workflow',
+          'run',
+          'x',
+          '--dry-run',
+          '--resume',
+          '--internal-detached-run-config',
+          payload,
+        ],
         {
           cwd: repo,
           encoding: 'utf8',
-          env: { ...process.env, ARCHON_HOME: archonHome },
+          env: {
+            ...process.env,
+            ARCHON_HOME: archonHome,
+            TOKEN_ENCRYPTION_KEY: '11'.repeat(32),
+          },
         }
       );
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain('Detached workflow run config payload is invalid.');
-      expect(result.stderr).not.toContain('not valid JSON');
+      expect(result.stderr).not.toContain('could not be decrypted');
+      expect(result.stderr).toContain('--resume and --config are mutually exclusive');
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

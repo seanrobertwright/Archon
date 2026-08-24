@@ -14,7 +14,21 @@ import '@archon/paths/strip-cwd-env-boot';
 // <cwd>/.archon/.env (repo scope, wins over user). Both with override: true.
 // See packages/paths/src/env-loader.ts and the three-path model (#1302 / #1303).
 import { loadArchonEnv } from '@archon/paths/env-loader';
+const hasDetachedRunConfigHandoff = process.argv
+  .slice(2)
+  .includes('--internal-detached-run-config');
+const inheritedTokenEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY;
+const inheritedArchonHome = process.env.ARCHON_HOME;
 loadArchonEnv(process.cwd());
+// The detached parent sealed this payload with its effective install key. Repo
+// env still loads normally, but it cannot replace the decryption context before
+// the child consumes the accepted snapshot.
+if (hasDetachedRunConfigHandoff) {
+  if (inheritedTokenEncryptionKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
+  else process.env.TOKEN_ENCRYPTION_KEY = inheritedTokenEncryptionKey;
+  if (inheritedArchonHome === undefined) delete process.env.ARCHON_HOME;
+  else process.env.ARCHON_HOME = inheritedArchonHome;
+}
 
 // Install the pipe-safe `console.log` shim BEFORE any command module imports.
 // `console.log` reaches fd 1 via a non-blocking pipe (pino opens it that way at
