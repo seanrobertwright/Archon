@@ -6766,10 +6766,14 @@ nodes:
     });
 
     it('warns on a gate/interactive loop_group nested inside a loop_group body', async () => {
-      // Exercises the recursion into loop_group.nodes — the outer group is
-      // clean, only the inner body nodes carry deprecated fields. 'inner-gate' also
-      // has a dependent ('inner-loop'), so it additionally trips the terminal-sink
-      // placement warning below — three warnings on one gate/loop pair, not two.
+      // Exercises the recursion into loop_group.nodes — the outer group's own
+      // body-terminal sink is 'inner-loop' (a plain interactive `loop:` node,
+      // since 'inner-gate' has a dependent and so is NOT the sole terminal
+      // sink). That makes four warnings: the two deprecation notices on
+      // 'inner-gate'/'inner-loop', the terminal-sink placement warning on
+      // 'inner-gate', and — #2753 — 'outer' itself, whose only escalatable
+      // sink is an interactive loop and therefore can't stop on a pause inside
+      // it.
       const pw = await warningsFor([
         'name: test',
         'description: test',
@@ -6794,12 +6798,94 @@ nodes:
         '            gate_message: continue?',
         '          depends_on: [inner-gate]',
       ]);
-      expect(pw).toHaveLength(3);
+      expect(pw).toHaveLength(4);
       expect(pw.some(w => w.includes("Node 'inner-gate'") && w.includes('on_reject'))).toBe(true);
       expect(pw.some(w => w.includes("Node 'inner-loop'") && w.includes('interactive'))).toBe(true);
       expect(pw.some(w => w.includes("Node 'inner-gate'") && w.includes('terminal sink'))).toBe(
         true
       );
+      expect(
+        pw.some(w => w.includes("Node 'outer'") && w.includes('inner-loop') && w.includes('#2753'))
+      ).toBe(true);
+    });
+
+    it('warns on a loop_group whose sole terminal sink is a gate-terminated nested loop_group (#2753)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'interactive: true',
+        'nodes:',
+        '  - id: outer',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: inner',
+        '          loop_group:',
+        '            until_bash: test "$review.output.decision" = approve',
+        '            max_iterations: 3',
+        '            nodes:',
+        '              - id: review',
+        '                approval:',
+        '                  message: ok?',
+      ]);
+      expect(pw).toHaveLength(1);
+      expect(pw[0]).toContain("Node 'outer'");
+      expect(pw[0]).toContain("'inner'");
+      expect(pw[0]).toContain('#2753');
+    });
+
+    it('warns at every level of a 3-deep nested loop_group chain (#2753)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'interactive: true',
+        'nodes:',
+        '  - id: grandparent',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: middle',
+        '          loop_group:',
+        '            until_bash: "exit 0"',
+        '            max_iterations: 2',
+        '            nodes:',
+        '              - id: inner',
+        '                loop_group:',
+        '                  until_bash: test "$review.output.decision" = approve',
+        '                  max_iterations: 3',
+        '                  nodes:',
+        '                    - id: review',
+        '                      approval:',
+        '                        message: ok?',
+      ]);
+      expect(pw).toHaveLength(2);
+      expect(pw.every(w => w.includes('#2753'))).toBe(true);
+      expect(pw.some(w => w.includes("Node 'grandparent'") && w.includes("'middle'"))).toBe(true);
+      expect(pw.some(w => w.includes("Node 'middle'") && w.includes("'inner'"))).toBe(true);
+    });
+
+    it('does not warn when a nested loop_group has nothing interactive to escalate (#2753)', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'interactive: true',
+        'nodes:',
+        '  - id: outer',
+        '    loop_group:',
+        '      until_bash: "exit 0"',
+        '      max_iterations: 2',
+        '      nodes:',
+        '        - id: inner',
+        '          loop_group:',
+        '            until_bash: "exit 0"',
+        '            max_iterations: 3',
+        '            nodes:',
+        '              - id: work',
+        '                prompt: do work',
+      ]);
+      expect(pw).toEqual([]);
     });
 
     it('warns on a gate node with a dependent inside a loop_group body (not a terminal sink)', async () => {

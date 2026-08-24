@@ -372,6 +372,33 @@ function collectUnknownNodeKeys(raw: unknown, id: string, label: string, warning
 }
 
 /**
+ * True when `node`, used as a loop_group's body-terminal sink, can itself pause
+ * in a way that is invisible one level up (#2753) — either directly (a `gate:`
+ * node — the pattern #2707 step 3's escalation handles correctly for its OWN
+ * enclosing loop_group, but that escalation is bounded to that one level) or
+ * transitively (a `loop:` node with `interactive: true`, the legacy mechanism,
+ * or a `loop_group:` node that is itself `interactive: true` or whose own sole
+ * terminal sink recurses into this same case, following a chain of well-formed
+ * sole-terminal-sink nesting to any depth). A gate that is mid-body or
+ * co-terminal with another sink breaks the chain here too — the placement
+ * check in `collectGateAndLoopDeprecationWarnings` below already warns about
+ * that misplacement on its own. Mirrors `findLoopGroupTerminalGate`'s doc comment
+ * (dag-executor.ts:4153-4164): the runtime has no unambiguous way to escalate
+ * a pause through a sink that isn't a bare gate, so this only makes that gap
+ * visible at load time.
+ */
+function isUnescalatableInteractiveSink(node: DagNode | IncludeDirective): boolean {
+  if (isIncludeDirective(node)) return false;
+  if (isGateNode(node)) return true;
+  if (isLoopNode(node)) return node.loop.interactive === true;
+  if (!isLoopGroupNode(node)) return false;
+  if (node.loop_group.interactive === true) return true;
+  const dependedOn = new Set(node.loop_group.nodes.flatMap(n => n.depends_on ?? []));
+  const sinks = node.loop_group.nodes.filter(n => !dependedOn.has(n.id));
+  return sinks.length === 1 && isUnescalatableInteractiveSink(sinks[0]);
+}
+
+/**
  * #2707 step 1 grow-then-deprecate warnings: `approval.capture_response`,
  * `approval.on_reject`, and node-level loop `interactive:` still parse and
  * function exactly as before (Migration section — these become load errors
@@ -521,6 +548,28 @@ function collectGateAndLoopDeprecationWarnings(
             'loop_group_gate_completion_not_referenced'
           );
         }
+      }
+    }
+
+    // A body-terminal sink that is itself an interactive loop/loop_group can pause
+    // without stopping THIS group (#2753) — a bare gate sink is excluded here since
+    // that case is already correctly handled above (and by #2707 step 3 at runtime);
+    // this covers a sink whose own pause is trapped one level down instead.
+    if (bodySinks.length === 1) {
+      const sink = bodySinks[0];
+      if (!isIncludeDirective(sink) && !isGateNode(sink) && isUnescalatableInteractiveSink(sink)) {
+        const message =
+          `Node '${id}': this loop_group's terminal sink ('${sink.id}') is itself an ` +
+          'interactive loop/loop_group — a pause inside it does not escalate to stop ' +
+          "this loop_group's own iteration (#2753). The outer loop can run further iterations " +
+          "while a human's answer to the inner pause is still pending. Only a gate node " +
+          'directly as the terminal sink correctly stops the enclosing loop_group ' +
+          '(#2707 step 3).';
+        warnings.push(message);
+        getLog().warn(
+          { id, sinkId: sink.id, warning: message },
+          'loop_group_nested_pause_not_escalated'
+        );
       }
     }
   }
