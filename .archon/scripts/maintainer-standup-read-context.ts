@@ -13,7 +13,7 @@ const RECENT_BRIEFS_LIMIT = 3;
 
 const baseDir = resolve(process.cwd(), '.archon/maintainer-standup');
 
-const directionPath = resolve(baseDir, 'direction.md');
+const directionPath = resolve(process.cwd(), '.archon/direction.md');
 const direction = existsSync(directionPath) ? readFileSync(directionPath, 'utf8') : '';
 
 const profilePath = resolve(baseDir, 'profile.md');
