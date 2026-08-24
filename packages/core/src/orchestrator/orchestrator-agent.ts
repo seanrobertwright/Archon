@@ -682,6 +682,10 @@ function formatPriorRunPromptPreview(message: string | null): string {
   return `${normalized.slice(0, FAILED_RUN_PROMPT_PREVIEW_MAX)}…`;
 }
 
+function formatResumableRunState(status: WorkflowRun['status']): string {
+  return status === 'running' ? 'interrupted' : status;
+}
+
 function buildFailedRunResumePrompt(
   workflowName: string,
   resumableRun: WorkflowRun,
@@ -693,7 +697,7 @@ function buildFailedRunResumePrompt(
   // This prompt fires for any non-paused resumable run — that includes a stale
   // 'running' orphan (started but never finished), not only 'failed' runs, so
   // the wording must track the actual status rather than hardcoding "failed".
-  const stateLabel = resumableRun.status === 'running' ? 'interrupted' : resumableRun.status;
+  const stateLabel = formatResumableRunState(resumableRun.status);
 
   return [
     '---',
@@ -1077,6 +1081,7 @@ async function dispatchOrchestratorWorkflowOwned(
       throw err;
     }
     if (prepared) {
+      const resumeStateLabel = formatResumableRunState(resumableRun.status);
       const suppliedModelBindingNames = [
         ...Object.keys(options?.modelOverrides?.tiers ?? {}),
         ...Object.keys(options?.modelOverrides?.aliases ?? {}),
@@ -1092,7 +1097,7 @@ async function dispatchOrchestratorWorkflowOwned(
         );
         await platform.sendMessage(
           conversationId,
-          `▶️ Resuming the paused run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
+          `▶️ Resuming the ${resumeStateLabel} run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
             `keeps the inputs it started with — the values you supplied now (${ignored}) were ` +
             'not applied. To run fresh with them instead, abandon that run first ' +
             `(\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`
@@ -1109,7 +1114,7 @@ async function dispatchOrchestratorWorkflowOwned(
         );
         await platform.sendMessage(
           conversationId,
-          `▶️ Resuming the paused run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
+          `▶️ Resuming the ${resumeStateLabel} run of **${workflow.name}** (\`${resumableRun.id}\`), which ` +
             'keeps the model bindings it started with — the bindings you supplied now ' +
             `(${suppliedModelBindingNames.join(', ')}) were not applied. To run fresh with them ` +
             `instead, abandon that run first (\`/workflow abandon ${resumableRun.id}\`) and re-invoke.`

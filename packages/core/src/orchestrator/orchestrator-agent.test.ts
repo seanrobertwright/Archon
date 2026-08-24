@@ -2678,6 +2678,27 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.modelOverrideLayer).toBeUndefined();
   });
 
+  test('uses the actual state when explicit resume ignores supplied model bindings', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve(makeWorkflowResult(true, { resumeRunId: 'failed-model-resume' }))
+    );
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(makeResumableRun({ id: 'failed-model-resume', status: 'failed' }))
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow resume failed-model-resume', {
+      workflowModelOverrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
+
+    const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+    expect(sent).toContain('Resuming the failed run');
+    expect(sent).not.toContain('Resuming the paused run');
+    expect(mockExecuteWorkflow).toHaveBeenCalled();
+  });
+
   test('re-raises the deferred input error when hydration finds nothing to resume', async () => {
     // The gate defers a contract violation while a continuation looks possible. This is
     // the ONE branch where that prediction turns out wrong — hydration returns null, so
