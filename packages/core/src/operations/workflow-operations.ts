@@ -87,17 +87,23 @@ export interface RejectionOperationResult {
 /** Safety bound on the abandon cascade walk (guards against corrupted run trees). */
 const MAX_CASCADE_RUNS = 500;
 
+type CancelWorkflowRun = (runId: string) => Promise<{ cancelled: boolean }>;
+
 /**
  * Cascade-cancel the `workflow:` sub-run tree under `rootId` (#2121 Phase 2 / D7).
  * A child sub-run shares the parent's conversation and runs in-process, so
- * abandoning the parent must flip every non-terminal DESCENDANT to cancelled — not
- * just direct children (a child may itself spawn grandchildren). Cooperative: each
- * cancelled run's executor between-layer status poll then aborts it (~10s; there is
- * no hard subprocess kill in slice 1). Best-effort — a per-run failure is logged,
- * never thrown, so the parent abandon always succeeds; the failure COUNT is
- * returned so callers can tell the user part of the tree may still be alive.
+ * abandoning the parent walks every DESCENDANT, not just direct children (a child
+ * may itself spawn grandchildren). `cancelRun` supplies the caller's ownership
+ * policy: explicit abandon cancels every non-terminal descendant, while `/reset`
+ * cancels only descendants that are still paused/failed. Best-effort — a per-run
+ * failure is logged, never thrown, so the parent abandon always succeeds; the
+ * failure COUNT is returned so callers can tell the user part of the tree may
+ * still be alive.
  */
-async function cascadeCancelChildren(rootId: string): Promise<{ failures: number }> {
+async function cascadeCancelChildren(
+  rootId: string,
+  cancelRun: CancelWorkflowRun
+): Promise<{ failures: number }> {
   const queue: string[] = [rootId];
   const seen = new Set<string>([rootId]);
   let processed = 0;
@@ -120,7 +126,7 @@ async function cascadeCancelChildren(rootId: string): Promise<{ failures: number
       queue.push(child.id); // traverse deeper even under an already-terminal child
       if (child.status === 'completed' || child.status === 'cancelled') continue;
       try {
-        await workflowDb.cancelWorkflowRun(child.id);
+        await cancelRun(child.id);
       } catch (err) {
         getLog().warn(
           { err, childId: child.id },
@@ -337,6 +343,51 @@ export interface AbandonWorkflowResult {
   blockedParentRunId: string | null;
 }
 
+interface AbandonAttemptResult extends AbandonWorkflowResult {
+  cancelled: boolean;
+}
+
+async function cancelRunAndCleanup(
+  run: WorkflowRun,
+  cancelRun: CancelWorkflowRun
+): Promise<AbandonAttemptResult> {
+  let cancelled: boolean;
+  try {
+    ({ cancelled } = await cancelRun(run.id));
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, errorType: err.constructor.name, runId: run.id },
+      'operations.workflow_abandon_failed'
+    );
+    throw new Error(`Failed to abandon workflow run ${run.id}: ${err.message}`);
+  }
+
+  // The same cancellation policy applies to descendants. This keeps `/reset`'s
+  // resumable-only ownership boundary intact through the complete run tree.
+  let cascadeFailures = 0;
+  if (cancelled) {
+    ({ failures: cascadeFailures } = await cascadeCancelChildren(run.id, cancelRun));
+  }
+  const blockedParentRunId = cancelled ? await findParentBlockedOn(run) : null;
+
+  // Reclaim only when our cancel won the CAS. A miss means another lifecycle
+  // owner now controls the run and its environment.
+  if (
+    cancelled &&
+    run.metadata?.isolation === 'container' &&
+    typeof run.metadata.isolation_env_id === 'string'
+  ) {
+    try {
+      const { reclaimContainerEnv } = await import('../services/cleanup-service');
+      await reclaimContainerEnv(run.metadata.isolation_env_id);
+    } catch (err) {
+      getLog().warn({ err, runId: run.id }, 'operations.workflow_abandon_container_reclaim_failed');
+    }
+  }
+  return { run, cancelled, cascadeFailures, blockedParentRunId };
+}
+
 /**
  * Abandon a workflow run (marks it as cancelled).
  *
@@ -352,75 +403,32 @@ export async function abandonWorkflow(runId: string): Promise<AbandonWorkflowRes
       `Cannot abandon run with status '${run.status}'. Only running, paused, or failed runs can be abandoned.`
     );
   }
-  let cancelled: boolean;
-  try {
-    ({ cancelled } = await workflowDb.cancelWorkflowRun(runId));
-  } catch (error) {
-    const err = error as Error;
-    getLog().error(
-      { err, errorType: err.constructor.name, runId },
-      'operations.workflow_abandon_failed'
-    );
-    throw new Error(`Failed to abandon workflow run ${runId}: ${err.message}`);
-  }
-  // Cascade-cancel the sub-run tree — ONLY when OUR cancel won the CAS (same guard as
-  // the container reclaim below): a false `cancelled` means a concurrent transition
-  // already took the run terminal, so its children are not ours to cancel.
-  let cascadeFailures = 0;
-  if (cancelled) {
-    ({ failures: cascadeFailures } = await cascadeCancelChildren(runId));
-  }
-  // Abandoning a CHILD strands a parent paused on it (the auto-resume hook only
-  // fires from inside the child's own execution) — detect and surface that so the
-  // caller can point the user at the blocked parent.
-  const blockedParentRunId = cancelled ? await findParentBlockedOn(run) : null;
-  // M2 — reclaim a container run's container + upper volume immediately, in the SHARED
-  // op so EVERY abandon surface (CLI, web API, chat, manage_run, Slack-cancel) frees the
-  // resources now rather than waiting for the scheduled reaper. Best-effort: a reclaim
-  // failure is logged (the reaper retries) — never thrown. Runs wherever the op executes
-  // (CLI/server), which is where docker is reachable.
-  //
-  // ONLY when OUR cancel actually won the CAS (`cancelled === true`). cancelWorkflowRun
-  // is `UPDATE … WHERE status NOT IN (completed, cancelled)`, so a false result means a
-  // concurrent transition (a resume or completion) already took the run terminal and now
-  // OWNS the environment — reclaiming here would pull the container out from under it.
-  if (
-    cancelled &&
-    run.metadata?.isolation === 'container' &&
-    typeof run.metadata.isolation_env_id === 'string'
-  ) {
-    try {
-      // Lazy import: `cleanup-service` pulls the docker/isolation/git chain, which the
-      // operations module (and its lightweight tests) otherwise never need — load it
-      // only when a container run is actually abandoned.
-      const { reclaimContainerEnv } = await import('../services/cleanup-service');
-      await reclaimContainerEnv(run.metadata.isolation_env_id);
-    } catch (err) {
-      getLog().warn({ err, runId }, 'operations.workflow_abandon_container_reclaim_failed');
-    }
-  }
-  return { run, cascadeFailures, blockedParentRunId };
+  const result = await cancelRunAndCleanup(run, workflowDb.cancelWorkflowRun);
+  return {
+    run: result.run,
+    cascadeFailures: result.cascadeFailures,
+    blockedParentRunId: result.blockedParentRunId,
+  };
 }
 
 export interface AbandonConversationRunsResult {
   /** Runs this call actually took to 'cancelled'. */
   abandoned: number;
   /**
-   * Runs that could not be abandoned (already terminal by the time we got to
-   * them, or a DB failure). Non-zero means part of the set may still be alive.
+   * Selected roots whose lookup or resumable-only abandon threw. Non-zero
+   * means part of the set may still be resumable.
    */
   failures: number;
   /**
-   * Sum of `cascadeFailures` returned by every per-run `abandonWorkflow` call:
-   * descendants the cascade failed to cancel (capped at MAX_CASCADE_RUNS, or
-   * hit a per-child throw). Non-zero means part of the abandoned trees may
-   * still be alive — surface a warning to the user.
+   * Descendants the selected-root cascades failed to cancel (capped at
+   * MAX_CASCADE_RUNS, or hit a per-child throw). Non-zero means part of the
+   * abandoned trees may still be alive — surface a warning to the user.
    */
   cascadeFailures: number;
   /**
-   * First abandoned run that left a parent paused blocked-on-child (stranded
-   * parent id), or null. The user must resume or abandon that parent to
-   * unstick the tree — nothing auto-resumes it.
+   * First selected root that left a parent outside the selected tree paused
+   * blocked-on-child (stranded parent id), or null. The user must resume or
+   * abandon that parent to unstick the tree — nothing auto-resumes it.
    */
   blockedParentRunId: string | null;
 }
@@ -431,70 +439,52 @@ export interface AbandonConversationRunsResult {
  * Backs `/reset`: with these gone, the resume lookups find nothing, so the next
  * message starts fresh instead of continuing a stale run.
  *
- * Routes through `abandonWorkflow` per run rather than issuing one bulk UPDATE.
- * That op is where abandon semantics live for EVERY surface (CLI, web API, chat,
- * manage_run, Slack-cancel) — the CAS guard, the sub-run cascade, and the
- * immediate container + upper-volume reclaim. A bulk UPDATE here would be a
- * sixth abandon surface that silently skips all three.
+ * Operates once per selected run tree. Descendants whose selected parent is
+ * also resumable are handled by that root's cascade, so intermediate
+ * blocked-parent and cascade diagnostics cannot leak into the final result.
  *
- * Only 'paused'/'failed' rows are selected (see
- * findResumableRunIdsForConversation): live `pending`/`running` work is never
- * touched, since it may belong to a different process altogether. The returned
- * `cascadeFailures`/`blockedParentRunId` mirror what `abandonWorkflow` itself
- * surfaces on every other abandon surface — `/reset` must report them too,
- * otherwise a partial-cascade abandonment can be read as "everything starts
- * fresh" while part of the run tree is still alive.
- *
- * Best-effort per run: a row can go terminal between the SELECT and the abandon,
- * which makes `abandonWorkflow` throw. That is counted, not propagated — one
- * racing run must not abort the whole reset. That said, the SELECT itself
- * already filters to `paused`/`failed`, so the only rows that can race to a
- * terminal state are the ones a concurrent cascade from an earlier loop
- * iteration already cancelled — pre-checking the row here keeps those from
- * being mis-counted as abandon failures (#2731 R2).
+ * Only 'paused'/'failed' rows are selected, and the same predicate is repeated
+ * atomically by every root/descendant cancellation. A row concurrently resumed
+ * to `running` is therefore a CAS miss owned by the new lifecycle, not a reset
+ * failure and never a cancellation target. Explicit `/workflow abandon` keeps
+ * its broader running/paused/failed policy.
  */
 export async function abandonResumableRunsForConversation(
   conversationId: string
 ): Promise<AbandonConversationRunsResult> {
-  const runIds = await workflowDb.findResumableRunIdsForConversation(conversationId);
+  const runs = await workflowDb.findResumableRunsForConversation(conversationId);
+  const selectedIds = new Set(runs.map(run => run.id));
+  const roots = runs.filter(run => !run.parent_run_id || !selectedIds.has(run.parent_run_id));
   let abandoned = 0;
   let failures = 0;
   let cascadeFailures = 0;
   let blockedParentRunId: string | null = null;
-  for (const runId of runIds) {
-    // Skip rows a previous loop iteration's cascade already took terminal
-    // (#2731 R2): without this precheck, abandonWorkflow throws "Cannot abandon
-    // run with status 'cancelled'" and the op reports a false partial-failure
-    // for what was actually a successful cascade. Same predicate the cascade
-    // itself uses to decide which children to cancel.
-    let current: WorkflowRun | null;
+  for (const root of roots) {
+    let run: WorkflowRun | null;
     try {
-      current = await workflowDb.getWorkflowRun(runId);
+      run = await workflowDb.getWorkflowRun(root.id);
     } catch (err) {
       getLog().warn(
-        { err, runId, conversationId },
+        { err, runId: root.id, conversationId },
         'operations.workflow_abandon_for_conversation_lookup_failed'
       );
       failures++;
       continue;
     }
-    if (!current) {
-      // SELECT said the row exists but a concurrent deleter just removed it.
-      // Treat as already-handled, not a failure.
-      continue;
-    }
-    if (current.status === 'completed' || current.status === 'cancelled') {
+    if (!run) continue;
+    if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
       continue;
     }
     try {
-      const { cascadeFailures: runCascade, blockedParentRunId: blocked } =
-        await abandonWorkflow(runId);
-      abandoned++;
+      const result = await cancelRunAndCleanup(run, workflowDb.cancelResumableWorkflowRun);
+      if (!result.cancelled) continue;
+      abandoned += 1;
+      const { cascadeFailures: runCascade, blockedParentRunId: blocked } = result;
       cascadeFailures += runCascade;
       if (blockedParentRunId === null) blockedParentRunId = blocked;
     } catch (err) {
       getLog().warn(
-        { err, runId, conversationId },
+        { err, runId: root.id, conversationId },
         'operations.workflow_abandon_for_conversation_failed'
       );
       failures++;

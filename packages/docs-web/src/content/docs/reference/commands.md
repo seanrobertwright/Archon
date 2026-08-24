@@ -48,7 +48,7 @@ These commands are handled deterministically by the orchestrator — they always
 | Command | Description |
 |---------|-------------|
 | `/status` | Show conversation state |
-| `/reset` | Start fresh: clears the AI session, releases the execution binding (working-directory override + isolation env), and abandons this conversation's **resumable** runs (`paused`/`failed`) so the next message does not continue one. Runs that are actively executing (`pending`/`running`) are never touched -- they may belong to another process entirely. The project attachment (`codebase_id`) is preserved; use `/setproject none` to drop that too |
+| `/reset` | Start fresh: clears the AI session, releases the execution binding (working-directory override + isolation env), and abandons this conversation's **resumable** run trees (`paused`/`failed`) so the next message does not continue one. Runs that are actively executing (`pending`/`running`) are never touched -- they may belong to another process entirely. Each cleanup effect still runs if another fails; an incomplete reset tells you to retry and does not promise a fresh next message. The project attachment (`codebase_id`) is preserved; use `/setproject none` to drop that too |
 | `/help` | Show all commands |
 
 ---

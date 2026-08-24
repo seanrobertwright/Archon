@@ -31,10 +31,11 @@ import {
   updateWorkflowActivity,
   findResumableRun,
   findResumableRunByParentConversation,
-  findResumableRunIdsForConversation,
+  findResumableRunsForConversation,
   resumeWorkflowRun,
   pauseWorkflowRun,
   cancelWorkflowRun,
+  cancelResumableWorkflowRun,
   failOrphanedRuns,
   findChildRuns,
   getRunAncestry,
@@ -767,14 +768,23 @@ describe('workflows database', () => {
     });
   });
 
-  describe('findResumableRunIdsForConversation', () => {
+  describe('findResumableRunsForConversation', () => {
     test('matches the conversation and its worker conversations', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-1' }, { id: 'run-2' }]));
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { id: 'run-1', parent_run_id: null },
+          { id: 'run-2', parent_run_id: 'run-1' },
+        ])
+      );
 
-      const result = await findResumableRunIdsForConversation('conv-1');
+      const result = await findResumableRunsForConversation('conv-1');
 
-      expect(result).toEqual(['run-1', 'run-2']);
+      expect(result).toEqual([
+        { id: 'run-1', parent_run_id: null },
+        { id: 'run-2', parent_run_id: 'run-1' },
+      ]);
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('SELECT id, parent_run_id');
       expect(query).toContain('conversation_id = $1');
       expect(query).toContain('parent_conversation_id = $2');
       expect(query).toContain('ORDER BY started_at DESC');
@@ -788,7 +798,7 @@ describe('workflows database', () => {
       // can return them, so cancelling them buys nothing and destroys live work.
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
-      await findResumableRunIdsForConversation('conv-1');
+      await findResumableRunsForConversation('conv-1');
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status IN ('paused', 'failed')");
@@ -799,13 +809,13 @@ describe('workflows database', () => {
     test('returns an empty array when nothing is resumable', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
-      expect(await findResumableRunIdsForConversation('conv-1')).toEqual([]);
+      expect(await findResumableRunsForConversation('conv-1')).toEqual([]);
     });
 
     test('throws on database error', async () => {
       mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
 
-      await expect(findResumableRunIdsForConversation('conv-1')).rejects.toThrow(
+      await expect(findResumableRunsForConversation('conv-1')).rejects.toThrow(
         'Failed to find resumable runs for conversation: Connection refused'
       );
     });
@@ -1296,6 +1306,38 @@ describe('workflows database', () => {
 
       await expect(cancelWorkflowRun('workflow-run-123')).rejects.toThrow(
         'Failed to cancel workflow run: Lock timeout'
+      );
+    });
+  });
+
+  describe('cancelResumableWorkflowRun', () => {
+    test('atomically limits reset cancellation to paused and failed runs', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await expect(cancelResumableWorkflowRun('workflow-run-123')).resolves.toEqual({
+        cancelled: true,
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status IN ('paused', 'failed')");
+      expect(query).not.toContain("'running'");
+      expect(query).not.toContain("'pending'");
+      expect(params).toEqual(['workflow-run-123']);
+    });
+
+    test('returns a CAS miss when another lifecycle resumed the run', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(cancelResumableWorkflowRun('workflow-run-123')).resolves.toEqual({
+        cancelled: false,
+      });
+    });
+
+    test('throws on database error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Lock timeout'));
+
+      await expect(cancelResumableWorkflowRun('workflow-run-123')).rejects.toThrow(
+        'Failed to cancel resumable workflow run: Lock timeout'
       );
     });
   });

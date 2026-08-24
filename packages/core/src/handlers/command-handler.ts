@@ -1337,13 +1337,23 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       // {codebase_id: <kept>, cwd: null, isolation_env_id: null} — is byte-for-
       // byte what /setproject already writes, so this is a well-trodden state,
       // not a novel one. Detaching the project is /setproject none's job.
-      const session = await sessionDb.getActiveSession(conversation.id);
-      if (session) {
-        await safeDeactivateSession(session.id, 'reset');
+      let hadActiveSession = false;
+      let sessionError: string | null = null;
+      try {
+        const session = await sessionDb.getActiveSession(conversation.id);
+        hadActiveSession = session !== null;
+        if (session) {
+          await safeDeactivateSession(session.id, 'reset');
+        }
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, conversationId: conversation.id }, 'cmd.reset_clear_session_failed');
+        sessionError = err.message;
       }
 
-      // Two independent effects, two independent try blocks. Sharing one would
-      // mean that a binding-clear failure AFTER a successful abandon swallows
+      // Three independent effects, three independent try blocks. Sharing the
+      // run and binding effects would mean that a binding-clear failure AFTER
+      // a successful abandon swallows
       // the count and reports only the failure — precisely the case where the
       // user most needs to know that N runs were already cancelled.
       let abandoned = 0;
@@ -1375,7 +1385,13 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
         bindingError = err.message;
       }
 
-      const parts = [session ? 'Session cleared.' : 'No active session.'];
+      const parts = [
+        sessionError !== null
+          ? `Could not clear the AI session: ${sessionError}`
+          : hadActiveSession
+            ? 'Session cleared.'
+            : 'No active session.',
+      ];
       parts.push(
         bindingCleared
           ? 'Cleared workspace binding (worktree + isolation env).'
@@ -1383,9 +1399,7 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       );
       if (abandoned > 0) parts.push(`Abandoned ${String(abandoned)} resumable run(s).`);
       if (abandonFailures > 0) {
-        parts.push(
-          `⚠️ ${String(abandonFailures)} run(s) could not be abandoned — check /workflow status.`
-        );
+        parts.push(`⚠️ ${String(abandonFailures)} run(s) could not be abandoned — retry /reset.`);
       }
       // Cascade + stranded-parent warnings mirror what `/workflow abandon <id>`
       // reports (#2731 R1): the abandon op surfaced them, `/reset` must too,
@@ -1404,10 +1418,22 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
       if (abandonError !== null) {
         parts.push(`⚠️ Could not look up resumable runs: ${abandonError}`);
       }
-      parts.push('Project attachment preserved — next message starts fresh.');
+
+      const resetComplete =
+        sessionError === null &&
+        bindingCleared &&
+        abandonError === null &&
+        abandonFailures === 0 &&
+        abandonCascadeFailures === 0 &&
+        abandonBlockedParentRunId === null;
+      parts.push(
+        resetComplete
+          ? 'Project attachment preserved — next message starts fresh.'
+          : 'Project attachment preserved. Reset is incomplete — retry /reset before sending the next message.'
+      );
 
       return {
-        success: bindingCleared && abandonError === null,
+        success: resetComplete,
         message: parts.join(' '),
       };
     }

@@ -497,7 +497,7 @@ export async function getPausedWorkflowRun(conversationId: string): Promise<Work
 }
 
 /**
- * Ids of every RESUMABLE run belonging to a conversation, newest first.
+ * Every RESUMABLE run belonging to a conversation, newest first.
  *
  * Used by `/reset` to give the user a real escape hatch: after these are
  * abandoned, the resume lookups find nothing, so the next dispatch starts fresh
@@ -514,20 +514,21 @@ export async function getPausedWorkflowRun(conversationId: string): Promise<Work
  * `workflow:` sub-runs inherit the parent's `conversation_id` AND
  * `parent_conversation_id` unchanged at every nesting level
  * (packages/workflows/src/executor.ts, child run creation), so this predicate
- * already covers the whole sub-run tree without a `parent_run_id` walk.
+ * covers the whole sub-run tree. `parent_run_id` lets the operation select one
+ * root per tree instead of publishing transient per-descendant diagnostics.
  */
-export async function findResumableRunIdsForConversation(
+export async function findResumableRunsForConversation(
   conversationId: string
-): Promise<string[]> {
+): Promise<Pick<WorkflowRun, 'id' | 'parent_run_id'>[]> {
   try {
-    const result = await pool.query<{ id: string }>(
-      `SELECT id FROM remote_agent_workflow_runs
+    const result = await pool.query<Pick<WorkflowRun, 'id' | 'parent_run_id'>>(
+      `SELECT id, parent_run_id FROM remote_agent_workflow_runs
        WHERE (conversation_id = $1 OR parent_conversation_id = $2)
          AND status IN ('paused', 'failed')
        ORDER BY started_at DESC`,
       [conversationId, conversationId]
     );
-    return result.rows.map(r => r.id);
+    return [...result.rows];
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, conversationId }, 'db.workflow_run_find_resumable_for_conv_failed');
@@ -1113,6 +1114,36 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
     // report "nothing to cancel" instead of a false "Cancelled" (see #1830 I1).
     // Same info level as the resume CAS-miss signal for consistency (S2).
     getLog().info({ workflowRunId: id }, 'db.workflow_run_cancel_noop');
+  }
+  return { cancelled };
+}
+
+/**
+ * Cancel a run only while it is still resumable.
+ *
+ * `/reset` selects paused/failed rows and then mutates them one at a time. The
+ * status predicate belongs in this UPDATE, not only in the earlier SELECT: a
+ * concurrent resume can otherwise move a selected row to `running` before the
+ * cancellation and transfer lifecycle ownership to another process.
+ */
+export async function cancelResumableWorkflowRun(id: string): Promise<{ cancelled: boolean }> {
+  const dialect = getDialect();
+  let result: Awaited<ReturnType<typeof pool.query>>;
+  try {
+    result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'cancelled', completed_at = ${dialect.now()}
+       WHERE id = $1 AND status IN ('paused', 'failed')`,
+      [id]
+    );
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_run_cancel_resumable_failed');
+    throw new Error(`Failed to cancel resumable workflow run: ${err.message}`);
+  }
+  const cancelled = (result.rowCount ?? 0) > 0;
+  if (!cancelled) {
+    getLog().info({ workflowRunId: id }, 'db.workflow_run_cancel_resumable_noop');
   }
   return { cancelled };
 }
