@@ -15,6 +15,7 @@
  * Module-singleton pattern mirrors `registeredGitHubAppAuthProvider`.
  */
 import { betterAuth } from 'better-auth';
+import type { User } from 'better-auth';
 import { APIError } from 'better-auth/api';
 import { Pool } from 'pg';
 import { createLogger } from '@archon/paths';
@@ -103,7 +104,9 @@ function buildAuth(env: NodeJS.ProcessEnv) {
     databaseHooks: {
       user: {
         create: {
-          before: async user => {
+          before: async (
+            user: User & Record<string, unknown>
+          ): Promise<{ data: User & Record<string, unknown> }> => {
             // Defense in depth: `disableSignUp` (set above from getSignupMode)
             // already blocks registration in `disabled` mode before this hook
             // runs — re-check here so the hook stays correct on its own if that

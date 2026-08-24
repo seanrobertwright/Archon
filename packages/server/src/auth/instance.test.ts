@@ -24,6 +24,16 @@ interface AuthOptions {
   };
 }
 
+interface FakeAuth {
+  handler: () => Response;
+  api: Record<string, never>;
+}
+
+interface FakeLogger {
+  info: () => void;
+  error: () => void;
+}
+
 let capturedOptions: AuthOptions | undefined;
 let poolOptions: { connectionString: string; max: number } | undefined;
 const endPool = mock(async (): Promise<void> => undefined);
@@ -37,22 +47,30 @@ class FakePool {
 }
 
 class FakeAPIError extends Error {
-  constructor(_status: string, options: { message: string }) {
+  readonly status: string;
+
+  constructor(status: string, options: { message: string }) {
     super(options.message);
+    this.status = status;
   }
 }
 
-mock.module('better-auth', () => ({
-  betterAuth: (options: AuthOptions) => {
+mock.module('better-auth', (): { betterAuth: (options: AuthOptions) => FakeAuth } => ({
+  betterAuth: (options: AuthOptions): FakeAuth => {
     capturedOptions = options;
-    return { handler: mock(() => new Response()), api: {} };
+    return { handler: mock((): Response => new Response()), api: {} };
   },
 }));
 
-mock.module('better-auth/api', () => ({ APIError: FakeAPIError }));
-mock.module('pg', () => ({ Pool: FakePool }));
-mock.module('@archon/paths', () => ({
-  createLogger: () => ({ info: mock(() => undefined), error: mock(() => undefined) }),
+mock.module('better-auth/api', (): { APIError: typeof FakeAPIError } => ({
+  APIError: FakeAPIError,
+}));
+mock.module('pg', (): { Pool: typeof FakePool } => ({ Pool: FakePool }));
+mock.module('@archon/paths', (): { createLogger: () => FakeLogger } => ({
+  createLogger: (): FakeLogger => ({
+    info: mock((): undefined => undefined),
+    error: mock((): undefined => undefined),
+  }),
 }));
 
 const { closeAuth, getAuth, resetAuthForTest } = await import('./instance');
@@ -75,26 +93,26 @@ function signupHook(): AuthOptions['databaseHooks']['user']['create']['before'] 
   return hook;
 }
 
-beforeEach(() => {
+beforeEach((): void => {
   capturedOptions = undefined;
   poolOptions = undefined;
   endPool.mockClear();
   resetAuthForTest();
 });
 
-afterEach(async () => {
+afterEach(async (): Promise<void> => {
   await closeAuth();
   resetAuthForTest();
 });
 
-describe('getAuth', () => {
-  test('returns null without both PostgreSQL and a signing secret', () => {
+describe('getAuth', (): void => {
+  test('returns null without both PostgreSQL and a signing secret', (): void => {
     expect(getAuth({})).toBeNull();
     expect(capturedOptions).toBeUndefined();
     expect(poolOptions).toBeUndefined();
   });
 
-  test('constructs the configured PostgreSQL email/password instance', () => {
+  test('constructs the configured PostgreSQL email/password instance', (): void => {
     const auth = getAuth(
       enabledEnv({
         BETTER_AUTH_URL: 'https://archon.example.test',
@@ -117,8 +135,8 @@ describe('getAuth', () => {
   });
 });
 
-describe('signup hook', () => {
-  test('rejects signup when the safe default disables it', async () => {
+describe('signup hook', (): void => {
+  test('rejects signup when the safe default disables it', async (): Promise<void> => {
     getAuth(enabledEnv({ ARCHON_AUTH_OPEN_SIGNUP: undefined }));
     expect(capturedOptions?.emailAndPassword.disableSignUp).toBe(true);
     await expect(signupHook()({ email: 'person@example.test' })).rejects.toThrow(
@@ -126,7 +144,7 @@ describe('signup hook', () => {
     );
   });
 
-  test('rejects missing and non-allowlisted email addresses', async () => {
+  test('rejects missing and non-allowlisted email addresses', async (): Promise<void> => {
     getAuth(
       enabledEnv({
         ARCHON_AUTH_OPEN_SIGNUP: undefined,
@@ -134,13 +152,16 @@ describe('signup hook', () => {
       })
     );
 
-    await expect(signupHook()({ name: 'Missing Email' })).rejects.toThrow('Email is required.');
+    await expect(signupHook()({ name: 'Missing Email' })).rejects.toMatchObject({
+      message: 'Email is required.',
+      status: 'BAD_REQUEST',
+    });
     await expect(signupHook()({ email: 'other@example.test' })).rejects.toThrow(
       'This email is not on the invite allowlist.'
     );
   });
 
-  test('returns the original user for allowlisted and open signup', async () => {
+  test('returns the original user for allowlisted and open signup', async (): Promise<void> => {
     const allowlisted = { email: 'allowed@example.test', name: 'Allowed' };
     getAuth(
       enabledEnv({
