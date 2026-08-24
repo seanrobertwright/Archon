@@ -170,8 +170,8 @@ describe('detached run control integration', () => {
     const server = createServer((socket: Socket): void => {
       socket.setEncoding('utf8');
       let request = '';
-      socket.on('data', (chunk: Buffer): void => {
-        request += chunk.toString();
+      socket.on('data', (chunk: string): void => {
+        request += chunk;
         if (request.includes('stop\n')) {
           socket.write(`${JSON.stringify({ pid: 12345 })}\n`);
           request = request.replace('stop\n', '');
