@@ -4,6 +4,7 @@ import {
   invalidRunConfigValue,
   isConfigRecord,
 } from '../../shared/run-config';
+import { parsePiModelRef } from './model-ref';
 
 export type { PiProviderDefaults };
 
@@ -194,8 +195,11 @@ export function parsePiRunConfig(raw: Record<string, unknown>): ParsedPiConfig {
     'extensionFlags',
     'nodes',
   ]);
-  if (raw.model !== undefined && typeof raw.model !== 'string') {
-    invalidRunConfigValue('model', 'a string');
+  if (raw.model !== undefined) {
+    if (typeof raw.model !== 'string') invalidRunConfigValue('model', 'a string');
+    if (parsePiModelRef(raw.model) === undefined) {
+      invalidRunConfigValue('model', "'<provider>/<model>'");
+    }
   }
   validateExtensionPosture(
     Object.fromEntries(

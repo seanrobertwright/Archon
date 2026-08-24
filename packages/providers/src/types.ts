@@ -785,6 +785,9 @@ export interface ProviderRegistration {
    * reject values the provider would otherwise silently discard.
    */
   parseRunConfig: ProviderRunConfigParser;
+
+  /** Return a reason when a model reference cannot reach this provider. */
+  validateModelRef?: (model: string) => string | undefined;
 }
 
 /**

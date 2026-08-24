@@ -92,8 +92,15 @@ function assertRegisteredProvider(provider: string, path: string): void {
   );
 }
 
-function assertValidPreset(path: string, preset: { provider: string; effort?: string }): void {
+function assertValidPreset(
+  path: string,
+  preset: { provider: string; model: string; effort?: string }
+): void {
   assertRegisteredProvider(preset.provider, `${path}.provider`);
+  const modelError = getRegistration(preset.provider).validateModelRef?.(preset.model);
+  if (modelError !== undefined) {
+    throw new Error(`Invalid run config at '${path}.model': ${modelError}.`);
+  }
   if (preset.effort !== undefined && !isEffortValidForProvider(preset.provider, preset.effort)) {
     const valid = validEffortsForProvider(preset.provider);
     throw new Error(

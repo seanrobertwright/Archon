@@ -114,6 +114,24 @@ describe('workflow run config', () => {
         { kind: 'http', label: 'inline' }
       )
     ).toThrow("Invalid run config at 'tiers.large.effort'");
+    expect(() =>
+      parseWorkflowRunConfig(
+        {
+          tiers: {
+            large: { provider: 'codex', model: 'gpt-5.6-sol', typo: true },
+          },
+        },
+        { kind: 'http', label: 'inline' }
+      )
+    ).toThrow("Invalid run config at 'tiers.large'");
+    for (const provider of ['pi', 'opencode']) {
+      expect(() =>
+        parseWorkflowRunConfig(
+          { aliases: { '@bad': { provider, model: 'banana' } } },
+          { kind: 'http', label: 'inline' }
+        )
+      ).toThrow("Invalid run config at 'aliases.@bad.model'");
+    }
   });
 
   it('rejects Pi defaults whose consumers own process-lifetime state', () => {
@@ -137,6 +155,7 @@ describe('workflow run config', () => {
       ['codex', { typo: true }, 'assistants.codex.typo'],
       ['claude', { settingSources: 'project' }, 'assistants.claude.settingSources'],
       ['pi', { apiKey: 'secret' }, 'assistants.pi.apiKey'],
+      ['pi', { model: 'banana' }, 'assistants.pi.model'],
       ['opencode', { model: 'gpt-5' }, 'assistants.opencode.model'],
       ['opencode', { baseUrl: 'http://localhost:4096' }, 'assistants.opencode.baseUrl'],
       ['opencode', { agent: 'general' }, 'assistants.opencode.agent'],
