@@ -627,7 +627,12 @@ nodes:
       parent,
       'goal',
       'conv-db',
-      { modelOverrides: { tiers: { large: 'codex/gpt-5.6-sol' } } }
+      {
+        modelOverrideLayer: {
+          kind: 'raw',
+          overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+        },
+      }
     );
 
     expect(result.success).toBe(true);

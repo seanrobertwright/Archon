@@ -17,7 +17,7 @@
 import { getProviderCapabilities, isRegisteredProvider } from '@archon/providers';
 import { parsePiModelRef } from '@archon/providers/community/pi';
 import tierDefaults from './defaults/tier-defaults.json';
-import { EFFORT_LEVELS, type ThinkingConfig } from './schemas/dag-node';
+import { EFFORT_LEVELS, thinkingConfigSchema, type ThinkingConfig } from './schemas/dag-node';
 
 /** Reserved tier names — cannot be used as custom alias names */
 export const TIER_NAMES = ['small', 'medium', 'large'] as const;
@@ -121,6 +121,35 @@ function assertValidEntry(name: string, entry: RawAliasEntry): void {
   }
   if (typeof entry.model !== 'string' || entry.model.length === 0) {
     throw new Error(`Alias '${name}' has invalid model — must be a non-empty string.`);
+  }
+}
+
+function assertValidPersistedPreset(name: string, entry: unknown): asserts entry is RawAliasEntry {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`Model binding '${name}' must be an object.`);
+  }
+  const record = entry as Record<string, unknown>;
+  assertValidEntry(name, record as unknown as RawAliasEntry);
+  if (record.effort !== undefined) {
+    if (typeof record.effort !== 'string') {
+      throw new Error(`Model binding '${name}' has an invalid effort.`);
+    }
+    const effort = resolvePresetEffort(record.provider as string, record.effort);
+    if (!effort.ok) {
+      throw new Error(
+        `Model binding '${name}' has effort '${record.effort}' that provider '${String(record.provider)}' does not accept.`
+      );
+    }
+  }
+  if (record.thinking !== undefined) {
+    if (
+      !record.thinking ||
+      typeof record.thinking !== 'object' ||
+      Array.isArray(record.thinking) ||
+      !thinkingConfigSchema.safeParse(record.thinking).success
+    ) {
+      throw new Error(`Model binding '${name}' has invalid thinking options.`);
+    }
   }
 }
 
@@ -388,6 +417,9 @@ export function readRunModelBindingsMetadata(
     if (layer !== undefined && (!layer || typeof layer !== 'object' || Array.isArray(layer))) {
       throw new Error(`Workflow run has invalid model_bindings ${layerName} metadata.`);
     }
+    for (const [name, preset] of Object.entries((layer ?? {}) as Record<string, unknown>)) {
+      assertValidPersistedPreset(name, preset);
+    }
   }
 
   const effectiveRecord = effective as Record<string, unknown>;
@@ -406,7 +438,7 @@ export function readRunModelBindingsMetadata(
     runAliases: resolved.aliases,
   });
   for (const [name, preset] of Object.entries(effectiveRecord.aliases)) {
-    assertValidEntry(name, preset as RawAliasEntry);
+    assertValidPersistedPreset(name, preset);
   }
 
   return value as RunModelBindingsMetadata;

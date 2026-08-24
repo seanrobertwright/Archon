@@ -581,7 +581,9 @@ async function dispatchBackgroundWorkflowOwned(
             // the executor creates the row itself); otherwise the row above already
             // carries them.
             inputs: ctx.inputs,
-            modelOverrides: ctx.modelOverrides,
+            ...(ctx.modelOverrides
+              ? { modelOverrideLayer: { kind: 'raw' as const, overrides: ctx.modelOverrides } }
+              : {}),
           }
         );
         // Surface workflow output to parent conversation as a result card

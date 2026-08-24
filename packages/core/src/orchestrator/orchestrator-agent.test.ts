@@ -2480,8 +2480,11 @@ describe('workflow dispatch routing — interactive flag', () => {
       workflowModelOverrides: { tiers: { large: 'openai/gpt-5.6' } },
     });
 
-    const opts = mockExecuteWorkflow.mock.calls[0][7] as { modelOverrides?: unknown };
-    expect(opts.modelOverrides).toEqual({ tiers: { large: 'openai/gpt-5.6' } });
+    const opts = mockExecuteWorkflow.mock.calls[0][7] as { modelOverrideLayer?: unknown };
+    expect(opts.modelOverrideLayer).toEqual({
+      kind: 'raw',
+      overrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
   });
 
   test('threads context.workflowModelOverrides into the console background path', async () => {
@@ -2672,7 +2675,7 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(sent).toContain('implicit-model-resume');
     expect(sent).not.toContain('openai/gpt-5.6');
     expect(mockExecuteWorkflow).toHaveBeenCalled();
-    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.modelOverrides).toBeUndefined();
+    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.modelOverrideLayer).toBeUndefined();
   });
 
   test('re-raises the deferred input error when hydration finds nothing to resume', async () => {

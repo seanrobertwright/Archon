@@ -406,6 +406,36 @@ describe('per-run model bindings', () => {
         model_bindings: { ...value, overrides: { aliases: [] } },
       })
     ).toThrow(/invalid model_bindings aliases/);
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          overrides: {
+            tiers: {
+              large: {
+                provider: 'claude',
+                model: 'opus',
+                thinking: { type: 'enabled', budgetTokens: -1 },
+              },
+            },
+          },
+        },
+      })
+    ).toThrow(/invalid thinking options/);
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          effective: {
+            ...value.effective,
+            aliases: {
+              ...value.effective.aliases,
+              large: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'warp' },
+            },
+          },
+        },
+      })
+    ).toThrow(/effort 'warp'/);
   });
 });
 

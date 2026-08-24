@@ -572,8 +572,11 @@ describe('dispatchBackgroundWorkflow', () => {
     );
     await flushBackgroundExecution();
 
-    const opts = mockExecuteWorkflow.mock.calls[0]?.[7] as { modelOverrides?: unknown };
-    expect(opts.modelOverrides).toEqual({ tiers: { large: 'openai/gpt-5.6' } });
+    const opts = mockExecuteWorkflow.mock.calls[0]?.[7] as { modelOverrideLayer?: unknown };
+    expect(opts.modelOverrideLayer).toEqual({
+      kind: 'raw',
+      overrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
   });
 
   test('default policy still resolves isolation for the worker', async () => {

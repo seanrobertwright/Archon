@@ -749,7 +749,12 @@ describe('executeWorkflow', () => {
         makeWorkflow({ model: 'large' }),
         'msg',
         'db-conv-1',
-        { modelOverrides: { tiers: { large: 'openai/gpt-5.6' } } }
+        {
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { tiers: { large: 'openai/gpt-5.6' } },
+          },
+        }
       );
 
       expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('pi');
@@ -788,7 +793,10 @@ describe('executeWorkflow', () => {
         'db-conv-1',
         {
           preCreatedRun,
-          modelOverrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+          },
         }
       );
 
@@ -818,7 +826,10 @@ describe('executeWorkflow', () => {
         'db-conv-1',
         {
           preCreatedRun,
-          modelOverrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+          modelOverrideLayer: {
+            kind: 'raw',
+            overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+          },
         }
       );
 
@@ -880,19 +891,22 @@ describe('executeWorkflow', () => {
           {
             preCreatedRun,
             priorCompletedNodes: new Map(),
-            modelOverrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+            },
           }
         )
       ).rejects.toThrow(/Cannot supply model overrides when resuming/);
     });
 
     it('fails a pre-created row when a semantic binding error stops startup', async () => {
-      const updateRun = mock<IWorkflowStore['updateWorkflowRun']>(async () => {});
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preCreatedRun = makeRun({ id: 'invalid-model-run', status: 'pending', metadata: {} });
 
       await expect(
         executeWorkflow(
-          makeDeps(makeStore({ updateWorkflowRun: updateRun })),
+          makeDeps(makeStore({ failWorkflowRun: failRun })),
           makePlatform(),
           'conv-1',
           '/tmp',
@@ -901,11 +915,17 @@ describe('executeWorkflow', () => {
           'db-conv-1',
           {
             preCreatedRun,
-            modelOverrides: { aliases: { '@missing': 'codex/gpt-5.6-sol' } },
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { aliases: { '@missing': 'codex/gpt-5.6-sol' } },
+            },
           }
         )
       ).rejects.toThrow(/unknown alias '@missing'/);
-      expect(updateRun).toHaveBeenCalledWith('invalid-model-run', { status: 'failed' });
+      expect(failRun).toHaveBeenCalledWith(
+        'invalid-model-run',
+        expect.stringContaining("unknown alias '@missing'")
+      );
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
@@ -920,7 +940,12 @@ describe('executeWorkflow', () => {
           workflow,
           'a',
           'db-a',
-          { modelOverrides: { tiers: { large: 'openai/gpt-5.6' } } }
+          {
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { tiers: { large: 'openai/gpt-5.6' } },
+            },
+          }
         ),
         executeWorkflow(
           makeDeps(makeStore({ createWorkflowRun: mock(async () => makeRun({ id: 'run-b' })) })),
@@ -930,7 +955,12 @@ describe('executeWorkflow', () => {
           workflow,
           'b',
           'db-b',
-          { modelOverrides: { tiers: { large: 'codex/gpt-5.6-sol' } } }
+          {
+            modelOverrideLayer: {
+              kind: 'raw',
+              overrides: { tiers: { large: 'codex/gpt-5.6-sol' } },
+            },
+          }
         ),
       ]);
 

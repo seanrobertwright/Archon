@@ -1184,7 +1184,14 @@ async function dispatchOrchestratorWorkflowOwned(
           // This branch creates a FRESH run row (the prior run had nothing to resume),
           // so the supplied inputs still need stamping.
           inputs: resolvedInputs,
-          modelOverrides: options?.modelOverrides,
+          ...(options?.modelOverrides
+            ? {
+                modelOverrideLayer: {
+                  kind: 'raw' as const,
+                  overrides: options.modelOverrides,
+                },
+              }
+            : {}),
         }
       );
     }
@@ -1262,7 +1269,11 @@ async function dispatchOrchestratorWorkflowOwned(
         resolveChildIsolation,
         capturedSourceOwner: owner,
         inputs: resolvedInputs,
-        modelOverrides: options?.modelOverrides,
+        ...(options?.modelOverrides
+          ? {
+              modelOverrideLayer: { kind: 'raw' as const, overrides: options.modelOverrides },
+            }
+          : {}),
       }
     );
   }

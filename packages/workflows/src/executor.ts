@@ -655,10 +655,10 @@ export type ExecuteWorkflowOptions = ResumePayload & {
    * Ignored on a resume: the row already carries the inputs validated at creation.
    */
   inputs?: Readonly<Record<string, string>>;
-  /** Sparse tier/@alias rebindings for this invocation, shared by CLI and HTTP. */
-  modelOverrides?: RunModelOverrides;
-  /** Engine-internal resolved layer propagated to recursive workflow children. */
-  resolvedModelOverrides?: ResolvedRunModelOverrides;
+  /** One model-binding phase: raw at invocation boundaries, resolved for child runs. */
+  modelOverrideLayer?:
+    | { kind: 'raw'; overrides: RunModelOverrides }
+    | { kind: 'resolved'; overrides: ResolvedRunModelOverrides };
   /**
    * The frozen source this run executes, from {@link prepareWorkflowSource}.
    *
@@ -1104,8 +1104,8 @@ async function runChildWorkflow(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   args: RunChildWorkflowArgs,
-  resolveChildIsolation?: ChildIsolationResolver,
-  resolvedModelOverrides?: ResolvedRunModelOverrides
+  resolvedModelOverrides: ResolvedRunModelOverrides,
+  resolveChildIsolation?: ChildIsolationResolver
 ): Promise<ChildWorkflowOutcome> {
   const {
     parentRun,
@@ -1319,7 +1319,7 @@ async function runChildWorkflow(
           codebaseId,
           resolveChildIsolation,
           preparedSource: childSource,
-          resolvedModelOverrides,
+          modelOverrideLayer: { kind: 'resolved', overrides: resolvedModelOverrides },
         };
         childRunId = hydrated.preCreatedRun.id;
       } else {
@@ -1331,7 +1331,7 @@ async function runChildWorkflow(
           codebaseId,
           resolveChildIsolation,
           preparedSource: childSource,
-          resolvedModelOverrides,
+          modelOverrideLayer: { kind: 'resolved', overrides: resolvedModelOverrides },
         };
         childRunId = preCreatedRun.id;
       }
@@ -1394,7 +1394,7 @@ async function runChildWorkflow(
         codebaseId,
         resolveChildIsolation,
         preparedSource: childSource,
-        resolvedModelOverrides,
+        modelOverrideLayer: { kind: 'resolved', overrides: resolvedModelOverrides },
       };
       childRunId = childRun.id;
     }
@@ -1702,12 +1702,15 @@ export async function executeWorkflow(
     container: containerCtx,
     resolveChildIsolation,
     inputs: suppliedInputs,
-    modelOverrides,
-    resolvedModelOverrides: callerResolvedModelOverrides,
+    modelOverrideLayer,
     preparedSource,
   } = opts;
 
   const executionUserId = preCreatedRun ? (preCreatedRun.user_id ?? undefined) : userId;
+  const modelOverrides =
+    modelOverrideLayer?.kind === 'raw' ? modelOverrideLayer.overrides : undefined;
+  const callerResolvedModelOverrides =
+    modelOverrideLayer?.kind === 'resolved' ? modelOverrideLayer.overrides : undefined;
   const isContinuation =
     preCreatedRun !== undefined &&
     (priorCompletedNodes !== undefined || preCreatedRun.status !== 'pending');
@@ -1883,7 +1886,7 @@ export async function executeWorkflow(
     // lifecycle catch.
     if (preCreatedRun) {
       await deps.store
-        .updateWorkflowRun(preCreatedRun.id, { status: 'failed' })
+        .failWorkflowRun(preCreatedRun.id, (error as Error).message)
         .catch((dbError: Error) => {
           getLog().error(
             { err: dbError, workflowRunId: preCreatedRun.id },
@@ -2829,7 +2832,7 @@ export async function executeWorkflow(
       // Also captures the per-child isolation resolver (slice 2, PR-A) so an
       // `isolation: 'worktree'` child gets its own worktree cwd.
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
-        runChildWorkflow(deps, platform, childArgs, resolveChildIsolation, resolvedModelOverrides),
+        runChildWorkflow(deps, platform, childArgs, resolvedModelOverrides, resolveChildIsolation),
       dagPriorUsage,
       priorNodeSessions,
       // Container runs resolve from the capture like every other run: it is bind-mounted

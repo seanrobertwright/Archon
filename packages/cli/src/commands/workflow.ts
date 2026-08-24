@@ -19,6 +19,8 @@ import {
   parseRunModelAssignments,
   resolveRunModelOverrides,
   TIER_NAMES,
+  type BuildAiProfileOptions,
+  type ResolvedAiProfile,
   type TierName,
   type RawTiersConfig,
 } from '@archon/workflows/model-validation';
@@ -648,6 +650,18 @@ async function assertCliWorkflowRequirementsMet(workflow: WorkflowDefinition): P
   assertWorkflowRequirementsMet(workflow, { githubConnected });
 }
 
+async function resolveCliDryRunAiPrefs(): Promise<Awaited<ReturnType<typeof getUserAiPrefs>>> {
+  const cliId = resolveCliUserId();
+  if (!cliId) return {};
+  try {
+    const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+    return await getUserAiPrefs(cliUser.id);
+  } catch (error) {
+    getLog().warn({ err: error as Error, cliId }, 'cli.dry_run_user_ai_prefs_resolve_failed');
+    return {};
+  }
+}
+
 /**
  * Resolve the provider used for CLI conversation titles from the workflow itself.
  * This keeps auxiliary title generation aligned with workflow execution instead
@@ -1198,10 +1212,26 @@ async function runWorkflowWithOwnedSource(
     // script nodes, and running them in the checkout the workflow was merely READ from
     // would mutate the author's tree instead of the one they aimed the dry run at.
     const dryRunConfig = await loadConfig(cwd);
-    const dryRunBaseProfile = buildAiProfile(dryRunConfig.assistant, {
+    const dryRunUserPrefs = await resolveCliDryRunAiPrefs();
+    let dryRunDefaultProvider = dryRunUserPrefs.defaultProvider ?? dryRunConfig.assistant;
+    let dryRunProfileOptions: BuildAiProfileOptions = {
       repoTiers: dryRunConfig.tiers,
       repoAliases: dryRunConfig.aliases,
-    });
+      userTiers: dryRunUserPrefs.tiers,
+      userAliases: dryRunUserPrefs.aliases,
+    };
+    let dryRunBaseProfile: ResolvedAiProfile;
+    try {
+      dryRunBaseProfile = buildAiProfile(dryRunDefaultProvider, dryRunProfileOptions);
+    } catch (error) {
+      getLog().error({ err: error as Error }, 'cli.dry_run_user_ai_prefs_profile_invalid');
+      dryRunDefaultProvider = dryRunConfig.assistant;
+      dryRunProfileOptions = {
+        repoTiers: dryRunConfig.tiers,
+        repoAliases: dryRunConfig.aliases,
+      };
+      dryRunBaseProfile = buildAiProfile(dryRunDefaultProvider, dryRunProfileOptions);
+    }
     const dryRunModelOverrides = resolveRunModelOverrides(dryRunBaseProfile, modelOverrides);
     const result = await dryRunWorkflow({
       workflow,
@@ -1213,9 +1243,8 @@ async function runWorkflowWithOwnedSource(
       defaultStubs: options.defaultStubs,
       pauseAtGates: options.pauseAtGates,
       config: dryRunConfig,
-      aiProfile: buildAiProfile(dryRunConfig.assistant, {
-        repoTiers: dryRunConfig.tiers,
-        repoAliases: dryRunConfig.aliases,
+      aiProfile: buildAiProfile(dryRunDefaultProvider, {
+        ...dryRunProfileOptions,
         runTiers: dryRunModelOverrides.tiers,
         runAliases: dryRunModelOverrides.aliases,
       }),
@@ -2280,7 +2309,9 @@ async function runWorkflowWithOwnedSource(
           resolveChildIsolation,
           // Fresh run only: a resume (`prepared`) replays the inputs already on its row.
           inputs: resolvedInputs,
-          modelOverrides,
+          ...(modelOverrides
+            ? { modelOverrideLayer: { kind: 'raw' as const, overrides: modelOverrides } }
+            : {}),
           // The frozen source this run executes, captured before the workflow was even
           // selected. A resume ignores it and loads the source recorded on its own row.
           preparedSource,

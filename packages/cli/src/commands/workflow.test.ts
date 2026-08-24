@@ -764,6 +764,48 @@ describe('workflowRunCommand — dry-run', () => {
     expect(consoleSpy).not.toHaveBeenCalled();
   });
 
+  it('layers acting-user preferences before resolving dry-run model bindings', async () => {
+    const previousUserId = process.env.ARCHON_USER_ID;
+    process.env.ARCHON_USER_ID = 'dry-run-user';
+    try {
+      const core = await import('@archon/core');
+      const dryRun = await import('@archon/workflows/dry-run');
+      (core.loadConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        assistant: 'claude',
+        tiers: {},
+        aliases: {},
+      });
+      (core.getUserAiPrefs as ReturnType<typeof mock>).mockResolvedValueOnce({
+        defaultProvider: 'codex',
+        aliases: {
+          '@personal': { provider: 'claude', model: 'opus' },
+          '@planner': { provider: 'pi', model: 'openai/gpt-5.6' },
+        },
+      });
+
+      await workflowRunCommand('/test/path', 'plan', 'hello', {
+        dryRun: true,
+        modelAssignments: ['large=@personal', '@planner=next-model'],
+      });
+
+      const options = (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+        aiProfile: {
+          defaultProvider: string;
+          aliases: Record<string, { provider: string; model: string }>;
+        };
+      };
+      expect(options.aiProfile.defaultProvider).toBe('codex');
+      expect(options.aiProfile.aliases.large).toEqual({ provider: 'claude', model: 'opus' });
+      expect(options.aiProfile.aliases['@planner']).toEqual({
+        provider: 'pi',
+        model: 'next-model',
+      });
+    } finally {
+      if (previousUserId === undefined) Reflect.deleteProperty(process.env, 'ARCHON_USER_ID');
+      else process.env.ARCHON_USER_ID = previousUserId;
+    }
+  });
+
   it('writes a scaffold from the discovered workflow and exits before simulation', async () => {
     const { executeWorkflow } = await import('@archon/workflows/executor');
     const dryRun = await import('@archon/workflows/dry-run');
@@ -1335,11 +1377,14 @@ describe('workflowRunCommand — sparse model bindings (#2481)', () => {
     });
 
     const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][7] as {
-      modelOverrides?: unknown;
+      modelOverrideLayer?: unknown;
     };
-    expect(opts.modelOverrides).toEqual({
-      tiers: { large: 'openai/gpt-5.6' },
-      aliases: { '@planner': 'codex/gpt-5.6-sol' },
+    expect(opts.modelOverrideLayer).toEqual({
+      kind: 'raw',
+      overrides: {
+        tiers: { large: 'openai/gpt-5.6' },
+        aliases: { '@planner': 'codex/gpt-5.6-sol' },
+      },
     });
   });
 
