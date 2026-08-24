@@ -135,7 +135,8 @@ function adaptLoginCallbacks(
         return (await callbacks.onSelect({ options: prompt.options })) ?? '';
       }
       // text / secret — Pi uses these for one-off prompts (e.g. github-copilot
-      // enterprise domain). The bridge routes them to the same code-deferred.
+      // enterprise domain). The caller decides how to answer; the Archon
+      // bridge has no interactive channel and returns "" (blank default).
       return callbacks.onPrompt(prompt);
     },
     notify: (event: AuthEvent): void => {
