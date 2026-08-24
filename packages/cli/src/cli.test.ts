@@ -163,12 +163,16 @@ describe('workflow run config argument', () => {
     writeFileSync(join(repo, '.archon', '.env'), `TOKEN_ENCRYPTION_KEY=${'22'.repeat(32)}\n`);
 
     const savedKey = process.env.TOKEN_ENCRYPTION_KEY;
-    process.env.TOKEN_ENCRYPTION_KEY = '11'.repeat(32);
+    const savedArchonHome = process.env.ARCHON_HOME;
+    delete process.env.TOKEN_ENCRYPTION_KEY;
+    process.env.ARCHON_HOME = archonHome;
     const payload = JSON.stringify(
       sealWorkflowRunConfig({ docsPath: 'accepted' }, { kind: 'cli', label: 'config.minimax.yaml' })
     );
     if (savedKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
     else process.env.TOKEN_ENCRYPTION_KEY = savedKey;
+    if (savedArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = savedArchonHome;
 
     try {
       const result = spawnSync(
@@ -189,7 +193,7 @@ describe('workflow run config argument', () => {
           env: {
             ...process.env,
             ARCHON_HOME: archonHome,
-            TOKEN_ENCRYPTION_KEY: '11'.repeat(32),
+            TOKEN_ENCRYPTION_KEY: '',
           },
         }
       );

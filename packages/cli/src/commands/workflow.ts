@@ -439,14 +439,17 @@ export function buildDetachedRunCmd(
 async function spawnDetachedWorkflowRun(
   cwd: string,
   conversationId: string,
-  extraArgs: string[]
+  extraArgs: string[],
+  runConfigPayload?: string
 ): Promise<string | null> {
   const cmd = buildDetachedRunCmd(
     BUNDLED_IS_BINARY,
     process.execPath,
     process.argv,
     cwd,
-    extraArgs
+    runConfigPayload
+      ? [...extraArgs, '--internal-detached-run-config', runConfigPayload]
+      : extraArgs
   );
 
   let logPath: string | null = null;
@@ -486,6 +489,14 @@ async function spawnDetachedWorkflowRun(
       env: {
         ...process.env,
         [DETACHED_RUN_OWNER_ENV]: '1',
+        ...(runConfigPayload
+          ? {
+              // Empty strings preserve meaningful absence: Bun will not fill
+              // these from the target repo's auto-loaded .env.
+              TOKEN_ENCRYPTION_KEY: process.env.TOKEN_ENCRYPTION_KEY ?? '',
+              ARCHON_HOME: process.env.ARCHON_HOME ?? '',
+            }
+          : {}),
       },
       stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
       detached: true,
@@ -1528,10 +1539,12 @@ async function runWorkflowWithOwnedSource(
     const runConfigPayload = runConfig
       ? JSON.stringify(sealWorkflowRunConfig(runConfig.layer, runConfig.source))
       : undefined;
-    if (runConfigPayload) {
-      extraArgs.push('--internal-detached-run-config', runConfigPayload);
-    }
-    const logPath = await spawnDetachedWorkflowRun(cwd, childConversationId, extraArgs);
+    const logPath = await spawnDetachedWorkflowRun(
+      cwd,
+      childConversationId,
+      extraArgs,
+      runConfigPayload
+    );
 
     if (options.json) {
       await writeJsonLine({

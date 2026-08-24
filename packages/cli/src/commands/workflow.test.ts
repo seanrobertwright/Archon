@@ -5325,7 +5325,9 @@ describe('workflowRunCommand — detach', () => {
     const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
     const savedArgv = process.argv;
     const savedKey = process.env.TOKEN_ENCRYPTION_KEY;
+    const savedArchonHome = process.env.ARCHON_HOME;
     process.env.TOKEN_ENCRYPTION_KEY = 'ab'.repeat(32);
+    delete process.env.ARCHON_HOME;
     process.argv = [
       'bun',
       '/abs/cli.ts',
@@ -5354,10 +5356,14 @@ describe('workflowRunCommand — detach', () => {
       const payloadIndex = spawnOptions?.cmd?.indexOf('--internal-detached-run-config') ?? -1;
       payload = payloadIndex >= 0 ? spawnOptions?.cmd?.[payloadIndex + 1] : undefined;
       expect(spawnOptions?.env?.ARCHON_INTERNAL_DETACHED_RUN_CONFIG).toBeUndefined();
+      expect(spawnOptions?.env?.TOKEN_ENCRYPTION_KEY).toBe('ab'.repeat(32));
+      expect(spawnOptions?.env?.ARCHON_HOME).toBe('');
     } finally {
       process.argv = savedArgv;
       if (savedKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
       else process.env.TOKEN_ENCRYPTION_KEY = savedKey;
+      if (savedArchonHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = savedArchonHome;
       spawnSpy.mockRestore();
     }
 
