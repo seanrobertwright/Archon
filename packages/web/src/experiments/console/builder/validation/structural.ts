@@ -4,7 +4,29 @@
  * without depending on a runtime schema.
  */
 import type { BuilderNode, BuilderWorkflow, Issue } from '../types';
+import { OUTPUT_REF_SOURCE } from '@/lib/node-ref';
 import { makeIssue } from './make-issue';
+
+const waitTimestampPattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
+const wholeInputsRefPattern = /^\$INPUTS\.[a-zA-Z_][a-zA-Z0-9_-]*$/;
+
+function isValidWaitTimestamp(value: string): boolean {
+  if (new RegExp(OUTPUT_REF_SOURCE).test(value) || wholeInputsRefPattern.test(value.trim())) {
+    return true;
+  }
+  const match = waitTimestampPattern.exec(value);
+  if (match === null) return false;
+  const parsed = new Date(value);
+  return (
+    Number.isFinite(parsed.getTime()) &&
+    parsed.getUTCFullYear() === Number(match[1]) &&
+    parsed.getUTCMonth() + 1 === Number(match[2]) &&
+    parsed.getUTCDate() === Number(match[3]) &&
+    parsed.getUTCHours() === Number(match[4]) &&
+    parsed.getUTCMinutes() === Number(match[5]) &&
+    parsed.getUTCSeconds() === Number(match[6])
+  );
+}
 
 /** Empty (or whitespace-only) ids and duplicate ids across the node list. */
 function checkIds(nodes: BuilderNode[]): Issue[] {
@@ -139,8 +161,14 @@ function checkRequiredFields(node: BuilderNode): Issue[] {
       ) {
         invalid('wait.duration_ms', 'wait duration must be a positive integer');
       }
-      if (node.data.until?.trim().length === 0)
+      if (node.data.until?.trim().length === 0) {
         missing('wait.until', 'wait timestamp must not be empty');
+      } else if (node.data.until !== undefined && !isValidWaitTimestamp(node.data.until)) {
+        invalid(
+          'wait.until',
+          'wait timestamp must be an ISO-8601 UTC timestamp or contain a runtime reference'
+        );
+      }
       if (node.data.event?.trim().length === 0)
         missing('wait.event', 'wait event must not be empty');
       if (

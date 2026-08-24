@@ -181,6 +181,23 @@ describe('validateStructural', () => {
     expect(issues.some(i => i.path.field === 'approval.message')).toBe(true);
   });
 
+  test('wait timestamps match the engine literal and runtime-reference grammar', () => {
+    for (const [until, shouldPass] of [
+      ['2026-08-25T22:00:00Z', true],
+      ['2026-08-25T22:00:00.000Z', true],
+      ['$clock.output.resume_at', true],
+      ['$INPUTS.resume_at', true],
+      ['tomorrow', false],
+      ['2026-08-25T22:00:00', false],
+      ['2026-08-25T22:00:00+02:00', false],
+    ] as const) {
+      const issues = validateStructural(
+        wf([{ id: 'wait', variant: 'wait', base: {}, data: { until } }])
+      );
+      expect(issues.some(i => i.path.field === 'wait.until')).toBe(!shouldPass);
+    }
+  });
+
   test('cancel missing reason is flagged', () => {
     const issues = validateStructural(
       wf([{ id: 'c', variant: 'cancel', base: {}, data: { reason: '' } }])

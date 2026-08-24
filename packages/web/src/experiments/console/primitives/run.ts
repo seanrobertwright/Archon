@@ -200,7 +200,7 @@ export function toRun(raw: RawWorkflowRun): Run {
     typeof wait === 'object' &&
     wait !== undefined &&
     'nodeId' in wait &&
-    typeof (wait as { nodeId: unknown }).nodeId === 'string' &&
+    typeof wait.nodeId === 'string' &&
     'resumeAt' in wait &&
     typeof (wait as { resumeAt: unknown }).resumeAt === 'string' &&
     'kind' in wait &&
