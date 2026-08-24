@@ -81,6 +81,25 @@ describe('workflow model arguments', () => {
       })
     ).toThrow(/provider/);
   });
+
+  for (const args of [
+    ['workflow', 'resume', 'run-1'],
+    ['workflow', 'approve', 'run-1'],
+    ['workflow', 'reject', 'run-1'],
+    ['workflow', 'respond', 'run-1', 'approve'],
+  ]) {
+    it(`rejects --model on ${args[0]} ${args[1]}`, () => {
+      const result = spawnSync(process.execPath, [CLI_ENTRY, ...args, '--model', 'large=opus'], {
+        encoding: 'utf8',
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        '--model cannot be used when continuing an existing workflow run'
+      );
+      expect(result.stderr).toContain('keeps the model bindings it started with');
+    });
+  }
 });
 
 describe('unknown flag rejection (#2769)', () => {

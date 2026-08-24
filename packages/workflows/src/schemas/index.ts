@@ -31,6 +31,7 @@ export {
   tierNameSchema,
   modelAliasPresetSchema,
   rawAliasesConfigSchema,
+  runAliasesConfigSchema,
   rawTiersConfigSchema,
   resolvedRunModelOverridesSchema,
   resolvedAiProfileSchema,

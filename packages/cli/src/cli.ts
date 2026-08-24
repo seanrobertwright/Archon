@@ -545,6 +545,19 @@ async function main(): Promise<number> {
       }
 
       case 'workflow':
+        if (
+          values.model !== undefined &&
+          (subcommand === 'resume' ||
+            subcommand === 'approve' ||
+            subcommand === 'reject' ||
+            subcommand === 'respond')
+        ) {
+          console.error(
+            'Error: --model cannot be used when continuing an existing workflow run. ' +
+              'The run keeps the model bindings it started with.'
+          );
+          return 1;
+        }
         switch (subcommand) {
           case 'list':
             await workflowListCommand(effectiveCwd, jsonFlag);

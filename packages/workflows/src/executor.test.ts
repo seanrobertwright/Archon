@@ -946,6 +946,44 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('anthropic/claude-sonnet-4-6');
     });
 
+    it('terminalizes a resumed run with an invalid persisted alias key', async () => {
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({
+        id: 'resume-invalid-alias-run',
+        status: 'running',
+        metadata: {
+          model_bindings: {
+            overrides: {
+              aliases: { planner: { provider: 'claude', model: 'opus' } },
+            },
+            effective: {
+              defaultProvider: 'claude',
+              aliases: {},
+            },
+          },
+        },
+      });
+
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore({ failWorkflowRun: failRun })),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow({ model: 'large' }),
+          'msg',
+          'db-conv-1',
+          { preCreatedRun, priorCompletedNodes: new Map() }
+        )
+      ).rejects.toThrow(/invalid model_bindings aliases/);
+
+      expect(failRun).toHaveBeenCalledWith(
+        'resume-invalid-alias-run',
+        expect.stringContaining('invalid model_bindings aliases')
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
     it('fails a pre-created row when a semantic binding error stops startup', async () => {
       const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preCreatedRun = makeRun({ id: 'invalid-model-run', status: 'pending', metadata: {} });

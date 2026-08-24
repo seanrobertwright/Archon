@@ -412,6 +412,16 @@ describe('per-run model bindings', () => {
         model_bindings: {
           ...value,
           overrides: {
+            aliases: { planner: { provider: 'claude', model: 'opus' } },
+          },
+        },
+      })
+    ).toThrow(/invalid model_bindings aliases/);
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          overrides: {
             tiers: {
               large: {
                 provider: 'claude',

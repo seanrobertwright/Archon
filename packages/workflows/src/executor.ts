@@ -1319,7 +1319,6 @@ async function runChildWorkflow(
           codebaseId,
           resolveChildIsolation,
           preparedSource: childSource,
-          modelOverrideLayer: { kind: 'resolved', overrides: resolvedModelOverrides },
         };
         childRunId = hydrated.preCreatedRun.id;
       } else {
@@ -1331,7 +1330,6 @@ async function runChildWorkflow(
           codebaseId,
           resolveChildIsolation,
           preparedSource: childSource,
-          modelOverrideLayer: { kind: 'resolved', overrides: resolvedModelOverrides },
         };
         childRunId = preCreatedRun.id;
       }
@@ -1394,7 +1392,6 @@ async function runChildWorkflow(
         codebaseId,
         resolveChildIsolation,
         preparedSource: childSource,
-        modelOverrideLayer: { kind: 'resolved', overrides: resolvedModelOverrides },
       };
       childRunId = childRun.id;
     }
@@ -1426,7 +1423,11 @@ async function runChildWorkflow(
         childWorkflow,
         input,
         conversationDbId,
-        { ...childOpts, capturedSourceOwner: owner }
+        {
+          ...childOpts,
+          capturedSourceOwner: owner,
+          modelOverrideLayer: { kind: 'resolved', overrides: resolvedModelOverrides },
+        }
       );
     });
 
