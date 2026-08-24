@@ -4,6 +4,8 @@
  * that the inner dag-executor.test.ts cannot reach.
  */
 import { describe, it, expect, mock, beforeEach, spyOn } from 'bun:test';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'path';
 
 // --- Mock logger ---
@@ -1668,6 +1670,40 @@ describe('executeWorkflow', () => {
           userId: 'u-1',
         })
       ).resolves.toBeDefined();
+    });
+
+    it('retains protected values when a later credential file write fails', async () => {
+      const credentialValue = 'oauth-partial-write-secret';
+      const deliveryRoot = await mkdtemp(join(tmpdir(), 'archon-provider-delivery-'));
+      const firstFile = join(deliveryRoot, 'codex-auth.json');
+      const impossibleSecondFile = join(firstFile, 'pi-auth.json');
+      const deps: WorkflowDeps = {
+        ...makeDeps(makeStore()),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async () => ({
+          env: { CODEX_HOME: deliveryRoot },
+          files: [
+            { path: firstFile, contents: credentialValue },
+            { path: impossibleSecondFile, contents: credentialValue },
+          ],
+          protectedValues: [credentialValue],
+        })),
+      };
+
+      try {
+        await expect(
+          executeWorkflow(deps, makePlatform(), 'conv-1', '/tmp', makeWorkflow(), 'msg', 'db-c1', {
+            userId: 'u-1',
+          })
+        ).resolves.toBeDefined();
+
+        const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+        expect(await readFile(firstFile, 'utf8')).toBe(credentialValue);
+        expect(configArg?.envVars).not.toHaveProperty('CODEX_HOME');
+        expect(configArg?.protectedCredentialValues).toEqual([credentialValue]);
+      } finally {
+        await rm(deliveryRoot, { recursive: true, force: true });
+      }
     });
   });
 

@@ -244,7 +244,9 @@ async function resolveUserGithubEnvForWorkflow(
  * deps adapter is absent.
  *
  * Contract: NEVER THROWS. Adapter failures are logged and yield empty bags so the
- * workflow continues with whatever env inheritance was already in place.
+ * workflow continues with whatever env inheritance was already in place. File
+ * write failures also drop the resolved env, but retain the credential values:
+ * an earlier file may already contain them and still needs failure-path redaction.
  */
 async function resolveUserProviderEnvForWorkflow(
   deps: WorkflowDeps,
@@ -255,21 +257,30 @@ async function resolveUserProviderEnvForWorkflow(
   if (!perUserEnabled || !userId || !deps.getUserProviderEnv) {
     return { env: {}, protectedValues: [] };
   }
+  let resolved: Awaited<ReturnType<NonNullable<WorkflowDeps['getUserProviderEnv']>>>;
   try {
-    const { env, files, protectedValues } = await deps.getUserProviderEnv(userId, artifactsDir);
-    for (const f of files) {
-      await mkdir(dirname(f.path), { recursive: true });
-      await writeFile(f.path, f.contents, { encoding: 'utf8', mode: 0o600 });
-    }
-    const envKeys = Object.keys(env);
-    if (envKeys.length > 0) {
-      getLog().debug({ userId, keys: envKeys }, 'workflow.user_provider_env_injected');
-    }
-    return { env, protectedValues };
+    resolved = await deps.getUserProviderEnv(userId, artifactsDir);
   } catch (err) {
     getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_env_resolve_failed');
     return { env: {}, protectedValues: [] };
   }
+
+  const { env, files, protectedValues } = resolved;
+  try {
+    for (const f of files) {
+      await mkdir(dirname(f.path), { recursive: true });
+      await writeFile(f.path, f.contents, { encoding: 'utf8', mode: 0o600 });
+    }
+  } catch (err) {
+    getLog().warn({ err: err as Error, userId }, 'workflow.user_provider_files_write_failed');
+    return { env: {}, protectedValues };
+  }
+
+  const envKeys = Object.keys(env);
+  if (envKeys.length > 0) {
+    getLog().debug({ userId, keys: envKeys }, 'workflow.user_provider_env_injected');
+  }
+  return { env, protectedValues };
 }
 
 /**
