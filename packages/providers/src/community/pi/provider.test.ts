@@ -1,12 +1,4 @@
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -751,31 +743,22 @@ describe('PiProvider', () => {
   });
 
   test('custom provider: filesystem error from buildCustomProviderModelsPath is classified as Pi auth storage init failed', async () => {
-    // Round-3 review (R1): the R2 cleanup fix correctly removed the silent
-    // swallow around mkdirSync/writeFileSync so FS errors now throw, but the
-    // throw site (buildCustomProviderModelsPath inside request-auth.ts) sits
-    // ABOVE the try block in provider.ts that wraps ModelRuntime.create
-    // errors as 'Pi auth storage init failed: …'. An EACCES/ENOSPC on the
-    // per-call tmpdir would propagate raw and bypass the classification the
-    // request-auth.ts doc comment promises. The fix moves the assignment
-    // inside the try; this test exercises the FS-error path against a real
-    // read-only tmpdir and asserts the framed error reaches the caller.
+    // The throw site (buildCustomProviderModelsPath inside request-auth.ts)
+    // sits inside the try block in provider.ts that wraps ModelRuntime.create
+    // errors as 'Pi auth storage init failed: …' — an FS error on the
+    // per-call tmpdir must be framed the same way, not propagate raw. This
+    // test exercises that classification path against a real FS failure.
     //
-    // Force the failure by pointing TMPDIR at a real, pre-populated dir
-    // chmod'd to 0o555. The shim's archon-pi-shim/package.json is
-    // pre-created so ensurePiPackageDirShim() succeeds (the if-guard on
-    // existsSync short-circuits the mkdirSync), but
-    // buildCustomProviderModelsPath's mkdirSync(archon-pi-models) fails with
-    // EACCES — exactly the production failure shape on a host with a
-    // read-only or misconfigured tmpdir.
-    const readOnlyTmp = mkdtempSync(join(tmpdir(), 'archon-pi-test-tmp-ro-'));
-    const roShimDir = join(readOnlyTmp, 'archon-pi-shim');
-    mkdirSync(roShimDir, { recursive: true });
-    writeFileSync(
-      join(roShimDir, 'package.json'),
-      JSON.stringify({ name: 'archon-pi-shim', version: '0.0.0', piConfig: {} })
-    );
-    chmodSync(readOnlyTmp, 0o555); // r-x for all, no write — mkdirSync fails with EACCES
+    // Provocation: a FILE occupies the exact path where
+    // buildCustomProviderModelsPath needs its directory
+    // (`<tmpdir>/archon-pi-models`), so `mkdirSync(..., { recursive: true })`
+    // throws EEXIST. Unlike a read-only-dir chmod (POSIX-only — Windows
+    // ignores directory write bits, which made this test's first version red
+    // on windows-latest), a file-occupies-dir-path collision throws on every
+    // platform. The scratch tmpdir stays writable, so ensurePiPackageDirShim
+    // creates its own `archon-pi-shim` dir there unaided.
+    const scratchTmp = mkdtempSync(join(tmpdir(), 'archon-pi-test-tmp-eexist-'));
+    writeFileSync(join(scratchTmp, 'archon-pi-models'), 'file-occupying-the-dir-path');
 
     // The user models.json lives at a SEPARATE dir (PI_CODING_AGENT_DIR) so
     // the per-call substitution still triggers — only the per-call write
@@ -800,10 +783,11 @@ describe('PiProvider', () => {
     const previousTemp = process.env.TEMP;
     process.env.PI_CODING_AGENT_DIR = userModelsDir;
     // Set all three env vars node:os reads so the override holds regardless
-    // of which one the host happens to define.
-    process.env.TMPDIR = readOnlyTmp;
-    process.env.TMP = readOnlyTmp;
-    process.env.TEMP = readOnlyTmp;
+    // of which one the host happens to define (TMPDIR on POSIX, TMP/TEMP on
+    // Windows).
+    process.env.TMPDIR = scratchTmp;
+    process.env.TMP = scratchTmp;
+    process.env.TEMP = scratchTmp;
 
     try {
       const { error } = await consume(
@@ -817,11 +801,11 @@ describe('PiProvider', () => {
       // reaches the provider's catch and is framed as 'Pi auth storage
       // init failed: …' — same shape as the ModelRuntime.create throw test
       // above, so orchestrator pattern-matchers that key on this prefix see
-      // the FS error too. Raw 'EACCES: permission denied, mkdir …' must NOT
-      // leak through.
+      // the FS error too. Raw 'EEXIST: file already exists, mkdir …' must
+      // NOT leak through unframed.
       expect(error).toBeDefined();
       expect(error?.message).toContain('Pi auth storage init failed');
-      expect(error?.message).toMatch(/EACCES|permission denied/);
+      expect(error?.message).toMatch(/EEXIST|file already exists/);
       expect(error?.message).toContain('~/.pi/agent/auth.json');
       expect(mockLogger.error).toHaveBeenCalledWith(
         expect.objectContaining({ piProvider: 'mygw' }),
@@ -833,9 +817,7 @@ describe('PiProvider', () => {
       // runs. Verify by checking the runtime mock was never invoked.
       expect(mockModelRuntimeCreate).not.toHaveBeenCalled();
     } finally {
-      // Restore write perms on the read-only tmpdir so cleanup can rmrf.
-      chmodSync(readOnlyTmp, 0o755);
-      rmSync(readOnlyTmp, { recursive: true, force: true });
+      rmSync(scratchTmp, { recursive: true, force: true });
       rmSync(userModelsDir, { recursive: true, force: true });
       if (previousAgentDir === undefined) {
         delete process.env.PI_CODING_AGENT_DIR;

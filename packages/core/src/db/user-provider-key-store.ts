@@ -213,6 +213,20 @@ async function resolveOAuthCredential(
     );
     return null;
   }
+  // The Pi mint path decides refresh purely by `Date.now() >= creds.expires`
+  // (`@archon/providers/oauth`, Archon-owned since pi-ai 0.84 — the SDK's
+  // toAuth never checks expiry). A missing or non-numeric `expires` from a
+  // legacy/corrupt row would make that comparison silently false and serve a
+  // stale token as success, so enforce the shape here where the raw blob
+  // enters, and treat a mismatch like the decrypt failure above. (The openai
+  // branch validates its own shape inside mintOpenAiOAuthApiKey.)
+  if (piProvider && !Number.isFinite(creds.expires)) {
+    getLog().error(
+      { userId, provider, expiresType: typeof creds.expires },
+      'user_provider_key.oauth_malformed_expires'
+    );
+    return null;
+  }
   let result: { newCredentials: PiOAuthCredentials | OAuthCredentials; apiKey: string } | null;
   try {
     result = piProvider

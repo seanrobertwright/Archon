@@ -34,9 +34,11 @@
  * the SDK call in try/finally so the file is cleaned up whether the SDK
  * succeeds or fails.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+import { expandTilde } from '@archon/paths';
 
 export interface CustomProviderEnvScope {
   provider: string;
@@ -133,7 +135,30 @@ function resolveProviderConfigValue(
   if (value.startsWith('!')) return undefined;
   if (!value.includes('$')) return undefined;
   const parts = parseTemplate(value);
+
+  // Classify the env references up front. The falsy (not presence) check
+  // mirrors the SDK's own resolver (`env?.[name] || process.env[name] ||
+  // undefined`): an empty-string value falls through exactly like a missing
+  // one, so the template survives and the SDK surfaces its actionable
+  // "Failed to resolve from environment variable: NAME" error instead of a
+  // schema-invalid empty apiKey silently dropping the whole provider.
+  let hasProtected = false;
+  let hasMissing = false;
+  for (const part of parts) {
+    if (part.type !== 'env') continue;
+    if (protectedKeys.has(part.name)) hasProtected = true;
+    else if (!env[part.name]) hasMissing = true;
+  }
+  if (hasMissing && !hasProtected) {
+    // Unresolvable reference and nothing to block: leave the original
+    // template unchanged so Pi surfaces its standard error. This is the
+    // documented behaviour for credentialless providers whose template
+    // references vars not delivered to the run.
+    return { resolved: value, didSubstitute: false };
+  }
+
   const resolvedParts: string[] = [];
+  let didSubstitute = false;
   for (const part of parts) {
     if (part.type === 'literal') {
       resolvedParts.push(part.value);
@@ -144,19 +169,25 @@ function resolveProviderConfigValue(
       // the SDK attempts to resolve `__ARCHON_BLOCKED_<VAR>` at request
       // time and fails (the name is provably absent from any context —
       // neither requestEnv nor process.env can supply it). The literal
-      // protected value never appears in the per-call file.
+      // protected value never appears in the per-call file. This
+      // substitution is UNCONDITIONAL — a different, merely-missing ref in
+      // the same template must never cancel it (the bail-out above only
+      // fires when no protected ref is present).
       resolvedParts.push(`\${__ARCHON_BLOCKED_${part.name}__}`);
+      didSubstitute = true;
       continue;
     }
-    if (!(part.name in env)) {
-      // Unresolvable reference: leave the original template unchanged so
-      // Pi surfaces its standard "Failed to resolve from environment variable:
-      // NAME" error. This is the documented behaviour for credentialless
-      // providers whose template references vars not delivered to the run.
-      return { resolved: value, didSubstitute: false };
+    if (!env[part.name]) {
+      // Reachable only alongside a protected ref (see bail-out above): keep
+      // the missing ref as template text so the SDK still reports it, while
+      // the protected placeholder above survives into the per-call file.
+      resolvedParts.push(`\${${part.name}}`);
+      continue;
     }
     resolvedParts.push(env[part.name]);
+    didSubstitute = true;
   }
+  if (!didSubstitute) return { resolved: value, didSubstitute: false };
   return { resolved: resolvedParts.join(''), didSubstitute: true };
 }
 
@@ -169,9 +200,16 @@ function resolveProviderConfigValue(
  * next to `process.execPath` at module load, which crashes compiled Archon
  * binaries at startup (v0.3.7 symptom, see provider.ts header note).
  */
-function getUserModelsPath(): string {
+export function getUserModelsPath(): string {
   const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
-  const agentDir = envDir && envDir.length > 0 ? envDir : join(homedir(), '.pi', 'agent');
+  // expandTilde matches the SDK's own getAgentDir(), which tilde-expands the
+  // override. Without it a `PI_CODING_AGENT_DIR=~/...` (dotenv-style loaders
+  // don't shell-expand) would make existsSync probe a literal `~/` path,
+  // skip substitution, and let the SDK read the REAL models.json via its own
+  // tilde-correct resolution — silently reverting to the leak this module
+  // exists to close.
+  const agentDir =
+    envDir && envDir.length > 0 ? expandTilde(envDir) : join(homedir(), '.pi', 'agent');
   return join(agentDir, 'models.json');
 }
 
@@ -186,9 +224,11 @@ function getUserModelsPath(): string {
  *   - `requestEnv` is undefined (no per-call env to substitute against);
  *   - the user's `models.json` doesn't exist or isn't valid JSON;
  *   - the targeted provider isn't in `models.json`;
- *   - no `${VAR}` reference in the provider's `apiKey`/`headers` is
- *     substitutable (either references a protected key, references a missing
- *     key, or the provider has no template values at all).
+ *   - no `${VAR}` reference in the provider's `apiKey`/`headers` produces a
+ *     substitution: the provider has no template values, or every templated
+ *     field references only missing/empty (and no protected) keys. A
+ *     protected reference ALWAYS produces a substitution (its placeholder),
+ *     so a file is written whenever one is present.
  */
 export function buildCustomProviderModelsPath(scope: CustomProviderEnvScope): string | undefined {
   const { provider, requestEnv, protectedEnvKeys } = scope;
@@ -262,8 +302,16 @@ export function buildCustomProviderModelsPath(scope: CustomProviderEnvScope): st
   const payload = JSON.stringify({ providers: { [provider]: substituted } }, null, 2);
   // mode is diluted by the process umask; set it explicitly AND chmod after
   // to guarantee 0o600 on disk. Mirrors the token-crypto pattern in
-  // `packages/core/src/utils/token-crypto.ts:100-102`.
-  writeFileSync(filePath, payload, { mode: 0o600 });
-  chmodSync(filePath, 0o600);
+  // `packages/core/src/utils/token-crypto.ts:100-102`. If the chmod (or a
+  // partial write) fails AFTER the file exists, remove it before re-throwing:
+  // the caller only cleans up paths this function RETURNED, so a throw here
+  // must never leave the cleartext secret behind.
+  try {
+    writeFileSync(filePath, payload, { mode: 0o600 });
+    chmodSync(filePath, 0o600);
+  } catch (err) {
+    rmSync(filePath, { force: true });
+    throw err;
+  }
   return filePath;
 }

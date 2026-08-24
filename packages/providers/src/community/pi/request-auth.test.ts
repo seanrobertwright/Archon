@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildCustomProviderModelsPath } from './request-auth';
+import { buildCustomProviderModelsPath, getUserModelsPath } from './request-auth';
 
 // pi 0.84.0+ ships `ModelRuntime.create({ modelsPath })` as the documented
 // seam for changing the `models.json` location. The test exercises the
@@ -202,6 +202,74 @@ describe('buildCustomProviderModelsPath', () => {
     expect(result).toBeDefined();
     const written = readModelsJson(result as string);
     expect(written.providers.mygw.apiKey).toBe('!bang token-2');
+  });
+
+  test('treats an empty-string env value as missing (template survives for the SDK error)', () => {
+    // Mirrors the SDK's own resolver (`env?.[name] || process.env[name] ||
+    // undefined`): an empty string falls through like a missing var. Writing
+    // `apiKey: ""` instead would fail the SDK's minLength schema and silently
+    // drop the whole provider ("Unknown provider") rather than surfacing the
+    // SDK's actionable resolve error.
+    createUserModelsDir('${MYGW_API_KEY}');
+    const result = buildCustomProviderModelsPath({
+      provider: 'mygw',
+      requestEnv: { MYGW_API_KEY: '' },
+      protectedEnvKeys: [],
+    });
+    expect(result).toBeUndefined();
+  });
+
+  test('protected ref keeps its placeholder even when an unrelated missing ref shares the field', () => {
+    // Regression for the R4 review finding: the missing-ref bail-out used to
+    // discard the already-computed placeholder and return the ORIGINAL
+    // template — no per-call file was written at all, and the SDK fell back
+    // to the user's unmodified models.json, silently no-opping the
+    // protected-key defense in exactly the combination it exists to catch.
+    createUserModelsDir('${GH_TOKEN}${MISSING_VAR}');
+    const result = buildCustomProviderModelsPath({
+      provider: 'mygw',
+      requestEnv: { GH_TOKEN: 'acting-user-secret' },
+      protectedEnvKeys: ['GH_TOKEN'],
+    });
+    expect(result).toBeDefined();
+    const written = readModelsJson(result as string);
+    // The placeholder survives; the merely-missing ref stays template text so
+    // the SDK still reports it. The literal protected value never appears.
+    expect(written.providers.mygw.apiKey).toBe('${__ARCHON_BLOCKED_GH_TOKEN__}${MISSING_VAR}');
+    expect(JSON.stringify(written)).not.toContain('acting-user-secret');
+  });
+
+  test('protected ref in one field is blocked even when another field has a missing ref', () => {
+    createUserModelsDir('${GH_TOKEN}', { 'X-Extra': '${MISSING_VAR}' });
+    const result = buildCustomProviderModelsPath({
+      provider: 'mygw',
+      requestEnv: { GH_TOKEN: 'acting-user-secret' },
+      protectedEnvKeys: ['GH_TOKEN'],
+    });
+    expect(result).toBeDefined();
+    const written = readModelsJson(result as string);
+    expect(written.providers.mygw.apiKey).toBe('${__ARCHON_BLOCKED_GH_TOKEN__}');
+    // The other field's unresolvable template is carried through unchanged.
+    expect(written.providers.mygw.headers).toEqual({ 'X-Extra': '${MISSING_VAR}' });
+    expect(JSON.stringify(written)).not.toContain('acting-user-secret');
+  });
+
+  test('tilde-prefixed PI_CODING_AGENT_DIR is expanded like the SDK expands it', () => {
+    // Regression for the R3 review finding: without tilde expansion the
+    // existsSync probe hits a literal `~/` path, substitution is skipped, and
+    // the SDK (whose own getAgentDir DOES expand) reads the real models.json
+    // with process.env fallback — silently reverting the fix this module
+    // exists for. Asserted on the exported path resolver directly: bun's
+    // os.homedir() cannot be redirected at runtime, so a filesystem-level
+    // fake home is not scriptable here.
+    process.env.PI_CODING_AGENT_DIR = '~/custom-agent';
+    expect(getUserModelsPath()).toBe(join(homedir(), 'custom-agent', 'models.json'));
+
+    process.env.PI_CODING_AGENT_DIR = '/absolute/agent-dir';
+    expect(getUserModelsPath()).toBe(join('/absolute/agent-dir', 'models.json'));
+
+    delete process.env.PI_CODING_AGENT_DIR;
+    expect(getUserModelsPath()).toBe(join(homedir(), '.pi', 'agent', 'models.json'));
   });
 
   test('leaves command-form values (`!cmd`) untouched even when they contain $VAR text', () => {
