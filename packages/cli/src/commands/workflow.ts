@@ -145,11 +145,7 @@ function getLog(): ReturnType<typeof createLogger> {
 const DETACHED_STARTUP_WINDOW_MS = 500;
 const DETACHED_LOG_TAIL_MAX_CHARS = 4_000;
 const DETACHED_LOG_TAIL_MAX_LINES = 40;
-const DETACHED_RUN_CONFIG_ENV = 'ARCHON_INTERNAL_DETACHED_RUN_CONFIG';
-
-function consumeDetachedRunConfig(): WorkflowRunConfigInput | undefined {
-  const payload = process.env[DETACHED_RUN_CONFIG_ENV];
-  Reflect.deleteProperty(process.env, DETACHED_RUN_CONFIG_ENV);
+function parseDetachedRunConfig(payload: string | undefined): WorkflowRunConfigInput | undefined {
   if (payload === undefined) return undefined;
 
   let value: unknown;
@@ -334,6 +330,8 @@ export interface WorkflowRunOptions {
   configPath?: string;
   /** @internal Validated immutable layer transferred from a detached parent. */
   detachedRunConfig?: WorkflowRunConfigInput;
+  /** @internal AES-GCM-sealed detached parent payload carried outside config env layers. */
+  detachedRunConfigPayload?: string;
 }
 
 /**
@@ -441,8 +439,7 @@ export function buildDetachedRunCmd(
 async function spawnDetachedWorkflowRun(
   cwd: string,
   conversationId: string,
-  extraArgs: string[],
-  runConfigPayload?: string
+  extraArgs: string[]
 ): Promise<string | null> {
   const cmd = buildDetachedRunCmd(
     BUNDLED_IS_BINARY,
@@ -489,7 +486,6 @@ async function spawnDetachedWorkflowRun(
       env: {
         ...process.env,
         [DETACHED_RUN_OWNER_ENV]: '1',
-        ...(runConfigPayload ? { [DETACHED_RUN_CONFIG_ENV]: runConfigPayload } : {}),
       },
       stdio: ['ignore', logFd ?? 'ignore', logFd ?? 'ignore'],
       detached: true,
@@ -1532,12 +1528,10 @@ async function runWorkflowWithOwnedSource(
     const runConfigPayload = runConfig
       ? JSON.stringify(sealWorkflowRunConfig(runConfig.layer, runConfig.source))
       : undefined;
-    const logPath = await spawnDetachedWorkflowRun(
-      cwd,
-      childConversationId,
-      extraArgs,
-      runConfigPayload
-    );
+    if (runConfigPayload) {
+      extraArgs.push('--internal-detached-run-config', runConfigPayload);
+    }
+    const logPath = await spawnDetachedWorkflowRun(cwd, childConversationId, extraArgs);
 
     if (options.json) {
       await writeJsonLine({
@@ -2568,7 +2562,7 @@ export async function workflowRunCommand(
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
-  const detachedRunConfig = consumeDetachedRunConfig();
+  const detachedRunConfig = parseDetachedRunConfig(options.detachedRunConfigPayload);
   await withCapturedSource(owner =>
     runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, {
       ...options,

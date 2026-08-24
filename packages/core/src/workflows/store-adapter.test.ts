@@ -68,6 +68,8 @@ mock.module('../db/codebases', () => ({
 mock.module('@archon/providers', () => ({
   getAgentProvider: mock(() => ({})),
   getRegisteredProviders: mock(() => []),
+  isRegisteredProvider: mock(() => false),
+  getProviderCapabilities: mock(() => ({ supportedEfforts: [] })),
   // Vendor → env-var map consumed by credentials/delivery (#1955). A realistic
   // subset of the generated map (incl. HF_TOKEN, the upstream var).
   PI_PROVIDER_ENV_VARS: {

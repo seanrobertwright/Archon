@@ -681,6 +681,9 @@ async function main(): Promise<number> {
               modelAssignments: values.model as string[] | undefined,
               configPath:
                 typeof values.config === 'string' ? resolve(cwd, values.config) : undefined,
+              detachedRunConfigPayload: values['internal-detached-run-config'] as
+                | string
+                | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;

@@ -5349,9 +5349,11 @@ describe('workflowRunCommand — detach', () => {
       });
       await finishStartupWindow(commandPromise, spawnSpy);
       const spawnOptions = spawnSpy.mock.calls[0]?.[0] as
-        | { env?: Record<string, string | undefined> }
+        | { cmd?: string[]; env?: Record<string, string | undefined> }
         | undefined;
-      payload = spawnOptions?.env?.ARCHON_INTERNAL_DETACHED_RUN_CONFIG;
+      const payloadIndex = spawnOptions?.cmd?.indexOf('--internal-detached-run-config') ?? -1;
+      payload = payloadIndex >= 0 ? spawnOptions?.cmd?.[payloadIndex + 1] : undefined;
+      expect(spawnOptions?.env?.ARCHON_INTERNAL_DETACHED_RUN_CONFIG).toBeUndefined();
     } finally {
       process.argv = savedArgv;
       if (savedKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;

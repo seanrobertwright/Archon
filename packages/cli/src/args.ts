@@ -55,4 +55,6 @@ export const cliArgOptions: CliArgOptions = {
   // Repeatable sparse tier/@alias rebinding for one workflow invocation (#2481).
   model: { type: 'string', multiple: true },
   config: { type: 'string' },
+  // Private sealed handoff appended by the parent of a detached workflow run.
+  'internal-detached-run-config': { type: 'string' },
 };

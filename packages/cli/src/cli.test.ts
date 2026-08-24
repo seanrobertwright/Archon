@@ -150,6 +150,31 @@ describe('workflow run config argument', () => {
     }
   });
 
+  it('keeps a detached config handoff outside repo env overrides', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'archon-cli-detached-config-'));
+    const archonHome = join(repo, 'archon-home');
+    mkdirSync(join(repo, '.archon'), { recursive: true });
+    spawnSync('git', ['init', '-q', '.'], { cwd: repo });
+    writeFileSync(join(repo, '.archon', '.env'), 'ARCHON_INTERNAL_DETACHED_RUN_CONFIG=not-json\n');
+
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'run', 'x', '--internal-detached-run-config', '{"version":1}'],
+        {
+          cwd: repo,
+          encoding: 'utf8',
+          env: { ...process.env, ARCHON_HOME: archonHome },
+        }
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Detached workflow run config payload is invalid.');
+      expect(result.stderr).not.toContain('not valid JSON');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   for (const args of [
     ['workflow', 'resume', 'run-1'],
     ['workflow', 'approve', 'run-1'],
