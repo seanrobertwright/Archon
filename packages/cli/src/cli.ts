@@ -361,7 +361,9 @@ async function main(): Promise<number> {
         input: { type: 'string', multiple: true },
       },
       allowPositionals: true,
-      strict: false, // Allow unknown flags to pass through
+      // Strict mode rejects unknown flags so a mistyped option (e.g. `--dry-run`)
+      // errors here instead of being silently dropped before command validation.
+      strict: true,
     });
   } catch (error) {
     const err = error as Error;

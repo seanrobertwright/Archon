@@ -42,6 +42,30 @@ describe('CLI help output', () => {
   });
 });
 
+describe('unknown flag rejection (#2769)', () => {
+  it('exits non-zero naming the mistyped flag before any command runs', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'run', 'assist', '--dryrun', '--stubs', 'x.yaml'],
+      { encoding: 'utf8' }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--dryrun');
+  });
+
+  it('still accepts a valid workflow dry-run invocation', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'run', 'definitely-not-a-workflow', '--dry-run'],
+      { encoding: 'utf8', cwd: join(import.meta.dir, '../../../') }
+    );
+
+    // Fails on the unknown workflow name (after parsing), not on the flag.
+    expect(result.stderr).not.toContain('Error parsing arguments');
+  });
+});
+
 describe('workflow status arguments', () => {
   it('rejects a run id and points to workflow get', () => {
     const result = spawnSync(
@@ -193,7 +217,7 @@ describe('CLI argument parsing', () => {
         'pause-at-gates': { type: 'boolean' },
       },
       allowPositionals: true,
-      strict: false,
+      strict: true,
     });
   };
 
@@ -396,18 +420,13 @@ describe('CLI argument parsing', () => {
     });
   });
 
-  describe('unknown flags with strict: false', () => {
-    it('should pass through unknown flags', () => {
-      const result = parseCliArgs(['--unknown', 'workflow', 'list']);
-      // Unknown flag is ignored, positionals are preserved
-      expect(result.positionals).toEqual(['workflow', 'list']);
+  describe('unknown flags (#2769)', () => {
+    it('rejects an unknown flag instead of dropping it', () => {
+      expect(() => parseCliArgs(['--unknown', 'workflow', 'list'])).toThrow(/unknown option/i);
     });
 
-    it('should pass through typos like --cwdd', () => {
-      const result = parseCliArgs(['--cwdd', '/path', 'workflow', 'list']);
-      // Typo is ignored, --cwd defaults to process.cwd()
-      expect(result.values.cwd).toBe(process.cwd());
-      expect(result.positionals).toContain('/path'); // /path becomes positional
+    it('rejects a typoed flag like --cwdd', () => {
+      expect(() => parseCliArgs(['--cwdd', '/path', 'workflow', 'list'])).toThrow(/--cwdd/);
     });
   });
 
