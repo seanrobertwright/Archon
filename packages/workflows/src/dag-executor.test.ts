@@ -14330,6 +14330,67 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     ).toBe(false);
   });
 
+  it('records that quota continuation is unavailable when reset text overflows without a fallback', async () => {
+    const creditExhaustedQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
+      async function* () {
+        yield {
+          type: 'assistant',
+          content: "You're out of extra usage · resets in 2400000001h",
+        };
+        yield { type: 'result', sessionId: 'dag-session-credit' };
+      }
+    );
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: creditExhaustedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-credit',
+      testDir,
+      {
+        name: 'credit-resume-test',
+        nodes: [
+          {
+            id: 'investigate',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'Investigate the issue' },
+          },
+        ],
+      },
+      makeWorkflowRun('credit-resume-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      {
+        ...minimalConfig,
+        workflows: {
+          autoResumeOnQuotaReset: true,
+          quotaMaxAttempts: 1,
+          quotaDeadlineMs: 3_600_000,
+        },
+      }
+    );
+
+    const failRun = store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>;
+    expect(failRun).toHaveBeenCalledTimes(1);
+    expect(failRun.mock.calls[0]?.[2]).toBeUndefined();
+    expect(store.createWorkflowEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'quota_resume_skipped',
+        data: { reason: 'reset_unavailable' },
+      })
+    );
+  });
+
   it('does not promise automatic quota continuation for a container run', async () => {
     const creditExhaustedQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
       async function* () {

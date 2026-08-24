@@ -1720,6 +1720,7 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         event: 'checks.complete',
+        resumeAt: '2026-08-25T10:00:00.000Z',
         payload: { conclusion: 'success' },
       }),
     });
@@ -1768,7 +1769,10 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     const response = await app.request('/api/workflows/runs/run-wait-web/signal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event: 'checks.complete' }),
+      body: JSON.stringify({
+        event: 'checks.complete',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+      }),
     });
 
     expect(response.status).toBe(200);
@@ -1802,7 +1806,10 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     const response = await app.request('/api/workflows/runs/run-loop-wait/signal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event: 'checks.complete' }),
+      body: JSON.stringify({
+        event: 'checks.complete',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+      }),
     });
 
     expect(response.status).toBe(200);
@@ -1841,7 +1848,46 @@ describe('POST /api/workflows/runs/:runId/signal', () => {
     const response = await app.request('/api/workflows/runs/run-wait-2/signal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event: 'deploy.complete' }),
+      body: JSON.stringify({
+        event: 'deploy.complete',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(mockSignalWorkflowWait).not.toHaveBeenCalled();
+  });
+
+  test('rejects a delayed signal for an earlier occurrence of the same event', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_RUNNING_RUN,
+      id: 'run-wait-2',
+      status: 'paused',
+      metadata: {
+        wait: {
+          owner: 'loop_group',
+          nodeId: 'release',
+          bodyWaitId: 'checks',
+          iteration: 2,
+          sessionId: null,
+          sessionProvider: null,
+          kind: 'event',
+          event: 'checks.complete',
+          waitingSince: '2026-08-24T10:01:00.000Z',
+          resumeAt: '2026-08-25T10:01:00.000Z',
+        },
+      },
+    });
+    const { app } = makeApp();
+
+    const response = await app.request('/api/workflows/runs/run-wait-2/signal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'checks.complete',
+        resumeAt: '2026-08-25T10:00:00.000Z',
+        payload: { conclusion: 'stale' },
+      }),
     });
 
     expect(response.status).toBe(400);

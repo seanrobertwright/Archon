@@ -1769,6 +1769,7 @@ export interface paths {
         content: {
           'application/json': {
             event: string;
+            resumeAt: string;
             payload?: unknown;
           };
         };

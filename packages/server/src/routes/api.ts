@@ -979,6 +979,7 @@ const resumeWorkflowRunRoute = createRoute({
 
 const signalWorkflowWaitBodySchema = z.object({
   event: z.string().min(1),
+  resumeAt: z.string().datetime(),
   payload: z.unknown().optional(),
 });
 
@@ -3699,12 +3700,12 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(signalWorkflowWaitRoute, async c => {
     const runId = c.req.param('runId') ?? '';
-    const { event, payload } = getValidatedBody(c, signalWorkflowWaitBodySchema);
+    const { event, resumeAt, payload } = getValidatedBody(c, signalWorkflowWaitBodySchema);
     try {
       const run = await workflowDb.getWorkflowRun(runId);
       if (!run) return apiError(c, 404, 'Workflow run not found');
       const wait = isWorkflowWaitContext(run.metadata?.wait) ? run.metadata.wait : undefined;
-      if (wait?.kind !== 'event' || wait.event !== event) {
+      if (wait?.kind !== 'event' || wait.event !== event || wait.resumeAt !== resumeAt) {
         return apiError(c, 400, `Run is not waiting on event '${event}'`);
       }
       const { signaled } = await workflowDb.signalWorkflowWait(runId, wait, payload);

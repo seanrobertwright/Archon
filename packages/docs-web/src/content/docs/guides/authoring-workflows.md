@@ -684,10 +684,12 @@ Signal one exact run through the authenticated API:
 curl -X POST http://localhost:3090/api/workflows/runs/<run-id>/signal \
   -H 'Content-Type: application/json' \
   -H 'X-Archon-User: <trusted-user-id>' \
-  -d '{"event":"checks.complete","payload":{"conclusion":"success"}}'
+  -d '{"event":"checks.complete","resumeAt":"<metadata.wait.resumeAt>","payload":{"conclusion":"success"}}'
 ```
 
 Use a Better Auth session cookie instead of `X-Archon-User` when browser authentication is enabled. The header is only for a trusted reverse proxy or loopback client; an auth-disabled local install can omit it. The event name must match the run's open wait. The signal and its audit event are committed together; duplicate or wrong-run signals do nothing. The server must be running for scheduled or event-driven continuation. If it is offline when a deadline passes, the persisted run resumes on the next scan after startup.
+
+Read `metadata.wait.resumeAt` from the run before sending the signal and pass it back unchanged. It identifies the open wait occurrence, so a delayed retry from an earlier loop iteration cannot satisfy a later wait for the same event.
 
 A wait may be the sole terminal sink in a `loop_group` body. Archon then escalates the persisted cursor to the group and rechecks the group's completion condition after the wait completes. A non-terminal body wait is rejected because resuming a partial iteration would otherwise require replaying already-completed sibling work. Waits below more than one nested `loop_group` boundary are not supported.
 
