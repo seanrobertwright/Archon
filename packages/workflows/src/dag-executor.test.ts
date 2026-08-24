@@ -25903,7 +25903,7 @@ describe('buildSubprocessDockerArgs — bash/script env isolation', () => {
   });
 });
 
-describe('container subprocess credential redaction', () => {
+describe('subprocess credential redaction', () => {
   const execContext = { kind: 'container' as const, containerId: 'cid-redaction' };
   let testDir: string;
 
@@ -26031,6 +26031,85 @@ describe('container subprocess credential redaction', () => {
         expect(durableText).not.toContain(otherInjectedSecret);
         expect(durableText).not.toContain(projectSecret);
         expect(durableText).not.toContain(fileDeliveredSecret);
+      }
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('removes a protected credential echoed by a failed host subprocess', async () => {
+    const protectedSecret = 'host-file-delivered-oauth-secret';
+    const logDir = join(testDir, 'host-logs');
+    const workflowRun = makeWorkflowRun('host-redaction-run', {
+      workflow_name: 'host-redaction',
+      conversation_id: 'conv-host-redaction',
+    });
+    const store = createMockStore();
+    const platform = createMockPlatform();
+    let rejection:
+      | (Error & { code: number; killed: boolean; cmd: string; stdout: string; stderr: string })
+      | undefined;
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (command: string, args: string[]) => {
+        const commandLine = [command, ...args].join(' ');
+        rejection = Object.assign(
+          new Error(`Command failed: ${commandLine}\nmessage echoed ${protectedSecret}`),
+          {
+            code: 1,
+            killed: false,
+            cmd: commandLine,
+            stdout: `stdout echoed ${protectedSecret}`,
+            stderr: `stderr echoed ${protectedSecret}`,
+          }
+        );
+        throw rejection;
+      }
+    );
+
+    try {
+      await executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        workflowRun.conversation_id,
+        testDir,
+        {
+          name: workflowRun.workflow_name,
+          nodes: [{ id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' }],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'host-artifacts'),
+        join(testDir, 'host-state'),
+        logDir,
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          envVars: { CODEX_HOME: '/run/codex-home', BASE_BRANCH: 'main' },
+          protectedEnvKeys: ['CODEX_HOME'],
+          protectedCredentialValues: [protectedSecret],
+        }
+      );
+
+      expect(execSpy).toHaveBeenCalledTimes(1);
+      expect(execSpy.mock.calls[0]?.[0]).not.toBe('docker');
+      const rejectionText = [
+        rejection?.message,
+        rejection?.stack,
+        rejection?.cmd,
+        rejection?.stdout,
+        rejection?.stderr,
+      ].join('\n');
+      expect(rejectionText).not.toContain(protectedSecret);
+
+      const durableEventText = JSON.stringify(
+        (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls
+      );
+      const durableMessageText = JSON.stringify(platform.sendMessage.mock.calls);
+      const durableLogText = await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8');
+      for (const durableText of [durableEventText, durableMessageText, durableLogText]) {
+        expect(durableText).not.toContain(protectedSecret);
       }
     } finally {
       execSpy.mockRestore();

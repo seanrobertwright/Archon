@@ -3258,7 +3258,7 @@ function redactCredentialValues(input: string, credentialValues: readonly string
 }
 
 /**
- * Scrub credentials from every field of a `docker exec` rejection that can carry
+ * Scrub credentials from every subprocess rejection field that can carry
  * subprocess text. The exact values come from the engine's injected-credential
  * provenance plus secret-named project env entries, so provider credentials are
  * removed even when the failed process echoes them without their env key.
@@ -3302,31 +3302,30 @@ async function runSubprocess(
     protectedCredentialValues?: readonly string[];
   }
 ): Promise<{ stdout: string; stderr: string }> {
-  if (execContext.kind === 'container') {
-    const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
-      cwd: options.cwd,
-      env: options.env,
-    });
-    // Env is delivered as `-e NAME=value` argv, and the rejection carries that argv
-    // in both `message` and `cmd` — so a failed exec hands every delivered
-    // credential to callers that persist it verbatim. Sanitize at the throw site:
-    // one wrap covers every downstream reader instead of each remembering to.
-    try {
+  try {
+    if (execContext.kind === 'container') {
+      const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
+        cwd: options.cwd,
+        env: options.env,
+      });
+      // Container env is delivered in argv, while either execution mode can echo a
+      // credential in output. Sanitize at the shared throw boundary so every
+      // downstream reader receives the same safe rejection.
       return await execFileAsync('docker', dockerArgs, { timeout: options.timeout });
-    } catch (err) {
-      const credentialValues = collectSubprocessCredentialValues(
-        options.env,
-        options.protectedEnvKeys,
-        options.protectedCredentialValues
-      );
-      throw redactSubprocessError(err as RawSubprocessRejection, credentialValues);
     }
+    return await execFileAsync(cmd, args, {
+      cwd: options.cwd,
+      timeout: options.timeout,
+      env: { ...process.env, ...options.env },
+    });
+  } catch (err) {
+    const credentialValues = collectSubprocessCredentialValues(
+      options.env,
+      options.protectedEnvKeys,
+      options.protectedCredentialValues
+    );
+    throw redactSubprocessError(err as RawSubprocessRejection, credentialValues);
   }
-  return execFileAsync(cmd, args, {
-    cwd: options.cwd,
-    timeout: options.timeout,
-    env: { ...process.env, ...options.env },
-  });
 }
 
 /** Threshold (bytes) above which $nodeId.output values are written to a temp file
