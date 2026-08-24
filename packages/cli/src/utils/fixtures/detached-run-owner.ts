@@ -1,11 +1,16 @@
 import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
-import { startDetachedRunControlServer } from '../detached-run-control';
+import {
+  assertDetachedRunProcessOwner,
+  startDetachedRunControlServer,
+} from '../detached-run-control';
 
 const [runId, readyPath, leakPath] = process.argv.slice(2);
 if (!runId || !readyPath || !leakPath) {
   throw new Error('Usage: detached-run-owner.ts <run-id> <ready-path> <leak-path>');
 }
+
+assertDetachedRunProcessOwner();
 
 const leakWriter = spawn(
   process.execPath,

@@ -469,6 +469,10 @@ owner process is gone, use `workflow abandon <run-id>` to clean up an orphaned r
 `workflow cancel` applies only to a live detached CLI owner. Foreground runs remain
 owned by their terminal and should be interrupted there.
 
+After termination is confirmed, `cancel` records cancellation through the same run-tree
+operation as `abandon`. Cancelling a parent therefore cancels every non-terminal
+descendant and can report the same cascade failures or blocked parent described below.
+
 ### `workflow abandon`
 
 Discard a workflow run by marking it `cancelled`. This is a state-only operation: it

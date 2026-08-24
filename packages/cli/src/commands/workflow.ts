@@ -108,6 +108,7 @@ import { CLIAdapter } from '../adapters/cli-adapter';
 import { writeJsonLine, writeStdout } from '../utils/stdout';
 import { exitWithDrain } from '../utils/exit-with-drain';
 import {
+  assertDetachedRunProcessOwner,
   DETACHED_RUN_OWNER_ENV,
   requestDetachedRunStop,
   startDetachedRunControlServer,
@@ -962,6 +963,7 @@ async function runWorkflowWithOwnedSource(
 ): Promise<void> {
   const detachedProcessOwner = process.env[DETACHED_RUN_OWNER_ENV] === '1';
   if (detachedProcessOwner) Reflect.deleteProperty(process.env, DETACHED_RUN_OWNER_ENV);
+  if (detachedProcessOwner) assertDetachedRunProcessOwner();
   const effectiveDiscoveryCwd = options.discoveryCwd ?? cwd;
 
   // Freeze the source BEFORE discovering, then discover from the frozen copy. Discovering

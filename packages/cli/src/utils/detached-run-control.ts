@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, fstatSync, mkdirSync, openSync, rmSync, statSync } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, rmSync, statSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,9 +9,13 @@ import { promisify } from 'node:util';
 export const DETACHED_RUN_OWNER_ENV = 'ARCHON_DETACHED_RUN_OWNER';
 
 const STOP_REQUEST = 'stop\n';
+const TERMINATE_REQUEST = 'terminate\n';
+const TERMINATE_READY = 'ready\n';
 const IPC_TIMEOUT_MS = 2_000;
 const TERMINATION_GRACE_MS = 5_000;
 const TERMINATION_CONFIRM_MS = 1_000;
+const TERMINATION_LEASE_MS = TERMINATION_GRACE_MS + TERMINATION_CONFIRM_MS + IPC_TIMEOUT_MS;
+const OWNER_CLOSE_WAIT_MS = TERMINATION_LEASE_MS + IPC_TIMEOUT_MS;
 const POLL_INTERVAL_MS = 50;
 const MAX_MESSAGE_BYTES = 256;
 
@@ -49,7 +53,28 @@ function controlDirectory(): string {
       ? join(tmpdir(), 'archon-run-control')
       : `/tmp/archon-${uid === undefined ? 'user' : String(uid)}`;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') {
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`Detached run control path is not a directory: ${directory}`);
+    }
+    if (uid !== undefined && stat.uid !== uid) {
+      throw new Error(`Detached run control directory is owned by another user: ${directory}`);
+    }
+    if ((stat.mode & 0o077) !== 0) {
+      throw new Error(`Detached run control directory must have mode 0700: ${directory}`);
+    }
+  }
   return directory;
+}
+
+/** Prove the marked POSIX owner has the process group that active cancellation will signal. */
+export function assertDetachedRunProcessOwner(): void {
+  if (process.platform !== 'win32' && !processGroupExists(process.pid)) {
+    throw new Error(
+      `Refusing detached run control because process ${String(process.pid)} does not own process group ${String(process.pid)}`
+    );
+  }
 }
 
 /** A bounded, user-scoped endpoint: Unix socket on POSIX, named pipe on Windows. */
@@ -173,29 +198,37 @@ export async function startDetachedRunControlServer(
     sockets.add(socket);
     socket.setEncoding('utf8');
     socket.setTimeout(IPC_TIMEOUT_MS, () => socket.destroy());
+    socket.on('error', () => socket.destroy());
 
     let request = '';
-    let handled = false;
+    let phase: 'request' | 'lease' | 'terminating' = 'request';
     socket.on('data', chunk => {
-      if (handled) return;
       request += chunk;
       if (Buffer.byteLength(request) > MAX_MESSAGE_BYTES) {
-        handled = true;
         socket.destroy();
         return;
       }
-      if (!request.includes('\n')) return;
-      handled = true;
-      if (request !== STOP_REQUEST) {
-        socket.destroy();
-        return;
+      let newline = request.indexOf('\n');
+      while (newline !== -1) {
+        const frame = request.slice(0, newline + 1);
+        request = request.slice(newline + 1);
+        if (phase === 'request' && frame === STOP_REQUEST) {
+          phase = 'lease';
+          stopSockets.add(socket);
+          socket.setTimeout(IPC_TIMEOUT_MS, () => socket.destroy());
+          socket.write(`${JSON.stringify({ pid: process.pid })}\n`);
+        } else if (phase === 'lease' && frame === TERMINATE_REQUEST) {
+          phase = 'terminating';
+          socket.setTimeout(TERMINATION_LEASE_MS, () => socket.destroy());
+          socket.write(TERMINATE_READY);
+          // The committed lease stays open longer than the bounded terminator.
+          // This prevents normal owner exit and PID reuse while signals are in flight.
+        } else {
+          socket.destroy();
+          return;
+        }
+        newline = request.indexOf('\n');
       }
-
-      stopSockets.add(socket);
-      socket.setTimeout(0);
-      socket.write(`${JSON.stringify({ pid: process.pid })}\n`);
-      // Keep this connection open through process-tree termination. It is the
-      // controller's live proof that the returned PID still belongs to this owner.
     });
     socket.once('close', () => {
       sockets.delete(socket);
@@ -205,6 +238,8 @@ export async function startDetachedRunControlServer(
       }
     });
   });
+  // Endpoint failure must make active cancellation unavailable, not crash the workflow owner.
+  server.on('error', () => undefined);
 
   try {
     await listenWithoutReplacingOwner(server, path);
@@ -220,7 +255,16 @@ export async function startDetachedRunControlServer(
       closePromise = (async (): Promise<void> => {
         if (stopSockets.size > 0) {
           await new Promise<void>(resolve => {
-            stopReleaseWaiters.add(resolve);
+            const finish = (): void => {
+              clearTimeout(timer);
+              stopReleaseWaiters.delete(finish);
+              resolve();
+            };
+            stopReleaseWaiters.add(finish);
+            const timer = setTimeout(() => {
+              for (const socket of stopSockets) socket.destroy();
+              finish();
+            }, OWNER_CLOSE_WAIT_MS);
           });
         }
         for (const socket of sockets) socket.destroy();
@@ -298,6 +342,7 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
         settled = true;
         socket.setTimeout(0);
         let released = false;
+        let stopping = false;
         const release = (): void => {
           if (released) return;
           released = true;
@@ -305,7 +350,54 @@ export function requestDetachedRunStop(runId: string): Promise<DetachedRunStopTa
         };
         resolve({
           stop: async (): Promise<void> => {
+            if (stopping) throw new Error('Detached workflow termination already started');
+            stopping = true;
             try {
+              await new Promise<void>((ready, rejectReady) => {
+                let acknowledgement = '';
+                const cleanup = (): void => {
+                  socket.off('data', onData);
+                  socket.off('error', onError);
+                  socket.off('timeout', onTimeout);
+                };
+                const failReady = (error: Error): void => {
+                  cleanup();
+                  rejectReady(error);
+                };
+                const onData = (chunk: string): void => {
+                  acknowledgement += chunk;
+                  if (Buffer.byteLength(acknowledgement) > MAX_MESSAGE_BYTES) {
+                    failReady(new Error('Detached workflow owner acknowledgement was too large'));
+                    return;
+                  }
+                  const readyNewline = acknowledgement.indexOf('\n');
+                  if (readyNewline === -1) return;
+                  if (acknowledgement.slice(0, readyNewline + 1) !== TERMINATE_READY) {
+                    failReady(
+                      new Error('Detached workflow owner returned an invalid acknowledgement')
+                    );
+                    return;
+                  }
+                  cleanup();
+                  socket.setTimeout(TERMINATION_LEASE_MS, () => socket.destroy());
+                  ready();
+                };
+                const onError = (error: Error): void => {
+                  failReady(error);
+                };
+                const onTimeout = (): void => {
+                  failReady(
+                    new Error('Detached workflow owner did not commit the termination lease')
+                  );
+                };
+                socket.on('data', onData);
+                socket.once('error', onError);
+                socket.once('timeout', onTimeout);
+                socket.setTimeout(IPC_TIMEOUT_MS);
+                socket.write(TERMINATE_REQUEST, error => {
+                  if (error) failReady(error);
+                });
+              });
               await terminateDetachedProcessTree(pid, () => !released && !socket.destroyed);
             } finally {
               release();
@@ -378,6 +470,12 @@ async function terminateDetachedProcessTree(
     process.kill(-pid, 'SIGTERM');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    if (processExists(pid)) {
+      throw new Error(
+        `Detached workflow owner ${String(pid)} is alive but does not own process group ${String(pid)}`
+      );
+    }
+    return;
   }
   if (await waitUntilGone(() => processGroupExists(pid), TERMINATION_GRACE_MS)) return;
 
@@ -385,6 +483,12 @@ async function terminateDetachedProcessTree(
     process.kill(-pid, 'SIGKILL');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    if (processExists(pid)) {
+      throw new Error(
+        `Detached workflow owner ${String(pid)} is alive but does not own process group ${String(pid)}`
+      );
+    }
+    return;
   }
   if (!(await waitUntilGone(() => processGroupExists(pid), TERMINATION_CONFIRM_MS))) {
     throw new Error(`Detached workflow process group ${String(pid)} is still running`);

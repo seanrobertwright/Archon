@@ -103,4 +103,4 @@ archon workflow reject <run-id> "reason for rejection"
 
 - **Workflow shows `running` for a long time**: The AI is doing research/implementation. Be patient — check again in a few minutes.
 - **Log file not found**: The log is at `~/.archon/workspaces/<owner>/<repo>/logs/<run-id>.jsonl`
-- **User wants to cancel**: Run `archon workflow reject <run-id>` to resolve an approval gate, `archon workflow cancel <run-id>` to actively stop a running CLI `--detach` owner, or `archon workflow abandon <run-id>` for a paused run or verified orphan where no host work remains.
+- **User wants to reject an approval gate**: Run `archon workflow reject <run-id>`. Use `archon workflow cancel <run-id>` to actively stop a running CLI `--detach` owner, or `archon workflow abandon <run-id>` to cancel a paused run or verified orphan where no host work remains.

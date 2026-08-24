@@ -51,6 +51,7 @@ const mockRequestDetachedRunStop = mock(() =>
   Promise.resolve({ stop: mockDetachedTargetStop, release: mockDetachedTargetRelease })
 );
 const mockDetachedControlClose = mock(() => Promise.resolve());
+const mockAssertDetachedRunProcessOwner = mock(() => undefined);
 let mockDetachedStopRequested = false;
 const mockStartDetachedRunControlServer = mock((_runId: string) =>
   Promise.resolve({
@@ -60,6 +61,7 @@ const mockStartDetachedRunControlServer = mock((_runId: string) =>
 );
 
 mock.module('../utils/detached-run-control', () => ({
+  assertDetachedRunProcessOwner: mockAssertDetachedRunProcessOwner,
   DETACHED_RUN_OWNER_ENV: 'ARCHON_DETACHED_RUN_OWNER',
   requestDetachedRunStop: mockRequestDetachedRunStop,
   startDetachedRunControlServer: mockStartDetachedRunControlServer,
@@ -7844,6 +7846,8 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
     exitSpy = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     capturedSubscribeHandler = null;
     mockDetachedStopRequested = false;
+    mockAssertDetachedRunProcessOwner.mockReset();
+    mockAssertDetachedRunProcessOwner.mockImplementation(() => undefined);
     mockStartDetachedRunControlServer.mockClear();
     mockDetachedControlClose.mockClear();
     mockUnsubscribe.mockClear();
@@ -7979,6 +7983,20 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
     expect(workflowsDb.failWorkflowRun).not.toHaveBeenCalled();
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(mockDetachedControlClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a detached marker when this process does not own its process group', async () => {
+    process.env.ARCHON_DETACHED_RUN_OWNER = '1';
+    mockAssertDetachedRunProcessOwner.mockImplementationOnce(() => {
+      throw new Error('does not own process group');
+    });
+
+    await expect(workflowRunCommand('/test/path', 'plan', 'hello', {})).rejects.toThrow(
+      'does not own process group'
+    );
+
+    expect(mockStartDetachedRunControlServer).not.toHaveBeenCalled();
+    expect(process.env.ARCHON_DETACHED_RUN_OWNER).toBeUndefined();
   });
 
   it('never touches a run it does not own (no owned run id at signal time)', async () => {
