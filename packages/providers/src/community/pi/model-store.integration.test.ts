@@ -31,7 +31,10 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 
 interface RealPiSdk {
   ModelRuntime: {
-    create(options?: { authPath?: string }): Promise<object>;
+    create(options?: {
+      authPath?: string;
+      refreshOnCreate?: boolean;
+    }): Promise<{ getModel?: unknown }>;
   };
   ModelRegistry: new (runtime: object) => {
     find(provider: string, modelId: string): { provider: string; id: string } | undefined;
@@ -49,11 +52,31 @@ async function loadRealSdk(): Promise<RealPiSdk> {
 
 /** True iff the deep-path load yields the real SDK (vs provider.test.ts's mock). */
 async function probeRealSdkAvailable(): Promise<boolean> {
+  // Isolate the probe from the host's real ~/.pi/agent: module load runs
+  // before beforeEach, so without this the create() below would read the
+  // developer's actual Pi config. refreshOnCreate: false matches the test
+  // body's own create call.
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = '/nonexistent-for-archon-store-probe';
   try {
     const { ModelRuntime, ModelRegistry } = await loadRealSdk();
-    return typeof ModelRuntime.create === 'function' && typeof ModelRegistry === 'function';
+    if (typeof ModelRuntime.create !== 'function' || typeof ModelRegistry !== 'function') {
+      return false;
+    }
+    // provider.test.ts's mock factory satisfies both typeof checks above (it
+    // ships `ModelRuntime.create` as a mock fn and `ModelRegistry` as a mock
+    // constructor), and its registry `find` fabricates a model for whatever
+    // ref is asked — the test would pass vacuously against it. Only a real
+    // ModelRuntime instance carries getModel (the mock stubs only
+    // setRuntimeApiKey/getAuth/hasConfiguredAuth), so probe the constructed
+    // instance — same discriminator as request-auth.integration.test.ts.
+    const inst = await ModelRuntime.create({ refreshOnCreate: false });
+    return typeof inst.getModel === 'function';
   } catch {
     return false;
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
 }
 

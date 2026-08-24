@@ -50,8 +50,13 @@ async function loadOAuthAuth(moduleFile: string, exportName: string): Promise<OA
   if (cached) return cached;
   const { createRequire } = await import('node:module');
   const { fileURLToPath } = await import('node:url');
+  // Called through the module object: node:path types dirname/join as
+  // PlatformPath methods, so destructuring them trips eslint unbound-method.
+  const path = await import('node:path');
+  // fileURLToPath returns backslash-separated paths on Windows — build the
+  // deep path with node:path, never string concatenation on '/'.
   const sdkPkgPath = fileURLToPath(import.meta.resolve('@earendil-works/pi-ai/package.json'));
-  const deepPath = `${sdkPkgPath.replace(/\/package\.json$/, '')}/dist/auth/oauth/${moduleFile}`;
+  const deepPath = path.join(path.dirname(sdkPkgPath), 'dist', 'auth', 'oauth', moduleFile);
   const require = createRequire(import.meta.url);
   const mod = require(deepPath) as Record<string, OAuthAuth>;
   const oauthAuth = mod[exportName];

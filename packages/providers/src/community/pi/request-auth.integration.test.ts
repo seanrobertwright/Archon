@@ -116,12 +116,23 @@ async function loadRealModelRuntime(): Promise<ModelRuntimeCtor> {
  * its own `bun test` process so the probe always returns `true` in CI.
  */
 async function probeRealSdkAvailable(): Promise<boolean> {
+  // Isolate the probe from the host's real ~/.pi/agent: it runs at module
+  // load, before beforeEach points PI_CODING_AGENT_DIR at a scratch dir, and
+  // every other create() in this file passes refreshOnCreate: false — the
+  // probe must not be the one call that reads the developer's actual config.
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = '/nonexistent-for-archon-int-probe';
   try {
     const ModelRuntime = await loadRealModelRuntime();
-    const inst = (await ModelRuntime.create({})) as { getModel?: unknown };
+    const inst = (await ModelRuntime.create({ refreshOnCreate: false })) as {
+      getModel?: unknown;
+    };
     return typeof inst.getModel === 'function';
   } catch {
     return false;
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
 }
 
