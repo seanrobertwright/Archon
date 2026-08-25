@@ -107,7 +107,7 @@ export async function findLatestByCodebaseAndWorkingPath(
      WHERE codebase_id = $1 AND working_path = $2 AND created_at <= $3
      ORDER BY created_at DESC
      LIMIT 1`,
-    [codebaseId, workingPath, createdBefore]
+    [codebaseId, workingPath, createdBefore.toISOString()]
   );
   const row = result.rows[0];
   return row ? normalizeEnvironmentRow(row) : null;

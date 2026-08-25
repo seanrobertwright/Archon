@@ -39,6 +39,7 @@ import {
   classifyIsolationError,
 } from '@archon/isolation';
 import type { ExecutionContext, ContainerBackend, ContainerBackendConfig } from '@archon/isolation';
+import type { TaskBranchSelection } from '@archon/isolation';
 import {
   createLogger,
   getArchonHome,
@@ -1664,7 +1665,12 @@ async function runWorkflowWithOwnedSource(
     // --branch (an explicit --branch is already in argv). Without this, the child
     // would generate its own timestamped branch and fork a second worktree.
     // Never pin a branch for folder projects — they run in place with no worktree.
-    if (wantsIsolation && !detachIsFolder && options.branchName === undefined) {
+    if (
+      wantsIsolation &&
+      !detachIsFolder &&
+      options.branchName === undefined &&
+      options.adoptRunId === undefined
+    ) {
       pinnedBranch = `${workflowName}-${String(Date.now())}`;
       extraArgs.push('--branch', pinnedBranch);
     }
@@ -1857,7 +1863,7 @@ async function runWorkflowWithOwnedSource(
   // start). Supersede validates existence/terminality only; it deliberately
   // inherits nothing.
   let adoptedFromRunId: string | undefined;
-  let adoptedBranch: git.BranchName | undefined;
+  let adoptedTaskBranch: Extract<TaskBranchSelection, { kind: 'existing' }> | undefined;
   let continuationMode: 'adopt' | 'supersede' | undefined;
   // Set when the adopt lane executes inside a checkout whose `.archon` may differ from
   // this process's cwd — the trigger for recaptureForLane once the path is final.
@@ -1900,11 +1906,11 @@ async function runWorkflowWithOwnedSource(
           `Adopting run ${adoptedRun.id} — reusing its worktree at ${lane.workingPath} (dirty state inherited as-is).`
         );
       } else if (lane.kind === 'checkout-branch') {
-        adoptedBranch = git.toBranchName(lane.branch);
+        adoptedTaskBranch = lane.taskBranch;
         wantsIsolation = true;
         adoptLaneRunsIsolatedCheckout = true;
         console.log(
-          `Adopting run ${adoptedRun.id} — its worktree is gone; checking out its existing branch '${lane.branch}'.`
+          `Adopting run ${adoptedRun.id} — its worktree is gone; checking out its existing branch '${lane.taskBranch.branch}'.`
         );
       } else {
         console.log(
@@ -2242,8 +2248,8 @@ async function runWorkflowWithOwnedSource(
       const isolatedEnv = await provider.create({
         workflowType: 'task',
         identifier: branchIdentifier,
-        taskBranch: adoptedBranch
-          ? { kind: 'existing', branch: adoptedBranch }
+        taskBranch: adoptedTaskBranch
+          ? adoptedTaskBranch
           : options.fromBranch?.trim()
             ? { kind: 'new', fromBranch: git.toBranchName(options.fromBranch.trim()) }
             : undefined,

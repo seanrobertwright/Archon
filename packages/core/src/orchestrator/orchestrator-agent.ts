@@ -929,7 +929,14 @@ async function dispatchOrchestratorWorkflowOwned(
   // isolation resolution below — so its capture is deferred until `cwd` is known.
   const captureCwd = adoptionLane?.kind === 'reuse-worktree' ? adoptionLane.workingPath : runCwd;
   if (!willContinueExistingRun && adoptionLane?.kind !== 'checkout-branch') {
-    freshCaptured = await captureFreshSource(owner, captureCwd, workflow, conversationId, platform);
+    freshCaptured = await captureFreshSource(
+      owner,
+      captureCwd,
+      workflow,
+      conversationId,
+      platform,
+      adoptionLane?.kind === 'reuse-worktree' ? captureCwd : undefined
+    );
     if (!freshCaptured) return; // capture failed, message already sent
     workflow = freshCaptured.workflow;
   }
@@ -1078,7 +1085,7 @@ async function dispatchOrchestratorWorkflowOwned(
               // earlier adoption's worktree and drop the exact branch on later ones.
               workflowId: randomUUID(),
               workflowType: 'task',
-              taskBranch: { kind: 'existing', branch: toBranchName(adoptionLane.branch) },
+              taskBranch: adoptionLane.taskBranch,
             }
           : isolationHints,
         false,
@@ -1106,7 +1113,7 @@ async function dispatchOrchestratorWorkflowOwned(
   // adopted branch, so its `.archon` is the branch's vintage — freeze it instead of
   // the parent checkout's, for the same reason the reuse-worktree lane captures above.
   if (adoptionLane?.kind === 'checkout-branch' && !willContinueExistingRun) {
-    freshCaptured = await captureFreshSource(owner, cwd, workflow, conversationId, platform);
+    freshCaptured = await captureFreshSource(owner, cwd, workflow, conversationId, platform, cwd);
     if (!freshCaptured) return; // capture failed, message already sent
     workflow = freshCaptured.workflow;
     // The executed graph just changed vintages; judge the invocation against the
@@ -1449,10 +1456,11 @@ async function captureFreshSource(
   runCwd: string,
   workflow: WorkflowDefinition,
   conversationId: string,
-  platform: IPlatformAdapter
+  platform: IPlatformAdapter,
+  explicitSourceRoot?: string
 ): Promise<{ preparedSource: PreparedWorkflowSource; workflow: WorkflowDefinition } | undefined> {
   try {
-    const workflowSourceRoot = await resolveWorkflowSourceRoot(runCwd);
+    const workflowSourceRoot = explicitSourceRoot ?? (await resolveWorkflowSourceRoot(runCwd));
     const preparedSource = await prepareWorkflowSource(createWorkflowDeps(), {
       sourceRoot: workflowSourceRoot ?? runCwd,
     });

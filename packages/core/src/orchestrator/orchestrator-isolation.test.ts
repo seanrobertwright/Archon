@@ -110,8 +110,9 @@ mock.module('../config/config-loader', () => ({
   loadRepoConfig: mock(() => Promise.resolve(null)),
 }));
 
+const mockResolveWorkflowSourceRoot = mock(() => Promise.resolve<string | undefined>(undefined));
 mock.module('../utils/workflow-source-root', () => ({
-  resolveWorkflowSourceRoot: mock(() => Promise.resolve(undefined)),
+  resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
 }));
 
 mock.module('../services/cleanup-service', () => ({
@@ -178,6 +179,30 @@ const mockExecuteWorkflow = mock(async (...args: unknown[]) => {
   if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
   return { paused: true };
 });
+const mockPrepareWorkflowSource = mock(() =>
+  Promise.resolve({
+    runId: 'prepared-run-id',
+    captureRoot: '/capture',
+    origin: '/origin',
+    manifest: {
+      version: 1,
+      engine_version: 'test',
+      origin: '/origin',
+      captured_at: '2026-08-21T00:00:00.000Z',
+      digest: 'test-digest',
+      file_count: 0,
+      byte_count: 0,
+      scopes: [],
+    },
+    roots: {
+      project: '/capture/project',
+      globalWorkflows: '/capture/global/workflows',
+      globalCommands: '/capture/global/commands',
+      globalScripts: '/capture/global/scripts',
+      bundledWorkflows: '/capture/bundled',
+    },
+  })
+);
 /** Ownership calls the dispatch path makes on its capture, in order. */
 const capturedSourceOwnerCalls: string[] = [];
 
@@ -186,30 +211,7 @@ mock.module('@archon/workflows/executor', () => ({
   // Source capture runs before dispatch and does real filesystem work; stub it so these
   // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
   // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
-  prepareWorkflowSource: mock(() =>
-    Promise.resolve({
-      runId: 'prepared-run-id',
-      captureRoot: '/capture',
-      origin: '/origin',
-      manifest: {
-        version: 1,
-        engine_version: 'test',
-        origin: '/origin',
-        captured_at: '2026-08-21T00:00:00.000Z',
-        digest: 'test-digest',
-        file_count: 0,
-        byte_count: 0,
-        scopes: [],
-      },
-      roots: {
-        project: '/capture/project',
-        globalWorkflows: '/capture/global/workflows',
-        globalCommands: '/capture/global/commands',
-        globalScripts: '/capture/global/scripts',
-        bundledWorkflows: '/capture/bundled',
-      },
-    })
-  ),
+  prepareWorkflowSource: mockPrepareWorkflowSource,
   recordSelectedWorkflow: mock(() => Promise.resolve()),
   disposeWorkflowSource: mock(() => Promise.resolve()),
   resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
@@ -423,6 +425,9 @@ describe('dispatchBackgroundWorkflow', () => {
     mockCreateWorkflowRun.mockClear();
     mockFailWorkflowRun.mockClear();
     mockExecuteWorkflow.mockClear();
+    mockPrepareWorkflowSource.mockClear();
+    mockResolveWorkflowSourceRoot.mockClear();
+    mockResolveWorkflowSourceRoot.mockResolvedValue(undefined);
     mockLogger.info.mockClear();
     mockGetOrCreateConversation.mockResolvedValue(
       makeConversation({ id: 'worker-conv-1', platform_conversation_id: 'web-worker-1' })
@@ -632,6 +637,7 @@ describe('dispatchBackgroundWorkflow', () => {
   });
 
   test('missing-worktree adoption materializes the exact branch for a background run', async () => {
+    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
     const workflow = makeWorkflow();
     mockResolve.mockResolvedValueOnce({
       status: 'resolved',
@@ -645,7 +651,10 @@ describe('dispatchBackgroundWorkflow', () => {
 
     await dispatchBackgroundWorkflow(
       makeRoutingCtx({
-        adoptionLane: { kind: 'checkout-branch', branch: 'feature/adopted' },
+        adoptionLane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       }),
       workflow
     );
@@ -664,6 +673,11 @@ describe('dispatchBackgroundWorkflow', () => {
       working_path: string;
     };
     expect(runRow.working_path).toBe('/worktrees/feature-adopted');
+    const captureArgs = mockPrepareWorkflowSource.mock.calls.at(-1) as unknown[];
+    expect((captureArgs[1] as { sourceRoot: string }).sourceRoot).toBe(
+      '/worktrees/feature-adopted'
+    );
+    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/worktrees/feature-adopted');
 
     await flushBackgroundExecution();
   });

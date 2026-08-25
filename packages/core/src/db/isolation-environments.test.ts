@@ -178,11 +178,7 @@ describe('isolation-environments', () => {
       expect(result).toEqual(destroyed);
       expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining('codebase_id = $1 AND working_path = $2'),
-        [
-          'codebase-456',
-          '/workspace/worktrees/project/issue-42',
-          new Date('2026-08-20T10:00:00.000Z'),
-        ]
+        ['codebase-456', '/workspace/worktrees/project/issue-42', '2026-08-20T10:00:00.000Z']
       );
       expect((mockQuery.mock.calls[0]?.[0] as string).includes("status = 'active'")).toBe(false);
       expect(mockQuery.mock.calls[0]?.[0]).toContain('created_at <= $3');

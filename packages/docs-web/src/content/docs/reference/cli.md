@@ -404,7 +404,7 @@ changes only the PR target. Archon warns in both cases.
 
 #### Continuing an existing estate
 
-Use structured continuation whenever a workflow must work on an existing branch or pull request. If you have the prior run id, `--adopt <run-id>` is the authoritative form. Archon reuses the prior worktree as-is. If that worktree is gone but its branch survives, Archon creates a worktree on that exact branch, so pushes still update the same pull request.
+Use structured continuation whenever a workflow must work on an existing branch or pull request. If you have the prior run id, `--adopt <run-id>` is the authoritative form. Archon reuses the prior worktree as-is. If the prior worktree is gone, Archon reuses a same-repository checkout already holding that branch, or creates one on the exact local branch. It does not fetch, reset, or synchronize the branch; update it first if the remote advanced.
 
 Every node in the new run uses that selected checkout, including bash/script delivery assertions. A branch name written only in the message is model context; it does not move engine-owned nodes to another checkout.
 

@@ -355,8 +355,9 @@ mock.module('@archon/isolation', () => ({
   classifyIsolationError: (err: Error) => err.message,
 }));
 
+const mockResolveWorkflowSourceRoot = mock(() => Promise.resolve<string | undefined>(undefined));
 mock.module('../utils/workflow-source-root', () => ({
-  resolveWorkflowSourceRoot: mock(() => Promise.resolve(undefined)),
+  resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
 }));
 
 mock.module('@archon/git', () => ({
@@ -1990,6 +1991,8 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockValidateAndResolveIsolation.mockClear();
     mockResolveWorkflowAdoption.mockClear();
     mockUpdateConversation.mockClear();
+    mockResolveWorkflowSourceRoot.mockClear();
+    mockResolveWorkflowSourceRoot.mockResolvedValue(undefined);
   });
 
   test('calls executeWorkflow (not dispatchBackground) for interactive workflow on web', async () => {
@@ -2028,7 +2031,12 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted', envId: 'env-1' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+          envId: 'env-1',
+        },
       })
     );
 
@@ -2062,7 +2070,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'checkout-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2098,7 +2109,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'checkout-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2123,6 +2137,7 @@ describe('workflow dispatch routing — interactive flag', () => {
   // R8: a reuse-worktree adoption executes inside the inherited worktree, so the
   // frozen source must come from there — not from the parent checkout.
   test('adopt with reuse-worktree captures workflow source from the inherited worktree', async () => {
+    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
     mockHandleCommand.mockReturnValueOnce(
@@ -2131,7 +2146,12 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted', envId: 'env-1' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+          envId: 'env-1',
+        },
       })
     );
 
@@ -2146,11 +2166,13 @@ describe('workflow dispatch routing — interactive flag', () => {
       sourceRoot?: string;
     };
     expect(captureArg.sourceRoot).toBe('/wt/adopted');
+    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/wt/adopted');
   });
 
   // R10: a checkout-branch adoption runs in a worktree on the adopted branch,
   // so its frozen source must come from that worktree — not from the parent checkout.
   test('adopt with checkout-branch captures workflow source from the created worktree', async () => {
+    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
     mockValidateAndResolveIsolation.mockImplementationOnce(() =>
       Promise.resolve({ cwd: '/wt/from-branch', status: 'new' })
     );
@@ -2162,7 +2184,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'checkout-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2177,6 +2202,7 @@ describe('workflow dispatch routing — interactive flag', () => {
       sourceRoot?: string;
     };
     expect(captureArg.sourceRoot).toBe('/wt/from-branch');
+    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/wt/from-branch');
   });
 
   // F1: the deferred capture swaps the executed graph for the branch's vintage, so the
@@ -2234,7 +2260,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'checkout-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2259,7 +2288,11 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2285,7 +2318,11 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 

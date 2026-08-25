@@ -5338,6 +5338,43 @@ describe('workflowRunCommand — detach', () => {
     expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
   });
 
+  it('passes adoption to the detached child without generating a conflicting branch', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const paths = await import('@archon/paths');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+
+    let spawnCmd: string[] = [];
+    try {
+      const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', {
+        detach: true,
+        adoptRunId: 'run-old',
+      });
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnCmd = (
+        (spawnSpy.mock.calls[0]?.[0] as { cmd: string[] } | undefined)?.cmd ?? []
+      ).slice();
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    const adoptIndex = spawnCmd.indexOf('--adopt');
+    expect(adoptIndex).toBeGreaterThan(-1);
+    expect(spawnCmd[adoptIndex + 1]).toBe('run-old');
+    expect(spawnCmd).not.toContain('--branch');
+  });
+
   it('hands the detached child the sealed validated layer instead of a mutable path', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     const paths = await import('@archon/paths');
@@ -9076,10 +9113,16 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
 
   function setupAdoptMocks(
     lane:
-      | { kind: 'reuse-worktree'; workingPath: string; envId?: string }
-      | { kind: 'checkout-branch'; branch: string } = {
+      | {
+          kind: 'reuse-worktree';
+          workingPath: string;
+          taskBranch: { kind: 'existing'; branch: string };
+          envId?: string;
+        }
+      | { kind: 'checkout-branch'; taskBranch: { kind: 'existing'; branch: string } } = {
       kind: 'reuse-worktree',
       workingPath: '/wt/adopted',
+      taskBranch: { kind: 'existing', branch: 'feature/live-pr' },
       envId: 'env-9',
     }
   ): void {
@@ -9144,24 +9187,38 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
   });
 
   it('checks out the exact adopted branch when the prior worktree is gone', async () => {
-    setupAdoptMocks({ kind: 'checkout-branch', branch: 'feature/live-pr' });
+    setupAdoptMocks({
+      kind: 'checkout-branch',
+      taskBranch: { kind: 'existing', branch: 'feature/live-pr' },
+    });
     const isolation = await import('@archon/isolation');
     const { executeWorkflow } = await import('@archon/workflows/executor');
+    const create = mock(() =>
+      Promise.resolve({
+        provider: 'worktree' as const,
+        id: '/wt/recreated',
+        workingPath: '/wt/recreated',
+        branchName: 'feature/live-pr',
+        status: 'active' as const,
+        createdAt: new Date(),
+        metadata: { adopted: true },
+      })
+    );
+    (isolation.getIsolationProvider as ReturnType<typeof mock>).mockReturnValueOnce({
+      create,
+      healthCheck: mock(() => Promise.resolve(true)),
+    });
 
     await workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: 'run-old' });
 
-    const getIsolationProviderMock = isolation.getIsolationProvider as ReturnType<typeof mock>;
-    const provider = getIsolationProviderMock.mock.results.at(-1)?.value as
-      | { create: ReturnType<typeof mock> }
-      | undefined;
-    expect(provider?.create).toHaveBeenCalledWith(
+    expect(create).toHaveBeenCalledWith(
       expect.objectContaining({
         workflowType: 'task',
         taskBranch: { kind: 'existing', branch: 'feature/live-pr' },
       })
     );
     const executed = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1) as unknown[];
-    expect(executed[3]).toBe('/test/path');
+    expect(executed[3]).toBe('/wt/recreated');
     const opts = executed.at(-1) as { adoptedFromRunId?: string };
     expect(opts.adoptedFromRunId).toBe('run-old');
   });

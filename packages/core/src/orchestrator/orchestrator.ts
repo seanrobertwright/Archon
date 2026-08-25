@@ -460,10 +460,7 @@ async function dispatchBackgroundWorkflowOwned(
           ? {
               workflowType: 'task',
               workflowId: workerPlatformId,
-              taskBranch: {
-                kind: 'existing',
-                branch: toBranchName(ctx.adoptionLane.branch),
-              },
+              taskBranch: ctx.adoptionLane.taskBranch,
             }
           : { workflowType: 'thread', workflowId: workerPlatformId };
       const result = await validateAndResolveIsolation(
@@ -529,13 +526,16 @@ async function dispatchBackgroundWorkflowOwned(
   // consistent set of bytes. This background path calls `executeWorkflow` directly, so
   // without its own capture it would be the one surface still reading live source.
   //
-  // `workerCwd` is frequently a worktree, whose `.archon` belongs to whatever branch it
-  // is on rather than to the author; the canonical repo is what gets captured.
-  const workflowSourceRoot = await resolveWorkflowSourceRoot(workerCwd);
+  // Ordinary worktrees inherit workflow definitions from the canonical checkout.
+  // Adoption is different: the selected branch is the declared estate, so its
+  // workflow source must stay anchored to that exact checkout.
+  const workflowSourceRoot = ctx.adoptionLane
+    ? workerCwd
+    : ((await resolveWorkflowSourceRoot(workerCwd)) ?? workerCwd);
   let preparedSource: PreparedWorkflowSource | undefined;
   try {
     preparedSource = await prepareWorkflowSource(workflowDeps, {
-      sourceRoot: workflowSourceRoot ?? workerCwd,
+      sourceRoot: workflowSourceRoot,
     });
     // From here the owner reclaims it unless a run adopts it, whichever way we leave.
     owner.hold(preparedSource);

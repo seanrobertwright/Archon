@@ -67,6 +67,7 @@ function makeDeps(
   return {
     existsSync: (p: string) => p === '/ws/repo/.worktrees/run-1',
     branchExists: async (_repo: string, branch: string) => branch === 'alive-branch',
+    currentBranch: async () => 'impl-branch',
     getRun: async () => ('run' in overrides ? overrides.run : null),
     getActiveRunByPath: async () => overrides.activeHolder ?? null,
     findEnvironmentByPath: async () => overrides.environment ?? null,
@@ -143,8 +144,50 @@ describe('resolveWorkflowAdoption', () => {
     expect(lane).toEqual({
       kind: 'reuse-worktree',
       workingPath: '/ws/repo/.worktrees/run-1',
+      taskBranch: { kind: 'existing', branch: 'impl-branch' },
       envId: 'env-1',
     });
+  });
+
+  test('refuses a surviving worktree that moved off its recorded branch', async () => {
+    await expect(
+      resolveWorkflowAdoption({
+        ...baseArgs,
+        adoptedRunId: 'run-1',
+        deps: {
+          ...makeDeps({ run: runRow(), environment: envRow() }),
+          currentBranch: async () => 'other-branch',
+        },
+      })
+    ).rejects.toThrow(/recorded on branch 'impl-branch' but is now on 'other-branch'/);
+  });
+
+  test('refuses a surviving worktree at detached HEAD', async () => {
+    await expect(
+      resolveWorkflowAdoption({
+        ...baseArgs,
+        adoptedRunId: 'run-1',
+        deps: {
+          ...makeDeps({ run: runRow(), environment: envRow() }),
+          currentBranch: async () => null,
+        },
+      })
+    ).rejects.toThrow(/detached HEAD/);
+  });
+
+  test('preserves an unexpected branch-inspection failure', async () => {
+    await expect(
+      resolveWorkflowAdoption({
+        ...baseArgs,
+        adoptedRunId: 'run-1',
+        deps: {
+          ...makeDeps({ run: runRow(), environment: envRow() }),
+          currentBranch: async () => {
+            throw new Error('git probe timed out');
+          },
+        },
+      })
+    ).rejects.toThrow(/git probe timed out/);
   });
 
   test('refuses reuse when another LIVE run holds the same path', async () => {
@@ -178,7 +221,10 @@ describe('resolveWorkflowAdoption', () => {
         }),
       })
     ).lane;
-    expect(lane).toEqual({ kind: 'checkout-branch', branch: 'alive-branch' });
+    expect(lane).toEqual({
+      kind: 'checkout-branch',
+      taskBranch: { kind: 'existing', branch: 'alive-branch' },
+    });
   });
 
   test('refuses when neither worktree nor branch survives', async () => {

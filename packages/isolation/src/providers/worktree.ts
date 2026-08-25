@@ -13,7 +13,7 @@ import {
   execFileAsync,
   findWorktreeByBranch,
   getCanonicalRepoPath,
-  getCurrentBranch,
+  getCurrentBranchStrict,
   getDefaultRemote,
   getWorktreeBase,
   listWorktrees,
@@ -676,7 +676,7 @@ export class WorktreeProvider implements IIsolationProvider {
       }
 
       if (exactTaskBranch) {
-        const actualBranch = await getCurrentBranch(toWorktreePath(worktreePath));
+        const actualBranch = await getCurrentBranchStrict(toWorktreePath(worktreePath));
         if (actualBranch !== exactTaskBranch) {
           throw new Error(
             `Cannot adopt worktree at '${worktreePath}': expected branch ` +
