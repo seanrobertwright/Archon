@@ -379,6 +379,37 @@ describe('WorktreeProvider', () => {
       expect((addCall?.[1] as string[]).includes('-b')).toBe(false);
     });
 
+    test('cleans a partially registered exact-branch worktree when checkout fails', async () => {
+      const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+      removeWorktreeSpy.mockResolvedValue(undefined);
+      const checkoutError = new Error('checkout interrupted');
+      execSpy.mockRejectedValueOnce(checkoutError);
+      worktreeExistsSpy
+        .mockResolvedValueOnce(false) // No existing checkout to adopt.
+        .mockResolvedValueOnce(true); // Git registered the attempted checkout before failing.
+      mockAccess.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'task',
+        identifier: 'adopt-run-1',
+        taskBranch: {
+          kind: 'existing',
+          branch: git.toBranchName('feature/live-pr'),
+        },
+      };
+
+      await expect(provider.create(request)).rejects.toThrow(
+        "Failed to check out existing branch 'feature/live-pr': checkout interrupted"
+      );
+      expect(removeWorktreeSpy).toHaveBeenCalledWith(
+        '/workspace/repo',
+        expect.stringContaining('feature/live-pr')
+      );
+
+      removeWorktreeSpy.mockRestore();
+    });
+
     test('reuses an exact task branch worktree discovered outside the expected path', async () => {
       const request: IsolationRequest = {
         ...baseRequest,
