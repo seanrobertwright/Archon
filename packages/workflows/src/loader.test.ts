@@ -5009,6 +5009,102 @@ nodes:
       expect(err?.error).toContain('depends_on');
     });
 
+    it('applies the same fan_out.items guards to a compose_fan_out node', async () => {
+      const result = await loadOne(
+        'cfo-dangling',
+        `
+name: cfo-dangling
+description: composed fan-out items reference a node that does not exist
+nodes:
+  - id: work
+    include: cfo-block
+    fan_out:
+      items: "$ghost.output"
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-dangling.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain("references unknown node '$ghost.output'");
+    });
+
+    it('rejects compose_fan_out items referencing a non-dependency producer', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'cfo-block.yaml'),
+        `name: cfo-block\ndescription: block\nnodes:\n  - id: run\n    prompt: "do the thing"\n`
+      );
+      const result = await loadOne(
+        'cfo-not-dep',
+        `
+name: cfo-not-dep
+description: composed block fanned out on a downstream producer (would race)
+nodes:
+  - id: list
+    bash: "echo []"
+  - id: work
+    include: cfo-block
+    fan_out:
+      items: "$list.output"
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-not-dep.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain('not an upstream dependency');
+    });
+
+    it('catches a dangling $node.output ref in a compose_fan_out with value', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'cfo-block.yaml'),
+        `name: cfo-block\ndescription: block\nnodes:\n  - id: run\n    prompt: "do the thing"\n`
+      );
+      const result = await loadOne(
+        'cfo-with-dangling',
+        `
+name: cfo-with-dangling
+description: with value references a node that does not exist
+nodes:
+  - id: work
+    include: cfo-block
+    with:
+      seed: "$ghost.output"
+    fan_out:
+      items: "[1, 2]"
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-with-dangling.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain("references unknown node '$ghost.output'");
+    });
+
+    it('rejects compose_fan_out with binding to a non-upstream producer', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'cfo-block.yaml'),
+        `name: cfo-block\ndescription: block\nnodes:\n  - id: run\n    prompt: "do the thing"\n`
+      );
+      const result = await loadOne(
+        'cfo-with-late',
+        `
+name: cfo-with-late
+description: with value reads a sibling that is not an upstream dependency
+nodes:
+  - id: seed
+    bash: "echo hi"
+  - id: work
+    include: cfo-block
+    with:
+      seed: "$seed.output"
+    fan_out:
+      items: "[1]"
+`
+      );
+      const err = result.errors.find(e => e.filename === 'cfo-with-late.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain("binding 'with.seed'");
+      expect(err?.error).toContain('not an upstream dependency');
+    });
+
     it("rejects 'fan_out' on a non-workflow node", async () => {
       const result = await loadOne(
         'fan-wrong-node',

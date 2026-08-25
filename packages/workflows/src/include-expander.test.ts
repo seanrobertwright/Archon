@@ -96,15 +96,18 @@ function blockWorkflow(): WorkflowDefinition {
 describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
   test('leaves an include+fan_out node unexpanded but validates the target exists', () => {
     const parent = wf('parent', [
-      { id: 'fan', include: 'blk', fan_out: { items: '$list.output' } },
+      { id: 'list', bash: 'echo []' },
+      // items must reference an upstream producer now that the loader scans a
+      // compose_fan_out's fan_out.items like a workflow node's.
+      { id: 'fan', include: 'blk', depends_on: ['list'], fan_out: { items: '$list.output' } },
     ]);
 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(blockWorkflow(), parent));
     expect(errors).toHaveLength(0);
 
     const expanded = workflows.get('parent')!;
-    expect(expanded.nodes).toHaveLength(1);
-    const deferred = expanded.nodes[0];
+    expect(expanded.nodes).toHaveLength(2);
+    const deferred = expanded.nodes.find(n => n.id === 'fan');
     expect(deferred).toMatchObject({ kind: 'compose_fan_out', include: 'blk' });
   });
 

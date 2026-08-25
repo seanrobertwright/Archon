@@ -894,7 +894,8 @@ export function validateDagStructure(
   // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
   // (prompt, systemPrompt, agents.*.prompt/description, bash, script,
   // approval.message/on_reject.prompt, wait.until/event, cancel, loop.prompt, loop.until_bash,
-  // loop_group.until_bash, workflow.input/with/fan_out.items). A dangling ref in any of
+  // loop_group.until_bash, workflow.input/with/fan_out.items,
+  // compose_fan_out.with/fan_out.items). A dangling ref in any of
   // them can bind the wrong flat-DAG output or fail at run time, so all must be validated
   // here.
   //
@@ -926,6 +927,10 @@ export function validateDagStructure(
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
   const whenRefPattern = new RegExp(WHEN_REF_SOURCE, 'g');
   for (const node of nodes) {
+    // Captured before any `isIncludeDirective` narrowing: a compose_fan_out node is
+    // structurally assignable to IncludeDirective (it carries `include:`), so the
+    // guard's false branch filters it out and later checks would see `never`.
+    const composeFanOut = isComposeFanOutNode(node) ? node : undefined;
     const sources: {
       field: string;
       text: string;
@@ -971,7 +976,9 @@ export function validateDagStructure(
         ? node.with
         : isAgentNode(node) && node.source.kind === 'command'
           ? node.source.with
-          : undefined;
+          : composeFanOut
+            ? composeFanOut.with
+            : undefined;
       if (nodeWith !== undefined) {
         for (const [name, value] of Object.entries(nodeWith)) {
           if (typeof value === 'string') {
@@ -984,6 +991,12 @@ export function validateDagStructure(
       // workflow.input is a live ref surface (a data string), scanned verbatim like
       // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
       // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
+      // A `compose_fan_out` node's `with:` values resolve at run time exactly like a
+      // `workflow:` node's (via nodeWith above); its `fan_out.items` is the same live
+      // `$node.output` ref surface as a `workflow:` node's.
+      if (composeFanOut) {
+        sources.push({ field: 'fan_out.items', text: composeFanOut.fan_out.items });
+      }
       if (isWorkflowNode(node)) {
         if (node.input) sources.push({ field: 'input', text: node.input });
         if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
@@ -1157,7 +1170,12 @@ export function validateDagStructure(
   // load time with an actionable message instead. A literal `items` with no `$…output`
   // ref is left to the runtime fail-closed check (it must still parse to an array).
   for (const node of nodes) {
-    if (isIncludeDirective(node) || !isWorkflowNode(node) || !node.fan_out) continue;
+    if (
+      isIncludeDirective(node) ||
+      !(isWorkflowNode(node) || isComposeFanOutNode(node)) ||
+      !node.fan_out
+    )
+      continue;
     const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);
     const producerId = refMatch?.[1];
     if (producerId === undefined) continue; // no ref surface — runtime fail-closed owns it
@@ -1172,12 +1190,17 @@ export function validateDagStructure(
   // enforced — a loop_group body node may read the enclosing scope, whose outputs are
   // settled before the group starts (existing body-ref semantics).
   for (const node of nodes) {
+    // Same capture-before-narrowing as the scan above: the include guard below would
+    // otherwise filter a compose_fan_out node out of the binding check entirely.
+    const composeFanOut = isComposeFanOutNode(node) ? node : undefined;
     if (isIncludeDirective(node)) continue;
     const nodeWith = isExecNode(node)
       ? node.with
       : isAgentNode(node) && node.source.kind === 'command'
         ? node.source.with
-        : undefined;
+        : composeFanOut
+          ? composeFanOut.with
+          : undefined;
     if (nodeWith === undefined) continue;
     for (const [name, value] of Object.entries(nodeWith)) {
       const producerIds: string[] = [];
