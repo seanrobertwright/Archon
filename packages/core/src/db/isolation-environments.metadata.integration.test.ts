@@ -134,9 +134,9 @@ describe('isolation-environments metadata — real SQLite round trip', () => {
 
   test('historical lookup selects the newest estate at or before the run cutoff', async () => {
     const rows = [
-      ['history-old', 'wf-history-old', 'old-branch', '2026-08-25T08:00:00.000Z'],
-      ['history-intended', 'wf-history-intended', 'intended-branch', '2026-08-25T09:00:00.000Z'],
-      ['history-later', 'wf-history-later', 'later-branch', '2026-08-25T11:00:00.000Z'],
+      ['history-old', 'wf-history-old', 'old-branch', '2026-08-25 08:00:00'],
+      ['history-intended', 'wf-history-intended', 'intended-branch', '2026-08-25 09:00:00'],
+      ['history-later', 'wf-history-later', 'later-branch', '2026-08-25 11:00:00'],
     ] as const;
     for (const [id, workflowId, branch, createdAt] of rows) {
       await db.query(

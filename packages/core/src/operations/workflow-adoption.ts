@@ -42,7 +42,6 @@ export type AdoptionLane =
   | {
       kind: 'reuse-worktree';
       workingPath: string;
-      taskBranch: ExistingTaskBranchSelection;
       envId?: string;
     }
   | { kind: 'checkout-branch'; taskBranch: ExistingTaskBranchSelection }
@@ -177,7 +176,6 @@ export async function resolveWorkflowAdoption(
       lane: {
         kind: 'reuse-worktree',
         workingPath: adoptedRun.working_path,
-        taskBranch: { kind: 'existing', branch: toBranchName(historicalBranch) },
         envId: environment.id,
       },
     };

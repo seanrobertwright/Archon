@@ -1,7 +1,7 @@
 /**
  * Database operations for isolation environments
  */
-import { pool, getDialect } from './connection';
+import { pool, getDialect, getDatabaseType } from './connection';
 import type {
   IsolationEnvironmentRow,
   IsolationWorkflowType,
@@ -102,12 +102,19 @@ export async function findLatestByCodebaseAndWorkingPath(
   workingPath: string,
   createdBefore: Date
 ): Promise<IsolationEnvironmentRow | null> {
+  // SQLite stores datetime('now') as TEXT in this exact shape, so its cutoff
+  // must use the same representation for lexicographic comparison. Postgres
+  // compares native timestamps and accepts ISO 8601 directly.
+  const cutoff =
+    getDatabaseType() === 'sqlite'
+      ? createdBefore.toISOString().replace('T', ' ').slice(0, 19)
+      : createdBefore.toISOString();
   const result = await pool.query<IsolationEnvironmentRow>(
     `SELECT * FROM remote_agent_isolation_environments
      WHERE codebase_id = $1 AND working_path = $2 AND created_at <= $3
      ORDER BY created_at DESC
      LIMIT 1`,
-    [codebaseId, workingPath, createdBefore.toISOString()]
+    [codebaseId, workingPath, cutoff]
   );
   const row = result.rows[0];
   return row ? normalizeEnvironmentRow(row) : null;

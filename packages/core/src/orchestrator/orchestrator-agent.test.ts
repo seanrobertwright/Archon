@@ -2034,7 +2034,6 @@ describe('workflow dispatch routing — interactive flag', () => {
         lane: {
           kind: 'reuse-worktree',
           workingPath: '/wt/adopted',
-          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
           envId: 'env-1',
         },
       })
@@ -2149,7 +2148,6 @@ describe('workflow dispatch routing — interactive flag', () => {
         lane: {
           kind: 'reuse-worktree',
           workingPath: '/wt/adopted',
-          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
           envId: 'env-1',
         },
       })
@@ -2291,7 +2289,6 @@ describe('workflow dispatch routing — interactive flag', () => {
         lane: {
           kind: 'reuse-worktree',
           workingPath: '/wt/adopted',
-          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
         },
       })
     );
@@ -2321,7 +2318,6 @@ describe('workflow dispatch routing — interactive flag', () => {
         lane: {
           kind: 'reuse-worktree',
           workingPath: '/wt/adopted',
-          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
         },
       })
     );

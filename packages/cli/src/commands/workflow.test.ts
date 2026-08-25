@@ -9116,13 +9116,11 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
       | {
           kind: 'reuse-worktree';
           workingPath: string;
-          taskBranch: { kind: 'existing'; branch: string };
           envId?: string;
         }
       | { kind: 'checkout-branch'; taskBranch: { kind: 'existing'; branch: string } } = {
       kind: 'reuse-worktree',
       workingPath: '/wt/adopted',
-      taskBranch: { kind: 'existing', branch: 'feature/live-pr' },
       envId: 'env-9',
     }
   ): void {

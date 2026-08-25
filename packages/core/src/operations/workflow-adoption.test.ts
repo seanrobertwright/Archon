@@ -144,22 +144,26 @@ describe('resolveWorkflowAdoption', () => {
     expect(lane).toEqual({
       kind: 'reuse-worktree',
       workingPath: '/ws/repo/.worktrees/run-1',
-      taskBranch: { kind: 'existing', branch: 'impl-branch' },
       envId: 'env-1',
     });
   });
 
   test('refuses a surviving worktree that moved off its recorded branch', async () => {
+    const inspectedPaths: string[] = [];
     await expect(
       resolveWorkflowAdoption({
         ...baseArgs,
         adoptedRunId: 'run-1',
         deps: {
           ...makeDeps({ run: runRow(), environment: envRow() }),
-          currentBranch: async () => 'other-branch',
+          currentBranch: async path => {
+            inspectedPaths.push(path);
+            return path === '/ws/repo/.worktrees/run-1' ? 'other-branch' : 'impl-branch';
+          },
         },
       })
     ).rejects.toThrow(/recorded on branch 'impl-branch' but is now on 'other-branch'/);
+    expect(inspectedPaths).toEqual(['/ws/repo/.worktrees/run-1']);
   });
 
   test('refuses a surviving worktree at detached HEAD', async () => {
