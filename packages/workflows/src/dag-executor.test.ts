@@ -1016,6 +1016,22 @@ describe('substituteNodeOutputRefs', () => {
     ).toBe("test -z ''");
   });
 
+  it('required mode preserves an absent field declared optional by the producer', () => {
+    const outputs = new Map([
+      [
+        'probe',
+        makeOutput('completed', '{"state":"pending"}', { state: 'pending' }, ['state', 'note']),
+      ],
+    ]);
+
+    expect(
+      substituteNodeOutputRefs('test -z $probe.output.note', outputs, true, undefined, {
+        consumerId: 'poll',
+        field: 'loop.until_bash',
+      })
+    ).toBe("test -z ''");
+  });
+
   it('dot notation extracts JSON field', () => {
     const outputs = new Map([['a', makeOutput('completed', JSON.stringify({ type: 'BUG' }))]]);
     expect(substituteNodeOutputRefs('Fix $a.output.type issue', outputs)).toBe('Fix BUG issue');
@@ -1072,15 +1088,28 @@ describe('substituteNodeOutputRefs', () => {
     );
   });
 
-  it('required mode adds the owning until_bash context to a field resolution error', () => {
-    const outputs = new Map<string, NodeOutput>();
+  it('required mode preserves the field error cause and nearby-id hint', () => {
+    const outputs = new Map([['analyze', makeOutput('completed', '{"state":"done"}')]]);
+    let caught: unknown;
 
-    expect(() =>
-      substituteNodeOutputRefs('test $probe.output.state = done', outputs, true, undefined, {
+    try {
+      substituteNodeOutputRefs('test $analze.output.state = done', outputs, true, undefined, {
         consumerId: 'poll',
         field: 'loop_group.until_bash',
-      })
-    ).toThrow("Node 'poll' field 'loop_group.until_bash' cannot resolve '$probe.output.state'");
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const message = (caught as Error).message;
+    expect(message).toContain(
+      "Node 'poll' field 'loop_group.until_bash' cannot resolve '$analze.output.state'"
+    );
+    expect(message).toContain(
+      "references node 'analze', but no node with that id has produced output"
+    );
+    expect(message).toContain("Did you mean: 'analyze'?");
   });
 
   it('failed producer (#2713): whole-text $node.output throws instead of splicing stale output', () => {
@@ -8754,6 +8783,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         yield { type: 'result', sessionId: 'loop-required-ref' };
       });
       const store = createMockStore();
+      const markerPath = join(testDir, 'loop-required-ref-ran.marker');
       const workflow = workflowDefinitionSchema.parse({
         name: 'loop-required-output-ref',
         description: 'A loop must not decide completion from a skipped producer',
@@ -8771,7 +8801,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
             trigger_rule: 'all_done',
             loop: {
               prompt: 'poll once',
-              until_bash: 'test $probe.output != pending',
+              until_bash: `printf ran > ${JSON.stringify(markerPath)}; test $probe.output != pending`,
               max_iterations: 1,
             },
           },
@@ -8801,6 +8831,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(failed?.data?.error).toContain(
         "Node 'poll' field 'loop.until_bash' cannot resolve '$probe.output'"
       );
+      expect(await Bun.file(markerPath).exists()).toBe(false);
     });
 
     it('reads oversized upstream output in until_bash from the run-owned spill directory', async () => {
@@ -21644,6 +21675,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
 
   it('#2803: loop_group until_bash fails when a direct whole-output producer was skipped', async () => {
     const store = createMockStore();
+    const markerPath = join(testDir, 'group-required-ref-ran.marker');
     const workflow = workflowDefinitionSchema.parse({
       name: 'group-required-output-ref',
       description: 'A group must not decide completion from a skipped body producer',
@@ -21651,7 +21683,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
         {
           id: 'poll',
           loop_group: {
-            until_bash: 'test $probe.output != pending',
+            until_bash: `printf ran > ${JSON.stringify(markerPath)}; test $probe.output != pending`,
             max_iterations: 1,
             nodes: [
               { id: 'gate', bash: "printf 'skip'" },
@@ -21690,6 +21722,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(failed?.data?.error).toContain(
       "Node 'poll' field 'loop_group.until_bash' cannot resolve '$probe.output'"
     );
+    expect(await Bun.file(markerPath).exists()).toBe(false);
   });
 
   it('INSTANCE 4: single-node body degenerates like loop: and completes in 1 iteration', async () => {
@@ -30237,7 +30270,7 @@ function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
   };
 }
 
-function includedProbeWaitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
+function includedProbeWaitTerminatedLoopGroupWorkflow(markerPath: string): WorkflowDefinition {
   const block = workflowDefinitionSchema.parse({
     name: 'probe-wait-block',
     description: 'Included polling loop with a terminal wait',
@@ -30246,7 +30279,7 @@ function includedProbeWaitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
       {
         id: 'await-checks',
         loop_group: {
-          until_bash: 'test $ci-probe.output != pending',
+          until_bash: `printf ran > ${JSON.stringify(markerPath)}; test $ci-probe.output != pending`,
           max_iterations: 3,
           nodes: [
             { id: 'ci-probe', bash: "printf 'pending'" },
@@ -30483,7 +30516,8 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
   });
 
   it('#2803: an included wait-resume fails loud when until_bash cannot restore its producer', async () => {
-    const workflow = includedProbeWaitTerminatedLoopGroupWorkflow();
+    const markerPath = join(testDir, 'included-resume-required-ref-ran.marker');
+    const workflow = includedProbeWaitTerminatedLoopGroupWorkflow(markerPath);
     const group = workflow.nodes.find(node => node.id === 'deliver__await-checks');
     expect(group && !('include' in group)).toBe(true);
     if (!group || 'include' in group || group.kind !== 'loop_group') {
@@ -30534,6 +30568,7 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
     expect(failed?.data?.error).toContain(
       "Node 'deliver__await-checks' field 'loop_group.until_bash' cannot resolve '$ci-probe.output'"
     );
+    expect(await Bun.file(markerPath).exists()).toBe(false);
   });
 
   it('keeps loop ownership when an event signal lands before the pause call returns', async () => {
