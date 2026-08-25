@@ -3379,6 +3379,9 @@ export function registerApiRoutes(
     let workflowInputs: Record<string, string> | undefined;
     let workflowModelOverrides: RunModelOverrides | undefined;
     let workflowRunConfig: WorkflowRunConfigInput | undefined;
+    // Between-run continuation (#2747): run-id only — no name-based newest-wins.
+    let adoptRunId: string | undefined;
+    let supersedesRunId: string | undefined;
     let savedFiles: AttachedFile[] = [];
     let uploadDir = '';
 
@@ -3507,6 +3510,8 @@ export function registerApiRoutes(
         aliases?: unknown;
         config?: unknown;
         configPath?: unknown;
+        adopt_run_id?: unknown;
+        supersedes_run_id?: unknown;
       };
       try {
         body = await c.req.json();
@@ -3526,6 +3531,21 @@ export function registerApiRoutes(
       const parsed = parseRunInputsField(body.inputs);
       if (!parsed.ok) return apiError(c, 400, parsed.error);
       workflowInputs = parsed.inputs;
+      for (const [field, target] of [
+        ['adopt_run_id', 'adopt'],
+        ['supersedes_run_id', 'supersede'],
+      ] as const) {
+        const raw = body[field];
+        if (raw === undefined) continue;
+        if (typeof raw !== 'string' || !raw) {
+          return apiError(c, 400, `${field} must be a non-empty run id`);
+        }
+        if (target === 'adopt') adoptRunId = raw;
+        else supersedesRunId = raw;
+      }
+      if (adoptRunId && supersedesRunId) {
+        return apiError(c, 400, 'adopt_run_id and supersedes_run_id are mutually exclusive');
+      }
       const parsedOverrides = parseRunModelOverridesFields(body.tiers, body.aliases);
       if (!parsedOverrides.ok) return apiError(c, 400, parsedOverrides.error);
       workflowModelOverrides = parsedOverrides.overrides;
@@ -3597,6 +3617,8 @@ export function registerApiRoutes(
         ...(workflowInputs ? { workflowInputs } : {}),
         ...(workflowModelOverrides ? { workflowModelOverrides } : {}),
         ...(workflowRunConfig ? { workflowRunConfig } : {}),
+        ...(adoptRunId ? { workflowAdoptRunId: adoptRunId } : {}),
+        ...(supersedesRunId ? { workflowSupersedesRunId: supersedesRunId } : {}),
       };
       const filesToCleanup = savedFiles.length > 0 ? { files: savedFiles, uploadDir } : undefined;
       const result = await dispatchToOrchestrator(
@@ -4147,6 +4169,14 @@ export function registerApiRoutes(
       // Default visibility stays open (everyone sees everyone's runs).
       const mine = c.req.query('mine') === 'true';
       const userId = mine ? (await resolveAuthContext(c))?.userId : undefined;
+
+      // Open-work inbox (#2747): a status-derived query, not a stored flag —
+      // terminal failed runs with no adopter/successor. Mutually exclusive with
+      // the other filters by contract; the inbox wins when combined.
+      if (c.req.query('open') === 'true') {
+        const openRuns = await workflowDb.findOpenWorkRuns({ codebaseId, limit });
+        return c.json({ runs: openRuns.map(toApiWorkflowRun) });
+      }
 
       const runs = await workflowDb.listWorkflowRuns({
         conversationId,

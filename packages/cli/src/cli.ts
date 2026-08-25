@@ -43,6 +43,7 @@ if (hasDetachedRunConfigHandoff) {
 // rationale.
 import { installPipeSafeConsole } from './utils/safe-console';
 import { withDrainedExit } from './utils/exit-with-drain';
+import { writeJsonLine } from './utils/stdout';
 installPipeSafeConsole();
 
 import { parseArgs } from 'util';
@@ -84,6 +85,7 @@ import {
   workflowResetSessionsCommand,
   workflowEventEmitCommand,
   workflowSearchCommand,
+  workflowTestCommand,
   workflowInstallCommand,
   isValidEventType,
 } from './commands/workflow';
@@ -146,6 +148,20 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
+ * Emit a failure message and return exit code 1. Under `--json` stdout must
+ * stay exactly one machine-readable payload, so the diagnostic goes into an
+ * `{ ok: false }` envelope there instead of bare stderr text (or stdout usage).
+ */
+async function fail(json: boolean | undefined, message: string): Promise<1> {
+  if (json) {
+    await writeJsonLine({ ok: false, error: message });
+  } else {
+    console.error(message);
+  }
+  return 1;
+}
+
+/**
  * Print usage information
  */
 function printUsage(): void {
@@ -171,6 +187,9 @@ Commands:
                              ('approve'/'reject' are sugar for the dedicated commands)
   workflow search [query]    Search the workflow marketplace
   workflow install <slug>    Install a workflow from the marketplace
+  workflow test [<name>|<pack>]
+                             Run declared dry-run fixtures (fixtures/*.stubs.yaml) for a
+                             workflow or pack; never creates a run or contacts a provider
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main
@@ -211,6 +230,8 @@ Options:
   --model <name>=<spec>      Rebind small/medium/large or @alias for one run; repeat per binding
   --config <path>            Load a sparse YAML config layer for one fresh workflow run
   --resume                   Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)
+  --adopt <run-id>           Start a new run adopting a terminal run's worktree/branch + artifacts ($ADOPTED_RUN_DIR)
+  --supersedes <run-id>      Record this fresh run as replacing the prior run's open item (no lane inheritance)
   --dry-run                  Simulate workflow DAG control flow without creating a run or contacting a provider
   --stubs <path>             YAML node-output map for --dry-run
   --stubs-init <path>        Write a complete dry-run stub scaffold and exit
@@ -225,6 +246,7 @@ Options:
   --detach                   Run 'workflow run'/'approve'/'reject'/'respond'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
+  --open                     For 'workflow runs': the open-work inbox — failed runs nothing has adopted or superseded
   --limit <n>                For 'workflow runs': max rows (default 20)
   --workflow <name>          Workflow to run for 'continue' (default: archon-assist)
   --no-context               Skip context injection for 'continue'
@@ -342,8 +364,11 @@ async function main(): Promise<number> {
     });
   } catch (error) {
     const err = error as Error;
-    console.error(`Error parsing arguments: ${err.message}`);
-    printUsage();
+    // parseArgs rejected before values.json was bound, so derive the flag
+    // from raw argv to honor the --json stdout contract.
+    const json = args.includes('--json');
+    await fail(json, `Error parsing arguments: ${err.message}`);
+    if (!json) printUsage();
     await shutdownTelemetry();
     return 1;
   }
@@ -431,18 +456,41 @@ async function main(): Promise<number> {
         await workflowSearchCommand(query, jsonFlag);
       } catch (error) {
         const err = error as Error;
-        console.error(`Error: ${err.message}`);
+        if (jsonFlag) {
+          await writeJsonLine({ ok: false, error: err.message });
+        } else {
+          console.error(`Error: ${err.message}`);
+        }
         return 1;
       }
       return 0;
+    }
+
+    // Fixture testing reads workflow files only — handle before git validation,
+    // like marketplace search above.
+    if (command === 'workflow' && subcommand === 'test') {
+      const target = positionals[2];
+      try {
+        // Resolve to the repo root like the git gate below does, so project
+        // workflow discovery reads the repository, not a subdirectory of it.
+        const testCwd = requiresGitRepo ? ((await git.findRepoRoot(cwd)) ?? cwd) : cwd;
+        return await workflowTestCommand(testCwd, target, { json: jsonFlag });
+      } catch (error) {
+        const err = error as Error;
+        if (jsonFlag) {
+          await writeJsonLine({ ok: false, error: err.message });
+        } else {
+          console.error(`Error: ${err.message}`);
+        }
+        return 1;
+      }
     }
 
     // Validate working directory exists
     let effectiveCwd = cwd;
     if (requiresGitRepo) {
       if (!existsSync(cwd)) {
-        console.error(`Error: Directory does not exist: ${cwd}`);
-        return 1;
+        return await fail(jsonFlag, `Error: Directory does not exist: ${cwd}`);
       }
 
       // Validate git repository and resolve to root
@@ -500,22 +548,24 @@ async function main(): Promise<number> {
           effectiveCwd = realCwd;
         } else if (gateLookupError && looksLikeConnectionError(gateLookupError)) {
           // A DB outage would otherwise be mis-reported as "not a git repository".
-          console.error(
-            'Error: Could not verify project registration — the database is unavailable.'
+          return await fail(
+            jsonFlag,
+            [
+              'Error: Could not verify project registration — the database is unavailable.',
+              `  ${gateLookupError.message}`,
+              '  Check that your database is running (or DATABASE_URL is set), then retry.',
+            ].join('\n')
           );
-          console.error(`  ${gateLookupError.message}`);
-          console.error(
-            '  Check that your database is running (or DATABASE_URL is set), then retry.'
-          );
-          return 1;
         } else {
-          console.error('Error: Not in a git repository.');
-          console.error('The Archon CLI must be run from within a git repository.');
-          console.error('Either navigate to a git repo or use --cwd to specify one.');
-          console.error(
-            'Or register this folder as a project: run with --folder, or use /register-project in chat.'
+          return await fail(
+            jsonFlag,
+            [
+              'Error: Not in a git repository.',
+              'The Archon CLI must be run from within a git repository.',
+              'Either navigate to a git repo or use --cwd to specify one.',
+              'Or register this folder as a project: run with --folder, or use /register-project in chat.',
+            ].join('\n')
           );
-          return 1;
         }
       }
     }
@@ -531,10 +581,7 @@ async function main(): Promise<number> {
 
       case 'chat': {
         const chatMessage = positionals.slice(1).join(' ');
-        if (!chatMessage) {
-          console.error('Usage: archon chat <message>');
-          return 1;
-        }
+        if (!chatMessage) return await fail(jsonFlag, 'Usage: archon chat <message>');
         await chatCommand(chatMessage);
         break;
       }
@@ -542,8 +589,10 @@ async function main(): Promise<number> {
       case 'setup': {
         const rawScope = values.scope as string | undefined;
         if (rawScope !== undefined && rawScope !== 'home' && rawScope !== 'project') {
-          console.error(`Error: Invalid --scope: "${rawScope}". Must be "home" or "project".`);
-          return 1;
+          return await fail(
+            jsonFlag,
+            `Error: Invalid --scope: "${rawScope}". Must be "home" or "project".`
+          );
         }
         const scope: 'home' | 'project' = rawScope ?? 'home';
         const forceFlag = (values.force as boolean | undefined) ?? false;
@@ -554,9 +603,13 @@ async function main(): Promise<number> {
         if (scope === 'project') {
           const repoRoot = await git.findRepoRoot(cwd);
           if (!repoRoot) {
-            console.error('Error: --scope project requires running from inside a git repository.');
-            console.error('Run from the repo root, pass --cwd <repo>, or use --scope home.');
-            return 1;
+            return await fail(
+              jsonFlag,
+              [
+                'Error: --scope project requires running from inside a git repository.',
+                'Run from the repo root, pass --cwd <repo>, or use --scope home.',
+              ].join('\n')
+            );
           }
           repoPath = repoRoot;
         }
@@ -572,11 +625,11 @@ async function main(): Promise<number> {
             subcommand === 'reject' ||
             subcommand === 'respond')
         ) {
-          console.error(
+          return await fail(
+            jsonFlag,
             'Error: --model cannot be used when continuing an existing workflow run. ' +
               'The run keeps the model bindings it started with.'
           );
-          return 1;
         }
         switch (subcommand) {
           case 'list':
@@ -586,8 +639,7 @@ async function main(): Promise<number> {
           case 'run': {
             const workflowName = positionals[2];
             if (!workflowName) {
-              console.error('Usage: archon workflow run <name> [message]');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon workflow run <name> [message]');
             }
             const userMessage = positionals.slice(3).join(' ') || '';
             if (resumeFlag && values.config !== undefined) {
@@ -598,35 +650,35 @@ async function main(): Promise<number> {
               return 1;
             }
             if (branchName !== undefined && noWorktree) {
-              console.error(
+              return await fail(
+                jsonFlag,
                 'Error: --branch and --no-worktree are mutually exclusive.\n' +
                   '  --branch creates an isolated worktree (safe).\n' +
                   '  --no-worktree runs directly in your repo (no isolation).\n' +
                   'Use one or the other.'
               );
-              return 1;
             }
             if (noWorktree && fromBranch !== undefined) {
-              console.error(
+              return await fail(
+                jsonFlag,
                 'Error: --from/--from-branch has no effect with --no-worktree.\n' +
                   'Remove --from or drop --no-worktree.'
               );
-              return 1;
             }
             if (noWorktree && baseBranch !== undefined) {
-              console.error(
+              return await fail(
+                jsonFlag,
                 'Error: --base has no effect with --no-worktree.\n' +
                   'Remove --base or drop --no-worktree.'
               );
-              return 1;
             }
             if (resumeFlag && branchName !== undefined) {
-              console.error(
+              return await fail(
+                jsonFlag,
                 'Error: --resume and --branch are mutually exclusive.\n' +
                   '  --resume reuses the existing worktree from the failed run.\n' +
                   '  Remove --branch when using --resume.'
               );
-              return 1;
             }
             // `--workflow-source` picks the authoring directory. It is fresh-run only:
             // a resume executes the source its run already captured, so accepting a
@@ -634,12 +686,12 @@ async function main(): Promise<number> {
             let workflowSource: string | undefined;
             if (workflowSourceFlag !== undefined) {
               if (resumeFlag) {
-                console.error(
+                return await fail(
+                  jsonFlag,
                   'Error: --workflow-source and --resume are mutually exclusive.\n' +
                     '  A resumed run executes the source it captured when it started.\n' +
                     '  Drop --workflow-source, or start a fresh run to pick up new source.'
                 );
-                return 1;
               }
               if (containerFlag) {
                 // A container run executes inside the container, which mounts the folder
@@ -647,26 +699,28 @@ async function main(): Promise<number> {
                 // separate source root could be frozen but never read — the run would
                 // fail looking for its own commands. Refuse the combination rather than
                 // ship a flag that silently does not apply.
-                console.error(
+                return await fail(
+                  jsonFlag,
                   'Error: --workflow-source and --container are mutually exclusive.\n' +
                     '  A container run reads source from the project it mounts.\n' +
                     '  Run without --container to execute source from another directory.'
                 );
-                return 1;
               }
               workflowSource = resolve(workflowSourceFlag);
               if (!(await isPathDirectory(workflowSource))) {
-                console.error(
+                return await fail(
+                  jsonFlag,
                   `Error: --workflow-source is not a directory: ${workflowSource}\n` +
                     '  Point it at the checkout holding .archon/workflows/.'
                 );
-                return 1;
               }
             }
             const options = {
               branchName,
               fromBranch,
               baseBranch,
+              adoptRunId: values.adopt as string | undefined,
+              supersedesRunId: values.supersedes as string | undefined,
               // `--workflow-source` selects WHERE the workflow is read from; `--cwd`
               // continues to select what it acts on. Reusing `discoveryCwd` keeps one
               // internal concept: the directory discovery searches, which the run then
@@ -706,11 +760,11 @@ async function main(): Promise<number> {
 
           case 'status':
             if (positionals[2] !== undefined) {
-              console.error(
+              return await fail(
+                jsonFlag,
                 'Usage: archon workflow status [--json] [--verbose] [--events]\n' +
                   'To show a single run, use: archon workflow get <run-id>'
               );
-              return 1;
             }
             await workflowStatusCommand(
               jsonFlag,
@@ -722,8 +776,10 @@ async function main(): Promise<number> {
           case 'get': {
             const getRunId = positionals[2];
             if (!getRunId || positionals[3] !== undefined) {
-              console.error('Usage: archon workflow get <run-id> [--json] [--verbose] [--events]');
-              return 1;
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow get <run-id> [--json] [--verbose] [--events]'
+              );
             }
             // Propagate the command's exit code so `get <id> && ...` and CI
             // pipelines see a non-zero status when the run is missing.
@@ -742,8 +798,10 @@ async function main(): Promise<number> {
             if (rawLimit !== undefined) {
               limit = Number(rawLimit);
               if (!Number.isInteger(limit) || limit < 1) {
-                console.error(`Error: --limit must be a positive integer, got '${rawLimit}'.`);
-                return 1;
+                return await fail(
+                  jsonFlag,
+                  `Error: --limit must be a positive integer, got '${rawLimit}'.`
+                );
               }
             }
             await workflowRunsCommand(effectiveCwd, {
@@ -751,6 +809,7 @@ async function main(): Promise<number> {
               all: values.all as boolean | undefined,
               status: values.status as string | undefined,
               limit,
+              open: values.open as boolean | undefined,
             });
             break;
           }
@@ -758,8 +817,7 @@ async function main(): Promise<number> {
           case 'resume': {
             const resumeRunId = positionals[2];
             if (!resumeRunId) {
-              console.error('Usage: archon workflow resume <run-id>');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon workflow resume <run-id>');
             }
             await workflowResumeCommand(resumeRunId, jsonFlag, effectiveCwd, detachFlag);
             break;
@@ -768,8 +826,7 @@ async function main(): Promise<number> {
           case 'abandon': {
             const abandonRunId = positionals[2];
             if (!abandonRunId) {
-              console.error('Usage: archon workflow abandon <run-id>');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon workflow abandon <run-id>');
             }
             await workflowAbandonCommand(abandonRunId, jsonFlag, effectiveCwd);
             break;
@@ -778,8 +835,7 @@ async function main(): Promise<number> {
           case 'cancel': {
             const cancelRunId = positionals[2];
             if (!cancelRunId) {
-              console.error('Usage: archon workflow cancel <run-id>');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon workflow cancel <run-id>');
             }
             await workflowCancelCommand(cancelRunId, jsonFlag, effectiveCwd);
             break;
@@ -788,8 +844,7 @@ async function main(): Promise<number> {
           case 'approve': {
             const approveRunId = positionals[2];
             if (!approveRunId) {
-              console.error('Usage: archon workflow approve <run-id> [comment]');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon workflow approve <run-id> [comment]');
             }
             // Accept comment as positional args (everything after run ID) or --comment flag.
             // Explicit empty→undefined conversion (not `|| undefined`): "no comment" must
@@ -811,8 +866,7 @@ async function main(): Promise<number> {
           case 'reject': {
             const rejectRunId = positionals[2];
             if (!rejectRunId) {
-              console.error('Usage: archon workflow reject <run-id> [reason]');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon workflow reject <run-id> [reason]');
             }
             const rawRejectReason =
               (values.reason as string | undefined) || positionals.slice(3).join(' ');
@@ -831,12 +885,12 @@ async function main(): Promise<number> {
             const respondRunId = positionals[2];
             const decision = positionals[3];
             if (!respondRunId || !decision) {
-              console.error('Usage: archon workflow respond <run-id> <decision> [text]');
-              console.error(
-                "  'approve' and 'reject' are sugar for the equivalent dedicated commands; " +
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow respond <run-id> <decision> [text]\n' +
+                  "  'approve' and 'reject' are sugar for the equivalent dedicated commands; " +
                   'any other decision must be one the gate actually declared.'
               );
-              return 1;
             }
             const rawRespondText =
               (values.text as string | undefined) || positionals.slice(4).join(' ');
@@ -855,9 +909,11 @@ async function main(): Promise<number> {
           case 'cleanup': {
             const days = positionals[2] ? Number(positionals[2]) : 7;
             if (Number.isNaN(days) || days < 0) {
-              console.error('Usage: archon workflow cleanup [days]');
-              console.error('  days: delete terminal runs older than N days (default: 7)');
-              return 1;
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow cleanup [days]\n' +
+                  '  days: delete terminal runs older than N days (default: 7)'
+              );
             }
             await workflowCleanupCommand(days);
             break;
@@ -867,25 +923,21 @@ async function main(): Promise<number> {
             const workflowName = positionals[2];
             const extras = positionals.slice(3);
             if (!workflowName) {
-              console.error(
-                'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]'
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]\n' +
+                  '  Without --scope: deletes persisted sessions across ALL scopes (requires --yes).'
               );
-              console.error(
-                '  Without --scope: deletes persisted sessions across ALL scopes (requires --yes).'
-              );
-              return 1;
             }
             // Reject extra positionals — this is a destructive command and silently
             // dropping `archon workflow reset-sessions wf planner` (likely intent: filter to
             // node "planner") to a cross-scope wipe would be a foot-gun.
             if (extras.length > 0) {
-              console.error(
-                'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]'
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]\n' +
+                  `Error: unexpected positional argument(s): ${extras.join(' ')}. Use --node <id> to filter by node.`
               );
-              console.error(
-                `Error: unexpected positional argument(s): ${extras.join(' ')}. Use --node <id> to filter by node.`
-              );
-              return 1;
             }
             await workflowResetSessionsCommand(workflowName, {
               scope: values.scope as string | undefined,
@@ -899,34 +951,33 @@ async function main(): Promise<number> {
           case 'event': {
             const action = positionals[2];
             if (action !== 'emit') {
-              if (action === undefined) {
-                console.error('Missing workflow event subcommand');
-              } else {
-                console.error(`Unknown workflow event subcommand: ${action}`);
-              }
-              console.error('Available: emit');
-              return 1;
+              const problem =
+                action === undefined
+                  ? 'Missing workflow event subcommand'
+                  : `Unknown workflow event subcommand: ${action}`;
+              return await fail(jsonFlag, `${problem}\nAvailable: emit`);
             }
             const runId = values['run-id'] as string | undefined;
             const eventType = values.type as string | undefined;
             if (!runId) {
-              console.error(
-                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>\n' +
+                  'Error: --run-id is required'
               );
-              console.error('Error: --run-id is required');
-              return 1;
             }
             if (!eventType) {
-              console.error(
-                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>'
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow event emit --run-id <run-id> --type <event-type>\n' +
+                  'Error: --type is required'
               );
-              console.error('Error: --type is required');
-              return 1;
             }
             if (!isValidEventType(eventType)) {
-              console.error(`Error: unknown event type: ${eventType}`);
-              console.error(`Valid types: ${WORKFLOW_EVENT_TYPES.join(', ')}`);
-              return 1;
+              return await fail(
+                jsonFlag,
+                `Error: unknown event type: ${eventType}\nValid types: ${WORKFLOW_EVENT_TYPES.join(', ')}`
+              );
             }
             let eventData: Record<string, unknown> | undefined;
             const rawData = values.data as string | undefined;
@@ -946,24 +997,23 @@ async function main(): Promise<number> {
           case 'install': {
             const installSlug = positionals[2];
             if (!installSlug) {
-              console.error('Usage: archon workflow install <slug> [--force]');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon workflow install <slug> [--force]');
             }
             const forceFlag = values.force as boolean | undefined;
             await workflowInstallCommand(installSlug, effectiveCwd, forceFlag);
             break;
           }
 
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing workflow subcommand');
-            } else {
-              console.error(`Unknown workflow subcommand: ${subcommand}`);
-            }
-            console.error(
-              'Available: list, run, status, get, runs, resume, cancel, abandon, approve, reject, cleanup, event, search, install'
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing workflow subcommand'
+                : `Unknown workflow subcommand: ${subcommand}`;
+            return await fail(
+              jsonFlag,
+              `${problem}\nAvailable: list, run, status, get, runs, resume, cancel, abandon, approve, reject, cleanup, event, search, install`
             );
-            return 1;
+          }
         }
         break;
 
@@ -985,14 +1035,13 @@ async function main(): Promise<number> {
             break;
           }
 
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing isolation subcommand');
-            } else {
-              console.error(`Unknown isolation subcommand: ${subcommand}`);
-            }
-            console.error('Available: list, cleanup');
-            return 1;
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing isolation subcommand'
+                : `Unknown isolation subcommand: ${subcommand}`;
+            return await fail(jsonFlag, `${problem}\nAvailable: list, cleanup`);
+          }
         }
         break;
 
@@ -1008,21 +1057,19 @@ async function main(): Promise<number> {
             return await validateCommandsCommand(effectiveCwd, validateName, jsonFlag);
           }
 
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing validate target');
-            } else {
-              console.error(`Unknown validate target: ${subcommand}`);
-            }
-            console.error('Available: workflows, commands');
-            return 1;
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing validate target'
+                : `Unknown validate target: ${subcommand}`;
+            return await fail(jsonFlag, `${problem}\nAvailable: workflows, commands`);
+          }
         }
 
       case 'complete': {
         const branches = positionals.slice(1);
         if (branches.length === 0) {
-          console.error('Usage: archon complete <branch-name> [branch2 ...]');
-          return 1;
+          return await fail(jsonFlag, 'Usage: archon complete <branch-name> [branch2 ...]');
         }
         const forceFlag = Boolean(values.force);
         await isolationCompleteCommand(branches, { force: forceFlag, deleteRemote: true });
@@ -1032,8 +1079,10 @@ async function main(): Promise<number> {
       case 'continue': {
         const continueBranch = positionals[1];
         if (!continueBranch) {
-          console.error('Usage: archon continue <branch> [--workflow <name>] "instruction"');
-          return 1;
+          return await fail(
+            jsonFlag,
+            'Usage: archon continue <branch> [--workflow <name>] "instruction"'
+          );
         }
         const continueMessage = positionals.slice(2).join(' ') || '';
         const continueWorkflow = values.workflow as string | undefined;
@@ -1059,14 +1108,13 @@ async function main(): Promise<number> {
         switch (subcommand) {
           case 'github':
             return await authGithubCommand();
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing auth subcommand');
-            } else {
-              console.error(`Unknown auth subcommand: ${subcommand}`);
-            }
-            console.error('Available: github');
-            return 1;
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing auth subcommand'
+                : `Unknown auth subcommand: ${subcommand}`;
+            return await fail(jsonFlag, `${problem}\nAvailable: github`);
+          }
         }
       }
 
@@ -1075,8 +1123,7 @@ async function main(): Promise<number> {
           case 'key': {
             const action = positionals[2];
             if (action !== 'set') {
-              console.error('Usage: archon ai key set <provider>');
-              return 1;
+              return await fail(jsonFlag, 'Usage: archon ai key set <provider>');
             }
             return await aiKeySetCommand(positionals[3]);
           }
@@ -1103,10 +1150,10 @@ async function main(): Promise<number> {
               case 'unset':
                 return await aiTierUnsetCommand(positionals[3], scopeFlag);
               default:
-                console.error(
+                return await fail(
+                  jsonFlag,
                   'Usage: archon ai tier set <small|medium|large> <provider> <model> [--effort <e>] [--scope user|install] | tier list [--json] | tier unset <tier> [--scope user|install]'
                 );
-                return 1;
             }
           }
           case 'alias': {
@@ -1126,10 +1173,10 @@ async function main(): Promise<number> {
               case 'unset':
                 return await aiAliasUnsetCommand(positionals[3], scopeFlag);
               default:
-                console.error(
+                return await fail(
+                  jsonFlag,
                   'Usage: archon ai alias set <@name> <provider> <model> [--effort <e>] [--scope user|install] | alias list [--json] | alias unset <@name> [--scope user|install]'
                 );
-                return 1;
             }
           }
           case 'default':
@@ -1138,16 +1185,16 @@ async function main(): Promise<number> {
               positionals[3],
               values.scope as string | undefined
             );
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing ai subcommand');
-            } else {
-              console.error(`Unknown ai subcommand: ${subcommand}`);
-            }
-            console.error(
-              'Available: key set <provider>, login <provider>, list, logout <provider>, tier set|list|unset, alias set|list|unset, default <provider> [<model>]'
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing ai subcommand'
+                : `Unknown ai subcommand: ${subcommand}`;
+            return await fail(
+              jsonFlag,
+              `${problem}\nAvailable: key set <provider>, login <provider>, list, logout <provider>, tier set|list|unset, alias set|list|unset, default <provider> [<model>]`
             );
-            return 1;
+          }
         }
       }
 
@@ -1157,14 +1204,13 @@ async function main(): Promise<number> {
             return telemetryStatusCommand();
           case 'reset':
             return telemetryResetCommand();
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing telemetry subcommand');
-            } else {
-              console.error(`Unknown telemetry subcommand: ${subcommand}`);
-            }
-            console.error('Available: status, reset');
-            return 1;
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing telemetry subcommand'
+                : `Unknown telemetry subcommand: ${subcommand}`;
+            return await fail(jsonFlag, `${problem}\nAvailable: status, reset`);
+          }
         }
       }
 
@@ -1177,30 +1223,36 @@ async function main(): Promise<number> {
             return await skillInstallCommand(targetPath);
           }
 
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing skill subcommand');
-            } else {
-              console.error(`Unknown skill subcommand: ${subcommand}`);
-            }
-            console.error('Available: install');
-            return 1;
+          default: {
+            const problem =
+              subcommand === undefined
+                ? 'Missing skill subcommand'
+                : `Unknown skill subcommand: ${subcommand}`;
+            return await fail(jsonFlag, `${problem}\nAvailable: install`);
+          }
         }
       }
 
-      default:
-        if (command === undefined) {
-          console.error('Missing command');
-        } else {
-          console.error(`Unknown command: ${command}`);
+      default: {
+        const problem = command === undefined ? 'Missing command' : `Unknown command: ${command}`;
+        // printUsage() writes human text to stdout, which would corrupt the
+        // machine-readable payload under --json.
+        if (jsonFlag) {
+          return await fail(true, problem);
         }
+        console.error(problem);
         printUsage();
         return 1;
+      }
     }
     await printUpdateNotice(values.quiet as boolean | undefined);
     return 0;
   } catch (error) {
     const err = error as Error;
+    if (values.json as boolean | undefined) {
+      await writeJsonLine({ ok: false, error: err.message });
+      return 1;
+    }
     console.error(`Error: ${err.message}`);
     if (process.env.DEBUG) {
       console.error(err.stack);
