@@ -31559,6 +31559,116 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(new Set(ownedNodeIds).size).toBe(2);
   });
 
+  it('does not reuse a composed child workflow fan-out from an earlier loop_group iteration', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: deterministic child fan-out block',
+        'mutates_checkout: false',
+        'inputs:',
+        '  items: { required: true }',
+        'nodes:',
+        '  - id: child',
+        '    workflow: child-workflow',
+        '    fan_out:',
+        "      items: '$INPUTS.items'",
+        '      as: item',
+        '      max_parallel: 1',
+      ].join('\n')
+    );
+    await writeBlock(
+      'name: child-workflow\ndescription: child\ninputs:\n  item: { required: true }\nnodes:\n  - id: work\n    bash: "echo child-$INPUTS.item"',
+      'child-workflow'
+    );
+
+    const childRuns: WorkflowRun[] = [];
+    const runChildWorkflow = mock<RunChildWorkflowFn>(async args => {
+      childRuns.push(
+        makeWorkflowRun(`child-fan-${String(childRuns.length + 1)}`, {
+          workflow_name: args.childWorkflowName,
+          status: 'completed',
+          parent_run_id: args.parentRun.id,
+          metadata: {
+            parent_node_id: args.nodeId,
+            child_index: args.childIndex,
+            summary: 'child-a',
+          },
+        })
+      );
+      return {
+        childRunId: childRuns.at(-1)!.id,
+        status: 'completed',
+        output: 'child-a',
+      };
+    });
+    const store = createMockStore();
+    (store.findChildRuns as Mock<IWorkflowStore['findChildRuns']>).mockImplementation(
+      async _parentRunId => childRuns
+    );
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-child-fan-loop',
+      testDir,
+      {
+        name: 'compose-parent-child-fan-loop',
+        nodes: [
+          {
+            id: 'grp',
+            kind: 'loop_group',
+            loop_group: {
+              until_bash:
+                'n=$(cat .compose-child-fan-loop 2>/dev/null || echo 0); ' +
+                'n=$((n + 1)); echo "$n" > .compose-child-fan-loop; test "$n" -eq 2',
+              max_iterations: 2,
+              fresh_context: true,
+              nodes: [
+                { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '[["a"]]'` },
+                {
+                  id: 'fan',
+                  kind: 'compose_fan_out',
+                  include: 'compose-blk',
+                  depends_on: ['list'],
+                  fan_out: {
+                    items: '$list.output',
+                    as: 'items',
+                    max_parallel: 1,
+                    join: 'all_done',
+                  },
+                },
+              ],
+            },
+            depends_on: [],
+          },
+        ],
+      },
+      makeWorkflowRun('compose-child-fan-loop-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { kind: 'host' },
+      undefined,
+      runChildWorkflow
+    );
+
+    expect(runChildWorkflow).toHaveBeenCalledTimes(2);
+    const ownedNodeIds = runChildWorkflow.mock.calls.map(([args]) => args.nodeId);
+    expect(new Set(ownedNodeIds).size).toBe(2);
+  });
+
   it('does not start a later instance when its atomic running-state claim loses', async () => {
     await writeBlock(
       [

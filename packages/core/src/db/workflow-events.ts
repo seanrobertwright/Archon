@@ -8,7 +8,7 @@
  * writes use `persistWorkflowEvent` and propagate storage failure to their owner.
  * Read operations also throw on error — callers own the degradation policy.
  */
-import { pool, getDatabase, getDialect, getDatabaseType } from './connection';
+import { pool, getDialect, getDatabaseType } from './connection';
 import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
@@ -125,22 +125,30 @@ export async function persistWorkflowEvent(data: WorkflowEventInput): Promise<vo
 
 /**
  * Persist a correctness-critical start only while the owning run is still running.
- * The row lock serializes this claim with cancellation: either the start commits first
- * and cancellation follows it, or cancellation wins and no new work may begin.
+ * This is one conditional INSERT rather than a SELECT followed by an INSERT: on
+ * SQLite, a plain cancellation query can otherwise join the claim's open transaction
+ * between those two statements. PostgreSQL additionally locks the selected run row,
+ * so its concurrent cancellation UPDATE observes the same claim order.
  */
 export async function persistWorkflowEventIfRunning(
   data: WorkflowEventInput
 ): Promise<{ persisted: boolean }> {
-  return getDatabase().withTransaction(async query => {
-    const lockClause = getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : '';
-    const run = await query<{ status: string }>(
-      `SELECT status FROM remote_agent_workflow_runs WHERE id = $1${lockClause}`,
-      [data.workflow_run_id]
-    );
-    if (run.rows[0]?.status !== 'running') return { persisted: false };
-    await insertWorkflowEvent(query, data);
-    return { persisted: true };
-  });
+  const lockClause = getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : '';
+  const result = await pool.query(
+    `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_index, step_name, data)
+     SELECT $1, $2, $3, $4, $5, $6
+     FROM remote_agent_workflow_runs
+     WHERE id = $2 AND status = 'running'${lockClause}`,
+    [
+      getDialect().generateUuid(),
+      data.workflow_run_id,
+      data.event_type,
+      data.step_index ?? null,
+      data.step_name ?? null,
+      JSON.stringify(data.data ?? {}),
+    ]
+  );
+  return { persisted: result.rowCount > 0 };
 }
 
 /**

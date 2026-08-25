@@ -630,17 +630,22 @@ function parseDagNode(
 
   const node = result.data;
 
-  // `mutates_checkout:` on an include is the fourth launch-only option (#1764), and
-  // the only one the schema cannot see: it is workflow-level, so Zod strips it before
-  // superRefine runs. An author writes it on an `include:` believing the block declares
-  // its own concurrency safety; composition has one checkout and one run, so the
-  // declaration belongs to the composing workflow or to a genuinely separate sub-run.
+  // `mutates_checkout:` is workflow-level, so Zod strips a misplaced node-level value
+  // before superRefine runs. Ordinary includes inherit the parent declaration; composed
+  // fan-out instead consumes the included workflow's declaration for block-level
+  // parallelism, so its correction points to that target rather than the parent run.
+  if (isIncludeDirective(node) && (raw as Record<string, unknown>).mutates_checkout !== undefined) {
+    errors.push(
+      `Node '${id}': 'mutates_checkout' is not supported on an include node: a composed block shares the run's single checkout, so concurrency safety is the composing workflow's to declare. Set it at workflow level, or use a 'workflow:' node when you want a separate governed run.`
+    );
+    return null;
+  }
   if (
-    (isIncludeDirective(node) || isComposeFanOutNode(node)) &&
+    isComposeFanOutNode(node) &&
     (raw as Record<string, unknown>).mutates_checkout !== undefined
   ) {
     errors.push(
-      `Node '${id}': 'mutates_checkout' is not supported on an include node: a composed block shares the run's single checkout, so concurrency safety is the composing workflow's to declare. Set it at workflow level, or use a 'workflow:' node when you want a separate governed run.`
+      `Node '${id}': 'mutates_checkout' is not supported on a composed fan-out node. Declare 'mutates_checkout: false' at the root of the included workflow when its whole block is safe to run concurrently, or set 'fan_out.max_parallel: 1'.`
     );
     return null;
   }
@@ -874,17 +879,11 @@ export function validateDagStructure(
   const hasDurableWait = (node: DagNode | IncludeDirective): boolean => {
     if (isIncludeDirective(node)) return false;
     if (isWaitNode(node)) return true;
-    // Like canSuspend: a composed block's waits are only known after expansion,
-    // so assume it holds one.
-    if (isComposeFanOutNode(node)) return true;
     return isLoopGroupNode(node) && node.loop_group.nodes.some(hasDurableWait);
   };
   const canSuspend = (node: DagNode | IncludeDirective): boolean => {
     if (isIncludeDirective(node)) return false;
     if (isGateNode(node) || isWaitNode(node) || isWorkflowNode(node)) return true;
-    // A composed block's gates are only known after expansion, so treat it as
-    // potentially suspending unconditionally.
-    if (isComposeFanOutNode(node)) return true;
     if (isLoopNode(node) && node.loop.interactive) return true;
     return (
       isLoopGroupNode(node) &&

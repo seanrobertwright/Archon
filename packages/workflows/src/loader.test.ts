@@ -2627,7 +2627,7 @@ ${suspensionNode}
       }
     });
 
-    it('treats a composed fan-out block as a suspension node', async () => {
+    it('rejects a suspension-capable path inside a composed fan-out block', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
       await writeFile(
@@ -2656,10 +2656,10 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const err = result.errors.find(e => e.filename === 'cfo-concurrent-suspension.yaml');
       expect(err).toBeDefined();
-      expect(err?.error).toContain("Suspending nodes 'wait-for-time'");
+      expect(err?.error).toContain('contains unsupported suspension-capable path');
     });
 
-    it('rejects two unordered composed fan-out blocks that each hide a wait', async () => {
+    it('rejects composed fan-out blocks that hide a wait', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
       await writeFile(
@@ -2693,7 +2693,28 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       const err = result.errors.find(e => e.filename === 'cfo-pair-suspension.yaml');
       expect(err).toBeDefined();
-      expect(err?.error).toMatch(/Suspending nodes 'fan-block-a[^']*'/);
+      expect(err?.error).toContain('contains unsupported suspension-capable path');
+    });
+
+    it('allows a deterministic composed fan-out beside an unrelated wait', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(
+        join(workflowDir, 'deterministic-block.yaml'),
+        `name: deterministic-block\ndescription: block\nmutates_checkout: false\ninputs:\n  item: { required: true }\nnodes:\n  - id: work\n    bash: "echo $INPUTS.item"\n`
+      );
+      await writeFile(
+        join(workflowDir, 'cfo-with-unrelated-wait.yaml'),
+        `name: cfo-with-unrelated-wait\ndescription: Deterministic fan-out does not own a pause cursor\nnodes:\n  - id: items\n    bash: 'echo ["a"]'\n  - id: wait-for-time\n    wait:\n      duration_ms: 60000\n  - id: fan-block\n    include: deterministic-block\n    depends_on: [items]\n    fan_out:\n      items: "$items.output"\n      as: item\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(
+        result.errors.find(error => error.filename === 'cfo-with-unrelated-wait.yaml')
+      ).toBeUndefined();
+      expect(
+        result.workflows.some(workflow => workflow.workflow.name === 'cfo-with-unrelated-wait')
+      ).toBe(true);
     });
 
     it('rejects waits nested below more than one loop_group boundary', () => {
@@ -5629,6 +5650,24 @@ nodes:
       expect(err?.error).toContain("'mutates_checkout' is not supported on an include node");
       expect(err?.error).toContain("'workflow:' node");
       expect(result.workflows.some(w => w.workflow.name === 'mc-parent')).toBe(false);
+    });
+
+    it("points misplaced composed fan-out 'mutates_checkout' to the included workflow", async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(
+        join(workflowDir, 'mc-fan-block.yaml'),
+        `name: mc-fan-block\ndescription: b\ninputs:\n  item: { required: true }\nnodes:\n  - id: work\n    bash: echo work\n`
+      );
+      await writeFile(
+        join(workflowDir, 'mc-fan-parent.yaml'),
+        `name: mc-fan-parent\ndescription: p\nnodes:\n  - id: items\n    bash: 'echo ["a"]'\n  - id: fan\n    include: mc-fan-block\n    depends_on: [items]\n    mutates_checkout: false\n    fan_out:\n      items: "$items.output"\n      as: item\n`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'mc-fan-parent.yaml');
+      expect(err?.error).toContain('root of the included workflow');
+      expect(err?.error).toContain('fan_out.max_parallel: 1');
     });
 
     it('warns only about the RUN-owned fields a composed workflow cannot carry', async () => {

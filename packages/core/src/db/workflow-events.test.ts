@@ -116,10 +116,8 @@ describe('workflow-events', () => {
   });
 
   describe('persistWorkflowEventIfRunning', () => {
-    test('locks the running row and persists the claimed start in one transaction', async () => {
-      mockQuery
-        .mockResolvedValueOnce(createQueryResult([{ status: 'running' }]))
-        .mockResolvedValueOnce(createQueryResult([]));
+    test('atomically inserts the start from a locked running row', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{}]));
 
       await expect(
         persistWorkflowEventIfRunning({
@@ -129,12 +127,13 @@ describe('workflow-events', () => {
         })
       ).resolves.toEqual({ persisted: true });
 
-      expect(mockQuery.mock.calls[0]?.[0]).toContain('FOR UPDATE');
-      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery.mock.calls[0]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(mockQuery.mock.calls[0]?.[0]).toContain("status = 'running' FOR UPDATE");
     });
 
-    test('does not persist a start after cancellation won the row lock', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([{ status: 'cancelled' }]));
+    test('does not persist a start after cancellation won the conditional insert', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
       await expect(
         persistWorkflowEventIfRunning({

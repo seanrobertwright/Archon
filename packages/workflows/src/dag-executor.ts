@@ -8555,7 +8555,7 @@ async function executeFanOutWorkflowNode(
     const children = (await deps.store.findChildRuns(parentRun.id)).filter(
       c =>
         readSubrunMetadata(c.metadata as Record<string, unknown> | undefined).parentNodeId ===
-        node.id
+        stepName
     );
     for (const child of children) {
       const meta = readSubrunMetadata(child.metadata as Record<string, unknown> | undefined);
@@ -8816,7 +8816,7 @@ async function executeFanOutWorkflowNode(
       // child's outcome alone. The join reads them all once every one has settled.
       const outcome = await runChild({
         parentRun,
-        nodeId: node.id,
+        nodeId: stepName,
         childWorkflowName: node.workflow,
         input,
         cwd,
