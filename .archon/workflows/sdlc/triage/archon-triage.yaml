@@ -22,17 +22,13 @@ inputs:
 returns: triage
 
 nodes:
-  - id: record-state
-    bash: |
-      # Triage is advisory. Snapshot the tree so the final guard can prove it
-      # left the operator's checkout untouched.
-      mkdir -p "$ARTIFACTS_DIR" &&
-        git status --porcelain > "$ARTIFACTS_DIR/.tree-state" &&
-        echo '{"state":"recorded"}'
-
   - id: triage
     command: triage
-    depends_on: [record-state]
+    # Triage is advisory: the engine fails this node with the touched paths
+    # named if it modifies the working tree (#2771). Replaced the
+    # record-state/assert-intact snapshot pair the pack carried before the
+    # engine could enforce this itself.
+    mutates_checkout: false
     output_type: work-triage
     output_format:
       type: object
@@ -46,14 +42,11 @@ nodes:
 
   - id: assert-intact
     bash: |
+      # Tree-intactness is engine-enforced via mutates_checkout: false above;
+      # what remains here is the evidence contract: a route without a written
+      # triage.md is not a triage.
       if [ ! -s "$ARTIFACTS_DIR/triage.md" ]; then
         echo "assert-intact: the run completed but wrote no triage.md — a route without evidence is not a triage." >&2
-        exit 1
-      fi
-      git status --porcelain > "$ARTIFACTS_DIR/.tree-state-after"
-      if ! diff -q "$ARTIFACTS_DIR/.tree-state" "$ARTIFACTS_DIR/.tree-state-after" > /dev/null 2>&1; then
-        echo "assert-intact: the working tree changed during an advisory run:" >&2
-        diff "$ARTIFACTS_DIR/.tree-state" "$ARTIFACTS_DIR/.tree-state-after" >&2 || true
         exit 1
       fi
       echo '{"intact":"true"}'

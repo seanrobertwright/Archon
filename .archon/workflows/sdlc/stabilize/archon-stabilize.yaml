@@ -50,25 +50,16 @@ inputs:
 returns: outcome
 
 nodes:
-  # Third appearance of the record/judge/verify advisory triad (triage, upkeep,
-  # now stabilize) — the rule of three fires, but extraction is blocked: an
-  # include block cannot parameterize its `command:` ref, so the triad cannot
-  # wrap a caller-chosen judging command today. Logged on the constitution's
-  # friction watch-list; extract when the engine can express it.
-  - id: record-state
-    bash: |
-      # Assess is advisory. Snapshot the tree so assert-intact can prove it
-      # left the operator's checkout untouched.
-      mkdir -p "$ARTIFACTS_DIR" &&
-        git status --porcelain > "$ARTIFACTS_DIR/.tree-state" &&
-        echo '{"state":"recorded"}'
-
   # Diagnosis is investigation-grade work (baseline forensics, root-causing a
   # race), not a version lookup — it gets the large tier where upkeep's
   # assessment runs on medium.
   - id: assess
     command: assess
-    depends_on: [record-state]
+    # Advisory: the engine fails this node with the touched paths named if it
+    # modifies the working tree (#2771); replaced the record-state snapshot —
+    # which also dissolved the record/judge/verify triad whose rule-of-three
+    # extraction the constitution's watch-list was tracking.
+    mutates_checkout: false
     model: large
     output_type: stability-assessment
     output_format:
@@ -83,14 +74,10 @@ nodes:
 
   - id: assert-intact
     bash: |
+      # Tree-intactness is engine-enforced via mutates_checkout: false above;
+      # what remains is the evidence contract.
       if [ ! -s "$ARTIFACTS_DIR/stabilize-assessment.md" ]; then
         echo "assert-intact: the run completed but wrote no stabilize-assessment.md — a verdict without evidence is not an assessment." >&2
-        exit 1
-      fi
-      git status --porcelain > "$ARTIFACTS_DIR/.tree-state-after"
-      if ! diff -q "$ARTIFACTS_DIR/.tree-state" "$ARTIFACTS_DIR/.tree-state-after" > /dev/null 2>&1; then
-        echo "assert-intact: the working tree changed during an advisory assessment:" >&2
-        diff "$ARTIFACTS_DIR/.tree-state" "$ARTIFACTS_DIR/.tree-state-after" >&2 || true
         exit 1
       fi
       echo '{"intact":"true"}'

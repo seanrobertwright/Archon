@@ -45,17 +45,11 @@ nodes:
   # The assessment stage is advisory and inline (not a composed package): the
   # record/judge/verify triad appears here for the second time after triage —
   # rule of three says extract on the third package that needs it, not now.
-  - id: record-state
-    bash: |
-      # Assess is advisory. Snapshot the tree so assert-intact can prove it
-      # left the operator's checkout untouched.
-      mkdir -p "$ARTIFACTS_DIR" &&
-        git status --porcelain > "$ARTIFACTS_DIR/.tree-state" &&
-        echo '{"state":"recorded"}'
-
   - id: assess
     command: assess
-    depends_on: [record-state]
+    # Advisory: the engine fails this node with the touched paths named if it
+    # modifies the working tree (#2771); replaced the record-state snapshot.
+    mutates_checkout: false
     model: medium
     output_type: dependency-assessment
     output_format:
@@ -70,14 +64,10 @@ nodes:
 
   - id: assert-intact
     bash: |
+      # Tree-intactness is engine-enforced via mutates_checkout: false above;
+      # what remains is the evidence contract.
       if [ ! -s "$ARTIFACTS_DIR/upkeep-assessment.md" ]; then
         echo "assert-intact: the run completed but wrote no upkeep-assessment.md — a verdict without evidence is not an assessment." >&2
-        exit 1
-      fi
-      git status --porcelain > "$ARTIFACTS_DIR/.tree-state-after"
-      if ! diff -q "$ARTIFACTS_DIR/.tree-state" "$ARTIFACTS_DIR/.tree-state-after" > /dev/null 2>&1; then
-        echo "assert-intact: the working tree changed during an advisory assessment:" >&2
-        diff "$ARTIFACTS_DIR/.tree-state" "$ARTIFACTS_DIR/.tree-state-after" >&2 || true
         exit 1
       fi
       echo '{"intact":"true"}'

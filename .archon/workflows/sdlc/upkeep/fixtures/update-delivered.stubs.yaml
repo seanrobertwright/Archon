@@ -1,7 +1,6 @@
 # Sparse dry-run fixture: the assessment confirms a concrete update is owed, so
 # the full delivery tail runs and the real outcome node verifies the result.
 # Run with --default-stubs.
-record-state: '{"state":"recorded"}'
 assess:
   action: update
   summary: "stub: locked 1.2.3, target 1.2.9 admitted by the constraint, two usage sites, no breaking changes apply"
