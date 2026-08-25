@@ -7,7 +7,7 @@ Aggregate the lens reports into one evidence-based verdict, write the review rep
 1. `$ARTIFACTS_DIR/review/scope.md` — the target, mode, and the **head SHA under review** — and then **the diff itself**, using the commands scope.md records. You verify findings against the code, never against summaries.
 2. Every lens report present in `$ARTIFACTS_DIR/review/` (`code.md`, `seams.md`, `tests.md`, `errors.md`, `comments.md`, `types.md`, `docs.md`, `simplify.md`) — read each **in full**. These files are the findings channel and nothing is truncated at this seam; the structured fields you emit at the end are only the loop signal, not the findings.
 
-The lenses ENABLED this round: `code` and `seams` always, plus the optional lenses whose input is true — tests=$INPUTS.tests, errors=$INPUTS.errors, comments=$INPUTS.comments, types=$INPUTS.types, docs=$INPUTS.docs, simplify=$INPUTS.simplify. A missing file for a DISABLED lens is by design — record it as disabled, never as clean. A missing or empty file for an ENABLED lens means that lens **failed to report**: the review is missing evidence it was asked for — record the gap and apply the verdict rule below.
+The lenses ENABLED this round: `code`, `seams`, and `simplify` always, plus the optional lenses whose input is true — tests=$INPUTS.tests, errors=$INPUTS.errors, comments=$INPUTS.comments, types=$INPUTS.types, docs=$INPUTS.docs. A missing file for a DISABLED lens is by design — record it as disabled, never as clean. A missing or empty file for an ENABLED lens means that lens **failed to report**: the review is missing evidence it was asked for — record the gap and apply the verdict rule below.
 
 ## Aggregate
 
