@@ -3,6 +3,15 @@ name: archon-cli-prompting-mistakes
 description: Common prompt mistakes when invoking Archon workflows or writing node prompts. Short, negative-form guidance. Read before dispatching work or authoring prompts.
 ---
 
+# Prompting Basics
+
+## General
+
+1. Agents are smart — take advantage of that. Each command node runs a real
+   coding-agent harness under the hood, with all its capabilities.
+2. Agents inside Archon do not necessarily know about Archon itself, this run,
+   or past failures. Do not reference context the agent has no awareness of.
+
 # Prompting Mistakes
 
 Short list. Applies in two places: the **message you pass when invoking a
