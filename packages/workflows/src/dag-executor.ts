@@ -9540,8 +9540,9 @@ async function executeComposeFanOutNode(
         }
         return outcome;
       }
-      // A cancelled/paused run stops runLayers early — surface incompleteness rather
-      // than reading absent outputs as success.
+      // Cancellation or another terminal status can stop runLayers early. A claimed
+      // deterministic instance finishes through a sibling's pause and reaches its sink.
+      // Surface any remaining incompleteness rather than treating absent output as success.
       const terminal = instanceCtx.nodeOutputs.get(expanded.primarySink);
       if (terminal?.state !== 'completed') {
         return {
