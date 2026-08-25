@@ -899,6 +899,9 @@ export async function validateWorkflowResources(
     if (isLoopNode(node) && node.loop.until_bash) {
       warnDoubleQuoted(node.loop.until_bash, 'loop.until_bash');
     }
+    if (isLoopGroupNode(node) && node.loop_group.until_bash) {
+      warnDoubleQuoted(node.loop_group.until_bash, 'loop_group.until_bash');
+    }
   }
 
   return issues;
