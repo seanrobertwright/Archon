@@ -1053,6 +1053,47 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
+    it('terminalizes a resumed run before dispatch when persisted thinking is ineffective', async () => {
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preset = {
+        provider: 'copilot',
+        model: 'gpt-5.6',
+        thinking: { type: 'enabled' as const, budgetTokens: 1_000 },
+      };
+      const preCreatedRun = makeRun({
+        id: 'resume-ignored-thinking-run',
+        status: 'running',
+        metadata: {
+          model_bindings: {
+            overrides: { tiers: { large: preset } },
+            effective: {
+              defaultProvider: 'claude',
+              aliases: { large: preset },
+            },
+          },
+        },
+      });
+
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore({ failWorkflowRun: failRun })),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow({ model: 'large' }),
+          'msg',
+          'db-conv-1',
+          { preCreatedRun, priorCompletedNodes: new Map() }
+        )
+      ).rejects.toThrow(/cannot apply Claude-shaped thinking options/);
+
+      expect(failRun).toHaveBeenCalledWith(
+        'resume-ignored-thinking-run',
+        expect.stringContaining('cannot apply Claude-shaped thinking options')
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
     it('fails a pre-created row when a semantic binding error stops startup', async () => {
       const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preCreatedRun = makeRun({ id: 'invalid-model-run', status: 'pending', metadata: {} });

@@ -125,6 +125,12 @@ function normalizePersistedOverridePreset(name: string, entry: ModelAliasPreset)
     );
   }
   assertValidPersistedPreset(name, entry);
+  if (entry.thinking !== undefined && entry.provider !== 'claude') {
+    throw new Error(
+      `Model binding '${name}' cannot apply Claude-shaped thinking options to ` +
+        `provider '${entry.provider}'.`
+    );
+  }
   return model === entry.model ? entry : { ...entry, model };
 }
 

@@ -547,6 +547,22 @@ describe('per-run model bindings', () => {
         },
       })?.overrides.tiers?.large
     ).toEqual({ provider: 'pi', model: 'openai/gpt-5' });
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          overrides: {
+            tiers: {
+              large: {
+                provider: 'copilot',
+                model: 'gpt-5.6',
+                thinking: { type: 'enabled', budgetTokens: 1_000 },
+              },
+            },
+          },
+        },
+      })
+    ).toThrow(/cannot apply Claude-shaped thinking options/);
   });
 });
 
