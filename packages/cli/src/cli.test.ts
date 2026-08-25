@@ -64,7 +64,10 @@ describe('CLI help output', () => {
   });
 
   it('documents the per-run config file', () => {
-    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], { encoding: 'utf8' });
+    const result = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('--config <path>');
   });
@@ -128,6 +131,19 @@ describe('workflow run config argument', () => {
     );
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('--config cannot be used when continuing');
+  });
+
+  it('rejects --config outside workflow run before dispatch', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'chat', 'hello', '--config', './does-not-exist.yaml'],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+      }
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--config can only be used with workflow run');
   });
 
   it('resolves a relative config path from the requested subdirectory cwd', () => {

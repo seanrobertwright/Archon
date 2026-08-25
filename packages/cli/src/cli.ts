@@ -397,6 +397,11 @@ async function main(): Promise<number> {
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
 
   try {
+    if (values.config !== undefined && (command !== 'workflow' || subcommand !== 'run')) {
+      console.error('Error: --config can only be used with workflow run.');
+      return 1;
+    }
+
     // setup/doctor/telemetry default to warn to avoid Pino info JSON interleaving with their human-readable output; lazy loggers pick up this level at first creation
     const isInteractiveCommand =
       command === 'setup' || command === 'doctor' || command === 'telemetry';
@@ -560,10 +565,6 @@ async function main(): Promise<number> {
       }
 
       case 'workflow':
-        if (values.config !== undefined && subcommand !== 'run') {
-          console.error('Error: --config can only be used with workflow run.');
-          return 1;
-        }
         if (
           values.model !== undefined &&
           (subcommand === 'resume' ||

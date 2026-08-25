@@ -96,7 +96,7 @@ mock.module('@archon/providers', () => ({
 }));
 
 const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
-const mockFailWorkflowRun = mock(() => Promise.resolve());
+const mockFailWorkflowRun = mock((): Promise<void> => Promise.resolve());
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
     store: { createWorkflowRun: mockCreateWorkflowRun, failWorkflowRun: mockFailWorkflowRun },

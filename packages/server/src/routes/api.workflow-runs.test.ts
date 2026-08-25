@@ -8,7 +8,7 @@ import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
-beforeAll(async () => {
+beforeAll(async (): Promise<void> => {
   const { registerBuiltinProviders, registerCommunityProviders } =
     await import('@archon/providers');
   registerBuiltinProviders();
@@ -992,18 +992,37 @@ describe('POST /api/workflows/:name/run', () => {
 
   test('rejects caller-supplied server paths and ineffective config before dispatch', async () => {
     const { app } = makeApp();
-    for (const payload of [
-      { configPath: '/etc/passwd' },
-      { config: null },
-      { config: { paths: { worktrees: '/tmp/other' } } },
-      { config: { unknown: true } },
-    ]) {
+    const invalidConfigs = [
+      [{ configPath: '/etc/passwd' }, 'configPath is not supported'],
+      [{ config: null }, "Invalid run config at 'document'"],
+      [{ config: { paths: { worktrees: '/tmp/other' } } }, "Run config key 'paths' cannot apply"],
+      [{ config: { unknown: true } }, "Unknown run config key 'unknown'"],
+    ] as const;
+    for (const [payload, expectedError] of invalidConfigs) {
       const response = await app.request('/api/workflows/bench/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go', ...payload }),
       });
       expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({
+        error: expect.stringContaining(expectedError),
+      });
+    }
+    for (const [payload, expectedError] of invalidConfigs) {
+      const form = new FormData();
+      form.append('conversationId', 'web-test-abc');
+      form.append('message', 'Go');
+      if ('configPath' in payload) form.append('configPath', payload.configPath);
+      if ('config' in payload) form.append('config', JSON.stringify(payload.config));
+      const response = await app.request('/api/workflows/bench/run', {
+        method: 'POST',
+        body: form,
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({
+        error: expect.stringContaining(expectedError),
+      });
     }
     expect(mockHandleMessage).not.toHaveBeenCalled();
   });
