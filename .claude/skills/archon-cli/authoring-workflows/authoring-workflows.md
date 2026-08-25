@@ -106,10 +106,18 @@ The first version is deliberately under-engineered:
   artifacts. The workflow converges on the project instead of being designed
   up front.
 
+All mechanical detail lives in `node-reference.md` (every node type and field,
+when:/trigger_rule wiring, fixtures) with the full substitution semantics in
+`variables.md` — read both when writing YAML.
+
 ## File layout — one folder per workflow
 
 A workflow IS a folder: everything it needs travels with it, and the folder is
-copyable between repos as one unit.
+copyable between repos as one unit. To start one in a repo:
+
+```bash
+mkdir -p .archon/workflows/my-pack/my-workflow/{commands,scripts,fixtures}
+```
 
 ```
 .archon/workflows/<pack>/<workflow>/

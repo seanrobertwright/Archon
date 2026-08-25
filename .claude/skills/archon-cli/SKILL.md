@@ -22,7 +22,7 @@ through the `archon` CLI. This skill has four capabilities; route by intent:
 | **Run** workflows on real work | `running-workflows/running-workflows.md` |
 | **Manage** existing runs (inspect/approve/reject/cancel/resume) | `manage-run/manage-runs.md` |
 | **Set up** Archon or change config | `setup-and-config/setup-and-config.md` |
-| **Author** a new workflow | `authoring-workflows/authoring-workflows.md` |
+| **Author** a new workflow | `authoring-workflows/authoring-workflows.md` (+ its `node-reference.md`) |
 
 Routing rules:
 
@@ -66,6 +66,7 @@ Two hard rules:
 
 - `running-workflows/running-workflows.md` — discovery, invocation, isolation, monitoring
 - `manage-run/manage-runs.md` — every run-control verb, gate semantics, JSON shapes
+- `manage-run/troubleshooting.md` — log locations, JSONL event types, jq recipes
 - `setup-and-config/setup-and-config.md` — install, doctor, config.yaml scopes, provider auth
 - `authoring-workflows/authoring-workflows.md` — designing a workflow: primitives, gates, prompts
 - `prompting-mistakes/prompting-mistakes.md` — common prompt mistakes, for authored nodes and

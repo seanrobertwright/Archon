@@ -53,6 +53,10 @@ Rules:
    `../prompting-mistakes/prompting-mistakes.md` before writing it (this file stands alone without it).
 5. **Interactive workflows need a human at their gates.** They run foreground;
    when they pause, resolve the gate per the sibling `../manage-run/manage-runs.md`.
+   You are a transparent relay, not a commentator: fetch the gate's output from
+   the run log (`jq 'select(.type == "assistant") | .content' <log> | tail -1`)
+   and show it to the user verbatim — no summarizing, no "the workflow asked..."
+   framing. Then take the user's reply back into approve/respond as-is.
 
 ## Monitoring
 
