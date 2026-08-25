@@ -93,14 +93,20 @@ nodes:
 
   # A ready initial review skips this block. Otherwise each iteration corrects
   # the current canonical findings, proves the correction is green, then runs a
-  # fresh light review over the delta. Three iterations means three real fix
-  # opportunities and three confirming reviews — never an unreviewed final fix.
+  # fresh light review over the delta — never an unreviewed final fix. The bound
+  # is a runaway backstop, not a pacing device: until_bash ends the loop the
+  # moment a recheck certifies ready, so a healthy fix-class run still exits in
+  # one or two rounds. Five rounds is calibrated to the feature-class evidence
+  # (2026-08-25: every executor-heavy delivery needed 4-6 rounds and every
+  # non-starved resume converged; 3 cut two converging runs short). A per-lane
+  # bound would need runtime-parameterized composition, which the language
+  # deliberately does not have — the flat bound buys the same outcome free.
   - id: corrections
     depends_on: [review]
     when: "$review.output.ready == 'false'"
     loop_group:
       until_bash: test "$recheck.output.ready" = "true"
-      max_iterations: 3
+      max_iterations: 5
       fresh_context: true
       nodes:
         - id: fix
