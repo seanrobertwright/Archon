@@ -4541,6 +4541,8 @@ async function executeLoopGroupNode(
   /** Ordered enclosing loop_group frames. Required so nested artifact identity cannot
    *  silently fall back to only the immediate group. */
   enclosingLoopGroupPath: NodeArtifactLoopFrame[],
+  /** Inherited only from a composed instance that already owns its durable start. */
+  claimedWorkPausePolicy: ClaimedWorkPausePolicy | undefined,
   issueContext?: string,
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
@@ -5000,6 +5002,7 @@ async function executeLoopGroupNode(
       layers: iterBodyLayers,
       nodeOutputs: scopedNodeOutputs,
       priorCompletedNodes: undefined, // body re-runs in full each iteration (v1)
+      claimedWorkPausePolicy,
       // Thread the loop-level session cursor: fresh_context (or the loop's true first
       // iteration) starts fresh; otherwise carry the prior iteration's last sequential
       // session forward so a body AI node resumes the prior iteration's conversation.
@@ -9414,16 +9417,21 @@ async function executeComposeFanOutNode(
         });
       }
       try {
-        const claim = await deps.store.persistWorkflowEventIfRunning({
-          workflow_run_id: parentRun.id,
-          event_type: 'node_started',
-          step_name: instanceScopeName,
-          data: {
-            type: 'compose_fan_out_instance',
-            identity: snapshot.identity,
-            ordinal: snapshot.ordinal,
+        const claim = await deps.store.persistWorkflowEventIfRunning(
+          {
+            workflow_run_id: parentRun.id,
+            event_type: 'node_started',
+            step_name: instanceScopeName,
+            data: {
+              type: 'compose_fan_out_instance',
+              identity: snapshot.identity,
+              ordinal: snapshot.ordinal,
+            },
           },
-        });
+          {
+            allowPaused: ctx.claimedWorkPausePolicy === 'finish_through_parent_pause',
+          }
+        );
         if (!claim.persisted) {
           return {
             status: 'cancelled',
@@ -9467,7 +9475,7 @@ async function executeComposeFanOutNode(
         layers: buildTopologicalLayers(expanded.nodes),
         nodeOutputs: instanceNodeOutputs,
         priorCompletedNodes: instancePriorNodes,
-        completeClaimedWorkOnPause: true,
+        claimedWorkPausePolicy: 'finish_through_parent_pause',
         lastSequentialSession: undefined,
         warnedProviderConflicts: ctx.warnedProviderConflicts,
         totalCostUsd: 0,
@@ -9733,6 +9741,8 @@ async function buildColdResumeRecoveryPointer(
  * executeLoopNode / executeApprovalNode. Body lifecycle rows additionally carry `iteration`
  * in `data`. The in-process emitter payloads stay raw (unprefixed) — see #2090.
  */
+type ClaimedWorkPausePolicy = 'finish_through_parent_pause';
+
 interface RunLayersContext {
   // --- run-level invariants (shared by top-level DAG and loop_group body) ---
   deps: WorkflowDeps;
@@ -9810,12 +9820,12 @@ interface RunLayersContext {
   afterLayer?: () => Promise<void>;
   /**
    * Finish an already-claimed deterministic subgraph when a sibling pauses the parent.
-   * Composed fan-out bodies set this after their running-state start claim: load-time
+   * Composed fan-out bodies set this after their durable start claim: load-time
    * validation proves they cannot create the pause themselves, and finishing the outer
    * node's claimed work avoids leaving an unresolved durable start. Cancellation and
    * deletion still stop between layers, and unclaimed instances still cannot start.
    */
-  completeClaimedWorkOnPause?: boolean;
+  claimedWorkPausePolicy?: ClaimedWorkPausePolicy;
   /** Resume cache: node ids that completed in a prior run (top-level only; undefined for body). */
   priorCompletedNodes?: Map<string, PersistedNodeOutput>;
   /**
@@ -10607,6 +10617,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   config,
                   ctx.warnedProviderConflicts,
                   ctx.loopGroupPath,
+                  ctx.claimedWorkPausePolicy,
                   issueContext,
                   stepNamePrefix,
                   execContext,
@@ -11213,7 +11224,10 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
       const dagStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
       if (dagStatus === null || dagStatus !== 'running') {
         const effectiveStatus = dagStatus ?? 'deleted';
-        if (effectiveStatus === 'paused' && ctx.completeClaimedWorkOnPause === true) {
+        if (
+          effectiveStatus === 'paused' &&
+          ctx.claimedWorkPausePolicy === 'finish_through_parent_pause'
+        ) {
           getLog().debug(
             { workflowRunId: workflowRun.id, layerIdx, totalLayers: layers.length },
             'dag.claimed_work_continues_through_parent_pause'

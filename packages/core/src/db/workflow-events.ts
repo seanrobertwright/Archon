@@ -124,21 +124,25 @@ export async function persistWorkflowEvent(data: WorkflowEventInput): Promise<vo
 }
 
 /**
- * Persist a correctness-critical start only while the owning run is still running.
- * This is one conditional INSERT rather than a SELECT followed by an INSERT: on
+ * Persist a correctness-critical start while the owning run is running, or while it is
+ * paused when the caller already owns deterministic work that must finish through that
+ * pause. This is one conditional INSERT rather than a SELECT followed by an INSERT: on
  * SQLite, a plain cancellation query can otherwise join the claim's open transaction
- * between those two statements. PostgreSQL additionally locks the selected run row,
- * so its concurrent cancellation UPDATE observes the same claim order.
+ * between those two statements. PostgreSQL additionally locks the selected run row, so
+ * its concurrent cancellation UPDATE observes the same claim order.
  */
 export async function persistWorkflowEventIfRunning(
-  data: WorkflowEventInput
+  data: WorkflowEventInput,
+  options?: { allowPaused?: boolean }
 ): Promise<{ persisted: boolean }> {
   const lockClause = getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : '';
+  const statusPredicate =
+    options?.allowPaused === true ? "status IN ('running', 'paused')" : "status = 'running'";
   const result = await pool.query(
     `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_index, step_name, data)
      SELECT $1, $2, $3, $4, $5, $6
      FROM remote_agent_workflow_runs
-     WHERE id = $2 AND status = 'running'${lockClause}`,
+     WHERE id = $2 AND ${statusPredicate}${lockClause}`,
     [
       getDialect().generateUuid(),
       data.workflow_run_id,

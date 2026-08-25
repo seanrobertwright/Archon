@@ -340,14 +340,20 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     data?: Record<string, unknown>;
   }): Promise<void>;
 
-  /** Atomically persist a correctness-critical event only while the run is running. */
-  persistWorkflowEventIfRunning(data: {
-    workflow_run_id: string;
-    event_type: WorkflowEventType;
-    step_index?: number;
-    step_name?: string;
-    data?: Record<string, unknown>;
-  }): Promise<{ persisted: boolean }>;
+  /**
+   * Atomically persist a correctness-critical event while the run is running. Claimed
+   * deterministic work may explicitly extend that claim through a parent pause.
+   */
+  persistWorkflowEventIfRunning(
+    data: {
+      workflow_run_id: string;
+      event_type: WorkflowEventType;
+      step_index?: number;
+      step_name?: string;
+      data?: Record<string, unknown>;
+    },
+    options?: { allowPaused?: boolean }
+  ): Promise<{ persisted: boolean }>;
 
   /**
    * Return completed node outputs and cumulative token usage from a prior DAG

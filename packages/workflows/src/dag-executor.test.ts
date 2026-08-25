@@ -117,7 +117,11 @@ import {
 import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore, PersistedNodeOutput } from './store';
-import { buildInstanceSnapshots, composeFanOutScopeSegment } from './fan-out-identity';
+import {
+  buildInstanceSnapshots,
+  composeFanOutScopeSegment,
+  type FanOutInstanceSnapshot,
+} from './fan-out-identity';
 import {
   buildAiProfile,
   isLiteralSpec,
@@ -31808,6 +31812,257 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
         event.event_type === 'node_completed' && event.data.type === 'compose_fan_out_instance'
     );
     expect(instanceTerminals).toHaveLength(1);
+    expect(
+      eventsOf(store).some(
+        event => event.event_type === 'node_completed' && event.step_name === 'fan'
+      )
+    ).toBe(false);
+  });
+
+  it('carries a claimed pause policy into a nested composed fan-out', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: nested fan block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: inner-list',
+        '    bash: \'echo [\\"x\\"]\'',
+        '  - id: inner-fan',
+        '    kind: compose_fan_out',
+        '    include: leaf-blk',
+        '    depends_on: [inner-list]',
+        '    fan_out:',
+        "      items: '$inner-list.output'",
+        '      as: item',
+        '      max_parallel: 1',
+      ].join('\n')
+    );
+    await writeBlock(
+      [
+        'name: leaf-blk',
+        'description: nested leaf',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: leaf',
+        "    bash: 'echo $INPUTS.item >> .compose-paused-nested; echo $INPUTS.item'",
+      ].join('\n'),
+      'leaf-blk'
+    );
+    const store = createMockStore();
+    let parentPaused = false;
+    let pauseOnInnerList = true;
+    let claimCount = 0;
+    (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mockImplementation(
+      async data => {
+        if (
+          pauseOnInnerList &&
+          data.event_type === 'node_completed' &&
+          data.step_name?.endsWith('__inner-list')
+        ) {
+          parentPaused = true;
+        }
+      }
+    );
+    (store.getWorkflowRunStatus as Mock<IWorkflowStore['getWorkflowRunStatus']>).mockImplementation(
+      async () => (parentPaused ? 'paused' : 'running')
+    );
+    (
+      store.persistWorkflowEventIfRunning as Mock<IWorkflowStore['persistWorkflowEventIfRunning']>
+    ).mockImplementation(async (data, options) => {
+      claimCount += 1;
+      if (parentPaused && options?.allowPaused !== true) return { persisted: false };
+      await store.persistWorkflowEvent(data);
+      return { persisted: true };
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-paused-nested',
+      testDir,
+      {
+        name: 'compose-parent-paused-nested',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a","b"]'` },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-paused-nested-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(claimCount).toBe(3);
+    expect(await readFile(join(testDir, '.compose-paused-nested'), 'utf8')).toBe('x\n');
+    const firstPassEvents = eventsOf(store);
+    expect(
+      firstPassEvents.filter(
+        event =>
+          event.event_type === 'node_completed' && event.data.type === 'compose_fan_out_instance'
+      )
+    ).toHaveLength(2);
+    expect(
+      firstPassEvents.some(
+        event => event.event_type === 'node_completed' && event.step_name === 'fan'
+      )
+    ).toBe(false);
+
+    const completedNodeOutputs = new Map<string, PersistedNodeOutput>();
+    const fanOutSnapshots = new Map<string, FanOutInstanceSnapshot[]>();
+    for (const event of firstPassEvents) {
+      if (event.event_type === 'node_completed' && typeof event.data.node_output === 'string') {
+        completedNodeOutputs.set(event.step_name, {
+          output: event.data.node_output,
+          ...(event.data.structured_output !== undefined
+            ? { structuredOutput: event.data.structured_output }
+            : {}),
+        });
+      }
+      if (event.event_type === 'fan_out_instances' && Array.isArray(event.data.instances)) {
+        fanOutSnapshots.set(event.step_name, event.data.instances as FanOutInstanceSnapshot[]);
+      }
+    }
+    (store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>).mockResolvedValue({
+      completedNodeOutputs,
+      fanOutSnapshots,
+      unresolvedNodeStarts: new Set(),
+      costUsd: 0,
+    });
+    parentPaused = false;
+    pauseOnInnerList = false;
+    claimCount = 0;
+    (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mockClear();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-paused-nested',
+      testDir,
+      {
+        name: 'compose-parent-paused-nested',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a","b"]'` },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-paused-nested-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(claimCount).toBe(2);
+    expect(await readFile(join(testDir, '.compose-paused-nested'), 'utf8')).toBe('x\nx\n');
+    expect(
+      eventsOf(store).some(
+        event => event.event_type === 'node_completed' && event.step_name === 'fan'
+      )
+    ).toBe(true);
+  });
+
+  it('carries a claimed pause policy into a deterministic loop_group body', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: loop group block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: group',
+        '    loop_group:',
+        "      until_bash: 'exit 0'",
+        '      max_iterations: 1',
+        '      nodes:',
+        '        - id: first',
+        "          bash: 'echo $INPUTS.item >> .compose-paused-loop-first'",
+        '        - id: second',
+        '          depends_on: [first]',
+        "          bash: 'echo $INPUTS.item >> .compose-paused-loop-second; echo $INPUTS.item'",
+      ].join('\n')
+    );
+    const store = createMockStore();
+    let parentPaused = false;
+    let claimCount = 0;
+    (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mockImplementation(
+      async data => {
+        if (data.event_type === 'node_completed' && data.step_name?.endsWith('.first')) {
+          parentPaused = true;
+        }
+      }
+    );
+    (store.getWorkflowRunStatus as Mock<IWorkflowStore['getWorkflowRunStatus']>).mockImplementation(
+      async () => (parentPaused ? 'paused' : 'running')
+    );
+    (
+      store.persistWorkflowEventIfRunning as Mock<IWorkflowStore['persistWorkflowEventIfRunning']>
+    ).mockImplementation(async (data, options) => {
+      claimCount += 1;
+      if (parentPaused && options?.allowPaused !== true) return { persisted: false };
+      await store.persistWorkflowEvent(data);
+      return { persisted: true };
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-paused-loop',
+      testDir,
+      {
+        name: 'compose-parent-paused-loop',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a","b"]'` },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-paused-loop-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(claimCount).toBe(2);
+    expect(await readFile(join(testDir, '.compose-paused-loop-first'), 'utf8')).toBe('a\n');
+    expect(await readFile(join(testDir, '.compose-paused-loop-second'), 'utf8')).toBe('a\n');
+    expect(
+      eventsOf(store).filter(
+        event =>
+          event.event_type === 'node_completed' && event.data.type === 'compose_fan_out_instance'
+      )
+    ).toHaveLength(1);
     expect(
       eventsOf(store).some(
         event => event.event_type === 'node_completed' && event.step_name === 'fan'

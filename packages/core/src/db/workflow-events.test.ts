@@ -144,6 +144,23 @@ describe('workflow-events', () => {
       ).resolves.toEqual({ persisted: false });
       expect(mockQuery).toHaveBeenCalledTimes(1);
     });
+
+    test('allows already-claimed deterministic work to extend through a pause', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{}]));
+
+      await expect(
+        persistWorkflowEventIfRunning(
+          {
+            workflow_run_id: 'run-456',
+            event_type: 'node_started',
+            step_name: 'nested-fan-instance',
+          },
+          { allowPaused: true }
+        )
+      ).resolves.toEqual({ persisted: true });
+
+      expect(mockQuery.mock.calls[0]?.[0]).toContain("status IN ('running', 'paused') FOR UPDATE");
+    });
   });
 
   describe('persistWorkflowEvent', () => {
