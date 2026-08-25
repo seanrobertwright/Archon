@@ -31735,6 +31735,86 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     ]);
   });
 
+  it('finishes a claimed deterministic instance when the parent pauses between inner layers', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: two-layer deterministic block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: first',
+        "    bash: 'echo $INPUTS.item >> .compose-paused-first; echo $INPUTS.item'",
+        '  - id: second',
+        '    depends_on: [first]',
+        "    bash: 'echo $INPUTS.item >> .compose-paused-second; echo $INPUTS.item'",
+      ].join('\n')
+    );
+    const store = createMockStore();
+    let parentPaused = false;
+    let claimCount = 0;
+    (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mockImplementation(
+      async data => {
+        if (data.event_type === 'node_completed' && data.step_name?.endsWith('__first')) {
+          parentPaused = true;
+        }
+      }
+    );
+    (store.getWorkflowRunStatus as Mock<IWorkflowStore['getWorkflowRunStatus']>).mockImplementation(
+      async () => (parentPaused ? 'paused' : 'running')
+    );
+    (
+      store.persistWorkflowEventIfRunning as Mock<IWorkflowStore['persistWorkflowEventIfRunning']>
+    ).mockImplementation(async data => {
+      claimCount += 1;
+      if (parentPaused) return { persisted: false };
+      await store.persistWorkflowEvent(data);
+      return { persisted: true };
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-sibling-pause',
+      testDir,
+      {
+        name: 'compose-parent-sibling-pause',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a","b"]'` },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-sibling-pause-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(claimCount).toBe(2);
+    expect(await readFile(join(testDir, '.compose-paused-first'), 'utf8')).toBe('a\n');
+    expect(await readFile(join(testDir, '.compose-paused-second'), 'utf8')).toBe('a\n');
+    const instanceTerminals = eventsOf(store).filter(
+      event =>
+        event.event_type === 'node_completed' && event.data.type === 'compose_fan_out_instance'
+    );
+    expect(instanceTerminals).toHaveLength(1);
+    expect(
+      eventsOf(store).some(
+        event => event.event_type === 'node_completed' && event.step_name === 'fan'
+      )
+    ).toBe(false);
+  });
+
   it('completes with an empty aggregate for an empty item list', async () => {
     await writeBlock(
       'name: compose-blk\ndescription: test block\nmutates_checkout: false\nnodes:\n  - id: work\n    bash: "echo nope"'

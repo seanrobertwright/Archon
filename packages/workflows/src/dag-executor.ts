@@ -9467,6 +9467,7 @@ async function executeComposeFanOutNode(
         layers: buildTopologicalLayers(expanded.nodes),
         nodeOutputs: instanceNodeOutputs,
         priorCompletedNodes: instancePriorNodes,
+        completeClaimedWorkOnPause: true,
         lastSequentialSession: undefined,
         warnedProviderConflicts: ctx.warnedProviderConflicts,
         totalCostUsd: 0,
@@ -9806,6 +9807,14 @@ interface RunLayersContext {
    * the first point it exists; loop_group bodies have no run-level hook.
    */
   afterLayer?: () => Promise<void>;
+  /**
+   * Finish an already-claimed deterministic subgraph when a sibling pauses the parent.
+   * Composed fan-out bodies set this after their running-state start claim: load-time
+   * validation proves they cannot create the pause themselves, and finishing the outer
+   * node's claimed work avoids leaving an unresolved durable start. Cancellation and
+   * deletion still stop between layers, and unclaimed instances still cannot start.
+   */
+  completeClaimedWorkOnPause?: boolean;
   /** Resume cache: node ids that completed in a prior run (top-level only; undefined for body). */
   priorCompletedNodes?: Map<string, PersistedNodeOutput>;
   /**
@@ -11203,6 +11212,13 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
       const dagStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
       if (dagStatus === null || dagStatus !== 'running') {
         const effectiveStatus = dagStatus ?? 'deleted';
+        if (effectiveStatus === 'paused' && ctx.completeClaimedWorkOnPause === true) {
+          getLog().debug(
+            { workflowRunId: workflowRun.id, layerIdx, totalLayers: layers.length },
+            'dag.claimed_work_continues_through_parent_pause'
+          );
+          continue;
+        }
         getLog().info(
           {
             workflowRunId: workflowRun.id,
