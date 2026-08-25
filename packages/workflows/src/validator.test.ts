@@ -1083,7 +1083,7 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
               id: 'inner',
               kind: 'loop_group',
               loop_group: {
-                until_bash: 'test "$probe.output.state" != "pending"',
+                until_bash: 'test "$LOOP_PREV.probe.output.state" != "pending"',
                 max_iterations: 2,
                 nodes: [{ id: 'probe', kind: 'exec', runtime: 'sh', script: 'echo pending' }],
               },

@@ -882,7 +882,8 @@ export async function validateWorkflowResources(
     // start, after `=`, or after whitespace) so a *closing* quote of an unrelated
     // earlier string doesn't cause a false positive (e.g. `echo "hi"; x=$a.output`).
     // `[^"\n]` excludes newlines — a double-quote spanning lines is pathological.
-    const doubleQuotedOutputRef = /(?:^|[=\s])"[^"\n]*\$[a-zA-Z_][a-zA-Z0-9_-]*\.output/m;
+    const doubleQuotedOutputRef =
+      /(?:^|[=\s])"[^"\n]*\$(?:[a-zA-Z_][a-zA-Z0-9_-]*\.output|LOOP_PREV\.[a-zA-Z_][a-zA-Z0-9_-]*\.output)/m;
     const warnDoubleQuoted = (body: string, field: string): void => {
       if (doubleQuotedOutputRef.test(body)) {
         issues.push({
@@ -890,8 +891,8 @@ export async function validateWorkflowResources(
           nodeId: node.id,
           field,
           message:
-            '`"$nodeId.output"` — double-quoting a substitution that is already shell-quoted by Archon produces the wrong value',
-          hint: 'Use `var=$node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so double-quoting is harmless for those, but the rule is uniform.)',
+            '`"$nodeId.output"` / `"$LOOP_PREV.nodeId.output"` — double-quoting a substitution that is already shell-quoted by Archon produces the wrong value',
+          hint: 'Use `var=$node.output.field` or `var=$LOOP_PREV.node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so double-quoting is harmless for those, but the rule is uniform.)',
         });
       }
     };
