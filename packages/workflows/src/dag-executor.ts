@@ -9628,7 +9628,7 @@ async function executeComposeFanOutNode(
       'workflow.compose_fan_out_interrupted'
     );
     return {
-      state: 'completed',
+      state: ctx.claimedWorkPausePolicy === 'finish_through_parent_pause' ? 'pending' : 'completed',
       output: '',
       ...(totalCostUsd !== undefined ? { costUsd: totalCostUsd } : {}),
       ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),

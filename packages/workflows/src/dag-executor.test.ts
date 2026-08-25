@@ -32080,6 +32080,107 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     ).toBe(false);
   });
 
+  it('does not persist an outer instance terminal when cancellation interrupts nested work', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: nested cancellation block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: inner-list',
+        '    bash: \'echo [\\"x\\"]\'',
+        '  - id: inner-fan',
+        '    kind: compose_fan_out',
+        '    include: leaf-blk',
+        '    depends_on: [inner-list]',
+        '    fan_out:',
+        "      items: '$inner-list.output'",
+        '      as: item',
+        '      max_parallel: 1',
+      ].join('\n')
+    );
+    await writeBlock(
+      [
+        'name: leaf-blk',
+        'description: two-layer nested leaf',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: leaf-first',
+        "    bash: 'echo $INPUTS.item >> .compose-cancelled-nested-first'",
+        '  - id: leaf-second',
+        '    depends_on: [leaf-first]',
+        "    bash: 'echo $INPUTS.item >> .compose-cancelled-nested-second'",
+      ].join('\n'),
+      'leaf-blk'
+    );
+    const store = createMockStore();
+    let runStatus: WorkflowRunStatus = 'running';
+    (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mockImplementation(
+      async data => {
+        if (data.event_type === 'node_completed' && data.step_name?.endsWith('__leaf-first')) {
+          runStatus = 'cancelled';
+        }
+      }
+    );
+    (store.getWorkflowRunStatus as Mock<IWorkflowStore['getWorkflowRunStatus']>).mockImplementation(
+      async () => runStatus
+    );
+    (
+      store.persistWorkflowEventIfRunning as Mock<IWorkflowStore['persistWorkflowEventIfRunning']>
+    ).mockImplementation(async (data, options) => {
+      const claimable =
+        runStatus === 'running' || (runStatus === 'paused' && options?.allowPaused === true);
+      if (!claimable) return { persisted: false };
+      await store.persistWorkflowEvent(data);
+      return { persisted: true };
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-cancelled-nested',
+      testDir,
+      {
+        name: 'compose-parent-cancelled-nested',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a"]'` },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-cancelled-nested-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(await readFile(join(testDir, '.compose-cancelled-nested-first'), 'utf8')).toBe('x\n');
+    await expect(
+      readFile(join(testDir, '.compose-cancelled-nested-second'), 'utf8')
+    ).rejects.toThrow();
+    expect(
+      eventsOf(store).some(
+        event =>
+          event.event_type === 'node_completed' && event.data.type === 'compose_fan_out_instance'
+      )
+    ).toBe(false);
+    expect(
+      eventsOf(store).some(
+        event => event.event_type === 'node_completed' && event.step_name === 'fan'
+      )
+    ).toBe(false);
+  });
+
   it('completes with an empty aggregate for an empty item list', async () => {
     await writeBlock(
       'name: compose-blk\ndescription: test block\nmutates_checkout: false\nnodes:\n  - id: work\n    bash: "echo nope"'
