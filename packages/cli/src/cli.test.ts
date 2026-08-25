@@ -11,7 +11,7 @@ import { cliArgOptions } from './args';
 import * as git from '@archon/git';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { sealWorkflowRunConfig } from '@archon/core/config';
 
@@ -179,7 +179,13 @@ describe('workflow run config argument', () => {
       join(repo, '.env'),
       `TOKEN_ENCRYPTION_KEY=${'33'.repeat(32)}\nARCHON_HOME=${join(repo, 'wrong-home')}\n`
     );
-    writeFileSync(join(repo, '.archon', '.env'), `TOKEN_ENCRYPTION_KEY=${'22'.repeat(32)}\n`);
+    writeFileSync(
+      join(repo, '.archon', '.env'),
+      `TOKEN_ENCRYPTION_KEY=${'22'.repeat(32)}\n` +
+        'ARCHON_DOCKER=true\n' +
+        'WORKSPACE_PATH=/workspace\n' +
+        'HOME=/root\n'
+    );
 
     const savedKey = process.env.TOKEN_ENCRYPTION_KEY;
     const savedArchonHome = process.env.ARCHON_HOME;
@@ -213,6 +219,9 @@ describe('workflow run config argument', () => {
             ...process.env,
             ARCHON_HOME: archonHome,
             TOKEN_ENCRYPTION_KEY: '',
+            ARCHON_DOCKER: '',
+            WORKSPACE_PATH: '',
+            HOME: homedir(),
           },
         }
       );
