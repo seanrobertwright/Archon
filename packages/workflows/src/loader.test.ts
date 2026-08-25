@@ -2568,6 +2568,41 @@ nodes:
       expect(err?.error).toContain("Suspending nodes 'wait-for-time'");
     });
 
+    it('rejects two unordered composed fan-out blocks that each hide a wait', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(
+        join(workflowDir, 'waiting-block.yaml'),
+        `name: waiting-block\ndescription: block\nnodes:\n  - id: delay\n    wait:\n      duration_ms: 60000\n`
+      );
+      await writeFile(
+        join(workflowDir, 'cfo-pair-suspension.yaml'),
+        `
+name: cfo-pair-suspension
+description: Two unordered composed blocks hiding waits must not race for the run cursor
+nodes:
+  - id: items-a
+    bash: "echo []"
+  - id: items-b
+    bash: "echo []"
+  - id: fan-block-a
+    include: waiting-block
+    depends_on: [items-a]
+    fan_out:
+      items: "$items-a.output"
+  - id: fan-block-b
+    include: waiting-block
+    depends_on: [items-b]
+    fan_out:
+      items: "$items-b.output"
+`
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'cfo-pair-suspension.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toMatch(/Suspending nodes 'fan-block-a[^']*'/);
+    });
+
     it('rejects waits nested below more than one loop_group boundary', () => {
       const result = parseWorkflow(
         `

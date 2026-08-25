@@ -866,6 +866,9 @@ export function validateDagStructure(
   const hasDurableWait = (node: DagNode | IncludeDirective): boolean => {
     if (isIncludeDirective(node)) return false;
     if (isWaitNode(node)) return true;
+    // Like canSuspend: a composed block's waits are only known after expansion,
+    // so assume it holds one.
+    if (isComposeFanOutNode(node)) return true;
     return isLoopGroupNode(node) && node.loop_group.nodes.some(hasDurableWait);
   };
   const canSuspend = (node: DagNode | IncludeDirective): boolean => {
