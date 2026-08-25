@@ -89,6 +89,31 @@ export async function listByCodebase(
 }
 
 /**
+ * Find the newest environment record for an exact project checkout path.
+ *
+ * Unlike operational environment lists, adoption needs the destroyed row: its
+ * branch name is the durable route back to an estate after cleanup removed the
+ * worktree. Scope by codebase, path, and the run's start time so neither an
+ * unrelated project nor a later checkout that reused the path can cross the
+ * ownership boundary.
+ */
+export async function findLatestByCodebaseAndWorkingPath(
+  codebaseId: string,
+  workingPath: string,
+  createdBefore: Date
+): Promise<IsolationEnvironmentRow | null> {
+  const result = await pool.query<IsolationEnvironmentRow>(
+    `SELECT * FROM remote_agent_isolation_environments
+     WHERE codebase_id = $1 AND working_path = $2 AND created_at <= $3
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [codebaseId, workingPath, createdBefore]
+  );
+  const row = result.rows[0];
+  return row ? normalizeEnvironmentRow(row) : null;
+}
+
+/**
  * Create or update an active isolation environment (upsert).
  * If an active environment with the same (codebase_id, workflow_type, workflow_id) exists,
  * it updates the existing row instead of inserting a duplicate.

@@ -630,4 +630,41 @@ describe('dispatchBackgroundWorkflow', () => {
 
     await flushBackgroundExecution();
   });
+
+  test('missing-worktree adoption materializes the exact branch for a background run', async () => {
+    const workflow = makeWorkflow();
+    mockResolve.mockResolvedValueOnce({
+      status: 'resolved',
+      env: makeEnvRow({
+        working_path: '/worktrees/feature-adopted',
+        branch_name: 'feature/adopted',
+      }),
+      cwd: '/worktrees/feature-adopted',
+      method: { type: 'created' },
+    });
+
+    await dispatchBackgroundWorkflow(
+      makeRoutingCtx({
+        adoptionLane: { kind: 'checkout-branch', branch: 'feature/adopted' },
+      }),
+      workflow
+    );
+
+    const resolveRequest = mockResolve.mock.calls[0]?.[0] as {
+      hints?: {
+        workflowType?: string;
+        taskBranch?: { kind: string; branch?: string };
+      };
+    };
+    expect(resolveRequest.hints).toMatchObject({
+      workflowType: 'task',
+      taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+    });
+    const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0] as unknown as {
+      working_path: string;
+    };
+    expect(runRow.working_path).toBe('/worktrees/feature-adopted');
+
+    await flushBackgroundExecution();
+  });
 });

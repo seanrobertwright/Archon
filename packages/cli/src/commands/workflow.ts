@@ -1857,6 +1857,7 @@ async function runWorkflowWithOwnedSource(
   // start). Supersede validates existence/terminality only; it deliberately
   // inherits nothing.
   let adoptedFromRunId: string | undefined;
+  let adoptedBranch: git.BranchName | undefined;
   let continuationMode: 'adopt' | 'supersede' | undefined;
   // Set when the adopt lane executes inside a checkout whose `.archon` may differ from
   // this process's cwd — the trigger for recaptureForLane once the path is final.
@@ -1898,14 +1899,12 @@ async function runWorkflowWithOwnedSource(
         console.log(
           `Adopting run ${adoptedRun.id} — reusing its worktree at ${lane.workingPath} (dirty state inherited as-is).`
         );
-      } else if (lane.kind === 'fresh-from-branch') {
-        options.fromBranch = lane.branch;
+      } else if (lane.kind === 'checkout-branch') {
+        adoptedBranch = git.toBranchName(lane.branch);
         wantsIsolation = true;
         adoptLaneRunsIsolatedCheckout = true;
-        options.fromBranch = lane.branch;
-        wantsIsolation = true;
         console.log(
-          `Adopting run ${adoptedRun.id} — its worktree is gone; cutting a fresh worktree from its branch '${lane.branch}'.`
+          `Adopting run ${adoptedRun.id} — its worktree is gone; checking out its existing branch '${lane.branch}'.`
         );
       } else {
         console.log(
@@ -2243,9 +2242,11 @@ async function runWorkflowWithOwnedSource(
       const isolatedEnv = await provider.create({
         workflowType: 'task',
         identifier: branchIdentifier,
-        fromBranch: options.fromBranch?.trim()
-          ? git.toBranchName(options.fromBranch.trim())
-          : undefined,
+        taskBranch: adoptedBranch
+          ? { kind: 'existing', branch: adoptedBranch }
+          : options.fromBranch?.trim()
+            ? { kind: 'new', fromBranch: git.toBranchName(options.fromBranch.trim()) }
+            : undefined,
         baseBranch: codebaseDefaultBranch ? git.toBranchName(codebaseDefaultBranch) : undefined,
         baseOverride: flagBase ? git.toBranchName(flagBase) : undefined,
         codebaseId: codebase.id,
@@ -2293,7 +2294,7 @@ async function runWorkflowWithOwnedSource(
   }
 
   // The lane's checkout is final here — reuse-worktree set it in the lane block, and
-  // fresh-from-branch when the resolver cut its worktree above.
+  // checkout-branch when the resolver materialized its exact branch above.
   if (adoptLaneRunsIsolatedCheckout) {
     console.log(`Capturing workflow source from ${workingCwd}.`);
     await recaptureForLane(workingCwd);

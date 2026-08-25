@@ -925,10 +925,10 @@ async function dispatchOrchestratorWorkflowOwned(
   // A reuse-worktree lane inherits the adopted run's worktree; its `.archon` belongs to
   // whatever branch that worktree carries, so the frozen source must come from THERE —
   // capturing from the parent checkout would mix vintages exactly as #2660 describes.
-  // A fresh-from-branch lane has the same constraint, but its worktree only exists after
+  // A checkout-branch lane has the same constraint, but its worktree only exists after
   // isolation resolution below — so its capture is deferred until `cwd` is known.
   const captureCwd = adoptionLane?.kind === 'reuse-worktree' ? adoptionLane.workingPath : runCwd;
-  if (!willContinueExistingRun && adoptionLane?.kind !== 'fresh-from-branch') {
+  if (!willContinueExistingRun && adoptionLane?.kind !== 'checkout-branch') {
     freshCaptured = await captureFreshSource(owner, captureCwd, workflow, conversationId, platform);
     if (!freshCaptured) return; // capture failed, message already sent
     workflow = freshCaptured.workflow;
@@ -942,7 +942,7 @@ async function dispatchOrchestratorWorkflowOwned(
   let deferredInputError: Error | undefined;
 
   // Input signature gate (#2470, #2554) plus capability gate, judged against ONE
-  // workflow definition. A fresh-from-branch adoption swaps the definition for the
+  // workflow definition. A checkout-branch adoption swaps the definition for the
   // branch's vintage only after isolation resolves its worktree, so these gates must
   // run AFTER that swap there — otherwise required inputs or `requires:` declared on
   // the branch would bypass them entirely.
@@ -999,7 +999,7 @@ async function dispatchOrchestratorWorkflowOwned(
   };
 
   const gatesWaitForBranchVintage =
-    adoptionLane?.kind === 'fresh-from-branch' && !willContinueExistingRun;
+    adoptionLane?.kind === 'checkout-branch' && !willContinueExistingRun;
   if (!gatesWaitForBranchVintage && !(await runSignatureGates(workflow))) return;
 
   // Keys the engine dropped from this workflow's YAML (#2213). Every chat and
@@ -1059,26 +1059,26 @@ async function dispatchOrchestratorWorkflowOwned(
   } else {
     try {
       const result = await validateAndResolveIsolation(
-        // A fresh-from-branch adoption must not adopt the conversation's existing env:
+        // A checkout-branch adoption must not adopt the conversation's existing env:
         // the resolver short-circuits on `existingEnvId` before hints are read (R7), so a
         // stale worktree from an earlier run in this conversation would win over the
         // adopted branch. Null it out — same shape the `stale_cleaned` retry sees.
         {
           ...conversation,
           codebase_id: codebase.id,
-          ...(adoptionLane?.kind === 'fresh-from-branch' ? { isolation_env_id: null } : {}),
+          ...(adoptionLane?.kind === 'checkout-branch' ? { isolation_env_id: null } : {}),
         },
         codebase,
         platform,
         conversationId,
-        adoptionLane?.kind === 'fresh-from-branch'
+        adoptionLane?.kind === 'checkout-branch'
           ? {
               ...isolationHints,
               // Unique per dispatch: a shared id would key the reuse lookup to an
-              // earlier adoption's worktree and drop `fromBranch` on later ones.
+              // earlier adoption's worktree and drop the exact branch on later ones.
               workflowId: randomUUID(),
               workflowType: 'task',
-              fromBranch: toBranchName(adoptionLane.branch),
+              taskBranch: { kind: 'existing', branch: toBranchName(adoptionLane.branch) },
             }
           : isolationHints,
         false,
@@ -1102,10 +1102,10 @@ async function dispatchOrchestratorWorkflowOwned(
     }
   }
 
-  // Deferred capture for the fresh-from-branch lane: the resolver cut a worktree from
-  // the adopted branch, so its `.archon` is the branch's vintage — freeze it instead of
+  // Deferred capture for the checkout-branch lane: the resolver materialized the
+  // adopted branch, so its `.archon` is the branch's vintage — freeze it instead of
   // the parent checkout's, for the same reason the reuse-worktree lane captures above.
-  if (adoptionLane?.kind === 'fresh-from-branch' && !willContinueExistingRun) {
+  if (adoptionLane?.kind === 'checkout-branch' && !willContinueExistingRun) {
     freshCaptured = await captureFreshSource(owner, cwd, workflow, conversationId, platform);
     if (!freshCaptured) return; // capture failed, message already sent
     workflow = freshCaptured.workflow;

@@ -2344,7 +2344,7 @@ describe('workflowRunCommand', () => {
     );
   });
 
-  it('passes fromBranch into isolation task request', async () => {
+  it('passes --from as a new task branch start point', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     const { executeWorkflow } = await import('@archon/workflows/executor');
     const conversationDb = await import('@archon/core/db/conversations');
@@ -2382,7 +2382,7 @@ describe('workflowRunCommand', () => {
       expect.objectContaining({
         workflowType: 'task',
         identifier: 'test-adapters',
-        fromBranch: 'feature/extract-adapters',
+        taskBranch: { kind: 'new', fromBranch: 'feature/extract-adapters' },
       })
     );
   });
@@ -3397,10 +3397,13 @@ describe('workflowRunCommand', () => {
       | { create: ReturnType<typeof mock> }
       | undefined;
     const lastCreateCall = provider?.create.mock.calls.at(-1)?.[0] as {
-      fromBranch?: string;
+      taskBranch?: { kind: string; fromBranch?: string };
       baseOverride?: string;
     };
-    expect(lastCreateCall.fromBranch).toBe('origin/release/2.0');
+    expect(lastCreateCall.taskBranch).toEqual({
+      kind: 'new',
+      fromBranch: 'origin/release/2.0',
+    });
     expect(lastCreateCall.baseOverride).toBe('dev');
 
     const executeSpy = executeWorkflow as ReturnType<typeof mock>;
@@ -9071,7 +9074,15 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     consoleSpy.mockRestore();
   });
 
-  function setupAdoptMocks(): void {
+  function setupAdoptMocks(
+    lane:
+      | { kind: 'reuse-worktree'; workingPath: string; envId?: string }
+      | { kind: 'checkout-branch'; branch: string } = {
+      kind: 'reuse-worktree',
+      workingPath: '/wt/adopted',
+      envId: 'env-9',
+    }
+  ): void {
     const discoverMock = require('@archon/workflows/workflow-discovery')
       .discoverWorkflowsWithConfig as ReturnType<typeof mock>;
     const prepareMock = require('@archon/workflows/executor').prepareWorkflowSource as ReturnType<
@@ -9112,7 +9123,7 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     const adoption = require('@archon/core/operations/workflow-adoption');
     (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockResolvedValueOnce({
       adoptedRun: { id: 'run-old' },
-      lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted', envId: 'env-9' },
+      lane,
     });
   }
 
@@ -9130,6 +9141,29 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     const executed = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1) as unknown[];
     expect((executed[4] as { description: string }).description).toBe('Branch vintage');
     expect(executed[3]).toBe('/wt/adopted');
+  });
+
+  it('checks out the exact adopted branch when the prior worktree is gone', async () => {
+    setupAdoptMocks({ kind: 'checkout-branch', branch: 'feature/live-pr' });
+    const isolation = await import('@archon/isolation');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+
+    await workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: 'run-old' });
+
+    const getIsolationProviderMock = isolation.getIsolationProvider as ReturnType<typeof mock>;
+    const provider = getIsolationProviderMock.mock.results.at(-1)?.value as
+      | { create: ReturnType<typeof mock> }
+      | undefined;
+    expect(provider?.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowType: 'task',
+        taskBranch: { kind: 'existing', branch: 'feature/live-pr' },
+      })
+    );
+    const executed = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1) as unknown[];
+    expect(executed[3]).toBe('/test/path');
+    const opts = executed.at(-1) as { adoptedFromRunId?: string };
+    expect(opts.adoptedFromRunId).toBe('run-old');
   });
 
   it('re-judges the declared-input gate against the branch vintage after recapture', async () => {

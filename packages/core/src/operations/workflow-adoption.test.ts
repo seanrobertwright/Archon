@@ -61,7 +61,7 @@ function makeDeps(
   overrides: {
     run?: Record<string, unknown> | null;
     activeHolder?: Record<string, unknown> | null;
-    environments?: Record<string, unknown>[];
+    environment?: Record<string, unknown> | null;
   } = {}
 ) {
   return {
@@ -69,7 +69,7 @@ function makeDeps(
     branchExists: async (_repo: string, branch: string) => branch === 'alive-branch',
     getRun: async () => ('run' in overrides ? overrides.run : null),
     getActiveRunByPath: async () => overrides.activeHolder ?? null,
-    listEnvironments: async () => overrides.environments ?? [],
+    findEnvironmentByPath: async () => overrides.environment ?? null,
   };
 }
 
@@ -103,6 +103,24 @@ describe('resolveWorkflowAdoption', () => {
     ).rejects.toThrow(/different project/);
   });
 
+  test('refuses adoption when either codebase identity is missing', async () => {
+    await expect(
+      resolveWorkflowAdoption({
+        ...baseArgs,
+        adoptedRunId: 'run-1',
+        codebaseId: null,
+        deps: makeDeps({ run: runRow() }),
+      })
+    ).rejects.toThrow(/different project/);
+    await expect(
+      resolveWorkflowAdoption({
+        ...baseArgs,
+        adoptedRunId: 'run-1',
+        deps: makeDeps({ run: runRow({ codebase_id: null }) }),
+      })
+    ).rejects.toThrow(/different project/);
+  });
+
   test('refuses container-backed runs in v1', async () => {
     await expect(
       resolveWorkflowAdoption({
@@ -119,7 +137,7 @@ describe('resolveWorkflowAdoption', () => {
       await resolveWorkflowAdoption({
         ...baseArgs,
         adoptedRunId: 'run-1',
-        deps: makeDeps({ run: runRow(), environments: [envRow()] }),
+        deps: makeDeps({ run: runRow(), environment: envRow() }),
       })
     ).lane;
     expect(lane).toEqual({
@@ -135,7 +153,7 @@ describe('resolveWorkflowAdoption', () => {
       adoptedRunId: 'run-1',
       deps: makeDeps({
         run: runRow(),
-        environments: [envRow()],
+        environment: envRow(),
         activeHolder: runRow({ id: 'other-run', status: 'running' }),
       }),
     }).catch((e: unknown) => e);
@@ -143,7 +161,7 @@ describe('resolveWorkflowAdoption', () => {
     expect((err as Error).message).toMatch(/held by live run 'other-run'/);
   });
 
-  test('cuts a fresh worktree from the adopted branch when the worktree is gone', async () => {
+  test('checks out the adopted branch when the worktree is gone', async () => {
     // Worktree deleted: env row destroyed AND nothing on disk. The branch survives.
     const lane = (
       await resolveWorkflowAdoption({
@@ -151,18 +169,16 @@ describe('resolveWorkflowAdoption', () => {
         adoptedRunId: 'run-1',
         deps: makeDeps({
           run: runRow({ working_path: '/ws/repo/.worktrees/vanished' }),
-          environments: [
-            envRow({
-              id: 'env-gone',
-              working_path: '/ws/repo/.worktrees/vanished',
-              branch_name: 'alive-branch',
-              status: 'destroyed',
-            }),
-          ],
+          environment: envRow({
+            id: 'env-gone',
+            working_path: '/ws/repo/.worktrees/vanished',
+            branch_name: 'alive-branch',
+            status: 'destroyed',
+          }),
         }),
       })
     ).lane;
-    expect(lane).toEqual({ kind: 'fresh-from-branch', branch: 'alive-branch' });
+    expect(lane).toEqual({ kind: 'checkout-branch', branch: 'alive-branch' });
   });
 
   test('refuses when neither worktree nor branch survives', async () => {
@@ -171,14 +187,12 @@ describe('resolveWorkflowAdoption', () => {
       adoptedRunId: 'run-1',
       deps: makeDeps({
         run: runRow({ working_path: '/ws/repo/.worktrees/vanished' }),
-        environments: [
-          envRow({
-            id: 'env-gone',
-            working_path: '/ws/repo/.worktrees/vanished',
-            branch_name: 'deleted-branch',
-            status: 'destroyed',
-          }),
-        ],
+        environment: envRow({
+          id: 'env-gone',
+          working_path: '/ws/repo/.worktrees/vanished',
+          branch_name: 'deleted-branch',
+          status: 'destroyed',
+        }),
       }),
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(WorkflowAdoptionError);

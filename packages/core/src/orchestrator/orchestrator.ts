@@ -331,7 +331,7 @@ export interface WorkflowRoutingContext {
   /**
    * Adoption lane resolved by `resolveWorkflowAdoption` upstream — the adopting
    * run executes in the adopted run's worktree (reuse) or in one cut from its
-   * branch (fresh-from-branch) instead of a fresh worktree from base.
+   * exact branch (checkout-branch) instead of a fresh worktree from base.
    */
   readonly adoptionLane?: AdoptionLane;
 }
@@ -453,15 +453,17 @@ async function dispatchBackgroundWorkflowOwned(
           );
         });
     } else {
-      // A fresh-from-branch adoption lane cuts the new worktree FROM the adopted
-      // run's branch rather than base; 'task' is the workflow type whose creation
-      // path consumes `fromBranch` (same shape the CLI's adopt lane produces).
+      // A checkout-branch adoption lane materializes the adopted run's exact
+      // branch; 'task' is the workflow type whose request carries that selection.
       const hints: IsolationHints =
-        ctx.adoptionLane?.kind === 'fresh-from-branch'
+        ctx.adoptionLane?.kind === 'checkout-branch'
           ? {
               workflowType: 'task',
               workflowId: workerPlatformId,
-              fromBranch: toBranchName(ctx.adoptionLane.branch),
+              taskBranch: {
+                kind: 'existing',
+                branch: toBranchName(ctx.adoptionLane.branch),
+              },
             }
           : { workflowType: 'thread', workflowId: workerPlatformId };
       const result = await validateAndResolveIsolation(
