@@ -310,6 +310,13 @@ class InMemoryStore implements IWorkflowStore {
   persistWorkflowEvent: IWorkflowStore['persistWorkflowEvent'] = data =>
     this.createWorkflowEvent(data);
 
+  persistWorkflowEventIfRunning: IWorkflowStore['persistWorkflowEventIfRunning'] = data => {
+    const run = this.runs.get(data.workflow_run_id);
+    if (run?.status !== 'running') return Promise.resolve({ persisted: false });
+    this.events.push(data);
+    return Promise.resolve({ persisted: true });
+  };
+
   getDagResumeSnapshot: IWorkflowStore['getDagResumeSnapshot'] = workflowRunId => {
     const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
     const tokens = { input: 0, output: 0 };

@@ -1211,7 +1211,8 @@ and then removed from the definition, so nothing can fall back to an outer file'
 | `requires` | **Unions** into the composing workflow, so a missing capability refuses the run at invocation instead of failing mid-block. |
 | `inputs`, `returns` | **Consumed** by composition — `inputs:` validates the caller's `with:`, `returns:` selects `$includeId.output`. |
 | `outcome_field` | **Owned by the workflow being run.** An included workflow's declaration does not propagate to its composer. A top-level composer may declare its own field relative to its own `returns:`; an include alias is rebound before that contract is validated. |
-| `interactive`, `worktree`, `container`, `evidence_policy`, `mutates_checkout` | **Run-owned.** Whoever starts the run decides these; a composed file's values are dropped with a load-time warning. Declare them on the top-level workflow. |
+| `interactive`, `worktree`, `container`, `evidence_policy` | **Run-owned.** Whoever starts the run decides these; a composed file's values are dropped with a load-time warning. Declare them on the top-level workflow. |
+| `mutates_checkout` | **Run-owned for ordinary `include:` composition.** It is dropped with the same warning. The one exception is `include:` + `fan_out:`, where the engine consumes the target block's `mutates_checkout: false` declaration to allow concurrent instances in the shared checkout. |
 | `webSearchMode` | **Dropped, and this one is a real gap.** It is the only workflow-level field with no per-node counterpart, so there is nowhere for it to travel. Set it on the top-level workflow — where it then applies to every node in the run. |
 
 Two consequences worth knowing:
@@ -2156,7 +2157,8 @@ What you get, compared with the `workflow:` fan-out above:
 
 - **One governance object.** No child `workflow_runs` rows, artifacts directories, cost
   lines or gate sets per item. Every instance's events are written under the parent run id,
-  under instance-qualified step names (`<nodeId>__<instanceId>__<innerNodeId>`).
+  under engine-owned instance-qualified step names. Their exact storage form is not part of
+  the workflow authoring contract.
 - **The same package and signature semantics as a static `include:`.** Command/script bodies
   resolve from the exact packaged source captured for the run, `returns:` selects the
   aggregate value, and `$INPUTS` binding follows the block's declared `inputs:`. The item

@@ -29,11 +29,16 @@ mock.module('./connection', () => ({
   },
   getDialect: () => mockPostgresDialect,
   getDatabaseType: () => 'postgresql',
+  getDatabase: () => ({
+    withTransaction: async <T>(fn: (query: typeof mockQuery) => Promise<T>): Promise<T> =>
+      fn(mockQuery),
+  }),
 }));
 
 import {
   createWorkflowEvent,
   persistWorkflowEvent,
+  persistWorkflowEventIfRunning,
   listWorkflowEvents,
   listRecentEvents,
   getDagResumeSnapshot,
@@ -107,6 +112,38 @@ describe('workflow-events', () => {
         workflow_run_id: 'run-456',
         event_type: 'step_started',
       });
+    });
+  });
+
+  describe('persistWorkflowEventIfRunning', () => {
+    test('locks the running row and persists the claimed start in one transaction', async () => {
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running' }]))
+        .mockResolvedValueOnce(createQueryResult([]));
+
+      await expect(
+        persistWorkflowEventIfRunning({
+          workflow_run_id: 'run-456',
+          event_type: 'node_started',
+          step_name: 'fan-instance',
+        })
+      ).resolves.toEqual({ persisted: true });
+
+      expect(mockQuery.mock.calls[0]?.[0]).toContain('FOR UPDATE');
+      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+    });
+
+    test('does not persist a start after cancellation won the row lock', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ status: 'cancelled' }]));
+
+      await expect(
+        persistWorkflowEventIfRunning({
+          workflow_run_id: 'run-456',
+          event_type: 'node_started',
+          step_name: 'fan-instance',
+        })
+      ).resolves.toEqual({ persisted: false });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -813,6 +850,49 @@ describe('workflow-events', () => {
       // than re-running the whole group.
       expect(result.completedNodeOutputs.get('group')).toEqual({ output: 'last iteration' });
       expect(result.completedNodeOutputs.get('group.body')).toEqual({ output: 'iteration 1' });
+    });
+
+    test('uses durable composed-instance summaries instead of their fallible inner rows', async () => {
+      const first = '__archon_fan_out__fan__root__item-a';
+      const second = '__archon_fan_out__fan__root__item-b';
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: `${first}__fan__item-a__work`,
+            event_type: 'node_completed',
+            data: { node_output: 'leaf', cost_usd: 0.01, tokens: { input: 10, output: 1 } },
+          },
+          {
+            step_name: first,
+            event_type: 'node_completed',
+            data: {
+              node_output: 'done-a',
+              type: 'compose_fan_out_instance',
+              aggregate: true,
+              cost_usd: 0.01,
+              tokens: { input: 10, output: 1 },
+            },
+          },
+          // The second instance proves the durable summary remains sufficient when its
+          // fire-and-forget leaf event never reached storage before the process died.
+          {
+            step_name: second,
+            event_type: 'node_completed',
+            data: {
+              node_output: 'done-b',
+              type: 'compose_fan_out_instance',
+              aggregate: true,
+              cost_usd: 0.02,
+              tokens: { input: 20, output: 2 },
+            },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-compose-accounting');
+
+      expect(result.costUsd).toBeCloseTo(0.03, 10);
+      expect(result.tokens).toEqual({ input: 30, output: 3 });
     });
 
     describe('node_output_spill_path preference (#2726)', () => {

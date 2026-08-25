@@ -8,7 +8,7 @@
  * writes use `persistWorkflowEvent` and propagate storage failure to their owner.
  * Read operations also throw on error — callers own the degradation policy.
  */
-import { pool, getDialect, getDatabaseType } from './connection';
+import { pool, getDatabase, getDialect, getDatabaseType } from './connection';
 import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
@@ -121,6 +121,26 @@ export async function createWorkflowEvent(data: WorkflowEventInput): Promise<voi
 /** Persist a correctness-critical event and propagate storage errors to the caller. */
 export async function persistWorkflowEvent(data: WorkflowEventInput): Promise<void> {
   await insertWorkflowEvent((sql, params) => pool.query(sql, params), data);
+}
+
+/**
+ * Persist a correctness-critical start only while the owning run is still running.
+ * The row lock serializes this claim with cancellation: either the start commits first
+ * and cancellation follows it, or cancellation wins and no new work may begin.
+ */
+export async function persistWorkflowEventIfRunning(
+  data: WorkflowEventInput
+): Promise<{ persisted: boolean }> {
+  return getDatabase().withTransaction(async query => {
+    const lockClause = getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : '';
+    const run = await query<{ status: string }>(
+      `SELECT status FROM remote_agent_workflow_runs WHERE id = $1${lockClause}`,
+      [data.workflow_run_id]
+    );
+    if (run.rows[0]?.status !== 'running') return { persisted: false };
+    await insertWorkflowEvent(query, data);
+    return { persisted: true };
+  });
 }
 
 /**
@@ -345,8 +365,8 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   const unresolvedNodeStarts = new Set<string>();
   // Collected and merged once at the end rather than folded pairwise: a pairwise fold
   // cannot tell "one of five contributions reported" from "one of two" (#2662).
-  const usages: TokenUsage[] = [];
-  let costUsd = 0;
+  const usageContributions: { stepName: string; tokens?: TokenUsage; costUsd?: number }[] = [];
+  const authoritativeInstanceScopes = new Set<string>();
   for (const row of result.rows) {
     if (!row.step_name) continue;
     if (row.event_type === 'node_started') {
@@ -445,8 +465,17 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
           : {}),
       });
     }
-    // A derived row restates usage that other rows in this same log already carry.
-    if (data.aggregate === true) continue;
+    // Composed-instance terminals are the durable accounting source for their whole
+    // scope. Their inner rows are observability writes and may be missing after a crash.
+    const isAuthoritativeInstanceUsage =
+      data.type === 'compose_fan_out_instance' &&
+      (row.event_type === 'node_completed' || row.event_type === 'node_failed');
+    if (isAuthoritativeInstanceUsage) authoritativeInstanceScopes.add(row.step_name);
+    // Other aggregate rows merely restate usage already carried by their leaves.
+    if (data.aggregate === true && !isAuthoritativeInstanceUsage) continue;
+    const contribution: { stepName: string; tokens?: TokenUsage; costUsd?: number } = {
+      stepName: row.step_name,
+    };
     if (row.event_type !== 'node_skipped_prior_success' && data.tokens !== undefined) {
       const eventTokens = data.tokens;
       if (
@@ -482,7 +511,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         if (optionalTokens.cachePartial === true) {
           normalized.cachePartial = true;
         }
-        usages.push(normalized);
+        contribution.tokens = normalized;
       } else {
         getLog().warn(
           { runId: workflowRunId, stepName: row.step_name, tokens: eventTokens },
@@ -496,7 +525,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
       // silently poison the total (NaN > 0 is false, which would drop the run's
       // cost from the persisted metadata with no trace).
       if (typeof eventCost === 'number' && Number.isFinite(eventCost)) {
-        costUsd += eventCost;
+        contribution.costUsd = eventCost;
       } else {
         getLog().warn(
           { runId: workflowRunId, stepName: row.step_name, costUsd: eventCost },
@@ -504,12 +533,24 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         );
       }
     }
+    if (contribution.tokens !== undefined || contribution.costUsd !== undefined) {
+      usageContributions.push(contribution);
+    }
   }
+  const authoritativeInstancePrefixes = [...authoritativeInstanceScopes].map(scope => `${scope}__`);
+  const countedUsage = usageContributions.filter(
+    contribution =>
+      !authoritativeInstancePrefixes.some(prefix => contribution.stepName.startsWith(prefix))
+  );
   return {
     completedNodeOutputs,
     fanOutSnapshots,
     unresolvedNodeStarts,
-    tokens: mergeTokenUsage(usages),
-    costUsd,
+    tokens: mergeTokenUsage(
+      countedUsage.flatMap(contribution =>
+        contribution.tokens === undefined ? [] : [contribution.tokens]
+      )
+    ),
+    costUsd: countedUsage.reduce((total, contribution) => total + (contribution.costUsd ?? 0), 0),
   };
 }

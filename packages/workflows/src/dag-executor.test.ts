@@ -117,7 +117,7 @@ import {
 import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore, PersistedNodeOutput } from './store';
-import { buildInstanceSnapshots } from './fan-out-identity';
+import { buildInstanceSnapshots, composeFanOutScopeSegment } from './fan-out-identity';
 import {
   buildAiProfile,
   isLiteralSpec,
@@ -125,6 +125,23 @@ import {
   type ModelAliasPreset,
   type RawTiersConfig,
 } from './model-validation';
+
+function composeScope(
+  nodeId = 'fan',
+  loopGroupPath: readonly { groupId: string; iteration: number }[] = []
+): string {
+  return composeFanOutScopeSegment(nodeId, loopGroupPath);
+}
+
+function composeInnerStep(
+  identity: string,
+  innerNodeId: string,
+  nodeId = 'fan',
+  loopGroupPath: readonly { groupId: string; iteration: number }[] = []
+): string {
+  const scope = composeScope(nodeId, loopGroupPath);
+  return `${scope}__${identity}__${nodeId}__${identity}__${innerNodeId}`;
+}
 
 // --- Mock helpers ---
 
@@ -197,6 +214,12 @@ function createMockStore(): MockWorkflowStore {
     persistWorkflowEvent: mock<IWorkflowStore['persistWorkflowEvent']>(async data => {
       await createWorkflowEvent(data);
     }),
+    persistWorkflowEventIfRunning: mock<IWorkflowStore['persistWorkflowEventIfRunning']>(
+      async data => {
+        await createWorkflowEvent(data);
+        return { persisted: true };
+      }
+    ),
     getDagResumeSnapshot: mock<IWorkflowStore['getDagResumeSnapshot']>(async _workflowRunId =>
       Promise.resolve({
         completedNodeOutputs: new Map<string, { output: string }>(),
@@ -31013,7 +31036,9 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     // One audit snapshot BEFORE any instance schedules.
     expect(events.some(e => e.event_type === 'fan_out_instances')).toBe(true);
     // Instance-qualified step names under the PARENT run id — no child runs exist.
-    const instanceEvents = events.filter(e => /^fan__[0-9a-f]{16}__work$/.test(e.step_name));
+    const instanceEvents = events.filter(
+      e => e.step_name.startsWith(`${composeScope()}__`) && e.step_name.endsWith('__work')
+    );
     expect(instanceEvents.length).toBeGreaterThanOrEqual(2);
     const instanceOutputs = instanceEvents
       .filter(e => e.event_type === 'node_completed')
@@ -31145,9 +31170,9 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     const store = createMockStore();
     (store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>).mockResolvedValue({
       completedNodeOutputs: new Map([
-        [`fan__${snapshot.identity}__first`, { output: 'persisted-first' }],
+        [composeInnerStep(snapshot.identity, 'first'), { output: 'persisted-first' }],
       ]),
-      fanOutSnapshots: new Map([['fan', [snapshot]]]),
+      fanOutSnapshots: new Map([[composeScope(), [snapshot]]]),
       unresolvedNodeStarts: new Set(),
       costUsd: 0,
     });
@@ -31196,6 +31221,54 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(wrapper?.data.structured_output).toEqual(['persisted-first-a']);
   });
 
+  it('resumes from the durable plan when the current item producer is malformed', async () => {
+    await writeBlock(
+      'name: compose-blk\ndescription: test block\nmutates_checkout: false\nnodes:\n  - id: work\n    bash: "echo done-$INPUTS.item"'
+    );
+    const snapshots = buildInstanceSnapshots(['a']);
+    const store = createMockStore();
+    (store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>).mockResolvedValue({
+      completedNodeOutputs: new Map(),
+      fanOutSnapshots: new Map([[composeScope(), snapshots]]),
+      unresolvedNodeStarts: new Set(),
+      costUsd: 0,
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose',
+      testDir,
+      {
+        name: 'compose-parent',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: 'echo not-json' },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-malformed-drift-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const wrapper = eventsOf(store).find(
+      event => event.event_type === 'node_completed' && event.step_name === 'fan'
+    );
+    expect(wrapper?.data.structured_output).toEqual(['done-a']);
+  });
+
   it('uses the persisted resolved input map when upstream bindings change on resume', async () => {
     await writeBlock(
       [
@@ -31214,7 +31287,7 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     const store = createMockStore();
     (store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>).mockResolvedValue({
       completedNodeOutputs: new Map(),
-      fanOutSnapshots: new Map([['fan', [snapshot!]]]),
+      fanOutSnapshots: new Map([[composeScope(), [snapshot!]]]),
       unresolvedNodeStarts: new Set(),
       costUsd: 0,
     });
@@ -31270,8 +31343,8 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     const store = createMockStore();
     (store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>).mockResolvedValue({
       completedNodeOutputs: new Map(),
-      fanOutSnapshots: new Map([['fan', [snapshot]]]),
-      unresolvedNodeStarts: new Set([`fan__${snapshot.identity}`]),
+      fanOutSnapshots: new Map([[composeScope(), [snapshot]]]),
+      unresolvedNodeStarts: new Set([`${composeScope()}__${snapshot.identity}`]),
       costUsd: 0,
     });
 
@@ -31384,6 +31457,174 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(wrapper?.data.structured_output).toEqual(['child-a']);
   });
 
+  it('does not reuse a composed child workflow from an earlier loop_group iteration', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: deterministic child block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: child',
+        '    workflow: child-workflow',
+        '    with:',
+        "      item: '$INPUTS.item'",
+      ].join('\n')
+    );
+    await writeBlock(
+      'name: child-workflow\ndescription: child\ninputs:\n  item: { required: true }\nnodes:\n  - id: work\n    bash: "echo child-$INPUTS.item"',
+      'child-workflow'
+    );
+
+    const childRuns: WorkflowRun[] = [];
+    const runChildWorkflow = mock<RunChildWorkflowFn>(async args => {
+      childRuns.push(
+        makeWorkflowRun(`child-${String(childRuns.length + 1)}`, {
+          workflow_name: args.childWorkflowName,
+          status: 'completed',
+          parent_run_id: args.parentRun.id,
+          metadata: { parent_node_id: args.nodeId, summary: 'child-a' },
+        })
+      );
+      return {
+        childRunId: childRuns.at(-1)!.id,
+        status: 'completed',
+        output: 'child-a',
+      };
+    });
+    const store = createMockStore();
+    (store.findChildRuns as Mock<IWorkflowStore['findChildRuns']>).mockImplementation(
+      async _parentRunId => childRuns
+    );
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-child-loop',
+      testDir,
+      {
+        name: 'compose-parent-child-loop',
+        nodes: [
+          {
+            id: 'grp',
+            kind: 'loop_group',
+            loop_group: {
+              until_bash:
+                'n=$(cat .compose-child-loop 2>/dev/null || echo 0); ' +
+                'n=$((n + 1)); echo "$n" > .compose-child-loop; test "$n" -eq 2',
+              max_iterations: 2,
+              fresh_context: true,
+              nodes: [
+                { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a"]'` },
+                {
+                  id: 'fan',
+                  kind: 'compose_fan_out',
+                  include: 'compose-blk',
+                  depends_on: ['list'],
+                  fan_out: {
+                    items: '$list.output',
+                    as: 'item',
+                    max_parallel: 1,
+                    join: 'all_done',
+                  },
+                },
+              ],
+            },
+            depends_on: [],
+          },
+        ],
+      },
+      makeWorkflowRun('compose-child-loop-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { kind: 'host' },
+      undefined,
+      runChildWorkflow
+    );
+
+    expect(runChildWorkflow).toHaveBeenCalledTimes(2);
+    const ownedNodeIds = runChildWorkflow.mock.calls.map(([args]) => args.nodeId);
+    expect(new Set(ownedNodeIds).size).toBe(2);
+  });
+
+  it('does not start a later instance when its atomic running-state claim loses', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: test block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: work',
+        "    bash: 'echo $INPUTS.item >> .compose-claimed-items; echo $INPUTS.item'",
+      ].join('\n')
+    );
+    const store = createMockStore();
+    let claimCount = 0;
+    (
+      store.persistWorkflowEventIfRunning as Mock<IWorkflowStore['persistWorkflowEventIfRunning']>
+    ).mockImplementation(async data => {
+      claimCount += 1;
+      if (claimCount === 2) return { persisted: false };
+      await store.persistWorkflowEvent(data);
+      return { persisted: true };
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose-claim',
+      testDir,
+      {
+        name: 'compose-parent-claim',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a","b"]'` },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-claim-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(claimCount).toBe(2);
+    expect(await readFile(join(testDir, '.compose-claimed-items'), 'utf8')).toBe('a\n');
+    const wrapper = eventsOf(store).find(
+      event => event.event_type === 'node_completed' && event.step_name === 'fan'
+    );
+    expect(wrapper?.data.structured_output).toEqual([
+      'a',
+      {
+        archon_failed: true,
+        error: 'parent run is no longer running; instance was not started',
+        status: 'cancelled',
+      },
+    ]);
+  });
+
   it('completes with an empty aggregate for an empty item list', async () => {
     await writeBlock(
       'name: compose-blk\ndescription: test block\nmutates_checkout: false\nnodes:\n  - id: work\n    bash: "echo nope"'
@@ -31426,7 +31667,11 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(wrapper).toBeDefined();
     expect(wrapper?.data.node_output).toBe('[]');
     // No instances were scheduled.
-    expect(eventsOf(mockDeps.store).some(e => e.step_name.startsWith('fan__'))).toBe(false);
+    expect(
+      eventsOf(mockDeps.store).some(
+        e => e.event_type === 'node_started' && e.step_name.startsWith(`${composeScope()}__`)
+      )
+    ).toBe(false);
   });
 
   it('rejects a gate inside the composed body before any instance spends', async () => {
@@ -31483,7 +31728,7 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(String(failed?.data.error)).toContain('approval gate');
     // Nothing was scheduled: no snapshot, no instances.
     expect(eventsOf(mockDeps.store).some(e => e.event_type === 'fan_out_instances')).toBe(false);
-    expect(eventsOf(mockDeps.store).some(e => e.step_name.startsWith('fan__'))).toBe(false);
+    expect(eventsOf(mockDeps.store).some(e => e.step_name.startsWith(composeScope()))).toBe(false);
   });
 
   it('fails closed when concurrent instances share the parent checkout of a mutating body', async () => {
@@ -31536,7 +31781,7 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(failed).toBeDefined();
     expect(String(failed?.data.error)).toContain('mutates_checkout');
     expect(eventsOf(mockDeps.store).some(e => e.event_type === 'fan_out_instances')).toBe(false);
-    expect(eventsOf(mockDeps.store).some(e => e.step_name.startsWith('fan__'))).toBe(false);
+    expect(eventsOf(mockDeps.store).some(e => e.step_name.startsWith(composeScope()))).toBe(false);
   });
 
   it('fails the node under join: all_success when an instance fails', async () => {
@@ -31654,7 +31899,7 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     const snapshots = buildInstanceSnapshots(items);
     const completedNodeOutputs = new Map<string, PersistedNodeOutput>();
     for (const snap of snapshots) {
-      completedNodeOutputs.set(`fan__${snap.identity}__work`, {
+      completedNodeOutputs.set(composeInnerStep(snap.identity, 'work'), {
         output: `prior-${String(snap.item)}`,
       });
     }
@@ -31710,7 +31955,8 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     const freshInstanceCompletions = eventsOf(storeOverride).filter(
       e =>
         e.event_type === 'node_completed' &&
-        /^fan__[0-9a-f]{16}__work$/.test(e.step_name) &&
+        e.step_name.startsWith(`${composeScope()}__`) &&
+        e.step_name.endsWith('__work') &&
         String(e.data.node_output).startsWith('done-')
     );
     expect(freshInstanceCompletions).toHaveLength(0);
@@ -31880,7 +32126,7 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
   });
 
   it('does not resume-skip instances inside a loop_group from another iteration’s rows', async () => {
-    // Iteration-1 rows persisted under BARE (pre-fix) step names must not satisfy
+    // Rows outside the engine-owned scope must not satisfy
     // iteration N's identity lookup: the whole-run snapshot has no iteration filter, so
     // the instance prefix carries the group + iteration disambiguator.
     await writeBlock(
@@ -31956,10 +32202,14 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
 
     const events = eventsOf(mockDeps.store);
     // The instance actually executed in BOTH iterations under iteration-scoped names.
+    const [snapshot] = buildInstanceSnapshots(['a']);
+    if (snapshot === undefined) throw new Error('expected one fan-out snapshot');
+    const expectedSteps = new Set([
+      `grp.${composeInnerStep(snapshot.identity, 'work', 'fan', [{ groupId: 'grp', iteration: 1 }])}`,
+      `grp.${composeInnerStep(snapshot.identity, 'work', 'fan', [{ groupId: 'grp', iteration: 2 }])}`,
+    ]);
     const instanceCompletions = events.filter(
-      e =>
-        e.event_type === 'node_completed' &&
-        /^grp\.grp[12]__fan__[0-9a-f]{16}__work$/.test(e.step_name)
+      e => e.event_type === 'node_completed' && expectedSteps.has(e.step_name)
     );
     expect(instanceCompletions.length).toBe(2);
     expect(instanceCompletions.every(e => e.data.node_output === 'DONE-a')).toBe(true);

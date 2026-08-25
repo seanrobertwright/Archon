@@ -28,6 +28,7 @@ const db = new SqliteAdapter(':memory:');
 
 mock.module('./connection', () => ({
   pool: db,
+  getDatabase: () => db,
   getDialect: () => sqliteDialect,
   getDatabaseType: () => 'sqlite',
 }));

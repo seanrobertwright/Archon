@@ -1,5 +1,9 @@
 import { describe, test, expect } from 'bun:test';
-import { buildInstanceSnapshots, composeInstanceIdentity } from './fan-out-identity';
+import {
+  buildInstanceSnapshots,
+  composeFanOutScopeSegment,
+  composeInstanceIdentity,
+} from './fan-out-identity';
 
 describe('fan-out-identity (#2512)', () => {
   test('identity is content-derived, not position-derived', () => {
@@ -46,5 +50,12 @@ describe('fan-out-identity (#2512)', () => {
       { seed: 7, file: 'a' },
       { seed: 7, file: 'b' },
     ]);
+  });
+
+  test('scope identity separates enclosing loop iterations without ambiguous concatenation', () => {
+    const first = composeFanOutScopeSegment('fan', [{ groupId: 'group1', iteration: 2 }]);
+    const second = composeFanOutScopeSegment('fan', [{ groupId: 'group', iteration: 12 }]);
+    expect(first).not.toBe(second);
+    expect(composeFanOutScopeSegment('fan', [])).toContain('root');
   });
 });

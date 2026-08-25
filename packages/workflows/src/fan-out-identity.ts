@@ -23,9 +23,31 @@ export interface FanOutInstanceSnapshot {
   inputs: Record<string, JsonValue>;
 }
 
+/**
+ * Reserved persisted-step marker for engine-owned composed fan-out state. Authored
+ * node ids may not contain it, which keeps instance plans, terminals, and inner rows
+ * disjoint from every author-controlled step name across nested loop scopes.
+ */
+export const COMPOSE_FAN_OUT_STEP_MARKER = '__archon_fan_out__';
+
 export function composeInstanceIdentity(item: JsonValue, duplicateOrdinal: number): string {
   const hash = createHash('sha256').update(canonicalValueText(item)).digest('hex').slice(0, 16);
   return duplicateOrdinal === 0 ? hash : `${hash}-${String(duplicateOrdinal)}`;
+}
+
+/** Stable engine-owned scope for one fan-out node in one enclosing loop iteration. */
+export function composeFanOutScopeSegment(
+  nodeId: string,
+  loopGroupPath: readonly { groupId: string; iteration: number }[]
+): string {
+  const loopIdentity =
+    loopGroupPath.length === 0
+      ? 'root'
+      : composeInstanceIdentity(
+          loopGroupPath.map(frame => [frame.groupId, frame.iteration]),
+          0
+        );
+  return `${COMPOSE_FAN_OUT_STEP_MARKER}${nodeId}__${loopIdentity}`;
 }
 
 /**

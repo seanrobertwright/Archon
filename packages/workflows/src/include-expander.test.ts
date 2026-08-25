@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { expandWorkflowIncludes, INCLUDE_MAX_DEPTH } from './include-expander';
 import { dagNodeSchema } from './schemas';
 import type { WorkflowDefinition, DagNode } from './schemas';
+import { COMPOSE_FAN_OUT_STEP_MARKER } from './fan-out-identity';
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
@@ -1668,7 +1669,7 @@ describe('expandWorkflowIncludes — errors', () => {
     expect(errors.find(err => err.filename === 'parent')?.error).toContain('Duplicate node id');
   });
 
-  test('reserves composed fan-out instance prefixes from authored siblings', () => {
+  test('reserves the engine-owned composed fan-out namespace from authored ids', () => {
     const block = wf('blk', [{ id: 'work', bash: 'echo work' }]);
     const parent = wf('parent', [
       { id: 'list', bash: 'echo []' },
@@ -1678,14 +1679,14 @@ describe('expandWorkflowIncludes — errors', () => {
         depends_on: ['list'],
         fan_out: { items: '$list.output', as: 'item' },
       },
-      { id: 'fan__ca978112ca1bbdca', bash: 'echo collision' },
+      { id: `authored${COMPOSE_FAN_OUT_STEP_MARKER}collision`, bash: 'echo collision' },
     ]);
 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
 
     expect(workflows.has('parent')).toBe(false);
     expect(errors.find(error => error.filename === 'parent')?.error).toContain(
-      "reserved composed fan-out namespace 'fan__'"
+      `reserved engine namespace '${COMPOSE_FAN_OUT_STEP_MARKER}'`
     );
   });
 });

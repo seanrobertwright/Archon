@@ -98,6 +98,7 @@ export function createWorkflowStore(): IWorkflowStore {
       }
     },
     persistWorkflowEvent: workflowEventDb.persistWorkflowEvent,
+    persistWorkflowEventIfRunning: workflowEventDb.persistWorkflowEventIfRunning,
     getDagResumeSnapshot: workflowEventDb.getDagResumeSnapshot,
     getCodebase: codebaseDb.getCodebase,
     getCodebaseEnvVars: envVarDb.getCodebaseEnvVars,

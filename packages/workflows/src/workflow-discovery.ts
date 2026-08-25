@@ -28,7 +28,7 @@ import type {
   DagNode,
   IncludeDirective,
 } from './schemas';
-import { isIncludeDirective, isLoopGroupNode } from './schemas';
+import { isComposeFanOutNode, isIncludeDirective, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
 import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 // Re-exported here because this is the module callers already import to discover with.
@@ -522,9 +522,11 @@ async function resolveIncludeBlockCommandContents(
   const visitNodes = (nodes: readonly (DagNode | IncludeDirective)[]): void => {
     for (const node of nodes) {
       if (!isIncludeDirective(node) && isLoopGroupNode(node)) visitNodes(node.loop_group.nodes);
-      if (!isIncludeDirective(node) || targetNames.has(node.include)) continue;
-      targetNames.add(node.include);
-      const target = byName.get(node.include);
+      const targetName =
+        isIncludeDirective(node) || isComposeFanOutNode(node) ? node.include : undefined;
+      if (targetName === undefined || targetNames.has(targetName)) continue;
+      targetNames.add(targetName);
+      const target = byName.get(targetName);
       if (target) visit(target);
     }
   };

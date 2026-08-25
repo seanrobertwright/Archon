@@ -138,7 +138,7 @@ import {
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
 import { mapWithLimit } from './utils/map-with-limit';
 import { collectComposedSuspensionPaths, instantiateResolvedInclude } from './include-expander';
-import { buildInstanceSnapshots } from './fan-out-identity';
+import { buildInstanceSnapshots, composeFanOutScopeSegment } from './fan-out-identity';
 import {
   classifyError,
   getRetryDelayMs,
@@ -7702,6 +7702,7 @@ async function executeWorkflowNode(
 ): Promise<NodeExecutionResult> {
   const { deps, platform, conversationId, cwd, workflowRun: parentRun } = ctx;
   const msgContext = { workflowId: parentRun.id, nodeName: node.id };
+  const executionNodeId = ctx.stepNamePrefix + node.id;
 
   // Build the failed result AND persist a node_failed event with the reason. Unlike
   // command/prompt/bash/script nodes (which write their own node_failed inside their
@@ -7718,7 +7719,7 @@ async function executeWorkflowNode(
       .createWorkflowEvent({
         workflow_run_id: parentRun.id,
         event_type: 'node_failed',
-        step_name: ctx.stepNamePrefix + node.id,
+        step_name: executionNodeId,
         data: {
           error,
           type: 'workflow',
@@ -7735,7 +7736,7 @@ async function executeWorkflowNode(
     getWorkflowEventEmitter().emit({
       type: 'node_failed',
       runId: parentRun.id,
-      nodeId: node.id,
+      nodeId: executionNodeId,
       nodeName: node.id,
       error,
     });
@@ -7905,7 +7906,7 @@ async function executeWorkflowNode(
       .createWorkflowEvent({
         workflow_run_id: parentRun.id,
         event_type: 'node_completed',
-        step_name: ctx.stepNamePrefix + node.id,
+        step_name: executionNodeId,
         data: {
           node_output: output,
           type: 'workflow',
@@ -7939,7 +7940,7 @@ async function executeWorkflowNode(
     getWorkflowEventEmitter().emit({
       type: 'node_completed',
       runId: parentRun.id,
-      nodeId: node.id,
+      nodeId: executionNodeId,
       nodeName: node.id,
       // The wrapper node has no meaningful duration of its own — the child run's
       // own events carry real timing. Emitted as 0 to satisfy NodeCompletedEvent.
@@ -7985,7 +7986,7 @@ async function executeWorkflowNode(
       `Approve it by run id: \`/workflow approve ${childRunId}\``;
     const paused = await pauseGateRespectingExternalTransition(deps, parentRun.id, {
       message,
-      nodeId: node.id,
+      nodeId: executionNodeId,
       type: 'child_workflow',
       childRunId,
     });
@@ -8037,7 +8038,7 @@ async function executeWorkflowNode(
     const children = (await deps.store.findChildRuns(parentRun.id)).filter(
       c =>
         readSubrunMetadata(c.metadata as Record<string, unknown> | undefined).parentNodeId ===
-        node.id
+        executionNodeId
     );
     existing = children.length > 0 ? children[children.length - 1] : undefined;
   } catch (err) {
@@ -8048,7 +8049,7 @@ async function executeWorkflowNode(
 
   const childArgs = {
     parentRun,
-    nodeId: node.id,
+    nodeId: executionNodeId,
     childWorkflowName: node.workflow,
     input,
     cwd,
@@ -9153,33 +9154,65 @@ async function executeComposeFanOutNode(
     await safeSendMessage(platform, conversationId, text, msgContext);
   };
 
-  // Resolve `fan_out.items` → a JSON array, identically to the governed fan-out path:
-  // two-pass substitution, fail closed on anything that is not an array.
-  let items: JsonValue[];
+  // Load the durable plan before touching the live item producer. Once a plan exists,
+  // it owns the instance set; current output is only a best-effort drift diagnostic.
+  const fanOutScopeName =
+    ctx.stepNamePrefix + composeFanOutScopeSegment(node.id, ctx.loopGroupPath);
+  let resumeSnapshot: DagResumeSnapshot;
   try {
-    const { prompt: itemsVarsResolved } = substituteWorkflowVariables(
-      fanOut.items,
-      parentRun.id,
-      parentRun.user_message ?? '',
-      ctx.artifactsDir,
-      ctx.baseBranch,
-      ctx.docsDir,
-      ctx.issueContext
-    );
-    const itemsResolved = substituteNodeOutputRefs(itemsVarsResolved, ctx.nodeOutputs);
-    const parsed: unknown = JSON.parse(itemsResolved);
-    if (!Array.isArray(parsed)) {
-      const msg =
-        `fan_out.items on '${node.id}' resolved to ${typeof parsed}, not a JSON array. ` +
-        `'${fanOut.items}' must reference a node output that produces a JSON array.`;
-      await notify(`❌ **Composed fan-out failed** (node \`${node.id}\`): ${msg}`);
-      return failResult(msg);
-    }
-    items = parsed;
+    resumeSnapshot = await deps.store.getDagResumeSnapshot(parentRun.id);
   } catch (err) {
-    const msg = `fan_out.items on '${node.id}' could not be resolved to a JSON array: ${(err as Error).message}`;
-    await notify(`❌ **Composed fan-out failed** (node \`${node.id}\`): ${msg}`);
+    const msg =
+      `composed fan-out node '${node.id}' could not load durable resume state: ` +
+      (err as Error).message;
+    getLog().error(
+      { err: err as Error, parentRunId: parentRun.id, nodeId: node.id },
+      'workflow.compose_fan_out_resume_snapshot_failed'
+    );
+    await notify(`❌ **Composed fan-out blocked** (node \`${node.id}\`): ${msg}`);
     return failResult(msg);
+  }
+  const priorOutputs = resumeSnapshot.completedNodeOutputs;
+  const persistedSnapshots = resumeSnapshot.fanOutSnapshots.get(fanOutScopeName);
+
+  const resolveCurrentItems = (): { items: JsonValue[] } | { error: string } => {
+    try {
+      const { prompt: itemsVarsResolved } = substituteWorkflowVariables(
+        fanOut.items,
+        parentRun.id,
+        parentRun.user_message ?? '',
+        ctx.artifactsDir,
+        ctx.baseBranch,
+        ctx.docsDir,
+        ctx.issueContext
+      );
+      const itemsResolved = substituteNodeOutputRefs(itemsVarsResolved, ctx.nodeOutputs);
+      const parsed: unknown = JSON.parse(itemsResolved);
+      if (!Array.isArray(parsed)) {
+        return {
+          error:
+            `fan_out.items on '${node.id}' resolved to ${typeof parsed}, not a JSON array. ` +
+            `'${fanOut.items}' must reference a node output that produces a JSON array.`,
+        };
+      }
+      return { items: parsed };
+    } catch (err) {
+      return {
+        error: `fan_out.items on '${node.id}' could not be resolved to a JSON array: ${(err as Error).message}`,
+      };
+    }
+  };
+
+  const currentItems = resolveCurrentItems();
+  if ('error' in currentItems && persistedSnapshots === undefined) {
+    await notify(`❌ **Composed fan-out failed** (node \`${node.id}\`): ${currentItems.error}`);
+    return failResult(currentItems.error);
+  }
+  if ('error' in currentItems) {
+    getLog().warn(
+      { parentRunId: parentRun.id, nodeId: node.id, error: currentItems.error },
+      'workflow.compose_fan_out_item_drift_unreadable'
+    );
   }
 
   // Preflight BEFORE any instance spend: the target must still resolve (it may have been
@@ -9213,38 +9246,12 @@ async function executeComposeFanOutNode(
     return failResult(msg);
   }
 
-  // Instance scopes include enclosing loop iterations. The same item may legitimately
-  // appear in successive iterations, but its events and engine-managed artifacts must
-  // never alias an earlier pass.
-  const loopSegment = ctx.loopGroupPath.map(f => `${f.groupId}${f.iteration}`).join('__');
-  const instanceStepNamePrefix =
-    ctx.loopGroupPath.length > 0 ? `${ctx.stepNamePrefix}${loopSegment}__` : ctx.stepNamePrefix;
-  const fanOutScopeName = instanceStepNamePrefix + node.id;
-
-  // Resume state is correctness-critical here. Re-running without it could duplicate
-  // arbitrary item side effects, so a failed read blocks instead of degrading to fresh.
-  let resumeSnapshot: DagResumeSnapshot;
-  try {
-    resumeSnapshot = await deps.store.getDagResumeSnapshot(parentRun.id);
-  } catch (err) {
-    const msg =
-      `composed fan-out node '${node.id}' could not load durable resume state: ` +
-      (err as Error).message;
-    getLog().error(
-      { err: err as Error, parentRunId: parentRun.id, nodeId: node.id },
-      'workflow.compose_fan_out_resume_snapshot_failed'
-    );
-    await notify(`❌ **Composed fan-out blocked** (node \`${node.id}\`): ${msg}`);
-    return failResult(msg);
-  }
-  const priorOutputs = resumeSnapshot.completedNodeOutputs;
-  const persistedSnapshots = resumeSnapshot.fanOutSnapshots.get(fanOutScopeName);
   let computedSnapshots: ReturnType<typeof buildInstanceSnapshots>;
   if (persistedSnapshots === undefined) {
     // Freeze every resolved binding together with the item before any instance starts.
     // A resumed run must never combine completed work from the old bindings with a
     // retried instance resolved from changed upstream output.
-    const staticInputs: Record<string, JsonValue> = {};
+    let staticInputs: Record<string, JsonValue> = {};
     const parentInputs = resolveRunInputs(parentRun);
     try {
       if (node.with !== undefined) {
@@ -9257,20 +9264,29 @@ async function executeComposeFanOutNode(
           issueContext: ctx.issueContext,
           nodeOutputs: ctx.nodeOutputs,
         };
-        for (const [name, rawValue] of Object.entries(node.with)) {
-          staticInputs[name] = resolveWorkflowValue(rawValue, resolutionCtx, parentInputs, false);
-        }
+        staticInputs = Object.fromEntries(
+          Object.entries(node.with).map(([name, rawValue]) => [
+            name,
+            resolveWorkflowValue(rawValue, resolutionCtx, parentInputs, false),
+          ])
+        );
       }
     } catch (err) {
       const msg = `fan_out 'with:' on '${node.id}' could not be resolved: ${(err as Error).message}`;
       await notify(`❌ **Composed fan-out failed** (node \`${node.id}\`): ${msg}`);
       return failResult(msg);
     }
-    computedSnapshots = buildInstanceSnapshots(items, staticInputs, fanOut.as);
+    if ('error' in currentItems) {
+      throw new Error('unreachable: fresh composed fan-out has no resolved item list');
+    }
+    computedSnapshots = buildInstanceSnapshots(currentItems.items, staticInputs, fanOut.as);
   } else {
     // Only compare item identity for drift diagnostics. The persisted input map is the
     // authority on resume, so current `with:` references are intentionally not resolved.
-    computedSnapshots = buildInstanceSnapshots(items, {}, fanOut.as);
+    computedSnapshots =
+      'items' in currentItems
+        ? buildInstanceSnapshots(currentItems.items, {}, fanOut.as)
+        : [...persistedSnapshots];
   }
   const snapshots = persistedSnapshots ?? computedSnapshots;
 
@@ -9346,29 +9362,12 @@ async function executeComposeFanOutNode(
 
   // Execute incomplete identities through a bounded sliding window. Each instance runs
   // the composed body via runLayers in its own context: fresh output map, events under
-  // the parent run id with instance-qualified step names (the expander produced fully-
-  // qualified ids; the prefix only carries the enclosing loop iterations).
+  // the parent run id with engine-owned, instance-qualified step names. The authored
+  // node ids remain ordinary DAG ids inside that isolated execution context.
   const settled = await mapWithLimit(
     snapshots,
     fanOut.max_parallel,
     async (snapshot): Promise<ComposeInstanceOutcome> => {
-      let currentStatus: WorkflowRunStatus | null;
-      try {
-        currentStatus = await deps.store.getWorkflowRunStatus(parentRun.id);
-      } catch (err) {
-        return {
-          status: 'failed',
-          output: '',
-          error: `could not verify parent status before instance ${snapshot.identity}: ${(err as Error).message}`,
-        };
-      }
-      if (currentStatus !== 'running') {
-        return {
-          status: 'cancelled',
-          output: '',
-          error: `parent run is ${currentStatus ?? 'missing'}; instance was not started`,
-        };
-      }
       let expanded: { nodes: DagNode[]; primarySink: string } | { error: string };
       try {
         expanded = expandComposeInstance(
@@ -9389,6 +9388,7 @@ async function executeComposeFanOutNode(
         };
       }
       const instanceScopeName = `${fanOutScopeName}__${snapshot.identity}`;
+      const instanceStepNamePrefix = `${instanceScopeName}__`;
       const prior = priorOutputs.get(instanceScopeName);
       if (prior !== undefined) {
         return {
@@ -9414,7 +9414,7 @@ async function executeComposeFanOutNode(
         });
       }
       try {
-        await deps.store.persistWorkflowEvent({
+        const claim = await deps.store.persistWorkflowEventIfRunning({
           workflow_run_id: parentRun.id,
           event_type: 'node_started',
           step_name: instanceScopeName,
@@ -9424,6 +9424,13 @@ async function executeComposeFanOutNode(
             ordinal: snapshot.ordinal,
           },
         });
+        if (!claim.persisted) {
+          return {
+            status: 'cancelled',
+            output: '',
+            error: 'parent run is no longer running; instance was not started',
+          };
+        }
       } catch (err) {
         return {
           status: 'failed',

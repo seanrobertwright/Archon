@@ -22,6 +22,7 @@ import {
   isPersistableNode,
   isNodeContextResume,
 } from './schemas';
+import { COMPOSE_FAN_OUT_STEP_MARKER } from './fan-out-identity';
 import { createLogger } from '@archon/paths';
 import {
   isRegisteredProvider,
@@ -784,21 +785,10 @@ export function validateDagStructure(
     if (enclosingNodes?.has(node.id)) {
       return `Node id '${node.id}' shadows a node id in the enclosing DAG`;
     }
-    nodesById.set(node.id, node);
-  }
-
-  // Runtime-width composition persists instance steps as `<fanOutId>__<identity>...`.
-  // Reserve that prefix inside each DAG scope so an authored sibling can never alias
-  // an engine-owned instance row during hydration or aggregation.
-  for (const node of nodes) {
-    if (!isComposeFanOutNode(node)) continue;
-    const reservedPrefix = `${node.id}__`;
-    const collision = nodes.find(
-      candidate => candidate !== node && candidate.id.startsWith(reservedPrefix)
-    );
-    if (collision !== undefined) {
-      return `Node '${collision.id}' uses reserved composed fan-out namespace '${reservedPrefix}' owned by node '${node.id}'`;
+    if (node.id.includes(COMPOSE_FAN_OUT_STEP_MARKER)) {
+      return `Node id '${node.id}' contains reserved engine namespace '${COMPOSE_FAN_OUT_STEP_MARKER}'`;
     }
+    nodesById.set(node.id, node);
   }
 
   // Check depends_on references

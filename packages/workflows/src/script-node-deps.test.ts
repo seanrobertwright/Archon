@@ -116,6 +116,7 @@ function createMockStore(): IWorkflowStore {
     cancelWorkflowRun: mock(() => Promise.resolve({ cancelled: false })),
     createWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEvent: mock(() => Promise.resolve()),
+    persistWorkflowEventIfRunning: mock(() => Promise.resolve({ persisted: true })),
     getDagResumeSnapshot: mock(() =>
       Promise.resolve({
         completedNodeOutputs: new Map<string, { output: string }>(),
