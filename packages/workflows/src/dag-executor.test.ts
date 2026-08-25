@@ -29829,6 +29829,26 @@ function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
   };
 }
 
+function probeWaitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
+  return {
+    name: 'probe-wait-terminated-loop-group',
+    description: '#2794 shape: a body node runs BEFORE the terminal wait',
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'grp',
+        loop_group: {
+          until_bash: '[ $probe.output = "satisfied" ]',
+          max_iterations: 3,
+          nodes: [
+            { id: 'probe', bash: "printf 'satisfied'", depends_on: [] },
+            { id: 'delay', wait: { duration_ms: 60_000 }, depends_on: ['probe'] },
+          ],
+        },
+      }),
+    ],
+  };
+}
+
 function repeatingWaitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
   return {
     name: 'repeating-wait-terminated-loop-group',
@@ -30034,6 +30054,55 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
       bodyWaitId: 'delay',
       iteration: 2,
     });
+  });
+
+  it('#2794: wait resume evaluates until_bash against the restored pre-wait body output', async () => {
+    // The issue's shape: iteration 1 ran `probe` before pausing on `delay`. On resume,
+    // the #2707-step-3 recheck must evaluate until_bash against that persisted
+    // `<groupId>.<bodyId>` output: "satisfied" ends the group WITHOUT a new iteration.
+    // If the row were lost, `$probe.output` substitutes empty, `[ '' = "satisfied" ]`
+    // exits 1, and the loop would silently start iterations 2..3 instead (#2794).
+    const expiredWait: WorkflowWaitContext = {
+      owner: 'loop_group',
+      nodeId: 'grp',
+      bodyWaitId: 'delay',
+      iteration: 1,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'time',
+      waitingSince: '2026-08-23T00:00:00.000Z',
+      resumeAt: '2026-08-23T00:01:00.000Z',
+    };
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['grp.probe', { output: 'satisfied' }],
+    ]);
+    const store = createEscalationStore('run-probe-wait-resume');
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      ready(probeWaitTerminatedLoopGroupWorkflow()),
+      makeWorkflowRun('run-probe-wait-resume', { metadata: { wait: expiredWait } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // The restored "satisfied" output satisfies until_bash on resume — the group
+    // completes WITHOUT re-running the body or arming another wait.
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
+    expect(store.getState().status).toBe('running');
   });
 
   it('keeps loop ownership when an event signal lands before the pause call returns', async () => {
