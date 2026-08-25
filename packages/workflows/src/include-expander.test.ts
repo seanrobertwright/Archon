@@ -99,7 +99,12 @@ describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
       { id: 'list', bash: 'echo []' },
       // items must reference an upstream producer now that the loader scans a
       // compose_fan_out's fan_out.items like a workflow node's.
-      { id: 'fan', include: 'blk', depends_on: ['list'], fan_out: { items: '$list.output' } },
+      {
+        id: 'fan',
+        include: 'blk',
+        depends_on: ['list'],
+        fan_out: { items: '$list.output', as: 'item' },
+      },
     ]);
 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(blockWorkflow(), parent));
@@ -113,7 +118,11 @@ describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
 
   test('errors at load time when the fan-out target name does not resolve', () => {
     const parent = wf('parent', [
-      { id: 'fan', include: 'no-such-block', fan_out: { items: '$list.output' } },
+      {
+        id: 'fan',
+        include: 'no-such-block',
+        fan_out: { items: '$list.output', as: 'item' },
+      },
     ]);
 
     const { workflows, errors } = expandWorkflowIncludes(mapOf(parent));
@@ -126,12 +135,13 @@ describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
   test("rewrites $node.output refs in the deferred node's with values and items ref", () => {
     const parent = wf('parent', [
       { id: 'list', bash: 'echo []' },
+      { id: 'blk1', include: 'blk', depends_on: ['list'] },
       {
         id: 'fan',
         include: 'blk',
-        depends_on: ['list'],
-        with: { seed: '$list.output' },
-        fan_out: { items: '$list.output' },
+        depends_on: ['list', 'blk1'],
+        with: { seed: '$blk1.output' },
+        fan_out: { items: '$list.output', as: 'item' },
       },
     ]);
 
@@ -141,7 +151,7 @@ describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
       with?: Record<string, string>;
       fan_out: { items: string };
     };
-    expect(deferred.with?.seed).toBe('$list.output');
+    expect(deferred.with?.seed).toBe('$blk1__impl.output');
     expect(deferred.fan_out.items).toBe('$list.output');
   });
 });

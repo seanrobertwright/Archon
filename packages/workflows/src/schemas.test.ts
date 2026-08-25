@@ -1685,6 +1685,18 @@ describe('dagNodeSchema — launch-only options on an include node (#1764)', () 
     }
   });
 
+  test('compose fan-out requires an explicit item binding', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'review',
+      include: 'blk',
+      fan_out: { items: '$list.output' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => issue.message).join(' | ')).toContain('fan_out.as');
+    }
+  });
+
   test('compose fan-out rejects join: first_success', () => {
     const result = dagNodeSchema.safeParse({
       id: 'review',

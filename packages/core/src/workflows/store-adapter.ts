@@ -97,6 +97,7 @@ export function createWorkflowStore(): IWorkflowStore {
         );
       }
     },
+    persistWorkflowEvent: workflowEventDb.persistWorkflowEvent,
     getDagResumeSnapshot: workflowEventDb.getDagResumeSnapshot,
     getCodebase: codebaseDb.getCodebase,
     getCodebaseEnvVars: envVarDb.getCodebaseEnvVars,

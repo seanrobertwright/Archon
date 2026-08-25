@@ -828,6 +828,13 @@ export const fanOutConfigSchema = z.object({
 /** Dynamic fan-out configuration for a `workflow:` sub-run node (#2121 slice 2, PR-C). */
 export type FanOutConfig = z.infer<typeof fanOutConfigSchema>;
 
+/** Composed fan-out always names the item binding; it has no `$ARGUMENTS` fallback. */
+export const composeFanOutConfigSchema = fanOutConfigSchema.extend({
+  as: z
+    .string()
+    .min(1, "'fan_out.as' is required on an include node and must be a non-empty input name"),
+});
+
 /**
  * Workflow (sub-run) node schema — starts another workflow as a CHILD RUN of the
  * current run at execution time (see executeWorkflowNode in dag-executor.ts). Unlike
@@ -874,12 +881,14 @@ export type WorkflowNode = z.infer<typeof workflowNodeSchema>;
  * re-purposing it would silently reinterpret live workflows the issue requires be
  * "continued safely ... not silently converted".
  */
-export interface ComposeFanOutNode extends DagNodeBase {
-  kind: 'compose_fan_out';
-  include: string;
-  with?: Record<string, JsonValue>;
-  fan_out: FanOutConfig;
-}
+export const composeFanOutNodeSchema = dagNodeBaseSchema.extend({
+  kind: z.literal('compose_fan_out'),
+  include: z.string().min(1, "'include' must be a non-empty workflow name"),
+  with: z.record(z.string(), jsonValueSchema).optional(),
+  fan_out: composeFanOutConfigSchema,
+});
+
+export type ComposeFanOutNode = z.infer<typeof composeFanOutNodeSchema>;
 
 /** Type guard: check if a node is a runtime-width composed fan-out (include + fan_out) */
 export function isComposeFanOutNode(node: DagNode | IncludeDirective): node is ComposeFanOutNode {
@@ -1398,6 +1407,25 @@ export const dagNodeSchema = dagNodeFlatSchema
           'nodes with their own models feeding one collector node — every attempt is kept and ' +
           'nothing is cancelled.',
         path: ['fan_out', 'join'],
+      });
+    }
+    if (hasInclude && data.fan_out !== undefined && data.fan_out.as === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "'fan_out.as' is required on an include node so each runtime item has an explicit $INPUTS.<name> binding",
+        path: ['fan_out', 'as'],
+      });
+    }
+    if (
+      (hasWorkflow || hasInclude) &&
+      data.fan_out?.as !== undefined &&
+      !INPUT_NAME_PATTERN.test(data.fan_out.as)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `invalid fan-out input name '${data.fan_out.as}'; use letters, numbers, underscores, or hyphens and start with a letter or underscore`,
+        path: ['fan_out', 'as'],
       });
     }
     // `fan_out.as` names the per-item value as `$INPUTS.<as>` inside each child (#2470

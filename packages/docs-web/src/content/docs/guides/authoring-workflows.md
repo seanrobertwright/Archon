@@ -2157,19 +2157,22 @@ What you get, compared with the `workflow:` fan-out above:
 - **One governance object.** No child `workflow_runs` rows, artifacts directories, cost
   lines or gate sets per item. Every instance's events are written under the parent run id,
   under instance-qualified step names (`<nodeId>__<instanceId>__<innerNodeId>`).
-- **The same composition semantics as a static `include:`** — gates in the block would be
-  ordinary parent gates, command/script bodies resolve from the block's own package, and
-  `$INPUTS` binding follows the block's declared `inputs:`.
+- **The same package and signature semantics as a static `include:`.** Command/script bodies
+  resolve from the exact packaged source captured for the run, `returns:` selects the
+  aggregate value, and `$INPUTS` binding follows the block's declared `inputs:`. The item
+  binding named by `fan_out.as` is required; there is no implicit `$ARGUMENTS` fallback.
 - **Ordered aggregate.** `$<id>.output` is a JSON array of the instances' terminal outputs
   **in item order**, not completion order; under `join: all_done` a failed instance
   contributes the `{ archon_failed: true, error, status }` marker. An empty item list
   completes immediately with `[]`. Under `join: all_success` any failed instance fails the
   node.
 - **Content-addressed resume.** Each instance is keyed by a hash of its item value (plus an
-  ordinal for byte-identical duplicates), snapshotted onto the run before anything
-  schedules. On resume, completed instances are threaded from persisted events — never
-  re-run, never re-billed — while incomplete ones re-drive, even if the producer's list came
-  back shorter, longer, or reordered.
+  ordinal for byte-identical duplicates). The first ordered snapshot is persisted before
+  anything schedules and remains authoritative: a resume ignores and logs a producer list
+  that is now shorter, longer, or reordered. Completed instances and their completed inner
+  nodes are threaded from persisted events instead of re-running or being billed twice. If
+  an instance has a durable start but no terminal event, Archon cannot prove whether its
+  side effects finished and blocks automatic replay for operator recovery.
 
 Two hard limits, both enforced before any spend:
 
@@ -2180,6 +2183,13 @@ Two hard limits, both enforced before any spend:
   to isolate. Instances share the parent's checkout, so as with a `workflow:` fan-out,
   concurrent instances over a mutating body fail closed unless the block declares
   `mutates_checkout: false`; `fan_out.max_parallel: 1` remains the serial escape.
+
+Cancellation stops the pool from claiming new items. An in-flight item may still reach its
+own terminal event; under `all_done`, a cancelled slot is represented by the same reserved
+`{ archon_failed: true, error, status: "cancelled" }` marker used by child-run fan-out.
+Instance and wrapper events are aggregate accounting rows, so their rolled-up usage is not
+counted again during resume. Engine-managed artifact names also carry the enclosing
+`loop_group` iteration path, preventing later iterations from overwriting earlier sidecars.
 
 Choose by where the audit boundary belongs: one run row per item → `workflow:` +
 `fan_out:`; everything attributable to this run → `include:` + `fan_out:`. Existing

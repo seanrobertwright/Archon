@@ -33,6 +33,7 @@ mock.module('./connection', () => ({
 
 import {
   createWorkflowEvent,
+  persistWorkflowEvent,
   listWorkflowEvents,
   listRecentEvents,
   getDagResumeSnapshot,
@@ -106,6 +107,21 @@ describe('workflow-events', () => {
         workflow_run_id: 'run-456',
         event_type: 'step_started',
       });
+    });
+  });
+
+  describe('persistWorkflowEvent', () => {
+    test('propagates a storage failure for correctness-critical events', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('disk full'));
+
+      await expect(
+        persistWorkflowEvent({
+          workflow_run_id: 'run-456',
+          event_type: 'fan_out_instances',
+          step_name: 'fan',
+          data: { instances: [] },
+        })
+      ).rejects.toThrow('disk full');
     });
   });
 
@@ -929,6 +945,43 @@ describe('workflow-events', () => {
       expect(result.completedNodeOutputs.size).toBe(0);
       expect(result.tokens).toBeUndefined();
       expect(result.costUsd).toBe(0);
+      expect(result.fanOutSnapshots.size).toBe(0);
+      expect(result.unresolvedNodeStarts.size).toBe(0);
+    });
+
+    test('keeps the first valid fan-out instance snapshot authoritative', async () => {
+      const first = [
+        { ordinal: 0, identity: 'a-0', item: { id: 'a' } },
+        { ordinal: 1, identity: 'b-0', item: { id: 'b' } },
+      ];
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { step_name: 'fan', event_type: 'fan_out_instances', data: { instances: first } },
+          {
+            step_name: 'fan',
+            event_type: 'fan_out_instances',
+            data: { instances: [{ ordinal: 0, identity: 'changed-0', item: 'changed' }] },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-fan');
+
+      expect(result.fanOutSnapshots.get('fan')).toEqual(first);
+    });
+
+    test('tracks a durable start until the same step reaches a terminal event', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { step_name: 'fan__a', event_type: 'node_started', data: {} },
+          { step_name: 'fan__b', event_type: 'node_started', data: {} },
+          { step_name: 'fan__b', event_type: 'node_completed', data: { node_output: 'done' } },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-starts');
+
+      expect(result.unresolvedNodeStarts).toEqual(new Set(['fan__a']));
     });
 
     test('throws on DB query error', async () => {

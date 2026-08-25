@@ -115,9 +115,12 @@ function createMockStore(): IWorkflowStore {
     releaseWritebackClaim: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve({ cancelled: false })),
     createWorkflowEvent: mock(() => Promise.resolve()),
+    persistWorkflowEvent: mock(() => Promise.resolve()),
     getDagResumeSnapshot: mock(() =>
       Promise.resolve({
         completedNodeOutputs: new Map<string, { output: string }>(),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })

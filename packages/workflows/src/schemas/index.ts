@@ -89,6 +89,8 @@ export {
   includeDirectiveSchema,
   workflowNodeSchema,
   fanOutConfigSchema,
+  composeFanOutConfigSchema,
+  composeFanOutNodeSchema,
   dagNodeSchema,
   INPUT_NAME_SOURCE,
   inputEnvKey,

@@ -1157,15 +1157,19 @@ export function expandWorkflowIncludes(
       // union — this guard must run (and narrow) before any isIncludeDirective check on
       // the same control-flow path.
       if (isComposeFanOutNode(node)) {
-        // Deferred composition fan-out: the width is runtime data, so the node is NOT
-        // expanded here — but the target NAME is static and load time is the only place
-        // an unknown target is a clean authoring error rather than a mid-run node failure
-        // after upstream spend. Validate existence and carry on.
-        if (!rawByName.has(node.include)) {
-          throw new IncludeExpansionError(
-            `Node '${node.id}': fan-out include target '${node.include}' not found`
-          );
+        // Width is runtime data, but the body remains ordinary static composition.
+        // Expanding it here validates its complete include closure and carries its
+        // requirements onto the parent before any upstream node can spend.
+        let child: WorkflowDefinition;
+        try {
+          child = expandOne(node.include, [...stack, workflowName]);
+        } catch (e) {
+          if (e instanceof IncludeExpansionError) {
+            throw new IncludeExpansionError(`Node '${node.id}': ${e.message}`);
+          }
+          throw e;
         }
+        includedRequirements.push(...(child.requires ?? []));
         expandedNodes.push(node);
         continue;
       }

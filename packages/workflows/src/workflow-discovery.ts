@@ -548,6 +548,31 @@ async function resolveIncludeBlockCommandContents(
 }
 
 /**
+ * Resolve file-backed command bodies for runtime composition from the same frozen
+ * source roots discovery used. Static include expansion normally owns this step;
+ * composed fan-out reuses it when materializing its load-resolved body per item.
+ */
+export async function resolveWorkflowCommandContents(
+  roots: WorkflowSourceRoots,
+  workflows: readonly WorkflowDefinition[]
+): Promise<Map<string, IncludeCommandContent>> {
+  const contents = new Map<string, IncludeCommandContent>();
+  for (const workflow of workflows) {
+    for (const commandName of collectFileBackedCommandNames(workflow.nodes)) {
+      if (contents.has(commandName)) continue;
+      contents.set(
+        commandName,
+        await resolveCommandContentForScan(roots, commandName, {
+          commandFolder: roots.config.command_folder,
+          loadDefaultCommands: roots.config.load_default_commands,
+        })
+      );
+    }
+  }
+  return contents;
+}
+
+/**
  * Discover and load workflows from codebase.
  *
  * Loads three scopes in order (later overrides earlier by filename):

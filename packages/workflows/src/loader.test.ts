@@ -30,7 +30,7 @@ mock.module('@archon/paths', () => ({
 }));
 
 // Bootstrap provider registry (needed by isRegisteredProvider checks at load time)
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import { registerBuiltinProviders, clearRegistry, type ProviderDefaults } from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
 
@@ -2649,6 +2649,7 @@ nodes:
     depends_on: [items]
     fan_out:
       items: "$items.output"
+      as: item
 `
       );
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
@@ -2679,11 +2680,13 @@ nodes:
     depends_on: [items-a]
     fan_out:
       items: "$items-a.output"
+      as: item
   - id: fan-block-b
     include: waiting-block
     depends_on: [items-b]
     fan_out:
       items: "$items-b.output"
+      as: item
 `
       );
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
@@ -5175,6 +5178,7 @@ nodes:
     include: cfo-block
     fan_out:
       items: "$ghost.output"
+      as: item
 `
       );
       const err = result.errors.find(e => e.filename === 'cfo-dangling.yaml');
@@ -5200,6 +5204,7 @@ nodes:
     include: cfo-block
     fan_out:
       items: "$list.output"
+      as: item
 `
       );
       const err = result.errors.find(e => e.filename === 'cfo-not-dep.yaml');
@@ -5225,6 +5230,7 @@ nodes:
       seed: "$ghost.output"
     fan_out:
       items: "[1, 2]"
+      as: item
 `
       );
       const err = result.errors.find(e => e.filename === 'cfo-with-dangling.yaml');
@@ -5252,6 +5258,7 @@ nodes:
       seed: "$seed.output"
     fan_out:
       items: "[1]"
+      as: item
 `
       );
       const err = result.errors.find(e => e.filename === 'cfo-with-late.yaml');
@@ -6480,7 +6487,7 @@ nodes:
         displayName: 'No Resume Skip Test',
         builtIn: false,
         credentials: { kind: 'static', specs: [] },
-        parseRunConfig: raw => raw,
+        parseRunConfig: (raw: ProviderDefaults): ProviderDefaults => raw,
         capabilities: {
           sessionResume: false,
           mcp: false,
@@ -6550,7 +6557,7 @@ nodes:
         displayName: 'No Resume Test',
         builtIn: false,
         credentials: { kind: 'static', specs: [] },
-        parseRunConfig: raw => raw,
+        parseRunConfig: (raw: ProviderDefaults): ProviderDefaults => raw,
         capabilities: {
           sessionResume: false,
           mcp: false,
@@ -7836,6 +7843,7 @@ nodes:
     include: some-block
     fan_out:
       items: "['a']"
+      as: item
     output_format:
       type: object
       properties:

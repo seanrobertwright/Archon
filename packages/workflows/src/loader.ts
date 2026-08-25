@@ -634,7 +634,10 @@ function parseDagNode(
   // superRefine runs. An author writes it on an `include:` believing the block declares
   // its own concurrency safety; composition has one checkout and one run, so the
   // declaration belongs to the composing workflow or to a genuinely separate sub-run.
-  if (isIncludeDirective(node) && (raw as Record<string, unknown>).mutates_checkout !== undefined) {
+  if (
+    (isIncludeDirective(node) || isComposeFanOutNode(node)) &&
+    (raw as Record<string, unknown>).mutates_checkout !== undefined
+  ) {
     errors.push(
       `Node '${id}': 'mutates_checkout' is not supported on an include node: a composed block shares the run's single checkout, so concurrency safety is the composing workflow's to declare. Set it at workflow level, or use a 'workflow:' node when you want a separate governed run.`
     );

@@ -17,6 +17,7 @@ import type {
   WorkflowRunNodeSession,
 } from './schemas';
 import type { TokenUsage } from '@archon/providers/types';
+import type { FanOutInstanceSnapshot } from './fan-out-identity';
 
 export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 
@@ -33,6 +34,10 @@ export interface PersistedNodeOutput {
 
 export interface DagResumeSnapshot {
   completedNodeOutputs: Map<string, PersistedNodeOutput>;
+  /** First durable ordered snapshot for each instance-qualified composed fan-out scope. */
+  fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
+  /** Node/instance starts with no later terminal event, in lifecycle order. */
+  unresolvedNodeStarts: Set<string>;
   tokens?: TokenUsage;
   /** Cumulative USD cost persisted by completed and failed node attempts across prior passes. */
   costUsd: number;
@@ -315,6 +320,19 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    * execution continues regardless of whether event persistence succeeds.
    */
   createWorkflowEvent(data: {
+    workflow_run_id: string;
+    event_type: WorkflowEventType;
+    step_index?: number;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  }): Promise<void>;
+
+  /**
+   * Persist a correctness-critical workflow event and propagate any storage failure.
+   * Use only when execution must not proceed without the row; ordinary observability
+   * belongs on `createWorkflowEvent`.
+   */
+  persistWorkflowEvent(data: {
     workflow_run_id: string;
     event_type: WorkflowEventType;
     step_index?: number;

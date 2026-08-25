@@ -1112,7 +1112,7 @@ describe('dryRunWorkflow', () => {
           id: 'fan',
           kind: 'compose_fan_out',
           include: 'some-block',
-          fan_out: { items: "['a']", max_parallel: 1 },
+          fan_out: { items: "['a']", as: 'item', max_parallel: 1 },
         },
       ],
     });
