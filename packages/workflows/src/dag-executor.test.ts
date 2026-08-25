@@ -31432,6 +31432,85 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(leafOutputs).toEqual(['leaf-x', 'leaf-x']);
   });
 
+  it('rejects an approval gate in a nested composed fan-out target before scheduling', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: outer block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: inner-list',
+        '    bash: \'echo ["x"]\'',
+        '  - id: inner-fan',
+        '    kind: compose_fan_out',
+        '    include: gated-leaf',
+        '    depends_on: [inner-list]',
+        '    fan_out:',
+        "      items: '$inner-list.output'",
+        '      as: item',
+        '      max_parallel: 1',
+      ].join('\n')
+    );
+    await writeBlock(
+      [
+        'name: gated-leaf',
+        'description: nested gated block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: nested-review',
+        '    approval:',
+        '      message: Review this item?',
+      ].join('\n'),
+      'gated-leaf'
+    );
+
+    const mockDeps = createMockDeps();
+    await executeDagWorkflow(
+      mockDeps,
+      createMockPlatform(),
+      'conv-compose-nested-gate',
+      testDir,
+      {
+        name: 'compose-parent-nested-gate',
+        nodes: [
+          {
+            id: 'list',
+            kind: 'exec',
+            runtime: 'sh',
+            script: `echo '${JSON.stringify(['a'])}'`,
+          },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-nested-gate-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = eventsOf(mockDeps.store);
+    expect(events.some(event => event.event_type === 'fan_out_instances')).toBe(false);
+    expect(
+      events.some(
+        event =>
+          event.step_name === 'fan' &&
+          event.event_type === 'node_failed' &&
+          String(event.data.error).includes("'nested-review'")
+      )
+    ).toBe(true);
+  });
+
   it('does not resume-skip instances inside a loop_group from another iteration’s rows', async () => {
     // Iteration-1 rows persisted under BARE (pre-fix) step names must not satisfy
     // iteration N's identity lookup: the whole-run snapshot has no iteration filter, so

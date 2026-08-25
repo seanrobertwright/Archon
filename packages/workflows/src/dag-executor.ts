@@ -9229,11 +9229,16 @@ async function executeComposeFanOutNode(
     await notify(`❌ **Composed fan-out blocked** (node \`${node.id}\`): ${msg}`);
     return failResult(msg);
   }
-  const siblingDefinitions = collectComposeDefinitionClosure(
+  const composeDefinitionClosure = collectComposeDefinitionClosure(
     resolved.definition,
     resolved.definitions
-  ).filter(definition => definition.name !== resolved.definition.name);
-  const bodyGates = collectComposedGates(resolved.definition.nodes);
+  );
+  const siblingDefinitions = composeDefinitionClosure.filter(
+    definition => definition.name !== resolved.definition.name
+  );
+  const bodyGates = composeDefinitionClosure.flatMap(definition =>
+    collectComposedGates(definition.nodes)
+  );
   if (bodyGates.length > 0) {
     const names = bodyGates.map(g => `'${g.id}'`).join(', ');
     const msg =
