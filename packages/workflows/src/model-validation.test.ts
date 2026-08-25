@@ -420,7 +420,7 @@ describe('per-run model bindings', () => {
     });
     expect(() =>
       resolveRunModelOverrides(unsupportedEffort, { aliases: { '@target': '@source' } })
-    ).toThrow(/cannot set effort/);
+    ).toThrow(/cannot apply effort/);
 
     const unsupportedThinking = buildAiProfile('pi', {
       repoAliases: {
@@ -434,7 +434,7 @@ describe('per-run model bindings', () => {
     });
     expect(() =>
       resolveRunModelOverrides(unsupportedThinking, { aliases: { '@target': '@source' } })
-    ).toThrow(/cannot copy Claude-shaped thinking/);
+    ).toThrow(/cannot apply Claude-shaped thinking/);
   });
 
   test('rejects unknown alias targets and references', () => {
@@ -563,6 +563,22 @@ describe('per-run model bindings', () => {
         },
       })
     ).toThrow(/cannot apply Claude-shaped thinking options/);
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          overrides: {
+            tiers: {
+              large: {
+                provider: 'opencode',
+                model: 'anthropic/claude-sonnet-4-6',
+                effort: 'ultra',
+              },
+            },
+          },
+        },
+      })
+    ).toThrow(/cannot apply effort to provider 'opencode'/);
   });
 });
 

@@ -929,7 +929,8 @@ describe('executeWorkflow', () => {
       ).rejects.toThrow(/Cannot supply model overrides when resuming/);
     });
 
-    it('resumes a persisted no-op effort accepted by the provider', async () => {
+    it('terminalizes a resumed run before dispatch when persisted effort is ineffective', async () => {
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preCreatedRun = makeRun({
         id: 'resume-opencode-effort-run',
         status: 'running',
@@ -960,19 +961,24 @@ describe('executeWorkflow', () => {
         },
       });
 
-      await executeWorkflow(
-        makeDeps(makeStore()),
-        makePlatform(),
-        'conv-1',
-        '/tmp',
-        makeWorkflow({ model: 'large' }),
-        'msg',
-        'db-conv-1',
-        { preCreatedRun, priorCompletedNodes: new Map() }
-      );
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore({ failWorkflowRun: failRun })),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow({ model: 'large' }),
+          'msg',
+          'db-conv-1',
+          { preCreatedRun, priorCompletedNodes: new Map() }
+        )
+      ).rejects.toThrow(/cannot apply effort to provider 'opencode'/);
 
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('opencode');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('anthropic/claude-sonnet-4-6');
+      expect(failRun).toHaveBeenCalledWith(
+        'resume-opencode-effort-run',
+        expect.stringContaining("cannot apply effort to provider 'opencode'")
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
     it('terminalizes a resumed run with an invalid persisted alias key', async () => {

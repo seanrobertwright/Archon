@@ -5,9 +5,12 @@ import {
   getRegistration,
   InvalidProviderRunConfigError,
   isRegisteredProvider,
-  parseProviderRunModel,
 } from '@archon/providers';
-import { validEffortsForProvider, type ModelAliasPreset } from '@archon/workflows/model-validation';
+import {
+  normalizeStrictRunModelPreset,
+  RunModelPresetValidationError,
+  type ModelAliasPreset,
+} from '@archon/workflows/model-validation';
 import {
   workflowRunConfigLayerSchema,
   type WorkflowRunConfigInput,
@@ -91,38 +94,23 @@ function assertRegisteredProvider(provider: string, path: string): void {
 }
 
 function normalizePreset(path: string, preset: ModelAliasPreset): ModelAliasPreset {
-  assertRegisteredProvider(preset.provider, `${path}.provider`);
-  let model: string;
   try {
-    model = parseProviderRunModel(preset.provider, preset.model);
+    return normalizeStrictRunModelPreset(preset);
   } catch (error) {
-    if (error instanceof InvalidProviderRunConfigError) {
-      throw new Error(`Invalid run config at '${path}.model': ${error.message}.`);
-    }
-    throw error;
-  }
-  if (preset.effort !== undefined) {
-    const valid = validEffortsForProvider(preset.provider);
-    if (valid === null) {
+    if (!(error instanceof RunModelPresetValidationError)) throw error;
+    const issuePath = `${path}.${error.issue.field}`;
+    if (error.issue.kind === 'unknown-provider') {
+      const available = getRegisteredProviders()
+        .map(entry => entry.id)
+        .sort()
+        .join(', ');
       throw new Error(
-        `Invalid run config at '${path}.effort': provider '${preset.provider}' does not ` +
-          'support per-run effort.'
+        `Invalid run config at '${issuePath}': unknown provider '${error.issue.provider}'.` +
+          (available ? ` Available: ${available}.` : ' No providers are registered.')
       );
     }
-    if (!valid.includes(preset.effort)) {
-      throw new Error(
-        `Invalid run config at '${path}.effort': '${preset.effort}' is not valid for provider ` +
-          `'${preset.provider}'. Valid: ${valid.join(', ')}.`
-      );
-    }
+    throw new Error(`Invalid run config at '${issuePath}': ${error.message}.`);
   }
-  if (preset.thinking !== undefined && preset.provider !== 'claude') {
-    throw new Error(
-      `Invalid run config at '${path}.thinking': the run preset uses Claude-shaped ` +
-        `thinking options, which provider '${preset.provider}' cannot consume.`
-    );
-  }
-  return model === preset.model ? preset : { ...preset, model };
 }
 
 /** Validate and normalize constraints owned by the live provider registry and lifecycle. */

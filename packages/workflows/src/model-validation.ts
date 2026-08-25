@@ -111,27 +111,111 @@ function assertValidPersistedPreset(name: string, entry: ModelAliasPreset): void
   }
 }
 
-function normalizePersistedOverridePreset(name: string, entry: ModelAliasPreset): ModelAliasPreset {
-  if (!isRegisteredProvider(entry.provider)) {
-    throw new Error(`Model binding '${name}' has unknown provider '${entry.provider}'.`);
+export type RunModelPresetValidationIssue =
+  | { kind: 'unknown-provider'; provider: string; field: 'provider' }
+  | { kind: 'invalid-model'; provider: string; model: string; reason: string; field: 'model' }
+  | { kind: 'unsupported-effort'; provider: string; effort: string; field: 'effort' }
+  | {
+      kind: 'invalid-effort';
+      provider: string;
+      effort: string;
+      valid: readonly string[];
+      field: 'effort';
+    }
+  | { kind: 'unsupported-thinking'; provider: string; field: 'thinking' };
+
+function runModelPresetValidationMessage(issue: RunModelPresetValidationIssue): string {
+  switch (issue.kind) {
+    case 'unknown-provider':
+      return `resolved to unknown provider '${issue.provider}'`;
+    case 'invalid-model':
+      return `has invalid ${issue.provider} model '${issue.model}': ${issue.reason}`;
+    case 'unsupported-effort':
+      return `cannot apply effort to provider '${issue.provider}'`;
+    case 'invalid-effort':
+      return (
+        `has invalid ${issue.provider} effort '${issue.effort}'. ` +
+        `Valid: ${issue.valid.join(', ')}`
+      );
+    case 'unsupported-thinking':
+      return `cannot apply Claude-shaped thinking options to provider '${issue.provider}'`;
   }
+}
+
+/** A strict execution-input preset failed a provider-owned semantic invariant. */
+export class RunModelPresetValidationError extends Error {
+  constructor(readonly issue: RunModelPresetValidationIssue) {
+    super(runModelPresetValidationMessage(issue));
+    this.name = 'RunModelPresetValidationError';
+  }
+}
+
+/**
+ * Validate and canonicalize a model preset that will directly affect one run.
+ * Ordinary layered config remains tolerant; every strict execution-input path
+ * (fresh config, explicit overrides, and persisted overrides) shares this gate.
+ */
+export function normalizeStrictRunModelPreset(preset: ModelAliasPreset): ModelAliasPreset {
+  if (!isRegisteredProvider(preset.provider)) {
+    throw new RunModelPresetValidationError({
+      kind: 'unknown-provider',
+      provider: preset.provider,
+      field: 'provider',
+    });
+  }
+
   let model: string;
   try {
-    model = parseProviderRunModel(entry.provider, entry.model);
+    model = parseProviderRunModel(preset.provider, preset.model);
   } catch (error) {
-    throw new Error(
-      `Model binding '${name}' has invalid ${entry.provider} model '${entry.model}': ` +
-        `${(error as Error).message}.`
-    );
+    throw new RunModelPresetValidationError({
+      kind: 'invalid-model',
+      provider: preset.provider,
+      model: preset.model,
+      reason: error instanceof Error ? error.message : String(error),
+      field: 'model',
+    });
   }
-  assertValidPersistedPreset(name, entry);
-  if (entry.thinking !== undefined && entry.provider !== 'claude') {
-    throw new Error(
-      `Model binding '${name}' cannot apply Claude-shaped thinking options to ` +
-        `provider '${entry.provider}'.`
-    );
+
+  if (preset.effort !== undefined) {
+    const valid = validEffortsForProvider(preset.provider);
+    if (valid === null) {
+      throw new RunModelPresetValidationError({
+        kind: 'unsupported-effort',
+        provider: preset.provider,
+        effort: preset.effort,
+        field: 'effort',
+      });
+    }
+    if (!valid.includes(preset.effort)) {
+      throw new RunModelPresetValidationError({
+        kind: 'invalid-effort',
+        provider: preset.provider,
+        effort: preset.effort,
+        valid,
+        field: 'effort',
+      });
+    }
   }
-  return model === entry.model ? entry : { ...entry, model };
+
+  if (preset.thinking !== undefined && preset.provider !== 'claude') {
+    throw new RunModelPresetValidationError({
+      kind: 'unsupported-thinking',
+      provider: preset.provider,
+      field: 'thinking',
+    });
+  }
+
+  return model === preset.model ? preset : { ...preset, model };
+}
+
+function normalizePersistedOverridePreset(name: string, entry: ModelAliasPreset): ModelAliasPreset {
+  try {
+    return normalizeStrictRunModelPreset(entry);
+  } catch (error) {
+    if (!(error instanceof RunModelPresetValidationError)) throw error;
+    throw new Error(`Model binding '${name}' ${error.message}.`);
+  }
 }
 
 function assertValidTierName(name: string): asserts name is TierName {
@@ -236,40 +320,12 @@ function presetForOverrideTarget(profile: ResolvedAiProfile, name: string): Mode
 }
 
 function normalizeRunOverridePreset(targetName: string, preset: RawAliasEntry): RawAliasEntry {
-  if (!isRegisteredProvider(preset.provider)) {
-    throw new Error(
-      `Model override '${targetName}' resolved to unknown provider '${preset.provider}'.`
-    );
-  }
-  let model: string;
   try {
-    model = parseProviderRunModel(preset.provider, preset.model);
+    return normalizeStrictRunModelPreset(preset);
   } catch (error) {
-    throw new Error(
-      `Model override '${targetName}' has invalid ${preset.provider} model '${preset.model}': ` +
-        `${(error as Error).message}.`
-    );
+    if (!(error instanceof RunModelPresetValidationError)) throw error;
+    throw new Error(`Model override '${targetName}' ${error.message}.`);
   }
-  if (preset.effort !== undefined) {
-    const valid = validEffortsForProvider(preset.provider);
-    if (valid === null) {
-      throw new Error(
-        `Model override '${targetName}' cannot set effort for provider '${preset.provider}'.`
-      );
-    }
-    if (!valid.includes(preset.effort)) {
-      throw new Error(
-        `Model override '${targetName}' has invalid ${preset.provider} effort '${preset.effort}'.`
-      );
-    }
-  }
-  if (preset.thinking !== undefined && preset.provider !== 'claude') {
-    throw new Error(
-      `Model override '${targetName}' cannot copy Claude-shaped thinking options to ` +
-        `provider '${preset.provider}'.`
-    );
-  }
-  return model === preset.model ? preset : { ...preset, model };
 }
 
 function resolveRunOverrideSpec(
