@@ -1,0 +1,20 @@
+# Sparse per-run config (#2482): the free-model dogfood combo.
+# Steers one run (and its children/resumes) without touching persistent config:
+#
+#   bun run cli workflow run archon-fix "..." --config "$PWD/.archon/configs/free-models.yaml" --detach
+#
+# (with `bun run cli`, a relative --config resolves from packages/cli — use an
+# absolute path or $PWD; the installed `archon` binary resolves from your cwd)
+#
+# MiniMax-M3 serves the small tier; stealth/ox-alpha (OpenRouter free, shared
+# upstream pool — expect bursty 429s, #2798 retries them) serves medium+large.
+tiers:
+  small:
+    provider: pi
+    model: minimax/MiniMax-M3
+  medium:
+    provider: pi
+    model: openrouter/stealth/ox-alpha
+  large:
+    provider: pi
+    model: openrouter/stealth/ox-alpha
