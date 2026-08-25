@@ -69,6 +69,7 @@ mock.module('@archon/providers', () => ({
   getAgentProvider: mock(() => ({})),
   getRegisteredProviders: mock(() => []),
   getRegistration: mock(() => ({ parseRunConfig: (raw: Record<string, unknown>) => raw })),
+  parseProviderRunModel: mock((_provider: string, model: string) => model),
   isRegisteredProvider: mock(() => false),
   InvalidProviderRunConfigError: class InvalidProviderRunConfigError extends Error {},
   getProviderCapabilities: mock(() => ({ supportedEfforts: [] })),
@@ -89,8 +90,6 @@ mock.module('@archon/providers', () => ({
 
 mock.module('../config/config-loader', () => ({
   loadConfig: mock(() => Promise.resolve({ assistant: 'claude' })),
-  readConfigFile: mock(() => Promise.resolve('')),
-  parseYaml: mock(() => ({})),
   // Required even though nothing here calls it: this factory replaces the module
   // for the whole process, and child-isolation-resolver.ts (same `bun test
   // src/workflows/` batch) does `import { loadRepoConfig }`. Omit it and that

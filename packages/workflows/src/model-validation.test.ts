@@ -527,6 +527,26 @@ describe('per-run model bindings', () => {
         },
       })
     ).toBeDefined();
+    expect(() =>
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          overrides: {
+            tiers: { large: { provider: 'removed-provider', model: 'legacy-model' } },
+          },
+        },
+      })
+    ).toThrow(/unknown provider 'removed-provider'/);
+    expect(
+      readRunModelBindingsMetadata({
+        model_bindings: {
+          ...value,
+          overrides: {
+            tiers: { large: { provider: 'pi', model: ' openai/ gpt-5 ' } },
+          },
+        },
+      })?.overrides.tiers?.large
+    ).toEqual({ provider: 'pi', model: 'openai/gpt-5' });
   });
 });
 

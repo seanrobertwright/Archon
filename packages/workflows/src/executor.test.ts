@@ -1013,6 +1013,46 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
+    it('terminalizes a resumed run before dispatch when a persisted provider is unavailable', async () => {
+      const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({
+        id: 'resume-removed-provider-run',
+        status: 'running',
+        metadata: {
+          model_bindings: {
+            overrides: {
+              tiers: { large: { provider: 'removed-provider', model: 'legacy-model' } },
+            },
+            effective: {
+              defaultProvider: 'claude',
+              aliases: {
+                large: { provider: 'removed-provider', model: 'legacy-model' },
+              },
+            },
+          },
+        },
+      });
+
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore({ failWorkflowRun: failRun })),
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow({ model: 'large' }),
+          'msg',
+          'db-conv-1',
+          { preCreatedRun, priorCompletedNodes: new Map() }
+        )
+      ).rejects.toThrow(/unknown provider 'removed-provider'/);
+
+      expect(failRun).toHaveBeenCalledWith(
+        'resume-removed-provider-run',
+        expect.stringContaining("unknown provider 'removed-provider'")
+      );
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
     it('fails a pre-created row when a semantic binding error stops startup', async () => {
       const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preCreatedRun = makeRun({ id: 'invalid-model-run', status: 'pending', metadata: {} });

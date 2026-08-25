@@ -111,6 +111,23 @@ function assertValidPersistedPreset(name: string, entry: ModelAliasPreset): void
   }
 }
 
+function normalizePersistedOverridePreset(name: string, entry: ModelAliasPreset): ModelAliasPreset {
+  if (!isRegisteredProvider(entry.provider)) {
+    throw new Error(`Model binding '${name}' has unknown provider '${entry.provider}'.`);
+  }
+  let model: string;
+  try {
+    model = parseProviderRunModel(entry.provider, entry.model);
+  } catch (error) {
+    throw new Error(
+      `Model binding '${name}' has invalid ${entry.provider} model '${entry.model}': ` +
+        `${(error as Error).message}.`
+    );
+  }
+  assertValidPersistedPreset(name, entry);
+  return model === entry.model ? entry : { ...entry, model };
+}
+
 function assertValidTierName(name: string): asserts name is TierName {
   if (!isTierName(name)) {
     throw new Error(`Tier name '${name}' is invalid. Supported tiers: ${TIER_NAMES.join(', ')}.`);
@@ -427,17 +444,29 @@ export function readRunModelBindingsMetadata(
     throw new Error('Workflow run has invalid model_bindings metadata.');
   }
 
-  for (const layer of [
-    parsed.data.overrides.tiers,
-    parsed.data.overrides.aliases,
-    parsed.data.effective.aliases,
-  ]) {
-    for (const [name, preset] of Object.entries(layer ?? {})) {
-      assertValidPersistedPreset(name, preset);
-    }
+  const tiers = Object.fromEntries(
+    Object.entries(parsed.data.overrides.tiers ?? {}).map(([name, preset]) => [
+      name,
+      normalizePersistedOverridePreset(name, preset),
+    ])
+  );
+  const aliases = Object.fromEntries(
+    Object.entries(parsed.data.overrides.aliases ?? {}).map(([name, preset]) => [
+      name,
+      normalizePersistedOverridePreset(name, preset),
+    ])
+  );
+  for (const [name, preset] of Object.entries(parsed.data.effective.aliases)) {
+    assertValidPersistedPreset(name, preset);
   }
 
-  return parsed.data;
+  return {
+    ...parsed.data,
+    overrides: {
+      ...(parsed.data.overrides.tiers === undefined ? {} : { tiers }),
+      ...(parsed.data.overrides.aliases === undefined ? {} : { aliases }),
+    },
+  };
 }
 
 /**

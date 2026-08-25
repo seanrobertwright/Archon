@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import {
   getRegisteredProviders,
@@ -16,7 +17,6 @@ import {
 } from '@archon/workflows/schemas/run-config';
 import { decryptToken, encryptToken, getEncryptionKey } from '../utils/token-crypto';
 import type { GlobalConfig, RepoConfig } from './config-types';
-import { parseYaml, readConfigFile } from './config-loader';
 
 type ConfigKey = keyof GlobalConfig | keyof RepoConfig;
 type KeyClassification = { kind: 'runtime' } | { kind: 'unavailable'; reason: string };
@@ -232,13 +232,13 @@ export function parseWorkflowRunConfig(
 export async function loadWorkflowRunConfigFile(path: string): Promise<WorkflowRunConfigInput> {
   let content: string;
   try {
-    content = await readConfigFile(path);
+    content = await readFile(path, 'utf8');
   } catch (error) {
     throw new Error(`Unable to read run config '${path}': ${(error as Error).message}`);
   }
   let value: unknown;
   try {
-    value = parseYaml(content);
+    value = Bun.YAML.parse(content);
   } catch (error) {
     throw new Error(`Invalid YAML in run config '${path}': ${(error as Error).message}`);
   }
