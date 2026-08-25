@@ -23,12 +23,14 @@ export function captureDetachedInstallContext(
   };
 }
 
-/** Restore the exact semantic snapshot; empty strings are the inherited-absence sentinel. */
+/** Restore the semantic snapshot; empty wire sentinels become absent variables again. */
 export function restoreDetachedInstallContext(
   context: DetachedInstallContext,
   env: NodeJS.ProcessEnv = process.env
 ): void {
   for (const key of DETACHED_INSTALL_CONTEXT_KEYS) {
-    env[key] = context[key];
+    const value = context[key];
+    if (value === '') Reflect.deleteProperty(env, key);
+    else env[key] = value;
   }
 }
