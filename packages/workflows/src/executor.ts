@@ -87,6 +87,7 @@ import {
 import { resolveGithubTokenOverrides } from './utils/github-token-policy';
 import {
   buildAiProfile,
+  applyResolvedRunModelOverrides,
   createRunModelBindingsMetadata,
   hasRunModelOverrides,
   readRunModelBindingsMetadata,
@@ -1002,6 +1003,44 @@ export async function prepareWorkflowSource(
   };
 }
 
+export interface ResumableRunInspection {
+  priorCompletedNodes: Map<string, PersistedNodeOutput>;
+  priorUsage: PriorRunUsage;
+}
+
+/** Read whether a candidate has state worth resuming without claiming or mutating it. */
+export async function inspectResumableRun(
+  deps: WorkflowDeps,
+  candidate: WorkflowRun
+): Promise<ResumableRunInspection | null> {
+  const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
+  const priorCompletedNodes = snapshot.completedNodeOutputs;
+  const rawApproval = candidate.metadata?.approval;
+  const approvalContext = isApprovalContext(rawApproval) ? rawApproval : undefined;
+  const hasReRunGateState = reRunsOwnNodeOnResume(approvalContext, candidate.metadata);
+  const hasWaitState = isWorkflowWaitContext(candidate.metadata?.wait);
+  const hasScheduledResume = isScheduledWorkflowResume(candidate.metadata?.scheduled_resume);
+  if (
+    priorCompletedNodes.size === 0 &&
+    !hasReRunGateState &&
+    !hasWaitState &&
+    !hasScheduledResume
+  ) {
+    getLog().info(
+      { resumableRunId: candidate.id },
+      'workflow.dag_resume_skipped_no_completed_nodes'
+    );
+    return null;
+  }
+  return {
+    priorCompletedNodes,
+    priorUsage: {
+      ...(snapshot.tokens !== undefined ? { tokens: snapshot.tokens } : {}),
+      costUsd: snapshot.costUsd,
+    },
+  };
+}
+
 /**
  * Hydrate an already-located resumable `WorkflowRun` candidate into the form
  * {@link executeWorkflow} expects. Returns `null` when the candidate has no
@@ -1025,8 +1064,9 @@ export async function hydrateResumableRun(
   priorUsage: PriorRunUsage;
   priorNodeSessions: WorkflowRunNodeSession[];
 } | null> {
-  const snapshot = await deps.store.getDagResumeSnapshot(candidate.id);
-  const priorCompletedNodes = snapshot.completedNodeOutputs;
+  const inspection = await inspectResumableRun(deps, candidate);
+  if (inspection === null) return null;
+  const { priorCompletedNodes, priorUsage } = inspection;
   // A gate whose node deliberately writes NO node_completed on pause must still be
   // resumable with zero completed nodes: interactive loops, a `workflow:` node
   // blocked on a child (#2121 Phase 2) whose child is the very first node, and a
@@ -1034,23 +1074,6 @@ export async function hydrateResumableRun(
   // reRunsOwnNodeOnResume's doc for the exhaustive per-reason breakdown. A
   // new-mode gate (#2707 step 1) needs no carve-out here: both approve and
   // reject write node_completed immediately.
-  const rawApproval = candidate.metadata?.approval;
-  const approvalContext = isApprovalContext(rawApproval) ? rawApproval : undefined;
-  const hasReRunGateState = reRunsOwnNodeOnResume(approvalContext, candidate.metadata);
-  const hasWaitState = isWorkflowWaitContext(candidate.metadata?.wait);
-  const hasScheduledResume = isScheduledWorkflowResume(candidate.metadata?.scheduled_resume);
-  if (
-    priorCompletedNodes.size === 0 &&
-    !hasReRunGateState &&
-    !hasWaitState &&
-    !hasScheduledResume
-  ) {
-    getLog().info(
-      { resumableRunId: candidate.id },
-      'workflow.dag_resume_skipped_no_completed_nodes'
-    );
-    return null;
-  }
   const completedNodeIds = new Set(priorCompletedNodes.keys());
   const priorNodeSessions = (await deps.store.listWorkflowRunNodeSessions(candidate.id)).filter(
     row => completedNodeIds.has(row.node_id)
@@ -1066,10 +1089,7 @@ export async function hydrateResumableRun(
   return {
     preCreatedRun,
     priorCompletedNodes,
-    priorUsage: {
-      ...(snapshot.tokens !== undefined ? { tokens: snapshot.tokens } : {}),
-      costUsd: snapshot.costUsd,
-    },
+    priorUsage,
     priorNodeSessions,
   };
 }
@@ -1990,14 +2010,7 @@ export async function executeWorkflow(
     }
     throw error;
   }
-  const aiProfile: ResolvedAiProfile = {
-    defaultProvider: baseAiProfile.defaultProvider,
-    aliases: {
-      ...baseAiProfile.aliases,
-      ...resolvedModelOverrides.tiers,
-      ...resolvedModelOverrides.aliases,
-    },
-  };
+  const aiProfile = applyResolvedRunModelOverrides(baseAiProfile, resolvedModelOverrides);
   const modelBindingsMetadata = createRunModelBindingsMetadata(resolvedModelOverrides, aiProfile);
   if (hasRunModelOverrides(resolvedModelOverrides)) {
     getLog().info(

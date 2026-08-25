@@ -20,6 +20,7 @@ import {
 import { WORKFLOW_EVENT_TYPES, type WorkflowEventType } from '@archon/workflows/store';
 import {
   isTierName,
+  applyResolvedRunModelOverrides,
   buildAiProfile,
   parseRunModelAssignments,
   resolveRunModelOverrides,
@@ -1332,11 +1333,7 @@ async function runWorkflowWithOwnedSource(
       defaultStubs: options.defaultStubs,
       pauseAtGates: options.pauseAtGates,
       config: dryRunConfig,
-      aiProfile: buildAiProfile(dryRunDefaultProvider, {
-        ...dryRunProfileOptions,
-        runTiers: { ...runConfig?.layer.tiers, ...dryRunModelOverrides.tiers },
-        runAliases: { ...runConfig?.layer.aliases, ...dryRunModelOverrides.aliases },
-      }),
+      aiProfile: applyResolvedRunModelOverrides(dryRunBaseProfile, dryRunModelOverrides),
     });
     if (options.json) {
       await writeJsonLine(result);

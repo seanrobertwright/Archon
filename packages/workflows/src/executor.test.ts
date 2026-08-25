@@ -162,6 +162,7 @@ registerCommunityProviders();
 import {
   executeWorkflow,
   hydrateResumableRun,
+  inspectResumableRun,
   resolveProjectPaths,
   resolveScopeArtifactsDir,
 } from './executor';
@@ -3059,6 +3060,27 @@ describe('telemetry wiring', () => {
 // ───────────────────────────────────────────────────────────────────────────
 
 describe('hydrateResumableRun', () => {
+  it('inspects resumable state without claiming the run', async () => {
+    const candidate = makeRun({ id: 'read-only-prior', status: 'paused' });
+    const priorNodes = new Map([['n1', { output: 'out1' }]]);
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: priorNodes,
+        tokens: { input: 4, output: 1 },
+        costUsd: 0.1,
+      })),
+    });
+
+    const result = await inspectResumableRun(makeDeps(store), candidate);
+
+    expect(result).toEqual({
+      priorCompletedNodes: priorNodes,
+      priorUsage: { tokens: { input: 4, output: 1 }, costUsd: 0.1 },
+    });
+    expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.listWorkflowRunNodeSessions).not.toHaveBeenCalled();
+  });
+
   it('returns hydrated run + prior outputs for a candidate with completed nodes', async () => {
     const candidate = makeRun({ id: 'prior-failed', status: 'failed' });
     const resumed = makeRun({ id: 'prior-failed', status: 'running' });

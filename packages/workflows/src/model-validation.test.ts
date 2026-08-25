@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
 
 import {
+  applyResolvedRunModelOverrides,
   buildAiProfile,
   createRunModelBindingsMetadata,
   parseRunModelAssignments,
@@ -383,6 +384,21 @@ describe('per-run model bindings', () => {
         tiers: { large: 'opencode/ openai / gpt-5.6 ' },
       }).tiers?.large
     ).toEqual({ provider: 'opencode', model: 'openai/gpt-5.6' });
+    expect(
+      resolveRunModelOverrides(base, {
+        tiers: { large: 'pi/ openai / gpt-5.6 ' },
+      }).tiers?.large
+    ).toEqual({ provider: 'pi', model: 'openai/gpt-5.6' });
+  });
+
+  test('applies resolved overrides as a sparse overlay', () => {
+    const overrides = resolveRunModelOverrides(base, { tiers: { large: 'openai/gpt-5.6' } });
+    const effective = applyResolvedRunModelOverrides(base, overrides);
+
+    expect(effective.defaultProvider).toBe(base.defaultProvider);
+    expect(effective.aliases.small).toEqual(base.aliases.small);
+    expect(effective.aliases['@planner']).toEqual(base.aliases['@planner']);
+    expect(effective.aliases.large).toEqual({ provider: 'pi', model: 'openai/gpt-5.6' });
   });
 
   test('unqualified literals inherit the target provider and preset refs copy options', () => {

@@ -46,6 +46,7 @@ import {
   withCapturedSource,
   type CapturedSourceOwner,
   hydrateResumableRun,
+  inspectResumableRun,
   prepareWorkflowSource,
   recordSelectedWorkflow,
   type PreparedWorkflowSource,
@@ -1056,7 +1057,20 @@ async function dispatchOrchestratorWorkflowOwned(
     const deps = createWorkflowDeps();
     let prepared: Awaited<ReturnType<typeof hydrateResumableRun>>;
     try {
-      prepared = await hydrateResumableRun(deps, resumableRun);
+      if (options?.runConfig) {
+        const inspection = await inspectResumableRun(deps, resumableRun);
+        if (inspection) {
+          await platform.sendMessage(
+            conversationId,
+            'This command would resume an existing run, so a new run config cannot be applied. ' +
+              'Resume without config, or force a fresh run.'
+          );
+          return;
+        }
+        prepared = null;
+      } else {
+        prepared = await hydrateResumableRun(deps, resumableRun);
+      }
     } catch (err) {
       // resumeWorkflowRun is a compare-and-swap: if another surface (web Resume,
       // a concurrent re-dispatch, the CLI) already claimed this run, it throws
@@ -1084,14 +1098,6 @@ async function dispatchOrchestratorWorkflowOwned(
       throw err;
     }
     if (prepared) {
-      if (options?.runConfig) {
-        await platform.sendMessage(
-          conversationId,
-          'This command would resume an existing run, so a new run config cannot be applied. ' +
-            'Resume without config, or force a fresh run.'
-        );
-        return;
-      }
       const resumeStateLabel = formatResumableRunState(resumableRun.status);
       const suppliedModelBindingNames = [
         ...Object.keys(options?.modelOverrides?.tiers ?? {}),

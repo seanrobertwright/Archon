@@ -245,6 +245,18 @@ describe('workflow run config', () => {
         { kind: 'http', label: 'inline' }
       ).layer.aliases?.['@open']
     ).toEqual({ provider: 'opencode', model: 'openai/gpt-5.6' });
+    expect(
+      parseWorkflowRunConfig(
+        {
+          assistants: { pi: { model: ' openai / gpt-5.6 ' } },
+          tiers: { large: { provider: 'pi', model: ' openai / gpt-5.6 ' } },
+        },
+        { kind: 'http', label: 'inline' }
+      ).layer
+    ).toMatchObject({
+      assistants: { pi: { model: 'openai/gpt-5.6' } },
+      tiers: { large: { provider: 'pi', model: 'openai/gpt-5.6' } },
+    });
   });
 
   it('seals secrets for replay while exposing only attribution and key paths', () => {

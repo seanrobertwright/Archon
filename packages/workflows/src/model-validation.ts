@@ -316,6 +316,21 @@ export function resolveRunModelOverrides(
   };
 }
 
+/** Apply already validated sparse run bindings without rebuilding lower config layers. */
+export function applyResolvedRunModelOverrides(
+  profile: ResolvedAiProfile,
+  overrides: ResolvedRunModelOverrides
+): ResolvedAiProfile {
+  return {
+    defaultProvider: profile.defaultProvider,
+    aliases: {
+      ...profile.aliases,
+      ...overrides.tiers,
+      ...overrides.aliases,
+    },
+  };
+}
+
 /** Parse repeated CLI `name=spec` mappings into the shared transport shape. */
 export function parseRunModelAssignments(assignments: readonly string[]): RunModelOverrides {
   const tiers: Partial<Record<TierName, string>> = {};

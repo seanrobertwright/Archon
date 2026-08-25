@@ -196,11 +196,13 @@ export function parsePiRunConfig(raw: Record<string, unknown>): ParsedPiConfig {
     'extensionFlags',
     'nodes',
   ]);
-  const model = normalizeRunConfigString(raw.model, 'model');
+  let model = normalizeRunConfigString(raw.model, 'model');
   if (model !== undefined) {
-    if (parsePiModelRef(model) === undefined) {
+    const parsedModel = parsePiModelRef(model);
+    if (parsedModel === undefined) {
       invalidRunConfigValue('model', "'<provider>/<model>'");
     }
+    model = `${parsedModel.provider}/${parsedModel.modelId}`;
   }
   validateExtensionPosture(
     Object.fromEntries(

@@ -167,12 +167,16 @@ const mockHydrateResumableRun = mock(
       priorCompletedNodes: new Map([['n1', 'v1']]),
     }) as unknown
 );
+const mockInspectResumableRun = mock(() =>
+  Promise.resolve({ priorCompletedNodes: new Map([['n1', 'v1']]), priorUsage: { costUsd: 0 } })
+);
 /** Ownership calls the dispatch path makes on its capture, in order. */
 const capturedSourceOwnerCalls: string[] = [];
 
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   hydrateResumableRun: mockHydrateResumableRun,
+  inspectResumableRun: mockInspectResumableRun,
   // Source capture runs before dispatch and does real filesystem work; stub it so these
   // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
   // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
@@ -1950,6 +1954,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockDispatchBackgroundWorkflow.mockClear();
     mockFindResumableRunByParentConversation.mockClear();
     mockHydrateResumableRun.mockClear();
+    mockInspectResumableRun.mockReset();
+    mockInspectResumableRun.mockImplementation(() =>
+      Promise.resolve({ priorCompletedNodes: new Map([['n1', 'v1']]), priorUsage: { costUsd: 0 } })
+    );
     mockUpdateWorkflowRun.mockClear();
     mockUpdateWorkflowRun.mockImplementation(() => Promise.resolve());
     mockResolveApprovalGate.mockClear();
@@ -2310,14 +2318,15 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockFindResumableRunByParentConversation.mockReturnValueOnce(
       Promise.resolve(makeResumableRun({ id: 'empty-config-run', status: 'paused' }))
     );
-    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
+    mockInspectResumableRun.mockReturnValueOnce(Promise.resolve(null));
 
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
       workflowRunConfig: runConfig,
     });
 
-    expect(mockHydrateResumableRun).toHaveBeenCalled();
+    expect(mockInspectResumableRun).toHaveBeenCalled();
+    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
     expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.runConfig).toEqual(runConfig);
     expect(platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n')).not.toContain(
       'a new run config cannot be applied'
@@ -2758,6 +2767,8 @@ describe('workflow dispatch routing — interactive flag', () => {
     const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
     expect(sent).toContain('a new run config cannot be applied');
     expect(sent).toContain('force a fresh run');
+    expect(mockInspectResumableRun).toHaveBeenCalled();
+    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
     expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
   });
