@@ -1,9 +1,10 @@
 /**
  * Skill command - Install bundled Archon skill files into a project
  *
- * Writes the bundled `archon` skill (SKILL.md, guides, references, examples) and
- * the focused `manage-run` skill into <targetPath>/.claude/skills/<skill>/ (for
- * Claude Code) and <targetPath>/.agents/skills/<skill>/ (the canonical Codex
+ * Writes the bundled `archon-cli` skill (router SKILL.md plus one capability
+ * folder per route: running-workflows, manage-run, setup-and-config,
+ * authoring-workflows, prompting-mistakes) into <targetPath>/.claude/skills/archon-cli/
+ * (for Claude Code) and <targetPath>/.agents/skills/archon-cli/ (the canonical Codex
  * project-level skill path) so both Claude Code and Codex pick them up.
  *
  * Always overwrites existing files to ensure the latest skill version
@@ -25,10 +26,9 @@ function writeSkillFiles(skillRoot: string, files: Record<string, string>): void
 }
 
 /**
- * Copy the bundled Archon skills into <targetPath>/.claude/skills/ (Claude Code)
+ * Copy the bundled Archon skill into <targetPath>/.claude/skills/ (Claude Code)
  * and <targetPath>/.agents/skills/ (Codex):
- *   - `archon`     — the broad authoring/setup/run skill
- *   - `manage-run` — the focused run-management skill
+ *   - `archon-cli` — router + capability references (run/manage/setup/author)
  *
  * Pure file-system helper used by both the standalone `skill install` CLI
  * command and the interactive setup wizard.
@@ -43,15 +43,14 @@ function writeSkillFiles(skillRoot: string, files: Record<string, string>): void
  * the source skill files are missing from disk.
  */
 export async function copyArchonSkill(targetPath: string): Promise<void> {
-  const { BUNDLED_SKILL_FILES, BUNDLED_MANAGE_RUN_SKILL_FILES } = await import('../bundled-skill');
+  const { BUNDLED_SKILL_FILES } = await import('../bundled-skill');
   const skillsRoots = [
     join(targetPath, '.claude', 'skills'),
     join(targetPath, '.agents', 'skills'),
   ];
 
   for (const skillsRoot of skillsRoots) {
-    writeSkillFiles(join(skillsRoot, 'archon'), BUNDLED_SKILL_FILES);
-    writeSkillFiles(join(skillsRoot, 'manage-run'), BUNDLED_MANAGE_RUN_SKILL_FILES);
+    writeSkillFiles(join(skillsRoot, 'archon-cli'), BUNDLED_SKILL_FILES);
   }
 }
 
@@ -69,10 +68,8 @@ export async function skillInstallCommand(targetPath: string): Promise<number> {
   }
 
   try {
-    const { BUNDLED_SKILL_FILES, BUNDLED_MANAGE_RUN_SKILL_FILES } =
-      await import('../bundled-skill');
-    const fileCount =
-      Object.keys(BUNDLED_SKILL_FILES).length + Object.keys(BUNDLED_MANAGE_RUN_SKILL_FILES).length;
+    const { BUNDLED_SKILL_FILES } = await import('../bundled-skill');
+    const fileCount = Object.keys(BUNDLED_SKILL_FILES).length;
     const installTargets = [
       join(absoluteTarget, '.claude', 'skills'),
       join(absoluteTarget, '.agents', 'skills'),
