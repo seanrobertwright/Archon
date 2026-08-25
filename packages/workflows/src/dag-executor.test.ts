@@ -31914,6 +31914,17 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
           event.event_type === 'node_completed' && event.data.type === 'compose_fan_out_instance'
       )
     ).toHaveLength(2);
+    const nestedWrapper = firstPassEvents.find(
+      event => event.event_type === 'node_completed' && event.step_name.endsWith('__inner-fan')
+    );
+    expect(nestedWrapper?.data.structured_output).toEqual(['x']);
+    const outerInstance = firstPassEvents.find(
+      event =>
+        event.event_type === 'node_completed' &&
+        event.data.type === 'compose_fan_out_instance' &&
+        !event.step_name.includes('__inner-fan__')
+    );
+    expect(outerInstance?.data.structured_output).toEqual(['x']);
     expect(
       firstPassEvents.some(
         event => event.event_type === 'node_completed' && event.step_name === 'fan'
@@ -31977,11 +31988,10 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
 
     expect(claimCount).toBe(2);
     expect(await readFile(join(testDir, '.compose-paused-nested'), 'utf8')).toBe('x\nx\n');
-    expect(
-      eventsOf(store).some(
-        event => event.event_type === 'node_completed' && event.step_name === 'fan'
-      )
-    ).toBe(true);
+    const finalWrapper = eventsOf(store).find(
+      event => event.event_type === 'node_completed' && event.step_name === 'fan'
+    );
+    expect(finalWrapper?.data.structured_output).toEqual([['x'], ['x']]);
   });
 
   it('carries a claimed pause policy into a deterministic loop_group body', async () => {

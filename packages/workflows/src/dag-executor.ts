@@ -9620,7 +9620,9 @@ async function executeComposeFanOutNode(
     const msg = `could not verify parent status after composed fan-out: ${(err as Error).message}`;
     return failResult(msg, totalCostUsd, totalTokens);
   }
-  if (runStatus !== 'running') {
+  const claimedWorkMayFinishPaused =
+    runStatus === 'paused' && ctx.claimedWorkPausePolicy === 'finish_through_parent_pause';
+  if (runStatus !== 'running' && !claimedWorkMayFinishPaused) {
     getLog().info(
       { parentRunId: parentRun.id, nodeId: node.id, runStatus },
       'workflow.compose_fan_out_interrupted'
