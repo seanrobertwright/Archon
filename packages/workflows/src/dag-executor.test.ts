@@ -11588,7 +11588,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       const parentWorkflow = {
         name: 'materialized-loop-gated',
         description: 'Includes the command-backed loop',
-        nodes: [{ id: 'included', include: 'materialized-loop-block' } satisfies IncludeDirective],
+        nodes: [
+          {
+            id: 'included',
+            kind: 'include',
+            include: 'materialized-loop-block',
+          } satisfies IncludeDirective,
+        ],
       } satisfies WorkflowDefinition;
       const workflowDir = join(testDir, '.archon', 'workflows');
       const commandPath = join(testDir, '.archon', 'commands', 'materialized-loop-command.md');
@@ -30892,6 +30898,72 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
       event => event.event_type === 'node_completed' && event.step_name === 'fan'
     );
     expect(wrapper?.data.structured_output).toEqual(['persisted-first-a']);
+  });
+
+  it('uses the persisted resolved input map when upstream bindings change on resume', async () => {
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: test block',
+        'mutates_checkout: false',
+        'inputs:',
+        '  item: { required: true }',
+        '  seed: { required: true }',
+        'nodes:',
+        '  - id: work',
+        "    bash: 'echo $INPUTS.seed:$INPUTS.item'",
+      ].join('\n')
+    );
+    const [snapshot] = buildInstanceSnapshots(['a'], { seed: 'persisted' }, 'item');
+    const store = createMockStore();
+    (store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>).mockResolvedValue({
+      completedNodeOutputs: new Map(),
+      fanOutSnapshots: new Map([['fan', [snapshot!]]]),
+      unresolvedNodeStarts: new Set(),
+      costUsd: 0,
+    });
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-compose',
+      testDir,
+      {
+        name: 'compose-parent',
+        nodes: [
+          { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a"]'` },
+          {
+            id: 'changed-seed',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'echo changed',
+            always_run: true,
+          },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list', 'changed-seed'],
+            with: { seed: '$changed-seed.output' },
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-frozen-inputs-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const wrapper = eventsOf(store).find(
+      event => event.event_type === 'node_completed' && event.step_name === 'fan'
+    );
+    expect(wrapper?.data.structured_output).toEqual(['persisted:a']);
   });
 
   it('blocks automatic replay for an instance with a durable start and no terminal row', async () => {

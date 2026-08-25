@@ -39,4 +39,12 @@ describe('fan-out-identity (#2512)', () => {
     expect(snaps.map(s => s.ordinal)).toEqual([0, 1, 2]);
     expect(snaps.map(s => s.item)).toEqual([3, 1, 2]);
   });
+
+  test('snapshots freeze the complete resolved input map for each item', () => {
+    const snaps = buildInstanceSnapshots(['a', 'b'], { seed: 7 }, 'file');
+    expect(snaps.map(snapshot => snapshot.inputs)).toEqual([
+      { seed: 7, file: 'a' },
+      { seed: 7, file: 'b' },
+    ]);
+  });
 });

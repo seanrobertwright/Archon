@@ -49,6 +49,7 @@ mock.module('../db/workflows', () => ({
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockPersistWorkflowEvent = mock(() => Promise.resolve());
 const mockGetDagResumeSnapshot = mock(() =>
   Promise.resolve({
     completedNodeOutputs: new Map<string, string>(),
@@ -57,6 +58,7 @@ const mockGetDagResumeSnapshot = mock(() =>
 );
 mock.module('../db/workflow-events', () => ({
   createWorkflowEvent: mockCreateWorkflowEvent,
+  persistWorkflowEvent: mockPersistWorkflowEvent,
   getDagResumeSnapshot: mockGetDagResumeSnapshot,
 }));
 
@@ -170,6 +172,7 @@ describe('createWorkflowStore', () => {
       'releaseWritebackClaim',
       'cancelWorkflowRun',
       'createWorkflowEvent',
+      'persistWorkflowEvent',
       'getDagResumeSnapshot',
       'getCodebase',
       'getCodebaseEnvVars',
@@ -223,6 +226,21 @@ describe('createWorkflowStore', () => {
     const result = await store.getDagResumeSnapshot('run-123');
     expect(result).toBe(expected);
     expect(mockGetDagResumeSnapshot).toHaveBeenCalledWith('run-123');
+  });
+
+  test('delegates durable workflow events to DB without swallowing failures', async () => {
+    const event = {
+      workflow_run_id: 'run-123',
+      event_type: 'fan_out_instances' as const,
+      step_name: 'fan',
+      data: { instances: [] },
+    };
+    const store = createWorkflowStore();
+    await store.persistWorkflowEvent(event);
+    expect(mockPersistWorkflowEvent).toHaveBeenCalledWith(event);
+
+    mockPersistWorkflowEvent.mockRejectedValueOnce(new Error('disk full'));
+    await expect(store.persistWorkflowEvent(event)).rejects.toThrow('disk full');
   });
 
   test('delegates cancelWorkflowRun to DB', async () => {

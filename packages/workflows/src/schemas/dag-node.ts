@@ -768,6 +768,7 @@ export const includeDirectiveSchema = dagNodeBaseSchema
     trigger_rule: true,
   })
   .extend({
+    kind: z.literal('include'),
     include: z.string().min(1, "'include' must be a non-empty workflow name"),
     // JSON-compatible input values (#2637): strings splice into text surfaces via
     // the load-time macro; non-string values keep their logical type through the
@@ -892,7 +893,7 @@ export type ComposeFanOutNode = z.infer<typeof composeFanOutNodeSchema>;
 
 /** Type guard: check if a node is a runtime-width composed fan-out (include + fan_out) */
 export function isComposeFanOutNode(node: DagNode | IncludeDirective): node is ComposeFanOutNode {
-  return 'kind' in node && node.kind === 'compose_fan_out';
+  return node.kind === 'compose_fan_out';
 }
 
 /**
@@ -1812,6 +1813,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       // via INCLUDE_NODE_IGNORED_FIELDS.
       return {
         ...structuralBase,
+        kind: 'include',
         include: data.include.trim(),
         ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
       } as IncludeDirective;
@@ -1924,11 +1926,15 @@ export function isWorkflowNode(node: DagNode): node is WorkflowNode {
 
 /**
  * Type guard: check if a pre-expansion graph entry is an include directive rather
- * than an executable `DagNode`. `IncludeDirective` is not a `DagNode` union member
- * (#2486) — it has no `kind` field, so this checks for the one field only it carries.
+ * than an executable `DagNode`. Normalized includes have their own discriminant even
+ * though they are not executable `DagNode`s (#2486).
  */
 export function isIncludeDirective(node: DagNode | IncludeDirective): node is IncludeDirective {
-  return !('kind' in node) && 'include' in node && typeof node.include === 'string';
+  const candidate = node as { kind?: unknown; include?: unknown };
+  return (
+    candidate.kind === 'include' ||
+    (candidate.kind === undefined && typeof candidate.include === 'string')
+  );
 }
 
 /** Type guard: validates a value is a known TriggerRule */

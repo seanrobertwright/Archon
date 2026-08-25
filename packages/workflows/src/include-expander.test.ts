@@ -132,6 +132,146 @@ describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
     expect(errors[0]?.error).toContain("'no-such-block' not found");
   });
 
+  test('validates required inputs and the item binding through ordinary include expansion', () => {
+    const block = {
+      ...wf('typed-block', [{ id: 'work', prompt: '$INPUTS.file $INPUTS.mode' }]),
+      inputs: { file: { required: true }, mode: { required: true } },
+    };
+    const parent = wf('parent', [
+      { id: 'list', bash: 'echo []' },
+      {
+        id: 'fan',
+        include: 'typed-block',
+        depends_on: ['list'],
+        with: { mode: 'strict' },
+        fan_out: { items: '$list.output', as: 'item' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "does not declare input 'item'"
+    );
+  });
+
+  test('rejects a missing non-item required input before runtime', () => {
+    const block = {
+      ...wf('typed-block', [{ id: 'work', prompt: '$INPUTS.item $INPUTS.mode' }]),
+      inputs: { item: { required: true }, mode: { required: true } },
+    };
+    const parent = wf('parent', [
+      { id: 'list', bash: 'echo []' },
+      {
+        id: 'fan',
+        include: 'typed-block',
+        depends_on: ['list'],
+        fan_out: { items: '$list.output', as: 'item' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "requires input 'mode'"
+    );
+  });
+
+  test('materializes packaged command resources for a deferred block at load time', () => {
+    const block = wf('command-block', [{ id: 'work', command: 'missing-command' }]);
+    const parent = wf('parent', [
+      { id: 'list', bash: 'echo []' },
+      {
+        id: 'fan',
+        include: 'command-block',
+        depends_on: ['list'],
+        fan_out: { items: '$list.output', as: 'item' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "command 'missing-command'"
+    );
+  });
+
+  test.each([
+    ['approval gate', { id: 'pause', approval: { message: 'Continue?' } }],
+    ['durable wait', { id: 'pause', wait: { duration_ms: 3_600_000 } }],
+    [
+      'interactive loop',
+      {
+        id: 'pause',
+        loop: {
+          prompt: 'iterate',
+          until: 'DONE',
+          max_iterations: 2,
+          interactive: true,
+          gate_message: 'Continue?',
+        },
+      },
+    ],
+    [
+      'interactive loop group',
+      {
+        id: 'pause',
+        loop_group: {
+          nodes: [{ id: 'work', bash: 'echo work' }],
+          until_bash: 'exit 1',
+          max_iterations: 2,
+          interactive: true,
+          gate_message: 'Continue?',
+        },
+      },
+    ],
+  ])('rejects a %s in the composed closure at load time', (_label, pausingNode) => {
+    const block = wf('pausing-block', [pausingNode]);
+    const parent = wf('parent', [
+      { id: 'list', bash: 'echo []' },
+      {
+        id: 'fan',
+        include: 'pausing-block',
+        depends_on: ['list'],
+        fan_out: { items: '$list.output', as: 'item' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      'unsupported suspension-capable path'
+    );
+  });
+
+  test('rejects a pause-capable nested workflow target at load time', () => {
+    const child = {
+      ...wf('child', [{ id: 'pause', wait: { duration_ms: 3_600_000 } }]),
+      interactive: true,
+    };
+    const block = wf('workflow-block', [{ id: 'child-run', workflow: 'child' }]);
+    const parent = wf('parent', [
+      { id: 'list', bash: 'echo []' },
+      {
+        id: 'fan',
+        include: 'workflow-block',
+        depends_on: ['list'],
+        fan_out: { items: '$list.output', as: 'item' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(child, block, parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    const error = errors.find(entry => entry.filename === 'parent')?.error;
+    expect(error).toContain("'child' (interactive workflow)");
+    expect(error).toContain("'pause' (durable wait)");
+  });
+
   test("rewrites $node.output refs in the deferred node's with values and items ref", () => {
     const parent = wf('parent', [
       { id: 'list', bash: 'echo []' },
@@ -1526,6 +1666,27 @@ describe('expandWorkflowIncludes — errors', () => {
     const { workflows, errors } = expandWorkflowIncludes(mapOf(blk, parent));
     expect(workflows.has('parent')).toBe(false);
     expect(errors.find(err => err.filename === 'parent')?.error).toContain('Duplicate node id');
+  });
+
+  test('reserves composed fan-out instance prefixes from authored siblings', () => {
+    const block = wf('blk', [{ id: 'work', bash: 'echo work' }]);
+    const parent = wf('parent', [
+      { id: 'list', bash: 'echo []' },
+      {
+        id: 'fan',
+        include: 'blk',
+        depends_on: ['list'],
+        fan_out: { items: '$list.output', as: 'item' },
+      },
+      { id: 'fan__ca978112ca1bbdca', bash: 'echo collision' },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "reserved composed fan-out namespace 'fan__'"
+    );
   });
 });
 

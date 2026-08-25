@@ -60,6 +60,7 @@ import { canonicalValueText, parseWholeInputsRef, type JsonValue } from './outpu
 import { createLogger } from '@archon/paths';
 import { validateDagStructure, validateWorkflowOutcomeDeclaration } from './loader';
 import { resolveDeclaredInputs } from './workflow-inputs';
+import { resolveWorkflowName } from './router';
 import { parseWhenAtom, whenAtoms } from './when-atom';
 import {
   COMPILED_LOOP_COMMAND,
@@ -91,6 +92,80 @@ import {
  */
 function getLog(): ReturnType<typeof createLogger> {
   return createLogger('workflow.include-expander');
+}
+
+export interface ComposedSuspensionPath {
+  id: string;
+  reason: string;
+}
+
+/**
+ * Find every path in a static include/workflow closure that can pause an instance.
+ * Composed fan-out currently owns one parent cursor, not one cursor per item, so both
+ * load-time validation and the execution-time source-drift preflight use this proof.
+ * Durable interactive instances are tracked separately in #2810.
+ */
+export function collectComposedSuspensionPaths(
+  root: WorkflowDefinition,
+  definitions: readonly WorkflowDefinition[]
+): ComposedSuspensionPath[] {
+  const byName = new Map(definitions.map(definition => [definition.name, definition]));
+  const visited = new Set<string>();
+  const found: ComposedSuspensionPath[] = [];
+
+  const visitDefinition = (definition: WorkflowDefinition): void => {
+    if (visited.has(definition.name)) return;
+    visited.add(definition.name);
+    if (definition.interactive === true) {
+      found.push({ id: definition.name, reason: 'interactive workflow' });
+    }
+    visitNodes(definition.nodes);
+  };
+
+  const visitTarget = (name: string, ownerId: string, kind: 'include' | 'workflow'): void => {
+    let target: WorkflowDefinition | undefined;
+    try {
+      target = kind === 'workflow' ? resolveWorkflowName(name, definitions) : byName.get(name);
+    } catch (_err) {
+      found.push({ id: ownerId, reason: `${kind} target '${name}' is ambiguous` });
+      return;
+    }
+    if (target === undefined) {
+      found.push({ id: ownerId, reason: `${kind} target '${name}' cannot be resolved` });
+      return;
+    }
+    visitDefinition(target);
+  };
+
+  const visitNodes = (nodes: readonly (DagNode | IncludeDirective)[]): void => {
+    for (const candidate of nodes) {
+      if (isIncludeDirective(candidate)) {
+        visitTarget(candidate.include, candidate.id, 'include');
+        continue;
+      }
+      if (isGateNode(candidate)) {
+        found.push({ id: candidate.id, reason: 'approval gate' });
+      } else if (isWaitNode(candidate)) {
+        found.push({ id: candidate.id, reason: 'durable wait' });
+      } else if (isLoopNode(candidate) && candidate.loop.interactive === true) {
+        found.push({ id: candidate.id, reason: 'interactive loop' });
+      } else if (isLoopGroupNode(candidate)) {
+        if (candidate.loop_group.interactive === true) {
+          found.push({ id: candidate.id, reason: 'interactive loop group' });
+        }
+        visitNodes(candidate.loop_group.nodes);
+      }
+
+      if (isComposeFanOutNode(candidate)) {
+        visitTarget(candidate.include, candidate.id, 'include');
+      } else if (isWorkflowNode(candidate)) {
+        visitTarget(candidate.workflow, candidate.id, 'workflow');
+      }
+    }
+  };
+
+  visitDefinition(root);
+  return found;
 }
 
 /**
@@ -689,7 +764,7 @@ function applyInputsMacro(
   }
 }
 
-interface ExpandedInclude {
+export interface ExpandedInclude {
   /** The child's nodes, deep-cloned, id-namespaced, edges + refs rewired. */
   namespaced: DagNode[];
   /** Namespaced ids of the child's sink nodes (no dependents within the child). */
@@ -907,6 +982,20 @@ function inlineInclude(
     // A valid non-empty DAG always has ≥1 sink; sinkOriginalIds[0] is defined.
     primarySink: prefix + (child.returns ?? sinkOriginalIds[0] ?? ''),
   };
+}
+
+/**
+ * Instantiate one already-resolved block through the ordinary include primitive.
+ * Deferred-width composition resolves and validates the block closure once at load,
+ * then calls this narrow operation for each runtime item without rediscovering or
+ * recompiling the workflow graph.
+ */
+export function instantiateResolvedInclude(
+  includeNode: IncludeDirective,
+  child: WorkflowDefinition,
+  commandContents: ReadonlyMap<string, IncludeCommandContent> = new Map()
+): ExpandedInclude {
+  return inlineInclude(includeNode, child, commandContents);
 }
 
 /**
@@ -1151,11 +1240,7 @@ export function expandWorkflowIncludes(
     const includedRequirements: WorkflowRequirement[] = [];
 
     for (const node of nodes) {
-      // Composed fan-out (#2512) FIRST: `ComposeFanOutNode` is structurally assignable
-      // to `IncludeDirective` (same fields plus `kind`/`fan_out`), so TypeScript's
-      // negative narrowing on the directive check below would erase it from the element
-      // union — this guard must run (and narrow) before any isIncludeDirective check on
-      // the same control-flow path.
+      // Runtime width stays deferred, while the complete body contract is proven now.
       if (isComposeFanOutNode(node)) {
         // Width is runtime data, but the body remains ordinary static composition.
         // Expanding it here validates its complete include closure and carries its
@@ -1169,6 +1254,37 @@ export function expandWorkflowIncludes(
           }
           throw e;
         }
+        const suspensionPaths = collectComposedSuspensionPaths(
+          rawByName.get(node.include) ?? child,
+          [...rawByName.values()]
+        );
+        if (suspensionPaths.length > 0) {
+          const details = suspensionPaths.map(path => `'${path.id}' (${path.reason})`).join(', ');
+          throw new IncludeExpansionError(
+            `Node '${node.id}': composed fan-out block '${node.include}' contains unsupported suspension-capable path${suspensionPaths.length === 1 ? '' : 's'} ${details}. Composed fan-out is currently limited to deterministic, non-interactive bodies because the parent has no durable per-item pause cursor. Put gates and waits before or after the fan-out, use governed child runs, or follow #2810 for interactive instance support.`
+          );
+        }
+        warnDroppedWorkflowLevelFields(
+          { id: node.id, kind: 'include', include: node.include },
+          child
+        );
+        // Exercise the exact ordinary-include instantiation once at load time. Width is
+        // still deferred, but the block's input contract and packaged command resources
+        // are static and must fail before upstream nodes can spend.
+        instantiateResolvedInclude(
+          {
+            id: node.id,
+            kind: 'include',
+            include: node.include,
+            ...(node.with !== undefined
+              ? { with: { ...node.with, [node.fan_out.as]: null } }
+              : {
+                  with: { [node.fan_out.as]: null },
+                }),
+          },
+          child,
+          commandContents ?? new Map()
+        );
         includedRequirements.push(...(child.requires ?? []));
         expandedNodes.push(node);
         continue;
@@ -1186,7 +1302,7 @@ export function expandWorkflowIncludes(
         }
         warnDroppedWorkflowLevelFields(node, child);
         includedRequirements.push(...(child.requires ?? []));
-        const inlined = inlineInclude(node, child, commandContents ?? new Map());
+        const inlined = instantiateResolvedInclude(node, child, commandContents ?? new Map());
         includesById.set(node.id, inlined);
         expandedNodes.push(...inlined.namespaced);
         continue;

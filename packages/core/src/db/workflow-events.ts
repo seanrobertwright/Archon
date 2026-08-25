@@ -276,6 +276,15 @@ function isFanOutItem(value: unknown): value is FanOutInstanceSnapshot['item'] {
   return Object.values(value).every(isFanOutItem);
 }
 
+function isFanOutInputs(value: unknown): value is Record<string, FanOutInstanceSnapshot['item']> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every(isFanOutItem)
+  );
+}
+
 function parseFanOutSnapshots(value: unknown): FanOutInstanceSnapshot[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const identities = new Set<string>();
@@ -287,16 +296,23 @@ function parseFanOutSnapshots(value: unknown): FanOutInstanceSnapshot[] | undefi
       !('ordinal' in entry) ||
       !('identity' in entry) ||
       !('item' in entry) ||
+      !('inputs' in entry) ||
       entry.ordinal !== index ||
       typeof entry.identity !== 'string' ||
       entry.identity.length === 0 ||
       identities.has(entry.identity) ||
-      !isFanOutItem(entry.item)
+      !isFanOutItem(entry.item) ||
+      !isFanOutInputs(entry.inputs)
     ) {
       return undefined;
     }
     identities.add(entry.identity);
-    snapshots.push({ ordinal: index, identity: entry.identity, item: entry.item });
+    snapshots.push({
+      ordinal: index,
+      identity: entry.identity,
+      item: entry.item,
+      inputs: entry.inputs,
+    });
   }
   return snapshots;
 }

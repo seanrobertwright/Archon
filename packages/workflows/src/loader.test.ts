@@ -42,6 +42,7 @@ import {
   isLoopNode,
   isAgentNode,
   isWorkflowNode,
+  isIncludeDirective,
 } from './schemas';
 import { parseWorkflow, resetClassPlacementWarningForTests, type ParseResult } from './loader';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
@@ -56,7 +57,7 @@ import { discoverScriptsForCwd } from './script-discovery';
 /** The inline prompt text of an agent node, or undefined for any other kind
  * (formerly the bare `'prompt' in node ? node.prompt : ...` idiom, #2486). */
 function inlinePrompt(node: DagNode | IncludeDirective | undefined): string | undefined {
-  return node && 'kind' in node && isAgentNode(node) && node.source.kind === 'inline'
+  return node && !isIncludeDirective(node) && isAgentNode(node) && node.source.kind === 'inline'
     ? node.source.prompt
     : undefined;
 }
@@ -66,7 +67,7 @@ function inlinePrompt(node: DagNode | IncludeDirective | undefined): string | un
 function nodeWith(
   node: DagNode | IncludeDirective | undefined
 ): Record<string, JsonValue | BindingDirective> | undefined {
-  if (!node || !('kind' in node)) return undefined;
+  if (!node || isIncludeDirective(node)) return undefined;
   if (isExecNode(node)) return node.with;
   if (isAgentNode(node) && node.source.kind === 'command') return node.source.with;
   if (isWorkflowNode(node)) return node.with;

@@ -787,6 +787,20 @@ export function validateDagStructure(
     nodesById.set(node.id, node);
   }
 
+  // Runtime-width composition persists instance steps as `<fanOutId>__<identity>...`.
+  // Reserve that prefix inside each DAG scope so an authored sibling can never alias
+  // an engine-owned instance row during hydration or aggregation.
+  for (const node of nodes) {
+    if (!isComposeFanOutNode(node)) continue;
+    const reservedPrefix = `${node.id}__`;
+    const collision = nodes.find(
+      candidate => candidate !== node && candidate.id.startsWith(reservedPrefix)
+    );
+    if (collision !== undefined) {
+      return `Node '${collision.id}' uses reserved composed fan-out namespace '${reservedPrefix}' owned by node '${node.id}'`;
+    }
+  }
+
   // Check depends_on references
   for (const node of nodes) {
     for (const dep of node.depends_on ?? []) {
@@ -937,10 +951,6 @@ export function validateDagStructure(
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
   const whenRefPattern = new RegExp(WHEN_REF_SOURCE, 'g');
   for (const node of nodes) {
-    // Captured before any `isIncludeDirective` narrowing: a compose_fan_out node is
-    // structurally assignable to IncludeDirective (it carries `include:`), so the
-    // guard's false branch filters it out and later checks would see `never`.
-    const composeFanOut = isComposeFanOutNode(node) ? node : undefined;
     const sources: {
       field: string;
       text: string;
@@ -986,8 +996,8 @@ export function validateDagStructure(
         ? node.with
         : isAgentNode(node) && node.source.kind === 'command'
           ? node.source.with
-          : composeFanOut
-            ? composeFanOut.with
+          : isComposeFanOutNode(node)
+            ? node.with
             : undefined;
       if (nodeWith !== undefined) {
         for (const [name, value] of Object.entries(nodeWith)) {
@@ -1004,8 +1014,8 @@ export function validateDagStructure(
       // A `compose_fan_out` node's `with:` values resolve at run time exactly like a
       // `workflow:` node's (via nodeWith above); its `fan_out.items` is the same live
       // `$node.output` ref surface as a `workflow:` node's.
-      if (composeFanOut) {
-        sources.push({ field: 'fan_out.items', text: composeFanOut.fan_out.items });
+      if (isComposeFanOutNode(node)) {
+        sources.push({ field: 'fan_out.items', text: node.fan_out.items });
       }
       if (isWorkflowNode(node)) {
         if (node.input) sources.push({ field: 'input', text: node.input });

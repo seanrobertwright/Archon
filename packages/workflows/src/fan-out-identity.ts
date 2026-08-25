@@ -19,6 +19,8 @@ export interface FanOutInstanceSnapshot {
   ordinal: number;
   identity: string;
   item: JsonValue;
+  /** Complete resolved `$INPUTS` map frozen before any instance starts. */
+  inputs: Record<string, JsonValue>;
 }
 
 export function composeInstanceIdentity(item: JsonValue, duplicateOrdinal: number): string {
@@ -31,12 +33,21 @@ export function composeInstanceIdentity(item: JsonValue, duplicateOrdinal: numbe
  * distinct VALUE (the 0-based index among byte-identical items), so removing one copy
  * of a duplicated value does not shift the others' identities.
  */
-export function buildInstanceSnapshots(items: readonly JsonValue[]): FanOutInstanceSnapshot[] {
+export function buildInstanceSnapshots(
+  items: readonly JsonValue[],
+  staticInputs: Readonly<Record<string, JsonValue>> = {},
+  itemBinding = 'item'
+): FanOutInstanceSnapshot[] {
   const seen = new Map<string, number>();
   return items.map((item, ordinal) => {
     const canonical = canonicalValueText(item);
     const k = seen.get(canonical) ?? 0;
     seen.set(canonical, k + 1);
-    return { ordinal, identity: composeInstanceIdentity(item, k), item };
+    return {
+      ordinal,
+      identity: composeInstanceIdentity(item, k),
+      item,
+      inputs: { ...staticInputs, [itemBinding]: item },
+    };
   });
 }

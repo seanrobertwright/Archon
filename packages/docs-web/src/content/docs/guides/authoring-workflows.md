@@ -2174,11 +2174,14 @@ What you get, compared with the `workflow:` fan-out above:
   an instance has a durable start but no terminal event, Archon cannot prove whether its
   side effects finished and blocks automatic replay for operator recovery.
 
-Two hard limits, both enforced before any spend:
+Two hard limits, both enforced at load time before any upstream node can spend:
 
-- **No gates inside the block.** The parent has a single approval slot, which N concurrent
-  instances cannot share; a block containing an `approval:` node is rejected at the fan-out
-  boundary. Put the gate in the parent around the node, or invoke the block 1:1.
+- **No suspension inside the complete block closure.** The parent has no durable per-item
+  pause cursor, so a block containing an `approval:` node, `wait:` node, interactive
+  `loop:`/`loop_group:`, or a nested workflow that can pause is rejected. Put the pause in
+  the parent around the node, use governed child runs, or invoke the block 1:1. Durable
+  interactive fan-out instances are a possible future extension tracked in
+  [#2810](https://github.com/coleam00/Archon/issues/2810), not a promise of the current shape.
 - **No `isolation:`** — a composed block runs inside this run and has no checkout of its own
   to isolate. Instances share the parent's checkout, so as with a `workflow:` fan-out,
   concurrent instances over a mutating body fail closed unless the block declares

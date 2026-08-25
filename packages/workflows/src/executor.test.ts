@@ -3297,6 +3297,39 @@ describe('hydrateResumableRun', () => {
     expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it('hydrates fan-out-only recovery state before any inner node completed', async () => {
+    const fanOutSnapshots = new Map([
+      [
+        'fan',
+        [
+          {
+            ordinal: 0,
+            identity: 'instance-a',
+            item: 'a',
+            inputs: { item: 'a' },
+          },
+        ],
+      ],
+    ]);
+    const candidate = makeRun({ id: 'fan-out-only', status: 'failed' });
+    const resumed = makeRun({ id: 'fan-out-only', status: 'running' });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        fanOutSnapshots,
+        unresolvedNodeStarts: new Set(['fan__instance-a']),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+
+    const result = await hydrateResumableRun(makeDeps(store), candidate);
+
+    expect(result).not.toBeNull();
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('fan-out-only');
+  });
+
   it('returns hydrated run when interactive-loop state is present even with zero completed nodes', async () => {
     const candidate = makeRun({
       id: 'paused-loop',

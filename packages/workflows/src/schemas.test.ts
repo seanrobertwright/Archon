@@ -1538,6 +1538,7 @@ describe('dagNodeSchema — include', () => {
     if (result.success) {
       expect(isIncludeDirective(result.data)).toBe(true);
       const node = result.data as IncludeDirective;
+      expect(node.kind).toBe('include');
       expect(node.include).toBe('archon-review-block');
       expect(node.depends_on).toEqual(['finalize-pr']);
       expect(node.when).toBe('always');

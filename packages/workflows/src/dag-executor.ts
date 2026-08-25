@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { isAbsolute, join as joinPath, resolve as resolvePath, sep } from 'path';
+import { basename, isAbsolute, join as joinPath, resolve as resolvePath, sep } from 'path';
 import { execFileAsync, resolveBashPath } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import { discoverWorkflowsWithConfig, resolveWorkflowCommandContents } from './workflow-discovery';
@@ -83,7 +83,6 @@ import {
   isScheduledWorkflowResume,
   isHaltNode,
   isIncludeDirective,
-  isComposeFanOutNode,
   isPersistableNode,
   readSubrunMetadata,
   isApprovalContext,
@@ -138,7 +137,7 @@ import {
 } from './logger';
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
 import { mapWithLimit } from './utils/map-with-limit';
-import { expandWorkflowIncludes } from './include-expander';
+import { collectComposedSuspensionPaths, instantiateResolvedInclude } from './include-expander';
 import { buildInstanceSnapshots } from './fan-out-identity';
 import {
   classifyError,
@@ -8186,12 +8185,24 @@ async function resolveFanOutChildDefinition(
   try {
     const sourceRoots =
       typeof source === 'string' ? liveSourceRoots(source) : (source ?? liveSourceRoots(cwd));
-    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, sourceRoots);
+    const { workflows, errors } = await discoverWorkflowsWithConfig(
+      cwd,
+      deps.loadConfig,
+      sourceRoots
+    );
     const definitions = workflows.map(w => w.workflow);
     const definition = resolveWorkflowName(targetName, definitions);
     // resolveWorkflowName returns undefined for an unknown name and THROWS only on
     // ambiguity, so the undefined branch is ordinary rather than exceptional.
-    if (!definition) return { unresolved: `no workflow named '${targetName}' was found` };
+    if (!definition) {
+      const relevantError = errors.find(error => {
+        const filename = basename(error.filename).replace(/\.ya?ml$/i, '');
+        return filename === targetName || error.error.includes(`'${targetName}'`);
+      });
+      return {
+        unresolved: relevantError?.error ?? `no workflow named '${targetName}' was found`,
+      };
+    }
     const commandContents = await resolveWorkflowCommandContents(sourceRoots, definitions);
     return { definition, definitions, commandContents };
   } catch (err) {
@@ -8943,108 +8954,30 @@ async function executeFanOutWorkflowNode(
 }
 
 /**
- * Recursive gate scan over a composed body's nodes (#2512 preflight). A gate anywhere in
- * a fanned-out composed body — including inside a nested loop_group body — would pause
- * the parent run from within a per-item expansion; the parent has a SINGLE approval slot,
- * so N concurrent pauses cannot be represented and even a serial instance would leave the
- * run paused mid-body with no per-instance resume cursor. Rejected at the fan-out boundary
- * BEFORE any item expands or spends, extending #2474's reject-before-spawn precedent.
- */
-function collectComposedGates(nodes: readonly (DagNode | IncludeDirective)[]): GateNode[] {
-  const gates: GateNode[] = [];
-  for (const node of nodes) {
-    if (isIncludeDirective(node)) continue;
-    if (isGateNode(node)) gates.push(node);
-    if (isLoopGroupNode(node)) {
-      for (const gate of collectComposedGates(node.loop_group.nodes)) {
-        gates.push(gate);
-      }
-    }
-  }
-  return gates;
-}
-
-/** Limit per-item expansion to the target's transitive deferred-compose closure. */
-function collectComposeDefinitionClosure(
-  root: WorkflowDefinition,
-  definitions: readonly WorkflowDefinition[]
-): WorkflowDefinition[] {
-  const byName = new Map(definitions.map(definition => [definition.name, definition]));
-  const closure = new Map<string, WorkflowDefinition>();
-  const visitNodes = (nodes: readonly (DagNode | IncludeDirective)[]): void => {
-    for (const node of nodes) {
-      if (isComposeFanOutNode(node)) {
-        const target = byName.get(node.include);
-        if (target !== undefined && !closure.has(target.name)) visit(target);
-      } else if (!isIncludeDirective(node) && isLoopGroupNode(node)) {
-        visitNodes(node.loop_group.nodes);
-      }
-    }
-  };
-  const visit = (definition: WorkflowDefinition): void => {
-    closure.set(definition.name, definition);
-    visitNodes(definition.nodes);
-  };
-  visit(root);
-  return [...closure.values()];
-}
-
-/**
- * Expand ONE composed fan-out instance through the SAME load-time machinery a static
- * `include:` uses (#2512 D2): a synthetic directive whose id is `<nodeId>__<identity>`
- * makes the expander produce exactly the planned instance-qualified namespace. Reusing
- * `expandWorkflowIncludes` preserves `$INPUTS` binding, declared returns, command/script
- * materialization, and deterministic structure validation; gates are rejected separately
- * because concurrent in-parent instances cannot share one pause cursor.
- *
- * The definition passed in is the DISCOVERED target (already expanded + collapsed once);
- * running it back through the expander is idempotent for an include-free node list and
- * keeps one code path for bodies that themselves contain deferred compose-fan-out nodes.
+ * Instantiate ONE composed fan-out item through the same narrow primitive used by a
+ * static include. The target closure was already resolved and validated at load time;
+ * only input materialization and instance namespacing vary per item.
  */
 function expandComposeInstance(
   node: ComposeFanOutNode,
   identity: string,
   inputs: Record<string, JsonValue>,
   definition: WorkflowDefinition,
-  /** Every OTHER discovered workflow by name. A nested deferred compose_fan_out inside
-   *  the target resolves its own include against this map at instance time — scoping it
-   *  to just the target would fail every instance after upstream spend. */
-  siblingDefinitions: readonly WorkflowDefinition[],
   commandContents: ReadonlyMap<string, IncludeCommandContent>
 ): { nodes: DagNode[]; primarySink: string } | { error: string } {
   const directiveId = `${node.id}__${identity}`;
   const directive: IncludeDirective = {
     id: directiveId,
+    kind: 'include',
     include: node.include,
     ...(Object.keys(inputs).length > 0 ? { with: inputs } : {}),
   };
-  // Minimal synthetic composer: a UNIQUE synthetic name carries the directive (reusing
-  // the block's own name would make the expander's cycle check fire). Binding `returns:`
-  // to the directive lets the ordinary include expander rebind it to the target's declared
-  // return, including a non-sink node.
-  const synth: WorkflowDefinition = {
-    name: `${directiveId}__compose`,
-    description: '',
-    nodes: [directive],
-    returns: directiveId,
-  };
-  const rawByName = new Map<string, WorkflowDefinition>(siblingDefinitions.map(d => [d.name, d]));
-  rawByName.set(definition.name, definition);
-  rawByName.set(synth.name, synth);
-  const { workflows, errors } = expandWorkflowIncludes(rawByName, commandContents);
-  const expanded = workflows.get(synth.name);
-  if (!expanded) {
-    return {
-      error:
-        errors.find(error => error.filename === synth.name)?.error ??
-        `instance '${directiveId}' failed to expand`,
-    };
-  }
-  const primarySink = expanded.returns ?? '';
+  const expanded = instantiateResolvedInclude(directive, definition, commandContents);
+  const primarySink = expanded.primarySink;
   if (primarySink === '') {
     return { error: `composed block '${definition.name}' has no sink node` };
   }
-  return { nodes: expanded.nodes as DagNode[], primarySink };
+  return { nodes: expanded.namespaced, primarySink };
 }
 
 /** One settled composed fan-out instance, reduced into the aggregate (#2512). */
@@ -9189,33 +9122,8 @@ async function executeComposeFanOutNode(
     return failResult(msg);
   }
 
-  // Static `with:` values — the same resolution tiers as every other composition surface;
-  // bound into each instance alongside the per-item value under `$INPUTS.<as>`.
-  const staticInputs: Record<string, JsonValue> = {};
-  const parentInputs = resolveRunInputs(parentRun);
-  try {
-    if (node.with !== undefined) {
-      const resolutionCtx: ShellInputContext = {
-        workflowRun: parentRun,
-        artifactsDir: ctx.artifactsDir,
-        stateDir: ctx.stateDir,
-        baseBranch: ctx.baseBranch,
-        docsDir: ctx.docsDir,
-        issueContext: ctx.issueContext,
-        nodeOutputs: ctx.nodeOutputs,
-      };
-      for (const [name, rawValue] of Object.entries(node.with)) {
-        staticInputs[name] = resolveWorkflowValue(rawValue, resolutionCtx, parentInputs, false);
-      }
-    }
-  } catch (err) {
-    const msg = `fan_out 'with:' on '${node.id}' could not be resolved: ${(err as Error).message}`;
-    await notify(`❌ **Composed fan-out failed** (node \`${node.id}\`): ${msg}`);
-    return failResult(msg);
-  }
-
-  // Preflight BEFORE any spend: the target must still resolve (it may have been renamed
-  // or deleted since load), and its body must be gate-free.
+  // Preflight BEFORE any instance spend: the target must still resolve (it may have been
+  // renamed or deleted since load), and its complete closure must remain suspension-free.
   const resolved = await resolveFanOutChildDefinition(
     deps,
     cwd,
@@ -9229,26 +9137,17 @@ async function executeComposeFanOutNode(
     await notify(`❌ **Composed fan-out blocked** (node \`${node.id}\`): ${msg}`);
     return failResult(msg);
   }
-  const composeDefinitionClosure = collectComposeDefinitionClosure(
-    resolved.definition,
-    resolved.definitions
-  );
-  const siblingDefinitions = composeDefinitionClosure.filter(
-    definition => definition.name !== resolved.definition.name
-  );
-  const bodyGates = composeDefinitionClosure.flatMap(definition =>
-    collectComposedGates(definition.nodes)
-  );
-  if (bodyGates.length > 0) {
-    const names = bodyGates.map(g => `'${g.id}'`).join(', ');
+  const bodySuspensions = collectComposedSuspensionPaths(resolved.definition, resolved.definitions);
+  if (bodySuspensions.length > 0) {
+    const names = bodySuspensions.map(entry => `'${entry.id}' (${entry.reason})`).join(', ');
     const msg =
-      `composed fan-out node '${node.id}': the composed block '${node.include}' contains approval ` +
-      `gate${bodyGates.length === 1 ? '' : 's'} ${names}. An in-parent fan-out cannot hold N ` +
-      'concurrently-paused bodies — the parent run has a single gate slot. Remove the gate from ' +
-      "the block, or invoke it as a single 'include:' node.";
+      `composed fan-out node '${node.id}': the composed block '${node.include}' contains ` +
+      `suspension-capable path${bodySuspensions.length === 1 ? '' : 's'} ${names}. An in-parent ` +
+      'fan-out has no per-instance pause cursor, so it cannot safely resume a partly completed ' +
+      "body. Remove the suspension path, or invoke the block once through 'include:' or 'workflow:'.";
     getLog().warn(
       { parentRunId: parentRun.id, nodeId: node.id, include: node.include },
-      'workflow.compose_fan_out_gate_rejected'
+      'workflow.compose_fan_out_suspension_rejected'
     );
     await notify(`❌ **Composed fan-out blocked** (node \`${node.id}\`): ${msg}`);
     return failResult(msg);
@@ -9280,7 +9179,39 @@ async function executeComposeFanOutNode(
   }
   const priorOutputs = resumeSnapshot.completedNodeOutputs;
   const persistedSnapshots = resumeSnapshot.fanOutSnapshots.get(fanOutScopeName);
-  const computedSnapshots = buildInstanceSnapshots(items);
+  let computedSnapshots: ReturnType<typeof buildInstanceSnapshots>;
+  if (persistedSnapshots === undefined) {
+    // Freeze every resolved binding together with the item before any instance starts.
+    // A resumed run must never combine completed work from the old bindings with a
+    // retried instance resolved from changed upstream output.
+    const staticInputs: Record<string, JsonValue> = {};
+    const parentInputs = resolveRunInputs(parentRun);
+    try {
+      if (node.with !== undefined) {
+        const resolutionCtx: ShellInputContext = {
+          workflowRun: parentRun,
+          artifactsDir: ctx.artifactsDir,
+          stateDir: ctx.stateDir,
+          baseBranch: ctx.baseBranch,
+          docsDir: ctx.docsDir,
+          issueContext: ctx.issueContext,
+          nodeOutputs: ctx.nodeOutputs,
+        };
+        for (const [name, rawValue] of Object.entries(node.with)) {
+          staticInputs[name] = resolveWorkflowValue(rawValue, resolutionCtx, parentInputs, false);
+        }
+      }
+    } catch (err) {
+      const msg = `fan_out 'with:' on '${node.id}' could not be resolved: ${(err as Error).message}`;
+      await notify(`❌ **Composed fan-out failed** (node \`${node.id}\`): ${msg}`);
+      return failResult(msg);
+    }
+    computedSnapshots = buildInstanceSnapshots(items, staticInputs, fanOut.as);
+  } else {
+    // Only compare item identity for drift diagnostics. The persisted input map is the
+    // authority on resume, so current `with:` references are intentionally not resolved.
+    computedSnapshots = buildInstanceSnapshots(items, {}, fanOut.as);
+  }
   const snapshots = persistedSnapshots ?? computedSnapshots;
 
   // Concurrent instances share the parent checkout. Use the authoritative persisted
@@ -9318,7 +9249,16 @@ async function executeComposeFanOutNode(
       await notify(`❌ **Composed fan-out blocked** (node \`${node.id}\`): ${msg}`);
       return failResult(msg);
     }
-  } else if (JSON.stringify(persistedSnapshots) !== JSON.stringify(computedSnapshots)) {
+  } else if (
+    persistedSnapshots.length !== computedSnapshots.length ||
+    persistedSnapshots.some((snapshot, index) => {
+      const current = computedSnapshots[index];
+      return (
+        snapshot.identity !== current?.identity ||
+        JSON.stringify(snapshot.item) !== JSON.stringify(current?.item)
+      );
+    })
+  ) {
     getLog().warn(
       { parentRunId: parentRun.id, nodeId: node.id },
       'workflow.compose_fan_out_using_persisted_instances'
@@ -9369,18 +9309,13 @@ async function executeComposeFanOutNode(
           error: `parent run is ${currentStatus ?? 'missing'}; instance was not started`,
         };
       }
-      const inputs: Record<string, JsonValue> = {
-        ...staticInputs,
-        [fanOut.as]: snapshot.item,
-      };
       let expanded: { nodes: DagNode[]; primarySink: string } | { error: string };
       try {
         expanded = expandComposeInstance(
           node,
           snapshot.identity,
-          inputs,
+          snapshot.inputs,
           resolved.definition,
-          siblingDefinitions,
           resolved.commandContents
         );
       } catch (err) {
@@ -10042,13 +9977,11 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             // resume-skip, `when:`, and trigger-rule handling — so an unexpanded include node
             // cannot slip through by matching a prior-completed entry, a false `when:`, or a
             // failing trigger rule. If one gets here, discovery was bypassed; fail loud rather
-            // than silently accepting an invalid runtime DAG. The compose-fan-out exclusion
-            // is required, not tidy: ComposeFanOutNode is structurally assignable to
-            // IncludeDirective (#2512), so the directive predicate alone would narrow it out
-            // of the union and strand every later compose dispatch on `never`.
-            if (!isComposeFanOutNode(node) && isIncludeDirective(node)) {
+            // than silently accepting an invalid runtime DAG.
+            if (isIncludeDirective(node as DagNode | IncludeDirective)) {
+              const includeNode = node as unknown as IncludeDirective;
               throw new Error(
-                `Internal error: include node '${node.id}' reached the executor unexpanded. ` +
+                `Internal error: include node '${includeNode.id}' reached the executor unexpanded. ` +
                   'Include nodes must be resolved by expandWorkflowIncludes() during discovery.'
               );
             }

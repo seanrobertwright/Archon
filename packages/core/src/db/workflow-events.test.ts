@@ -951,8 +951,8 @@ describe('workflow-events', () => {
 
     test('keeps the first valid fan-out instance snapshot authoritative', async () => {
       const first = [
-        { ordinal: 0, identity: 'a-0', item: { id: 'a' } },
-        { ordinal: 1, identity: 'b-0', item: { id: 'b' } },
+        { ordinal: 0, identity: 'a-0', item: { id: 'a' }, inputs: { item: { id: 'a' } } },
+        { ordinal: 1, identity: 'b-0', item: { id: 'b' }, inputs: { item: { id: 'b' } } },
       ];
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
@@ -960,7 +960,16 @@ describe('workflow-events', () => {
           {
             step_name: 'fan',
             event_type: 'fan_out_instances',
-            data: { instances: [{ ordinal: 0, identity: 'changed-0', item: 'changed' }] },
+            data: {
+              instances: [
+                {
+                  ordinal: 0,
+                  identity: 'changed-0',
+                  item: 'changed',
+                  inputs: { item: 'changed' },
+                },
+              ],
+            },
           },
         ])
       );
@@ -968,6 +977,22 @@ describe('workflow-events', () => {
       const result = await getDagResumeSnapshot('run-fan');
 
       expect(result.fanOutSnapshots.get('fan')).toEqual(first);
+    });
+
+    test('ignores a fan-out snapshot that does not carry its resolved input map', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            step_name: 'fan',
+            event_type: 'fan_out_instances',
+            data: { instances: [{ ordinal: 0, identity: 'incomplete', item: 'a' }] },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-incomplete-fan-plan');
+
+      expect(result.fanOutSnapshots.has('fan')).toBe(false);
     });
 
     test('tracks a durable start until the same step reaches a terminal event', async () => {
