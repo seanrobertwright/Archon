@@ -48,6 +48,8 @@ import {
   markTierNoticeShown,
   expandTilde,
   isDocker,
+  captureDetachedInstallContext,
+  type DetachedInstallContext,
 } from '@archon/paths';
 import { isAbsolute, join, resolve } from 'node:path';
 import { applyWorkflowRunConfigLayer } from '@archon/workflows/run-config';
@@ -461,9 +463,9 @@ export function buildDetachedRunCmd(
 export function resolveDetachedRunEncryptionEnv(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd()
-): { TOKEN_ENCRYPTION_KEY: string; ARCHON_HOME: string } {
+): DetachedInstallContext {
   return {
-    TOKEN_ENCRYPTION_KEY: env.TOKEN_ENCRYPTION_KEY ?? '',
+    ...captureDetachedInstallContext(env),
     ARCHON_HOME: isDocker(env)
       ? getArchonHome(env)
       : env.ARCHON_HOME

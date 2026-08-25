@@ -6417,6 +6417,9 @@ describe('resolveDetachedRunEncryptionEnv', () => {
     expect(resolveDetachedRunEncryptionEnv({}, '/parent/repo')).toEqual({
       TOKEN_ENCRYPTION_KEY: '',
       ARCHON_HOME: '',
+      ARCHON_DOCKER: '',
+      WORKSPACE_PATH: '',
+      HOME: '',
     });
     expect(
       resolveDetachedRunEncryptionEnv(
@@ -6426,19 +6429,31 @@ describe('resolveDetachedRunEncryptionEnv', () => {
     ).toEqual({
       TOKEN_ENCRYPTION_KEY: 'install-key',
       ARCHON_HOME: resolve('/parent/repo', 'relative-home'),
+      ARCHON_DOCKER: '',
+      WORKSPACE_PATH: '',
+      HOME: '',
     });
     expect(resolveDetachedRunEncryptionEnv({ ARCHON_HOME: '~/.archon-custom' }, '/parent')).toEqual(
       {
         TOKEN_ENCRYPTION_KEY: '',
         ARCHON_HOME: join(homedir(), '.archon-custom'),
+        ARCHON_DOCKER: '',
+        WORKSPACE_PATH: '',
+        HOME: '',
       }
     );
     const dockerHandoff = resolveDetachedRunEncryptionEnv(
       { ARCHON_DOCKER: 'true', ARCHON_HOME: '/ignored-custom-home' },
       '/parent'
     );
-    expect(dockerHandoff).toEqual({ TOKEN_ENCRYPTION_KEY: '', ARCHON_HOME: '/.archon' });
-    expect(isDocker(dockerHandoff)).toBe(false);
+    expect(dockerHandoff).toEqual({
+      TOKEN_ENCRYPTION_KEY: '',
+      ARCHON_HOME: '/.archon',
+      ARCHON_DOCKER: 'true',
+      WORKSPACE_PATH: '',
+      HOME: '',
+    });
+    expect(isDocker(dockerHandoff)).toBe(true);
     expect(getArchonHome(dockerHandoff)).toBe('/.archon');
   });
 });

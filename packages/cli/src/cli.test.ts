@@ -13,6 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { sealWorkflowRunConfig } from '@archon/core/config';
 
 const CLI_ENTRY = join(import.meta.dir, 'cli.ts');
@@ -177,7 +178,11 @@ describe('workflow run config argument', () => {
     spawnSync('git', ['init', '-q', '.'], { cwd: repo });
     writeFileSync(
       join(repo, '.env'),
-      `TOKEN_ENCRYPTION_KEY=${'33'.repeat(32)}\nARCHON_HOME=${join(repo, 'wrong-home')}\n`
+      `TOKEN_ENCRYPTION_KEY=${'33'.repeat(32)}\n` +
+        `ARCHON_HOME=${join(repo, 'wrong-home')}\n` +
+        'ARCHON_DOCKER=true\n' +
+        'WORKSPACE_PATH=/workspace\n' +
+        'HOME=/root\n'
     );
     writeFileSync(
       join(repo, '.archon', '.env'),
@@ -228,6 +233,78 @@ describe('workflow run config argument', () => {
       expect(result.status).toBe(1);
       expect(result.stderr).not.toContain('could not be decrypted');
       expect(result.stderr).toContain('--resume and --config are mutually exclusive');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a detached Docker install classified through target env loading', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'archon-cli-detached-docker-'));
+    mkdirSync(join(repo, '.archon'), { recursive: true });
+    writeFileSync(
+      join(repo, '.env'),
+      `TOKEN_ENCRYPTION_KEY=${'33'.repeat(32)}\n` +
+        `ARCHON_HOME=${join(repo, 'wrong-home')}\n` +
+        'ARCHON_DOCKER=false\n' +
+        'WORKSPACE_PATH=\n' +
+        `HOME=${repo}\n`
+    );
+    writeFileSync(
+      join(repo, '.archon', '.env'),
+      `TOKEN_ENCRYPTION_KEY=${'22'.repeat(32)}\n` +
+        `ARCHON_HOME=${join(repo, 'wrong-home')}\n` +
+        'ARCHON_DOCKER=false\n' +
+        'WORKSPACE_PATH=\n' +
+        `HOME=${repo}\n`
+    );
+
+    const stripBootUrl = pathToFileURL(
+      join(repoRoot, 'packages', 'paths', 'src', 'strip-cwd-env-boot.ts')
+    ).href;
+    const pathsUrl = pathToFileURL(join(repoRoot, 'packages', 'paths', 'src', 'index.ts')).href;
+    const probe = join(repo, 'probe.ts');
+    writeFileSync(
+      probe,
+      `import '${stripBootUrl}';\n` +
+        `import { captureDetachedInstallContext, getArchonHome, isDocker, loadArchonEnv, restoreDetachedInstallContext } from '${pathsUrl}';\n` +
+        'const inherited = captureDetachedInstallContext();\n' +
+        'loadArchonEnv(process.cwd());\n' +
+        'restoreDetachedInstallContext(inherited);\n' +
+        'process.stdout.write(JSON.stringify({ docker: isDocker(), home: getArchonHome(), context: inherited }));\n'
+    );
+
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [probe, '--internal-detached-run-config', 'placeholder'],
+        {
+          cwd: repo,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            TOKEN_ENCRYPTION_KEY: 'parent-key',
+            ARCHON_HOME: '/.archon',
+            ARCHON_DOCKER: 'true',
+            WORKSPACE_PATH: '/workspace',
+            HOME: '/root',
+          },
+        }
+      );
+      expect({ status: result.status, stderr: result.stderr }).toEqual({
+        status: 0,
+        stderr: expect.stringContaining('[archon] stripped 5 keys'),
+      });
+      expect(JSON.parse(result.stdout)).toEqual({
+        docker: true,
+        home: '/.archon',
+        context: {
+          TOKEN_ENCRYPTION_KEY: 'parent-key',
+          ARCHON_HOME: '/.archon',
+          ARCHON_DOCKER: 'true',
+          WORKSPACE_PATH: '/workspace',
+          HOME: '/root',
+        },
+      });
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

@@ -14,29 +14,19 @@ import '@archon/paths/strip-cwd-env-boot';
 // <cwd>/.archon/.env (repo scope, wins over user). Both with override: true.
 // See packages/paths/src/env-loader.ts and the three-path model (#1302 / #1303).
 import { loadArchonEnv } from '@archon/paths/env-loader';
+import { captureDetachedInstallContext, restoreDetachedInstallContext } from '@archon/paths';
 const hasDetachedRunConfigHandoff = process.argv
   .slice(2)
   .includes('--internal-detached-run-config');
-const inheritedTokenEncryptionKey = process.env.TOKEN_ENCRYPTION_KEY;
-const inheritedArchonHome = process.env.ARCHON_HOME;
-const inheritedArchonDocker = process.env.ARCHON_DOCKER;
-const inheritedWorkspacePath = process.env.WORKSPACE_PATH;
-const inheritedHome = process.env.HOME;
+const inheritedInstallContext = hasDetachedRunConfigHandoff
+  ? captureDetachedInstallContext()
+  : undefined;
 loadArchonEnv(process.cwd());
 // The detached parent sealed this payload with its effective install key. Repo
 // env still loads normally, but it cannot replace any input that derives the
 // install home before the child consumes the accepted snapshot.
-if (hasDetachedRunConfigHandoff) {
-  if (inheritedTokenEncryptionKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
-  else process.env.TOKEN_ENCRYPTION_KEY = inheritedTokenEncryptionKey;
-  if (inheritedArchonHome === undefined) delete process.env.ARCHON_HOME;
-  else process.env.ARCHON_HOME = inheritedArchonHome;
-  if (inheritedArchonDocker === undefined) delete process.env.ARCHON_DOCKER;
-  else process.env.ARCHON_DOCKER = inheritedArchonDocker;
-  if (inheritedWorkspacePath === undefined) delete process.env.WORKSPACE_PATH;
-  else process.env.WORKSPACE_PATH = inheritedWorkspacePath;
-  if (inheritedHome === undefined) delete process.env.HOME;
-  else process.env.HOME = inheritedHome;
+if (inheritedInstallContext) {
+  restoreDetachedInstallContext(inheritedInstallContext);
 }
 
 // Install the pipe-safe `console.log` shim BEFORE any command module imports.
