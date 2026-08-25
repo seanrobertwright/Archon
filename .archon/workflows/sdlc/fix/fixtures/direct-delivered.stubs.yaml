@@ -17,3 +17,16 @@ deliver__validate__validate:
   summary: "stub: project gate green"
 outcome: "https://github.com/example/repo/pull/4"
 ci-probe: '{"state":"concluded","detail":"all checks green"}'
+classify:
+  tests: false
+  errors: false
+  comments: false
+  types: false
+  docs: false
+  reasons:
+    tests: "stub: small fixture diff"
+    errors: "stub: no failure paths"
+    comments: "stub: no comment changes"
+    types: "stub: no contract changes"
+    docs: "stub: no doc-facing changes"
+resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'

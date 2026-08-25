@@ -44,9 +44,6 @@ inputs:
   docs:
     default: false
     description: Run the docs-impact lens.
-  simplify:
-    default: false
-    description: Run the simplification lens (suggestions only, never blocks).
 
 returns: synthesize
 outcome_field: ready
@@ -119,11 +116,13 @@ nodes:
       max_attempts: 2
       delay_ms: 20000
 
+  # Always-on with code and seams: the three universal questions about any diff
+  # are "is it correct", "do the seams hold", and "is it over-built". Findings
+  # stay suggestions-only; it never blocks.
   - id: simplify
     command: review-simplify
     context: fresh
     depends_on: [scope]
-    when: "$INPUTS.simplify == 'true'"
     retry:
       max_attempts: 2
       delay_ms: 20000

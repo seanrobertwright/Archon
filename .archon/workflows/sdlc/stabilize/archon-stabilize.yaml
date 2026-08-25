@@ -30,22 +30,19 @@ inputs:
   # disable it per run; the other lenses stay opt-in as everywhere else.
   tests:
     default: true
-    description: Enable the review's test-coverage lens (default on — the diff is test code).
+    description: Test-coverage lens — forced on by default (the diff is test code); auto or false override.
   errors:
-    default: false
-    description: Enable the review's silent-failure lens.
+    default: "auto"
+    description: Silent-failure lens — auto, true, or false.
   comments:
-    default: false
-    description: Enable the review's comment-accuracy lens.
+    default: "auto"
+    description: Comment-accuracy lens — auto, true, or false.
   types:
-    default: false
-    description: Enable the review's type-design lens.
+    default: "auto"
+    description: Type-design lens — auto, true, or false.
   docs:
-    default: false
-    description: Enable the review's docs-impact lens.
-  simplify:
-    default: false
-    description: Enable the review's simplification lens (suggestions only).
+    default: "auto"
+    description: Docs-impact lens — auto, true, or false.
 
 returns: outcome
 
@@ -101,7 +98,6 @@ nodes:
       comments: "$INPUTS.comments"
       types: "$INPUTS.types"
       docs: "$INPUTS.docs"
-      simplify: "$INPUTS.simplify"
       work: >-
         Fix the flaky or unsound test specified in
         $ARTIFACTS_DIR/stabilize-assessment.md. Read that file in full first —
