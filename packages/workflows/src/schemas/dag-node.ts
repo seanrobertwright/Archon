@@ -854,6 +854,32 @@ export const workflowNodeSchema = dagNodeBaseSchema.extend({
 export type WorkflowNode = z.infer<typeof workflowNodeSchema>;
 
 /**
+ * Deferred composition fan-out (#2512) — an `include:` node that also declares
+ * `fan_out:`. Unlike a plain `IncludeDirective` it is NOT expanded away at load time:
+ * the item list is runtime data, so the width of the expansion is unknowable until
+ * execution. `expandWorkflowIncludes` leaves the node in place (validating the target
+ * name resolves) and the executor expands the target once per item at run time through
+ * the same expander, under a per-instance `<nodeId>__<identity>` namespace — one parent
+ * run row, events under the parent's id, no child runs.
+ *
+ * Deliberately NOT spelled `workflow:` + `fan_out:` (the issue's illustrative YAML is
+ * declared non-final): that spelling already means governed per-item child runs, and
+ * re-purposing it would silently reinterpret live workflows the issue requires be
+ * "continued safely ... not silently converted".
+ */
+export interface ComposeFanOutNode extends DagNodeBase {
+  kind: 'compose_fan_out';
+  include: string;
+  with?: Record<string, JsonValue>;
+  fan_out: FanOutConfig;
+}
+
+/** Type guard: check if a node is a runtime-width composed fan-out (include + fan_out) */
+export function isComposeFanOutNode(node: DagNode | IncludeDirective): node is ComposeFanOutNode {
+  return 'kind' in node && node.kind === 'compose_fan_out';
+}
+
+/**
  * A single executable node in a DAG workflow, discriminated on `kind` (#2486).
  * `command:`/`prompt:` collapse into `'agent'`; `bash:`/`script:` collapse into
  * `'exec'`. `include:` is NOT a member — it has no execution surface and is fully
@@ -868,7 +894,8 @@ export type DagNode =
   | WaitNode
   | LoopNode
   | LoopGroupNode
-  | WorkflowNode;
+  | WorkflowNode
+  | ComposeFanOutNode;
 
 // ---------------------------------------------------------------------------
 // AI-specific fields that are meaningless on non-AI nodes
@@ -990,9 +1017,9 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   // `'worktree'` (slice 2, PR-A) runs the child in its own git worktree via an
   // injected child-isolation resolver.
   isolation: z.enum(['inherit', 'worktree']).optional(),
-  // Dynamic fan-out (slice 2, PR-C) — expand the workflow node into N child runs
-  // over a data-driven item list. Only meaningful on a `workflow:` node (guarded in
-  // superRefine).
+  // Dynamic fan-out (slice 2, PR-C) — expand a node over a data-driven item list. On a
+  // `workflow:` node it multiplies child runs (#2121 slice 2); on an `include:` node it
+  // multiplies the composed body inside this run (#2512). Guarded in superRefine.
   fan_out: fanOutConfigSchema.optional(),
   // Raw (not `z.record(z.string(), z.string())`) so each relevant node mode validates it
   // contextually. Include and workflow nodes both accept the same identifier-keyed string
@@ -1288,10 +1315,6 @@ export const dagNodeSchema = dagNodeFlatSchema
         'a composed block runs inside the run that composed it, so it has no checkout of its own to isolate',
       ],
       [
-        'fan_out',
-        'composition inlines a fixed set of nodes at load time, so there is nothing to multiply per item',
-      ],
-      [
         'input',
         "a composed block reads named values as $INPUTS.<name>, supplied through 'with:' — there is no separate $ARGUMENTS for it",
       ],
@@ -1305,7 +1328,7 @@ export const dagNodeSchema = dagNodeFlatSchema
           path: [field],
         });
       }
-    } else if (!hasWorkflow) {
+    } else if (!hasWorkflow && !hasInclude) {
       if (data.isolation !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -1313,13 +1336,14 @@ export const dagNodeSchema = dagNodeFlatSchema
           path: ['isolation'],
         });
       }
-      // Dynamic fan-out (slice 2, PR-C) is meaningful ONLY on a `workflow:` node — it
-      // multiplies a child sub-run. On any other node type it would be silently dropped,
-      // so reject it fail-fast (mirrors the `isolation` guard above).
+      // Dynamic fan-out is meaningful only where it multiplies something: a `workflow:`
+      // node multiplies child runs (#2121 slice 2), an `include:` node multiplies the
+      // composed body inside this run (#2512). On any other node type it would be
+      // silently dropped, so reject it fail-fast (mirrors the `isolation` guard above).
       if (data.fan_out !== undefined) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: "'fan_out' is only supported on workflow (sub-run) nodes.",
+          message: "'fan_out' is only supported on workflow (sub-run) and include nodes.",
           path: ['fan_out'],
         });
       }
@@ -1333,7 +1357,7 @@ export const dagNodeSchema = dagNodeFlatSchema
     // justification is gone. A better one replaces it: an author whose YAML already says
     // `first_success` gets a message naming the rejection and the shape that serves the want,
     // instead of an opaque unrecognised-enum-value error. Do not remove it as dead weight.
-    if (hasWorkflow && data.fan_out?.join === 'first_success') {
+    if ((hasWorkflow || hasInclude) && data.fan_out?.join === 'first_success') {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
@@ -1351,7 +1375,7 @@ export const dagNodeSchema = dagNodeFlatSchema
     // `$INPUTS.<name>` slot on the child with a precedence rule between them — the same
     // two-channels-one-name ambiguity the `with:`+`input:` guard rejects above.
     if (
-      hasWorkflow &&
+      (hasWorkflow || hasInclude) &&
       data.fan_out?.as !== undefined &&
       typeof data.with === 'object' &&
       data.with !== null &&
@@ -1706,6 +1730,20 @@ export const dagNodeSchema = dagNodeFlatSchema
       return { ...base, ...shared, kind: 'halt', reason: data.cancel.trim() } as HaltNode;
     }
     if (data.include !== undefined && data.include.trim().length > 0) {
+      // `include:` + `fan_out:` (#2512) is the runtime-width composed fan-out: the item
+      // list resolves at run time, so this node is NOT expanded away — it survives as a
+      // ComposeFanOutNode and the executor expands one instance per item through the
+      // same expander. Carries only structural fields + include target + with map + the
+      // fan-out config, like the static directive below it.
+      if (data.fan_out !== undefined) {
+        return {
+          ...structuralBase,
+          kind: 'compose_fan_out',
+          include: data.include.trim(),
+          ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
+          fan_out: data.fan_out,
+        } as ComposeFanOutNode;
+      }
       // An include is a load-time directive, not an executable node. It carries the
       // structural graph fields, target name, and optional load-time input mapping. The
       // expander reads those fields to attach and parameterize the sub-DAG (description just

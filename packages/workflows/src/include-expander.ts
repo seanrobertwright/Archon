@@ -53,6 +53,7 @@ import {
   isPersistableNode,
   isNodeContextResume,
   isBindingDirective,
+  isComposeFanOutNode,
   INPUT_NAME_SOURCE,
 } from './schemas';
 import { canonicalValueText, parseWholeInputsRef, type JsonValue } from './output-ref';
@@ -460,6 +461,15 @@ function rewriteNodeOutputRefs(
       }
     }
     if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
+  } else if (isComposeFanOutNode(node)) {
+    // A deferred composition fan-out (#2512) carries the same live ref surfaces as a
+    // `workflow:` node — its `with:` values and `fan_out.items` resolve at run time.
+    if (node.with !== undefined) {
+      for (const [key, value] of Object.entries(node.with)) {
+        if (typeof value === 'string') node.with[key] = code(value);
+      }
+    }
+    if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
   } else if (isHaltNode(node)) {
     node.reason = code(node.reason);
   } else if (isAgentNode(node) && node.source.kind === 'inline') {
@@ -615,6 +625,16 @@ function applyInputsMacro(
     // `input:` is the child's $ARGUMENTS — a TEXT channel by construction, so a typed
     // input splices as canonical text there; `with:` values are typed positions.
     if (node.input !== undefined) node.input = substitute(node.input);
+    if (node.with !== undefined) {
+      for (const [key, value] of Object.entries(node.with)) {
+        node.with[key] = substituteValue(value);
+      }
+    }
+    if (node.fan_out !== undefined) node.fan_out.items = substitute(node.fan_out.items);
+  } else if (isComposeFanOutNode(node)) {
+    // Same $INPUTS surfaces as a `workflow:` node (#2512): the deferred fan-out binds
+    // its block inputs exactly where the static directive does — typed positions in
+    // `with:`, text substitution in `fan_out.items`.
     if (node.with !== undefined) {
       for (const [key, value] of Object.entries(node.with)) {
         node.with[key] = substituteValue(value);
@@ -1131,6 +1151,25 @@ export function expandWorkflowIncludes(
     const includedRequirements: WorkflowRequirement[] = [];
 
     for (const node of nodes) {
+      // Composed fan-out (#2512) FIRST: `ComposeFanOutNode` is structurally assignable
+      // to `IncludeDirective` (same fields plus `kind`/`fan_out`), so TypeScript's
+      // negative narrowing on the directive check below would erase it from the element
+      // union — this guard must run (and narrow) before any isIncludeDirective check on
+      // the same control-flow path.
+      if (isComposeFanOutNode(node)) {
+        // Deferred composition fan-out: the width is runtime data, so the node is NOT
+        // expanded here — but the target NAME is static and load time is the only place
+        // an unknown target is a clean authoring error rather than a mid-run node failure
+        // after upstream spend. Validate existence and carry on.
+        if (!rawByName.has(node.include)) {
+          throw new IncludeExpansionError(
+            `Node '${node.id}': fan-out include target '${node.include}' not found`
+          );
+        }
+        expandedNodes.push(node);
+        continue;
+      }
+
       if (isIncludeDirective(node)) {
         let child: WorkflowDefinition;
         try {

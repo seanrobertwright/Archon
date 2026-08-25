@@ -93,6 +93,56 @@ function blockWorkflow(): WorkflowDefinition {
 // Namespacing + edge rewiring
 // ---------------------------------------------------------------------------
 
+describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
+  test('leaves an include+fan_out node unexpanded but validates the target exists', () => {
+    const parent = wf('parent', [
+      { id: 'fan', include: 'blk', fan_out: { items: '$list.output' } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(blockWorkflow(), parent));
+    expect(errors).toHaveLength(0);
+
+    const expanded = workflows.get('parent')!;
+    expect(expanded.nodes).toHaveLength(1);
+    const deferred = expanded.nodes[0];
+    expect(deferred).toMatchObject({ kind: 'compose_fan_out', include: 'blk' });
+  });
+
+  test('errors at load time when the fan-out target name does not resolve', () => {
+    const parent = wf('parent', [
+      { id: 'fan', include: 'no-such-block', fan_out: { items: '$list.output' } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(parent));
+    expect(workflows.size).toBe(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.error).toContain("Node 'fan'");
+    expect(errors[0]?.error).toContain("'no-such-block' not found");
+  });
+
+  test("rewrites $node.output refs in the deferred node's with values and items ref", () => {
+    const parent = wf('parent', [
+      { id: 'list', bash: 'echo []' },
+      {
+        id: 'fan',
+        include: 'blk',
+        depends_on: ['list'],
+        with: { seed: '$list.output' },
+        fan_out: { items: '$list.output' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(blockWorkflow(), parent));
+    expect(errors).toHaveLength(0);
+    const deferred = workflows.get('parent')!.nodes.find(n => n.id === 'fan') as unknown as {
+      with?: Record<string, string>;
+      fan_out: { items: string };
+    };
+    expect(deferred.with?.seed).toBe('$list.output');
+    expect(deferred.fan_out.items).toBe('$list.output');
+  });
+});
+
 describe('expandWorkflowIncludes — namespacing', () => {
   test('inlines the block as flattened, namespaced nodes with no include remaining', () => {
     const parent = wf('parent', [

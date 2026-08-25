@@ -18,6 +18,7 @@ import {
   isHaltNode,
   isWorkflowNode,
   isIncludeDirective,
+  isComposeFanOutNode,
   isPersistableNode,
   isNodeContextResume,
 } from './schemas';
@@ -647,6 +648,7 @@ function parseDagNode(
   const hasWithSupport =
     isIncludeDirective(node) ||
     isWorkflowNode(node) ||
+    isComposeFanOutNode(node) ||
     (isExecNode(node) && node.runtime !== 'sh') ||
     (isAgentNode(node) && node.source.kind === 'command');
   if ((raw as Record<string, unknown>).with !== undefined && !hasWithSupport) {
@@ -659,6 +661,10 @@ function parseDagNode(
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
   let nonAiNode: { type: string; fields: readonly string[] } | undefined;
   if (isIncludeDirective(node)) {
+    nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
+  } else if (isComposeFanOutNode(node)) {
+    // Same execution-less posture as a static include: the composed body's own nodes
+    // carry their config, so AI-level fields declared here are ignored (#2512).
     nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
   } else if (isHaltNode(node)) {
     nonAiNode = { type: 'cancel', fields: BASH_NODE_AI_FIELDS };

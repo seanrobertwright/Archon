@@ -32,6 +32,7 @@ import type {
   ExecNode,
   HaltNode,
   IncludeDirective,
+  ComposeFanOutNode,
   TriggerRule,
   WaitConfig,
 } from './schemas';
@@ -1651,7 +1652,6 @@ describe('dagNodeSchema — include', () => {
 describe('dagNodeSchema — launch-only options on an include node (#1764)', () => {
   test.each([
     ['isolation', { isolation: 'worktree' }],
-    ['fan_out', { fan_out: { items: '$list.output' } }],
     ['input', { input: 'do the thing' }],
   ])('rejects %s, naming the option and pointing at workflow:', (field, extra) => {
     const result = dagNodeSchema.safeParse({ id: 'review', include: 'blk', ...extra });
@@ -1660,6 +1660,53 @@ describe('dagNodeSchema — launch-only options on an include node (#1764)', () 
       const message = result.error.issues.map(i => i.message).join(' | ');
       expect(message).toContain(`'${field}' is not supported on an include node`);
       expect(message).toContain("'workflow:' node");
+    }
+  });
+
+  // #2512: `fan_out:` on an include node is now the composed fan-out surface — it parses
+  // to a deferred ComposeFanOutNode instead of being rejected as launch-only.
+  test('include + fan_out parses to a deferred compose_fan_out node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'review',
+      include: 'archon-review-block',
+      depends_on: ['gather'],
+      fan_out: { items: '$list.output', as: 'item', max_parallel: 3 },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const node = result.data as ComposeFanOutNode;
+      expect(node.kind).toBe('compose_fan_out');
+      expect(node.include).toBe('archon-review-block');
+      expect(node.fan_out.max_parallel).toBe(3);
+      expect(node.fan_out.join).toBe('all_done');
+      expect(isIncludeDirective(result.data)).toBe(false);
+    }
+  });
+
+  test('compose fan-out rejects join: first_success', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'review',
+      include: 'blk',
+      fan_out: { items: '$list.output', join: 'first_success' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const message = result.error.issues.map(i => i.message).join(' | ');
+      expect(message).toContain('first_success');
+    }
+  });
+
+  test('compose fan-out rejects fan_out.as colliding with a with: key', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'review',
+      include: 'blk',
+      with: { item: 'static' },
+      fan_out: { items: '$list.output', as: 'item' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const message = result.error.issues.map(i => i.message).join(' | ');
+      expect(message).toContain('collides with');
     }
   });
 

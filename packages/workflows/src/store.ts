@@ -131,6 +131,9 @@ export const WORKFLOW_EVENT_TYPES = [
   // deliverable. `data.warnings` is the message list. Absence means the YAML was
   // clean OR the run predates this event type — never that delivery failed.
   'workflow_parse_warnings',
+  // #2512 — audit snapshot of a composed fan-out's ordered instance set (identity +
+  // item per ordinal), written before the first instance schedules.
+  'fan_out_instances',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
