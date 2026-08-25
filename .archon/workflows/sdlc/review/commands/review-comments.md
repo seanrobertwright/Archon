@@ -11,7 +11,7 @@ Read `$ARTIFACTS_DIR/review/scope.md` first. In light mode, verify prior finding
 3. The concrete maintenance consequence: a caller uses the wrong contract, an operator follows unsafe guidance, an invariant drifts.
 4. The smallest correction: fix, narrow, remove, or replace with an enforceable reference.
 
-Check "must/always/never" claims, units, ordering, ownership; examples against the actual API; TODOs against implemented behavior; comments naming files, symbols, commands, or versions. Verbose or terse prose is not a finding.
+Check "must/always/never" claims, units, ordering, ownership; rationale that no longer matches the implementation choice it justifies; examples against the actual API; TODOs against implemented behavior; comments naming files, symbols, commands, or versions. Verbose or terse prose is not a finding. Also not findings: temporary notes with a named owner and still-open linked work, license/generated-file/tooling directives that remain applicable, and examples protected by tests or generated from authoritative sources. Documentation outside code comments belongs to the docs lens.
 
 ## Missing comments
 

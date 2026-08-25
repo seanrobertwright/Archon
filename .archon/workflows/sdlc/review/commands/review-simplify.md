@@ -12,7 +12,7 @@ Read `$ARTIFACTS_DIR/review/scope.md` first. In light mode, verify prior finding
 4. **Primitive** — the existing or smaller mechanism that carries the outcome: an API already present, data available before it was copied, one owner replacing synchronized representations, direct control flow replacing speculative policy.
 5. **Proof** — call sites, tests, or contracts showing the smaller shape suffices. Taste, line count, and "more idiomatic" are not proof.
 
-Ask what forces each moving part: which observable transition requires the lifecycle? what second real use does the wrapper own? which supported variation exists today for the configuration? which concrete failure does the fallback recover, and who observes it?
+Ask what forces each moving part: which observable transition requires the lifecycle? what second real use does the wrapper own? which supported variation exists today for the configuration? which concrete failure does the fallback recover, and who observes it? is data copied, flattened, rebuilt, or cached where one owner could carry it — and does a signal threaded through types, schemas, or layers have an owner that already knows the answer? DRY applies to shared structure and data models, not every repeated line: explicit repetition can be simpler than a premature abstraction.
 
 ## Falsify before reporting
 

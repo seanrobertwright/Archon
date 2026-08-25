@@ -11,7 +11,7 @@ Read `$ARTIFACTS_DIR/review/scope.md` first. In light mode, verify prior finding
 3. **Consequence** — a concrete consumer that fails, branches defensively, or accepts a contract-violating result, with `file:line`.
 4. **Proportional correction** — the smallest enforcement: a discriminated union for genuinely different variants, validation at one ingress boundary, a distinct phase type when consumers need proof a transition happened, a required field when absence is not supported. The correction must cost less than the defensive code it removes — never propose a class hierarchy, wrapper, or builder by default.
 
-Repeated guards saying an earlier phase "should already have" enforced something are the strongest signal: a runtime assertion standing in for a type nobody wrote.
+Repeated guards saying an earlier phase "should already have" enforced something are the strongest signal: a runtime assertion standing in for a type nobody wrote. Also worth a look: casts, assertions, and `any` that hide a proof the compiler lacks; local types hand-duplicating an authoritative schema they can drift from (the correction is derivation from the schema, not a third copy); and matches that let a new variant compile without deliberate handling — check whether the language could already enforce exhaustiveness there without a permissive default.
 
 ## Falsify before reporting
 
