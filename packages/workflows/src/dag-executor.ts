@@ -7549,6 +7549,21 @@ async function executeApprovalNode(
  *    node_completed (mirrors executeApprovalNode), so the node re-runs when the
  *    parent auto-resumes after the child terminates.
  */
+/**
+ * The child's terminal LOGICAL value for `output_format` validation (#2774): prefer the
+ * typed `structuredOutput` (#2637); fall back to parsing the text summary, and treat
+ * non-JSON text as a raw string — which then correctly fails an object-typed schema,
+ * since a string IS what the child returned.
+ */
+function subrunLogicalValue(outcome: ChildWorkflowOutcome): unknown {
+  if (outcome.structuredOutput !== undefined) return outcome.structuredOutput;
+  try {
+    return JSON.parse(outcome.output ?? '') as unknown;
+  } catch {
+    return outcome.output ?? '';
+  }
+}
+
 async function executeWorkflowNode(
   node: WorkflowNode,
   ctx: RunLayersContext
@@ -7685,6 +7700,59 @@ async function executeWorkflowNode(
   // branch — so the resume snapshot skips a truly-finished sub-run on resume
   // but re-runs one still blocked on its child.
   const asCompleted = (outcome: ChildWorkflowOutcome): NodeExecutionResult => {
+    // Declared boundary contract (#2774): when the node declares `output_format`, the
+    // child's terminal value must match it — a mismatch fails the node HERE, before any
+    // node_completed row exists, so resume re-runs into the same named failure instead
+    // of rehydrating an invalid "completed" payload. Mirrors the AI/loop structured-
+    // output gates; no reask loop (a child rerun costs a full run and may have side
+    // effects), one validation, one hard failure.
+    let certifiedLogicalValue: unknown;
+    let schemaCompiled = false;
+    if (node.output_format) {
+      const logicalValue = subrunLogicalValue(outcome);
+      let schemaCompileError: string | undefined;
+      const validation = validateStructuredOutput(logicalValue, node.output_format, compileMsg => {
+        schemaCompileError = compileMsg;
+      });
+      if (schemaCompileError === undefined) {
+        schemaCompiled = true;
+        certifiedLogicalValue = logicalValue;
+      } else {
+        // Fail-safe on an uncompilable schema, same contract as the AI-node gate:
+        // surface it loudly but never turn it into a spurious node failure.
+        getLog().warn(
+          { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
+          'workflow.subrun_schema_uncompilable'
+        );
+        void safeSendMessage(
+          platform,
+          conversationId,
+          `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so the sub-run '${node.workflow}' output was NOT validated against it. Fix the schema to enforce it.`,
+          msgContext
+        ).catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: parentRun.id, nodeId: node.id },
+            'workflow.subrun_schema_warn_send_failed'
+          );
+        });
+      }
+      if (!validation.valid) {
+        const errors = (validation.errors ?? ['value does not match the declared schema']).join(
+          '; '
+        );
+        const received =
+          logicalValue === null
+            ? 'null'
+            : Array.isArray(logicalValue)
+              ? 'array'
+              : typeof logicalValue;
+        return failResult(
+          `Node '${node.id}': sub-run '${node.workflow}' output does not match its declared output_format: ${errors}. Expected: ${JSON.stringify(node.output_format)}. Received: ${received}.`,
+          outcome.costUsd,
+          outcome.tokens
+        );
+      }
+    }
     if (outcome.output === undefined) {
       // A completed child with no non-blank terminal output threads '' into
       // $<node>.output — legal, but indistinguishable downstream from an
@@ -7711,10 +7779,16 @@ async function executeWorkflowNode(
           type: 'workflow',
           child_run_id: outcome.childRunId,
           // The child's terminal logical value (#2637), so parent cold resume
-          // rehydrates typed access to `$<node>.output.field`.
+          // rehydrates typed access to `$<node>.output.field`. When the child
+          // carried no typed value but the output_format gate certified a parsed
+          // one, persist THAT — otherwise an array-typed certified output would
+          // pass its own gate yet stay unreadable downstream (parity with the
+          // fan-out join's childElement fallback).
           ...(outcome.structuredOutput !== undefined
             ? { structured_output: outcome.structuredOutput }
-            : {}),
+            : schemaCompiled && certifiedLogicalValue !== outcome.output
+              ? { structured_output: certifiedLogicalValue as JsonValue }
+              : {}),
           ...(outcome.costUsd !== undefined ? { cost_usd: outcome.costUsd } : {}),
           // Rolled up from the child run's persisted totals, exactly like cost_usd —
           // tokens are the axis every provider reports (Codex reports no cost at all),
@@ -7747,7 +7821,9 @@ async function executeWorkflowNode(
       ...(outcome.tokens !== undefined ? { tokens: outcome.tokens } : {}),
       ...(outcome.structuredOutput !== undefined
         ? { structuredOutput: outcome.structuredOutput }
-        : {}),
+        : schemaCompiled && certifiedLogicalValue !== outcome.output
+          ? { structuredOutput: certifiedLogicalValue }
+          : {}),
       ...(declaredFields !== undefined ? { declaredFields } : {}),
     };
   };
@@ -8630,27 +8706,28 @@ async function executeFanOutWorkflowNode(
   const totalCostUsd = sumFanOutCost(outcomes);
   const totalTokens = sumFanOutTokens(outcomes);
 
-  // I3: parity with the 1:1 asCompleted path — a completed child with no terminal output
-  // threads '' but is indistinguishable downstream from an intentional empty result, so
-  // leave a trace. Used by both join reducers.
-  const childOutput = (o: ChildWorkflowOutcome, index: number): string => {
+  // A completed child's aggregate ELEMENT (#2637): its terminal LOGICAL value —
+  // exactly what the #2774 output_format gate above certified via
+  // {@link subrunLogicalValue} — so a structured child lands single-encoded
+  // (`[{"v":1}]`, never `["{\"v\":1}"]`), a text-only child whose summary happens
+  // to be JSON lands parsed like the validator saw it, and any other child stays
+  // the exact string it always was.
+  // I3: parity with the 1:1 asCompleted path — a completed child with no terminal
+  // output is indistinguishable downstream from an intentional empty result, so
+  // leave a trace before falling back to ''. A structured child always has text too
+  // (the canonical serialization), so this warn still covers every genuinely empty
+  // completion.
+  const childElement = (o: ChildWorkflowOutcome, index: number): JsonValue => {
     if (o.status === 'completed' && o.output === undefined) {
       getLog().warn(
         { parentRunId: parentRun.id, nodeId: node.id, childRunId: o.childRunId, childIndex: index },
         'workflow.subrun_completed_without_output'
       );
     }
-    return o.output ?? '';
+    return o.structuredOutput !== undefined
+      ? (o.structuredOutput as JsonValue)
+      : (subrunLogicalValue(o) as JsonValue);
   };
-
-  // A completed child's aggregate ELEMENT (#2637): its terminal LOGICAL value when it
-  // produced one, else its output text — so a structured child lands single-encoded
-  // (`[{"v":1}]`, never `["{\"v\":1}"]`) while a string-output child stays the exact
-  // string it always was. A structured child always has text too (the canonical
-  // serialization), so the missing-output warn in childOutput still covers every
-  // genuinely empty completion.
-  const childElement = (o: ChildWorkflowOutcome, index: number): JsonValue =>
-    o.structuredOutput !== undefined ? (o.structuredOutput as JsonValue) : childOutput(o, index);
 
   // 7. #2180 (first-run path): a freshly-spawned child that paused at a gate fails the
   //    node. Cancel the paused child(ren) tagged `fan_out_gate` (recoverable once the gate
@@ -8676,6 +8753,50 @@ async function executeFanOutWorkflowNode(
     const msg = fanOutAutonomousGateMessage(node, outcomes[pausedIdx].childRunId, pausedIdx);
     await notify(`⏸→❌ **Fan-out gate rejected** (node \`${node.id}\`): ${msg}`);
     return failResult(msg, totalCostUsd, totalTokens);
+  }
+
+  // Declared boundary contract (#2774), fan-out parity with the 1:1 asCompleted path:
+  // when the node declares `output_format`, EVERY completed child's terminal value must
+  // match it — the join aggregates children, so one invalid element would otherwise be
+  // persisted inside a "completed" node_completed row. Fails the node BEFORE any
+  // writeCompleted so resume re-runs into the same named failure. An uncompilable
+  // schema warn-skips like the 1:1 gate; failed/paused/cancelled children are not
+  // validated (they never contribute a payload element).
+  if (node.output_format) {
+    for (const [index, outcome] of outcomes.entries()) {
+      if (outcome.status !== 'completed') continue;
+      const logicalValue = subrunLogicalValue(outcome);
+      let schemaCompileError: string | undefined;
+      const validation = validateStructuredOutput(logicalValue, node.output_format, compileMsg => {
+        schemaCompileError = compileMsg;
+      });
+      if (schemaCompileError !== undefined) {
+        getLog().warn(
+          { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
+          'workflow.subrun_schema_uncompilable'
+        );
+        await notify(
+          `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so fan-out child ${String(index)} of '${node.workflow}' was NOT validated against it. Fix the schema to enforce it.`
+        );
+        continue;
+      }
+      if (!validation.valid) {
+        const errors = (validation.errors ?? ['value does not match the declared schema']).join(
+          '; '
+        );
+        const received =
+          logicalValue === null
+            ? 'null'
+            : Array.isArray(logicalValue)
+              ? 'array'
+              : typeof logicalValue;
+        const msg =
+          `Node '${node.id}': fan-out child ${String(index)} of sub-run '${node.workflow}' output does not match the node's declared output_format: ${errors}. ` +
+          `Expected: ${JSON.stringify(node.output_format)}. Received: ${received}.`;
+        await notify(`❌ **Fan-out output_format violation** (node \`${node.id}\`): ${msg}`);
+        return failResult(msg, totalCostUsd, totalTokens);
+      }
+    }
   }
 
   // 8. Join.
