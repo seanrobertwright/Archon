@@ -4,6 +4,7 @@ import {
   getRegistration,
   InvalidProviderRunConfigError,
   isRegisteredProvider,
+  parseProviderRunModel,
 } from '@archon/providers';
 import { validEffortsForProvider, type ModelAliasPreset } from '@archon/workflows/model-validation';
 import {
@@ -91,10 +92,14 @@ function assertRegisteredProvider(provider: string, path: string): void {
 
 function normalizePreset(path: string, preset: ModelAliasPreset): ModelAliasPreset {
   assertRegisteredProvider(preset.provider, `${path}.provider`);
-  const registration = getRegistration(preset.provider);
-  const parsedModel = registration.parseModelRef?.(preset.model);
-  if (parsedModel?.ok === false) {
-    throw new Error(`Invalid run config at '${path}.model': ${parsedModel.reason}.`);
+  let model: string;
+  try {
+    model = parseProviderRunModel(preset.provider, preset.model);
+  } catch (error) {
+    if (error instanceof InvalidProviderRunConfigError) {
+      throw new Error(`Invalid run config at '${path}.model': ${error.message}.`);
+    }
+    throw error;
   }
   if (preset.effort !== undefined) {
     const valid = validEffortsForProvider(preset.provider);
@@ -111,15 +116,13 @@ function normalizePreset(path: string, preset: ModelAliasPreset): ModelAliasPres
       );
     }
   }
-  if (preset.thinking !== undefined && !registration.capabilities.thinkingControl) {
+  if (preset.thinking !== undefined && preset.provider !== 'claude') {
     throw new Error(
-      `Invalid run config at '${path}.thinking': provider '${preset.provider}' does not ` +
-        'support per-run thinking.'
+      `Invalid run config at '${path}.thinking': the run preset uses Claude-shaped ` +
+        `thinking options, which provider '${preset.provider}' cannot consume.`
     );
   }
-  return parsedModel?.ok === true && parsedModel.model !== preset.model
-    ? { ...preset, model: parsedModel.model }
-    : preset;
+  return model === preset.model ? preset : { ...preset, model };
 }
 
 /** Validate and normalize constraints owned by the live provider registry and lifecycle. */

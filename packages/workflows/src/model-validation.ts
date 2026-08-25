@@ -14,7 +14,11 @@
  * per call.
  */
 
-import { getProviderCapabilities, getRegistration, isRegisteredProvider } from '@archon/providers';
+import {
+  getProviderCapabilities,
+  isRegisteredProvider,
+  parseProviderRunModel,
+} from '@archon/providers';
 import { parsePiModelRef } from '@archon/providers/community/pi';
 import tierDefaults from './defaults/tier-defaults.json';
 import { EFFORT_LEVELS } from './schemas/dag-node';
@@ -214,16 +218,35 @@ function normalizeRunOverridePreset(targetName: string, preset: RawAliasEntry): 
       `Model override '${targetName}' resolved to unknown provider '${preset.provider}'.`
     );
   }
-  const parsed = getRegistration(preset.provider).parseModelRef?.(preset.model);
-  if (parsed?.ok === false) {
+  let model: string;
+  try {
+    model = parseProviderRunModel(preset.provider, preset.model);
+  } catch (error) {
     throw new Error(
       `Model override '${targetName}' has invalid ${preset.provider} model '${preset.model}': ` +
-        `${parsed.reason}.`
+        `${(error as Error).message}.`
     );
   }
-  return parsed?.ok === true && parsed.model !== preset.model
-    ? { ...preset, model: parsed.model }
-    : preset;
+  if (preset.effort !== undefined) {
+    const valid = validEffortsForProvider(preset.provider);
+    if (valid === null) {
+      throw new Error(
+        `Model override '${targetName}' cannot set effort for provider '${preset.provider}'.`
+      );
+    }
+    if (!valid.includes(preset.effort)) {
+      throw new Error(
+        `Model override '${targetName}' has invalid ${preset.provider} effort '${preset.effort}'.`
+      );
+    }
+  }
+  if (preset.thinking !== undefined && preset.provider !== 'claude') {
+    throw new Error(
+      `Model override '${targetName}' cannot copy Claude-shaped thinking options to ` +
+        `provider '${preset.provider}'.`
+    );
+  }
+  return model === preset.model ? preset : { ...preset, model };
 }
 
 function resolveRunOverrideSpec(

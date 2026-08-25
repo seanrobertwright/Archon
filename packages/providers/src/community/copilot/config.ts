@@ -91,11 +91,8 @@ export function parseCopilotRunConfig(raw: Record<string, unknown>): CopilotProv
     'logLevel',
   ]);
   const model = normalizeRunConfigString(raw.model, 'model');
-  for (const key of ['copilotCliPath', 'configDir'] as const) {
-    if (raw[key] !== undefined && typeof raw[key] !== 'string') {
-      invalidRunConfigValue(key, 'a string');
-    }
-  }
+  const copilotCliPath = normalizeRunConfigString(raw.copilotCliPath, 'copilotCliPath');
+  const configDir = normalizeRunConfigString(raw.configDir, 'configDir');
   if (raw.modelReasoningEffort !== undefined && !isEffortRung(raw.modelReasoningEffort)) {
     invalidRunConfigValue('modelReasoningEffort', 'a valid Archon effort level');
   }
@@ -112,5 +109,10 @@ export function parseCopilotRunConfig(raw: Record<string, unknown>): CopilotProv
     invalidRunConfigValue('logLevel', 'none, error, warning, info, debug, or all');
   }
   const parsed = parseCopilotConfig(raw);
-  return model === undefined ? parsed : { ...parsed, model };
+  return {
+    ...parsed,
+    ...(model === undefined ? {} : { model }),
+    ...(copilotCliPath === undefined ? {} : { copilotCliPath }),
+    ...(configDir === undefined ? {} : { configDir }),
+  };
 }

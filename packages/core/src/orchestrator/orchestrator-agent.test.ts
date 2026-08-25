@@ -2299,6 +2299,31 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(opts.preparedSource?.manifest?.captured_at).toBe('2026-08-21T00:00:00.000Z');
   });
 
+  test('applies a run config when a resume candidate hydrates to a fresh run', async () => {
+    const runConfig = {
+      source: { kind: 'http' as const, label: 'inline' },
+      layer: { docsPath: 'handbook' },
+    };
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(makeResumableRun({ id: 'empty-config-run', status: 'paused' }))
+    );
+    mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run test-workflow', {
+      workflowRunConfig: runConfig,
+    });
+
+    expect(mockHydrateResumableRun).toHaveBeenCalled();
+    expect(mockExecuteWorkflow.mock.calls[0]?.[7]?.runConfig).toEqual(runConfig);
+    expect(platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n')).not.toContain(
+      'a new run config cannot be applied'
+    );
+  });
+
   test('foreground_resume_detected: fresh-run-in-same-worktree refuses with the capture-failure message when prepareWorkflowSource rejects (#2686)', async () => {
     // The new capture call inside the resume-null fallback introduces a SECOND call site
     // of `captureFreshSource(...)` whose failure path is unexercised by the success-only

@@ -101,7 +101,6 @@ import {
 } from './run-config';
 import type { WorkflowRunConfigInput, WorkflowRunConfigMetadata } from './schemas/run-config';
 import type {
-  BuildAiProfileOptions,
   ResolvedAiProfile,
   ResolvedRunModelOverrides,
   RunModelBindingsMetadata,
@@ -1936,19 +1935,17 @@ export async function executeWorkflow(
     );
   }
   let baseAiProfile: ResolvedAiProfile;
-  let appliedProfileOptions: BuildAiProfileOptions;
   try {
-    appliedProfileOptions = {
-      repoTiers: fileConfig.tiers,
-      repoAliases: fileConfig.aliases,
-      userTiers: userAiPrefs.tiers,
-      userAliases: userAiPrefs.aliases,
-      runTiers: effectiveRunConfig?.layer.tiers,
-      runAliases: effectiveRunConfig?.layer.aliases,
-    };
     baseAiProfile = buildAiProfile(
       effectiveRunConfig?.layer.assistant ?? userAiPrefs.defaultProvider ?? fileConfig.assistant,
-      appliedProfileOptions
+      {
+        repoTiers: fileConfig.tiers,
+        repoAliases: fileConfig.aliases,
+        userTiers: userAiPrefs.tiers,
+        userAliases: userAiPrefs.aliases,
+        runTiers: effectiveRunConfig?.layer.tiers,
+        runAliases: effectiveRunConfig?.layer.aliases,
+      }
     );
   } catch (error) {
     // Structurally invalid STORED prefs (corrupt DB row) must not kill the run
@@ -1958,16 +1955,12 @@ export async function executeWorkflow(
       { err: error as Error, userId: executionUserId },
       'workflow.user_ai_prefs_profile_invalid'
     );
-    appliedProfileOptions = {
+    baseAiProfile = buildAiProfile(effectiveRunConfig?.layer.assistant ?? fileConfig.assistant, {
       repoTiers: fileConfig.tiers,
       repoAliases: fileConfig.aliases,
       runTiers: effectiveRunConfig?.layer.tiers,
       runAliases: effectiveRunConfig?.layer.aliases,
-    };
-    baseAiProfile = buildAiProfile(
-      effectiveRunConfig?.layer.assistant ?? fileConfig.assistant,
-      appliedProfileOptions
-    );
+    });
   }
 
   let persistedModelBindings: RunModelBindingsMetadata | undefined;
@@ -1997,17 +1990,14 @@ export async function executeWorkflow(
     }
     throw error;
   }
-  const aiProfile = buildAiProfile(baseAiProfile.defaultProvider, {
-    ...appliedProfileOptions,
-    runTiers: {
-      ...effectiveRunConfig?.layer.tiers,
+  const aiProfile: ResolvedAiProfile = {
+    defaultProvider: baseAiProfile.defaultProvider,
+    aliases: {
+      ...baseAiProfile.aliases,
       ...resolvedModelOverrides.tiers,
-    },
-    runAliases: {
-      ...effectiveRunConfig?.layer.aliases,
       ...resolvedModelOverrides.aliases,
     },
-  });
+  };
   const modelBindingsMetadata = createRunModelBindingsMetadata(resolvedModelOverrides, aiProfile);
   if (hasRunModelOverrides(resolvedModelOverrides)) {
     getLog().info(

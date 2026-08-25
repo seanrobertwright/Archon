@@ -188,6 +188,10 @@ describe('workflow run config', () => {
       ['codex', { webSearchMode: 'realtime' }, 'assistants.codex.webSearchMode'],
       ['codex', { typo: true }, 'assistants.codex.typo'],
       ['claude', { settingSources: 'project' }, 'assistants.claude.settingSources'],
+      ['claude', { claudeBinaryPath: '   ' }, 'assistants.claude.claudeBinaryPath'],
+      ['codex', { codexBinaryPath: '' }, 'assistants.codex.codexBinaryPath'],
+      ['copilot', { copilotCliPath: '   ' }, 'assistants.copilot.copilotCliPath'],
+      ['copilot', { configDir: '' }, 'assistants.copilot.configDir'],
       ['pi', { apiKey: 'secret' }, 'assistants.pi.apiKey'],
       ['pi', { model: 'banana' }, 'assistants.pi.model'],
       ['opencode', { model: 'gpt-5' }, 'assistants.opencode.model'],
@@ -200,6 +204,21 @@ describe('workflow run config', () => {
           { kind: 'http', label: 'inline' }
         )
       ).toThrow(`Invalid run config at '${path}'`);
+    }
+  });
+
+  it('rejects Claude-shaped thinking presets for providers that ignore that shape', () => {
+    for (const provider of ['pi', 'copilot']) {
+      expect(() =>
+        parseWorkflowRunConfig(
+          {
+            tiers: {
+              large: { provider, model: 'openai/gpt-5.6', thinking: 'enabled' },
+            },
+          },
+          { kind: 'http', label: 'inline' }
+        )
+      ).toThrow("Invalid run config at 'tiers.large.thinking'");
     }
   });
 

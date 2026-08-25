@@ -27,6 +27,7 @@ export {
   getAgentProvider,
   getRegistration,
   getProviderCapabilities,
+  parseProviderRunModel,
   getRegisteredProviders,
   getProviderInfoList,
   isRegisteredProvider,

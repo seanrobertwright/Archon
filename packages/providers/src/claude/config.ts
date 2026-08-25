@@ -86,6 +86,7 @@ export function parseClaudeConfig(raw: Record<string, unknown>): ClaudeProviderD
 export function parseClaudeRunConfig(raw: Record<string, unknown>): ClaudeProviderDefaults {
   assertKnownRunConfigKeys(raw, ['model', 'settingSources', 'claudeBinaryPath']);
   const model = normalizeRunConfigString(raw.model, 'model');
+  const claudeBinaryPath = normalizeRunConfigString(raw.claudeBinaryPath, 'claudeBinaryPath');
   if (raw.settingSources !== undefined) {
     if (!Array.isArray(raw.settingSources)) {
       invalidRunConfigValue('settingSources', "an array containing only 'project' or 'user'");
@@ -97,9 +98,10 @@ export function parseClaudeRunConfig(raw: Record<string, unknown>): ClaudeProvid
       invalidRunConfigValue(`settingSources.${invalidIndex}`, "'project' or 'user'");
     }
   }
-  if (raw.claudeBinaryPath !== undefined && typeof raw.claudeBinaryPath !== 'string') {
-    invalidRunConfigValue('claudeBinaryPath', 'a string');
-  }
   const parsed = parseClaudeConfig(raw);
-  return model === undefined ? parsed : { ...parsed, model };
+  return {
+    ...parsed,
+    ...(model === undefined ? {} : { model }),
+    ...(claudeBinaryPath === undefined ? {} : { claudeBinaryPath }),
+  };
 }

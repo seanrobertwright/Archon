@@ -395,6 +395,32 @@ describe('per-run model bindings', () => {
     ).toEqual({ provider: 'claude', model: 'opus', effort: 'high' });
   });
 
+  test('copied lower aliases cannot carry unsupported run controls into the final binding', () => {
+    const unsupportedEffort = buildAiProfile('opencode', {
+      repoAliases: {
+        '@source': { provider: 'opencode', model: 'openai/gpt-5.6', effort: 'high' },
+        '@target': { provider: 'opencode', model: 'openai/gpt-5' },
+      },
+    });
+    expect(() =>
+      resolveRunModelOverrides(unsupportedEffort, { aliases: { '@target': '@source' } })
+    ).toThrow(/cannot set effort/);
+
+    const unsupportedThinking = buildAiProfile('pi', {
+      repoAliases: {
+        '@source': {
+          provider: 'pi',
+          model: 'openai/gpt-5.6',
+          thinking: { type: 'enabled' },
+        },
+        '@target': { provider: 'pi', model: 'openai/gpt-5' },
+      },
+    });
+    expect(() =>
+      resolveRunModelOverrides(unsupportedThinking, { aliases: { '@target': '@source' } })
+    ).toThrow(/cannot copy Claude-shaped thinking/);
+  });
+
   test('rejects unknown alias targets and references', () => {
     expect(() => resolveRunModelOverrides(base, { aliases: { '@missing': 'opus' } })).toThrow(
       /unknown alias '@missing'/

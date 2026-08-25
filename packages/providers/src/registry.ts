@@ -22,7 +22,7 @@ import { CODEX_CAPABILITIES } from './codex/capabilities';
 import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
 import { registerPiProvider } from './community/pi/registration';
-import { UnknownProviderError } from './errors';
+import { InvalidProviderRunConfigError, UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -84,6 +84,15 @@ export function getRegistration(id: string): ProviderRegistration {
  */
 export function getProviderCapabilities(id: string): ProviderCapabilities {
   return getRegistration(id).capabilities;
+}
+
+/** Validate and normalize a run-owned model through the provider's strict parser. */
+export function parseProviderRunModel(id: string, model: string): string {
+  const parsed = getRegistration(id).parseRunConfig({ model });
+  if (typeof parsed.model !== 'string' || parsed.model.trim().length === 0) {
+    throw new InvalidProviderRunConfigError('model', 'provider did not accept the model');
+  }
+  return parsed.model;
 }
 
 /**

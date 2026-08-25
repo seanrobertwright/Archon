@@ -785,9 +785,6 @@ export interface ProviderRegistration {
    * reject values the provider would otherwise silently discard.
    */
   parseRunConfig: ProviderRunConfigParser;
-
-  /** Validate and canonicalize a model reference before it is persisted for one run. */
-  parseModelRef?: (model: string) => { ok: true; model: string } | { ok: false; reason: string };
 }
 
 /**

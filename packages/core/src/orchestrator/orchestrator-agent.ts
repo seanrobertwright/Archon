@@ -825,14 +825,6 @@ async function dispatchOrchestratorWorkflowOwned(
   const willContinueExistingRun =
     Boolean(resumableRun?.working_path) &&
     (resumableRun?.status === 'paused' || resumableRun?.id === options?.resumeRunId);
-  if (willContinueExistingRun && options?.runConfig) {
-    await platform.sendMessage(
-      conversationId,
-      'This command would resume an existing run, so a new run config cannot be applied. ' +
-        'Resume without config, or force a fresh run.'
-    );
-    return;
-  }
 
   // ── Executable source ───────────────────────────────────────────────────────
   //
@@ -1092,6 +1084,14 @@ async function dispatchOrchestratorWorkflowOwned(
       throw err;
     }
     if (prepared) {
+      if (options?.runConfig) {
+        await platform.sendMessage(
+          conversationId,
+          'This command would resume an existing run, so a new run config cannot be applied. ' +
+            'Resume without config, or force a fresh run.'
+        );
+        return;
+      }
       const resumeStateLabel = formatResumableRunState(resumableRun.status);
       const suppliedModelBindingNames = [
         ...Object.keys(options?.modelOverrides?.tiers ?? {}),

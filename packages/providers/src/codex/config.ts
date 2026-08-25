@@ -86,6 +86,7 @@ export function parseCodexRunConfig(raw: Record<string, unknown>): CodexProvider
     'codexBinaryPath',
   ]);
   const model = normalizeRunConfigString(raw.model, 'model');
+  const codexBinaryPath = normalizeRunConfigString(raw.codexBinaryPath, 'codexBinaryPath');
   if (raw.modelReasoningEffort !== undefined && !isCodexEffort(raw.modelReasoningEffort)) {
     invalidRunConfigValue('modelReasoningEffort', CODEX_EFFORTS.join(', '));
   }
@@ -105,9 +106,10 @@ export function parseCodexRunConfig(raw: Record<string, unknown>): CodexProvider
       invalidRunConfigValue(`additionalDirectories.${invalidIndex}`, 'a string');
     }
   }
-  if (raw.codexBinaryPath !== undefined && typeof raw.codexBinaryPath !== 'string') {
-    invalidRunConfigValue('codexBinaryPath', 'a string');
-  }
   const parsed = parseCodexConfig(raw);
-  return model === undefined ? parsed : { ...parsed, model };
+  return {
+    ...parsed,
+    ...(model === undefined ? {} : { model }),
+    ...(codexBinaryPath === undefined ? {} : { codexBinaryPath }),
+  };
 }
