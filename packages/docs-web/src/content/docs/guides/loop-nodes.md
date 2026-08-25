@@ -666,7 +666,7 @@ runtime-resolved graph:
 ```yaml
 - id: converge
   loop_group:
-    until_bash: test $review.output.ready = true
+    until_bash: test $review.output.ready = "true"
     max_iterations: 5
     nodes:
       - id: review
