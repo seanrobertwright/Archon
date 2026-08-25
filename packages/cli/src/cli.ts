@@ -14,7 +14,20 @@ import '@archon/paths/strip-cwd-env-boot';
 // <cwd>/.archon/.env (repo scope, wins over user). Both with override: true.
 // See packages/paths/src/env-loader.ts and the three-path model (#1302 / #1303).
 import { loadArchonEnv } from '@archon/paths/env-loader';
+import { captureDetachedInstallContext, restoreDetachedInstallContext } from '@archon/paths';
+const hasDetachedRunConfigHandoff = process.argv
+  .slice(2)
+  .includes('--internal-detached-run-config');
+const inheritedInstallContext = hasDetachedRunConfigHandoff
+  ? captureDetachedInstallContext()
+  : undefined;
 loadArchonEnv(process.cwd());
+// The detached parent sealed this payload with its effective install key. Repo
+// env still loads normally, but it cannot replace any input that derives the
+// install home before the child consumes the accepted snapshot.
+if (inheritedInstallContext) {
+  restoreDetachedInstallContext(inheritedInstallContext);
+}
 
 // Install the pipe-safe `console.log` shim BEFORE any command module imports.
 // `console.log` reaches fd 1 via a non-blocking pipe (pino opens it that way at
@@ -214,6 +227,7 @@ Options:
   --folder                   Register the current non-git directory as a folder project and run in place
   --input <name>=<value>     Supply a declared workflow input; repeat per input (mutually exclusive with --resume)
   --model <name>=<spec>      Rebind small/medium/large or @alias for one run; repeat per binding
+  --config <path>            Load a sparse YAML config layer for one fresh workflow run
   --resume                   Resume the most recent failed or paused run of the workflow (mutually exclusive with --branch)
   --adopt <run-id>           Start a new run adopting a terminal run's worktree/branch + artifacts ($ADOPTED_RUN_DIR)
   --supersedes <run-id>      Record this fresh run as replacing the prior run's open item (no lane inheritance)
@@ -407,6 +421,11 @@ async function main(): Promise<number> {
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
 
   try {
+    if (values.config !== undefined && (command !== 'workflow' || subcommand !== 'run')) {
+      console.error('Error: --config can only be used with workflow run.');
+      return 1;
+    }
+
     // setup/doctor/telemetry default to warn to avoid Pino info JSON interleaving with their human-readable output; lazy loggers pick up this level at first creation
     const isInteractiveCommand =
       command === 'setup' || command === 'doctor' || command === 'telemetry';
@@ -622,6 +641,13 @@ async function main(): Promise<number> {
               return await fail(jsonFlag, 'Usage: archon workflow run <name> [message]');
             }
             const userMessage = positionals.slice(3).join(' ') || '';
+            if (resumeFlag && values.config !== undefined) {
+              console.error(
+                'Error: --config cannot be used when continuing an existing workflow run. ' +
+                  'The run keeps the config it started with.'
+              );
+              return 1;
+            }
             if (branchName !== undefined && noWorktree) {
               return await fail(
                 jsonFlag,
@@ -721,6 +747,11 @@ async function main(): Promise<number> {
               // Raw `name=value` assignments; parsed at the invocation gate (#2554).
               inputs: values.input as string[] | undefined,
               modelAssignments: values.model as string[] | undefined,
+              configPath:
+                typeof values.config === 'string' ? resolve(cwd, values.config) : undefined,
+              detachedRunConfigPayload: values['internal-detached-run-config'] as
+                | string
+                | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;
