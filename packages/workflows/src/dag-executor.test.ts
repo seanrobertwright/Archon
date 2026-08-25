@@ -30629,4 +30629,168 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     );
     expect(freshInstanceCompletions).toHaveLength(0);
   });
+
+  it('resolves a nested deferred compose_fan_out inside the target block (#2512 instance expansion)', async () => {
+    // The target block itself contains a deferred compose_fan_out whose include target is
+    // a THIRD workflow: instance expansion must resolve it against the full discovered
+    // name map, not just {synth, target}.
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: test block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: inner-list',
+        '    bash: \'echo [\\"x\\"]\'',
+        '  - id: inner-fan',
+        '    kind: compose_fan_out',
+        '    include: leaf-blk',
+        '    depends_on: [inner-list]',
+        '    fan_out:',
+        "      items: '$inner-list.output'",
+        '      as: item',
+        '      max_parallel: 1',
+      ].join('\n')
+    );
+    await writeBlock(
+      [
+        'name: leaf-blk',
+        'description: leaf block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: leaf',
+        "    bash: 'echo leaf-$INPUTS.item'",
+      ].join('\n'),
+      'leaf-blk'
+    );
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-compose-nested',
+      testDir,
+      {
+        name: 'compose-parent-nested',
+        nodes: [
+          {
+            id: 'list',
+            kind: 'exec',
+            runtime: 'sh',
+            script: `echo '${JSON.stringify(['a', 'b'])}'`,
+          },
+          {
+            id: 'fan',
+            kind: 'compose_fan_out',
+            include: 'compose-blk',
+            depends_on: ['list'],
+            with: { item: 'unused' },
+            fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+          },
+        ],
+      },
+      makeWorkflowRun('compose-nested-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = eventsOf(mockDeps.store);
+    expect(events.some(e => String(e.data.error ?? '').includes('failed to compose'))).toBe(false);
+    const wrapper = events.find(e => e.event_type === 'node_completed' && e.step_name === 'fan');
+    expect(wrapper).toBeDefined();
+    // Each outer instance ran its nested fan once → two leaf completions total.
+    const leafOutputs = events
+      .filter(e => e.event_type === 'node_completed' && /__leaf$/.test(e.step_name))
+      .map(e => e.data.node_output)
+      .sort();
+    expect(leafOutputs).toEqual(['leaf-x', 'leaf-x']);
+  });
+
+  it('does not resume-skip instances inside a loop_group from another iteration’s rows', async () => {
+    // Iteration-1 rows persisted under BARE (pre-fix) step names must not satisfy
+    // iteration N's identity lookup: the whole-run snapshot has no iteration filter, so
+    // the instance prefix carries the group + iteration disambiguator.
+    await writeBlock(
+      [
+        'name: compose-blk',
+        'description: test block',
+        'mutates_checkout: false',
+        'nodes:',
+        '  - id: work',
+        "    bash: 'echo DONE-$INPUTS.item'",
+      ].join('\n')
+    );
+    const stale = new Map<string, PersistedNodeOutput>();
+    for (const snap of buildInstanceSnapshots(['a'])) {
+      stale.set(`fan__${snap.identity}__work`, { output: 'stale-never-executed' });
+    }
+    const storeOverride = createMockStore();
+    (
+      storeOverride.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>
+    ).mockImplementation(async _id => ({ completedNodeOutputs: stale, costUsd: 0 }));
+
+    const mockDeps = createMockDeps(storeOverride);
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-compose-loop',
+      testDir,
+      {
+        name: 'compose-parent-loop',
+        nodes: [
+          {
+            id: 'grp',
+            kind: 'loop_group',
+            loop_group: {
+              until: 'DONE',
+              max_iterations: 2,
+              fresh_context: true,
+              nodes: [
+                { id: 'list', kind: 'exec', runtime: 'sh', script: `echo '["a"]'` },
+                {
+                  id: 'fan',
+                  kind: 'compose_fan_out',
+                  include: 'compose-blk',
+                  depends_on: ['list'],
+                  with: { item: 'x' },
+                  fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+                },
+              ],
+            },
+            depends_on: [],
+          },
+        ],
+      },
+      makeWorkflowRun('compose-loop-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const events = eventsOf(mockDeps.store);
+    // The instance actually executed in BOTH iterations under iteration-scoped names.
+    const instanceCompletions = events.filter(
+      e =>
+        e.event_type === 'node_completed' &&
+        /^grp\.grp[12]__fan__[0-9a-f]{16}__work$/.test(e.step_name)
+    );
+    expect(instanceCompletions.length).toBe(2);
+    expect(instanceCompletions.every(e => e.data.node_output === 'DONE-a')).toBe(true);
+    expect(events.some(e => String(e.data.error ?? '').length > 0)).toBe(false);
+  });
 });

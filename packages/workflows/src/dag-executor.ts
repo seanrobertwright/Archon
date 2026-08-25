@@ -7920,21 +7920,21 @@ async function resolveFanOutChildDefinition(
   /** Parent run's AUTHORING directory; a fan-out target is a sibling workflow, so it
    *  lives beside the parent there rather than in the target workspace. */
   childSourceRoot?: string
-): Promise<{ definition: WorkflowDefinition } | { unresolved: string }> {
+): Promise<
+  { definition: WorkflowDefinition; definitions: WorkflowDefinition[] } | { unresolved: string }
+> {
   try {
     const { workflows } = await discoverWorkflowsWithConfig(
       cwd,
       deps.loadConfig,
       childSourceRoot === undefined ? undefined : liveSourceRoots(childSourceRoot)
     );
-    const definition = resolveWorkflowName(
-      targetName,
-      workflows.map(w => w.workflow)
-    );
+    const definitions = workflows.map(w => w.workflow);
+    const definition = resolveWorkflowName(targetName, definitions);
     // resolveWorkflowName returns undefined for an unknown name and THROWS only on
     // ambiguity, so the undefined branch is ordinary rather than exceptional.
     return definition
-      ? { definition }
+      ? { definition, definitions }
       : { unresolved: `no workflow named '${targetName}' was found` };
   } catch (err) {
     return { unresolved: (err as Error).message };
@@ -8677,7 +8677,11 @@ function expandComposeInstance(
   node: ComposeFanOutNode,
   identity: string,
   inputs: Record<string, JsonValue>,
-  definition: WorkflowDefinition
+  definition: WorkflowDefinition,
+  /** Every OTHER discovered workflow by name. A nested deferred compose_fan_out inside
+   *  the target resolves its own include against this map at instance time — scoping it
+   *  to just the target would fail every instance after upstream spend. */
+  siblingDefinitions: readonly WorkflowDefinition[]
 ): { nodes: DagNode[]; primarySink: string } | { error: string } {
   const directiveId = `${node.id}__${identity}`;
   const directive: IncludeDirective = {
@@ -8696,14 +8700,10 @@ function expandComposeInstance(
     description: '',
     nodes: [directive],
   };
-  const { workflows, errors } = expandWorkflowIncludes(
-    new Map([
-      [synth.name, synth],
-      // The target rides along so the synthetic directive resolves; expansion is
-      // memoized, and re-expanding the already-expanded block is idempotent.
-      [definition.name, definition],
-    ])
-  );
+  const rawByName = new Map<string, WorkflowDefinition>(siblingDefinitions.map(d => [d.name, d]));
+  rawByName.set(definition.name, definition);
+  rawByName.set(synth.name, synth);
+  const { workflows, errors } = expandWorkflowIncludes(rawByName);
   const expanded = workflows.get(synth.name);
   if (!expanded) {
     return { error: errors[0]?.error ?? `instance '${directiveId}' failed to expand` };
@@ -8908,6 +8908,7 @@ async function executeComposeFanOutNode(
     await notify(`❌ **Composed fan-out blocked** (node \`${node.id}\`): ${msg}`);
     return failResult(msg);
   }
+  const siblingDefinitions = resolved.definitions.filter(d => d.name !== resolved.definition.name);
   const bodyGates = collectComposedGates(resolved.definition.nodes);
   if (bodyGates.length > 0) {
     const names = bodyGates.map(g => `'${g.id}'`).join(', ');
@@ -8975,10 +8976,20 @@ async function executeComposeFanOutNode(
     );
   }
 
+  // Instance step names must disambiguate loop iterations: identities derive from item
+  // content alone, and the whole-run resume snapshot has no iteration filter — inside a
+  // loop_group body, iteration N > 1 would find iteration 1's persisted rows under bare
+  // `<nodeId>__<identity>__<inner>` names and resume-skip every instance. The frames ride
+  // the same `{groupId}.{iteration}` convention ctx.stepNamePrefix already uses for body
+  // nodes; at the top level the segment is empty so names stay `fan__<identity>__<inner>`.
+  const loopSegment = ctx.loopGroupPath.map(f => `${f.groupId}${f.iteration}`).join('__');
+  const instanceStepNamePrefix =
+    ctx.loopGroupPath.length > 0 ? `${ctx.stepNamePrefix}${loopSegment}__` : ctx.stepNamePrefix;
+
   // Execute incomplete identities through a bounded sliding window. Each instance runs
   // the composed body via runLayers in its own context: fresh output map, events under
-  // the parent run id with instance-qualified step names (empty prefix — the expander
-  // already produced fully-qualified ids).
+  // the parent run id with instance-qualified step names (the expander produced fully-
+  // qualified ids; the prefix only carries the enclosing loop iterations).
   const settled = await mapWithLimit(
     snapshots,
     fanOut.max_parallel,
@@ -8989,7 +9000,13 @@ async function executeComposeFanOutNode(
       };
       let expanded: { nodes: DagNode[]; primarySink: string } | { error: string };
       try {
-        expanded = expandComposeInstance(node, snapshot.identity, inputs, resolved.definition);
+        expanded = expandComposeInstance(
+          node,
+          snapshot.identity,
+          inputs,
+          resolved.definition,
+          siblingDefinitions
+        );
       } catch (err) {
         expanded = { error: (err as Error).message };
       }
@@ -9001,9 +9018,9 @@ async function executeComposeFanOutNode(
         };
       }
       // The expander prefixed every body node with the synthetic directive id
-      // (`<nodeId>__<identity>`), so primarySink is ALREADY instance-qualified — the same
-      // byte-for-byte name runLayers persists for the instance's terminal step.
-      const primaryStepName = expanded.primarySink;
+      // (`<nodeId>__<identity>`), so primarySink is ALREADY instance-qualified; the
+      // run-time prefix adds the enclosing loop iterations' disambiguator on top.
+      const primaryStepName = instanceStepNamePrefix + expanded.primarySink;
       const prior = priorOutputs?.get(primaryStepName);
       if (prior !== undefined) {
         // Resume skip: this instance's terminal already survived a prior pass.
@@ -9047,7 +9064,7 @@ async function executeComposeFanOutNode(
         totalCostUsd: 0,
         totalTokens: undefined,
         totalLoopIterations: 0,
-        stepNamePrefix: '',
+        stepNamePrefix: instanceStepNamePrefix,
         loopGroupPath: [],
       };
       await runLayers(instanceCtx);

@@ -188,6 +188,9 @@ export function validateWorkflowOutcomeDeclaration(
   if (isWorkflowNode(selectedNode) && selectedNode.fan_out !== undefined) {
     return `Workflow outcome_field: '${field}' cannot select fan-out workflow node '${workflow.returns}' because its runtime output is an aggregate array; select a collector node with a required boolean output instead`;
   }
+  if (isComposeFanOutNode(selectedNode)) {
+    return `Workflow outcome_field: '${field}' cannot select composed fan-out node '${workflow.returns}' because its runtime output is an aggregate array; select a collector node with a required boolean output instead`;
+  }
 
   const schema = selectedNode.output_format;
   if (schema === undefined) {

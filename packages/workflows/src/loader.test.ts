@@ -7571,6 +7571,32 @@ nodes:
     expect(error?.error).toContain('collector node');
   });
 
+  it('rejects a composed fan-out node because its runtime output is an aggregate array', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: compose-fan-out-outcome
+description: invalid direct outcome over an in-parent instance aggregate
+returns: fan
+outcome_field: green
+nodes:
+  - id: fan
+    include: some-block
+    fan_out:
+      items: "['a']"
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`,
+      'compose-fan-out-outcome.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.error).toContain('composed fan-out node');
+    expect(error?.error).toContain('collector node');
+  });
+
   it('rejects a loop_group because its declared output format is ignored at runtime', () => {
     const { workflow, error } = parseWorkflow(
       `
