@@ -1,7 +1,7 @@
 # Sparse per-run config (#2482): the free-model dogfood combo.
 # Steers one run (and its children/resumes) without touching persistent config:
 #
-#   bun run cli workflow run archon-fix "..." --config "$PWD/.archon/configs/free-models.yaml" --detach
+#   bun run cli workflow run archon-fix "..." --config "$PWD/.config.mini-alpha.yaml" --detach
 #
 # (with `bun run cli`, a relative --config resolves from packages/cli — use an
 # absolute path or $PWD; the installed `archon` binary resolves from your cwd)
