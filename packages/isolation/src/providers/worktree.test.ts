@@ -398,14 +398,15 @@ describe('WorktreeProvider', () => {
           branch: git.toBranchName('feature/live-pr'),
         },
       };
+      const expectedWorktreePath = provider.getWorktreePath(
+        request,
+        git.toBranchName('feature/live-pr')
+      );
 
       await expect(provider.create(request)).rejects.toThrow(
         "Failed to check out existing branch 'feature/live-pr': checkout interrupted"
       );
-      expect(removeWorktreeSpy).toHaveBeenCalledWith(
-        '/workspace/repo',
-        expect.stringContaining('feature/live-pr')
-      );
+      expect(removeWorktreeSpy).toHaveBeenCalledWith('/workspace/repo', expectedWorktreePath);
 
       removeWorktreeSpy.mockRestore();
     });
