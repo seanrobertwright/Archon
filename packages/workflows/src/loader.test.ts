@@ -2537,6 +2537,37 @@ ${suspensionNode}
       }
     });
 
+    it('treats a composed fan-out block as a suspension node', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(
+        join(workflowDir, 'gated-block.yaml'),
+        `name: gated-block\ndescription: block\nnodes:\n  - id: approve\n    approval:\n      message: Approve?\n`
+      );
+      await writeFile(
+        join(workflowDir, 'cfo-concurrent-suspension.yaml'),
+        `
+name: cfo-concurrent-suspension
+description: A wait and a suspending composed block must not race for the run cursor
+nodes:
+  - id: items
+    bash: "echo []"
+  - id: wait-for-time
+    wait:
+      duration_ms: 60000
+  - id: fan-block
+    include: gated-block
+    depends_on: [items]
+    fan_out:
+      items: "$items.output"
+`
+      );
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const err = result.errors.find(e => e.filename === 'cfo-concurrent-suspension.yaml');
+      expect(err).toBeDefined();
+      expect(err?.error).toContain("Suspending nodes 'wait-for-time'");
+    });
+
     it('rejects waits nested below more than one loop_group boundary', () => {
       const result = parseWorkflow(
         `

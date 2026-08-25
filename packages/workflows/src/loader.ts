@@ -871,6 +871,9 @@ export function validateDagStructure(
   const canSuspend = (node: DagNode | IncludeDirective): boolean => {
     if (isIncludeDirective(node)) return false;
     if (isGateNode(node) || isWaitNode(node) || isWorkflowNode(node)) return true;
+    // A composed block's gates are only known after expansion, so treat it as
+    // potentially suspending unconditionally.
+    if (isComposeFanOutNode(node)) return true;
     if (isLoopNode(node) && node.loop.interactive) return true;
     return (
       isLoopGroupNode(node) &&
