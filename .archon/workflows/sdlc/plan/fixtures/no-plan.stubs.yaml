@@ -5,3 +5,7 @@
 plan:
   ready: true
   summary: "stub: claims a complete plan but produced no artifact"
+fixture:
+  expect: failed
+  fail-node: assert-intact
+exec-code: true

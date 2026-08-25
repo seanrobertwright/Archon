@@ -4,3 +4,5 @@ investigate:
   rooted: false
   summary: "stub: two hypotheses survive — the report names what would separate them"
 assert-intact: '{"intact":"true"}'
+fixture:
+  expect: completed

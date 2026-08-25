@@ -3,3 +3,7 @@
 triage:
   route: plan
   summary: "stub: design choices remain"
+fixture:
+  expect: failed
+  fail-node: assert-intact
+exec-code: true

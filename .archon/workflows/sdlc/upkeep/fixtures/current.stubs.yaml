@@ -5,3 +5,6 @@ assess:
   action: no_action
   summary: "stub: the locked version already satisfies the advisory's fixed range"
 assert-intact: '{"intact":"true"}'
+fixture:
+  expect: completed
+exec-code: true

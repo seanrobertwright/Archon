@@ -6,3 +6,7 @@ implement:
   done: true
   green: false
   summary: "stub: declined — the plan file this run was pointed at does not exist"
+fixture:
+  expect: failed
+  fail-node: assert-changed
+exec-code: true

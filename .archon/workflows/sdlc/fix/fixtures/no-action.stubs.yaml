@@ -4,3 +4,6 @@ triage__triage:
   route: no_action
   summary: "stub: the requested outcome is already present on the current branch"
 triage__assert-intact: '{"intact":"true"}'
+fixture:
+  expect: completed
+exec-code: true

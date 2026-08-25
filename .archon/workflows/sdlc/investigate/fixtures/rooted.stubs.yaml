@@ -5,3 +5,5 @@ investigate:
   rooted: true
   summary: "stub: cause established — full report at investigation.md"
 assert-intact: '{"intact":"true"}'
+fixture:
+  expect: completed

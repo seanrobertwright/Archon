@@ -35,3 +35,6 @@ classify:
     types: "stub: no contract changes"
     docs: "stub: no doc-facing changes"
 resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+fixture:
+  expect: completed
+review__simplify: "0 findings (suggestions only)"

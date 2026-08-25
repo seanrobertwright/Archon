@@ -4,3 +4,5 @@ plan:
   ready: false
   summary: "stub: blocked on missing intent — the plan names the owner's open question"
 assert-intact: '{"intact":"true"}'
+fixture:
+  expect: completed

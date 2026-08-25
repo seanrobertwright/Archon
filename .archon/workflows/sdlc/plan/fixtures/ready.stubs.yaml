@@ -5,3 +5,5 @@ plan:
   ready: true
   summary: "stub: approach chosen — full plan at plan.md"
 assert-intact: '{"intact":"true"}'
+fixture:
+  expect: completed

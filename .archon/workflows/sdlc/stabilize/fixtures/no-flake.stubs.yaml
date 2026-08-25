@@ -5,3 +5,6 @@ assess:
   action: no_action
   summary: "stub: the named test was already stabilized on the current head — the sleep-based wait it flaked on no longer exists"
 assert-intact: '{"intact":"true"}'
+fixture:
+  expect: completed
+exec-code: true
