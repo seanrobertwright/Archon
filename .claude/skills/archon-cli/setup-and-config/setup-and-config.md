@@ -25,7 +25,9 @@ itself). Then either:
 
 ```bash
 # Source install
-git clone <archon-repo> && cd Archon && bun install && bun link
+git clone <archon-repo> && cd Archon
+bun install
+cd packages/cli && bun link && cd ../..
 
 # or run from a checkout without linking
 bun --cwd packages/cli src/cli.ts --help
@@ -42,14 +44,16 @@ The wizard composes these, which also work standalone:
 ```bash
 archon ai list                      # which providers are connected
 archon ai key set anthropic        # API key (prompt/stdin) — anthropic, openai, ...
-archon ai login claude             # subscription OAuth (claude, copilot)
+archon ai login anthropic          # Claude Pro/Max subscription
+archon ai login openai             # ChatGPT/Codex subscription
+archon ai login github-copilot     # GitHub Copilot subscription
 archon auth github                  # GitHub identity via device flow
 ```
 
 Notes:
 
-- Subscription logins cover Claude Pro/Max and Copilot; Codex/ChatGPT uses an
-  API-key path.
+- Subscription logins cover Claude Pro/Max, ChatGPT/Codex, and GitHub Copilot.
+  API keys remain available through `ai key set`.
 - On multi-user installs each human connects their own credentials; runs execute
   on the starter's keys. Solo installs just need one working provider.
 - `gh` must be authenticated (`gh auth status`) for any GitHub-touching workflow.
@@ -72,7 +76,7 @@ assistants:
     # provider-specific options live here too
 tiers:                     # how much model a step deserves; keywords small/medium/large
   large:
-    provider: anthropic
+    provider: claude
     model: claude-<...>
     effort: high
 aliases:                   # @name shortcuts resolvable in workflows
@@ -90,11 +94,15 @@ env:                           # per-project env vars injected into execution
 Prefer the typed commands over hand-editing when they exist — they validate:
 
 ```bash
-archon ai tier set large anthropic claude-<model> --effort high
+archon ai tier set large claude claude-<model> --effort high
 archon ai tier list --json     # configured vs built-in defaults
-archon ai alias set @fast pi minimax-m3          # if supported by your build
-archon ai key set openai sk-...
+archon ai alias set @fast pi minimax/MiniMax-M3  # if supported by your build
+archon ai key set openai                         # masked prompt, or key via stdin
 ```
+
+Tier, alias, and default commands write install-wide settings unless you pass
+`--scope user`. Use the user scope for one person's preferences on a shared
+install; use the install scope for shared defaults.
 
 After edits, confirm with `archon doctor` and one cheap probe:
 `archon workflow list` should load with no errors.
@@ -110,19 +118,22 @@ layer** holding only the keys it overrides, and load it per run with `--config`:
 tiers:
   small:
     provider: pi
-    model: pi/minimax/minimax-m3
+    model: minimax/MiniMax-M3
   large:
     provider: pi
-    model: pi/minimax/minimax-m3
+    model: minimax/MiniMax-M3
 aliases:
   "@fast":
     provider: pi
-    model: pi/minimax/minimax-m3
+    model: minimax/MiniMax-M3
 ```
 
-Valid layer keys: `tiers`, `aliases`, `assistants`, `assistant`, `workflows`,
-`docsPath`, `envVars`. Tier/alias models must be full `<provider>/<model-ref>`
-specs (`pi/minimax/minimax-m3`, not bare `minimax-m3`).
+Valid layer keys: `assistant` or `defaultAssistant`, `assistants`, `tiers`,
+`aliases`, `workflows`, `docs` (with `path`), and `env`. A tier or alias entry
+stores the Archon provider separately from the model. For `provider: pi`, the
+model is Pi's inner `<vendor>/<model>` reference, such as
+`minimax/MiniMax-M3`. The outer `pi/` appears only in a single-string CLI
+binding such as `--model large=pi/minimax/MiniMax-M3`.
 
 ```bash
 archon workflow run archon-ship --branch fix/x "..." --config .config.free.yaml

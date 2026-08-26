@@ -14,8 +14,9 @@ argument-hint: "[workflow | run-id | intent]"
 
 # Archon CLI
 
-Archon runs multi-step AI workflows in isolated git worktrees, driven entirely
-through the `archon` CLI. This skill has five capabilities; route by intent:
+Archon runs multi-step AI workflows through the `archon` CLI. Git projects use
+isolated worktrees by default; registered folder projects run in place. This
+skill has five capabilities; route by intent:
 
 | User wants to... | Read |
 |---|---|
@@ -49,18 +50,22 @@ Most requests land here. The short version; details in the running reference:
 4. When a run pauses at a gate, resolve it deliberately:
    see `manage-run/manage-runs.md`.
 
-Two hard rules:
+Three hard rules:
 
-- Interactive-class workflows (approval gates) refuse `--detach`. Run them in the
-  foreground as a background *task* of your harness instead.
+- A fresh launch of an interactive-class workflow refuses `--detach`. Run that
+  launch in the foreground as a background *task* of your harness. Once the run
+  pauses, `resume`/`approve`/`reject`/`respond --detach` are supported continuation
+  actions.
 - Prefer `--detach` if the workflow is not interactive.
 - One workflow per shell; multiple tasks = separate invocations, separate branches.
 
 ## Gotchas
 
-- The current directory scopes every command to that project. Run from the repo root.
-- A completed run does not mean the work succeeded — read the run's report artifact
-  and outcome fields (`archon workflow get <run-id> --verbose --json`), not just status.
+- The current directory scopes every command to that project. For a git project,
+  run from the repo root. Register a non-git project with `workflow run --folder`.
+- A completed run does not mean the work succeeded. Use `workflow get <run-id>
+  --json` for the normalized `outcome` and `leave_behind.artifactFiles`; use a
+  separate `--verbose --json` call for node summaries.
 - Prefer `--json` whenever you will parse output.
 
 ## Resources

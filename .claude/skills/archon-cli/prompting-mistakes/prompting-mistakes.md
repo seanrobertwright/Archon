@@ -21,8 +21,8 @@ command/prompt nodes** you author.
 ## The mistakes
 
 1. **Vague outcome, implied method.** "Look into the auth thing." Say what done
-   looks like and where context lives: "Fix issue #42; root cause is likely in
-   session refresh; keep the fix store-level."
+   looks like and where context lives: "Fix issue #42. Use the issue, comments,
+   and current source as evidence. Preserve the documented login behavior."
 2. **Smuggling your diagnosis.** If you want the run's investigation tested,
    ask for the fix in ordinary language — do not hand it your suspected root
    cause as fact unless you have proven it.
@@ -44,8 +44,9 @@ command/prompt nodes** you author.
 9. **Stop rules left unstated.** Tell the agent when to stop and surface:
    ambiguity → present options; missing context → name it. Never "use judgment"
    on decisions with real cost.
-10. **Soft failure language.** "Try to..." invites theater. "Run X; if it fails,
-    fail the run with its stderr" makes failure legible downstream.
+10. **Soft failure language.** "Try to..." invites theater. Put checkable failure
+    in a `bash:`/`script:` node whose exit code fails the run, or have a judging
+    node return a structured boolean and gate on it deterministically.
 
 ## The one-line test
 

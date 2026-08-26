@@ -75,6 +75,16 @@ describe('CLI help output', () => {
     expect(help.status).toBe(0);
     expect(help.stdout).toContain('--config <path>');
   });
+
+  it('documents the unified skill destinations and subscription providers', () => {
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain(
+      'skill install [path]       Install archon-cli into .claude/skills and .agents/skills'
+    );
+    expect(help.stdout).toContain(
+      'ai login <provider>        Connect a Claude, ChatGPT/Codex, or Copilot subscription'
+    );
+  });
 });
 
 describe('workflow model arguments', () => {

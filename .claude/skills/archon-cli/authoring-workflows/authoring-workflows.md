@@ -38,9 +38,12 @@ Work through these questions in order, with the user where marked:
 4. **Primitives.** Thinking in primitives is right: name the small jobs that
    compose into the outcome — investigate, decide, implement, verify, publish;
    or intake, enrich, judge, route, notify for an ops queue.
-   Each becomes one node (or one loop body); if a job needs judgment it is an AI
-   node, if it is checkable it is code. The primitive set comes from THIS outcome,
-   not from copying another workflow's node list.
+   Package each coherent reusable primitive as a workflow folder with declared
+   `inputs:` and `returns:`. It can then run alone or compose into a parent with
+   `include:` and `with:`. Nodes implement a primitive's internals and the small
+   one-off glue in a parent: use an AI node for judgment and code for a checkable
+   fact. The primitive set comes from THIS outcome, not from copying another
+   workflow's node list.
 5. **Gate placement (with the user).** Where must the run stop before
    continuing, and what decides? Three gate kinds, all first-class:
 
@@ -49,24 +52,25 @@ Work through these questions in order, with the user where marked:
      in code work: tests pass, file exists; in ops: totals reconcile, every
      row has an owner, the export count matches the source. Cheapest and least
      arguable.
-   - **Prompt command gates** — one agent judging another's output against an
-     evidence bar: a verifier reads the diff/artifact/entry, checks claims and
-     criteria, and returns a structured boolean that drives the loop or the
-     branch. When gate design is unknown, START HERE: an agent checking agents is
-     the most powerful general-purpose gate and catches what no fixed check
-     anticipated. Keep the verdict structured (`output_format` boolean) so a
-     machine consumes it; keep the judgment prose in the prompt. Grounded on an
-     **authored sidecar** — a versioned rubric/directions file in the repo — an
-     agent judgment gate stands in for a typical human reviewer: same criteria,
-     same questions, recorded answers, every run.
+   - **Prompt command gates** — an independent verifier judging another agent's
+     output against an evidence bar. Start the verifier with `context: fresh`,
+     have it read the diff/artifact/entry, check claims and criteria, and return a
+     structured boolean that drives the loop or branch. When gate design is
+     unknown, START HERE: an agent checking agents is the most powerful
+     general-purpose gate and catches what no fixed check anticipated. Keep the
+     verdict structured (`output_format` boolean) so a machine consumes it; keep
+     the judgment prose in the prompt. Grounded on an **authored sidecar** — a
+     versioned rubric/directions file in the repo — an agent judgment gate stands
+     in for a typical human reviewer: same criteria, same questions, recorded
+     answers, every run.
    - **Human `approval:` gates** — only two cases justify them: an
      **interactive** workflow where a human is present at the console and reads
      each iteration, or a **super load-bearing** action — irreversible,
      public-facing, or expensive beyond easy rollback (deploy, post publicly,
      delete data, send customer-facing communication). Everything else should be
      decidable by code or by another agent. Remember: any `approval:` gate forces
-     `interactive: true` at the workflow level, which means the run can never be
-     detached.
+     `interactive: true` at the workflow level. The fresh launch cannot detach;
+     continuation actions on an already-paused run can.
 
    On a project-specific workflow the user often already knows some of these —
    "never push before I see the diff", "stop if the migration touches billing",
@@ -89,8 +93,11 @@ Work through these questions in order, with the user where marked:
 8. **Wiring** into YAML (below), then **fixtures**: every authored workflow ships
    a dry-run fixture under `<pack>/<workflow>/fixtures/*.stubs.yaml` declaring its
    expected outcome. Prove red paths red before trusting them — on a clean tree.
+   Fixtures prove the paths that dry-run can execute. A reachable `workflow:` or
+   `include:` + `fan_out:` node fails dry-run by design, so prove that path with a
+   small real acceptance run while keeping fixtures for the surrounding wiring.
 9. Validate: load-time errors surface in `archon workflow list`; then
-   `archon workflow test <workflow>` runs the fixture set without AI spend.
+   `archon workflow test <workflow>` runs supported fixture paths without AI spend.
 
 ## Start simple, then adapt to what runs teach
 
@@ -139,7 +146,7 @@ will maintain it.
 (py/ts, no AI) · `loop` (iterate one AI node) · `loop_group` (repeat a sub-DAG) ·
 `approval` (human gate) · `cancel` (terminate with reason, usually behind `when:`) ·
 `wait` (durable suspension) · `workflow` (governed child run) · `include`
-(load-time composition).
+(plain load-time composition or runtime-width in-run composition with `fan_out:`).
 
 Selection rules of thumb:
 
@@ -165,10 +172,12 @@ tax on non-enforcing providers. Provider-agnostic YAML always: tiers
 
 ## Isolation and interactivity
 
-- `isolation: worktree` is explicit, never inferred. A worktree bounds git files;
-  it does NOT isolate `~/.archon`, env, database, or sessions.
-- Any `approval:` gate requires `interactive: true` at the workflow level — such
-  workflows can never run detached.
+- At workflow level, `worktree.enabled: true` pins worktree isolation. Omission
+  leaves the choice to the caller. On a `workflow:` child node,
+  `isolation: worktree` explicitly gives the child its own worktree. A worktree
+  bounds git files; it does NOT isolate `~/.archon`, env, database, or sessions.
+- Any `approval:` gate requires `interactive: true` at the workflow level. A fresh
+  interactive launch cannot detach; continuation actions on an already-paused run can.
 - Composition (`include:`) runs inside the parent's single run/isolation/audit
   trail. Use `workflow:` sub-runs only when a separately governed launch is the
   actual requirement.

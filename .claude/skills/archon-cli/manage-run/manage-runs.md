@@ -49,6 +49,7 @@ For reusable alternate setups, prefer a config layer instead of long flag lists
 | Filter by status / cap rows | `archon workflow runs --status running --limit 50 --json` |
 | One run's status/error | `archon workflow get <run-id> --json` |
 | One run with per-node detail | `archon workflow get <run-id> --verbose --json` |
+| One run with raw event rows | `archon workflow get <run-id> --verbose --events --json` |
 | Active runs only | `archon workflow status --json` |
 | Resolve a gate with any declared decision | `archon workflow respond <run-id> <decision> [text]` |
 | Approve (default vocabulary) | `archon workflow approve <run-id> [text]` |
@@ -74,6 +75,11 @@ archon workflow approve <run-id> "ship it" --json   # recorded, resumable: true
 archon workflow resume <run-id>                     # executes; background task
 ```
 
+To let the continuation own a background process, add `--detach` to
+`approve`/`reject`/`respond`/`resume`. The parent validates the run and returns an
+ack with `continues: true`; the detached child records the decision and continues
+without `--json`.
+
 ## Interactive-loop gates: comment or no comment is a decision
 
 Read the gate state first:
@@ -86,7 +92,9 @@ archon workflow get <run-id> --json | jq .metadata.approval.completionSignaled
   finalizes from its already-computed output, no re-run.
 - You approve **with** a comment → another full iteration runs using your text
   as feedback.
-- Reject always needs a reason; it becomes `$REJECTION_REASON` for rework nodes.
+- Reject always needs a reason. Gates with authored `decisions:` expose it as
+  `$gate.output.text`; only legacy `approval.on_reject` prompts receive
+  `$REJECTION_REASON`.
 
 Choose deliberately after reading what the gate produced — not by reflex.
 
@@ -105,12 +113,19 @@ guessing one.
 
 ## Judging a finished run
 
-Terminal ≠ good. From `get --verbose --json`, read:
+Terminal ≠ good. The three JSON modes expose different data:
 
-- per-node states (what actually ran vs was skipped),
-- declared outcome fields wherever the workflow declares an `outcome_field:`
-  (sdlc pack uses `green`, `ready`, `rooted`; any workflow may declare its own),
-- the report artifact path in metadata — read it before reporting to the user.
+| Command | Read |
+|---|---|
+| `get <id> --json` | top-level normalized `outcome` (`succeeded`/`failed`) and `leave_behind.artifactFiles` |
+| `get <id> --verbose --json` | ordered `nodes` summaries and parse warnings |
+| `get <id> --verbose --events --json` | raw `events` rows |
+
+`outcome_field` selects a boolean from the return node, but the run stores only
+the normalized top-level outcome. It does not expose the authored field name
+(`green`, `ready`, or `rooted`) as another top-level property. Locate the report
+through `leave_behind.artifactFiles`, then read the artifact before reporting to
+the user.
 
 Report outcomes with their evidence: "completed, review verdict ready:false —
 2 findings remain, report at <path>" beats "done".

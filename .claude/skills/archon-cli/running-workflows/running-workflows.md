@@ -29,11 +29,14 @@ archon workflow run <workflow> --branch <branch-name> "<message>" --detach
 archon workflow run <workflow> --branch <name> --from <base> "<message>" --detach
 
 # Foreground (blocks the shell) — REQUIRED for interactive-class workflows,
-# which refuse --detach on every surface
+# whose fresh launches refuse --detach
 archon workflow run <workflow> --branch <name> "<message>"
 
 # No isolation — only when the user explicitly asks to work on the checkout directly
 archon workflow run <workflow> --no-worktree "<message>"
+
+# First run for a registered non-git folder project (runs in place; no branch flags)
+archon workflow run <workflow> --folder "<message>"
 ```
 
 Rules:
@@ -41,24 +44,25 @@ Rules:
 1. **Detached is the default posture.** Workflows are long-running; `--detach`
    returns immediately and the run appears in `archon workflow runs`. In your
    harness, even foreground invocations belong in a background task.
-2. **Always pass `--branch`** unless the user chose otherwise. Derive the name
+2. **For git projects, pass `--branch`** unless the user chose otherwise. Derive the name
    from the domain of work — code: `fix/<topic-or-issue-N>`, `feat/<name>`,
    `review/pr-N`; ops/process runs: e.g. `ops/<queue>-<item>`,
    `upkeep/<dependency>`, `triage/<source>`. To run on
    different models for one run, see the sibling
    `../manage-run/manage-runs.md` ("Overriding models for one run").
+   Folder projects run in place and reject `--branch`, `--from`, and `--base`.
 3. **One workflow per shell.** Multiple pieces of work = separate invocations with
    separate branches; they cannot conflict because each gets its own worktree.
 4. **The message is the work order.** Write it as you would brief a competent
    engineer: what outcome is wanted, where the context lives (issue number, plan
    path), and any constraint the user actually stated. See
    `../prompting-mistakes/prompting-mistakes.md` before writing it (this file stands alone without it).
-5. **Interactive workflows need a human at their gates.** They run foreground;
-   when they pause, resolve the gate per the sibling `../manage-run/manage-runs.md`.
-   You are a transparent relay, not a commentator: fetch the gate's output from
-   the run log (`jq -sr 'map(select(.type == "assistant") | .content) | last // empty' <log>`)
-   and show it to the user verbatim — no summarizing, no "the workflow asked..."
-   framing. Then take the user's reply back into approve/respond as-is.
+5. **Interactive workflows need a human at their gates.** Launch them in the
+   foreground. When they pause, read the rendered gate message and declared
+   decisions from `archon workflow get <run-id> --json` under
+   `metadata.approval`; assistant JSONL rows are AI transcripts, not the gate
+   contract. Resolve the gate per `../manage-run/manage-runs.md`. Continuation
+   actions on the paused run may use `--detach`.
 
 ## Monitoring
 
@@ -72,11 +76,10 @@ archon workflow get <run-id> --verbose --json  # + per-node detail
 Terminal statuses: `completed`, `failed`, `cancelled`. Poll `get` between other
 work rather than sleeping in a tight loop.
 
-**Status is not verdict.** A `completed` run can carry an authored negative outcome
-(a declined implement records `green: false`; an investigation that found no safe
-fix boundary records `rooted: false`). Read the run's report artifact and outcome
-fields from `get --verbose` and judge the evidence, then report honestly to the
-user — including when the honest answer is "the run completed but declined".
+**Status is not verdict.** A `completed` run can carry a normalized negative
+`outcome`. Read it with `get --json`, locate the report under
+`leave_behind.artifactFiles`, and use a separate `get --verbose --json` call for
+node summaries. Read the report before telling the user what the run concluded.
 
 ## Continuing finished work
 
@@ -89,11 +92,15 @@ archon isolation cleanup --merged                           # prune merged ones 
 
 ## Resuming after failure
 
-A failed or paused run resumes from completed nodes — AI session context is not
-restored:
+A failed or paused run resumes from completed nodes:
 
 ```bash
 archon workflow resume <run-id>
+archon workflow resume <run-id> --detach
 ```
 
-Run it as a background task; it re-executes streaming output.
+The ambient sequential session cursor is not reconstructed by a cold resume.
+Explicit `context: { resume: node-id }` ancestry is restored from the completed
+source's saved handle, and a paused loop with `fresh_context: false` continues its
+pre-pause session when the provider supports it. Use durable artifacts for every
+handoff that must survive regardless of provider session availability.
