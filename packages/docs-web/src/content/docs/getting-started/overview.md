@@ -479,6 +479,7 @@ Archon skill into your project. The setup wizard handles this automatically — 
 To install manually instead, run `archon skill install /path/to/your/repo`, or copy it by hand:
 
 ```bash
+mkdir -p /path/to/your/repo/.claude/skills
 cp -r Archon/.claude/skills/archon-cli /path/to/your/repo/.claude/skills/
 ```
 

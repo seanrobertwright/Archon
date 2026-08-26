@@ -26,7 +26,7 @@ and why in one line.
 archon workflow run <workflow> --branch <branch-name> "<message>" --detach
 
 # Start from a specific base instead of the current branch
-archon workflow run <workflow> --branch <name> --from <base> "<message>"
+archon workflow run <workflow> --branch <name> --from <base> "<message>" --detach
 
 # Foreground (blocks the shell) — REQUIRED for interactive-class workflows,
 # which refuse --detach on every surface
@@ -56,7 +56,7 @@ Rules:
 5. **Interactive workflows need a human at their gates.** They run foreground;
    when they pause, resolve the gate per the sibling `../manage-run/manage-runs.md`.
    You are a transparent relay, not a commentator: fetch the gate's output from
-   the run log (`jq 'select(.type == "assistant") | .content' <log> | tail -1`)
+   the run log (`jq -sr 'map(select(.type == "assistant") | .content) | last // empty' <log>`)
    and show it to the user verbatim — no summarizing, no "the workflow asked..."
    framing. Then take the user's reply back into approve/respond as-is.
 
@@ -81,7 +81,7 @@ user — including when the honest answer is "the run completed but declined".
 ## Continuing finished work
 
 ```bash
-archon continue fix/issue-42 "Now also update the docs"     # resume a worktree branch
+archon continue fix/issue-42 "Now also update the docs"     # start a new run on the existing branch
 archon complete fix/issue-42                                # remove worktree + branches
 archon isolation cleanup                                    # prune stale environments (7d)
 archon isolation cleanup --merged                           # prune merged ones now

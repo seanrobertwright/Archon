@@ -7,10 +7,10 @@
  * (for Claude Code) and <targetPath>/.agents/skills/archon-cli/ (the canonical Codex
  * project-level skill path) so both Claude Code and Codex pick them up.
  *
- * Always overwrites existing files to ensure the latest skill version
- * shipped with the current Archon binary is installed.
+ * Removes the two retired Archon-owned skill roots, then overwrites existing
+ * archon-cli files so only the version shipped with the current binary is active.
  */
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 
 /** Write a skill's relative-path→content map under <skillRoot>, creating dirs as needed. */
@@ -50,6 +50,8 @@ export async function copyArchonSkill(targetPath: string): Promise<void> {
   ];
 
   for (const skillsRoot of skillsRoots) {
+    rmSync(join(skillsRoot, 'archon'), { recursive: true, force: true });
+    rmSync(join(skillsRoot, 'manage-run'), { recursive: true, force: true });
     writeSkillFiles(join(skillsRoot, 'archon-cli'), BUNDLED_SKILL_FILES);
   }
 }
@@ -75,7 +77,7 @@ export async function skillInstallCommand(targetPath: string): Promise<number> {
       join(absoluteTarget, '.agents', 'skills'),
     ];
     console.log(
-      `Installing Archon skills (archon + manage-run, ${fileCount} files per destination) into ${installTargets.join(' and ')}`
+      `Installing Archon skill (archon-cli, ${fileCount} files per destination) into ${installTargets.join(' and ')}`
     );
 
     await copyArchonSkill(absoluteTarget);

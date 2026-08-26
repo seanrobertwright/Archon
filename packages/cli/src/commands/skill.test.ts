@@ -2,7 +2,7 @@
  * Tests for skill install command
  */
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { BUNDLED_SKILL_FILES } from '../bundled-skill';
@@ -73,6 +73,26 @@ describe('copyArchonSkill', () => {
 
     await copyArchonSkill(tempDir);
     expect(readFileSync(skillMdPath, 'utf-8')).toBe(BUNDLED_SKILL_FILES['SKILL.md']);
+  });
+
+  it('removes obsolete skills from both supported skill roots during upgrades', async () => {
+    for (const root of ['.claude', '.agents']) {
+      const skillsRoot = join(tempDir, root, 'skills');
+      const obsoleteRoots = [join(skillsRoot, 'archon'), join(skillsRoot, 'manage-run')];
+      for (const obsoleteRoot of obsoleteRoots) {
+        mkdirSync(obsoleteRoot, { recursive: true });
+        writeFileSync(join(obsoleteRoot, 'SKILL.md'), 'STALE');
+      }
+    }
+
+    await copyArchonSkill(tempDir);
+
+    for (const root of ['.claude', '.agents']) {
+      const skillsRoot = join(tempDir, root, 'skills');
+      expect(existsSync(join(skillsRoot, 'archon'))).toBe(false);
+      expect(existsSync(join(skillsRoot, 'manage-run'))).toBe(false);
+      expect(existsSync(join(skillsRoot, 'archon-cli', 'SKILL.md'))).toBe(true);
+    }
   });
 });
 

@@ -26,7 +26,7 @@ archon workflow run archon-ship --branch fix/x "..." \
 ```
 
 Spec format: `<tier|@alias>=<provider>/<model-ref>` where `<model-ref>` is what
-the named provider expects (for Pi backends that is itself a `<vendor>/<model>
+the named provider expects (for Pi backends that is itself a `<vendor>/<model>`
 ref, e.g. `pi/minimax/minimax-m3`). An unknown tier/alias errors with the list
 of defined names.
 

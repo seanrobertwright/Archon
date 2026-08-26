@@ -3,11 +3,11 @@ name: archon-cli
 description: |
   Drive Archon through its CLI: run AI workflows on a repo, manage those runs
   (inspect, approve, reject, cancel, resume), set up Archon or change its config,
-  and author new workflows. Use when the user says "use archon", "run archon",
+  author new workflows, and improve workflow prompts. Use when the user says "use archon", "run archon",
   "archon workflow", "fix issue #N with archon", "have archon review this PR",
   "what's running / check run <id>", "approve/reject/cancel/resume that run",
   "set up archon", "configure archon", "change my archon config",
-  "create a workflow", or "author a workflow".
+  "create a workflow", "author a workflow", or asks how to write a better Archon prompt.
   NOT for: doing the coding work yourself — Archon delegates it to isolated runs.
 argument-hint: "[workflow | run-id | intent]"
 ---
@@ -15,7 +15,7 @@ argument-hint: "[workflow | run-id | intent]"
 # Archon CLI
 
 Archon runs multi-step AI workflows in isolated git worktrees, driven entirely
-through the `archon` CLI. This skill has four capabilities; route by intent:
+through the `archon` CLI. This skill has five capabilities; route by intent:
 
 | User wants to... | Read |
 |---|---|
@@ -23,12 +23,13 @@ through the `archon` CLI. This skill has four capabilities; route by intent:
 | **Manage** existing runs (inspect/approve/reject/cancel/resume) | `manage-run/manage-runs.md` |
 | **Set up** Archon or change config | `setup-and-config/setup-and-config.md` |
 | **Author** a new workflow | `authoring-workflows/authoring-workflows.md` (+ its `node-reference.md`) |
+| **Improve prompts** for workflow nodes or run messages | `prompting-mistakes/prompting-mistakes.md` |
 
 Routing rules:
 
 - Intent is clear from the request ("build me a workflow for X", "run archon-ship
   on issue #42") → route directly. Do not ask.
-- Genuinely ambiguous → ask the user which capability they want, listing these four.
+- Genuinely ambiguous → ask the user which capability they want, listing these five.
 - First contact with an unconfigured machine → `setup-and-config/setup-and-config.md` before anything else.
 
 ## Quick spine: running a workflow

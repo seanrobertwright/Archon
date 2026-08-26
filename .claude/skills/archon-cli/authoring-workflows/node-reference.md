@@ -24,10 +24,10 @@ worktree:
 mutates_checkout: false      # declare when the workflow never touches the working tree
 ```
 
-## The eight node types
+## The eleven node types
 
 Exactly one of these appears per node: `command`, `prompt`, `bash`, `script`,
-`loop`, `loop_group`, `approval`, `cancel`.
+`loop`, `loop_group`, `approval`, `cancel`, `wait`, `workflow`, `include`.
 
 ### command / prompt — AI nodes
 
@@ -143,6 +143,45 @@ for interactive sessions or super load-bearing actions.
   cancel: "Refusing: input flagged UNSAFE."
   when: "$classify.output != 'SAFE'"
 ```
+
+### workflow / include — reuse another workflow
+
+Use `workflow:` to start a governed child run with its own artifacts, gates, cost,
+and audit trail. Use `include:` to flatten a reusable workflow block into the
+current run at load time.
+
+```yaml
+- id: review-child
+  workflow: archon-review
+  with:
+    branch: "$INPUTS.branch"
+  isolation: worktree
+
+- id: review-inline
+  include: archon-review-block
+  with:
+    branch: "$INPUTS.branch"
+```
+
+The `workflow:` target name is static YAML but resolves when the node executes,
+so a prior node may author the child workflow. `workflow:` also accepts `input:`
+instead of `with:` and can declare `fan_out:`. An `include:` target resolves and
+expands fully at load time; the directive carries only structural graph fields
+plus `with:` and has no execution surface of its own.
+
+### wait — suspend durably
+
+```yaml
+- id: pause-for-ci
+  wait:
+    duration_ms: 300000
+```
+
+A wait declares exactly one bounded condition: `duration_ms`, an ISO timestamp
+under `until`, or `event` plus `deadline_ms`. Archon persists the suspension and
+releases the worker slot. Its fixed structured output includes `status`
+(`satisfied` or `expired`) and `waited_ms`; event waits may also return `event`
+and `payload`.
 
 ## Wiring nodes together
 

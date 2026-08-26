@@ -96,8 +96,8 @@ Work through these questions in order, with the user where marked:
 
 The first version is deliberately under-engineered:
 
-- Few nodes, short prompts, key gates, dont add determinism because you can, to much determinsim
-  added before a real run is a guess about where things fail.
+- Use few nodes, short prompts, and key gates. Do not add determinism without evidence;
+  before a real run, it is only a guess about where things fail.
 - Dogfood it immediately on something real — a genuine task in the actual repo,
   not a demo. The run itself is the test.
 - Adapt from evidence, not anticipation: a failure shows which gate was missing;
@@ -120,7 +120,7 @@ copyable between repos as one unit. To start one in a repo:
 mkdir -p .archon/workflows/my-pack/my-workflow/{commands,scripts,fixtures}
 ```
 
-```
+```text
 .archon/workflows/<pack>/<workflow>/
 ├── <workflow>.yaml      # name, description, inputs:, returns:, nodes:
 ├── commands/*.md        # prompt files referenced by command: nodes
@@ -137,7 +137,9 @@ will maintain it.
 
 `command` (prompt file) · `prompt` (inline) · `bash` (shell, no AI) · `script`
 (py/ts, no AI) · `loop` (iterate one AI node) · `loop_group` (repeat a sub-DAG) ·
-`approval` (human gate) · `cancel` (terminate with reason, usually behind `when:`).
+`approval` (human gate) · `cancel` (terminate with reason, usually behind `when:`) ·
+`wait` (durable suspension) · `workflow` (governed child run) · `include`
+(load-time composition).
 
 Selection rules of thumb:
 

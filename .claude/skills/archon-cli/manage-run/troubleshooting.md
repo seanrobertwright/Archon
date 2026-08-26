@@ -6,7 +6,7 @@ Where to look when a workflow fails, hangs, or does the wrong thing.
 
 Workflow run logs are written as JSONL per run:
 
-```
+```text
 ~/.archon/workspaces/<owner>/<repo>/logs/<run-id>.jsonl
 ```
 
@@ -26,7 +26,7 @@ Find the run ID from `archon workflow runs --status failed` (or `archon workflow
 
 ```bash
 # Last assistant message (what the AI said before failure)
-jq 'select(.type == "assistant") | .content' <log-file> | tail -1
+jq -sr 'map(select(.type == "assistant") | .content) | last // empty' <log-file>
 
 # All error events (node failures + workflow-level failures)
 jq 'select(.type == "node_error" or .type == "workflow_error")' <log-file>
@@ -39,7 +39,7 @@ Adapter logs (Slack / Telegram / Web / GitHub) are emitted to stderr when `LOG_L
 
 ## Artifact Locations
 
-```
+```text
 ~/.archon/workspaces/<owner>/<repo>/artifacts/runs/<run-id>/
 ```
 
@@ -110,9 +110,9 @@ archon workflow resume <run-id>
 
 ### Approval gate not appearing on web UI
 
-You set `interactive: true` on the approval node but the workflow still runs in the background and no chat message appears.
+The workflow has an approval node but still runs in the background and no chat message appears.
 
-**Fix:** Set `interactive: true` at the **workflow level** too. Node-level `interactive` is ignored on web without workflow-level `interactive`. See `references/workflow-dag.md` §Approval Nodes and §Interactive Loops.
+**Fix:** Set `interactive: true` at the **workflow level**. Node-level `interactive` is not a supported field; the loader ignores it and warns that the key is unknown.
 
 ### `MCP server connection failed: <plugin>` noise in chat
 
