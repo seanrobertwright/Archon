@@ -20,7 +20,7 @@ tier keywords or aliases at launch — the persistent config stays untouched:
 
 ```bash
 # Rebind one or more tiers / @aliases for this run only; repeat per binding
-archon workflow run archon-fix --branch fix/x "..." \
+archon workflow run archon-ship --branch fix/x "..." \
   --model large=pi/minimax/minimax-m3 \
   --model small=openai/gpt-5-mini
 ```

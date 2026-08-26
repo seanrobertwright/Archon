@@ -125,7 +125,7 @@ Valid layer keys: `tiers`, `aliases`, `assistants`, `assistant`, `workflows`,
 specs (`pi/minimax/minimax-m3`, not bare `minimax-m3`).
 
 ```bash
-archon workflow run archon-fix --branch fix/x "..." --config .config.free.yaml
+archon workflow run archon-ship --branch fix/x "..." --config .config.free.yaml
 ```
 
 Notes:

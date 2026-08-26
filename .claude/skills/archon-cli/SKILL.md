@@ -26,7 +26,7 @@ through the `archon` CLI. This skill has four capabilities; route by intent:
 
 Routing rules:
 
-- Intent is clear from the request ("build me a workflow for X", "run archon-fix
+- Intent is clear from the request ("build me a workflow for X", "run archon-ship
   on issue #42") → route directly. Do not ask.
 - Genuinely ambiguous → ask the user which capability they want, listing these four.
 - First contact with an unconfigured machine → `setup-and-config/setup-and-config.md` before anything else.

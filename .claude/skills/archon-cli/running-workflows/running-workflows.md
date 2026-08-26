@@ -11,7 +11,7 @@ archon workflow search "pr review"  # search the marketplace (installable packs)
 ```
 
 The live list is authoritative. Bundled workflows ship under the `archon-` prefix
-(e.g. `archon-fix`, `archon-review`, `archon-deliver`, `archon-investigate`,
+(e.g. `archon-ship`, `archon-review`, `archon-deliver`, `archon-investigate`,
 `archon-triage`, `archon-upkeep`, `archon-stabilize`); user-authored workflows may
 claim any name and override a bundled one in that repo.
 

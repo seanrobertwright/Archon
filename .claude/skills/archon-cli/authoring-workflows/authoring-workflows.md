@@ -33,7 +33,7 @@ Work through these questions in order, with the user where marked:
    into a user workflow by default. Their prompts and gates are deliberately
    general so they fit any project; a user workflow composed out of them inherits
    that generality and loses the specificity that made it valuable. If the user
-   asks for "something like archon-fix but for my repo", write a new workflow in
+   asks for "something like archon-ship but for my repo", write a new workflow in
    their project's terms, using the pack only as the craft reference.
 4. **Primitives.** Thinking in primitives is right: name the small jobs that
    compose into the outcome — investigate, decide, implement, verify, publish;
@@ -100,9 +100,6 @@ The first version is deliberately under-engineered:
   added before a real run is a guess about where things fail.
 - Dogfood it immediately on something real — a genuine task in the actual repo,
   not a demo. The run itself is the test.
-- Author against a different imaginary project first: if your prompt examples
-  only make sense for the repo you're staring at, you've smuggled one project's
-  incident into a general workflow. The smell description or input IS the spec.
 - Adapt from evidence, not anticipation: a failure shows which gate was missing;
   a wasted review shows which check earned its place. Add machinery only where a
   logged occurrence demands it.
