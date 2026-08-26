@@ -24,6 +24,17 @@ worktree:
 mutates_checkout: false      # declare when the workflow never touches the working tree
 ```
 
+An input default does not fall back to the invocation message automatically.
+When both are valid sources, give the model both values and state the precedence:
+
+```yaml
+- id: implement
+  prompt: |
+    Optional work override: $INPUTS.work
+    Original invocation: $ARGUMENTS
+    Use the work override when it is non-empty; otherwise use the original invocation.
+```
+
 ## The eleven node types
 
 Exactly one of these appears per node: `command`, `prompt`, `bash`, `script`,

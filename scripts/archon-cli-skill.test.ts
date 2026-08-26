@@ -56,6 +56,21 @@ nodes:
 `);
   });
 
+  test('workflow input fallback is explicit in the consuming prompt', () => {
+    const consumer = yamlFenceAfter('An input default does not fall back');
+    expectWorkflowToLoad(`
+name: input-fallback-example
+description: Validate the documented input fallback prompt
+inputs:
+  work:
+    default: ""
+nodes:
+${indent(consumer)}
+`);
+    expect(consumer).toContain('$INPUTS.work');
+    expect(consumer).toContain('$ARGUMENTS');
+  });
+
   test('script bindings and loop completion examples satisfy the loader', () => {
     const script = yamlFenceAfter('### script —');
     expectWorkflowToLoad(`
