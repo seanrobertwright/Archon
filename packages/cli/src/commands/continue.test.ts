@@ -18,17 +18,25 @@ const mockGetCodebase = mock(
 mock.module('@archon/core/db/codebases', () => ({ getCodebase: mockGetCodebase }));
 
 const mockWorkflowRunCommand = mock((): Promise<void> => Promise.resolve());
-mock.module('./workflow', () => ({ workflowRunCommand: mockWorkflowRunCommand }));
+mock.module('./workflow', (): { workflowRunCommand: typeof mockWorkflowRunCommand } => ({
+  workflowRunCommand: mockWorkflowRunCommand,
+}));
 
 const mockFindActiveByBranchName = mock(() => Promise.resolve(null));
-mock.module('@archon/core/db/isolation-environments', () => ({
-  findActiveByBranchName: mockFindActiveByBranchName,
-}));
+mock.module(
+  '@archon/core/db/isolation-environments',
+  (): { findActiveByBranchName: typeof mockFindActiveByBranchName } => ({
+    findActiveByBranchName: mockFindActiveByBranchName,
+  })
+);
 
 const mockFindLatestRunByWorkingPath = mock(() => Promise.resolve(null));
-mock.module('@archon/core/db/workflows', () => ({
-  findLatestRunByWorkingPath: mockFindLatestRunByWorkingPath,
-}));
+mock.module(
+  '@archon/core/db/workflows',
+  (): { findLatestRunByWorkingPath: typeof mockFindLatestRunByWorkingPath } => ({
+    findLatestRunByWorkingPath: mockFindLatestRunByWorkingPath,
+  })
+);
 
 let archonHome: string;
 

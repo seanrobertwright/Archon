@@ -68,7 +68,7 @@ function makeDeps(
   return {
     existsSync: (p: string) => p === '/ws/repo/.worktrees/run-1',
     branchExists: async (_repo: string, branch: string) => branch === 'alive-branch',
-    currentBranch: async () => 'impl-branch',
+    currentBranch: async (): Promise<string | null> => 'impl-branch',
     getRun: async () => ('run' in overrides ? overrides.run : null),
     getActiveRunByPath: async () => overrides.activeHolder ?? null,
     findEnvironmentByPath: async () => overrides.environment ?? null,
@@ -157,7 +157,7 @@ describe('resolveWorkflowAdoption', () => {
         adoptedRunId: 'run-1',
         deps: {
           ...makeDeps({ run: runRow(), environment: envRow() }),
-          currentBranch: async path => {
+          currentBranch: async (path): Promise<string | null> => {
             inspectedPaths.push(path);
             return path === '/ws/repo/.worktrees/run-1' ? 'other-branch' : 'impl-branch';
           },
@@ -174,7 +174,7 @@ describe('resolveWorkflowAdoption', () => {
         adoptedRunId: 'run-1',
         deps: {
           ...makeDeps({ run: runRow(), environment: envRow() }),
-          currentBranch: async () => null,
+          currentBranch: async (): Promise<string | null> => null,
         },
       })
     ).rejects.toThrow(/detached HEAD/);
@@ -187,7 +187,7 @@ describe('resolveWorkflowAdoption', () => {
         adoptedRunId: 'run-1',
         deps: {
           ...makeDeps({ run: runRow(), environment: envRow() }),
-          currentBranch: async () => {
+          currentBranch: async (): Promise<string | null> => {
             throw new Error('git probe timed out');
           },
         },

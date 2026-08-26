@@ -6,6 +6,7 @@ import type { IsolationEnvironmentRow } from '@archon/isolation';
 // Type-only imports are erased at runtime, so these do not load './orchestrator'
 // (or the workflow engine) before the mock.module() calls below take effect.
 import type { WorkflowRoutingContext } from './orchestrator';
+import type { PreparedWorkflowSource } from '@archon/workflows/executor';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import {
   makeTestComposedWorkflow,
@@ -110,7 +111,9 @@ mock.module('../config/config-loader', () => ({
   loadRepoConfig: mock(() => Promise.resolve(null)),
 }));
 
-const mockResolveWorkflowSourceRoot = mock(() => Promise.resolve<string | undefined>(undefined));
+const mockResolveWorkflowSourceRoot = mock(
+  (): Promise<string | undefined> => Promise.resolve(undefined)
+);
 mock.module('../utils/workflow-source-root', () => ({
   resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
 }));
@@ -179,29 +182,30 @@ const mockExecuteWorkflow = mock(async (...args: unknown[]) => {
   if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
   return { paused: true };
 });
-const mockPrepareWorkflowSource = mock(() =>
-  Promise.resolve({
-    runId: 'prepared-run-id',
-    captureRoot: '/capture',
-    origin: '/origin',
-    manifest: {
-      version: 1,
-      engine_version: 'test',
+const mockPrepareWorkflowSource = mock(
+  (): Promise<PreparedWorkflowSource> =>
+    Promise.resolve({
+      runId: 'prepared-run-id',
+      captureRoot: '/capture',
       origin: '/origin',
-      captured_at: '2026-08-21T00:00:00.000Z',
-      digest: 'test-digest',
-      file_count: 0,
-      byte_count: 0,
-      scopes: [],
-    },
-    roots: {
-      project: '/capture/project',
-      globalWorkflows: '/capture/global/workflows',
-      globalCommands: '/capture/global/commands',
-      globalScripts: '/capture/global/scripts',
-      bundledWorkflows: '/capture/bundled',
-    },
-  })
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/origin',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/capture/project',
+        globalWorkflows: '/capture/global/workflows',
+        globalCommands: '/capture/global/commands',
+        globalScripts: '/capture/global/scripts',
+        bundledWorkflows: '/capture/bundled',
+      },
+    })
 );
 /** Ownership calls the dispatch path makes on its capture, in order. */
 const capturedSourceOwnerCalls: string[] = [];

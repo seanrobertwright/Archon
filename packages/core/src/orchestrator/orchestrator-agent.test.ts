@@ -355,7 +355,9 @@ mock.module('@archon/isolation', () => ({
   classifyIsolationError: (err: Error) => err.message,
 }));
 
-const mockResolveWorkflowSourceRoot = mock(() => Promise.resolve<string | undefined>(undefined));
+const mockResolveWorkflowSourceRoot = mock(
+  (): Promise<string | undefined> => Promise.resolve(undefined)
+);
 mock.module('../utils/workflow-source-root', () => ({
   resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
 }));

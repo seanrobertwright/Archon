@@ -9,7 +9,7 @@ mock.module('./connection', () => ({
     query: mockQuery,
   },
   getDialect: () => mockPostgresDialect,
-  getDatabaseType: () => 'postgresql',
+  getDatabaseType: (): 'postgresql' => 'postgresql',
 }));
 
 import {
