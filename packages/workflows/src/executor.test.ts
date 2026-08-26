@@ -188,9 +188,13 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     getWorkflowRun: mock(async () => ({ ...makeRun(), status: 'completed' as const })),
     getWorkflowRunStatus: mock(async () => 'completed' as const),
     createWorkflowEvent: mock(async () => {}),
+    persistWorkflowEvent: mock(async () => {}),
+    persistWorkflowEventIfRunning: mock(async () => ({ persisted: true })),
     findResumableRun: mock(async () => null),
     getDagResumeSnapshot: mock(async () => ({
       completedNodeOutputs: new Map(),
+      fanOutSnapshots: new Map(),
+      unresolvedNodeStarts: new Set<string>(),
       tokens: { input: 0, output: 0 },
       costUsd: 0,
     })),
@@ -2033,7 +2037,13 @@ describe('executeWorkflow', () => {
       const tokens = { input: 40, output: 4 };
       const costUsd = 0.25;
       const store = makeStore({
-        getDagResumeSnapshot: mock(async () => ({ completedNodeOutputs, tokens, costUsd })),
+        getDagResumeSnapshot: mock(async () => ({
+          completedNodeOutputs,
+          fanOutSnapshots: new Map(),
+          unresolvedNodeStarts: new Set<string>(),
+          tokens,
+          costUsd,
+        })),
         listWorkflowRunNodeSessions: mock(async () => [
           {
             workflow_run_id: 'failed-run',
@@ -3210,6 +3220,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: priorNodes,
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 4, output: 1 },
         costUsd: 0.1,
       })),
@@ -3232,6 +3244,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: priorNodes,
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 40, output: 4 },
         costUsd: 0.75,
       })),
@@ -3271,6 +3285,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),
@@ -3280,6 +3296,39 @@ describe('hydrateResumableRun', () => {
     expect(result).toBeNull();
     // Must not transition the run — there is nothing to resume.
     expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('hydrates fan-out-only recovery state before any inner node completed', async () => {
+    const fanOutSnapshots = new Map([
+      [
+        'fan',
+        [
+          {
+            ordinal: 0,
+            identity: 'instance-a',
+            item: 'a',
+            inputs: { item: 'a' },
+          },
+        ],
+      ],
+    ]);
+    const candidate = makeRun({ id: 'fan-out-only', status: 'failed' });
+    const resumed = makeRun({ id: 'fan-out-only', status: 'running' });
+    const store = makeStore({
+      getDagResumeSnapshot: mock(async () => ({
+        completedNodeOutputs: new Map(),
+        fanOutSnapshots,
+        unresolvedNodeStarts: new Set(['fan__instance-a']),
+        tokens: { input: 0, output: 0 },
+        costUsd: 0,
+      })),
+      resumeWorkflowRun: mock(async () => resumed),
+    });
+
+    const result = await hydrateResumableRun(makeDeps(store), candidate);
+
+    expect(result).not.toBeNull();
+    expect(store.resumeWorkflowRun).toHaveBeenCalledWith('fan-out-only');
   });
 
   it('returns hydrated run when interactive-loop state is present even with zero completed nodes', async () => {
@@ -3294,6 +3343,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),
@@ -3340,6 +3391,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),
@@ -3378,6 +3431,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),
@@ -3410,6 +3465,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map(),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),
@@ -3434,6 +3491,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: priorNodes,
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),
@@ -3461,6 +3520,8 @@ describe('hydrateResumableRun', () => {
     const store = makeStore({
       getDagResumeSnapshot: mock(async () => ({
         completedNodeOutputs: new Map([['n1', { output: 'v1' }]]),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
         costUsd: 0,
       })),

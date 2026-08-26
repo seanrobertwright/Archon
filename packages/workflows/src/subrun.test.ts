@@ -307,6 +307,16 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve();
   };
 
+  persistWorkflowEvent: IWorkflowStore['persistWorkflowEvent'] = data =>
+    this.createWorkflowEvent(data);
+
+  persistWorkflowEventIfRunning: IWorkflowStore['persistWorkflowEventIfRunning'] = data => {
+    const run = this.runs.get(data.workflow_run_id);
+    if (run?.status !== 'running') return Promise.resolve({ persisted: false });
+    this.events.push(data);
+    return Promise.resolve({ persisted: true });
+  };
+
   getDagResumeSnapshot: IWorkflowStore['getDagResumeSnapshot'] = workflowRunId => {
     const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
     const tokens = { input: 0, output: 0 };
@@ -352,7 +362,13 @@ class InMemoryStore implements IWorkflowStore {
         }
       }
     }
-    return Promise.resolve({ completedNodeOutputs, tokens, costUsd });
+    return Promise.resolve({
+      completedNodeOutputs,
+      fanOutSnapshots: new Map(),
+      unresolvedNodeStarts: new Set(),
+      tokens,
+      costUsd,
+    });
   };
 
   getCodebase = (): Promise<null> => Promise.resolve(null);
