@@ -30311,7 +30311,11 @@ function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
   };
 }
 
-function includedProbeWaitTerminatedLoopGroupWorkflow(markerPath: string): WorkflowDefinition {
+function includedProbeWaitTerminatedLoopGroupWorkflow(
+  markerPath: string,
+  quoteOutputRef = false
+): WorkflowDefinition {
+  const stateRef = quoteOutputRef ? '"$ci-probe.output.state"' : '$ci-probe.output.state';
   const block = workflowDefinitionSchema.parse({
     name: 'probe-wait-block',
     description: 'Included polling loop with a terminal wait',
@@ -30320,10 +30324,10 @@ function includedProbeWaitTerminatedLoopGroupWorkflow(markerPath: string): Workf
       {
         id: 'await-checks',
         loop_group: {
-          until_bash: `printf ran > ${JSON.stringify(markerPath)}; test $ci-probe.output != pending`,
+          until_bash: `printf ran > ${JSON.stringify(markerPath)}; test ${stateRef} != "pending"`,
           max_iterations: 3,
           nodes: [
-            { id: 'ci-probe', bash: "printf 'pending'" },
+            { id: 'ci-probe', bash: `printf '{"state":"pending"}'` },
             { id: 'ci-pause', wait: { duration_ms: 60_000 }, depends_on: ['ci-probe'] },
           ],
         },
@@ -30607,9 +30611,106 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
         event => event.event_type === 'node_failed' && event.step_name === 'deliver__await-checks'
       );
     expect(failed?.data?.error).toContain(
-      "Node 'deliver__await-checks' field 'loop_group.until_bash' cannot resolve '$ci-probe.output'"
+      "Node 'deliver__await-checks' field 'loop_group.until_bash' cannot resolve '$ci-probe.output.state'"
     );
     expect(await Bun.file(markerPath).exists()).toBe(false);
+  });
+
+  it('#2794: an included wait-resume rechecks the restored JSON field without extra quoting', async () => {
+    const markerPath = join(testDir, 'included-resume-restored-ref-ran.marker');
+    const workflow = includedProbeWaitTerminatedLoopGroupWorkflow(markerPath);
+    const expiredWait: WorkflowWaitContext = {
+      owner: 'loop_group',
+      nodeId: 'deliver__await-checks',
+      bodyWaitId: 'ci-pause',
+      iteration: 1,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'time',
+      waitingSince: '2026-08-23T00:00:00.000Z',
+      resumeAt: '2026-08-23T00:01:00.000Z',
+    };
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['deliver__await-checks.ci-probe', { output: '{"state":"pending"}' }],
+    ]);
+    const store = createEscalationStore('run-included-restored-probe');
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      ready(workflow),
+      makeWorkflowRun('run-included-restored-probe', { metadata: { wait: expiredWait } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    expect(await Bun.file(markerPath).exists()).toBe(true);
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.getState()).toMatchObject({
+      status: 'paused',
+      metadata: {
+        wait: {
+          nodeId: 'deliver__await-checks',
+          bodyWaitId: 'ci-pause',
+          iteration: 2,
+        },
+      },
+    });
+  });
+
+  it('#2794: double-quoting the already shell-quoted JSON field reproduces the incident', async () => {
+    const markerPath = join(testDir, 'included-resume-double-quoted-ref-ran.marker');
+    const workflow = includedProbeWaitTerminatedLoopGroupWorkflow(markerPath, true);
+    const expiredWait: WorkflowWaitContext = {
+      owner: 'loop_group',
+      nodeId: 'deliver__await-checks',
+      bodyWaitId: 'ci-pause',
+      iteration: 1,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'time',
+      waitingSince: '2026-08-23T00:00:00.000Z',
+      resumeAt: '2026-08-23T00:01:00.000Z',
+    };
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['deliver__await-checks.ci-probe', { output: '{"state":"pending"}' }],
+    ]);
+    const store = createEscalationStore('run-included-double-quoted-probe');
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      ready(workflow),
+      makeWorkflowRun('run-included-double-quoted-probe', { metadata: { wait: expiredWait } }),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    expect(await Bun.file(markerPath).exists()).toBe(true);
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
   });
 
   it('keeps loop ownership when an event signal lands before the pause call returns', async () => {
