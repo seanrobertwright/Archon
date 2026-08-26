@@ -43,6 +43,11 @@ if (inheritedInstallContext) {
 import { installPipeSafeConsole } from './utils/safe-console';
 import { withDrainedExit } from './utils/exit-with-drain';
 import { writeJsonLine } from './utils/stdout';
+import {
+  rejectConfigOnContinue,
+  rejectConfigOutsideRun,
+  rejectModelOnContinue,
+} from './dispatch-guards';
 installPipeSafeConsole();
 
 import { parseArgs } from 'util';
@@ -421,8 +426,9 @@ async function main(): Promise<number> {
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
 
   try {
-    if (values.config !== undefined && (command !== 'workflow' || subcommand !== 'run')) {
-      console.error('Error: --config can only be used with workflow run.');
+    const configOutsideRun = rejectConfigOutsideRun(command, subcommand, values.config);
+    if (configOutsideRun) {
+      console.error(configOutsideRun);
       return 1;
     }
 
@@ -616,19 +622,10 @@ async function main(): Promise<number> {
         break;
       }
 
-      case 'workflow':
-        if (
-          values.model !== undefined &&
-          (subcommand === 'resume' ||
-            subcommand === 'approve' ||
-            subcommand === 'reject' ||
-            subcommand === 'respond')
-        ) {
-          return await fail(
-            jsonFlag,
-            'Error: --model cannot be used when continuing an existing workflow run. ' +
-              'The run keeps the model bindings it started with.'
-          );
+      case 'workflow': {
+        const modelOnContinue = rejectModelOnContinue(subcommand, values.model);
+        if (modelOnContinue) {
+          return await fail(jsonFlag, modelOnContinue);
         }
         switch (subcommand) {
           case 'list':
@@ -641,11 +638,9 @@ async function main(): Promise<number> {
               return await fail(jsonFlag, 'Usage: archon workflow run <name> [message]');
             }
             const userMessage = positionals.slice(3).join(' ') || '';
-            if (resumeFlag && values.config !== undefined) {
-              console.error(
-                'Error: --config cannot be used when continuing an existing workflow run. ' +
-                  'The run keeps the config it started with.'
-              );
+            const configOnContinue = rejectConfigOnContinue(resumeFlag, values.config);
+            if (configOnContinue) {
+              console.error(configOnContinue);
               return 1;
             }
             if (branchName !== undefined && noWorktree) {
@@ -1015,6 +1010,7 @@ async function main(): Promise<number> {
           }
         }
         break;
+      }
 
       case 'isolation':
         switch (subcommand) {
