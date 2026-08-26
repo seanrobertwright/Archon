@@ -31,6 +31,7 @@ import {
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
   isWaitNode,
+  isIncludeDirective,
   SUBRUN_METADATA_KEYS,
   readSubrunMetadata,
   RUN_METADATA_KEYS,
@@ -1033,11 +1034,16 @@ export async function inspectResumableRun(
   const hasReRunGateState = reRunsOwnNodeOnResume(approvalContext, candidate.metadata);
   const hasWaitState = isWorkflowWaitContext(candidate.metadata?.wait);
   const hasScheduledResume = isScheduledWorkflowResume(candidate.metadata?.scheduled_resume);
+  // A valid composed instance start is always preceded by its durable fan-out plan.
+  // Do not treat an arbitrary unresolved node_started row as resumable: ordinary nodes
+  // have no ambiguity guard and replaying one could duplicate its side effects.
+  const hasFanOutRecoveryState = snapshot.fanOutSnapshots.size > 0;
   if (
     priorCompletedNodes.size === 0 &&
     !hasReRunGateState &&
     !hasWaitState &&
-    !hasScheduledResume
+    !hasScheduledResume &&
+    !hasFanOutRecoveryState
   ) {
     getLog().info(
       { resumableRunId: candidate.id },
@@ -1783,7 +1789,7 @@ export async function executeWorkflow(
 
   const containsWait = (nodes: readonly (DagNode | IncludeDirective)[]): boolean =>
     nodes.some(node => {
-      if (!('kind' in node)) return false;
+      if (isIncludeDirective(node)) return false;
       if (isWaitNode(node)) return true;
       return isLoopGroupNode(node) && containsWait(node.loop_group.nodes);
     });
