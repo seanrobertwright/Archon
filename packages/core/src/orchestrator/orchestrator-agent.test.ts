@@ -355,8 +355,11 @@ mock.module('@archon/isolation', () => ({
   classifyIsolationError: (err: Error) => err.message,
 }));
 
+const mockResolveWorkflowSourceRoot = mock(
+  (): Promise<string | undefined> => Promise.resolve(undefined)
+);
 mock.module('../utils/workflow-source-root', () => ({
-  resolveWorkflowSourceRoot: mock(() => Promise.resolve(undefined)),
+  resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
 }));
 
 mock.module('@archon/git', () => ({
@@ -1990,6 +1993,8 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockValidateAndResolveIsolation.mockClear();
     mockResolveWorkflowAdoption.mockClear();
     mockUpdateConversation.mockClear();
+    mockResolveWorkflowSourceRoot.mockClear();
+    mockResolveWorkflowSourceRoot.mockResolvedValue(undefined);
   });
 
   test('calls executeWorkflow (not dispatchBackground) for interactive workflow on web', async () => {
@@ -2028,7 +2033,11 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted', envId: 'env-1' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+          envId: 'env-1',
+        },
       })
     );
 
@@ -2053,7 +2062,7 @@ describe('workflow dispatch routing — interactive flag', () => {
     });
   });
 
-  test('adopt with fresh-from-branch lane cuts the foreground worktree from the adopted branch', async () => {
+  test('adopt with checkout-branch lane materializes the exact adopted branch', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
     mockHandleCommand.mockReturnValueOnce(
@@ -2062,7 +2071,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'fresh-from-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2073,18 +2085,21 @@ describe('workflow dispatch routing — interactive flag', () => {
 
     expect(mockValidateAndResolveIsolation).toHaveBeenCalled();
     const isoArgs = mockValidateAndResolveIsolation.mock.calls[0] as unknown[];
-    const hints = isoArgs[4] as { workflowType?: string; fromBranch?: string };
+    const hints = isoArgs[4] as {
+      workflowType?: string;
+      taskBranch?: { kind: string; branch?: string };
+    };
     expect(hints.workflowType).toBe('task');
-    expect(hints.fromBranch).toBe('feature/adopted');
+    expect(hints.taskBranch).toEqual({ kind: 'existing', branch: 'feature/adopted' });
     const callArgs = mockExecuteWorkflow.mock.calls[0] as unknown[];
     const opts = callArgs[callArgs.length - 1] as { adoptedFromRunId?: string };
     expect(opts.adoptedFromRunId).toBe('prior-run');
   });
 
   // R7: the resolver short-circuits on `existingEnvId` before hints are read, so a
-  // fresh-from-branch adoption must neutralize the conversation's stale env and key
+  // checkout-branch adoption must neutralize the conversation's stale env and key
   // its reuse lookup with a unique per-dispatch workflow id.
-  test('adopt fresh-from-branch ignores a stale isolation env and keys a unique worktree', async () => {
+  test('adopt checkout-branch ignores a stale isolation env and keys a unique worktree', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(
       Promise.resolve(makeDispatchConversation({ isolation_env_id: 'env-stale' }))
     );
@@ -2095,7 +2110,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'fresh-from-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2108,8 +2126,11 @@ describe('workflow dispatch routing — interactive flag', () => {
     const isoArgs = mockValidateAndResolveIsolation.mock.calls[0] as unknown[];
     const convArg = isoArgs[0] as { isolation_env_id?: string | null };
     expect(convArg.isolation_env_id).toBeNull();
-    const hints = isoArgs[4] as { workflowId?: string; fromBranch?: string };
-    expect(hints.fromBranch).toBe('feature/adopted');
+    const hints = isoArgs[4] as {
+      workflowId?: string;
+      taskBranch?: { kind: string; branch?: string };
+    };
+    expect(hints.taskBranch).toEqual({ kind: 'existing', branch: 'feature/adopted' });
     expect(typeof hints.workflowId).toBe('string');
     expect(hints.workflowId!.length).toBeGreaterThan(0);
   });
@@ -2117,6 +2138,7 @@ describe('workflow dispatch routing — interactive flag', () => {
   // R8: a reuse-worktree adoption executes inside the inherited worktree, so the
   // frozen source must come from there — not from the parent checkout.
   test('adopt with reuse-worktree captures workflow source from the inherited worktree', async () => {
+    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
     mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
     mockHandleCommand.mockReturnValueOnce(
@@ -2125,7 +2147,11 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted', envId: 'env-1' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+          envId: 'env-1',
+        },
       })
     );
 
@@ -2140,11 +2166,13 @@ describe('workflow dispatch routing — interactive flag', () => {
       sourceRoot?: string;
     };
     expect(captureArg.sourceRoot).toBe('/wt/adopted');
+    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/wt/adopted');
   });
 
-  // R10: a fresh-from-branch adoption runs in a worktree cut from the adopted branch,
+  // R10: a checkout-branch adoption runs in a worktree on the adopted branch,
   // so its frozen source must come from that worktree — not from the parent checkout.
-  test('adopt with fresh-from-branch captures workflow source from the created worktree', async () => {
+  test('adopt with checkout-branch captures workflow source from the created worktree', async () => {
+    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
     mockValidateAndResolveIsolation.mockImplementationOnce(() =>
       Promise.resolve({ cwd: '/wt/from-branch', status: 'new' })
     );
@@ -2156,7 +2184,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'fresh-from-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2171,13 +2202,14 @@ describe('workflow dispatch routing — interactive flag', () => {
       sourceRoot?: string;
     };
     expect(captureArg.sourceRoot).toBe('/wt/from-branch');
+    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/wt/from-branch');
   });
 
   // F1: the deferred capture swaps the executed graph for the branch's vintage, so the
   // invocation gates must be judged against THAT definition — a required input declared
   // only on the branch must refuse the run instead of slipping through on the parent's
   // vintage.
-  test('adopt with fresh-from-branch enforces an input declared only on the branch', async () => {
+  test('adopt with checkout-branch enforces an input declared only on the branch', async () => {
     mockPrepareWorkflowSource.mockImplementationOnce(() =>
       Promise.resolve({
         runId: 'prepared-run-id',
@@ -2228,7 +2260,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'fresh-from-branch', branch: 'feature/adopted' },
+        lane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
       })
     );
 
@@ -2253,7 +2288,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+        },
       })
     );
 
@@ -2279,7 +2317,10 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockResolveWorkflowAdoption.mockImplementationOnce(() =>
       Promise.resolve({
         adoptedRun: {},
-        lane: { kind: 'reuse-worktree', workingPath: '/wt/adopted' },
+        lane: {
+          kind: 'reuse-worktree',
+          workingPath: '/wt/adopted',
+        },
       })
     );
 

@@ -209,6 +209,10 @@ archon workflow run issue-to-pr --cwd /path/to/repo \
 archon workflow run issue-to-pr --cwd /path/to/repo \
   --config ./config.minimax.yaml \
   --model large=openai/gpt-5.6 "fix #2482"
+
+# Continue the exact estate left by a terminal run
+archon workflow run archon-fix --cwd /path/to/repo \
+  --adopt 6d5066ca-47b4-4ee8-8d1d-2f3db8039190 "finish the delivery"
 ```
 
 Progress events (node start/complete/fail/skip, approval gates) are written to stderr during execution.
@@ -233,6 +237,8 @@ Note that a real `run` emits a JSON payload **only** under `--detach`. Without i
 | `--model <name>=<spec>` | Rebind one `small`, `medium`, `large`, or existing `@alias` for this run. **Repeat the flag per binding.** An Archon agent prefix selects that agent (`codex/gpt-5.6-sol`); another valid vendor/model ref selects Pi (`openai/gpt-5.6`); an unqualified model keeps the binding's current provider; a tier or alias RHS copies that preset. Unspecified names keep their user → repo → global → built-in values. Literal `model:` pins and nodes that never reference the rebound name do not change. Bare `--model <spec>` is invalid, there is no run-wide `--provider`, and the flag is rejected with `--resume`. Works with `--dry-run`. |
 | `--config <path>` | Load one sparse YAML config layer for this fresh run. Relative paths resolve from the directory named by `--cwd`, even when it is a repository subdirectory. Values in the file override persistent config and user AI preferences; explicit `--model` flags then replace only their named bindings. Works with `--dry-run` and `--detach`; the parent validates and seals the layer before handing it to a detached child, so later file edits cannot change that launch. Rejected with `--resume` because a continuation restores the sealed layer recorded when the run started. |
 | `--resume` | Resume from last failed run at the working path (skips completed nodes) |
+| `--adopt <run-id>` | Start a new run in a terminal run's exact worktree or branch, with `adopted_from_run_id` provenance and `$ADOPTED_RUN_DIR` access. Run-id selection is exact; adoption never infers a run from workflow name or prompt text. |
+| `--supersedes <run-id>` | Start in a fresh estate while recording that this run replaces a terminal prior run. Unlike `--adopt`, it inherits no checkout. |
 | `--quiet`, `-q` | Suppress all progress output to stderr |
 | `--verbose`, `-v` | Also show tool-level events (tool name and duration) |
 | `--detach` | Run in a detached background child and return immediately. The child does all the work; find it later with `workflow runs`/`workflow get`. Child stdout/stderr is captured to `~/.archon/logs/detached-run-<id>.log`. Combine with `--json` for a machine-readable ack. Also available on `approve`/`reject`/`resume` — see [Detached control verbs](#detached-control-verbs). |
@@ -395,6 +401,12 @@ no worktree was ever cut from.
 **When an existing worktree is adopted** -- `--branch` naming a healthy worktree,
 or `--resume` continuing a prior run -- the cut-from is already fixed, so `--base`
 changes only the PR target. Archon warns in both cases.
+
+#### Continuing an existing estate
+
+Use structured continuation whenever a workflow must work on an existing branch or pull request. If you have the prior run id, `--adopt <run-id>` is the authoritative form. Archon reuses the prior worktree as-is. If the prior worktree is gone, Archon reuses a same-repository checkout already holding that branch, or creates one on the exact local branch. It does not fetch, reset, or synchronize the branch; update it first if the remote advanced.
+
+Every node in the new run uses that selected checkout, including bash/script delivery assertions. A branch name written only in the message is model context; it does not move engine-owned nodes to another checkout.
 
 **Name Matching:**
 
@@ -703,6 +715,24 @@ archon validate commands my-command       # Validate a single command
 Checks: file exists, non-empty, valid name.
 
 Exit code: 0 = all valid, 1 = errors found.
+
+### `continue <branch> [message]`
+
+Start a new workflow run on an exact active worktree, with recent Git, pull-request, and prior-run context added to the message.
+
+```bash
+archon continue feature/live-pr --workflow archon-fix "resolve the remaining review finding"
+archon continue feature/live-pr --no-context "run the final validation"
+```
+
+If the worktree has a prior run, `continue` adopts that exact run: the new row records `adopted_from_run_id`, `$ADOPTED_RUN_DIR` points at the prior artifacts, and the normal terminal-status, project-identity, and live-path-lock checks apply. A live prior run is not taken over; resume, respond to, or abandon it first.
+
+If the worktree has no prior run, Archon still runs at the exact branch path but has no run provenance to record. `continue` only resolves active worktrees; use `workflow run <name> --adopt <run-id>` when the worktree was removed.
+
+| Flag | Effect |
+|------|--------|
+| `--workflow <name>` | Workflow to run (default: `archon-assist`) |
+| `--no-context` | Do not add Git, pull-request, or prior-artifact context to the message |
 
 ### `complete <branch> [branch2 ...]`
 
