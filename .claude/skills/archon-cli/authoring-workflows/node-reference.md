@@ -58,8 +58,10 @@ for typed artifact sidecars), `allowed_tools`/`denied_tools`, `effort`/`thinking
   bash: bun run test
   timeout: 300000            # ms; stdout captured as $test-gate.output
 ```
-Exit code decides pass/fail. One-or-two-line glue only; anything with branching
-is a script node.
+Exit code decides pass/fail. The same node shape verifies non-code work:
+`bash: python3 scripts/reconcile.py --period 2026-08` (totals must balance),
+or a script that checks every imported row has an owner. One-or-two-line glue
+only; anything with branching is a script node.
 
 ### script — TypeScript (bun) or Python (uv), no AI
 

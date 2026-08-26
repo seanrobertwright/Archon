@@ -108,7 +108,8 @@ guessing one.
 Terminal ≠ good. From `get --verbose --json`, read:
 
 - per-node states (what actually ran vs was skipped),
-- declared outcome fields (`green`, `ready`, `rooted`) where present,
+- declared outcome fields wherever the workflow declares an `outcome_field:`
+  (sdlc pack uses `green`, `ready`, `rooted`; any workflow may declare its own),
 - the report artifact path in metadata — read it before reporting to the user.
 
 Report outcomes with their evidence: "completed, review verdict ready:false —

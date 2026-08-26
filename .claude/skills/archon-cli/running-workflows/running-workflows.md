@@ -41,8 +41,10 @@ Rules:
 1. **Detached is the default posture.** Workflows are long-running; `--detach`
    returns immediately and the run appears in `archon workflow runs`. In your
    harness, even foreground invocations belong in a background task.
-2. **Always pass `--branch`** unless the user chose otherwise. Branch naming by
-   intent: `fix/<topic-or-issue-N>`, `feat/<name>`, `review/pr-N`. To run on
+2. **Always pass `--branch`** unless the user chose otherwise. Derive the name
+   from the domain of work — code: `fix/<topic-or-issue-N>`, `feat/<name>`,
+   `review/pr-N`; ops/process runs: e.g. `ops/<queue>-<item>`,
+   `upkeep/<dependency>`, `triage/<source>`. To run on
    different models for one run, see the sibling
    `../manage-run/manage-runs.md` ("Overriding models for one run").
 3. **One workflow per shell.** Multiple pieces of work = separate invocations with

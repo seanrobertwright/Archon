@@ -45,9 +45,10 @@ Work through these questions in order, with the user where marked:
    continuing, and what decides? Three gate kinds, all first-class:
 
    - **Deterministic gates** — a `bash:`/`script:` node owning an exit code or a
-     `when:` on a declared field. Use wherever a checkable fact settles it:
-     tests pass, file exists, field true, totals reconcile, no row without an
-     owner. Cheapest and least arguable.
+     `when:` on a declared field. Use wherever a checkable fact settles it —
+     in code work: tests pass, file exists; in ops: totals reconcile, every
+     row has an owner, the export count matches the source. Cheapest and least
+     arguable.
    - **Prompt command gates** — one agent judging another's output against an
      evidence bar: a verifier reads the diff/artifact/entry, checks claims and
      criteria, and returns a structured boolean that drives the loop or the
@@ -99,6 +100,9 @@ The first version is deliberately under-engineered:
   added before a real run is a guess about where things fail.
 - Dogfood it immediately on something real — a genuine task in the actual repo,
   not a demo. The run itself is the test.
+- Author against a different imaginary project first: if your prompt examples
+  only make sense for the repo you're staring at, you've smuggled one project's
+  incident into a general workflow. The smell description or input IS the spec.
 - Adapt from evidence, not anticipation: a failure shows which gate was missing;
   a wasted review shows which check earned its place. Add machinery only where a
   logged occurrence demands it.
