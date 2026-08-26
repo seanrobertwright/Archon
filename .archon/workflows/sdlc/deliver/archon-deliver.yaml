@@ -162,7 +162,7 @@ nodes:
     depends_on: [review]
     when: "$review.output.ready == 'false'"
     loop_group:
-      until_bash: test "$recheck.output.ready" = "true"
+      until_bash: test $recheck.output.ready = "true"
       max_iterations: 5
       fresh_context: true
       nodes:
