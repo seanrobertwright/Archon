@@ -1,6 +1,6 @@
 /** Tests for the declared-data dry-run fixture runner (#2772). */
 import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseWorkflow } from './loader';
@@ -316,7 +316,7 @@ describe('runFixtures', () => {
 
     const packPath = join(cwd, '.archon', 'workflows', 'sdlc');
     // Exact labels pin both the scope-root-relative shape and the boundary against the
-    // prefix-named `sdlc-ext` sibling: `targetDir + sep` must never match it.
+    // prefix-named `sdlc-ext` sibling: the `dir + sep` containment anchor must never match it.
     await expect(fixtureLabels('sdlc')).resolves.toEqual([
       'sdlc/plan/fixtures/plan.stubs.yaml',
       'sdlc/ship/fixtures/ship.stubs.yaml',
@@ -329,6 +329,30 @@ describe('runFixtures', () => {
     await expect(fixtureLabels(packPath)).resolves.toHaveLength(2);
     await expect(fixtureLabels(undefined)).resolves.toHaveLength(3);
   });
+
+  // Junctions would also resolve on Windows, but fs.realpath's junction handling is
+  // platform-dependent; ubuntu CI already runs this, and that is where the tmpdir
+  // realpath is the identity and the symlink spelling is the only protection.
+  it.skipIf(process.platform === 'win32')(
+    'resolves a target spelled through a symlink to the pack directory',
+    async () => {
+      const { cwd } = writeNestedPackProject();
+      const linkPath = join(cwd, 'sdlc-link');
+      symlinkSync(join(cwd, '.archon', 'workflows', 'sdlc'), linkPath, 'dir');
+      const workflows = [
+        ...workflowsOnDisk(cwd, ['plan-wf'], 'sdlc/plan'),
+        ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+        ...workflowsOnDisk(cwd, ['ext-wf'], 'sdlc-ext/ext'),
+      ];
+      const report = await runFixtures({ workflows, cwd, target: linkPath });
+      // Selection outcomes, not implementation details: drops both the containment
+      // anchor and the discovery-side realpath, so a revert cannot pass silently.
+      expect(report.results.map(r => r.fixture)).toEqual([
+        'sdlc/plan/fixtures/plan.stubs.yaml',
+        'sdlc/ship/fixtures/ship.stubs.yaml',
+      ]);
+    }
+  );
 
   it('selects by the union of workflow name and folder: a target that is both picks both', async () => {
     const cwd = makeTempProject();
