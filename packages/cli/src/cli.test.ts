@@ -115,7 +115,7 @@ describe('removed continue command', () => {
     expect(result.stderr).toContain('--adopt <run-id>');
   });
 
-  it('rejects archon continue outside any git repository', () => {
+  it('rejects archon continue outside any git repository', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'archon-no-repo-'));
     try {
       const result = spawnSync(process.execPath, [CLI_ENTRY, 'continue', 'some/branch'], {
@@ -127,7 +127,7 @@ describe('removed continue command', () => {
       expect(result.stderr).toContain("Removed: 'archon continue'");
       expect(result.stderr).toContain('--adopt <run-id>');
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await removeTempTree(dir);
     }
   });
 
