@@ -1071,6 +1071,10 @@ async function* streamClaudeMessages(
         }
       } else if (subtype === 'task_progress' && sysMsg.task_id) {
         if (hiddenTaskIds.has(sysMsg.task_id)) {
+          // The SDK emits task_progress roughly every 30s to prove the
+          // subprocess is alive. Preserve that deadlock-timer signal without
+          // recreating the hidden task in persistence or the Web UI.
+          yield { type: 'system', content: '' };
           continue;
         }
         yield {

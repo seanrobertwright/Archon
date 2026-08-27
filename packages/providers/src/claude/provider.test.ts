@@ -581,7 +581,7 @@ describe('ClaudeProvider', () => {
       });
     });
 
-    test('drops the housekeeping task lifecycle when SDK start sets skip_transcript', async () => {
+    test('hides a skip_transcript task lifecycle while preserving its idle heartbeat', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
           type: 'system',
@@ -610,10 +610,10 @@ describe('ClaudeProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks).toHaveLength(0);
+      expect(chunks).toEqual([{ type: 'system', content: '' }]);
     });
 
-    test('drops the housekeeping task lifecycle when SDK start sets ambient', async () => {
+    test('hides an ambient task lifecycle while preserving its idle heartbeat', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
           type: 'system',
@@ -642,7 +642,7 @@ describe('ClaudeProvider', () => {
         chunks.push(chunk);
       }
 
-      expect(chunks).toHaveLength(0);
+      expect(chunks).toEqual([{ type: 'system', content: '' }]);
     });
 
     test('yields task_progress with summary + usage + lastToolName', async () => {
