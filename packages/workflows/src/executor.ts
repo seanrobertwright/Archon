@@ -61,6 +61,7 @@ import { discoverWorkflowsWithConfig } from './workflow-discovery';
 import type { WorkflowWithSource, WorkflowLoadError } from './schemas';
 import { validateWorkflowOutcomeDeclaration } from './loader';
 import { maybeWarnLegacyStatePath, maybeWarnLegacyArtifactsPath } from './state-migration';
+import { formatDeprecationNotice } from './deprecation';
 import { resolveWorkflowName } from './router';
 import { resolveDeclaredInputs, defaultRunInputs } from './workflow-inputs';
 import { logWorkflowStart, logWorkflowError } from './logger';
@@ -2858,6 +2859,29 @@ export async function executeWorkflow(
         .catch((err: Error) => {
           getLog().error(
             { err, workflowRunId: workflowRun.id, eventType: 'workflow_parse_warnings' },
+            'workflow_event_persist_failed'
+          );
+        });
+    }
+
+    // Deprecated bundled default (#2781). Recorded here like the parse warnings
+    // above so every run surface — REST/detached starts included, which have no
+    // conversation to post into — carries the removal notice on its durable trace.
+    // The chat/web message that mirrors this is best-effort; this record cannot fail.
+    const deprecationNotice = formatDeprecationNotice(workflow);
+    if (deprecationNotice) {
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'workflow_deprecation_notice',
+          data: {
+            workflowName: workflow.name,
+            notice: deprecationNotice,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'workflow_deprecation_notice' },
             'workflow_event_persist_failed'
           );
         });

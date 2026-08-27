@@ -129,6 +129,29 @@ describe('generate-bundled-defaults: untracked-file guard (#1578)', () => {
     }
   }, 15_000);
 
+  it('embeds a tracked defaults/legacy/ workflow into the flat bundle (#2781)', () => {
+    const repoRoot = createRepo();
+    try {
+      const legacyDir = join(repoRoot, '.archon/workflows/defaults/legacy');
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(
+        join(legacyDir, 'tracked-legacy-workflow.yaml'),
+        'name: tracked-legacy-workflow\ndeprecated:\n  message: Switch instead.\n'
+      );
+      runGit(repoRoot, ['add', '.archon/workflows/defaults/legacy']);
+
+      // `defaults/legacy` must NOT be misread as a packaged pack directory —
+      // that failure mode exits 1 with "must contain exactly one .yaml".
+      const { exitCode, stderr } = runScript(repoRoot);
+      expect(stderr).toBe('');
+      expect(exitCode).toBe(0);
+      const output = readFileSync(join(repoRoot, OUTPUT_REL), 'utf-8');
+      expect(output).toContain('"tracked-legacy-workflow"');
+    } finally {
+      rmSync(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   it('embeds packaged workflows, commands, scripts, and owner metadata', () => {
     const repoRoot = createRepo();
     try {

@@ -767,3 +767,7 @@ nodes:
       ```
 
       Keep it factual. No commentary — just the data.
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.

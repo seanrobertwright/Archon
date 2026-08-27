@@ -267,3 +267,7 @@ nodes:
          - How to run it: `bun run cli workflow run $extract-intent.output.workflow_name "your input"`
          - How to test it: `bun run cli validate workflows $extract-intent.output.workflow_name`
     depends_on: [validate-yaml]
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.
