@@ -79,14 +79,23 @@ interface TableInfoRow {
 
 function readCatalog(path: string): Catalog {
   const raw = new Database(path);
+  // close() is sqlite3_close_v2, so the connection keeps its file open until
+  // every prepared statement is finalized. Track them and finalize explicitly.
+  const statements: { finalize(): void }[] = [];
+  const prepare = (sql: string) => {
+    const stmt = raw.prepare(sql);
+    statements.push(stmt);
+    return stmt;
+  };
+
   try {
-    const objects = raw
-      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
-      .all() as MasterRow[];
+    const objects = prepare(
+      "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+    ).all() as MasterRow[];
 
     const tables = new Map<string, Set<string>>();
     for (const table of objects.filter(o => o.type === 'table')) {
-      const cols = raw.prepare(`PRAGMA table_info('${table.name}')`).all() as TableInfoRow[];
+      const cols = prepare(`PRAGMA table_info('${table.name}')`).all() as TableInfoRow[];
       tables.set(table.name, new Set(cols.map(c => `${c.name}:${c.type}`)));
     }
 
@@ -97,7 +106,33 @@ function readCatalog(path: string): Catalog {
 
     return { tables, objects: indexedObjects };
   } finally {
+    for (const stmt of statements) stmt.finalize();
     raw.close();
+  }
+}
+
+/**
+ * Delete one temp file, tolerating a database handle this test cannot close.
+ *
+ * SqliteAdapter prepares statements in initSchema() that it never finalizes, so
+ * sqlite3_close_v2 leaves each vintage database open after `await close()`
+ * until garbage collection finalizes them; Bun.gc(true) forces that pass. POSIX
+ * unlink ignores an open handle, Windows rejects it with EBUSY, so retry with
+ * another finalization pass between attempts. A temp file surviving all of that
+ * is not a failure of what this test asserts, but it should stay visible.
+ */
+function removeTempFile(path: string): void {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (existsSync(path)) unlinkSync(path);
+      return;
+    } catch (error) {
+      if (attempt === 3) {
+        console.warn(`[sqlite-vintages] could not remove ${path}: ${String(error)}`);
+        return;
+      }
+      Bun.gc(true);
+    }
   }
 }
 
@@ -146,12 +181,13 @@ function diffCatalogs(fresh: Catalog, upgraded: Catalog): CatalogDiff {
 
 describe('SqliteAdapter upgrades from released schema vintages', () => {
   afterEach(() => {
+    // Finalizes the statements SqliteAdapter left behind, which is what releases
+    // its hold on each database file. See removeTempFile().
+    Bun.gc(true);
     // -wal/-shm sidecars exist while a connection is open; sweep them in case
     // a failure leaves one behind alongside its database.
     for (const base of tempDbPaths) {
-      for (const path of [base, `${base}-wal`, `${base}-shm`]) {
-        if (existsSync(path)) unlinkSync(path);
-      }
+      for (const path of [base, `${base}-wal`, `${base}-shm`]) removeTempFile(path);
     }
     tempDbPaths.length = 0;
   });
