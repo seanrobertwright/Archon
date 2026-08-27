@@ -232,6 +232,78 @@ describe('runFixtures', () => {
     );
   });
 
+  it('suggests only workflows that carry fixtures when a target has none', async () => {
+    const { cwd } = writeTempProject({ body: passingBody });
+    const bareDir = join(cwd, '.archon', 'workflows', 'bare');
+    mkdirSync(bareDir, { recursive: true });
+    writeFileSync(
+      join(bareDir, 'bare-wf.yaml'),
+      'name: bare-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hi\n'
+    );
+    const err = await runFixtures({
+      workflows: [
+        ...workflowsOnDisk(cwd, ['test-wf']),
+        ...workflowsOnDisk(cwd, ['bare-wf'], 'bare'),
+      ],
+      cwd,
+      target: 'bare-wf',
+    }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    const suggested = /fixtures \(([^)]*)\)/.exec((err as Error).message)?.[1] ?? '';
+    expect(suggested.split(', ')).toEqual(['test-wf']);
+  });
+
+  it('excludes fixture-targeted workflows the catalog cannot load from suggestions', async () => {
+    const { cwd } = writeTempProject({ body: passingBody });
+    // A name-only YAML passes workflowNamesBeside but fails parseWorkflow, so the fixture
+    // beside it targets a workflow the command can never resolve (#2850).
+    const brokenDir = join(cwd, '.archon', 'workflows', 'broken');
+    mkdirSync(join(brokenDir, 'fixtures'), { recursive: true });
+    writeFileSync(join(brokenDir, 'broken-wf.yaml'), 'name: broken-wf\n');
+    writeFileSync(join(brokenDir, 'fixtures', 'orphan.stubs.yaml'), passingBody);
+    const err = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['test-wf']),
+      cwd,
+      target: 'nope',
+    }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    const suggested = /fixtures \(([^)]*)\)/.exec((err as Error).message)?.[1] ?? '';
+    expect(suggested.split(', ')).toEqual(['test-wf']);
+  });
+
+  it('reports the divergence hint when discovered fixtures target no catalog workflow', async () => {
+    const { cwd } = writeTempProject({ body: passingBody });
+    const err = await runFixtures({
+      workflows: [],
+      cwd,
+      target: 'nope',
+    }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(
+      /Discovered fixtures target no workflow in the discovery catalog/
+    );
+    expect((err as Error).message).not.toMatch(/declares fixtures/);
+  });
+
+  it('says no workflow declares fixtures when discovery found no fixtures at all', async () => {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    const packDir = join(cwd, '.archon', 'workflows', 'pack');
+    mkdirSync(packDir, { recursive: true });
+    writeFileSync(
+      join(packDir, 'test-wf.yaml'),
+      'name: test-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    const err = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['test-wf']),
+      cwd,
+      target: 'test-wf',
+    }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/No workflow in any discovery scope declares fixtures/);
+    expect((err as Error).message).not.toContain('()');
+  });
+
   it('restricts to fixtures of the named workflow via target', async () => {
     const { cwd } = writeTempProject({
       workflowName: 'target-wf',
