@@ -593,6 +593,12 @@ export async function cancelResumableRunsForConversation(
           `Resumable run snapshot changed during reset (expected ${String(resumable.length)}, cancelled ${String(result.rowCount)})`
         );
       }
+      for (const run of resumable) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: run.id,
+          event_type: 'workflow_cancelled',
+        });
+      }
       return resumable.map(run => normalizeWorkflowRun(run));
     });
   } catch (error) {

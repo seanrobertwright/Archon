@@ -242,6 +242,38 @@ describe('cancelResumableRunsForConversation — real SQLite', () => {
       { id: 'reset-b', status: 'running', completed_at: null },
       { id: 'reset-c', status: 'cancelled', completed_at: expect.any(String) },
     ]);
+    const events = await db.query<{ workflow_run_id: string }>(
+      `SELECT workflow_run_id FROM remote_agent_workflow_events
+       WHERE workflow_run_id IN ('reset-a', 'reset-b', 'reset-c')
+         AND event_type = 'workflow_cancelled'
+       ORDER BY workflow_run_id`,
+      []
+    );
+    expect(events.rows).toEqual([{ workflow_run_id: 'reset-a' }, { workflow_run_id: 'reset-c' }]);
+  });
+
+  test('rolls back every cancellation when an event cannot be stored', async () => {
+    await seed('reset-atomic-a', 'paused', "datetime('now')");
+    await seed('reset-atomic-b', 'failed', "datetime('now')");
+
+    await db.query('ALTER TABLE remote_agent_workflow_events RENAME TO events_stash', []);
+    try {
+      await expect(cancelResumableRunsForConversation('conv-1')).rejects.toThrow(
+        'Failed to cancel resumable runs for conversation'
+      );
+    } finally {
+      await db.query('ALTER TABLE events_stash RENAME TO remote_agent_workflow_events', []);
+    }
+
+    const runs = await db.query<{ id: string; status: string; completed_at: string | null }>(
+      `SELECT id, status, completed_at FROM remote_agent_workflow_runs
+       WHERE id IN ('reset-atomic-a', 'reset-atomic-b') ORDER BY id`,
+      []
+    );
+    expect(runs.rows).toEqual([
+      { id: 'reset-atomic-a', status: 'paused', completed_at: null },
+      { id: 'reset-atomic-b', status: 'failed', completed_at: null },
+    ]);
   });
 });
 

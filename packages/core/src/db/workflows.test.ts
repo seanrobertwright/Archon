@@ -1057,12 +1057,14 @@ describe('workflows database', () => {
       const failed = { ...mockWorkflowRun, id: 'run-c', status: 'failed' as const };
       mockQuery
         .mockResolvedValueOnce(createQueryResult([paused, running, failed]))
-        .mockResolvedValueOnce(createQueryResult([], 2));
+        .mockResolvedValueOnce(createQueryResult([], 2))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
 
       const result = await cancelResumableRunsForConversation('conv-1');
 
       expect(result).toEqual([paused, failed]);
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(mockQuery).toHaveBeenCalledTimes(4);
       const [selectSql, selectParams] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(selectSql).toContain('SELECT * FROM remote_agent_workflow_runs');
       expect(selectSql).toContain('conversation_id = $1 OR parent_conversation_id = $2');
@@ -1074,6 +1076,12 @@ describe('workflows database', () => {
       expect(updateSql).not.toContain("'pending'");
       expect(updateSql).not.toContain('RETURNING');
       expect(updateParams).toEqual(['conv-1', 'conv-1']);
+      for (const [index, runId] of ['run-a', 'run-c'].entries()) {
+        const [eventSql, eventParams] = mockQuery.mock.calls[index + 2] as [string, unknown[]];
+        expect(eventSql).toContain('INSERT INTO remote_agent_workflow_events');
+        expect(eventParams[1]).toBe(runId);
+        expect(eventParams[2]).toBe('workflow_cancelled');
+      }
     });
 
     test('returns without writing when the locked snapshot has nothing resumable', async () => {
