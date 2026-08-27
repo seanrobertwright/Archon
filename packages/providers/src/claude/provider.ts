@@ -328,6 +328,7 @@ function classifySdkErrorCode(code: SdkErrorCode): 'rate_limit' | 'auth' | 'cras
   switch (code) {
     case 'authentication_failed':
     case 'oauth_org_not_allowed':
+    case 'account_on_hold':
     case 'billing_error':
       return 'auth';
     case 'rate_limit':
@@ -1026,8 +1027,9 @@ async function* streamClaudeMessages(
         status?: string;
         output_file?: string;
         skip_transcript?: boolean;
+        ambient?: boolean;
         // Background-task set (Claude SDK v0.3.209+ `background_tasks_changed`)
-        tasks?: { task_id: string; task_type: string; description: string }[];
+        tasks?: { task_id: string; task_type: string; description: string; ambient?: boolean }[];
         // Hook lifecycle (Claude SDK v0.2.89+)
         hook_id?: string;
         hook_name?: string;
@@ -1043,11 +1045,12 @@ async function* streamClaudeMessages(
           yield { type: 'system', content: `MCP server connection failed: ${names}` };
         }
       } else if (subtype === 'task_started' && sysMsg.task_id) {
-        // Ambient / housekeeping tasks (SDK signals via skip_transcript) are
+        // Ambient / housekeeping tasks (SDK v0.3.247 signals them directly;
+        // older emitters use skip_transcript) are
         // SDK-internal — they bloat the Web UI's tasks panel without telling
         // the user anything actionable. Drop them at the provider boundary;
         // the workflow executor and SSE bridge never see them.
-        if (sysMsg.skip_transcript === true) {
+        if (sysMsg.ambient === true || sysMsg.skip_transcript === true) {
           getLog().debug(
             { taskId: sysMsg.task_id, taskType: sysMsg.task_type },
             'claude.task_started_housekeeping_suppressed'
@@ -1073,6 +1076,13 @@ async function* streamClaudeMessages(
           ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
         };
       } else if (subtype === 'task_notification' && sysMsg.task_id) {
+        if (sysMsg.ambient === true) {
+          getLog().debug(
+            { taskId: sysMsg.task_id, taskType: sysMsg.task_type },
+            'claude.task_notification_housekeeping_suppressed'
+          );
+          continue;
+        }
         const status = sysMsg.status;
         if (status !== 'completed' && status !== 'failed' && status !== 'stopped') {
           getLog().warn(
@@ -1098,7 +1108,9 @@ async function* streamClaudeMessages(
         // change (REPLACE semantics — see the MessageChunk variant docs). An
         // empty `tasks` array is meaningful ("all drained") and MUST be
         // forwarded, so no `&& sysMsg.tasks` guard here.
-        const tasks = Array.isArray(sysMsg.tasks) ? sysMsg.tasks : [];
+        const tasks = Array.isArray(sysMsg.tasks)
+          ? sysMsg.tasks.filter(task => task.ambient !== true)
+          : [];
         yield {
           type: 'background_tasks',
           tasks: tasks.map(t => ({

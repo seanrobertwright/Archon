@@ -600,6 +600,25 @@ describe('ClaudeProvider', () => {
       expect(chunks).toHaveLength(0);
     });
 
+    test('drops housekeeping task_started when SDK sets ambient', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_started',
+          task_id: 't-ambient',
+          description: 'Live update watcher',
+          ambient: true,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(0);
+    });
+
     test('yields task_progress with summary + usage + lastToolName', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
@@ -678,6 +697,26 @@ describe('ClaudeProvider', () => {
       expect(chunks[0]).toMatchObject({ type: 'task_notification', status: 'failed' });
     });
 
+    test('drops housekeeping task_notification when SDK sets ambient', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-ambient',
+          status: 'completed',
+          summary: 'Watcher stopped',
+          ambient: true,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(0);
+    });
+
     // --- #2083 — background-task liveness (SDK 0.3.209 background_tasks_changed) ---
 
     test('yields background_tasks chunk from SDK background_tasks_changed', async () => {
@@ -721,6 +760,53 @@ describe('ClaudeProvider', () => {
       // An empty set means "all background work drained" — it must be forwarded,
       // not dropped, or the executor's wait gate would never release.
       expect(chunks).toEqual([{ type: 'background_tasks', tasks: [] }]);
+    });
+
+    test('filters ambient entries from background task replacement sets', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [
+            {
+              task_id: 't-user',
+              task_type: 'local_agent',
+              description: 'Research problem',
+            },
+            {
+              task_id: 't-ambient',
+              task_type: 'live_update_watcher',
+              description: 'Watch for updates',
+              ambient: true,
+            },
+          ],
+        };
+        yield {
+          type: 'system',
+          subtype: 'background_tasks_changed',
+          tasks: [
+            {
+              task_id: 't-ambient',
+              task_type: 'live_update_watcher',
+              description: 'Watch for updates',
+              ambient: true,
+            },
+          ],
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([
+        {
+          type: 'background_tasks',
+          tasks: [{ taskId: 't-user', taskType: 'local_agent', description: 'Research problem' }],
+        },
+        { type: 'background_tasks', tasks: [] },
+      ]);
     });
 
     test('keeps forwarding chunks that arrive AFTER the result (background-task wait window)', async () => {
@@ -2905,6 +2991,17 @@ describe('API error surfaced as text (#1797)', () => {
     const { error } = await collect(client.sendQuery('test', '/workspace'));
     expect(error?.message).toContain('Claude API error (authentication_failed)');
     expect(error?.message).toContain('Invalid API key');
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test('account_on_hold throws as a non-retryable auth error', async () => {
+    mockQuery.mockImplementation(async function* () {
+      yield syntheticAssistantMessage('account_on_hold', 'This account is temporarily on hold');
+      yield apiErrorResult('This account is temporarily on hold');
+    });
+
+    const { error } = await collect(client.sendQuery('test', '/workspace'));
+    expect(error?.message).toContain('Claude API error (account_on_hold)');
     expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 
