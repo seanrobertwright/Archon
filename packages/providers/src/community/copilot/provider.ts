@@ -127,9 +127,10 @@ function normalizeReasoning(value: unknown): CopilotReasoningEffort | undefined 
  * Precedence:
  *   nodeConfig.thinking > nodeConfig.effort > config.modelReasoningEffort
  *
- * Copilot's SDK has neither end of Archon's ladder, so `max` clamps to `xhigh`
- * and `minimal` to `low` (see `clampEffort`). The `'off'` sentinel disables
- * reasoning. The object form of `thinking` (Claude-specific) returns a warning.
+ * Copilot's SDK covers only `low` through `xhigh`, so `max`/`ultra` clamp to
+ * `xhigh` and `minimal` to `low` (see `clampEffort`). The `'off'` sentinel
+ * disables reasoning. The object form of `thinking` (Claude-specific) returns
+ * a warning.
  */
 function resolveCopilotReasoning(
   nodeConfig: SendQueryOptions['nodeConfig'] | undefined,
@@ -154,7 +155,7 @@ function resolveCopilotReasoning(
     return {
       effort: undefined,
       warning:
-        'Copilot ignored `thinking` (object form is Claude-specific). Use `effort: minimal|low|medium|high|xhigh|max` instead.',
+        'Copilot ignored `thinking` (object form is Claude-specific). Use `effort: minimal|low|medium|high|xhigh|max|ultra` instead.',
     };
   }
 
@@ -162,7 +163,7 @@ function resolveCopilotReasoning(
     const offender = typeof rawThinking === 'string' ? rawThinking : rawEffort;
     return {
       effort: undefined,
-      warning: `Copilot ignored unknown reasoning level '${String(offender)}'. Valid: minimal, low, medium, high, xhigh, max, off.`,
+      warning: `Copilot ignored unknown reasoning level '${String(offender)}'. Valid: minimal, low, medium, high, xhigh, max, ultra, off.`,
     };
   }
 

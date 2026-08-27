@@ -83,10 +83,10 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
  * from config.yaml — mirroring Copilot's `resolveCopilotReasoning`, so a workflow's
  * declared depth beats the install default on both providers alike.
  *
- * Codex has no `max` rung, so `effort: max` clamps to `xhigh` (see
- * `clampEffort`). A value that is not on the ladder at all falls back to the
- * config default rather than being invented; the workflow loader rejects such
- * values at parse time, so this only guards programmatic callers.
+ * Codex accepts every rung on Archon's ladder. A value that is not on the
+ * ladder at all falls back to the config default rather than being invented;
+ * the workflow loader rejects such values at parse time, so this only guards
+ * programmatic callers.
  */
 function resolveModelReasoningEffort(
   nodeConfig: NodeConfig | undefined,

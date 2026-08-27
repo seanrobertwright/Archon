@@ -31,6 +31,8 @@ export const CODEX_EFFORTS = [
   'medium',
   'high',
   'xhigh',
+  'max',
+  'ultra',
 ] as const satisfies readonly ModelReasoningEffort[];
 
 /** Coverage, which `satisfies` above cannot express — a rung the SDK gains must

@@ -47,10 +47,15 @@ describe('resolvePiThinkingLevel', () => {
     expect(resolvePiThinkingLevel({ thinking: 'max' })).toEqual({ level: 'max' });
   });
 
-  test('every rung on the ladder passes through Pi unclamped', () => {
+  test('every Pi-native rung passes through unclamped', () => {
     for (const rung of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
       expect(resolvePiThinkingLevel({ effort: rung })).toEqual({ level: rung });
     }
+  });
+
+  test("'ultra' clamps to Pi's strongest native rung", () => {
+    expect(resolvePiThinkingLevel({ effort: 'ultra' })).toEqual({ level: 'max' });
+    expect(resolvePiThinkingLevel({ thinking: 'ultra' })).toEqual({ level: 'max' });
   });
 
   test('warns on Claude-shape object thinking config', () => {
@@ -89,14 +94,14 @@ describe('resolvePiThinkingLevel', () => {
     // warning strings that have not earned it.
     expect(result.warning).toBe(
       'Pi ignored `thinking` (object form is Claude-specific). Use ' +
-        '`effort: minimal|low|medium|high|xhigh|max` in YAML — Pi accepts every rung natively.'
+        '`effort: minimal|low|medium|high|xhigh|max|ultra` in YAML — Pi accepts through max natively and maps ultra to max.'
     );
   });
 
   test('warns on unknown string thinking value', () => {
-    const result = resolvePiThinkingLevel({ thinking: 'ultra' });
+    const result = resolvePiThinkingLevel({ thinking: 'extreme' });
     expect(result.level).toBeUndefined();
-    expect(result.warning).toContain("unknown thinking level 'ultra'");
+    expect(result.warning).toContain("unknown thinking level 'extreme'");
   });
 
   test('warns on unknown string effort value', () => {

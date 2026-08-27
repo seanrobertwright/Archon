@@ -1,18 +1,17 @@
 import { describe, test, expect } from 'bun:test';
 import { EFFORT_LADDER, clampEffort, isEffortRung } from './effort';
 
-// The vocabularies the four effort-capable SDKs accept. Pi's is the full ladder;
-// the rest are real slices — Claude has no `minimal`, Codex no `max`, Copilot
-// neither.
+// The vocabularies the four effort-capable SDKs accept. Codex has the full
+// ladder; the rest are contiguous slices.
 const CLAUDE = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
-const CODEX = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
-const PI = EFFORT_LADDER; // Pi's ThinkingLevel is the full ladder, `max` included
+const CODEX = EFFORT_LADDER;
+const PI = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const COPILOT = ['low', 'medium', 'high', 'xhigh'] as const;
 
 describe('isEffortRung', () => {
   test('accepts every rung on the ladder and nothing else', () => {
     for (const rung of EFFORT_LADDER) expect(isEffortRung(rung)).toBe(true);
-    for (const other of ['off', 'ultra', '', 'HIGH', 3, null, undefined, {}]) {
+    for (const other of ['off', 'extreme', '', 'HIGH', 3, null, undefined, {}]) {
       expect(isEffortRung(other)).toBe(false);
     }
   });
@@ -25,10 +24,11 @@ describe('clampEffort', () => {
   });
 
   test('clamps down to the nearest supported rung', () => {
-    // No `max` on Codex/Copilot — the top of Archon's ladder means "as deep as
-    // this model goes", so it lands on their strongest rung, not nothing. Pi
-    // has `max` natively and must NOT be clamped.
-    expect(clampEffort('max', CODEX)).toBe('xhigh');
+    // The top of Archon's ladder means "as deep as this model goes", so it
+    // lands on each provider's strongest rung rather than disappearing.
+    expect(clampEffort('ultra', CLAUDE)).toBe('max');
+    expect(clampEffort('ultra', PI)).toBe('max');
+    expect(clampEffort('ultra', COPILOT)).toBe('xhigh');
     expect(clampEffort('max', COPILOT)).toBe('xhigh');
     expect(clampEffort('max', PI)).toBe('max');
   });
@@ -50,7 +50,7 @@ describe('clampEffort', () => {
     // `off` is a real sentinel in Pi/Copilot's node config, handled by the
     // caller before the clamp — the clamp itself must not invent a rung for it.
     expect(clampEffort('off', CODEX)).toBeUndefined();
-    expect(clampEffort('ultra', CLAUDE)).toBeUndefined();
+    expect(clampEffort('extreme', CLAUDE)).toBeUndefined();
     expect(clampEffort(undefined, CLAUDE)).toBeUndefined();
     expect(clampEffort(5, CLAUDE)).toBeUndefined();
   });
