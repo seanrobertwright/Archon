@@ -70,9 +70,9 @@ export const WORKFLOW_EVENT_TYPES = [
   'workflow_failed',
   // #2348 — written by the resume CAS ONLY when it clears a non-empty
   // `metadata.error`, carrying that error in `data.error`. It is the audit
-  // record for a failure that resume would otherwise erase (the CLI's SIGTERM
-  // handler records a failure in metadata and nowhere else), NOT a general
-  // "a resume happened" marker: its absence never means the run wasn't resumed.
+  // record for a legacy failure that resume would otherwise erase (older CLI
+  // SIGTERM handlers could record a failure in metadata and nowhere else), NOT
+  // a general "a resume happened" marker: its absence never means the run wasn't resumed.
   'workflow_resumed',
   // Between-run continuation (#2747) — written on the ADOPTING run's log when it
   // starts with `--adopt`/`--supersedes`, so the chain renders from events alone.
@@ -251,7 +251,13 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
-  completeWorkflowRun(id: string, metadata?: Record<string, unknown>): Promise<void>;
+  /** Atomically complete the run and persist its matching lifecycle event. */
+  completeWorkflowRun(
+    id: string,
+    completion: { duration_ms: number },
+    metadata?: Record<string, unknown>
+  ): Promise<void>;
+  /** Atomically fail the run and persist its matching lifecycle event. */
   failWorkflowRun(
     id: string,
     error: string,

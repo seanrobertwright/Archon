@@ -3104,7 +3104,7 @@ export async function executeWorkflow(
       );
     }
 
-    // Emit workflow_failed event
+    // Emit the live workflow_failed event
     const emitter = getWorkflowEventEmitter();
     emitter.emit({
       type: 'workflow_failed',
@@ -3125,18 +3125,6 @@ export async function executeWorkflow(
       // Categorical class only (fatal/transient/unknown) — err.message never leaves.
       errorClass: toTelemetryErrorClass(classifyError(err)),
     });
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'workflow_failed',
-        data: { error: err.message },
-      })
-      .catch((err: Error) => {
-        getLog().error(
-          { err, workflowRunId: workflowRun.id, eventType: 'workflow_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
     emitter.unregisterRun(workflowRun.id);
 
     // Notify user about the failure

@@ -12498,23 +12498,29 @@ export async function executeDagWorkflow(
         : undefined;
   }
 
+  const duration = Date.now() - dagStartTime;
+
   // Update DB and emit completion
   try {
-    await deps.store.completeWorkflowRun(workflowRun.id, {
-      node_counts: nodeCounts,
-      // Cost and token totals are NOT written here — `persistRunUsage` already wrote
-      // them at the run tail, before this branch was chosen (#2469). Keeping a second
-      // copy here would be two writers of the same three keys, free to drift.
-      // A sub-run persists its terminal summary so the parent can thread it as
-      // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
-      // growth to child runs only (top-level runs return the summary directly).
-      // `summary_value` is the additive logical sibling (#2637): old binaries keep
-      // reading `summary`, new parents prefer the typed value when present.
-      ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
-      ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
-        ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
-        : {}),
-    });
+    await deps.store.completeWorkflowRun(
+      workflowRun.id,
+      { duration_ms: duration },
+      {
+        node_counts: nodeCounts,
+        // Cost and token totals are NOT written here — `persistRunUsage` already wrote
+        // them at the run tail, before this branch was chosen (#2469). Keeping a second
+        // copy here would be two writers of the same three keys, free to drift.
+        // A sub-run persists its terminal summary so the parent can thread it as
+        // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
+        // growth to child runs only (top-level runs return the summary directly).
+        // `summary_value` is the additive logical sibling (#2637): old binaries keep
+        // reading `summary`, new parents prefer the typed value when present.
+        ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
+        ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
+          ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
+          : {}),
+      }
+    );
   } catch (dbErr) {
     getLog().error(
       { err: dbErr as Error, workflowRunId: workflowRun.id },
@@ -12534,7 +12540,6 @@ export async function executeDagWorkflow(
     ...(totalCostUsd > 0 ? { cost_usd: totalCostUsd } : {}),
     ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),
   });
-  const duration = Date.now() - dagStartTime;
   const emitter = getWorkflowEventEmitter();
   emitter.emit({
     type: 'workflow_completed',
@@ -12555,18 +12560,6 @@ export async function executeDagWorkflow(
     nodesTotal: nodeCounts.total,
     ...runUsageProps,
   });
-  deps.store
-    .createWorkflowEvent({
-      workflow_run_id: workflowRun.id,
-      event_type: 'workflow_completed',
-      data: { duration_ms: duration },
-    })
-    .catch((err: Error) => {
-      getLog().error(
-        { err, workflowRunId: workflowRun.id, eventType: 'workflow_completed' },
-        'workflow_event_persist_failed'
-      );
-    });
   emitter.unregisterRun(workflowRun.id);
 
   // terminalOutput (computed above, before the completion write) is the run's

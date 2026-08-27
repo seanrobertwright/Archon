@@ -195,7 +195,9 @@ function createMockStore(): MockWorkflowStore {
     updateWorkflowRun: mock<IWorkflowStore['updateWorkflowRun']>(async (_id, _updates) => {}),
     updateWorkflowActivity: mock<IWorkflowStore['updateWorkflowActivity']>(async _id => {}),
     getWorkflowRunStatus: mock<IWorkflowStore['getWorkflowRunStatus']>(async _id => 'running'),
-    completeWorkflowRun: mock<IWorkflowStore['completeWorkflowRun']>(async (_id, _metadata) => {}),
+    completeWorkflowRun: mock<IWorkflowStore['completeWorkflowRun']>(
+      async (_id, _completion, _metadata) => {}
+    ),
     failWorkflowRun: mock<IWorkflowStore['failWorkflowRun']>(async (_id, _error) => {}),
     pauseWorkflowRun: mock<IWorkflowStore['pauseWorkflowRun']>(
       async (_id, _approvalContext, _extraMetadata) => {}
@@ -7580,14 +7582,16 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(mockSendQueryDag.mock.calls.length).toBe(1);
       // Workflow should be marked completed with node counts metadata
       const completeCalls = (
-        mockDeps.store.completeWorkflowRun as Mock<
-          (id: string, metadata?: Record<string, unknown>) => Promise<void>
-        >
+        mockDeps.store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>
       ).mock.calls;
       expect(completeCalls.length).toBe(1);
-      expect(completeCalls[0][1]).toEqual({
+      expect(completeCalls[0][1]?.duration_ms).toBeNumber();
+      expect(completeCalls[0][2]).toEqual({
         node_counts: { completed: 1, failed: 0, skipped: 0, total: 1 },
       });
+      expect(mockDeps.store.createWorkflowEvent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ event_type: 'workflow_completed' })
+      );
     });
 
     it('records requested model/tier on node_started and the resolved model on node_completed (#2314)', async () => {
@@ -8556,11 +8560,8 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       // 3 iterations run, signal found on iteration 3 → completed, NOT failed
       expect(mockSendQueryDag.mock.calls.length).toBe(3);
       expect(
-        (
-          mockDeps.store.completeWorkflowRun as Mock<
-            (id: string, metadata?: Record<string, unknown>) => Promise<void>
-          >
-        ).mock.calls.length
+        (mockDeps.store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>).mock
+          .calls.length
       ).toBe(1);
       expect(
         (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
@@ -9948,12 +9949,10 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       // Should complete on first iteration (plain signal on own line)
       expect(mockSendQueryDag.mock.calls.length).toBe(1);
       const completeCalls = (
-        mockDeps.store.completeWorkflowRun as Mock<
-          (id: string, metadata?: Record<string, unknown>) => Promise<void>
-        >
+        mockDeps.store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>
       ).mock.calls;
       expect(completeCalls.length).toBe(1);
-      expect(completeCalls[0][1]).toEqual({
+      expect(completeCalls[0][2]).toEqual({
         node_counts: { completed: 1, failed: 0, skipped: 0, total: 1 },
       });
     });
@@ -16563,13 +16562,10 @@ describe('executeDagWorkflow -- cost tracking', () => {
 
     expect(runUsageWrites(store)).toEqual([{ total_cost_usd: 0.0042 }]);
     // Exactly one writer: completeWorkflowRun keeps node_counts, not usage (#2469).
-    const completeCalls = (
-      store.completeWorkflowRun as Mock<
-        (id: string, metadata?: Record<string, unknown>) => Promise<void>
-      >
-    ).mock.calls;
+    const completeCalls = (store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>)
+      .mock.calls;
     expect(completeCalls.length).toBe(1);
-    expect(completeCalls[0][1]).toEqual({
+    expect(completeCalls[0][2]).toEqual({
       node_counts: { completed: 1, failed: 0, skipped: 0, total: 1 },
     });
   });
@@ -16652,13 +16648,10 @@ describe('executeDagWorkflow -- cost tracking', () => {
     // A zero must stay ABSENT, not written as 0 — a bash-only workflow reading as a
     // free AI run is the misleading shape the `> 0` guards exist to prevent.
     expect(runUsageWrites(store)).toEqual([]);
-    const completeCalls = (
-      store.completeWorkflowRun as Mock<
-        (id: string, metadata?: Record<string, unknown>) => Promise<void>
-      >
-    ).mock.calls;
+    const completeCalls = (store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>)
+      .mock.calls;
     expect(completeCalls.length).toBe(1);
-    expect(completeCalls[0][1]).not.toHaveProperty('total_cost_usd');
+    expect(completeCalls[0][2]).not.toHaveProperty('total_cost_usd');
   });
 
   it('accumulates finite loop costs and ignores a later non-finite cost', async () => {
@@ -18665,6 +18658,35 @@ describe('executeDagWorkflow -- final status derivation', () => {
     }
   });
 
+  it('a failed-only DAG delegates its terminal event to failWorkflowRun', async () => {
+    const mockStore = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(mockStore),
+      createMockPlatform(),
+      'conv-status',
+      testDir,
+      {
+        name: 'status-test',
+        nodes: [{ id: 'fail', kind: 'exec', runtime: 'sh', script: 'exit 1' } as ExecNode],
+      },
+      makeWorkflowRun('dag-status-failed-only'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockStore.failWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockStore.createWorkflowEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'workflow_failed' })
+    );
+  });
+
   it('one success + one independent failure -> failWorkflowRun, not completeWorkflowRun', async () => {
     const mockStore = createMockStore();
     const mockDeps = createMockDeps(mockStore);
@@ -18699,6 +18721,9 @@ describe('executeDagWorkflow -- final status derivation', () => {
       expect.anything(),
       expect.stringContaining('fail'),
       undefined
+    );
+    expect(mockStore.createWorkflowEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'workflow_failed' })
     );
 
     // Confirm the failure message names the failing node

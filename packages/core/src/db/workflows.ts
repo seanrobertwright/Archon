@@ -897,8 +897,7 @@ export async function resumeWorkflowRun(
     //
     // The CAS also clears `metadata.error` so a run that fails, is resumed, and
     // then completes doesn't keep rendering its old failure (#2329). Because
-    // metadata is the ONLY place some failures are recorded — the CLI's SIGTERM
-    // handler calls failWorkflowRun and writes no event (#2348) — the error being
+    // legacy runs may carry their only failure record in metadata (#2348), the error being
     // cleared is first preserved as a `workflow_resumed` event, in the SAME
     // transaction as the clear, so the audit trail can never lose it. The read,
     // the CAS and the event INSERT are one transaction (mirroring
@@ -1122,26 +1121,35 @@ export async function updateWorkflowRun(
 
 export async function completeWorkflowRun(
   id: string,
+  completion: { duration_ms: number },
   metadata?: Record<string, unknown>
 ): Promise<void> {
   const dialect = getDialect();
   let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
-    if (metadata) {
-      result = await pool.query(
-        `UPDATE remote_agent_workflow_runs
-         SET status = 'completed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-         WHERE id = $1 AND status = 'running'`,
-        [id, JSON.stringify(metadata)]
-      );
-    } else {
-      result = await pool.query(
-        `UPDATE remote_agent_workflow_runs
-         SET status = 'completed', completed_at = ${dialect.now()}
-         WHERE id = $1 AND status = 'running'`,
-        [id]
-      );
-    }
+    result = await getDatabase().withTransaction(async query => {
+      const update = metadata
+        ? await query(
+            `UPDATE remote_agent_workflow_runs
+             SET status = 'completed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
+             WHERE id = $1 AND status = 'running'`,
+            [id, JSON.stringify(metadata)]
+          )
+        : await query(
+            `UPDATE remote_agent_workflow_runs
+             SET status = 'completed', completed_at = ${dialect.now()}
+             WHERE id = $1 AND status = 'running'`,
+            [id]
+          );
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_completed',
+          data: completion,
+        });
+      }
+      return update;
+    });
   } catch (error) {
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_complete_failed');
@@ -1202,6 +1210,13 @@ export async function failWorkflowRun(
             attempt: parsedSchedule.attempt,
             max_attempts: parsedSchedule.maxAttempts,
           },
+        });
+      }
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_failed',
+          data: { error },
         });
       }
       return update;

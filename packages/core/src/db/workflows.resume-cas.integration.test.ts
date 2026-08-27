@@ -56,6 +56,8 @@ const {
   resolveAndCancelApprovalGate,
   claimWriteback,
   releaseWritebackClaim,
+  completeWorkflowRun,
+  failWorkflowRun,
   WorkflowNotResumableError,
 } = await import('./workflows');
 const { approveWorkflow, rejectWorkflow } = await import('../operations/workflow-operations');
@@ -99,7 +101,7 @@ describe('resumeWorkflowRun — real SQLite (CAS + orphan recovery)', () => {
   test('clears a failed run error when resuming, preserving it as an event', async () => {
     // #2329: a run that failed, resumed and completed kept rendering its old
     // error. #2348: for the motivating run the error lived ONLY in metadata —
-    // the CLI's SIGTERM handler calls failWorkflowRun and writes no event — so
+    // older CLI SIGTERM handlers could leave only this metadata error — so
     // clearing it silently destroyed the only record that the run ever failed.
     await seed('failed-with-error', 'failed', "datetime('now')", {
       error: 'Process terminated (SIGTERM)',
@@ -578,6 +580,77 @@ async function countEvents(runId: string, eventType: string): Promise<number> {
   );
   return Number(result.rows[0]?.cnt ?? 0);
 }
+
+describe('terminal workflow transitions — real SQLite', () => {
+  test('commits completion and its matching event together', async () => {
+    await seed('terminal-complete', 'running', "datetime('now')");
+
+    await completeWorkflowRun('terminal-complete', { duration_ms: 321 });
+
+    expect((await getWorkflowRun('terminal-complete'))?.status).toBe('completed');
+    expect(await countEvents('terminal-complete', 'workflow_completed')).toBe(1);
+    const event = await db.query<{ data: string }>(
+      `SELECT data FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND event_type = 'workflow_completed'`,
+      ['terminal-complete']
+    );
+    expect(JSON.parse(event.rows[0]?.data ?? '{}')).toEqual({ duration_ms: 321 });
+  });
+
+  test('commits failure and its matching event together', async () => {
+    await seed('terminal-fail', 'pending', "datetime('now')");
+
+    await failWorkflowRun('terminal-fail', 'node exploded');
+
+    expect((await getWorkflowRun('terminal-fail'))?.status).toBe('failed');
+    expect(await countEvents('terminal-fail', 'workflow_failed')).toBe(1);
+    const event = await db.query<{ data: string }>(
+      `SELECT data FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND event_type = 'workflow_failed'`,
+      ['terminal-fail']
+    );
+    expect(JSON.parse(event.rows[0]?.data ?? '{}')).toEqual({ error: 'node exploded' });
+  });
+
+  test('only the winning terminal transition inserts an event', async () => {
+    await seed('terminal-race', 'running', "datetime('now')");
+
+    const outcomes = await Promise.allSettled([
+      completeWorkflowRun('terminal-race', { duration_ms: 7 }),
+      failWorkflowRun('terminal-race', 'lost race'),
+    ]);
+
+    expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
+    const run = await getWorkflowRun('terminal-race');
+    expect(
+      (await countEvents('terminal-race', 'workflow_completed')) +
+        (await countEvents('terminal-race', 'workflow_failed'))
+    ).toBe(1);
+    expect(run?.status).toBe(
+      (await countEvents('terminal-race', 'workflow_completed')) === 1 ? 'completed' : 'failed'
+    );
+  });
+
+  test('rolls back both terminal transitions when the event table is unavailable', async () => {
+    await seed('terminal-complete-atomic', 'running', "datetime('now')");
+    await seed('terminal-fail-atomic', 'running', "datetime('now')");
+
+    await db.query('ALTER TABLE remote_agent_workflow_events RENAME TO events_stash', []);
+    try {
+      await expect(
+        completeWorkflowRun('terminal-complete-atomic', { duration_ms: 9 })
+      ).rejects.toThrow('Failed to complete workflow run');
+      await expect(failWorkflowRun('terminal-fail-atomic', 'boom')).rejects.toThrow(
+        'Failed to fail workflow run'
+      );
+    } finally {
+      await db.query('ALTER TABLE events_stash RENAME TO remote_agent_workflow_events', []);
+    }
+
+    expect((await getWorkflowRun('terminal-complete-atomic'))?.status).toBe('running');
+    expect((await getWorkflowRun('terminal-fail-atomic'))?.status).toBe('running');
+  });
+});
 
 describe('durable wait continuation races — real SQLite', () => {
   const waitA = {

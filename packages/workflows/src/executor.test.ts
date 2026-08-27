@@ -2902,6 +2902,10 @@ describe('telemetry wiring', () => {
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
       expect.objectContaining({ outcome: 'failed', exitReason: 'unhandled_error' })
     );
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(store.createWorkflowEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'workflow_failed' })
+    );
   });
 
   it('reports feature-adoption booleans on workflow_invoked', async () => {
