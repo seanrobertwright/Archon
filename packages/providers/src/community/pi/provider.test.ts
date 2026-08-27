@@ -1904,7 +1904,7 @@ describe('PiProvider', () => {
       | undefined;
     expect(loaderArgs?.systemPrompt).toBe('You are a careful investigator.');
     expect(loaderArgs?.noExtensions).toBe(false);
-    expect(loaderArgs?.noContextFiles).toBe(true);
+    expect(loaderArgs).not.toHaveProperty('noContextFiles');
   });
 
   test('nodeConfig.systemPrompt used when requestOptions.systemPrompt absent', async () => {
@@ -2128,11 +2128,12 @@ describe('PiProvider', () => {
     // users run Pi; off-by-default silently broke users who installed or
     // authored one and expected it to fire.
     expect(loaderArgs?.noExtensions).toBe(false);
-    // Skills/prompts/themes/context stay suppressed — only extensions flip on.
+    // Skills/prompts/themes stay suppressed. Context files follow Pi's native
+    // default instead of an Archon-owned policy.
     expect(loaderArgs?.noSkills).toBe(true);
     expect(loaderArgs?.noPromptTemplates).toBe(true);
     expect(loaderArgs?.noThemes).toBe(true);
-    expect(loaderArgs?.noContextFiles).toBe(true);
+    expect(loaderArgs).not.toHaveProperty('noContextFiles');
   });
 
   test('assistantConfig.enableExtensions: true flips noExtensions to false', async () => {
@@ -2150,11 +2151,12 @@ describe('PiProvider', () => {
       | Record<string, unknown>
       | undefined;
     expect(loaderArgs?.noExtensions).toBe(false);
-    // Skills/prompts/themes/context still suppressed — only extensions opt-in.
+    // Skills/prompts/themes stay suppressed. Context files follow Pi's native
+    // default instead of the extension switch.
     expect(loaderArgs?.noSkills).toBe(true);
     expect(loaderArgs?.noPromptTemplates).toBe(true);
     expect(loaderArgs?.noThemes).toBe(true);
-    expect(loaderArgs?.noContextFiles).toBe(true);
+    expect(loaderArgs).not.toHaveProperty('noContextFiles');
   });
 
   test('assistantConfig.enableExtensions: false keeps noExtensions: true', async () => {
@@ -2963,7 +2965,7 @@ describe('PiProvider', () => {
       expect(mockResourceLoaderReload).toHaveBeenCalledTimes(2);
     });
 
-    test('extensions disabled keeps a fresh loader per call and never reloads', async () => {
+    test('extensions disabled keeps a fresh loader per call and reloads native context', async () => {
       process.env.GEMINI_API_KEY = 'sk-test';
       resetScript(scriptedAgentEnd());
 
@@ -2974,9 +2976,11 @@ describe('PiProvider', () => {
       await consume(new PiProvider().sendQuery('a', '/tmp', undefined, opts));
       await consume(new PiProvider().sendQuery('b', '/tmp', undefined, opts));
 
-      // No caching on the extensions-off path: fresh loader each call, no reload.
+      // No caching on the extensions-off path: each loader can reload safely
+      // because no extension factories run. Reload is what discovers Pi's
+      // native AGENTS.md / CLAUDE.md context files.
       expect(MockDefaultResourceLoader).toHaveBeenCalledTimes(2);
-      expect(mockResourceLoaderReload).not.toHaveBeenCalled();
+      expect(mockResourceLoaderReload).toHaveBeenCalledTimes(2);
     });
 
     test('distinct additionalSkillPaths get their own reloaded loader', async () => {

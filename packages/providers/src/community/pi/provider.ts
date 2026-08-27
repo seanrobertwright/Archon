@@ -318,7 +318,7 @@ export class PiProvider implements IAgentProvider {
       piCodingAgent,
       { bridgeSession },
       { resolvePiSkills, resolvePiThinkingLevel, resolvePiTools, buildDefaultPiTools },
-      { createNoopResourceLoader, getOrCreateReloadedExtensionLoader },
+      { createPiResourceLoader, getOrCreateReloadedExtensionLoader },
       { resolvePiSession },
       { createArchonUIBridge, createArchonUIContext },
       { buildPiNativeToolDefinitions },
@@ -758,8 +758,9 @@ export class PiProvider implements IAgentProvider {
     // installed extension factory from scratch and the 2nd reload in a process
     // deadlocks on the first call's never-torn-down state (issue #1877 — see the
     // doc on getOrCreateReloadedExtensionLoader). When extensions are OFF there
-    // is no reload() and thus no re-entrancy hazard, so a fresh per-call loader
-    // is fine. Build the shared options once so the two paths can't drift.
+    // is no re-entrancy hazard, so a fresh per-call loader can reload safely.
+    // That reload is still required for Pi to discover its native context files.
+    // Build the shared options once so the two paths can't drift.
     const loaderOptions = {
       ...(systemPrompt !== undefined ? { systemPrompt } : {}),
       ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
@@ -798,7 +799,8 @@ export class PiProvider implements IAgentProvider {
         getLog().debug({ count: providerRegistrations.length }, 'pi.extension_providers_reapplied');
       }
     } else {
-      resourceLoader = createNoopResourceLoader(cwd, loaderOptions);
+      resourceLoader = createPiResourceLoader(cwd, loaderOptions);
+      await resourceLoader.reload();
     }
 
     getLog().info(
