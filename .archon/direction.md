@@ -31,6 +31,22 @@ This file is **committed and shared by all maintainers**. Edit deliberately — 
 - **Not a package-manager distribution hub.** The maintained install channels are the curl/PowerShell installer, Homebrew, Docker, and the GitHub release binaries. Additional channels (Nix, AUR, Scoop, winget, apt, ...) are welcome as **community-maintained docs recipes**, or as packages upstream in the package manager's own registry (e.g. nixpkgs) where they get that ecosystem's CI and hash-update bots for free — not as in-repo manifests Archon version-bumps. Every hash-pinned channel adds a per-release chore and a surface that rots silently between releases; Homebrew already costs one. Cite as `direction.md §distribution-channels`.
 - **Not a programming language.** The workflow YAML coordinates (gates, joins, retries, sessions, artifacts, reusable structure); computation lives inside nodes, not in the YAML. PRs that add computation to the YAML surface conflict — see §workflow-language. This is about the *language*, not about which node type an author picks: a `prompt:` node that computes is a legitimate choice — see §prompt-computation.
 
+## Aspirational architecture: a standalone core
+
+This is the target architecture, not a description of the current package graph or install. Design work should move toward it without pretending the decomposition is already complete. Tracked in [#2791](https://github.com/coleam00/Archon/issues/2791).
+
+Agentic engineering changes too quickly for a monolith to stay right. Projects that endure keep a small, flexible core and let users build the rest through plugins and extensions.
+
+- **The engine stands alone as an SDK.** Its public surface defines, validates, runs, resumes, governs, and queries workflows without requiring the server, Web UI, platform adapters, provider implementations, or a database.
+- **Core plus CLI is a complete local install.** The engine and CLI must be downloadable and installable without the rest of Archon. Worktree isolation is part of that baseline because it is the default local workspace primitive.
+- **Append-only files are the default persistence.** A standalone install uses append-only JSON or JSONL run records and event logs. A database is an optional persistence adapter, not a prerequisite for the engine.
+- **Providers and platform adapters are plugins.** AI providers, Slack, Telegram, GitHub, Discord, Web, and future integrations attach through stable extension seams. None belongs to the required core distribution.
+- **Additional isolation backends are plugins.** Worktrees remain built in; containers, VMs, microVMs, remote execution, and future isolation forms are optional add-ons behind the isolation contract.
+- **Engine capabilities have pluggable hosts.** Continuation wakes, schedules, triggers, and similar lifecycle functions belong to core surfaces that a CLI command, server loop, OS timer, or third-party host can drive. The server is a batteries-included host, not the owner of the capability.
+- **Everything outside the core is optional.** The server, UI, database adapters, providers, platform adapters, and non-worktree isolation should compose around the SDK. A consumer adopts only the surfaces it needs.
+
+Triage clause: cite this direction as `direction.md §standalone-core`. Do not reject incremental improvements because they do not complete the decomposition in one change; reject new coupling that makes the target materially harder.
+
 ## Community providers
 
 Archon ships built-in providers for Claude (`@anthropic-ai/claude-agent-sdk`) and Codex (`@openai/codex-sdk`). Pi (`@earendil-works/pi-coding-agent`) is the reference community provider and sets the pattern others should follow.
@@ -51,7 +67,7 @@ When citing this policy in a PR comment: `direction.md §community-providers`.
 
 ## Workflow language (YAML surface)
 
-The workflow YAML is a **coordination language**, not a programming language. Admissibility test for any new YAML surface feature (field, node type, expression capability): (1) does the *engine* need to see it to govern the run? (2) is it declarative data, not evaluation? (3) could a script node + existing wiring express it today? A feature that computes rather than coordinates is declined with a pointer to the escape hatch. Full rationale, case law, and the five failure smells: `packages/docs-web/src/content/docs/reference/workflow-language-constitution.md`.
+The workflow YAML is a **coordination language**, not a programming language. Admissibility test for any new YAML surface feature (field, node type, expression capability): (1) does the *engine* need to see it to govern the run? (2) is it declarative data, not evaluation? (3) could a script node + existing wiring express it today? A feature that computes rather than coordinates is declined with a pointer to the escape hatch. Full rationale, case law, and the five failure smells: `.archon/workflow-language-constitution.md`.
 
 Triage clauses — cite as `direction.md §<clause>`:
 
