@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
 import {
-  DETACHED_RUN_IPC_TIMEOUT_MS,
   detachedRunControlPath,
   requestDetachedRunStop,
   startDetachedRunControlServer,
@@ -43,9 +42,25 @@ function waitForExit(
   });
 }
 
-// Explicit slack for the shutdown steps after the lease socket's idle timeout
-// fires (socket teardown, server close, endpoint unlink) on a loaded host.
-const LEASE_RELEASE_SLACK_MS = 1_000;
+/**
+ * Ask the endpoint itself whether it is still serving. Connection refusal is the
+ * owner's own answer, so this reports shutdown progress without timing it.
+ */
+function endpointIsReachable(path: string): Promise<boolean> {
+  return new Promise<boolean>((resolve: (reachable: boolean) => void): void => {
+    const probe = createConnection(path);
+    const settle = (reachable: boolean): void => {
+      probe.destroy();
+      resolve(reachable);
+    };
+    probe.once('connect', (): void => {
+      settle(true);
+    });
+    probe.once('error', (): void => {
+      settle(false);
+    });
+  });
+}
 
 function processExists(pid: number): boolean {
   try {
@@ -154,23 +169,31 @@ describe('detached run control integration', () => {
 
   it('bounds owner shutdown when a controller retains an uncommitted stop lease', async () => {
     const runId = `retained-${crypto.randomUUID()}`;
+    const endpointPath = detachedRunControlPath(runId);
     const owner = await startDetachedRunControlServer(runId);
-    const client = createConnection(detachedRunControlPath(runId));
+    const client = createConnection(endpointPath);
     await new Promise<void>((resolve, reject) => {
       client.once('connect', resolve);
       client.once('error', reject);
     });
-    // The client never sends 'terminate', so the owner-side idle timeout is the
-    // only thing that releases close(). The timeout arms when the owner parses
-    // the stop frame (at or after leaseStartedAt) and never fires early, and
-    // close() must not hang materially past it plus explicit shutdown slack.
-    const leaseStartedAt = Date.now();
+    // The client never sends 'terminate' and never hangs up, so the owner-side
+    // idle timeout is the only thing that can release close(). Assert the order
+    // that timeout produces rather than measuring how long it took: an elapsed
+    // floor against a real timer carries a couple of milliseconds of headroom
+    // and fails whenever the timer and the clock disagree by that much (#2859).
     client.write('stop\n');
     await waitFor(() => owner.isStopRequested());
-    await owner.close();
-    const elapsedMs = Date.now() - leaseStartedAt;
-    expect(elapsedMs).toBeGreaterThanOrEqual(DETACHED_RUN_IPC_TIMEOUT_MS);
-    expect(elapsedMs).toBeLessThan(DETACHED_RUN_IPC_TIMEOUT_MS + LEASE_RELEASE_SLACK_MS);
+
+    const closing = owner.close();
+    // close() is parked on the retained lease and has gone no further: it stops
+    // the server and unlinks the endpoint only afterwards, so a close() that
+    // ignored the lease would already have made this probe unreachable.
+    expect(await endpointIsReachable(endpointPath)).toBe(true);
+    expect(owner.isStopRequested()).toBe(true);
+
+    await closing;
+    expect(owner.isStopRequested()).toBe(false);
+    expect(await endpointIsReachable(endpointPath)).toBe(false);
     client.destroy();
   });
 
