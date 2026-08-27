@@ -104,8 +104,10 @@ export function parseFixtureFile(text: string, path: string): ParsedFixtureFile 
 
 const FIXTURES_DIR = 'fixtures';
 const FIXTURE_SUFFIX = '.stubs.yaml';
-// Discovery walks user directories; the bound mirrors discovery's own depth cap so a
-// pathological tree cannot hang the command.
+// Discovery walks user directories. This is a hang-guard margin for a pathological
+// tree, not a mirror of discovery's cap (MAX_DISCOVERY_DEPTH is 1, and the catalog
+// reaches one packaged-scanner level deeper): fixtures below the catalog's reach are
+// discovered here but can never match a loadable workflow.
 const MAX_WALK_DEPTH = 12;
 
 async function exists(path: string): Promise<boolean> {
@@ -257,8 +259,9 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
       selected = all.filter(fixture => fixture.pack === options.target);
     }
     if (selected.length === 0) {
-      // Suggest only workflows a discovered fixture actually targets; the full catalog
-      // would point the user at workflows that cannot satisfy the command.
+      // Suggest only workflows a discovered fixture actually targets AND that the catalog
+      // loaded; the full catalog would point the user at workflows that cannot satisfy the
+      // command, and a fixture beside an unloadable workflow would too.
       const names = [...new Set(all.flatMap(f => f.workflowNames))]
         .filter(name => byName.has(name))
         .sort()
@@ -266,7 +269,9 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
       const hint =
         names.length > 0
           ? ` Name a workflow with fixtures (${names}) or a pack directory containing them.`
-          : ' No workflow in any discovery scope declares fixtures.';
+          : all.length === 0
+            ? ' No workflow in any discovery scope declares fixtures.'
+            : ' Discovered fixtures target no workflow in the discovery catalog.';
       throw new Error(`No fixtures found for '${targetName}'.${hint}`);
     }
   }
