@@ -215,12 +215,17 @@ async function discoverFixtures(roots: readonly string[]): Promise<DiscoveredFix
     const before = found.length;
     await walkForFixtures(scopeRoot, scopeRoot, 0, found);
     for (let i = before; i < found.length; i++) {
-      if (seen.has(found[i].path)) {
-        // Higher-precedence scope already discovered this fixture path.
+      // Keyed on the scope-relative label, not the absolute path: an absolute path is
+      // unique per scope by construction, so keying on it would never dedup anything and
+      // a project copy of a bundled workflow would run both fixtures. The label is what
+      // makes an override shadow the copy it overrides, matching how `workflow-discovery`
+      // resolves the same scope chain for the workflow files themselves.
+      if (seen.has(found[i].label)) {
+        // Higher-precedence scope already discovered this fixture.
         found.splice(i, 1);
         i--;
       } else {
-        seen.add(found[i].path);
+        seen.add(found[i].label);
       }
     }
   }
@@ -409,9 +414,15 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
     // before the containment check; a nonexistent target can never contain a
     // fixture, so keeping its resolved spelling there is safe.
     const targetReal = await realpath(targetDir).catch(() => targetDir);
+    // Name matching is gated on catalog membership: a workflow file can sit on disk with
+    // a `fixtures/` dir beside it and still never load. Without the gate its name would
+    // select fixtures the run cannot check, turning an unresolved target into a per-fixture
+    // "no discovered workflow matches" failure instead of the documented exit-1 error. The
+    // suggestion list below applies the same gate.
+    const targetIsLoadedWorkflow = byName.has(targetName);
     selected = all.filter(
       fixture =>
-        fixture.workflowNames.includes(targetName) ||
+        (targetIsLoadedWorkflow && fixture.workflowNames.includes(targetName)) ||
         fixture.dirs.includes(targetName) ||
         fixture.path.startsWith(targetReal + sep)
     );

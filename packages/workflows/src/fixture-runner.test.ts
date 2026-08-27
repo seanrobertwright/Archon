@@ -69,7 +69,9 @@ async function runFixtures(
   return runFixturesFromSource({
     ...options,
     sourceConfig: options.sourceConfig ?? DEFAULT_WORKFLOW_SOURCE_CONFIG,
-    sourceRoots: isolatedSourceRoots(options.cwd),
+    // Default to empty global/bundled scopes so a test cannot read the real ones; a test
+    // that is specifically about cross-scope behavior passes its own populated roots.
+    sourceRoots: options.sourceRoots ?? isolatedSourceRoots(options.cwd),
   });
 }
 
@@ -487,6 +489,89 @@ describe('runFixtures', () => {
       'sdlc/plan/fixtures/ship.stubs.yaml',
       'sdlc/ship/fixtures/ship.stubs.yaml',
     ]);
+  });
+
+  it('rejects a target naming a workflow that is on disk but not in the catalog', async () => {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    // `broken-wf` parses far enough to declare a name but never reaches the catalog — the
+    // shape of an unfinished or unloadable workflow file that still has fixtures beside it.
+    const brokenDir = join(cwd, '.archon', 'workflows', 'broken');
+    mkdirSync(join(brokenDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(brokenDir, 'broken-wf.yaml'),
+      'name: broken-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(brokenDir, 'fixtures', 'orphan.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+    // A loaded workflow elsewhere, so the failure is "this target is unresolved" rather
+    // than "nothing is loaded at all" — and so the hint names a real alternative.
+    const okDir = join(cwd, '.archon', 'workflows', 'ok');
+    mkdirSync(join(okDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(okDir, 'ok-wf.yaml'),
+      'name: ok-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(okDir, 'fixtures', 'ok.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+
+    // Ungated name matching selects the orphan fixture and reports it as a per-fixture
+    // "no discovered workflow matches" failure, which blames the fixture for a target problem.
+    await expect(
+      runFixtures({ workflows: workflowsOnDisk(cwd, ['ok-wf'], 'ok'), cwd, target: 'broken-wf' })
+    ).rejects.toThrow("No fixtures found for 'broken-wf'. Name a workflow with fixtures (ok-wf)");
+
+    // The gate must not cost the loaded name its own resolution.
+    const loaded = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['ok-wf'], 'ok'),
+      cwd,
+      target: 'ok-wf',
+    });
+    expect(loaded.results.map(r => r.fixture)).toEqual(['ok/fixtures/ok.stubs.yaml']);
+  });
+
+  it('lets a project fixture shadow the bundled fixture it overrides', async () => {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    const bundled = makeTempProject();
+    cleanups.push(bundled);
+    // The same relative fixture in two scopes: a project that copied a bundled workflow
+    // folder to customize it. Both declare the same workflow name, so both would be checked
+    // against the same catalog entry and print the same label — indistinguishable in output.
+    const write = (root: string, expectOutcome: string) => {
+      const dir = join(root, 'ship');
+      mkdirSync(join(dir, 'fixtures'), { recursive: true });
+      writeFileSync(
+        join(dir, 'ship-wf.yaml'),
+        'name: ship-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+      );
+      writeFileSync(
+        join(dir, 'fixtures', 'x.stubs.yaml'),
+        ['fixture:', `  expect: ${expectOutcome}`, 'node-a: "stub output"', ''].join('\n')
+      );
+    };
+    write(join(cwd, '.archon', 'workflows'), 'completed');
+    write(bundled, 'failed');
+
+    const report = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['ship-wf'], 'ship'),
+      cwd,
+      sourceRoots: {
+        ...liveSourceRoots(cwd),
+        globalWorkflows: join(cwd, '.empty', 'global-workflows'),
+        bundledWorkflows: bundled,
+      },
+    });
+
+    // One result, and it is the project's: a path-keyed `seen` never dedups across scopes
+    // (absolute paths are scope-unique) and yields two, while dedup that kept the wrong
+    // side would report the bundled `expect: failed` under an identical label.
+    expect(report.results.map(r => r.fixture)).toEqual(['ship/fixtures/x.stubs.yaml']);
+    expect(report.results[0].expect).toBe('completed');
   });
 });
 
