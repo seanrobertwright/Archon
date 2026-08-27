@@ -767,16 +767,15 @@ describe('formatSubprocessFailure', () => {
     expect(userMessage).toContain('[exit 2]');
   });
 
-  it('truncates diagnostics larger than 2 KB from the tail', () => {
+  it('keeps the tail of diagnostics larger than 2 KB and bounds the output', () => {
     const big = 'x'.repeat(5000) + '\nactual error at end';
     const { userMessage } = formatSubprocessFailure(
       { message: 'Command failed: cmd\n', stderr: big, code: 1 },
       "Script node 'n1'"
     );
     expect(userMessage).toContain('actual error at end');
-    expect(userMessage).toContain('[truncated]');
-    // Tight bound: ~2 KB diagnostic + label prefix + truncation suffix should fit
-    // well under 2.1 KB. Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
+    // Tight bound: ~2 KB diagnostic + label prefix should fit well under 2.1 KB.
+    // Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
     expect(userMessage.length).toBeLessThan(2100);
   });
 
@@ -810,6 +809,56 @@ describe('formatSubprocessFailure', () => {
     expect(logFields.exitCode).toBeUndefined();
     expect(logFields.killed).toBe(false);
     expect(logFields.stderrTail).toBeUndefined();
+  });
+
+  it('uses a stdout tail as the diagnostic when stderr is empty', () => {
+    const err = {
+      message: 'Command failed: bash -c script body\n',
+      stdout: 'targeted test failed on repetition 3/5: bun test foo.test.ts',
+      code: 1,
+    };
+    const { userMessage, logFields } = formatSubprocessFailure(err, "Script node 'n1'");
+    expect(userMessage).not.toContain('no diagnostic output');
+    expect(userMessage).toContain('targeted test failed on repetition 3/5');
+    expect(userMessage).toContain('[exit 1]');
+    expect(logFields.stdoutTail).toBe(err.stdout);
+    expect(logFields.stderrTail).toBeUndefined();
+  });
+
+  it('includes labelled stderr and stdout tails when both streams are populated', () => {
+    const err = {
+      message: 'Command failed: bash -c script body\n',
+      stderr: 'error: assertion failed',
+      stdout: 'progress line before failure',
+      code: 1,
+    };
+    const { userMessage, logFields } = formatSubprocessFailure(err, "Script node 'n1'");
+    expect(userMessage).toContain('[stderr]');
+    expect(userMessage).toContain('error: assertion failed');
+    expect(userMessage).toContain('[stdout]');
+    expect(userMessage).toContain('progress line before failure');
+    expect(logFields.stderrTail).toBe('error: assertion failed');
+    expect(logFields.stdoutTail).toBe('progress line before failure');
+  });
+
+  it('caps stderr and stdout tails jointly under the existing 2 KB budget', () => {
+    const err = {
+      message: 'Command failed: cmd\n',
+      stderr: 'e'.repeat(1200),
+      stdout: 'o'.repeat(5000),
+      code: 1,
+    };
+    const { userMessage, logFields } = formatSubprocessFailure(err, "Script node 'n1'");
+    expect(userMessage.length).toBeLessThan(2100);
+    expect(userMessage).toContain('[stderr]');
+    expect(userMessage).toContain('[stdout]');
+    const { stderrTail, stdoutTail } = logFields;
+    expect(typeof stderrTail).toBe('string');
+    expect(typeof stdoutTail).toBe('string');
+    if (typeof stderrTail !== 'string' || typeof stdoutTail !== 'string')
+      throw new Error('tails missing');
+    expect(stderrTail.length).toBeLessThanOrEqual(1000);
+    expect(stdoutTail.length).toBeLessThanOrEqual(2000 - stderrTail.length);
   });
 
   it('omits the [exit N] suffix when no code is present', () => {
