@@ -13,6 +13,7 @@ const SCRIPT_PATH = join(
   'scripts',
   'resolve-review-mode.py'
 );
+const PYTHON_COMMAND = globalThis.process.platform === 'win32' ? 'python' : 'python3';
 const tempDirs: string[] = [];
 
 async function runResolver(priorReport: string): Promise<{
@@ -20,7 +21,7 @@ async function runResolver(priorReport: string): Promise<{
   stdout: string;
   stderr: string;
 }> {
-  const process = Bun.spawn(['uv', 'run', SCRIPT_PATH], {
+  const process = Bun.spawn([PYTHON_COMMAND, SCRIPT_PATH], {
     cwd: REPO_ROOT,
     env: { ...globalThis.process.env, INPUTS_PRIOR_REPORT: priorReport },
     stdout: 'pipe',
