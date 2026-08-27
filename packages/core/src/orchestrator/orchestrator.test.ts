@@ -1,5 +1,6 @@
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp } from 'fs/promises';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -1624,7 +1625,7 @@ describe('orchestrator-agent handleMessage', () => {
           expect.stringContaining('registered successfully')
         );
       } finally {
-        await rm(projectPath, { recursive: true, force: true });
+        await removeTempTree(projectPath);
       }
     });
 
@@ -1665,7 +1666,7 @@ describe('orchestrator-agent handleMessage', () => {
           kind: 'repo',
         });
       } finally {
-        await rm(projectPath, { recursive: true, force: true });
+        await removeTempTree(projectPath);
       }
     });
 

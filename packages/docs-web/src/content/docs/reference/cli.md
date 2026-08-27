@@ -716,23 +716,16 @@ Checks: file exists, non-empty, valid name.
 
 Exit code: 0 = all valid, 1 = errors found.
 
-### `continue <branch> [message]`
+### Removed: `continue <branch> [message]`
 
-Start a new workflow run on an exact active worktree, with recent Git, pull-request, and prior-run context added to the message.
+`archon continue` inferred a run from a branch name and injected a prose preamble of git history, pull-request text, and prior artifacts. Continuation that inherits prior work is identified by exact run id instead:
 
 ```bash
-archon continue feature/live-pr --workflow archon-ship "resolve the remaining review finding"
-archon continue feature/live-pr --no-context "run the final validation"
+archon workflow runs --open                       # find the prior run id
+archon workflow run archon-ship --adopt <run-id> "resolve the remaining review finding"
 ```
 
-If the worktree has a prior run, `continue` adopts that exact run: the new row records `adopted_from_run_id`, `$ADOPTED_RUN_DIR` points at the prior artifacts, and the normal terminal-status, project-identity, and live-path-lock checks apply. A live prior run is not taken over; resume, respond to, or abandon it first.
-
-If the worktree has no prior run, Archon still runs at the exact branch path but has no run provenance to record. `continue` only resolves active worktrees; use `workflow run <name> --adopt <run-id>` when the worktree was removed.
-
-| Flag | Effect |
-|------|--------|
-| `--workflow <name>` | Workflow to run (default: `archon-assist`) |
-| `--no-context` | Do not add Git, pull-request, or prior-artifact context to the message |
+`workflow run <name> --adopt <run-id>` reuses a terminal run's exact worktree or branch, records `adopted_from_run_id` provenance, and exposes prior artifacts through `$ADOPTED_RUN_DIR`. The orchestrating agent owns choosing the next workflow and writing the input; see [`--adopt <run-id>`](#workflow-run-name-message).
 
 ### `complete <branch> [branch2 ...]`
 

@@ -6,7 +6,6 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  rmSync,
   statSync,
   utimesSync,
   writeFileSync,
@@ -15,6 +14,7 @@ import { tmpdir } from 'os';
 import { isAbsolute, join, resolve } from 'path';
 import { spawnSync } from 'node:child_process';
 import { refreshCompiledInstallManifest, type InstallManifest } from './install-manifest';
+import { removeTempTree } from './test-utils';
 
 describe('compiled install manifest', () => {
   const envKeys = ['ARCHON_HOME', 'WORKSPACE_PATH', 'ARCHON_DOCKER'] as const;
@@ -29,13 +29,15 @@ describe('compiled install manifest', () => {
     process.env.ARCHON_HOME = testDir;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     for (const key of envKeys) {
       const value = originalEnv[key];
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    rmSync(testDir, { recursive: true, force: true });
+    // Async so the removal can retry: this suite runs the compiled-startup path through
+    // a real `spawnSync`, and `rmSync` has no retry of its own on any runtime (#2306).
+    await removeTempTree(testDir);
   });
 
   function manifestPath(): string {

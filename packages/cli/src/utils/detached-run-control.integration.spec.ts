@@ -1,20 +1,20 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import {
   detachedRunControlPath,
   requestDetachedRunStop,
   startDetachedRunControlServer,
 } from './detached-run-control';
 
-const cleanupPaths: string[] = [];
-
-afterEach(() => {
-  for (const path of cleanupPaths.splice(0)) rmSync(path, { recursive: true, force: true });
-});
+// These fixtures are torn down after tests that spawn, and then kill, a real detached
+// child. A killed process can still hold a handle inside its temp tree at the instant of
+// cleanup, and an unretried removal fails a test whose assertions already passed (#2306).
+const trackTempRoot = trackTempRoots();
 
 async function waitFor(check: () => boolean, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -99,8 +99,7 @@ async function rejectedError(action: () => Promise<unknown>): Promise<Error> {
 describe('detached run control integration', () => {
   it('stops the detached owner process group before its descendant can leak work', async () => {
     const runId = `tree-${crypto.randomUUID()}`;
-    const fixtureDir = mkdtempSync(join(tmpdir(), 'archon-detached-control-'));
-    cleanupPaths.push(fixtureDir);
+    const fixtureDir = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-detached-control-')));
     const readyPath = join(fixtureDir, 'ready');
     const leakPath = join(fixtureDir, 'leaked');
     const goPath = join(fixtureDir, 'go');
@@ -148,8 +147,7 @@ describe('detached run control integration', () => {
     if (process.platform === 'win32') return;
 
     const runId = `foreground-${crypto.randomUUID()}`;
-    const fixtureDir = mkdtempSync(join(tmpdir(), 'archon-foreground-control-'));
-    cleanupPaths.push(fixtureDir);
+    const fixtureDir = trackTempRoot(mkdtempSync(join(tmpdir(), 'archon-foreground-control-')));
     const readyPath = join(fixtureDir, 'ready');
     const leakPath = join(fixtureDir, 'leaked');
     const goPath = join(fixtureDir, 'go');

@@ -1,15 +1,19 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { detachedRunControlPath, requestDetachedRunStop } from '../utils/detached-run-control';
 
 const cleanupPaths: string[] = [];
 const activeRunIds = new Set<string>();
 
+// Deliberately one explicit hook rather than `trackTempRoots()` from the same module:
+// a still-running owner has to be stopped before its tree can be removed, and splitting
+// that into two `afterEach` hooks would leave the order they were registered in as the
+// only thing keeping it correct.
 afterEach(async () => {
   for (const runId of activeRunIds) {
     try {
@@ -21,10 +25,7 @@ afterEach(async () => {
   }
   activeRunIds.clear();
   for (const path of cleanupPaths.splice(0)) {
-    // The control endpoint closes after the workflow settles but just before the
-    // detached process finishes its remaining CLI cleanup. Windows can retain an
-    // inherited log or SQLite handle during that short gap.
-    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempTree(path);
   }
 });
 
@@ -170,7 +171,19 @@ describe('detached workflow terminal database events', () => {
         return run?.status === fixture.status ? run : undefined;
       });
       expect(terminal.id).toBe(created.id);
-      const events = readTerminalEvents(databasePath, terminal.id, fixture.event);
+      // Not a write-ordering gap: `completeWorkflowRun` and `failWorkflowRun` write the
+      // status UPDATE and the event INSERT inside one `withTransaction`, so a reader can
+      // never see the terminal status without the event. What retries here is the READ.
+      // Opening a second readonly connection against a database that is still settling
+      // that commit fails outright on Windows — `SQLiteError: disk I/O error` from
+      // `prepare()`, not an empty result (#2306). So this waits out reader-side
+      // contention, and the count stays exact: the event was committed atomically with
+      // the status already observed above, and the owner's endpoint is unreachable, so
+      // nothing can append a second row after the first read succeeds.
+      const events = await waitFor(() => {
+        const rows = readTerminalEvents(databasePath, terminal.id, fixture.event);
+        return rows.length > 0 ? rows : undefined;
+      });
       expect(events).toHaveLength(1);
       const data = JSON.parse(events[0]?.data ?? '{}') as Record<string, unknown>;
       if (fixture.status === 'completed') expect(data.duration_ms).toBeNumber();

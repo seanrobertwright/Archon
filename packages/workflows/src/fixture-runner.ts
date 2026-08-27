@@ -23,9 +23,9 @@
  * The TARGET that `exec-code: true` nodes execute against is a scratch worktree of the
  * caller repo's HEAD (see {@link withExecWorkspace}), never the operator's tree.
  */
-import { readdir, rm, stat } from 'node:fs/promises';
+import { readdir, realpath, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { join, relative, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
 import { createLogger, getArchonTempPath } from '@archon/paths';
 import { execFileAsync } from '@archon/git';
@@ -135,10 +135,10 @@ async function exists(path: string): Promise<boolean> {
 }
 
 interface DiscoveredFixture {
-  /** Label relative to its discovery scope root, e.g. `sdlc/deliver/fixtures/clean.stubs.yaml`. */
+  /** Display path relative to its discovery scope root, e.g. `sdlc/deliver/fixtures/clean.stubs.yaml`. */
   readonly label: string;
-  /** First path segment under the scope root — the pack, when fixtures are organized in packs. */
-  readonly pack: string | undefined;
+  /** Directory segments between the scope root and `fixtures/`, e.g. `['sdlc', 'deliver']`. */
+  readonly dirs: readonly string[];
   readonly path: string;
   readonly workflowNames: readonly string[];
 }
@@ -169,6 +169,7 @@ async function workflowNamesBeside(fixturesDir: string): Promise<string[]> {
 }
 
 async function walkForFixtures(
+  scopeRoot: string,
   root: string,
   depth: number,
   out: DiscoveredFixture[]
@@ -184,20 +185,21 @@ async function walkForFixtures(
     if (!entry.isDirectory()) continue;
     const dirPath = join(root, entry.name);
     if (entry.name === FIXTURES_DIR) {
-      const labelRoot = join(root, '..');
+      const dirs = relative(scopeRoot, root)
+        .split(sep)
+        .filter(segment => segment.length > 0);
       for (const file of await readdir(dirPath)) {
         if (!file.endsWith(FIXTURE_SUFFIX)) continue;
-        const rel = relative(labelRoot, join(dirPath, file));
         out.push({
-          label: rel.split(sep).join('/'),
-          pack: rel.split(sep).length > 1 ? rel.split(sep)[0] : undefined,
+          label: [...dirs, FIXTURES_DIR, file].join('/'),
+          dirs,
           path: join(dirPath, file),
           workflowNames: await workflowNamesBeside(dirPath),
         });
       }
       continue;
     }
-    await walkForFixtures(dirPath, depth + 1, out);
+    await walkForFixtures(scopeRoot, dirPath, depth + 1, out);
   }
 }
 
@@ -206,11 +208,20 @@ async function discoverFixtures(roots: readonly string[]): Promise<DiscoveredFix
   const found: DiscoveredFixture[] = [];
   for (const root of roots) {
     if (!(await exists(root))) continue;
+    // Path targets compare against fixture paths by real path, so discovery reports
+    // canonical spellings and a target spelled through a symlink still matches
+    // (e.g. macOS /tmp → /private/tmp).
+    const scopeRoot = await realpath(root).catch(() => root);
     const before = found.length;
-    await walkForFixtures(root, 0, found);
+    await walkForFixtures(scopeRoot, scopeRoot, 0, found);
     for (let i = before; i < found.length; i++) {
+      // Keyed on the scope-relative label, not the absolute path: an absolute path is
+      // unique per scope by construction, so keying on it would never dedup anything and
+      // a project copy of a bundled workflow would run both fixtures. The label is what
+      // makes an override shadow the copy it overrides, matching how `workflow-discovery`
+      // resolves the same scope chain for the workflow files themselves.
       if (seen.has(found[i].label)) {
-        // Higher-precedence scope already discovered this fixture path.
+        // Higher-precedence scope already discovered this fixture.
         found.splice(i, 1);
         i--;
       } else {
@@ -257,7 +268,11 @@ export interface RunFixturesOptions {
   sourceConfig: WorkflowSourceConfig;
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
-  /** Restrict to one workflow name or pack prefix; unresolved values are an error. */
+  /**
+   * Restrict to a workflow name, a pack or workflow-folder name, or a path (relative
+   * or absolute) to any fixture-containing directory — a directory above a `fixtures/`
+   * dir, the `fixtures/` dir itself, or an ancestor of one. Unresolved values error.
+   */
   target?: string;
 }
 
@@ -392,11 +407,25 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
   let selected = all;
   if (options.target !== undefined) {
     const targetName = options.target;
-    if (byName.has(targetName)) {
-      selected = all.filter(fixture => fixture.workflowNames.includes(targetName));
-    } else {
-      selected = all.filter(fixture => fixture.pack === options.target);
-    }
+    // A target resolves when it names a discovered workflow, a directory above a
+    // fixtures dir (pack name or workflow folder), or a path containing fixtures.
+    const targetDir = resolve(options.cwd, targetName);
+    // Discovery reports fixture paths as real paths, so canonicalize the target
+    // before the containment check; a nonexistent target can never contain a
+    // fixture, so keeping its resolved spelling there is safe.
+    const targetReal = await realpath(targetDir).catch(() => targetDir);
+    // Name matching is gated on catalog membership: a workflow file can sit on disk with
+    // a `fixtures/` dir beside it and still never load. Without the gate its name would
+    // select fixtures the run cannot check, turning an unresolved target into a per-fixture
+    // "no discovered workflow matches" failure instead of the documented exit-1 error. The
+    // suggestion list below applies the same gate.
+    const targetIsLoadedWorkflow = byName.has(targetName);
+    selected = all.filter(
+      fixture =>
+        (targetIsLoadedWorkflow && fixture.workflowNames.includes(targetName)) ||
+        fixture.dirs.includes(targetName) ||
+        fixture.path.startsWith(targetReal + sep)
+    );
     if (selected.length === 0) {
       // Suggest only workflows a discovered fixture actually targets AND that the catalog
       // loaded; the full catalog would point the user at workflows that cannot satisfy the
@@ -407,7 +436,8 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
         .join(', ');
       const hint =
         names.length > 0
-          ? ` Name a workflow with fixtures (${names}) or a pack directory containing them.`
+          ? ` Name a workflow with fixtures (${names}), a workflow folder or pack name ` +
+            'containing them, or a path to such a directory.'
           : all.length === 0
             ? ' No workflow in any discovery scope declares fixtures.'
             : ' Discovered fixtures target no workflow in the discovery catalog.';
