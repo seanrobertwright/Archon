@@ -42,6 +42,7 @@ mock.module('./connection', () => ({
 
 const {
   resumeWorkflowRun,
+  recoverCancelledFanOutRun,
   pauseWorkflowRun,
   pauseWorkflowRunForWait,
   clearWorkflowWaitContext,
@@ -649,6 +650,34 @@ describe('terminal workflow transitions — real SQLite', () => {
 
     expect((await getWorkflowRun('terminal-complete-atomic'))?.status).toBe('running');
     expect((await getWorkflowRun('terminal-fail-atomic'))?.status).toBe('running');
+  });
+});
+
+describe('fan-out cancellation recovery — real SQLite', () => {
+  test('claims an engine-cancelled child without creating a failed state or event', async () => {
+    await seed('fan-out-recover', 'cancelled', "datetime('now')", {
+      cancelled_reason: 'fan_out_orphan',
+    });
+    await db.query(
+      "UPDATE remote_agent_workflow_runs SET completed_at = datetime('now') WHERE id = $1",
+      ['fan-out-recover']
+    );
+
+    const recovered = await recoverCancelledFanOutRun('fan-out-recover');
+
+    expect(recovered.status).toBe('running');
+    expect(recovered.completed_at).toBeNull();
+    expect(recovered.metadata.cancelled_reason).toBeUndefined();
+    expect(await countEvents('fan-out-recover', 'workflow_failed')).toBe(0);
+  });
+
+  test('does not recover a user-cancelled child', async () => {
+    await seed('user-cancelled', 'cancelled', "datetime('now')");
+
+    await expect(recoverCancelledFanOutRun('user-cancelled')).rejects.toThrow(
+      'not an engine-cancelled fan-out child'
+    );
+    expect((await getWorkflowRun('user-cancelled'))?.status).toBe('cancelled');
   });
 });
 

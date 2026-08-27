@@ -1181,7 +1181,7 @@ async function runChildWorkflow(
     isolation,
     childIndex,
     itemHash,
-    resumeFailedChild,
+    resumeChild,
     inputs,
   } = args;
 
@@ -1306,11 +1306,11 @@ async function runChildWorkflow(
   // Populated only when THIS spawn created a fresh isolated worktree — its env id +
   // branch are stamped into the child's metadata (S3; PR-E console grouping reads it).
   let childIsolationEnv: ChildIsolationResult | undefined;
-  if (resumeFailedChild) {
+  if (resumeChild) {
     // Reuse the child's own recorded working_path: its worktree for an isolated
     // child, the shared parent checkout for `inherit`. Reaching this branch at all
     // means the child row survived, so there is nothing to re-resolve.
-    const priorPath = resumeFailedChild.working_path;
+    const priorPath = resumeChild.run.working_path;
     // An isolated child's worktree can be pruned by `isolation cleanup`/`complete`
     // between its failure and this resume. Reusing a vanished path would surface as a
     // deep ENOENT mid-run; fail fast with the same guidance the top-level CLI resume
@@ -1319,7 +1319,7 @@ async function runChildWorkflow(
       return failOutcome(
         `Cannot resume sub-run '${childWorkflowName}': its working path no longer exists ` +
           `(${priorPath}). The worktree may have been cleaned up — start a fresh run.`,
-        resumeFailedChild.id
+        resumeChild.run.id
       );
     }
     // `working_path` is nullable in the schema, and falling back to the parent's
@@ -1332,7 +1332,7 @@ async function runChildWorkflow(
       return failOutcome(
         `Cannot resume sub-run '${childWorkflowName}': its run row has no recorded working ` +
           'path, so the checkout it ran in is unknown — start a fresh run.',
-        resumeFailedChild.id
+        resumeChild.run.id
       );
     }
     childCwd = priorPath;
@@ -1372,22 +1372,43 @@ async function runChildWorkflow(
   // sibling `container:` context has the same non-propagation gap today; out of scope
   // for this PR, but noted so it isn't mistaken for intentional.)
   try {
-    if (resumeFailedChild) {
-      const hydrated = await hydrateResumableRun(deps, resumeFailedChild);
-      if (hydrated) {
-        childOpts = {
-          ...hydrated,
-          codebaseId,
-          resolveChildIsolation,
-          preparedSource: childSource,
-        };
-        childRunId = hydrated.preCreatedRun.id;
+    if (resumeChild) {
+      if (resumeChild.kind === 'failed') {
+        const hydrated = await hydrateResumableRun(deps, resumeChild.run);
+        if (hydrated) {
+          childOpts = {
+            ...hydrated,
+            codebaseId,
+            resolveChildIsolation,
+            preparedSource: childSource,
+          };
+          childRunId = hydrated.preCreatedRun.id;
+        } else {
+          const preCreatedRun = await deps.store.resumeWorkflowRun(resumeChild.run.id);
+          childOpts = {
+            preCreatedRun,
+            codebaseId,
+            resolveChildIsolation,
+            preparedSource: childSource,
+          };
+          childRunId = preCreatedRun.id;
+        }
       } else {
-        // Failed child with no completed nodes — flip it back to running and re-run
-        // from the top (nothing to skip).
-        const preCreatedRun = await deps.store.resumeWorkflowRun(resumeFailedChild.id);
+        const inspection = await inspectResumableRun(deps, resumeChild.run);
+        const preCreatedRun = await deps.store.recoverCancelledFanOutRun(resumeChild.run.id);
+        const completedNodeIds = new Set(inspection?.priorCompletedNodes.keys() ?? []);
+        const priorNodeSessions = (
+          await deps.store.listWorkflowRunNodeSessions(resumeChild.run.id)
+        ).filter(row => completedNodeIds.has(row.node_id));
         childOpts = {
           preCreatedRun,
+          ...(inspection
+            ? {
+                priorCompletedNodes: inspection.priorCompletedNodes,
+                priorUsage: inspection.priorUsage,
+                priorNodeSessions,
+              }
+            : {}),
           codebaseId,
           resolveChildIsolation,
           preparedSource: childSource,
@@ -2290,14 +2311,12 @@ export async function executeWorkflow(
         // active set immediately — without this, our row sits as
         // pending/running and blocks the path until the 5-min stale window
         // (or never, if we'd already promoted it to running via resume).
-        await deps.store
-          .updateWorkflowRun(workflowRun.id, { status: 'cancelled' })
-          .catch((cleanupErr: Error) => {
-            getLog().warn(
-              { err: cleanupErr, workflowRunId: workflowRun?.id, cwd },
-              'workflow.guard_self_cancel_failed'
-            );
-          });
+        await deps.store.cancelWorkflowRun(workflowRun.id).catch((cleanupErr: Error) => {
+          getLog().warn(
+            { err: cleanupErr, workflowRunId: workflowRun?.id, cwd },
+            'workflow.guard_self_cancel_failed'
+          );
+        });
 
         const elapsedMs = Date.now() - parseDbTimestamp(activeWorkflow.started_at);
         const duration = formatDuration(elapsedMs);
@@ -2346,14 +2365,12 @@ export async function executeWorkflow(
       // window would clear it eventually; for a row already promoted to
       // running (e.g., resumed), nothing would clear it without manual
       // intervention.
-      await deps.store
-        .updateWorkflowRun(workflowRun.id, { status: 'cancelled' })
-        .catch((cleanupErr: Error) => {
-          getLog().warn(
-            { err: cleanupErr, workflowRunId: workflowRun?.id },
-            'workflow.guard_query_failure_cleanup_failed'
-          );
-        });
+      await deps.store.cancelWorkflowRun(workflowRun.id).catch((cleanupErr: Error) => {
+        getLog().warn(
+          { err: cleanupErr, workflowRunId: workflowRun?.id },
+          'workflow.guard_query_failure_cleanup_failed'
+        );
+      });
       await sendCriticalMessage(
         platform,
         conversationId,

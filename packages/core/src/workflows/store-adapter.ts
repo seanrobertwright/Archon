@@ -68,6 +68,7 @@ export function createWorkflowStore(): IWorkflowStore {
     findResumableRun: workflowDb.findResumableRun,
     failOrphanedRuns: workflowDb.failOrphanedRuns,
     resumeWorkflowRun: workflowDb.resumeWorkflowRun,
+    recoverCancelledFanOutRun: workflowDb.recoverCancelledFanOutRun,
     updateWorkflowRun: workflowDb.updateWorkflowRun,
     updateWorkflowActivity: workflowDb.updateWorkflowActivity,
     // DB returns string | null; IWorkflowStore declares WorkflowRunStatus | null.

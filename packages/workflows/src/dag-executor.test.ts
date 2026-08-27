@@ -192,6 +192,9 @@ function createMockStore(): MockWorkflowStore {
       async (_workflowName, _workingPath) => null
     ),
     resumeWorkflowRun: mock<IWorkflowStore['resumeWorkflowRun']>(async _id => mockWorkflowRun()),
+    recoverCancelledFanOutRun: mock<IWorkflowStore['recoverCancelledFanOutRun']>(async _id =>
+      mockWorkflowRun()
+    ),
     updateWorkflowRun: mock<IWorkflowStore['updateWorkflowRun']>(async (_id, _updates) => {}),
     updateWorkflowActivity: mock<IWorkflowStore['updateWorkflowActivity']>(async _id => {}),
     getWorkflowRunStatus: mock<IWorkflowStore['getWorkflowRunStatus']>(async _id => 'running'),

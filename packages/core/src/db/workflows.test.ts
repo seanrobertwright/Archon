@@ -240,24 +240,26 @@ describe('workflows database', () => {
   });
 
   describe('updateWorkflowRun', () => {
-    test('updates status to completed', async () => {
+    test.each(['completed', 'failed', 'cancelled'] as const)(
+      'rejects terminal status %s before querying',
+      async status => {
+        await expect(
+          updateWorkflowRun('workflow-run-123', {
+            status,
+          } as unknown as Parameters<typeof updateWorkflowRun>[1])
+        ).rejects.toThrow(`Terminal workflow status '${status}' requires a lifecycle writer`);
+        expect(mockQuery).not.toHaveBeenCalled();
+      }
+    );
+
+    test('updates a non-terminal status without touching completed_at', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
-      await updateWorkflowRun('workflow-run-123', { status: 'completed' });
+      await updateWorkflowRun('workflow-run-123', { status: 'running' });
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain('status = $1');
-      expect(query).toContain('completed_at = NOW()');
-    });
-
-    test('updates status to failed', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
-
-      await updateWorkflowRun('workflow-run-123', { status: 'failed' });
-
-      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain('status = $1');
-      expect(query).toContain('completed_at = NOW()');
+      expect(query).not.toContain('completed_at');
     });
 
     test('updates metadata', async () => {
@@ -324,7 +326,7 @@ describe('workflows database', () => {
     test('omitting output_root leaves it out of the SET clause entirely', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
-      await updateWorkflowRun('workflow-run-123', { status: 'completed' });
+      await updateWorkflowRun('workflow-run-123', { status: 'running' });
 
       const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).not.toContain('output_root');
@@ -829,7 +831,7 @@ describe('workflows database', () => {
     test('updateWorkflowRun throws on database error', async () => {
       mockQuery.mockRejectedValueOnce(new Error('Update failed'));
 
-      await expect(updateWorkflowRun('test-id', { status: 'completed' })).rejects.toThrow(
+      await expect(updateWorkflowRun('test-id', { status: 'running' })).rejects.toThrow(
         'Failed to update workflow run: Update failed'
       );
     });

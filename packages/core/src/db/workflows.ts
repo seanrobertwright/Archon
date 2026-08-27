@@ -1020,6 +1020,50 @@ export async function resumeWorkflowRun(
   return normalizeWorkflowRun(row);
 }
 
+export async function recoverCancelledFanOutRun(id: string): Promise<WorkflowRun> {
+  const dialect = getDialect();
+  const cancelledReason =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->>'cancelled_reason'"
+      : "json_extract(metadata, '$.cancelled_reason')";
+  const metadataWithoutCancelledReason =
+    getDatabaseType() === 'postgresql'
+      ? "metadata - 'cancelled_reason'"
+      : "json_remove(metadata, '$.cancelled_reason')";
+
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'running',
+             completed_at = NULL,
+             started_at = ${dialect.now()},
+             last_activity_at = ${dialect.now()},
+             metadata = ${metadataWithoutCancelledReason}
+         WHERE id = $1
+           AND status = 'cancelled'
+           AND ${cancelledReason} IN ('fan_out_gate', 'fan_out_sibling', 'fan_out_orphan')`,
+        [id]
+      );
+      if ((result.rowCount ?? 0) === 0) {
+        throw new Error(`Workflow run is not an engine-cancelled fan-out child (id: ${id})`);
+      }
+      const recovered = await query<WorkflowRun>(
+        'SELECT * FROM remote_agent_workflow_runs WHERE id = $1',
+        [id]
+      );
+      const row = recovered.rows[0];
+      if (!row) throw new Error(`Workflow run not found after fan-out recovery (id: ${id})`);
+      return normalizeWorkflowRun(row);
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run ')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_fan_out_recover_failed');
+    throw new Error(`Failed to recover cancelled fan-out run: ${err.message}`);
+  }
+}
+
 /**
  * Find the most recent workflow run for a worker platform conversation ID.
  * Joins with conversations table to resolve platform_conversation_id → DB id.
@@ -1045,36 +1089,28 @@ export async function getWorkflowRunByWorkerPlatformId(
 }
 
 /**
- * Partially update a workflow run.
- * - Dynamically builds SQL from provided fields
- * - Auto-sets completed_at when status becomes 'completed' or 'failed'
- * - Merges metadata with existing (does not replace)
- * - No-op if updates object is empty
+ * Partially update non-terminal workflow state. Terminal transitions use their
+ * dedicated lifecycle writers so the run row cannot outpace its durable event.
  */
 export async function updateWorkflowRun(
   id: string,
-  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+  updates: Partial<Pick<WorkflowRun, 'metadata' | 'output_root'>> & {
+    status?: Exclude<WorkflowRunStatus, 'completed' | 'failed' | 'cancelled'>;
     outcome?: WorkflowRunOutcome;
   }
 ): Promise<void> {
   const dialect = getDialect();
   const setClauses: string[] = [];
   const values: unknown[] = [];
+  const requestedStatus: WorkflowRunStatus | undefined = updates.status;
 
-  if (updates.status !== undefined) {
-    values.push(updates.status);
+  if (requestedStatus !== undefined && TERMINAL_WORKFLOW_STATUSES.includes(requestedStatus)) {
+    throw new Error(`Terminal workflow status '${requestedStatus}' requires a lifecycle writer`);
+  }
+
+  if (requestedStatus !== undefined) {
+    values.push(requestedStatus);
     setClauses.push(`status = $${values.length}`);
-    // Auto-set completed_at for terminal statuses. (Gate approve/reject no
-    // longer stages runs as 'failed' — they stay 'paused' with
-    // metadata.approval.resolved set (#2075) — so a 'failed' write here is
-    // always a real completion.)
-    if (
-      updates.status === 'completed' ||
-      updates.status === 'failed' ||
-      updates.status === 'cancelled'
-    ) {
-      setClauses.push(`completed_at = ${dialect.now()}`);
-    }
   }
   if (updates.metadata !== undefined) {
     // Use dialect helper for JSON merge - need to calculate the param index

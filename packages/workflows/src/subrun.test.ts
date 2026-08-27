@@ -198,6 +198,23 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve(this.clone(r));
   };
 
+  recoverCancelledFanOutRun = (id: string): Promise<WorkflowRun> => {
+    const r = this.runs.get(id);
+    const reason = r?.metadata.cancelled_reason;
+    if (
+      !r ||
+      r.status !== 'cancelled' ||
+      (reason !== 'fan_out_gate' && reason !== 'fan_out_sibling' && reason !== 'fan_out_orphan')
+    ) {
+      throw new Error(`run ${id} is not recoverable`);
+    }
+    r.status = 'running';
+    r.completed_at = null;
+    const { cancelled_reason: _cancelledReason, ...metadata } = r.metadata;
+    r.metadata = metadata;
+    return Promise.resolve(this.clone(r));
+  };
+
   updateWorkflowRun: IWorkflowStore['updateWorkflowRun'] = (id, updates) => {
     const r = this.runs.get(id);
     if (r) {
@@ -1127,7 +1144,7 @@ nodes:
     expect(child1?.status).toBe('failed');
 
     // Resume the PARENT: re-entry finds the failed child and re-drives it once
-    // (resumeFailedChild), the marker now exists so the child completes, and the
+    // (resumeChild), the marker now exists so the child completes, and the
     // output threads through to the downstream node. A failed parent with zero
     // completed nodes hydrates to null — mirror the CLI's fallback: flip it back
     // to running and re-run from the top under the SAME run id.
@@ -2444,7 +2461,7 @@ nodes:
       working_path: cwd,
       metadata: { parent_node_id: 'work', child_index: 1, cancelled_reason: 'fan_out_orphan' },
     });
-    await store.updateWorkflowRun(orphan.id, { status: 'cancelled' });
+    await store.cancelWorkflowRun(orphan.id);
 
     const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(parentRun.id))!);
     const r = await executeWorkflow(
@@ -2582,7 +2599,10 @@ nodes:
       step_name: 'plan',
       data: { node_output: '["a","b","c"]' },
     });
-    const seed = async (idx: number, status: WorkflowRun['status']): Promise<void> => {
+    const seed = async (
+      idx: number,
+      status: Extract<WorkflowRun['status'], 'completed' | 'failed'>
+    ): Promise<void> => {
       const child = await store.createWorkflowRun({
         workflow_name: 'fan-child',
         conversation_id: 'conv-db',
@@ -2591,11 +2611,15 @@ nodes:
         working_path: cwd,
         metadata: { parent_node_id: 'work', child_index: idx },
       });
-      await store.updateWorkflowRun(child.id, { status });
       if (status === 'completed') {
-        await store.updateWorkflowRun(child.id, {
-          metadata: { summary: `did:${['a', 'b', 'c'][idx]}` },
-        });
+        await store.updateWorkflowRun(child.id, { status: 'running' });
+        await store.completeWorkflowRun(
+          child.id,
+          { duration_ms: 0 },
+          { summary: `did:${['a', 'b', 'c'][idx]}` }
+        );
+      } else {
+        await store.failWorkflowRun(child.id, 'seeded failure');
       }
     };
     await seed(0, 'completed');

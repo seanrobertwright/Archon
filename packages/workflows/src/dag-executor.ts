@@ -837,8 +837,10 @@ export interface RunChildWorkflowArgs {
    * non-deterministic items producer changed the item at a given index (never re-keys).
    */
   itemHash?: string;
-  /** Present only when re-driving a FAILED child on parent resume (D5 recovery path). */
-  resumeFailedChild?: WorkflowRun;
+  /** Present only when re-driving an existing child on parent resume. */
+  resumeChild?:
+    | { kind: 'failed'; run: WorkflowRun }
+    | { kind: 'fan-out-cancelled'; run: WorkflowRun };
   /**
    * Named inputs (#2470) — the resolved `with:` map the parent supplied, plus (for a
    * fan-out child) the per-item `fan_out.as` entry. Logical JSON values (#2637).
@@ -8071,7 +8073,7 @@ async function executeWorkflowNode(
     if (existing.status === 'failed') {
       // Resume-through-parent recovery (D5/#1764): re-drive the failed child once.
       return await interpret(
-        await ctx.runChildWorkflow({ ...childArgs, resumeFailedChild: existing })
+        await ctx.runChildWorkflow({ ...childArgs, resumeChild: { kind: 'failed', run: existing } })
       );
     }
     if (
@@ -8799,22 +8801,12 @@ async function executeFanOutWorkflowNode(
         ...fanOutStaticInputs,
         ...(fanOut.as !== undefined ? { [fanOut.as]: item as JsonValue } : {}),
       };
-      // A fan-out-recoverable-cancelled child (gate/sibling) can't be resumed while
-      // 'cancelled' (resumeWorkflowRun rejects that status) — clear it to 'failed' first,
-      // then re-drive through the failed path. Our own tagged cancel is terminal state we
-      // own, so this recovery heuristic is appropriate (CLAUDE.md).
-      let resumeChild = existing?.status === 'failed' ? existing : undefined;
-      if (existing?.status === 'cancelled' && isFanOutRecoverableCancel(existing)) {
-        await deps.store
-          .updateWorkflowRun(existing.id, { status: 'failed' })
-          .catch((err: unknown) => {
-            getLog().error(
-              { err: err as Error, childRunId: existing.id },
-              'workflow.fan_out_recover_cancel_failed'
-            );
-          });
-        resumeChild = { ...existing, status: 'failed' };
-      }
+      const resumeChild =
+        existing?.status === 'failed'
+          ? ({ kind: 'failed', run: existing } as const)
+          : existing?.status === 'cancelled' && isFanOutRecoverableCancel(existing)
+            ? ({ kind: 'fan-out-cancelled', run: existing } as const)
+            : undefined;
       // Whatever this child returns — completed, failed, cancelled, or paused — it is this
       // child's outcome alone. The join reads them all once every one has settled.
       const outcome = await runChild({
@@ -8831,7 +8823,7 @@ async function executeFanOutWorkflowNode(
         childIndex: i,
         itemHash: hashFanOutItem(input),
         ...(Object.keys(childInputs).length > 0 ? { inputs: childInputs } : {}),
-        ...(resumeChild ? { resumeFailedChild: resumeChild } : {}),
+        ...(resumeChild ? { resumeChild } : {}),
       });
       // A paused child is cancelled HERE rather than at the join, and the timing is
       // load-bearing rather than tidiness. A pause is not terminal, and a non-terminal run

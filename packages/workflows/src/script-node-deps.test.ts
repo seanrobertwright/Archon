@@ -102,6 +102,7 @@ function createMockStore(): IWorkflowStore {
         adopted_from_run_id: null,
       })
     ),
+    recoverCancelledFanOutRun: mock(() => Promise.reject(new Error('unused in this test'))),
     updateWorkflowRun: mock(() => Promise.resolve()),
     updateWorkflowActivity: mock(() => Promise.resolve()),
     getWorkflowRunStatus: mock(() => Promise.resolve('running' as const)),

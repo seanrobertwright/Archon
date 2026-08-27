@@ -237,6 +237,8 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
   failOrphanedRuns(): Promise<{ count: number }>;
   resumeWorkflowRun(id: string, cursor?: WorkflowResumeCursor): Promise<WorkflowRun>;
+  /** Claim an engine-cancelled fan-out child for immediate in-process recovery. */
+  recoverCancelledFanOutRun(id: string): Promise<WorkflowRun>;
   /**
    * `output_root` (#2200) is write-once: the executor sets it at run start only
    * when the persisted value is null. Re-writing it on resume would re-derive
@@ -245,7 +247,8 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    */
   updateWorkflowRun(
     id: string,
-    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+    updates: Partial<Pick<WorkflowRun, 'metadata' | 'output_root'>> & {
+      status?: Exclude<WorkflowRunStatus, 'completed' | 'failed' | 'cancelled'>;
       outcome?: WorkflowRunOutcome;
     }
   ): Promise<void>;
