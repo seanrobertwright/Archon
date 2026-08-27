@@ -8,6 +8,7 @@ import type {
   CreateAgentSessionOptions,
   CreateAgentSessionResult,
   ModelRegistry,
+  ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
 import type { Api, Model } from '@earendil-works/pi-ai';
 
@@ -234,6 +235,12 @@ const mockSettingsManagerCreate = mock(() => ({
 }));
 const mockSettingsManagerInMemory = mock((_settings?: unknown) => ({}));
 const mockResourceLoaderReload = mock(async () => undefined);
+let mockAgentsFiles: Array<{ path: string; content: string }> = [];
+const mockLoadProjectContextFiles = mock(
+  (_options: { cwd: string; agentDir: string }): Array<{ path: string; content: string }> => [
+    ...mockAgentsFiles,
+  ]
+);
 // Shared extension runtime exposed by the mock loader's getExtensions() —
 // one object shared across sessions, exactly like Pi's real runtime. Tests
 // seed `pendingProviderRegistrations` to simulate an extension factory
@@ -287,6 +294,7 @@ mock.module('@earendil-works/pi-coding-agent', () => ({
     inMemory: mockSettingsManagerInMemory,
   },
   DefaultResourceLoader: MockDefaultResourceLoader,
+  loadProjectContextFiles: mockLoadProjectContextFiles,
   // Stub for the value import added when resource-loader.ts started passing
   // an explicit `agentDir` to DefaultResourceLoader (required since
   // pi-coding-agent 0.68+). Returns a deterministic path for tests.
@@ -355,6 +363,8 @@ describe('PiProvider', () => {
     mockSetModel.mockClear();
     mockSetFlagValue.mockClear();
     mockResourceLoaderReload.mockClear();
+    mockLoadProjectContextFiles.mockClear();
+    mockAgentsFiles = [];
     mockGetExtensions.mockClear();
     mockLoaderRuntime.pendingProviderRegistrations = [];
     mockCreateAgentSession.mockClear();
@@ -2909,6 +2919,41 @@ describe('PiProvider', () => {
   // reuses it — so reload()/construct must run once across identical calls,
   // while each call still gets its own session.
   describe('extension loader reuse (issue #1877)', () => {
+    test('each extension-enabled session reads current native context without reloading extensions', async () => {
+      process.env.GEMINI_API_KEY = 'sk-test';
+      resetScript(scriptedAgentEnd());
+
+      const runSession = async (): Promise<ResourceLoader> => {
+        await consume(
+          new PiProvider().sendQuery('context', '/tmp', undefined, {
+            model: 'google/gemini-2.5-pro',
+          })
+        );
+        const call = mockCreateAgentSession.mock.calls.at(-1);
+        const resourceLoader = call?.[0]?.resourceLoader;
+        if (!resourceLoader) throw new Error('Expected Pi session resource loader');
+        return resourceLoader;
+      };
+
+      const first = await runSession();
+      expect(first.getAgentsFiles().agentsFiles).toEqual([]);
+
+      mockAgentsFiles = [{ path: '/tmp/CLAUDE.md', content: '# First rules\n' }];
+      const second = await runSession();
+      expect(second.getAgentsFiles().agentsFiles).toEqual(mockAgentsFiles);
+
+      mockAgentsFiles = [{ path: '/tmp/CLAUDE.md', content: '# Updated rules\n' }];
+      const third = await runSession();
+      expect(third.getAgentsFiles().agentsFiles).toEqual(mockAgentsFiles);
+
+      mockAgentsFiles = [];
+      const fourth = await runSession();
+      expect(fourth.getAgentsFiles().agentsFiles).toEqual([]);
+
+      expect(MockDefaultResourceLoader).toHaveBeenCalledTimes(1);
+      expect(mockResourceLoaderReload).toHaveBeenCalledTimes(1);
+    });
+
     test('reload() and loader construction run once across two sequential calls with identical inputs', async () => {
       process.env.GEMINI_API_KEY = 'sk-test';
       resetScript(scriptedAgentEnd());

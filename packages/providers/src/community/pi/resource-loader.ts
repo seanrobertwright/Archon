@@ -1,5 +1,9 @@
-import { DefaultResourceLoader, getAgentDir } from '@earendil-works/pi-coding-agent';
-import type { ProviderConfig } from '@earendil-works/pi-coding-agent';
+import {
+  DefaultResourceLoader,
+  getAgentDir,
+  loadProjectContextFiles,
+} from '@earendil-works/pi-coding-agent';
+import type { ProviderConfig, ResourceLoader } from '@earendil-works/pi-coding-agent';
 
 /**
  * In pi-coding-agent <= 0.67.x, DefaultResourceLoader and PackageManager
@@ -99,6 +103,40 @@ export function createPiResourceLoader(
 }
 
 /**
+ * Give one Pi session a current view of native context files while delegating
+ * every other resource to the process-cached extension loader.
+ *
+ * The extension loader cannot be reloaded per session: doing so re-invokes
+ * extension factories whose process-scoped state may still be live. Context
+ * files have the opposite lifetime, so read them through Pi's own discovery
+ * helper when the session builds its prompt instead of freezing the first
+ * reload's snapshot.
+ */
+export function createPiSessionResourceLoader(
+  extensionLoader: DefaultResourceLoader,
+  cwd: string
+): ResourceLoader {
+  const agentDir = getAgentDir();
+  return {
+    getExtensions: () => extensionLoader.getExtensions(),
+    getSkills: () => extensionLoader.getSkills(),
+    getPrompts: () => extensionLoader.getPrompts(),
+    getThemes: () => extensionLoader.getThemes(),
+    getAgentsFiles: () => ({
+      agentsFiles: loadProjectContextFiles({ cwd, agentDir }),
+    }),
+    getSystemPrompt: () => extensionLoader.getSystemPrompt(),
+    getSystemPromptSource: () => extensionLoader.getSystemPromptSource(),
+    getAppendSystemPrompt: () => extensionLoader.getAppendSystemPrompt(),
+    getAppendSystemPromptSources: () => extensionLoader.getAppendSystemPromptSources(),
+    extendResources: (paths): void => {
+      extensionLoader.extendResources(paths);
+    },
+    reload: options => extensionLoader.reload(options),
+  };
+}
+
+/**
  * Process-level cache of reloaded, extension-bearing ResourceLoaders (issue #1877).
  *
  * Pi's `DefaultResourceLoader.reload()` re-runs the entire extension-discovery
@@ -113,11 +151,13 @@ export function createPiResourceLoader(
  * state, and every Pi workflow node after the first idle-times-out.
  *
  * Fix: reload the extension-bearing loader ONCE per process per loader-affecting
- * input set and reuse it. `createAgentSession({ resourceLoader })` skips its own
- * internal `reload()` when a loader is supplied, and reads the already-loaded
- * extensions via `resourceLoader.getExtensions()` — so reuse is safe. Each
- * session still builds its own ExtensionRunner and fires `session_start` via
- * `bindExtensions()`, preserving per-node behavior.
+ * input set and reuse its extension resources. Each session receives a thin
+ * `createPiSessionResourceLoader()` view so native context files keep their
+ * per-session lifetime without reloading extensions. `createAgentSession({
+ * resourceLoader })` skips its own internal `reload()` and reads the cached
+ * extensions through that view. Each session still builds its own
+ * ExtensionRunner and fires `session_start` via `bindExtensions()`, preserving
+ * per-node behavior.
  *
  * Growth & eviction: entries are keyed by `(cwd, systemPrompt, skillPaths)`, so
  * the cache grows by at most one small loader per distinct worktree/prompt combo
