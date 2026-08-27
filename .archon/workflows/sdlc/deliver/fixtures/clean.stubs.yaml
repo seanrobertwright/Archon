@@ -9,9 +9,11 @@ impl__implement:
 impl__assert-changed: "3 files changed"
 gate-green: '{"gate":"green"}'
 pr__pr: "https://github.com/example/repo/pull/2 (draft)"
+review__mode: '{"continuation":false}'
 review__scope: "target recorded; head sha stubbed"
 review__code: "0 findings"
 review__seams: "0 findings"
+review__review-complete: "settled"
 review__synthesize:
   ready: true
   action: none

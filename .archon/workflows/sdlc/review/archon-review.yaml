@@ -1,11 +1,12 @@
 name: archon-review
 description: |
   Review a change through parallel specialist lenses and produce one evidence-based
-  verdict. The code and seams lenses always run; the other lenses are opt-in
-  inputs the operator enables per run. Reviews a PR when given one, otherwise the working diff. Advisory and
-  read-only: it judges, it never edits. Re-reviews are light — given the previous
-  round's report, it verifies prior findings and reviews only the delta since the
-  recorded cursor.
+  verdict. On the first round, code, seams, and simplification always run while
+  the other lenses are opt-in inputs. Reviews a PR when given one, otherwise the
+  working diff. Advisory and read-only: it judges, it never edits. Given the
+  previous round's report, one continuation reviewer verifies the prior findings,
+  reviews the correction delta, and follows their causal class without repeating
+  the full specialist fan-out.
 
   When reviewing a PR, the final synthesized report is posted to it as one
   canonical comment, edited in place on re-review.
@@ -37,33 +38,41 @@ inputs:
       this empty and use the PR's problem, outcome, and explicit scope instead.
   tests:
     default: false
-    description: Run the test-coverage lens.
+    description: Enable the test-coverage lens on a full review.
   errors:
     default: false
-    description: Run the silent-failure lens.
+    description: Enable the silent-failure lens on a full review.
   comments:
     default: false
-    description: Run the comment-accuracy lens.
+    description: Enable the comment-accuracy lens on a full review.
   types:
     default: false
-    description: Run the type-design lens.
+    description: Enable the type-design lens on a full review.
   docs:
     default: false
-    description: Run the docs-impact lens.
+    description: Enable the docs-impact lens on a full review.
 
 returns: synthesize
 outcome_field: ready
 
 nodes:
+  - id: mode
+    script: resolve-review-mode
+    runtime: uv
+    with:
+      prior_report: "$INPUTS.prior_report"
+
   - id: scope
     command: review-scope
     context: fresh
+    depends_on: [mode]
 
   # ── Always-on lenses ─────────────────────────────────────────────
   - id: code
     command: review-code
     context: fresh
     depends_on: [scope]
+    when: "$mode.output.continuation == false"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -72,6 +81,7 @@ nodes:
     command: review-seams
     context: fresh
     depends_on: [scope]
+    when: "$mode.output.continuation == false"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -81,7 +91,7 @@ nodes:
     command: review-tests
     context: fresh
     depends_on: [scope]
-    when: "$INPUTS.tests == 'true'"
+    when: "$mode.output.continuation == false && $INPUTS.tests == 'true'"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -90,7 +100,7 @@ nodes:
     command: review-errors
     context: fresh
     depends_on: [scope]
-    when: "$INPUTS.errors == 'true'"
+    when: "$mode.output.continuation == false && $INPUTS.errors == 'true'"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -99,7 +109,7 @@ nodes:
     command: review-comments
     context: fresh
     depends_on: [scope]
-    when: "$INPUTS.comments == 'true'"
+    when: "$mode.output.continuation == false && $INPUTS.comments == 'true'"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -108,7 +118,7 @@ nodes:
     command: review-types
     context: fresh
     depends_on: [scope]
-    when: "$INPUTS.types == 'true'"
+    when: "$mode.output.continuation == false && $INPUTS.types == 'true'"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -117,7 +127,7 @@ nodes:
     command: review-docs
     context: fresh
     depends_on: [scope]
-    when: "$INPUTS.docs == 'true'"
+    when: "$mode.output.continuation == false && $INPUTS.docs == 'true'"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -129,20 +139,32 @@ nodes:
     command: review-simplify
     context: fresh
     depends_on: [scope]
+    when: "$mode.output.continuation == false"
     retry:
       max_attempts: 2
       delay_ms: 20000
 
-  # all_done so an input-disabled lens (skipped) never blocks synthesis. A lens
-  # that FAILED — retries exhausted, e.g. a provider stream dying mid-review
-  # (run ae71ab1e) — must not kill the run either: synthesize detects the missing
+  # all_done lets this barrier settle after input-disabled lenses, every skipped
+  # continuation lens, or a lens whose retries were exhausted. The deciding
+  # agent can then tolerate specialist failures without also tolerating a failed
+  # mode/scope preflight: synthesize separately requires scope to have succeeded.
+  - id: review-complete
+    bash: "true"
+    depends_on: [code, seams, tests, errors, comments, types, docs, simplify]
+    trigger_rule: all_done
+
+  # A failed specialist (for example, a provider stream dying mid-review in run
+  # ae71ab1e) must not kill the review: synthesize detects the missing
   # report for an ENABLED lens and forces ready:false naming the gap, so
   # degradation is disclosed, never silent, and the correction loop's recheck is
   # the retry. `ready` is a real boolean — the load-bearing field a composing
-  # loop terminates on; the findings channel is the complete lens files under
-  # $ARTIFACTS_DIR/review/, never truncated at this seam.
+  # loop terminates on. Full reviews receive complete lens files; continuation
+  # reviews receive the complete prior report and correction delta.
   #
-  # Synthesis starts fresh and re-reads the diff. Returning into the scope
+  # The deciding agent starts fresh and re-reads the diff. On a continuation it
+  # performs the review itself from the previous report and correction delta;
+  # that keeps the accumulated review state without paying for a cold fan-out.
+  # Returning into the scope
   # node's session is not portable across the bundle's supported providers:
   # Claude Code, Codex, and Pi. Bundled defaults stay on that shared capability
   # floor even where the configured provider can resume a named upstream session.
@@ -155,8 +177,7 @@ nodes:
     command: review-synthesize
     context: fresh
     output_type: review-report
-    depends_on: [code, seams, tests, errors, comments, types, docs, simplify]
-    trigger_rule: all_done
+    depends_on: [scope, review-complete]
     output_format:
       type: object
       properties:

@@ -307,14 +307,34 @@ describe('bundled-defaults', () => {
       });
     });
 
-    it('archon-review exposes the three-way action contract', () => {
+    it('archon-review exposes the three-way action contract behind a successful preflight', () => {
       const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-review'], 'archon-review.yaml');
       if (parsed.workflow === null) throw new Error(parsed.error.error);
 
       expect(parsed.workflow.inputs?.work_order?.default).toBe('');
+      const scope = parsed.workflow.nodes.find(node => node.id === 'scope');
+      expect(scope?.depends_on).toEqual(['mode']);
+
+      const specialists = [
+        'code',
+        'seams',
+        'tests',
+        'errors',
+        'comments',
+        'types',
+        'docs',
+        'simplify',
+      ];
+      const reviewComplete = parsed.workflow.nodes.find(node => node.id === 'review-complete');
+      expect(reviewComplete?.kind).toBe('exec');
+      expect(reviewComplete?.depends_on).toEqual(specialists);
+      expect(reviewComplete?.trigger_rule).toBe('all_done');
+
       const synthesize = parsed.workflow.nodes.find(node => node.id === 'synthesize');
       expect(synthesize?.kind).toBe('agent');
       if (synthesize?.kind !== 'agent') throw new Error('synthesize is not an agent');
+      expect(synthesize.depends_on).toEqual(['scope', 'review-complete']);
+      expect(synthesize.trigger_rule).toBeUndefined();
       expect(synthesize.output_format).toMatchObject({
         properties: {
           action: { type: 'string', enum: ['none', 'correct', 'replan'] },

@@ -21,6 +21,7 @@ classify:
     types: "stub"
     docs: "stub"
 resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+review__mode: '{"continuation":false}'
 review__scope: "accepted contract recorded"
 review__code: "1 Important in-scope finding"
 review__seams: "0 findings"
@@ -36,10 +37,8 @@ fix__implement:
   summary: "stub: correction exposed a scope conflict"
 fix__assert-changed: "1 file changed"
 gate-correction-green: '{"gate":"green"}'
+recheck__mode: '{"continuation":true}'
 recheck__scope: "light review with original accepted contract"
-recheck__code: "1 Important scope conflict"
-recheck__seams: "0 findings"
-recheck__simplify: "0 findings (suggestions only)"
 recheck__synthesize:
   ready: false
   action: replan
