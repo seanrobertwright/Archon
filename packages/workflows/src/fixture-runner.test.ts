@@ -1,12 +1,26 @@
 /** Tests for the declared-data dry-run fixture runner (#2772). */
 import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileAsync } from '@archon/git';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
 import type { WorkflowWithSource } from './schemas/workflow';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  DEFAULT_WORKFLOW_SOURCE_CONFIG,
+  liveSourceRoots,
+  type WorkflowSourceConfig,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 
 /** Load the temp project's on-disk workflows so targets match discovery's output shape. */
 function workflowsOnDisk(cwd: string, names: string[], pack = 'pack'): WorkflowWithSource[] {
@@ -43,9 +57,17 @@ function isolatedSourceRoots(cwd: string): WorkflowSourceRoots {
   };
 }
 
-async function runFixtures(options: RunFixturesOptions): Promise<FixtureReport> {
+/**
+ * `sourceConfig` is required on the real option type so no production caller can freeze a
+ * narrower set of directories than the run would. Most tests here are not about command
+ * policy, so the wrapper makes that one choice — the standard folders — on their behalf.
+ */
+async function runFixtures(
+  options: Omit<RunFixturesOptions, 'sourceConfig'> & { sourceConfig?: WorkflowSourceConfig }
+): Promise<FixtureReport> {
   return runFixturesFromSource({
     ...options,
+    sourceConfig: options.sourceConfig ?? DEFAULT_WORKFLOW_SOURCE_CONFIG,
     sourceRoots: isolatedSourceRoots(options.cwd),
   });
 }
@@ -343,5 +365,268 @@ describe('runFixtures', () => {
       target: 'pack',
     });
     expect(report.passed).toBe(1);
+  });
+});
+
+describe('runFixtures exec-code isolation (#2851)', () => {
+  const COMMITTED_YAML = 'committed-file\n';
+
+  /** A bash node whose success depends ONLY on the cleanliness of the checkout it executes in. */
+  const GUARD_YAML = [
+    'name: test-wf',
+    'description: probe the checkout it executes in',
+    'nodes:',
+    '  - id: probe',
+    '    bash: |',
+    '      [ -z "$(git status --porcelain)" ]',
+  ].join('\n');
+
+  const WRITER_YAML = [
+    'name: writer-wf',
+    'description: writes a relative-path file where it executes',
+    'nodes:',
+    '  - id: writer',
+    '    bash: echo executed > leak.txt',
+  ].join('\n');
+
+  const execFixtureBody = ['fixture:', '  expect: completed', '', 'exec-code: true'].join('\n');
+
+  const git = (cwd: string, ...args: string[]): Promise<unknown> =>
+    execFileAsync('git', args, { cwd });
+
+  /** Turn a plain temp project into a git repo with one committed file besides the project's own. */
+  async function initGitWithCommittedFile(cwd: string): Promise<void> {
+    await git(cwd, 'init', '-q');
+    await git(cwd, 'config', 'user.email', 't@t');
+    await git(cwd, 'config', 'user.name', 't');
+    writeFileSync(join(cwd, 'tracked.txt'), COMMITTED_YAML);
+    await git(cwd, 'add', '-A');
+    await git(cwd, 'commit', '-qm', 'init');
+  }
+
+  it('gives clean and pre-dirtied callers the same verdict (#2851)', async () => {
+    const clean = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
+    await initGitWithCommittedFile(clean.cwd);
+    const cleanReport = await runFixtures({
+      workflows: [workflowsOnDisk(clean.cwd, ['test-wf'])[0]],
+      cwd: clean.cwd,
+    });
+    expect(cleanReport.failed).toBe(0);
+
+    const dirty = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
+    await initGitWithCommittedFile(dirty.cwd);
+    // Exactly the operator-tree state the issue reports: one modified tracked file,
+    // one untracked stray.
+    writeFileSync(join(dirty.cwd, 'tracked.txt'), `${COMMITTED_YAML}edited\n`);
+    writeFileSync(join(dirty.cwd, 'scratch.txt'), 'untracked stray\n');
+    const dirtyReport = await runFixtures({
+      workflows: [workflowsOnDisk(dirty.cwd, ['test-wf'])[0]],
+      cwd: dirty.cwd,
+    });
+    expect(dirtyReport.passed).toBe(1);
+  });
+
+  it('keeps executed writes out of the caller checkout (#2851)', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'writer-wf',
+      workflowYaml: WRITER_YAML,
+      body: execFixtureBody,
+    });
+    await initGitWithCommittedFile(cwd);
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['writer-wf'])[0]],
+      cwd,
+    });
+    // The node genuinely executed (passing would fail if it had errored); its write
+    // landed somewhere that is not the caller's working tree.
+    expect(report.results[0].outcome).toBe('completed');
+    expect(existsSync(join(cwd, 'leak.txt'))).toBe(false);
+    expect(readFileSync(join(cwd, 'tracked.txt'), 'utf8')).toBe(COMMITTED_YAML);
+  });
+
+  const SCRIPT_YAML = [
+    'name: script-wf',
+    'description: runs a named script',
+    'nodes:',
+    '  - id: run-script',
+    '    script: greet-script',
+    '    runtime: bun',
+  ].join('\n');
+
+  function writeScript(cwd: string, body: string): void {
+    mkdirSync(join(cwd, '.archon', 'scripts'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'scripts', 'greet-script.ts'), body);
+  }
+
+  it('executes the captured copy of a named script, not the caller tree file (#2851)', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'script-wf',
+      workflowYaml: SCRIPT_YAML,
+      body: execFixtureBody,
+    });
+    // Absolute, so the probe records where the script FILE was, independently of the
+    // directory it executed in.
+    const probe = join(cwd, 'ran-from.txt');
+    writeScript(
+      cwd,
+      `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(probe)}, import.meta.path);\n`
+    );
+    await initGitWithCommittedFile(cwd);
+
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
+      cwd,
+    });
+    expect(report.failed).toBe(0);
+
+    // The bytes that ran came from the invocation's source capture, under its project
+    // scope — so every `__file__`-relative read and write a script performs lands in the
+    // capture too, not in the operator's checkout.
+    const ranFrom = readFileSync(probe, 'utf8');
+    expect(ranFrom).toContain('fixture-source-');
+    expect(ranFrom.endsWith(join('project', '.archon', 'scripts', 'greet-script.ts'))).toBe(true);
+  });
+
+  it('shares one capture across every fixture in an invocation (#2851)', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'script-wf',
+      workflowYaml: SCRIPT_YAML,
+      fixtureName: 'first',
+      body: execFixtureBody,
+    });
+    // A second fixture beside the first, targeting the same workflow: two fixtures, one
+    // `runFixtures` call. Capturing per fixture would still pass every other test here.
+    writeFileSync(
+      join(cwd, '.archon', 'workflows', 'pack', 'fixtures', 'second.stubs.yaml'),
+      execFixtureBody
+    );
+    const probe = join(cwd, 'ran-from.txt');
+    writeScript(
+      cwd,
+      `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(probe)}, import.meta.path + '\\n');\n`
+    );
+    await initGitWithCommittedFile(cwd);
+
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
+      cwd,
+    });
+    expect(report.passed).toBe(2);
+
+    // Both executions resolved out of the SAME capture directory — the snapshot the whole
+    // invocation is a function of. Two capture ids here would mean an edit landing between
+    // fixtures could change the second verdict.
+    const captureIds = readFileSync(probe, 'utf8')
+      .split('\n')
+      .filter(line => line.length > 0)
+      .map(line => /fixture-source-[0-9a-f-]+/.exec(line)?.[0]);
+    expect(captureIds).toHaveLength(2);
+    expect(captureIds[0]).toBeDefined();
+    expect(captureIds[1]).toBe(captureIds[0]);
+  });
+
+  it('captures the working tree, so an uncommitted script edit is what runs (#2851)', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'script-wf',
+      workflowYaml: SCRIPT_YAML,
+      body: execFixtureBody,
+    });
+    // Committed — and therefore the only version a scratch worktree of HEAD holds.
+    writeScript(cwd, 'process.exit(1);\n');
+    await initGitWithCommittedFile(cwd);
+    // Uncommitted: the edit an author is iterating on when they run `workflow test`.
+    writeScript(cwd, 'console.log("ok");\n');
+
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
+      cwd,
+    });
+    expect(report.results[0].outcome).toBe('completed');
+  });
+
+  it('captures the command folder the source config names (#2851)', async () => {
+    const body = ['fixture:', '  expect: completed', '', 'run-command: "stub"'].join('\n');
+    const workflowYaml = [
+      'name: command-wf',
+      'description: sources its prompt from a command file',
+      'nodes:',
+      '  - id: run-command',
+      '    command: greet',
+    ].join('\n');
+    const { cwd } = writeTempProject({
+      workflowName: 'command-wf',
+      workflowYaml,
+      body,
+    });
+    // A repo that moved its commands off the default folder; only the source config
+    // says where they are, and the capture is what a command node then reads.
+    mkdirSync(join(cwd, '.archon', 'prompts'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'prompts', 'greet.md'), 'Greet $ARGUMENTS');
+    const workflows = [workflowsOnDisk(cwd, ['command-wf'])[0]];
+
+    const configured = await runFixtures({
+      workflows,
+      cwd,
+      sourceConfig: {
+        load_default_workflows: true,
+        load_default_commands: true,
+        command_folder: '.archon/prompts',
+      },
+    });
+    expect(configured.failed).toBe(0);
+
+    // Under the standard folders that same directory is outside every captured scope, and
+    // the node fails the way a real run would rather than quietly reading the live file.
+    const standardFolders = await runFixtures({
+      workflows,
+      cwd,
+      sourceConfig: DEFAULT_WORKFLOW_SOURCE_CONFIG,
+    });
+    expect(standardFolders.failed).toBe(1);
+  });
+
+  it('disposes both the scratch worktree and the source capture (#2851)', async () => {
+    const { cwd } = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
+    await initGitWithCommittedFile(cwd);
+    const home = mkdtempSync(join(tmpdir(), 'fixture-runner-home-'));
+    cleanups.push(home);
+    const previousHome = process.env.ARCHON_HOME;
+    process.env.ARCHON_HOME = home;
+    try {
+      const report = await runFixtures({
+        workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+        cwd,
+      });
+      expect(report.failed).toBe(0);
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+    }
+    // `git worktree add` records metadata in the caller's .git, so a leaked
+    // workspace would show up here as a stale entry.
+    const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd });
+    expect(stdout).not.toContain('fixture-exec-');
+    expect(stdout.split('\n').filter(line => line.startsWith('worktree '))).toHaveLength(1);
+    // A leaked capture is heavier than a leaked scratch worktree — it is a full copy of the
+    // project, global, and bundled source trees — and Archon's own SDLC workflows run
+    // `workflow test` repeatedly, so it would compound.
+    const leftBehind = readdirSync(join(home, 'temp')).filter(
+      entry => entry.startsWith('fixture-exec-') || entry.startsWith('fixture-source-')
+    );
+    expect(leftBehind).toEqual([]);
+  });
+
+  it('fails an exec-code fixture in a directory outside any git repository', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'writer-wf',
+      workflowYaml: WRITER_YAML,
+      body: execFixtureBody,
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['writer-wf'])[0]],
+      cwd,
+    });
+    expect(report.failed).toBe(1);
+    expect(report.results[0].failureReason).toContain('not inside a git repository');
   });
 });

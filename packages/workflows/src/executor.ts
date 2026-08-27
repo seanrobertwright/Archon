@@ -49,6 +49,7 @@ import {
   recordSelectedWorkflow,
   resolveRunSourceCapture,
   resolveChildDiscoveryRoot,
+  workflowSourceConfigFrom,
   type WorkflowSourceManifest,
   type WorkflowSourceConfig,
   type WorkflowSourceRoots,
@@ -73,7 +74,12 @@ import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
 // Re-exported so callers driving the capture-first sequence need only this module.
-export { recordSelectedWorkflow, capturedSourceRoots, loadWorkflowSource } from './workflow-source';
+export {
+  recordSelectedWorkflow,
+  capturedSourceRoots,
+  loadWorkflowSource,
+  workflowSourceConfigFrom,
+} from './workflow-source';
 export type { WorkflowSourceRoots } from './workflow-source';
 import type { ChildIsolationResolver, ChildIsolationResult } from './child-isolation';
 export type {
@@ -982,12 +988,7 @@ export async function prepareWorkflowSource(
   // rather than passed in so no caller can forget it.
   let sourceConfig: WorkflowSourceConfig;
   try {
-    const config = await deps.loadConfig(opts.sourceRoot);
-    sourceConfig = {
-      load_default_workflows: config.defaults?.loadDefaultWorkflows ?? true,
-      load_default_commands: config.defaults?.loadDefaultCommands ?? true,
-      ...(config.commands?.folder !== undefined ? { command_folder: config.commands.folder } : {}),
-    };
+    sourceConfig = workflowSourceConfigFrom(await deps.loadConfig(opts.sourceRoot));
   } catch (error) {
     // A malformed config would otherwise silently narrow what gets frozen.
     throw new Error(
