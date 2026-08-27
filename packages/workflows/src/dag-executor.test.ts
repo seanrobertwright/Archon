@@ -2586,14 +2586,16 @@ describe('executeDagWorkflow -- bash nodes', () => {
       user_message: 'test',
     });
 
-    // Marker is echoed to stdout only (so it lands in the command line embedded
-    // in err.message but never in stderr). If it shows up in errorMsg the
-    // prefix line was not stripped.
+    // The marker appears only in the script body (never echoed to stdout or
+    // stderr). If it shows up in errorMsg the "Command failed: bash -c <body>"
+    // prefix line was not stripped. The stdout echo is separately asserted so a
+    // regression that drops stdout from the diagnostics is caught.
     const bashNode: ExecNode = {
       id: 'fail-bash-1389',
       kind: 'exec',
       runtime: 'sh',
-      script: 'echo UNIQUE_CMDLINE_MARKER_1389; echo "diagnostic from stderr" >&2; exit 1',
+      script:
+        'UNIQUE_CMDLINE_MARKER_1389=; echo "stdout context before failure"; echo "diagnostic from stderr" >&2; exit 1',
     };
 
     await executeDagWorkflow(
@@ -2626,6 +2628,9 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(errorMsg).not.toContain('Command failed:');
     expect(errorMsg).not.toContain('UNIQUE_CMDLINE_MARKER_1389');
     expect(errorMsg).toContain('diagnostic from stderr');
+    expect(errorMsg).toContain('stdout context before failure');
+    expect(errorMsg).toContain('[stderr]');
+    expect(errorMsg).toContain('[stdout]');
   });
 
   it('variable substitution works in bash scripts', async () => {

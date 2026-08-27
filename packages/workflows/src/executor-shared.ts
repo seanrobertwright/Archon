@@ -191,8 +191,13 @@ export function toTelemetryErrorClass(errorType: ErrorType): archonPaths.Workflo
 
 // ─── Subprocess Failure Formatting ───────────────────────────────────────────
 
-/** Max characters of stderr/message we keep in user-facing and logged fields. */
+/** Max characters of combined stdout+stderr we keep in user-facing and logged fields. */
 const SUBPROCESS_ERROR_MAX_CHARS = 2000;
+
+function streamTail(text: string, max: number): string | undefined {
+  if (text.length === 0) return undefined;
+  return text.length > max ? text.slice(-max) : text;
+}
 
 /**
  * Raw ExecFileException shape from Node's `child_process.execFile`. For inline
@@ -215,7 +220,9 @@ interface RawSubprocessError {
  * Produce a concise, diagnostic-first summary of a failed subprocess.
  *
  * User-visible output strips Node's `"Command failed: <cmd>"` prefix (which for
- * inline scripts contains the full script body) and prefers stderr when present.
+ * inline scripts contains the full script body) and includes a jointly capped
+ * tail of stderr and stdout — stderr keeps budget priority, stdout gets the
+ * remainder, so scripts that report failure context on stdout stay visible.
  * Log fields expose a controlled, tail-truncated subset — never the full `err`
  * object, to prevent Pino's default error serializer from emitting three copies
  * of the script body (`err.message`, `err.stack`, `err.cmd`).
@@ -225,6 +232,7 @@ export function formatSubprocessFailure(
   label: string
 ): { userMessage: string; logFields: Record<string, unknown> } {
   const stderr = (err.stderr ?? '').trim();
+  const stdout = (err.stdout ?? '').trim();
   const rawMessage = (err.message ?? '').trim();
 
   // The first line of Node's ExecFileException.message is `Command failed: <cmd>`,
@@ -235,9 +243,26 @@ export function formatSubprocessFailure(
     ? rawMessage.split('\n').slice(1).join('\n').trim()
     : rawMessage;
 
+  // Well-behaved scripts print failure context to stdout, so both streams share
+  // the cap. stderr keeps budget priority; the leftover goes to stdout, and each
+  // stream is labelled only when both are present. The budget accounts for the
+  // label overhead so the joined diagnostic never truncates away a label.
+  const STDERR_LABEL = '[stderr]\n';
+  const STDOUT_LABEL = '\n[stdout]\n';
+  const bothPresent = stderr.length > 0 && stdout.length > 0;
+  const labelsOverhead = bothPresent ? STDERR_LABEL.length + STDOUT_LABEL.length : 0;
+  const halfCap = Math.floor(SUBPROCESS_ERROR_MAX_CHARS / 2);
+  const stderrTail = streamTail(stderr, bothPresent ? halfCap : SUBPROCESS_ERROR_MAX_CHARS);
+  const stdoutTail = streamTail(
+    stdout,
+    SUBPROCESS_ERROR_MAX_CHARS - labelsOverhead - (stderrTail?.length ?? 0)
+  );
+
   let diagnostic: string;
-  if (stderr) {
-    diagnostic = stderr;
+  if (stderrTail && stdoutTail) {
+    diagnostic = `${STDERR_LABEL}${stderrTail}${STDOUT_LABEL}${stdoutTail}`;
+  } else if (stderrTail || stdoutTail) {
+    diagnostic = (stderrTail ?? '') + (stdoutTail ?? '');
   } else if (bodyAfterPrefix) {
     diagnostic = bodyAfterPrefix;
   } else if (hasCommandFailedPrefix) {
@@ -254,15 +279,13 @@ export function formatSubprocessFailure(
 
   const exitSuffix = err.code != null ? ` [exit ${String(err.code)}]` : '';
 
-  const stderrTail =
-    stderr.length > SUBPROCESS_ERROR_MAX_CHARS ? stderr.slice(-SUBPROCESS_ERROR_MAX_CHARS) : stderr;
-
   return {
     userMessage: `${label} failed${exitSuffix}: ${truncated}`,
     logFields: {
       exitCode: err.code ?? undefined,
       killed: err.killed === true,
-      stderrTail: stderrTail.length > 0 ? stderrTail : undefined,
+      stderrTail,
+      stdoutTail,
     },
   };
 }
