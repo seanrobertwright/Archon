@@ -16,7 +16,7 @@
  * `workflow run --dry-run --stubs` accepts. The only execution path is
  * `dryRunWorkflow`, so a fixture can never trigger a real run or provider call.
  */
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, realpath, stat } from 'node:fs/promises';
 import { join, relative, resolve, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
 import { createLogger } from '@archon/paths';
@@ -118,7 +118,7 @@ async function exists(path: string): Promise<boolean> {
 }
 
 interface DiscoveredFixture {
-  /** Label relative to its discovery scope root, e.g. `sdlc/deliver/fixtures/clean.stubs.yaml`. */
+  /** Display path relative to its discovery scope root, e.g. `sdlc/deliver/fixtures/clean.stubs.yaml`. */
   readonly label: string;
   /** Directory segments between the scope root and `fixtures/`, e.g. `['sdlc', 'deliver']`. */
   readonly dirs: readonly string[];
@@ -168,15 +168,14 @@ async function walkForFixtures(
     if (!entry.isDirectory()) continue;
     const dirPath = join(root, entry.name);
     if (entry.name === FIXTURES_DIR) {
-      const labelRoot = join(root, '..');
+      const dirs = relative(scopeRoot, root)
+        .split(sep)
+        .filter(segment => segment.length > 0);
       for (const file of await readdir(dirPath)) {
         if (!file.endsWith(FIXTURE_SUFFIX)) continue;
-        const rel = relative(labelRoot, join(dirPath, file));
         out.push({
-          label: rel.split(sep).join('/'),
-          dirs: relative(scopeRoot, root)
-            .split(sep)
-            .filter(segment => segment.length > 0),
+          label: [...dirs, FIXTURES_DIR, file].join('/'),
+          dirs,
           path: join(dirPath, file),
           workflowNames: await workflowNamesBeside(dirPath),
         });
@@ -192,15 +191,19 @@ async function discoverFixtures(roots: readonly string[]): Promise<DiscoveredFix
   const found: DiscoveredFixture[] = [];
   for (const root of roots) {
     if (!(await exists(root))) continue;
+    // Path targets compare against fixture paths by real path, so discovery reports
+    // canonical spellings and a target spelled through a symlink still matches
+    // (e.g. macOS /tmp → /private/tmp).
+    const scopeRoot = await realpath(root).catch(() => root);
     const before = found.length;
-    await walkForFixtures(root, root, 0, found);
+    await walkForFixtures(scopeRoot, scopeRoot, 0, found);
     for (let i = before; i < found.length; i++) {
-      if (seen.has(found[i].label)) {
+      if (seen.has(found[i].path)) {
         // Higher-precedence scope already discovered this fixture path.
         found.splice(i, 1);
         i--;
       } else {
-        seen.add(found[i].label);
+        seen.add(found[i].path);
       }
     }
   }
@@ -231,7 +234,11 @@ export interface RunFixturesOptions {
   sourceRoots?: WorkflowSourceRoots;
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
-  /** Restrict to a workflow name, a directory above a fixtures dir (pack or workflow folder), or a path to one; unresolved values are an error. */
+  /**
+   * Restrict to a workflow name, a pack or workflow-folder name, or a path (relative
+   * or absolute) to any fixture-containing directory — a directory above a `fixtures/`
+   * dir, the `fixtures/` dir itself, or an ancestor of one. Unresolved values error.
+   */
   target?: string;
 }
 
@@ -257,11 +264,15 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
     // A target resolves when it names a discovered workflow, a directory above a
     // fixtures dir (pack name or workflow folder), or a path containing fixtures.
     const targetDir = resolve(options.cwd, targetName);
+    // Discovery reports fixture paths as real paths, so canonicalize the target
+    // before the containment check; a nonexistent target can never contain a
+    // fixture, so keeping its resolved spelling there is safe.
+    const targetReal = await realpath(targetDir).catch(() => targetDir);
     selected = all.filter(
       fixture =>
         fixture.workflowNames.includes(targetName) ||
         fixture.dirs.includes(targetName) ||
-        fixture.path.startsWith(targetDir + sep)
+        fixture.path.startsWith(targetReal + sep)
     );
     if (selected.length === 0) {
       const names = [...byName.keys()].sort().join(', ');

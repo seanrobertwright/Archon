@@ -273,7 +273,7 @@ describe('runFixtures', () => {
     expect(report.passed).toBe(1);
   });
 
-  /** Pack layout like the bundled SDLC pack: `<pack>/<workflow-folder>/fixtures/`. */
+  /** Pack layout like the bundled SDLC pack: `<pack>/<workflow-folder>/fixtures/`, plus a sibling pack whose name extends `sdlc` so the path-containment anchor cannot drift. */
   function writeNestedPackProject(): { cwd: string } {
     const cwd = makeTempProject();
     cleanups.push(cwd);
@@ -289,6 +289,16 @@ describe('runFixtures', () => {
         ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
       );
     }
+    const extDir = join(cwd, '.archon', 'workflows', 'sdlc-ext', 'ext');
+    mkdirSync(join(extDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(extDir, 'ext-wf.yaml'),
+      'name: ext-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(extDir, 'fixtures', 'ext.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
     return { cwd };
   }
 
@@ -297,6 +307,7 @@ describe('runFixtures', () => {
     const workflows = [
       ...workflowsOnDisk(cwd, ['plan-wf'], 'sdlc/plan'),
       ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+      ...workflowsOnDisk(cwd, ['ext-wf'], 'sdlc-ext/ext'),
     ];
     const fixtureLabels = (target: string | undefined) =>
       runFixtures({ workflows, cwd, ...(target !== undefined ? { target } : {}) }).then(report =>
@@ -304,15 +315,58 @@ describe('runFixtures', () => {
       );
 
     const packPath = join(cwd, '.archon', 'workflows', 'sdlc');
+    // Exact labels pin both the scope-root-relative shape and the boundary against the
+    // prefix-named `sdlc-ext` sibling: `targetDir + sep` must never match it.
     await expect(fixtureLabels('sdlc')).resolves.toEqual([
-      expect.stringContaining('plan/fixtures/plan.stubs.yaml'),
-      expect.stringContaining('ship/fixtures/ship.stubs.yaml'),
+      'sdlc/plan/fixtures/plan.stubs.yaml',
+      'sdlc/ship/fixtures/ship.stubs.yaml',
     ]);
-    await expect(fixtureLabels('ship')).resolves.toEqual([
-      expect.stringContaining('ship/fixtures/ship.stubs.yaml'),
+    await expect(fixtureLabels('ship')).resolves.toEqual(['sdlc/ship/fixtures/ship.stubs.yaml']);
+    await expect(fixtureLabels('sdlc-ext')).resolves.toEqual([
+      'sdlc-ext/ext/fixtures/ext.stubs.yaml',
     ]);
     await expect(fixtureLabels('.archon/workflows/sdlc')).resolves.toHaveLength(2);
     await expect(fixtureLabels(packPath)).resolves.toHaveLength(2);
-    await expect(fixtureLabels(undefined)).resolves.toHaveLength(2);
+    await expect(fixtureLabels(undefined)).resolves.toHaveLength(3);
+  });
+
+  it('selects by the union of workflow name and folder: a target that is both picks both', async () => {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    // Workflow `ship` inside folder `plan`: its fixture matches by name only.
+    const planDir = join(cwd, '.archon', 'workflows', 'sdlc', 'plan');
+    mkdirSync(join(planDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(planDir, 'ship.yaml'),
+      'name: ship\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(planDir, 'fixtures', 'ship.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+    // Folder `ship` with a differently-named workflow: its fixture matches by folder only.
+    const shipDir = join(cwd, '.archon', 'workflows', 'sdlc', 'ship');
+    mkdirSync(join(shipDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(shipDir, 'ship-wf.yaml'),
+      'name: ship-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(shipDir, 'fixtures', 'ship.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+    const report = await runFixtures({
+      workflows: [
+        ...workflowsOnDisk(cwd, ['ship'], 'sdlc/plan'),
+        ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+      ],
+      cwd,
+      target: 'ship',
+    });
+    // Name-first precedence would drop the ship-folder fixture; dir-first would drop the plan one.
+    expect(report.results.map(r => r.fixture).sort()).toEqual([
+      'sdlc/plan/fixtures/ship.stubs.yaml',
+      'sdlc/ship/fixtures/ship.stubs.yaml',
+    ]);
   });
 });
