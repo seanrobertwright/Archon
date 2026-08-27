@@ -92,8 +92,8 @@ Work through these questions in order, with the user where marked:
 7. **Prompting** per node → see `../prompting-mistakes/prompting-mistakes.md` before writing prose.
 8. **Wiring** into YAML (below), then **fixtures**: every authored workflow ships
    a dry-run fixture under `<pack>/<workflow>/fixtures/*.stubs.yaml` declaring its
-   expected outcome. Prove red paths red before trusting them — on a clean tree.
-   Fixtures prove the paths that dry-run can execute. A reachable `workflow:` or
+   expected outcome. Prove red paths red before trusting them. Fixtures prove the
+   paths that dry-run can execute. A reachable `workflow:` or
    `include:` + `fan_out:` node fails dry-run by design, so prove that path with a
    small real acceptance run while keeping fixtures for the surrounding wiring.
 9. Validate: load-time errors surface in `archon workflow list`; then
@@ -199,6 +199,6 @@ Read before writing YAML:
 - **Trusting exit codes / run status as verdicts.** A declined task exits 0;
   gate on artifacts existing and validating, and on declared outcome fields.
 - **Skipping fixtures.** Unfalsified wiring is unknown wiring. Expected-red paths
-  especially: seen red on a clean tree, or they prove nothing.
+  especially: seen red, or they prove nothing.
 - **Inline everything.** Long prompts inline in YAML, logic inline in bash.
   Files age better, diff better, and are reusable across nodes.

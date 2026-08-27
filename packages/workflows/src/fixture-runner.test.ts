@@ -1,6 +1,14 @@
 /** Tests for the declared-data dry-run fixture runner (#2772). */
 import { describe, it, expect, afterEach } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileAsync } from '@archon/git';
@@ -349,6 +357,59 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     expect(report.results[0].outcome).toBe('completed');
     expect(existsSync(join(cwd, 'leak.txt'))).toBe(false);
     expect(readFileSync(join(cwd, 'tracked.txt'), 'utf8')).toBe(COMMITTED_YAML);
+  });
+
+  it('resolves named scripts from the caller tree, not the scratch worktree (#2851)', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'script-wf',
+      workflowYaml: [
+        'name: script-wf',
+        'description: runs a named script',
+        'nodes:',
+        '  - id: run-script',
+        '    script: greet-script',
+        '    runtime: bun',
+      ].join('\n'),
+      body: execFixtureBody,
+    });
+    await initGitWithCommittedFile(cwd);
+    // Written after the commit, so the scratch worktree of HEAD cannot contain it:
+    // only caller-tree (`cwd`) source resolution can find this script.
+    mkdirSync(join(cwd, '.archon', 'scripts'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'scripts', 'greet-script.ts'), 'console.log("ok")\n');
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
+      cwd,
+    });
+    expect(report.failed).toBe(0);
+    expect(report.results[0].outcome).toBe('completed');
+  });
+
+  it('disposes the scratch worktree after each fixture (#2851)', async () => {
+    const { cwd } = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
+    await initGitWithCommittedFile(cwd);
+    const home = mkdtempSync(join(tmpdir(), 'fixture-runner-home-'));
+    cleanups.push(home);
+    const previousHome = process.env.ARCHON_HOME;
+    process.env.ARCHON_HOME = home;
+    try {
+      const report = await runFixtures({
+        workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+        cwd,
+      });
+      expect(report.failed).toBe(0);
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+    }
+    // `git worktree add` records metadata in the caller's .git, so a leaked
+    // workspace would show up here as a stale entry.
+    const { stdout } = await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd });
+    expect(stdout).not.toContain('fixture-exec-');
+    expect(stdout.split('\n').filter(line => line.startsWith('worktree '))).toHaveLength(1);
+    expect(
+      readdirSync(join(home, 'temp')).filter(entry => entry.startsWith('fixture-exec-'))
+    ).toEqual([]);
   });
 
   it('fails an exec-code fixture in a directory outside any git repository', async () => {

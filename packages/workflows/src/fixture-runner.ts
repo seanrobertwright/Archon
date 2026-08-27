@@ -18,7 +18,7 @@
  * With `exec-code: true`, executed nodes run in a scratch worktree of the caller
  * repo's HEAD (see {@link withExecWorkspace}), never against the operator's tree.
  */
-import { readdir, mkdir, rm, stat } from 'node:fs/promises';
+import { readdir, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join, relative, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
@@ -257,8 +257,8 @@ async function withExecWorkspace<T>(
       `Exec-code fixtures require a git checkout to isolate execution; '${cwd}' is not inside a git repository`
     );
   }
+  // git worktree add creates the workspace path's leading directories itself.
   const workspace = join(getArchonTempPath(), `fixture-exec-${randomUUID()}`);
-  await mkdir(getArchonTempPath(), { recursive: true });
   try {
     await execFileAsync('git', ['worktree', 'add', '--detach', workspace, 'HEAD'], { cwd });
   } catch (error) {
@@ -391,7 +391,7 @@ async function checkFixture(
   };
   try {
     const execCode = parsed.execCode;
-    const run = (workspace?: string): Promise<DryRunResult> =>
+    const run = (workspace: string): Promise<DryRunResult> =>
       dryRunWorkflow({
         workflow: ws.workflow,
         userMessage: '',
@@ -399,11 +399,11 @@ async function checkFixture(
         stubs: parsed.stubs,
         ...(parsed.declaration.inputs ? { inputs: parsed.declaration.inputs } : {}),
         execCode,
-        ...(workspace !== undefined ? { execWorkspace: workspace } : {}),
+        execWorkspace: workspace,
         ...(options.config ? { config: options.config } : {}),
         ...(options.aiProfile ? { aiProfile: options.aiProfile } : {}),
       });
-    const result = execCode ? await withExecWorkspace(options.cwd, run) : await run();
+    const result = execCode ? await withExecWorkspace(options.cwd, run) : await run(options.cwd);
 
     let failureReason: string | undefined;
     if (result.outcome !== parsed.declaration.expect) {

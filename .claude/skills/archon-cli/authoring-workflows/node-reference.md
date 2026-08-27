@@ -302,7 +302,7 @@ implement:
   done: true
   green: true
   summary: "stub summary"
-exec-code: false             # true executes bash/script nodes for real (clean tree!)
+exec-code: false             # true executes bash/script nodes for real (requires a git checkout)
 ```
 
 Run them:
@@ -313,6 +313,8 @@ archon workflow test my-workflow        # one workflow's fixtures
 ```
 
 Expected-red fixtures are the important ones: a guard that has never been seen
-failing proves nothing. Prove reds red on a CLEAN tree — uncommitted edits
-outside `.archon/` make deterministic change-detectors pass and turn your red
-path green. Validate load-time errors with `archon workflow list`.
+failing proves nothing. Prove reds red before trusting them. Exec-code fixtures
+run in a scratch worktree of HEAD, so your working tree's state cannot change a
+verdict — but executed nodes see committed HEAD content, not uncommitted edits.
+Exec-code fixtures require a git checkout and fail explicitly outside one.
+Validate load-time errors with `archon workflow list`.
