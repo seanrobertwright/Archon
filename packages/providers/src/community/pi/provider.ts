@@ -6,7 +6,7 @@ import { createLogger } from '@archon/paths';
 // Type-only import — erased by TS, so it does NOT trigger Pi's config.js
 // package.json read at module load (see the header note below). Used only to
 // annotate the per-call ResourceLoader local.
-import type { ResourceLoader } from '@earendil-works/pi-coding-agent';
+import type { DefaultResourceLoader } from '@earendil-works/pi-coding-agent';
 
 import type {
   IAgentProvider,
@@ -318,7 +318,7 @@ export class PiProvider implements IAgentProvider {
       piCodingAgent,
       { bridgeSession },
       { resolvePiSkills, resolvePiThinkingLevel, resolvePiTools, buildDefaultPiTools },
-      { createPiResourceLoader, createPiSessionResourceLoader, getOrCreateReloadedExtensionLoader },
+      { createPiResourceLoader, getOrCreateReloadedExtensionLoader },
       { resolvePiSession },
       { createArchonUIBridge, createArchonUIContext },
       { buildPiNativeToolDefinitions },
@@ -765,13 +765,13 @@ export class PiProvider implements IAgentProvider {
       ...(systemPrompt !== undefined ? { systemPrompt } : {}),
       ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
     };
-    let resourceLoader: ResourceLoader;
+    let resourceLoader: DefaultResourceLoader;
     if (enableExtensions) {
       const { loader, providerRegistrations } = await getOrCreateReloadedExtensionLoader(
         cwd,
         loaderOptions
       );
-      resourceLoader = createPiSessionResourceLoader(loader, cwd);
+      resourceLoader = loader;
       // Re-apply the load-time extension provider registrations to THIS call's
       // fresh ModelRegistry (issue #2064). Extension factories run only during
       // the single cached reload(), and the SDK drains their queued
