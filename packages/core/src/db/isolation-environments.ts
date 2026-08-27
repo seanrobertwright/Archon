@@ -9,6 +9,7 @@ import type {
   CreateEnvironmentParams,
 } from '@archon/isolation';
 import { createLogger } from '@archon/paths';
+import { toHydratedTimestamp } from './timestamps';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -18,19 +19,22 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
- * Normalize an isolation-environment row so `metadata` is ALWAYS a parsed object,
- * regardless of dialect. SQLite stores `metadata` as TEXT (a JSON string,
- * `JSON.stringify`'d on write) while Postgres returns a parsed JSONB object — so the
- * raw SQLite row hands back a STRING, which makes `IsolationEnvironmentRow.metadata`
- * (typed `Record<string, unknown>`) a lie on SQLite. That lie once leaked a container
- * during Phase B smoke testing: `destroy()` read `metadata.containerName` off the
- * string as `undefined` and silently skipped `docker rm`. Parsing here at the store
- * boundary makes the type TRUE for every consumer, so no downstream reader has to
- * re-guard the shape. A corrupt string is logged and normalized to `{}` — the read
- * stays resilient (one bad row must not break `isolation list`/cleanup for all rows),
- * while the destructive path (container `destroy()`) still throws loudly when the
- * resulting object lacks the fields it needs. Mirrors `normalizeWorkflowRun` in
- * `workflows.ts`. `metadata` is the only JSON column on this row.
+ * Normalize an isolation-environment row so it matches the
+ * `IsolationEnvironmentRow` type's promise for every consumer, regardless of
+ * dialect. SQLite stores `metadata` as TEXT (a JSON string, `JSON.stringify`'d
+ * on write) while Postgres returns a parsed JSONB object — so the raw SQLite row
+ * hands back a STRING, which makes the typed `Record<string, unknown>` a lie on
+ * SQLite. That lie once leaked a container during Phase B smoke testing:
+ * `destroy()` read `metadata.containerName` off the string as `undefined` and
+ * silently skipped `docker rm`. Parsing here at the store boundary makes the type
+ * TRUE, so no downstream reader has to re-guard the shape. A corrupt string is
+ * logged and normalized to `{}` — the read stays resilient (one bad row must not
+ * break `isolation list`/cleanup for all rows), while the destructive path
+ * (container `destroy()`) still throws loudly when the resulting object lacks the
+ * fields it needs. The same boundary hydrates `created_at`: SQLite stores it as
+ * zone-less UTC TEXT that JavaScript parses as LOCAL time, so staleness math like
+ * cleanup's `isEnvironmentStale` would age every environment by the host's UTC
+ * offset without re-anchoring. Mirrors `normalizeWorkflowRun` in workflows.ts.
  */
 function normalizeEnvironmentRow<T extends IsolationEnvironmentRow>(row: T): T {
   if (typeof row.metadata === 'string') {
@@ -41,6 +45,7 @@ function normalizeEnvironmentRow<T extends IsolationEnvironmentRow>(row: T): T {
       row.metadata = {};
     }
   }
+  if (typeof row.created_at === 'string') row.created_at = toHydratedTimestamp(row.created_at);
   return row;
 }
 
