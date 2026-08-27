@@ -50,3 +50,7 @@ nodes:
 
       Read `.archon/test-loop-dag-counter.txt` and confirm the final counter value.
       Report: "Test loop DAG completed successfully. Final counter: {value}"
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.

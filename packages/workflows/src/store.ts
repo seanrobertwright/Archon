@@ -139,6 +139,12 @@ export const WORKFLOW_EVENT_TYPES = [
   // deliverable. `data.warnings` is the message list. Absence means the YAML was
   // clean OR the run predates this event type — never that delivery failed.
   'workflow_parse_warnings',
+  // #2781 — the run's workflow declares `deprecated:`. Written by the executor at
+  // run start for every deprecated workflow, whatever surface started it (the
+  // chat/console message is best-effort; this is the durable trace).
+  // `data.notice` is the composed message; absence means not deprecated OR the run
+  // predates this event type.
+  'workflow_deprecation_notice',
   // #2512 — audit snapshot of a composed fan-out's ordered instance set (identity +
   // item per ordinal), written before the first instance schedules.
   'fan_out_instances',

@@ -251,6 +251,12 @@ async function loadPackagedWorkflowsFromDir(
       }
       continue;
     }
+    // `defaults` is the flat-bundled-defaults convention, not a pack (its files
+    // are read by loadWorkflowsFromDir, including the `legacy/` subfolder during
+    // the #2781 deprecation window). Packaged scanning cannot interpret it —
+    // `defaults/legacy` would fail "must contain exactly one .yaml" and surface
+    // a bogus error on every discovery pass.
+    if (pack === 'defaults') continue;
     if (!isValidWorkflowFolderSegment(pack)) {
       errors.push({
         filename: pack,

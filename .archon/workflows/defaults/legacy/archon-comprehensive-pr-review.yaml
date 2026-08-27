@@ -46,3 +46,7 @@ nodes:
   - id: implement-fixes
     command: archon-implement-review-fixes
     depends_on: [synthesize]
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.

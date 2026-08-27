@@ -82,6 +82,7 @@ import {
   resolveTopLevelInputs,
 } from '@archon/workflows/utils/workflow-requirements';
 import { parseInputAssignments } from '@archon/workflows/workflow-inputs';
+import { formatDeprecationNotice } from '@archon/workflows/deprecation';
 import {
   dryRunWorkflow,
   formatDryRunTrace,
@@ -966,6 +967,19 @@ export function emitParseWarnings(
   }
 }
 
+/**
+ * Print a deprecated workflow's removal notice (#2781) to stderr.
+ *
+ * Same channel as emitParseWarnings: stderr keeps `--json` stdout parseable,
+ * and `console.warn` survives `--json`'s log silencing. Not gated on --quiet —
+ * a user driving runs programmatically still has to learn the default they
+ * picked is scheduled for removal.
+ */
+export function emitDeprecationNotice(workflow: WorkflowDefinition): void {
+  const notice = formatDeprecationNotice(workflow);
+  if (notice) console.warn(notice);
+}
+
 function countWorkflowSources(
   workflows: readonly WorkflowWithSource[]
 ): Record<WorkflowSource, number> {
@@ -1274,6 +1288,7 @@ async function runWorkflowWithOwnedSource(
     }
     await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
     emitParseWarnings(workflowEntry?.parseWarnings, workflow.name);
+    emitDeprecationNotice(workflow);
     // The gates above ran against the parent checkout's YAML; this lane executes the
     // branch's graph, so judge the same signature gates against the branch vintage
     // (mirrors the orchestrator's deferred runSignatureGates).
@@ -1317,6 +1332,7 @@ async function runWorkflowWithOwnedSource(
   // reaches an agent driving runs through `--json`. Not gated on --quiet — a
   // dropped key can be a gate the author believes is protecting the run.
   emitParseWarnings(workflowEntry?.parseWarnings, workflow.name);
+  emitDeprecationNotice(workflow);
 
   if (isContinuation && options.modelAssignments && options.modelAssignments.length > 0) {
     throw new Error(

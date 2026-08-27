@@ -47,3 +47,7 @@ nodes:
     command: archon-workflow-summary
     depends_on: [review]
     context: fresh
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.

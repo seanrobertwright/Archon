@@ -154,6 +154,13 @@ inputs:                          # Optional: declared signature — what this bl
 returns: synthesize              # Optional: the node id whose output IS this block's result.
 # outcome_field: ready           # Optional: a required boolean property on `returns:` whose
                                  #   exact value is persisted as the authored run outcome.
+# deprecated:                    # Optional: marks the workflow deprecated (#2781). Every run
+#   message: Use <pack> instead. #   start announces removal in an upcoming release with this
+                                 #   message plus the copy-to-project/global escape hatch.
+                                 #   Metadata-only — execution is unchanged. Bundled defaults
+                                 #   carry it during a deprecation window; author your own copy
+                                 #   (project or global `.archon/workflows/`, same filename) without
+                                 #   it to silence the notice.
 
 # Required for DAG-based
 nodes:
@@ -2432,6 +2439,21 @@ nodes:
 ```
 
 The workflow uses `opus` instead of the config default `haiku`, but other settings inherit from config.
+
+---
+
+## Deprecating a Workflow
+
+A bundled default that is being replaced is kept runnable during a deprecation window and marked declaratively:
+
+```yaml
+deprecated:
+  message: Switch to the sdlc pack instead.
+```
+
+The field is metadata-only — it never blocks or alters execution. Every run start announces on each surface the run reports to (chat platforms, web console, CLI stderr, plus the run's durable event trace) that the workflow will be removed in an upcoming release, carrying the declared message and both exits: switch to the replacement, or copy the workflow file into your project `.archon/workflows/` or global `~/.archon/workflows/` (same filename wins discovery) to keep using it.
+
+Any future bundle deprecation works the same way with no engine change: declare the field, get the notice. A copy without the field silences it.
 
 ---
 

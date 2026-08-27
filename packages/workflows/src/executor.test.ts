@@ -1724,6 +1724,59 @@ describe('executeWorkflow', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Deprecation notice recorded on the run (#2781)
+  // -------------------------------------------------------------------------
+
+  describe('workflow_deprecation_notice', () => {
+    it('records the composed notice for a deprecated workflow', async () => {
+      const createEventSpy = mock<IWorkflowStore['createWorkflowEvent']>(async _data => {});
+      const store = makeStore({ createWorkflowEvent: createEventSpy });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ deprecated: { message: 'Switch to the sdlc pack instead.' } }),
+        'test message',
+        'db-conv-1'
+      );
+
+      const noticeEvent = createEventSpy.mock.calls
+        .map(call => call[0])
+        .find(event => event.event_type === 'workflow_deprecation_notice');
+      expect(noticeEvent?.data).toEqual({
+        workflowName: 'test-workflow',
+        notice:
+          '⚠️ `test-workflow` is deprecated and will be removed in an upcoming release. ' +
+          'Switch to the sdlc pack instead. ' +
+          'To keep using this workflow after removal, copy the workflow file into your project ' +
+          '`.archon/workflows/` or your global `~/.archon/workflows/`.',
+      });
+    });
+
+    it('records nothing for a workflow without the marker', async () => {
+      const createEventSpy = mock<IWorkflowStore['createWorkflowEvent']>(async _data => {});
+      const store = makeStore({ createWorkflowEvent: createEventSpy });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+
+      const noticeEvent = createEventSpy.mock.calls
+        .map(call => call[0])
+        .find(event => event.event_type === 'workflow_deprecation_notice');
+      expect(noticeEvent).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // $DOCS_DIR default resolution
   // -------------------------------------------------------------------------
 

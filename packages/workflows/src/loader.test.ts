@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock, type Mock } from 'bun:test';
-import { mkdir, writeFile, rm, readdir, readFile } from 'fs/promises';
+import { mkdir, mkdtemp, writeFile, rm, readdir, readFile } from 'fs/promises';
 import { join, basename } from 'path';
 import { tmpdir } from 'os';
 
@@ -35,6 +35,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 import { discoverWorkflows, discoverWorkflowsWithConfig } from './workflow-discovery';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import {
   isExecNode,
   isHaltNode,
@@ -7044,6 +7045,148 @@ nodes:
     });
   });
 
+  describe('defaults/legacy discovery (#2781)', () => {
+    /** A temp project whose bundled root carries a legacy deprecation-window default. */
+    const setupLegacyProject = async (): Promise<string> => {
+      const tmp = await mkdtemp(join(tmpdir(), 'archon-legacy-'));
+      const defaultsDir = join(tmp, 'bundled', 'defaults', 'legacy');
+      await mkdir(defaultsDir, { recursive: true });
+      await writeFile(
+        join(defaultsDir, 'legacy-wf.yaml'),
+        [
+          'name: legacy-wf',
+          'description: legacy default',
+          'deprecated:',
+          '  message: Switch to the sdlc pack instead.',
+          'nodes:',
+          '  - id: n',
+          '    command: archon-parse-user-request', // plain ref against bundled commands/defaults',
+        ].join('\n')
+      );
+      return tmp;
+    };
+
+    const rootsFor = (tmp: string): WorkflowSourceRoots => {
+      const roots = liveSourceRoots(tmp);
+      return {
+        ...roots,
+        bundledWorkflows: join(tmp, 'bundled'),
+        globalWorkflows: join(tmp, '.empty-global'),
+      };
+    };
+
+    it('loads a legacy default as bundled with unqualified command refs and the marker', async () => {
+      const tmp = await setupLegacyProject();
+      try {
+        const result = await discoverWorkflows(tmp, { sourceRoots: rootsFor(tmp) });
+        expect(result.errors).toEqual([]);
+        const entry = result.workflows.find(w => w.workflow.name === 'legacy-wf');
+        expect(entry).toBeDefined();
+        expect(entry!.source).toBe('bundled');
+        expect(entry!.workflow.deprecated?.message).toBe('Switch to the sdlc pack instead.');
+        // Flat loading must NOT qualify resource refs (that happens only for
+        // packaged packs) — the plain name still resolves against the shared
+        // `.archon/commands/defaults/` + BUNDLED_COMMANDS tiers.
+        expect(JSON.stringify(entry!.workflow)).not.toContain('__archon_pack__');
+      } finally {
+        await rm(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('packaged scanning of the workflows root produces no error for defaults/legacy', async () => {
+      const tmp = await setupLegacyProject();
+      try {
+        // Without the reserved-name guard, loadPackagedWorkflowsFromDir reads
+        // `defaults/legacy` as pack/workflow and fails "must contain exactly
+        // one .yaml" on every discovery pass.
+        const result = await discoverWorkflows(tmp, { sourceRoots: rootsFor(tmp) });
+        expect(result.errors).toEqual([]);
+      } finally {
+        await rm(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('a project copy with the same filename overrides and clears the notice', async () => {
+      const tmp = await setupLegacyProject();
+      try {
+        const projectWfDir = join(tmp, '.archon', 'workflows');
+        await mkdir(projectWfDir, { recursive: true });
+        // The copy a user makes to keep the workflow after removal: same
+        // filename, marker stripped — discovery pins by filename and wins.
+        await writeFile(
+          join(projectWfDir, 'legacy-wf.yaml'),
+          [
+            'name: legacy-wf',
+            'description: user copy',
+            'nodes:',
+            '  - id: n',
+            '    command: archon-parse-user-request',
+          ].join('\n')
+        );
+        const result = await discoverWorkflows(tmp, { sourceRoots: rootsFor(tmp) });
+        expect(result.errors).toEqual([]);
+        const entry = result.workflows.find(w => w.workflow.name === 'legacy-wf');
+        expect(entry).toBeDefined();
+        // Content override is what matters: the user's copy — without the
+        // marker — wins by filename, so the notice disappears.
+        expect(entry!.workflow.description).toBe('user copy');
+        expect(entry!.workflow.deprecated).toBeUndefined();
+        // Known discovery quirk (not new here): a same-filename project file
+        // matching a bundled default keeps the 'bundled' SOURCE LABEL because
+        // the repo-scope scanner cannot distinguish "re-discovering the app's
+        // own defaults" from "an intentional override". Content overrode above,
+        // so only the label, not behavior, rides on this.
+        expect(['bundled', 'project']).toContain(entry!.source);
+      } finally {
+        await rm(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('deprecated marker (#2781)', () => {
+    /** Write a single workflow and return its parsed definition + warnings. */
+    const parseSingle = async (lines: string[]) => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(join(workflowDir, 'test.yaml'), lines.join('\n'));
+      return discoverWorkflows(testDir, { loadDefaults: false });
+    };
+
+    it('parses a declared deprecation cleanly and keeps the field', async () => {
+      const result = await parseSingle([
+        'name: test',
+        'description: test',
+        'deprecated:',
+        '  message: Switch to the sdlc pack instead.',
+        'nodes:',
+        '  - id: n',
+        '    prompt: p',
+      ]);
+      expect(result.workflows.length).toBe(1);
+      expect(result.errors).toEqual([]);
+      expect(result.workflows[0].parseWarnings).toBeUndefined();
+      expect(result.workflows[0].workflow.deprecated?.message).toBe(
+        'Switch to the sdlc pack instead.'
+      );
+    });
+
+    it('rejects a malformed deprecated block instead of dropping it silently', async () => {
+      // An empty block would mean a bundled default with no removal warning at
+      // all — the exact failure the notice exists to prevent.
+      const result = await parseSingle([
+        'name: test',
+        'description: test',
+        'deprecated: {}',
+        'nodes:',
+        '  - id: n',
+        '    prompt: p',
+      ]);
+      expect(result.workflows.length).toBe(0);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain('Invalid deprecated');
+    });
+  });
+
   describe('include: warnings stay with the file that declared the key (#2213)', () => {
     // Pins CURRENT behaviour, which is a known gap documented in the authoring
     // guide: warnings are keyed by the file they were parsed from, so an
@@ -8046,6 +8189,10 @@ describe('workflow-level field parity (#2457)', () => {
     outcome_field: {
       yaml: 'returns: only\noutcome_field: green',
       present: w => w.outcome_field === 'green',
+    },
+    deprecated: {
+      yaml: 'deprecated:\n  message: Switch instead.',
+      present: w => w.deprecated?.message === 'Switch instead.',
     },
   };
 

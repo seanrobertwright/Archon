@@ -4109,6 +4109,111 @@ describe('handleWorkflowRunCommand — E2 single codebase auto-select', () => {
     expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
   });
 
+  // #2781 — a deprecated bundled default announces its removal on the surface
+  // the run reports to, before any background dispatch. Same funnel argument
+  // as the parse-warning mirror above: this is the one place that covers them all.
+  test('sends the deprecation notice at run start for a workflow declaring deprecated:', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow assist...',
+        workflow: { definition: assistWorkflow, args: 'test prompt' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [
+          makeTestWorkflowWithSource({
+            name: 'assist',
+            deprecated: { message: 'Switch to the sdlc pack instead.' },
+          }),
+        ],
+        errors: [],
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      '⚠️ `assist` is deprecated and will be removed in an upcoming release. ' +
+        'Switch to the sdlc pack instead. ' +
+        'To keep using this workflow after removal, copy the workflow file into your project ' +
+        '`.archon/workflows/` or your global `~/.archon/workflows/`.'
+    );
+    // The notice must not replace the run — it precedes it.
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+  });
+
+  test('sends no deprecation notice for a clean workflow', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow assist...',
+        workflow: { definition: assistWorkflow, args: 'test prompt' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
+
+    expect(platform.sendMessage).not.toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('will be removed in an upcoming release')
+    );
+  });
+
+  test('a failed deprecation delivery does not stop the run', async () => {
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow assist...',
+        workflow: { definition: assistWorkflow, args: 'test prompt' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [
+          makeTestWorkflowWithSource({
+            name: 'assist',
+            deprecated: { message: 'Switch instead.' },
+          }),
+        ],
+        errors: [],
+      })
+    );
+
+    const platform = makePlatform();
+    (platform.sendMessage as ReturnType<typeof mock>).mockImplementation(
+      (_id: string, text: string) =>
+        text.includes('will be removed in an upcoming release')
+          ? Promise.reject(new Error('rate limited'))
+          : Promise.resolve()
+    );
+
+    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+  });
+
   test('resolves workflow by case-insensitive name when exact match fails', async () => {
     const upperWorkflow = makeTestWorkflow({ name: 'Assist' });
     const conversation = makeConversation({ codebase_id: null });
