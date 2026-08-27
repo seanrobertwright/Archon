@@ -135,9 +135,9 @@ describe('isolation-environments metadata — real SQLite round trip', () => {
 
   test('SQLite stores created_at as zone-less TEXT, but the store returns a UTC-hydrated Date', async () => {
     // Insert EXACTLY as SQLite writes it: created_at as zone-less UTC TEXT via
-    // the shape datetime('now') produces — under a non-UTC host timezone a naive
-    // Date parse reads this as 13:00 local (= 17:00Z), skewing cleanup's
-    // staleness math by the UTC offset.
+    // the shape datetime('now') produces — under America/New_York a naive Date
+    // parse yields 2026-08-26T09:00 EDT (= 13:00Z), four hours after the true
+    // instant; east of UTC the sign flips.
     const id = 'ts-env-1';
     await db.query(
       `INSERT INTO remote_agent_isolation_environments

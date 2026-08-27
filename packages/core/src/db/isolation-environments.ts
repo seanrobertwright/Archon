@@ -33,8 +33,9 @@ function getLog(): ReturnType<typeof createLogger> {
  * (container `destroy()`) still throws loudly when the resulting object lacks the
  * fields it needs. The same boundary hydrates `created_at`: SQLite stores it as
  * zone-less UTC TEXT that JavaScript parses as LOCAL time, so staleness math like
- * cleanup's `isEnvironmentStale` would age every environment by the host's UTC
- * offset without re-anchoring. Mirrors `normalizeWorkflowRun` in workflows.ts.
+ * cleanup's `isEnvironmentStale` shifts every environment's computed age by the
+ * host's UTC offset (older-looking east of UTC, younger west) without
+ * re-anchoring. Mirrors `normalizeWorkflowRun` in workflows.ts.
  */
 function normalizeEnvironmentRow<T extends IsolationEnvironmentRow>(row: T): T {
   if (typeof row.metadata === 'string') {
