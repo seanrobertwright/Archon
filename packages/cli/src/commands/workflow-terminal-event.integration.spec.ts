@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -19,7 +20,12 @@ afterEach(async () => {
     }
   }
   activeRunIds.clear();
-  for (const path of cleanupPaths.splice(0)) rmSync(path, { recursive: true, force: true });
+  for (const path of cleanupPaths.splice(0)) {
+    // The control endpoint closes after the workflow settles but just before the
+    // detached process finishes its remaining CLI cleanup. Windows can retain an
+    // inherited log or SQLite handle during that short gap.
+    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
 });
 
 async function waitFor<T>(
