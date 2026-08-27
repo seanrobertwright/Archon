@@ -409,6 +409,8 @@ Archon never writes back to these files — `~/.pi/agent/settings.json` is read-
 
 If Pi settings files do not exist (Docker, first-time setup, compiled binary with no Pi home directory), Archon falls back to Pi SDK defaults. Parse errors in the settings files are logged as warnings (`pi.settings_load_error`) and never prevent the session from starting.
 
+Pi also keeps its native context-file discovery. By default, every Pi node loads the user-level `~/.pi/agent/AGENTS.md` plus `AGENTS.md` or `CLAUDE.md` files from the project and its parent directories; `AGENTS.override.md` replaces the ordinary file in the same directory. Archon leaves Pi's context option unset rather than adding its own policy or configuration key.
+
 ### Extensions (on by default)
 
 A major reason to pick Pi is its **extension ecosystem**: community packages (installed via `pi install npm:<package>`) and your own local ones that hook into the agent's lifecycle. Extensions can intercept tool calls, gate execution on human review, post to external systems, render UIs — anything the Pi extension API exposes.
