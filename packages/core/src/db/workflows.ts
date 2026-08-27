@@ -46,9 +46,28 @@ function rollback(): Promise<void> {
 class WorkflowRunGuardError extends Error {}
 
 /**
+ * SQLite stores every timestamp as TEXT written by `datetime('now')` — UTC,
+ * "YYYY-MM-DD HH:MM:SS", no zone marker — which JavaScript parses as LOCAL
+ * time, so re-anchor it to UTC before converting. Postgres rows arrive as real
+ * Date objects and strings are the only other shape this sees; the regex trusts
+ * an already-zoned string and leaves its offset intact. This is the inverse of
+ * the `toDbDateParam` cutoff shape (workflow-events.ts, isolation-environments.ts):
+ * a hydrated `started_at` round-trips back into the same TEXT comparison, which
+ * is what keeps `environment.created_at <= run.started_at` (#2747 adoption)
+ * UTC-correct on both dialects.
+ */
+function toHydratedTimestamp(value: string): Date {
+  const zoned = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(value);
+  return new Date(zoned ? value : `${value.replace(' ', 'T')}Z`);
+}
+
+/**
  * Normalize a WorkflowRun row from the database.
- * SQLite stores metadata as TEXT (JSON string), PostgreSQL returns parsed objects.
- * This ensures metadata is always a parsed object regardless of database backend.
+ * SQLite stores metadata as TEXT (JSON string) and timestamps as TEXT datetimes;
+ * PostgreSQL returns parsed objects and real Dates. This makes both shapes match
+ * the `WorkflowRun` type's promise for every consumer — downstream code may treat
+ * them as a parsed object and a Date without re-guarding (a raw SQLite string once
+ * crashed `resolveWorkflowAdoption` at `.toISOString()`, #2845).
  */
 function normalizeWorkflowRun<T extends WorkflowRun>(row: T): T {
   if (typeof row.metadata === 'string') {
@@ -58,6 +77,11 @@ function normalizeWorkflowRun<T extends WorkflowRun>(row: T): T {
       row.metadata = {};
     }
   }
+  if (typeof row.started_at === 'string') row.started_at = toHydratedTimestamp(row.started_at);
+  if (typeof row.completed_at === 'string')
+    row.completed_at = toHydratedTimestamp(row.completed_at);
+  if (typeof row.last_activity_at === 'string')
+    row.last_activity_at = toHydratedTimestamp(row.last_activity_at);
   return row;
 }
 
