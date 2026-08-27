@@ -655,7 +655,7 @@ describe('terminal workflow transitions — real SQLite', () => {
 });
 
 describe('fan-out cancellation recovery — real SQLite', () => {
-  test('stores the engine reason in the same transition that cancels the child', async () => {
+  test('stores the engine reason and matching event when it cancels the child', async () => {
     await seed('fan-out-cancel', 'running', "datetime('now')", { existing: true });
 
     await expect(cancelFanOutRun('fan-out-cancel', 'fan_out_gate')).resolves.toEqual({
@@ -666,23 +666,44 @@ describe('fan-out cancellation recovery — real SQLite', () => {
     expect(cancelled?.status).toBe('cancelled');
     expect(cancelled?.completed_at).not.toBeNull();
     expect(cancelled?.metadata).toEqual({ existing: true, cancelled_reason: 'fan_out_gate' });
+    expect(await countEvents('fan-out-cancel', 'workflow_cancelled')).toBe(1);
+    const event = await db.query<{ data: string }>(
+      `SELECT data FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND event_type = 'workflow_cancelled'`,
+      ['fan-out-cancel']
+    );
+    expect(JSON.parse(event.rows[0]?.data ?? '{}')).toEqual({ reason: 'fan_out_gate' });
   });
 
-  test('claims an engine-cancelled child without creating a failed state or event', async () => {
-    await seed('fan-out-recover', 'cancelled', "datetime('now')", {
-      cancelled_reason: 'fan_out_orphan',
-    });
-    await db.query(
-      "UPDATE remote_agent_workflow_runs SET completed_at = datetime('now') WHERE id = $1",
-      ['fan-out-recover']
-    );
+  test('claims an engine-cancelled child and removes its obsolete terminal event', async () => {
+    await seed('fan-out-recover', 'running', "datetime('now')");
+    await cancelFanOutRun('fan-out-recover', 'fan_out_orphan');
 
     const recovered = await recoverCancelledFanOutRun('fan-out-recover');
 
     expect(recovered.status).toBe('running');
     expect(recovered.completed_at).toBeNull();
     expect(recovered.metadata.cancelled_reason).toBeUndefined();
+    expect(await countEvents('fan-out-recover', 'workflow_cancelled')).toBe(0);
     expect(await countEvents('fan-out-recover', 'workflow_failed')).toBe(0);
+  });
+
+  test('rolls back fan-out cancellation when its event cannot be stored', async () => {
+    await seed('fan-out-cancel-atomic', 'running', "datetime('now')", { existing: true });
+
+    await db.query('ALTER TABLE remote_agent_workflow_events RENAME TO events_stash', []);
+    try {
+      await expect(cancelFanOutRun('fan-out-cancel-atomic', 'fan_out_gate')).rejects.toThrow(
+        'Failed to cancel fan-out run'
+      );
+    } finally {
+      await db.query('ALTER TABLE events_stash RENAME TO remote_agent_workflow_events', []);
+    }
+
+    const run = await getWorkflowRun('fan-out-cancel-atomic');
+    expect(run?.status).toBe('running');
+    expect(run?.completed_at).toBeNull();
+    expect(run?.metadata).toEqual({ existing: true });
   });
 
   test('does not recover a user-cancelled child', async () => {

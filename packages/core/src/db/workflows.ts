@@ -1032,6 +1032,8 @@ export async function recoverCancelledFanOutRun(id: string): Promise<WorkflowRun
     getDatabaseType() === 'postgresql'
       ? "metadata - 'cancelled_reason'"
       : "json_remove(metadata, '$.cancelled_reason')";
+  const eventReason =
+    getDatabaseType() === 'postgresql' ? "data->>'reason'" : "json_extract(data, '$.reason')";
 
   try {
     return await getDatabase().withTransaction(async query => {
@@ -1050,6 +1052,13 @@ export async function recoverCancelledFanOutRun(id: string): Promise<WorkflowRun
       if ((result.rowCount ?? 0) === 0) {
         throw new Error(`Workflow run is not an engine-cancelled fan-out child (id: ${id})`);
       }
+      await query(
+        `DELETE FROM remote_agent_workflow_events
+         WHERE workflow_run_id = $1
+           AND event_type = 'workflow_cancelled'
+           AND ${eventReason} IN ($2, $3, $4)`,
+        [id, ...FAN_OUT_CANCEL_REASONS]
+      );
       const recovered = await query<WorkflowRun>(
         'SELECT * FROM remote_agent_workflow_runs WHERE id = $1',
         [id]
@@ -1307,16 +1316,26 @@ export async function cancelFanOutRun(
   reason: FanOutCancelReason
 ): Promise<{ cancelled: boolean }> {
   const dialect = getDialect();
-  let result: Awaited<ReturnType<typeof pool.query>>;
+  let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
-    result = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'cancelled',
-           completed_at = ${dialect.now()},
-           metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
-      [id, JSON.stringify({ cancelled_reason: reason })]
-    );
+    result = await getDatabase().withTransaction(async query => {
+      const update = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'cancelled',
+             completed_at = ${dialect.now()},
+             metadata = ${dialect.jsonMerge('metadata', 2)}
+         WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
+        [id, JSON.stringify({ cancelled_reason: reason })]
+      );
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_cancelled',
+          data: { reason },
+        });
+      }
+      return update;
+    });
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, workflowRunId: id, reason }, 'db.workflow_run_fan_out_cancel_failed');

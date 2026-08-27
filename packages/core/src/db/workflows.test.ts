@@ -1669,13 +1669,15 @@ describe('workflows database', () => {
 
   describe('cancelFanOutRun', () => {
     test('persists the engine reason and cancelled status in one update', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
 
       await expect(cancelFanOutRun('workflow-run-123', 'fan_out_orphan')).resolves.toEqual({
         cancelled: true,
       });
 
-      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'cancelled'");
       expect(query).toContain('metadata =');
@@ -1683,6 +1685,15 @@ describe('workflows database', () => {
       expect(params).toEqual([
         'workflow-run-123',
         JSON.stringify({ cancelled_reason: 'fan_out_orphan' }),
+      ]);
+      const [eventQuery, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(eventParams.slice(1)).toEqual([
+        'workflow-run-123',
+        'workflow_cancelled',
+        null,
+        null,
+        JSON.stringify({ reason: 'fan_out_orphan' }),
       ]);
     });
 
