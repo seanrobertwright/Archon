@@ -38,19 +38,19 @@ inputs:
       this empty and use the PR's problem, outcome, and explicit scope instead.
   tests:
     default: false
-    description: Run the test-coverage lens.
+    description: Enable the test-coverage lens on a full review.
   errors:
     default: false
-    description: Run the silent-failure lens.
+    description: Enable the silent-failure lens on a full review.
   comments:
     default: false
-    description: Run the comment-accuracy lens.
+    description: Enable the comment-accuracy lens on a full review.
   types:
     default: false
-    description: Run the type-design lens.
+    description: Enable the type-design lens on a full review.
   docs:
     default: false
-    description: Run the docs-impact lens.
+    description: Enable the docs-impact lens on a full review.
 
 returns: synthesize
 outcome_field: ready
@@ -144,10 +144,17 @@ nodes:
       max_attempts: 2
       delay_ms: 20000
 
-  # all_done so an input-disabled lens, or every specialist during a continuation
-  # review, never blocks the deciding agent. A lens
-  # that FAILED (retries exhausted, e.g. a provider stream dying mid-review,
-  # run ae71ab1e) must not kill the run either: synthesize detects the missing
+  # all_done lets this barrier settle after input-disabled lenses, every skipped
+  # continuation lens, or a lens whose retries were exhausted. The deciding
+  # agent can then tolerate specialist failures without also tolerating a failed
+  # mode/scope preflight: synthesize separately requires scope to have succeeded.
+  - id: review-complete
+    bash: "true"
+    depends_on: [code, seams, tests, errors, comments, types, docs, simplify]
+    trigger_rule: all_done
+
+  # A failed specialist (for example, a provider stream dying mid-review in run
+  # ae71ab1e) must not kill the review: synthesize detects the missing
   # report for an ENABLED lens and forces ready:false naming the gap, so
   # degradation is disclosed, never silent, and the correction loop's recheck is
   # the retry. `ready` is a real boolean — the load-bearing field a composing
@@ -170,8 +177,7 @@ nodes:
     command: review-synthesize
     context: fresh
     output_type: review-report
-    depends_on: [code, seams, tests, errors, comments, types, docs, simplify]
-    trigger_rule: all_done
+    depends_on: [scope, review-complete]
     output_format:
       type: object
       properties:

@@ -14,7 +14,7 @@ There are two modes in `$ARTIFACTS_DIR/review/scope.md`:
 3. In continuation mode, read `$INPUTS.prior_report` in full before judging the delta. Also read `$ARTIFACTS_DIR/implementation.md` when it exists; it records what the correction claims to have changed and proved. Specialist files beside the report belong to the earlier round and are evidence only through the canonical prior report. Do not count them as freshly rerun lenses.
 4. Read every producer record under `$ARTIFACTS_DIR/discoveries/`, when that directory exists. Its absence means no producer recorded a discovery. Each file is independent evidence; never delete or replace these raw files.
 
-The specialist concerns selected for the original review were `code`, `seams`, and `simplify`, plus the optional concerns whose inputs are true: tests=$INPUTS.tests, errors=$INPUTS.errors, comments=$INPUTS.comments, types=$INPUTS.types, docs=$INPUTS.docs. In full mode, a missing or empty report for an enabled lens means that lens failed to report and blocks readiness. In continuation mode, use these as context for what the accepted review cared about, not as a requirement to simulate separate reviewers.
+In full mode, the selected specialist concerns are `code`, `seams`, and `simplify`, plus the optional concerns whose inputs are true: tests=$INPUTS.tests, errors=$INPUTS.errors, comments=$INPUTS.comments, types=$INPUTS.types, docs=$INPUTS.docs. A missing or empty report for an enabled lens means that lens failed to report and blocks readiness. In continuation mode, the prior report's review-coverage section is authoritative for the concerns the accepted review covered; do not reconstruct it from current optional inputs or simulate separate reviewers.
 
 ## Continuation judgment
 

@@ -29,6 +29,7 @@ review__code: "0 findings"
 review__seams: "0 findings"
 review__tests: "0 findings"
 review__simplify: "0 findings (suggestions only)"
+review__review-complete: "settled"
 review__synthesize:
   ready: true
   action: none

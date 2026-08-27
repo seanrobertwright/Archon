@@ -206,8 +206,10 @@ nodes:
             scope: ""
             prior_report: "$ARTIFACTS_DIR/review/report.md"
             work_order: "$INPUTS.work"
-            # Round-1's resolved concerns remain available to the continuation
-            # reviewer without repeating the specialist fan-out.
+            # These bindings keep the included workflow's full-review `when:`
+            # expressions resolvable after load-time input substitution. In
+            # continuation mode the prior report owns coverage and every
+            # specialist remains skipped regardless of these values.
             tests: "$resolve-scope.output.tests"
             errors: "$resolve-scope.output.errors"
             comments: "$resolve-scope.output.comments"
