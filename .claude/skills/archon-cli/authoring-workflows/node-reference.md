@@ -314,7 +314,8 @@ archon workflow test my-workflow        # one workflow's fixtures
 
 Expected-red fixtures are the important ones: a guard that has never been seen
 failing proves nothing. Prove reds red before trusting them. Exec-code fixtures
-run in a scratch worktree of HEAD, so your working tree's state cannot change a
-verdict — but executed nodes see committed HEAD content, not uncommitted edits.
-Exec-code fixtures require a git checkout and fail explicitly outside one.
+run in a scratch worktree of HEAD, so executed code reads committed HEAD content,
+not uncommitted edits — but the workflow YAML, named scripts, and command files
+still resolve from your working tree, so uncommitted edits to those do change a
+verdict. Exec-code fixtures require a git checkout and fail explicitly outside one.
 Validate load-time errors with `archon workflow list`.
