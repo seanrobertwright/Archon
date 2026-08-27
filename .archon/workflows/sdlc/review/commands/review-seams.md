@@ -23,12 +23,14 @@ Mechanical starting points that pay off: grep the changed area for the KEEP-IN-S
 
 ## The bar
 
-**Name both sides or you have no finding.** A lone untyped value at a framework edge is the platform, not a defect. Bound the search to two hops from changed lines — do not audit the codebase. Honest duplication across a build boundary the project cannot deduplicate (or documents as deliberate) is a carve-out, not a finding — and prove the boundary by reading the build manifest, never by assuming it; when the sides truly cannot import one definition, the most you owe is a note recommending a conformance test. A missing discriminator (kind/type field) is reportable only with growth evidence — an open ticket, a TODO, a sibling payload that already has two kinds, a one-case switch: **no growth evidence, no finding.**
+**Name both sides or you have no finding.** A lone untyped value at a framework edge is the platform, not a defect. Bound ordinary search to two hops from changed lines — do not audit the codebase. Once one concrete seam defect proves that a member of a finite class violates the same invariant, enumerate that class with a deterministic repository search and finish it before reporting. Emit one causal finding with the invariant, discovery method, all affected members, and all examined-clean members; do not use class completion for an unrelated audit. Honest duplication across a build boundary the project cannot deduplicate (or documents as deliberate) is a carve-out, not a finding — and prove the boundary by reading the build manifest, never by assuming it; when the sides truly cannot import one definition, the most you owe is a note recommending a conformance test. A missing discriminator (kind/type field) is reportable only with growth evidence — an open ticket, a TODO, a sibling payload that already has two kinds, a one-case switch: **no growth evidence, no finding.**
 
 When you clear a seam, your reason must be a **quotation** from the code or build config — never your own characterization. If you cannot quote it, mark it unverified and leave it off the clean list.
 
 ## Output
 
 Write `$ARTIFACTS_DIR/review/seams.md`: each finding with severity (Critical if it already failed or fails silently on a supported path; Important otherwise), **both sides quoted with `file:line`**, what the missing type would carry, the concrete failure, and the smallest change that keeps the type. Then carve-outs applied, and the examined-and-clean list with its quotations. In light mode, a verdict per prior finding. No findings is a valid result — but only quoted silence.
+
+If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-seams.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`seams`). Write no file for no discovery; never append to another lens's file or record suspicion.
 
 Verify every `file:line` cited is real, then reply with one line: findings count by severity.

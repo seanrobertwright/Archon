@@ -30,7 +30,9 @@ review__tests: "0 findings"
 review__simplify: "0 findings (suggestions only)"
 review__synthesize:
   ready: true
+  action: none
   findings_summary: "stub: selected review is clean"
+review-action: '{"ready":true,"action":"none"}'
 gate-ready: '{"ready":"true"}'
 validate__validate:
   green: true
