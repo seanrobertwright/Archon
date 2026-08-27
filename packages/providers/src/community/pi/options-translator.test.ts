@@ -37,8 +37,9 @@ describe('resolvePiThinkingLevel', () => {
     expect(resolvePiThinkingLevel({ effort: 'off' })).toEqual({ level: undefined });
   });
 
-  // Pi's `ThinkingLevel` is Archon's ladder exactly — `max` included
-  // (@earendil-works/pi-ai types.d.ts). This previously asserted a downgrade to
+  // Pi's native `ThinkingLevel` matches Archon's ladder through `max`
+  // (@earendil-works/pi-ai types.d.ts); Codex-only `ultra` clamps separately.
+  // This previously asserted a downgrade to
   // `xhigh`, which was the bug: `effort: max` meant "as deep as this model goes"
   // everywhere except Pi, where a rung was quietly removed before Pi could apply
   // its own per-model handling.
