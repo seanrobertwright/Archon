@@ -115,6 +115,7 @@ function createMockStore(): IWorkflowStore {
     claimWriteback: mock(() => Promise.resolve({ claimed: true })),
     releaseWritebackClaim: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve({ cancelled: false })),
+    cancelFanOutRun: mock(() => Promise.resolve({ cancelled: false })),
     createWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEventIfRunning: mock(() => Promise.resolve({ persisted: true })),

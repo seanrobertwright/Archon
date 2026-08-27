@@ -27,10 +27,12 @@ import type {
 } from '../schemas/workflow-run';
 import { createLogger } from '@archon/paths';
 import type {
+  FanOutCancelReason,
   WorkflowResumeCursor,
   WorkflowWaitCompletion,
   WorkflowWaitPause,
 } from '@archon/workflows/store';
+import { FAN_OUT_CANCEL_REASONS } from '@archon/workflows/store';
 
 /** Best-effort ROLLBACK — log but swallow errors since we're already in an error path. */
 function rollback(): Promise<void> {
@@ -1042,8 +1044,8 @@ export async function recoverCancelledFanOutRun(id: string): Promise<WorkflowRun
              metadata = ${metadataWithoutCancelledReason}
          WHERE id = $1
            AND status = 'cancelled'
-           AND ${cancelledReason} IN ('fan_out_gate', 'fan_out_sibling', 'fan_out_orphan')`,
-        [id]
+           AND ${cancelledReason} IN ($2, $3, $4)`,
+        [id, ...FAN_OUT_CANCEL_REASONS]
       );
       if ((result.rowCount ?? 0) === 0) {
         throw new Error(`Workflow run is not an engine-cancelled fan-out child (id: ${id})`);
@@ -1296,6 +1298,33 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
     // report "nothing to cancel" instead of a false "Cancelled" (see #1830 I1).
     // Same info level as the resume CAS-miss signal for consistency (S2).
     getLog().info({ workflowRunId: id }, 'db.workflow_run_cancel_noop');
+  }
+  return { cancelled };
+}
+
+export async function cancelFanOutRun(
+  id: string,
+  reason: FanOutCancelReason
+): Promise<{ cancelled: boolean }> {
+  const dialect = getDialect();
+  let result: Awaited<ReturnType<typeof pool.query>>;
+  try {
+    result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'cancelled',
+           completed_at = ${dialect.now()},
+           metadata = ${dialect.jsonMerge('metadata', 2)}
+       WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
+      [id, JSON.stringify({ cancelled_reason: reason })]
+    );
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id, reason }, 'db.workflow_run_fan_out_cancel_failed');
+    throw new Error(`Failed to cancel fan-out run: ${err.message}`);
+  }
+  const cancelled = (result.rowCount ?? 0) > 0;
+  if (!cancelled) {
+    getLog().info({ workflowRunId: id, reason }, 'db.workflow_run_fan_out_cancel_noop');
   }
   return { cancelled };
 }

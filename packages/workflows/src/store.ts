@@ -146,6 +146,13 @@ export const WORKFLOW_EVENT_TYPES = [
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
 
+export const FAN_OUT_CANCEL_REASONS = [
+  'fan_out_gate',
+  'fan_out_sibling',
+  'fan_out_orphan',
+] as const;
+export type FanOutCancelReason = (typeof FAN_OUT_CANCEL_REASONS)[number];
+
 /**
  * Run-tree navigation (#2121 Phase 2) — a narrow, distinct concern (walking the
  * `parent_run_id` graph) kept out of the fat `IWorkflowStore` per the project's ISP
@@ -322,6 +329,8 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    */
   releaseWritebackClaim(id: string): Promise<void>;
   cancelWorkflowRun(id: string): Promise<{ cancelled: boolean }>;
+  /** Atomically identify and cancel a fan-out child owned by the engine. */
+  cancelFanOutRun(id: string, reason: FanOutCancelReason): Promise<{ cancelled: boolean }>;
 
   /**
    * Create a workflow event. Implementations MUST NOT throw — catch all errors

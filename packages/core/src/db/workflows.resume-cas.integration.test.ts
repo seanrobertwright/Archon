@@ -43,6 +43,7 @@ mock.module('./connection', () => ({
 const {
   resumeWorkflowRun,
   recoverCancelledFanOutRun,
+  cancelFanOutRun,
   pauseWorkflowRun,
   pauseWorkflowRunForWait,
   clearWorkflowWaitContext,
@@ -654,6 +655,19 @@ describe('terminal workflow transitions — real SQLite', () => {
 });
 
 describe('fan-out cancellation recovery — real SQLite', () => {
+  test('stores the engine reason in the same transition that cancels the child', async () => {
+    await seed('fan-out-cancel', 'running', "datetime('now')", { existing: true });
+
+    await expect(cancelFanOutRun('fan-out-cancel', 'fan_out_gate')).resolves.toEqual({
+      cancelled: true,
+    });
+
+    const cancelled = await getWorkflowRun('fan-out-cancel');
+    expect(cancelled?.status).toBe('cancelled');
+    expect(cancelled?.completed_at).not.toBeNull();
+    expect(cancelled?.metadata).toEqual({ existing: true, cancelled_reason: 'fan_out_gate' });
+  });
+
   test('claims an engine-cancelled child without creating a failed state or event', async () => {
     await seed('fan-out-recover', 'cancelled', "datetime('now')", {
       cancelled_reason: 'fan_out_orphan',

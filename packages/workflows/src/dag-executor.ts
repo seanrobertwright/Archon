@@ -95,7 +95,8 @@ import {
   waitCondition,
 } from './schemas';
 import type { BindingDirective } from './schemas';
-import type { DagResumeSnapshot, PersistedNodeOutput } from './store';
+import { FAN_OUT_CANCEL_REASONS } from './store';
+import type { DagResumeSnapshot, FanOutCancelReason, PersistedNodeOutput } from './store';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger, captureWorkflowCompleted } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
@@ -8107,16 +8108,7 @@ async function executeWorkflowNode(
  * never re-driven, so the parent would fail every resume with no way back. Delete it only
  * once no resumable run can predate the change.
  */
-type FanOutCancelReason = 'fan_out_gate' | 'fan_out_sibling' | 'fan_out_orphan';
-const FAN_OUT_RECOVERABLE_CANCEL_REASONS: ReadonlySet<string> = new Set<FanOutCancelReason>([
-  'fan_out_gate',
-  'fan_out_sibling',
-  // Every reason above is engine-owned, so every one belongs here — `fan_out_orphan` was
-  // missing, which read an orphan the engine cancelled as a USER cancel. Items shrinking
-  // and then growing back left those slots permanently cancelled: dead under all_done, and
-  // an unrecoverable node failure on every resume under all_success.
-  'fan_out_orphan',
-]);
+const FAN_OUT_RECOVERABLE_CANCEL_REASONS: ReadonlySet<string> = new Set(FAN_OUT_CANCEL_REASONS);
 
 /**
  * A `running`/`pending` child found on re-entry is ambiguous: a crash-orphan of a prior
@@ -8457,21 +8449,14 @@ async function executeFanOutWorkflowNode(
   };
 
   // Cancel a child the fan-out path OWNS, stamping WHY (C2/I4) so the cancel is
-  // attributable AND — unlike a user's out-of-band cancel — recoverable on resume. The
-  // reason is written first (a best-effort metadata merge), then the status is flipped;
-  // both are best-effort so a store hiccup can't unwind the node.
+  // attributable AND — unlike a user's out-of-band cancel — recoverable on resume.
   const cancelChild = async (childId: string, reason: FanOutCancelReason): Promise<void> => {
     if (!childId) return;
-    await deps.store
-      .updateWorkflowRun(childId, { metadata: { cancelled_reason: reason } })
-      .catch((err: unknown) => {
-        getLog().error(
-          { err: err as Error, childRunId: childId, reason },
-          'workflow.fan_out_cancel_reason_write_failed'
-        );
-      });
-    await deps.store.cancelWorkflowRun(childId).catch((err: unknown) => {
-      getLog().error({ err: err as Error, childRunId: childId }, 'workflow.fan_out_cancel_failed');
+    await deps.store.cancelFanOutRun(childId, reason).catch((err: unknown) => {
+      getLog().error(
+        { err: err as Error, childRunId: childId, reason },
+        'workflow.fan_out_cancel_failed'
+      );
     });
   };
 

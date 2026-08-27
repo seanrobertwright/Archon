@@ -17,6 +17,7 @@ const mockGetWorkflowRunStatus = mock(() => Promise.resolve('running'));
 const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
+const mockCancelFanOutRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRunForWait = mock(() => Promise.resolve());
 const mockClearWorkflowWaitContext = mock(() => Promise.resolve({ cleared: true }));
@@ -42,6 +43,7 @@ mock.module('../db/workflows', () => ({
   completeWorkflowRun: mockCompleteWorkflowRun,
   failWorkflowRun: mockFailWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
+  cancelFanOutRun: mockCancelFanOutRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
   pauseWorkflowRunForWait: mockPauseWorkflowRunForWait,
   clearWorkflowWaitContext: mockClearWorkflowWaitContext,
@@ -176,6 +178,7 @@ describe('createWorkflowStore', () => {
       'claimWriteback',
       'releaseWritebackClaim',
       'cancelWorkflowRun',
+      'cancelFanOutRun',
       'createWorkflowEvent',
       'persistWorkflowEvent',
       'persistWorkflowEventIfRunning',
@@ -269,6 +272,12 @@ describe('createWorkflowStore', () => {
     const store = createWorkflowStore();
     await store.cancelWorkflowRun('run-123');
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123');
+  });
+
+  test('delegates cancelFanOutRun to DB', async () => {
+    const store = createWorkflowStore();
+    await store.cancelFanOutRun('run-123', 'fan_out_gate');
+    expect(mockCancelFanOutRun).toHaveBeenCalledWith('run-123', 'fan_out_gate');
   });
 
   test('delegates getCodebase to DB', async () => {

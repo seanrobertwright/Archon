@@ -1395,11 +1395,11 @@ async function runChildWorkflow(
         }
       } else {
         const inspection = await inspectResumableRun(deps, resumeChild.run);
-        const preCreatedRun = await deps.store.recoverCancelledFanOutRun(resumeChild.run.id);
         const completedNodeIds = new Set(inspection?.priorCompletedNodes.keys() ?? []);
         const priorNodeSessions = (
           await deps.store.listWorkflowRunNodeSessions(resumeChild.run.id)
         ).filter(row => completedNodeIds.has(row.node_id));
+        const preCreatedRun = await deps.store.recoverCancelledFanOutRun(resumeChild.run.id);
         childOpts = {
           preCreatedRun,
           ...(inspection

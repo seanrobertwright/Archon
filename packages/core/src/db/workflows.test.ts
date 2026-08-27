@@ -40,6 +40,7 @@ import {
   signalWorkflowWait,
   clearWorkflowWaitContext,
   cancelWorkflowRun,
+  cancelFanOutRun,
   failOrphanedRuns,
   findChildRuns,
   getRunAncestry,
@@ -1662,6 +1663,43 @@ describe('workflows database', () => {
 
       await expect(cancelWorkflowRun('workflow-run-123')).rejects.toThrow(
         'Failed to cancel workflow run: Lock timeout'
+      );
+    });
+  });
+
+  describe('cancelFanOutRun', () => {
+    test('persists the engine reason and cancelled status in one update', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await expect(cancelFanOutRun('workflow-run-123', 'fan_out_orphan')).resolves.toEqual({
+        cancelled: true,
+      });
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status = 'cancelled'");
+      expect(query).toContain('metadata =');
+      expect(query).toContain("status NOT IN ('completed', 'cancelled')");
+      expect(params).toEqual([
+        'workflow-run-123',
+        JSON.stringify({ cancelled_reason: 'fan_out_orphan' }),
+      ]);
+    });
+
+    test('does not tag an already-terminal run', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(cancelFanOutRun('workflow-run-123', 'fan_out_gate')).resolves.toEqual({
+        cancelled: false,
+      });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('surfaces a failed atomic update', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('Lock timeout'));
+
+      await expect(cancelFanOutRun('workflow-run-123', 'fan_out_gate')).rejects.toThrow(
+        'Failed to cancel fan-out run: Lock timeout'
       );
     });
   });
