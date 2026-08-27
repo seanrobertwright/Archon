@@ -296,3 +296,7 @@ nodes:
       To start implementation: `/prp-plan {prd-path}`
       ```
     depends_on: [generate]
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.

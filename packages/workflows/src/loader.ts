@@ -51,6 +51,7 @@ import {
   webSearchModeSchema,
   workflowRequirementSchema,
   workflowEvidencePolicySchema,
+  workflowDeprecationSchema,
   workflowInputSpecSchema,
   KNOWN_WORKFLOW_KEYS,
   KNOWN_WORKFLOW_NESTED_KEYS,
@@ -59,6 +60,7 @@ import {
 import type {
   WorkflowRequirement,
   WorkflowEvidencePolicy,
+  WorkflowDeprecation,
   WorkflowInputSpec,
 } from './schemas/workflow';
 import { INPUT_NAME_PATTERN, inputEnvKey } from './schemas/dag-node';
@@ -1734,6 +1736,27 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       evidencePolicy = parsedEvidence.data;
     }
 
+    // Parse workflow-level deprecation marker (#2781). Like evidence_policy, a
+    // malformed block REJECTS the workflow instead of warn-and-ignore: silently
+    // dropping it would ship a bundled default with no removal warning at all,
+    // defeating the whole deprecation window.
+    let deprecated: WorkflowDeprecation | undefined;
+    if (raw.deprecated !== undefined) {
+      const parsedDeprecation = workflowDeprecationSchema.safeParse(raw.deprecated);
+      if (!parsedDeprecation.success) {
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error:
+              'Invalid deprecated: expected { message: string } — the sentence carried in the run-start deprecation notice (#2781).',
+            errorType: 'validation_error',
+          },
+        };
+      }
+      deprecated = parsedDeprecation.data;
+    }
+
     // Parse mutates_checkout — boolean, omitted means true (run the path-lock guard).
     // Same parse/warn pattern as `interactive` (invalid non-boolean values are dropped).
     // When false, the executor skips the path-lock guard and allows concurrent runs on the same checkout.
@@ -2059,6 +2082,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       ...(inputs !== undefined ? { inputs } : {}),
       ...(returns !== undefined ? { returns } : {}),
       ...(outcomeField !== undefined ? { outcome_field: outcomeField } : {}),
+      ...(deprecated !== undefined ? { deprecated } : {}),
     };
     const outcomeDeclarationError = validateWorkflowOutcomeDeclaration(workflow);
     if (outcomeDeclarationError !== null) {

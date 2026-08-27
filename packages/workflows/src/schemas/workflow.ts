@@ -161,6 +161,23 @@ export const workflowInputSpecSchema = z.object({
 
 export type WorkflowInputSpec = z.infer<typeof workflowInputSpecSchema>;
 
+/**
+ * Deprecation marker (#2781). A bundle declares this on a workflow that is being
+ * replaced and kept only for a deprecation window; every run-start surface then
+ * composes its standard notice around `message`.
+ *
+ * Declare-and-done: a future deprecation of any bundled workflow (or a replaced
+ * pack revision) needs no engine change — set the field, get the notice. Pure
+ * declarative coordination, so it stays admissible under the Workflow Language
+ * Constitution (code computes, YAML coordinates).
+ */
+export const workflowDeprecationSchema = z.object({
+  /** Per-item sentence carried inside the standard run-start deprecation notice. */
+  message: z.string().min(1),
+});
+
+export type WorkflowDeprecation = z.infer<typeof workflowDeprecationSchema>;
+
 // ---------------------------------------------------------------------------
 // WorkflowBase — common fields shared by all workflow types
 // ---------------------------------------------------------------------------
@@ -246,6 +263,14 @@ export const workflowBaseSchema = z.object({
    * engine maps exact true/false values to succeeded/failed without inference.
    */
   outcome_field: z.string().trim().min(1).optional(),
+  /**
+   * Marks the workflow deprecated (#2781): run-start surfaces announce removal
+   * in an upcoming release with a switch/copy escape hatch, while it keeps
+   * running normally. Metadata-only — never blocks or alters execution.
+   * Bundled defaults carry it during a deprecation window; nothing may ship it
+   * on the exempt `archon-assist` default.
+   */
+  deprecated: workflowDeprecationSchema.optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
@@ -321,6 +346,7 @@ export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = ne
     'evidence_policy',
     { kind: 'object', keys: new Set(Object.keys(workflowEvidencePolicySchema.shape)) },
   ],
+  ['deprecated', { kind: 'object', keys: new Set(Object.keys(workflowDeprecationSchema.shape)) }],
   // First `record` entry in this map: `inputs` is a record of input-name → spec,
   // so unknown keys under an individual spec (e.g. `inputs.diff.typo`) warn.
   // `returns` and `outcome_field` are plain strings and need no nested registration.

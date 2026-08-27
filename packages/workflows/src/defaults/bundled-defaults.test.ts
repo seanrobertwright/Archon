@@ -20,6 +20,9 @@ import { parseWorkflow } from '../loader';
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
 const COMMANDS_DIR = join(REPO_ROOT, '.archon/commands/defaults');
 const WORKFLOWS_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
+// `legacy/` holds the deprecated-window defaults (#2781): same flat file
+// convention, one grouping subfolder within the discovery depth cap.
+const LEGACY_WORKFLOWS_DIR = join(WORKFLOWS_DIR, 'legacy');
 
 function findPackagedScriptPath(scriptDir: string, name: string, extension: string): string {
   const filename = `${name}${extension}`;
@@ -68,10 +71,13 @@ describe('bundled-defaults', () => {
     });
 
     it('BUNDLED_WORKFLOWS contains every .yaml/.yml file in .archon/workflows/defaults/', () => {
-      const onDisk = readdirSync(WORKFLOWS_DIR)
-        .filter(f => f.endsWith('.yaml') || f.endsWith('.yml'))
-        .map(f => f.replace(/\.ya?ml$/, ''))
-        .sort();
+      const readFlat = (dir: string): string[] => {
+        if (!existsSync(dir)) return [];
+        return readdirSync(dir)
+          .filter(f => f.endsWith('.yaml') || f.endsWith('.yml'))
+          .map(f => f.replace(/\.ya?ml$/, ''));
+      };
+      const onDisk = [...readFlat(WORKFLOWS_DIR), ...readFlat(LEGACY_WORKFLOWS_DIR)].sort();
       expect(
         Object.keys(BUNDLED_WORKFLOWS)
           .filter(name => BUNDLED_WORKFLOW_OWNERS[name] === undefined)
@@ -94,14 +100,23 @@ describe('bundled-defaults', () => {
       }
       for (const [name, content] of Object.entries(BUNDLED_WORKFLOWS)) {
         if (BUNDLED_WORKFLOW_OWNERS[name] !== undefined) continue;
-        // Workflows may be .yaml or .yml — prefer .yaml, fall back.
-        let diskContent: string;
-        try {
-          diskContent = readLF(join(WORKFLOWS_DIR, `${name}.yaml`));
-        } catch {
-          diskContent = readLF(join(WORKFLOWS_DIR, `${name}.yml`));
+        // Workflows may be .yaml or .yml — prefer .yaml, fall back. The name may
+        // live in the flat defaults dir or the legacy/ deprecation window.
+        let diskContent: string | undefined;
+        for (const dir of [WORKFLOWS_DIR, LEGACY_WORKFLOWS_DIR]) {
+          try {
+            diskContent = readLF(join(dir, `${name}.yaml`));
+            break;
+          } catch {}
+          try {
+            diskContent = readLF(join(dir, `${name}.yml`));
+            break;
+          } catch {}
         }
-        expect(content).toBe(diskContent);
+        // The completeness test above pins the file existing; here we only
+        // compare content parity.
+        expect(diskContent).toBeDefined();
+        expect(content).toBe(diskContent as string);
       }
     });
 

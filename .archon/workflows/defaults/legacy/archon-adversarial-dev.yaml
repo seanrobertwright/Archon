@@ -344,3 +344,7 @@ nodes:
       Write this report to `$ARTIFACTS_DIR/report.md` AND output it as your response so the user
       sees it directly.
     allowed_tools: [Read, Write, Glob, Grep]
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.

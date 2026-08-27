@@ -61,6 +61,7 @@ import {
   WorkflowMissingInputsError,
 } from '@archon/workflows/utils/workflow-requirements';
 import { WorkflowInputContractError } from '@archon/workflows/workflow-inputs';
+import { formatDeprecationNotice } from '@archon/workflows/deprecation';
 import type {
   WorkflowDefinition,
   WorkflowWithSource,
@@ -1025,6 +1026,23 @@ async function dispatchOrchestratorWorkflowOwned(
       getLog().warn(
         { err: toError(error), conversationId, workflowName: workflow.name },
         'workflow.parse_warning_delivery_failed'
+      );
+    }
+  }
+
+  // Deprecated bundled default (#2781). Same reach as the parse warnings above:
+  // every chat and console run funnels through here, before any background split,
+  // so the removal notice lands on each surface the run reports to. Derived from
+  // the definition itself — a copied override in project/global `.archon`
+  // (same filename) drops the marker and the notice with it. Best-effort.
+  const deprecationNotice = formatDeprecationNotice(workflow);
+  if (deprecationNotice) {
+    try {
+      await platform.sendMessage(conversationId, deprecationNotice);
+    } catch (error) {
+      getLog().warn(
+        { err: toError(error), conversationId, workflowName: workflow.name },
+        'workflow.deprecation_notice_delivery_failed'
       );
     }
   }

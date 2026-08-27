@@ -19144,13 +19144,21 @@ describe('bundled opus nodes -- provider annotation invariant (#1610)', () => {
     // import.meta.dir = packages/workflows/src → go up 3 levels to repo root → .archon/workflows/defaults
     const repoRoot = join(import.meta.dir, '..', '..', '..');
     const defaultsDir = join(repoRoot, '.archon', 'workflows', 'defaults');
+    // The invariant covers the legacy deprecation-window folder too (#2781).
+    const dirs = [defaultsDir, join(defaultsDir, 'legacy')];
 
     const { readdir, readFile: readFileFs } = await import('fs/promises');
-    const files = (await readdir(defaultsDir)).filter(f => f.endsWith('.yaml'));
+    const files: { dir: string; file: string }[] = [];
+    for (const dir of dirs) {
+      if (!(await readdir(dir).catch(() => null))) continue;
+      for (const f of await readdir(dir)) {
+        if (f.endsWith('.yaml')) files.push({ dir, file: f });
+      }
+    }
     expect(files.length).toBeGreaterThan(0);
 
-    for (const file of files) {
-      const src = await readFileFs(join(defaultsDir, file), 'utf-8');
+    for (const { dir, file } of files) {
+      const src = await readFileFs(join(dir, file), 'utf-8');
       const result = parseWorkflow(src, file);
       if (!('workflow' in result)) continue; // skip load errors
 

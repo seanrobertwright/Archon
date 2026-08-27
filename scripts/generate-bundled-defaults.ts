@@ -266,6 +266,11 @@ async function collectPackagedDefaults(root: string): Promise<PackagedDefaults> 
   for (const pack of (await readdir(root)).sort((a, b) => a.localeCompare(b))) {
     const packPath = join(root, pack);
     if (!(await isDirectory(packPath))) continue;
+    // `defaults` is the flat-bundled-defaults convention, not a pack — including
+    // its `legacy/` subfolder during the #2781 deprecation window. It is scanned
+    // separately via collectFiles; treating it as a pack would fail here with
+    // "must contain exactly one .yaml" for every legacy default.
+    if (pack === 'defaults') continue;
     if (!isValidWorkflowFolderSegment(pack)) {
       throw new Error(`Invalid packaged workflow pack directory "${pack}".`);
     }
@@ -396,7 +401,8 @@ function renderFile(
     ' *',
     ' * Source of truth:',
     ' *   .archon/commands/defaults/*.md (legacy)',
-    ' *   .archon/workflows/defaults/*.{yaml,yml} (legacy)',
+    ' *   .archon/workflows/defaults/*.{yaml,yml} (current)',
+    ' *   .archon/workflows/defaults/legacy/*.{yaml,yml} (deprecated window)',
     ' *   .archon/workflows/<pack>/<workflow>/',
     ' *',
     ' * Contents are inlined as plain string literals (JSON-escaped) so this',
@@ -455,14 +461,34 @@ async function main(): Promise<void> {
     ),
   ]);
 
-  const [legacyCommands, legacyWorkflows, packaged] = await Promise.all([
+  const [legacyCommands, packaged] = await Promise.all([
     collectFiles(COMMANDS_DIR, ['.md']),
-    collectFiles(WORKFLOWS_DIR, ['.yaml', '.yml']),
     collectPackagedDefaults(WORKFLOWS_ROOT),
   ]);
+  // Legacy defaults live flat in `defaults/` and — since #2781's deprecation
+  // window — under `defaults/legacy/`, one subfolder within the discovery depth
+  // cap. The test fixtures built by generate-bundled-defaults.test.ts predate
+  // the folder, so its absence is tolerated.
+  const legacyWorkflows = [
+    ...(await collectFiles(WORKFLOWS_DIR, ['.yaml', '.yml'])),
+    ...((await isDirectory(join(WORKFLOWS_DIR, 'legacy')))
+      ? await collectFiles(join(WORKFLOWS_DIR, 'legacy'), ['.yaml', '.yml'])
+      : []),
+  ];
   await assertTrackedPackagedFiles(packaged.sourcePaths);
 
-  const legacyWorkflowNames = new Set(legacyWorkflows.map(workflow => workflow.name));
+  // collectFiles only sees one directory at a time, so a name present in both
+  // the flat defaults/ and defaults/legacy/ would slip through as a duplicate
+  // bundle entry. Catch it here, plus the pre-existing packaged collision below.
+  const legacyWorkflowNames = new Set<string>();
+  for (const workflow of legacyWorkflows) {
+    if (legacyWorkflowNames.has(workflow.name)) {
+      throw new Error(
+        `Bundled workflow filename collision: "${workflow.name}" exists in both .archon/workflows/defaults/ and its legacy/ subfolder.`
+      );
+    }
+    legacyWorkflowNames.add(workflow.name);
+  }
   for (const workflow of packaged.workflows) {
     if (legacyWorkflowNames.has(workflow.name)) {
       throw new Error(

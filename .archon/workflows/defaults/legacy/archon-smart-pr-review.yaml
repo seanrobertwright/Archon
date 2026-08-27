@@ -138,3 +138,7 @@ nodes:
       - title: "PR Review Complete"
       - message: 1-2 sentence summary — verdict and issue count. Short enough for a lock screen.
       - priority: 3 if ready to merge, 4 if needs fixes, 5 if critical issues remain
+
+# Deprecated legacy default (#2781): announce removal in the run-start notice during this window.
+deprecated:
+  message: Switch to the sdlc pack instead.

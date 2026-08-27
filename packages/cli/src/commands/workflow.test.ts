@@ -1944,6 +1944,62 @@ describe('workflowRunCommand', () => {
     }
   });
 
+  // #2781 — the deprecation notice rides the same stderr channel as the parse
+  // warnings above, with the same --json-purity rationale.
+  it('warns on stderr about a deprecated workflow', async () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+      (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        workflows: [
+          makeTestWorkflowWithSource({
+            name: 'assist',
+            deprecated: { message: 'Switch to the sdlc pack instead.' },
+          }),
+        ],
+        errors: [],
+      });
+
+      try {
+        await workflowRunCommand('/repo/root', 'assist', 'hello', { noWorktree: true });
+      } catch {
+        // Downstream failure is acceptable; this test only checks the notice.
+      }
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        '⚠️ `assist` is deprecated and will be removed in an upcoming release. ' +
+          'Switch to the sdlc pack instead. ' +
+          'To keep using this workflow after removal, copy the workflow file into your project ' +
+          '`.archon/workflows/` or your global `~/.archon/workflows/`.'
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('stays silent when the resolved workflow is not deprecated', async () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+      (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' }, 'project')],
+        errors: [],
+      });
+
+      try {
+        await workflowRunCommand('/repo/root', 'assist', 'hello', { noWorktree: true });
+      } catch {
+        // Downstream failure is acceptable; this test only checks silence.
+      }
+
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('will be removed in an upcoming release')
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it('does not print discovery diagnostic in quiet mode', async () => {
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
