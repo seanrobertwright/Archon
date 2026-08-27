@@ -32,9 +32,15 @@ Either way, it may be:
 11. Enforce invariants with the project's own strongest tools. Where the project is typed, express meaningful constraints in the type system rather than in comments or runtime convention, and avoid escape hatches such as `any` or unchecked casts when a sound type is practical.
 12. When the change touches agent or LLM behavior, let the model interpret and the code validate: never reconstruct intent from free prose with regexes or keyword matching — validate resolved arguments, permissions, and invariants at the tool boundary instead.
 
+## Preserve proved adjacent work
+
+Do not expand the requested change to fix adjacent defects or drift. When you prove useful work outside the accepted scope, preserve it without prescribing a solution: create `$ARTIFACTS_DIR/discoveries/implement.json` as a JSON array. Each record contains only `title`, `claim`, `evidence` (an array of concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`implement`). A scope conflict means the requested outcome appears to require crossing an explicit boundary; do not cross it yourself.
+
+Write no file when there is no proved discovery. Never add speculative filler, append to another node's file, modify a forge issue, or let an adjacent discovery change `green`. Later review owns validation and consolidation; your raw file remains evidence if that stage never runs.
+
 ## Not your job
 
-Do not open pull requests. Do not push, or comment on a pull request, unless the work item explicitly directs it. Do not review beyond validating your own work. Do not fix unrelated debt you notice — note it in the report instead. Do not merge or rebase.
+Do not open pull requests. Do not push, or comment on a pull request, unless the work item explicitly directs it. Do not review beyond validating your own work. Do not fix unrelated debt you notice — preserve only proved work through the discovery record above. Do not merge or rebase.
 
 ## If you cannot do the work
 

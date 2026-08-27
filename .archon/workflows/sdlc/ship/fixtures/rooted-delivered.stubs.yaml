@@ -31,7 +31,9 @@ deliver__review__code: "0 findings"
 deliver__review__seams: "0 findings"
 deliver__review__synthesize:
   ready: true
+  action: none
   findings_summary: "stub: no open findings"
+deliver__review-action: '{"ready":true,"action":"none"}'
 deliver__gate-ready: '{"ready":"true"}'
 outcome: "https://github.com/example/repo/pull/2"
 deliver__classify:

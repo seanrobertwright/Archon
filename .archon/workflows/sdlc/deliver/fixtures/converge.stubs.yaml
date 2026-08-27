@@ -15,6 +15,7 @@ review__code: "2 findings (Important)"
 review__seams: "0 findings"
 review__synthesize:
   ready: false
+  action: correct
   findings_summary: "stub: 3 Important findings open"
 fix__record-start: '{"start":"recorded"}'
 fix__implement:
@@ -28,6 +29,7 @@ recheck__code: "prior findings fixed; 0 new"
 recheck__seams: "0 findings"
 recheck__synthesize:
   ready: true
+  action: none
   findings_summary: "stub: no open Critical/Important"
 # gate-ready is deliberately unstubbed: under --exec-code the real script runs,
 # proving the $corrections.output whole-ref binding on a completed loop_group.

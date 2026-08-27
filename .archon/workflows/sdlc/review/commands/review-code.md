@@ -15,6 +15,8 @@ Every finding needs: the changed line that causes it, the reachable path (caller
 
 Leave the diff far enough to understand the changed behavior: read full changed files, direct callers, consumers, and tests — at most two hops from changed lines. Read the repo's steering files before judging rule violations. Do not audit unrelated code; a pre-existing defect is reportable only if this change makes it reachable, worsens it, or claims to fix it without doing so.
 
+The two-hop bound governs ordinary search. Once one concrete defect proves that a member of a finite class violates the same invariant, enumerate that class with a deterministic repository search and finish it before reporting. Emit one causal finding with the invariant, discovery method, all affected members, and all examined-clean members. Do not use class completion to start an unrelated audit.
+
 When execution is practical, run the smallest command that can falsify a finding. A passing broad suite is not proof an untested path is correct.
 
 ## Not yours
@@ -31,5 +33,7 @@ There is no third level from this lens — anything weaker is silence.
 ## Output
 
 Write `$ARTIFACTS_DIR/review/code.md`: each finding with severity, the evidence fields above, and `file:line` references; then an "examined and clean" list naming the specific contracts or callers that cleared the suspicious spots; in light mode, a verdict per prior finding (still open / fixed at `<sha>` / disproved, with evidence). If there are no findings, say so and name what was decisively checked — never claim the whole change is correct.
+
+If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-code.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`code`). Write no file for no discovery; never append to another lens's file or record suspicion.
 
 Verify the file exists and every `file:line` in it is real, then reply with one line: findings count by severity.

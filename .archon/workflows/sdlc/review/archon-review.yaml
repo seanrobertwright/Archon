@@ -29,6 +29,12 @@ inputs:
       Path to the previous review round's report. When set, this round verifies
       prior findings first and reviews only the delta since the report's recorded
       head SHA.
+  work_order:
+    default: ""
+    description: >-
+      The accepted outcome and scope boundaries for this change. Delivery passes
+      the same work order implementation received. Standalone review may leave
+      this empty and use the PR's problem, outcome, and explicit scope instead.
   tests:
     default: false
     description: Run the test-coverage lens.
@@ -156,6 +162,9 @@ nodes:
       properties:
         ready:
           type: boolean
+        action:
+          type: string
+          enum: [none, correct, replan]
         findings_summary:
           type: string
-      required: [ready, findings_summary]
+      required: [ready, action, findings_summary]
