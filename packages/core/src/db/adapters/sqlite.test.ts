@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from 'bun:test';
 import { SqliteAdapter } from './sqlite';
 import { getSchemaSQL } from '../bundled-schema';
 import { APP_VERSION, readSchemaVersion } from '../schema-version';
-import { Database } from 'bun:sqlite';
+import { Database, type Statement } from 'bun:sqlite';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 
@@ -1077,3 +1077,72 @@ function raw_query(dbPath: string, sql: string): unknown[] {
     raw.close();
   }
 }
+
+describe('SqliteAdapter native-resource finalization (#2875)', () => {
+  let adapter: SqliteAdapter | undefined;
+
+  afterEach(async () => {
+    if (adapter) {
+      await adapter.close();
+      adapter = undefined;
+    }
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        unlinkSync(currentDbPath + suffix);
+      } catch {
+        /* may not exist */
+      }
+    }
+  });
+
+  test('finalizes every statement it prepares by the time close() resolves', async () => {
+    const originalPrepare = Database.prototype.prepare;
+    let prepared = 0;
+    let finalized = 0;
+    Database.prototype.prepare = function (
+      this: Database,
+      ...args: Parameters<typeof originalPrepare>
+    ) {
+      const stmt = originalPrepare.apply(this, args) as Statement & {
+        finalize: () => unknown;
+      };
+      prepared++;
+      const nativeFinalize = stmt.finalize.bind(stmt);
+      stmt.finalize = () => {
+        finalized++;
+        return nativeFinalize();
+      };
+      return stmt;
+    };
+
+    try {
+      adapter = createTestDb();
+      await insertCodebase(adapter, 'cb-finalize');
+      await adapter.query('SELECT id FROM remote_agent_codebases WHERE id = $1', ['cb-finalize']);
+
+      // A statement that prepares cleanly but fails on execution (primary key
+      // violation) must still be finalized (this is the finally-branch of the fix).
+      await expect(insertCodebase(adapter, 'cb-finalize')).rejects.toThrow();
+
+      await adapter.close();
+      adapter = undefined;
+
+      expect(prepared).toBeGreaterThan(0);
+      expect(finalized).toBe(prepared);
+    } finally {
+      Database.prototype.prepare = originalPrepare;
+    }
+  });
+
+  test('close() leaves the database file immediately deletable', async () => {
+    adapter = createTestDb();
+    await insertCodebase(adapter, 'cb-delete');
+    await adapter.query('SELECT id FROM remote_agent_codebases WHERE id = $1', ['cb-delete']);
+    await adapter.close();
+    adapter = undefined;
+
+    // Passes trivially where POSIX unlink tolerates open handles, but on
+    // windows-latest this fails with EBUSY while any statement is unfinalized.
+    unlinkSync(currentDbPath);
+  });
+});
