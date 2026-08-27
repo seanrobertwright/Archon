@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import * as realPaths from '@archon/paths';
+import { removeTempTree } from '@archon/paths/test-utils';
 
 const bundledName = '__archon_pack__bundled:video-pack:render::hello';
 
@@ -41,7 +42,7 @@ describe('bundled packaged script materialization (#2527)', () => {
   afterEach(async () => {
     if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
     else process.env.ARCHON_HOME = originalArchonHome;
-    await rm(root, { recursive: true, force: true });
+    await removeTempTree(root);
   });
 
   it('writes embedded content to a stable file and executes it', async () => {

@@ -34,7 +34,8 @@
  * reach for the timeout.
  */
 import { describe, test, expect } from 'bun:test';
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'fs/promises';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 
@@ -53,12 +54,11 @@ interface Sandbox {
 /**
  * Create a sandbox, run `body`, and always tear down.
  *
- * `maxRetries` covers the Windows case where a just-exited child still holds a
- * handle inside the sandbox: node's `rm` retries on EBUSY, EMFILE, ENFILE,
- * ENOTEMPTY and EPERM, which covers what this hits. On PR #2513 an unretried `rm`
- * threw `EBUSY … archon-migrate-dhOLl3` from teardown and failed the check. A leaked
- * temp directory is not a test failure, so a final failure warns instead of
- * throwing — but it does warn, so a genuine leak stays visible.
+ * Teardown has to survive the Windows case where a just-exited child still holds a
+ * handle inside the sandbox: on PR #2513 an unretried `rm` threw
+ * `EBUSY … archon-migrate-dhOLl3` and failed the check. `removeTempTree` owns that
+ * retry — and owns it explicitly, because passing `maxRetries` to `rm` does nothing
+ * under Bun (#2306). This docblock used to claim that option was the fix.
  */
 async function withSandbox(body: (ctx: Sandbox) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'archon-migrate-'));
@@ -77,11 +77,7 @@ async function withSandbox(body: (ctx: Sandbox) => Promise<void>): Promise<void>
   try {
     await body(ctx);
   } finally {
-    try {
-      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    } catch (error) {
-      console.warn(`sandbox cleanup failed for ${root}: ${(error as Error).message}`);
-    }
+    await removeTempTree(root);
   }
 }
 

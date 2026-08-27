@@ -9,8 +9,9 @@ import { Database } from 'bun:sqlite';
 import { parseArgs } from 'util';
 import { cliArgOptions } from './args';
 import * as git from '@archon/git';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -149,7 +150,7 @@ describe('workflow run config argument', () => {
     expect(message).toContain('--config can only be used with workflow run');
   });
 
-  it('resolves a relative config path from the requested subdirectory cwd', () => {
+  it('resolves a relative config path from the requested subdirectory cwd', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'archon-cli-config-cwd-'));
     const subdir = join(repo, 'bench');
     mkdirSync(subdir, { recursive: true });
@@ -166,11 +167,11 @@ describe('workflow run config argument', () => {
       expect(result.stderr).toContain("Run config key 'paths' cannot apply");
       expect(result.stderr).not.toContain('Unable to read run config');
     } finally {
-      rmSync(repo, { recursive: true, force: true });
+      await removeTempTree(repo);
     }
   });
 
-  it('keeps a detached config handoff outside repo env overrides', () => {
+  it('keeps a detached config handoff outside repo env overrides', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'archon-cli-detached-config-'));
     const archonHome = join(repo, 'archon-home');
     mkdirSync(join(repo, '.archon'), { recursive: true });
@@ -233,11 +234,11 @@ describe('workflow run config argument', () => {
       expect(result.stderr).not.toContain('could not be decrypted');
       expect(result.stderr).toContain('--resume and --config are mutually exclusive');
     } finally {
-      rmSync(repo, { recursive: true, force: true });
+      await removeTempTree(repo);
     }
   });
 
-  it('keeps a detached Docker install classified through target env loading', () => {
+  it('keeps a detached Docker install classified through target env loading', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'archon-cli-detached-docker-'));
     mkdirSync(join(repo, '.archon'), { recursive: true });
     writeFileSync(
@@ -305,7 +306,7 @@ describe('workflow run config argument', () => {
         },
       });
     } finally {
-      rmSync(repo, { recursive: true, force: true });
+      await removeTempTree(repo);
     }
   });
 
@@ -383,7 +384,7 @@ describe('workflow get arguments', () => {
 });
 
 describe('CLI workflow event dispatch', () => {
-  it('resolves a run prefix using the registered effective cwd', () => {
+  it('resolves a run prefix using the registered effective cwd', async () => {
     const scratch = mkdtempSync(join(tmpdir(), 'archon-cli-event-'));
     const archonHome = join(scratch, 'home');
     const repoDir = join(scratch, 'repo');
@@ -466,7 +467,7 @@ describe('CLI workflow event dispatch', () => {
         verify.close();
       }
     } finally {
-      rmSync(scratch, { recursive: true, force: true });
+      await removeTempTree(scratch);
     }
   }, 30_000);
 });

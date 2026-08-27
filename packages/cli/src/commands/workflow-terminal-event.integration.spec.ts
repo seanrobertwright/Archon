@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { detachedRunControlPath, requestDetachedRunStop } from '../utils/detached-run-control';
 
 const cleanupPaths: string[] = [];
@@ -21,10 +21,7 @@ afterEach(async () => {
   }
   activeRunIds.clear();
   for (const path of cleanupPaths.splice(0)) {
-    // The control endpoint closes after the workflow settles but just before the
-    // detached process finishes its remaining CLI cleanup. Windows can retain an
-    // inherited log or SQLite handle during that short gap.
-    await rm(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempTree(path);
   }
 });
 
@@ -170,7 +167,16 @@ describe('detached workflow terminal database events', () => {
         return run?.status === fixture.status ? run : undefined;
       });
       expect(terminal.id).toBe(created.id);
-      const events = readTerminalEvents(databasePath, terminal.id, fixture.event);
+      // The status row and the terminal-event row are two separate writes, so a terminal
+      // status does not mean the event is visible to a second connection yet — on Windows
+      // that contention surfaced as `SQLiteError: disk I/O error` from a single-shot read
+      // (#2306). Waiting for the row is safe rather than lenient about the count: the
+      // owner's endpoint is already unreachable above, so no further event can be written
+      // after the first one appears.
+      const events = await waitFor(() => {
+        const rows = readTerminalEvents(databasePath, terminal.id, fixture.event);
+        return rows.length > 0 ? rows : undefined;
+      });
       expect(events).toHaveLength(1);
       const data = JSON.parse(events[0]?.data ?? '{}') as Record<string, unknown>;
       if (fixture.status === 'completed') expect(data.duration_ms).toBeNumber();
