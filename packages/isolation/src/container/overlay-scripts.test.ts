@@ -9,10 +9,10 @@
  * dest-symlink traversal. Char-device (0,0) whiteout detection needs `mknod` (root)
  * and is exercised by the live in-container malicious-overlay smoke instead.
  */
-import { afterEach, describe, test, expect } from 'bun:test';
+import { describe, test, expect } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { resolveBashPath } from '@archon/git';
-import { removeTempTree } from '@archon/paths/test-utils';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import {
   mkdtempSync,
   mkdirSync,
@@ -84,25 +84,14 @@ function runScript(
   return { records, stdout, stderr, code };
 }
 
-/**
- * Temp roots awaiting teardown.
- *
- * Cleanup used to be a trailing `rmSync` in each test body, which ran only when every
- * assertion above it passed — so the tests most worth diagnosing were the ones that left
- * their fixture behind. Draining here also gets the removal off each test's own budget,
- * and lets it retry against a bash/tar child that has exited but not yet released its
- * handles (#2306).
- */
-const cleanupRoots: string[] = [];
-
-afterEach(async () => {
-  for (const root of cleanupRoots.splice(0)) await removeTempTree(root);
-});
+// Cleanup used to be a trailing `rmSync` in each test body; the tracker reaps every root
+// even when a test fails first, and retries against a bash/tar child that has exited but
+// not yet released its handles (#2306).
+const trackTempRoot = trackTempRoots();
 
 /** Fresh {upper, dest} pair under a temp root; `data` is the overlay upperdir. */
 function makeDirs(): { root: string; upper: string; dest: string; ws: string } {
-  const root = mkdtempSync(join(tmpdir(), 'overlay-sec-'));
-  cleanupRoots.push(root);
+  const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'overlay-sec-')));
   const upper = join(root, 'upper', 'data');
   const dest = join(root, 'dest');
   mkdirSync(upper, { recursive: true });

@@ -2,7 +2,7 @@
  * Source capture: what a run freezes, and what it must keep resolving after the
  * authoring checkout moves on.
  */
-import { describe, test, expect, afterEach } from 'bun:test';
+import { describe, test, expect } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, rm, readFile, readdir, symlink, stat } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -22,7 +22,7 @@ import { discoverScriptsForCwd } from './script-discovery';
 import { loadCommandPrompt } from './executor-shared';
 import { withCapturedSource } from './executor';
 import type { WorkflowDeps } from './deps';
-import { removeTempTree } from '@archon/paths/test-utils';
+import { trackTempRoots } from '@archon/paths/test-utils';
 
 /** One test's paths. Created by the test, never shared with another. */
 interface Sandbox {
@@ -32,20 +32,18 @@ interface Sandbox {
   readonly runArtifacts: string;
 }
 
-/**
- * Temp roots awaiting teardown.
- *
- * Only `afterEach` reads this. Each test holds its own paths as locals, so an assertion
- * left running by a timed-out test can only ever describe its own sandbox (#2306). These
- * used to be module-level `let` bindings reassigned in `beforeEach`, which let such an
- * orphaned assertion read the NEXT test's paths and report a mutation that never happened.
- */
-const cleanupRoots: string[] = [];
+const trackTempRoot = trackTempRoots();
 
+/**
+ * A temp root owned by one test.
+ *
+ * Each test holds its own paths as locals, so an assertion left running by a timed-out
+ * test can only ever describe its own sandbox (#2306). These used to be module-level
+ * `let` bindings reassigned in `beforeEach`, which let such an orphaned assertion read
+ * the NEXT test's paths and report a mutation that never happened.
+ */
 async function createTempRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'archon-source-'));
-  cleanupRoots.push(root);
-  return root;
+  return trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-source-')));
 }
 
 async function createSandbox(): Promise<Sandbox> {
@@ -95,10 +93,6 @@ const deps = {
   loadConfig: () =>
     Promise.resolve({} as unknown as Awaited<ReturnType<WorkflowDeps['loadConfig']>>),
 } satisfies Pick<WorkflowDeps, 'loadConfig'>;
-
-afterEach(async () => {
-  for (const root of cleanupRoots.splice(0)) await removeTempTree(root);
-});
 
 describe('captureWorkflowSource', () => {
   test('freezes commands and scripts so the target never needs them', async () => {

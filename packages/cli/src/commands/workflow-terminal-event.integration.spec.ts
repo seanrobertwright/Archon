@@ -10,6 +10,10 @@ import { detachedRunControlPath, requestDetachedRunStop } from '../utils/detache
 const cleanupPaths: string[] = [];
 const activeRunIds = new Set<string>();
 
+// Deliberately one explicit hook rather than `trackTempRoots()` from the same module:
+// a still-running owner has to be stopped before its tree can be removed, and splitting
+// that into two `afterEach` hooks would leave the order they were registered in as the
+// only thing keeping it correct.
 afterEach(async () => {
   for (const runId of activeRunIds) {
     try {
@@ -167,12 +171,15 @@ describe('detached workflow terminal database events', () => {
         return run?.status === fixture.status ? run : undefined;
       });
       expect(terminal.id).toBe(created.id);
-      // The status row and the terminal-event row are two separate writes, so a terminal
-      // status does not mean the event is visible to a second connection yet — on Windows
-      // that contention surfaced as `SQLiteError: disk I/O error` from a single-shot read
-      // (#2306). Waiting for the row is safe rather than lenient about the count: the
-      // owner's endpoint is already unreachable above, so no further event can be written
-      // after the first one appears.
+      // Not a write-ordering gap: `completeWorkflowRun` and `failWorkflowRun` write the
+      // status UPDATE and the event INSERT inside one `withTransaction`, so a reader can
+      // never see the terminal status without the event. What retries here is the READ.
+      // Opening a second readonly connection against a database that is still settling
+      // that commit fails outright on Windows — `SQLiteError: disk I/O error` from
+      // `prepare()`, not an empty result (#2306). So this waits out reader-side
+      // contention, and the count stays exact: the event was committed atomically with
+      // the status already observed above, and the owner's endpoint is unreachable, so
+      // nothing can append a second row after the first read succeeds.
       const events = await waitFor(() => {
         const rows = readTerminalEvents(databasePath, terminal.id, fixture.event);
         return rows.length > 0 ? rows : undefined;

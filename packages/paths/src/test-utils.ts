@@ -4,6 +4,7 @@
  * This module is test-only. Nothing in `src/` imports it; it lives here because
  * `@archon/paths` is the one package every consumer of these helpers already depends on.
  */
+import { afterEach } from 'bun:test';
 import { rm } from 'node:fs/promises';
 
 /** Attempts before a stuck tree is reported as a leak rather than retried again. */
@@ -68,4 +69,42 @@ export async function removeTempTree(path: string): Promise<void> {
       await Bun.sleep(RETRY_DELAY_MS);
     }
   }
+}
+
+/**
+ * Track temp roots for teardown, and register the `afterEach` that removes them.
+ *
+ * Call once at module scope and pass every root through the returned function as it is
+ * created:
+ *
+ * ```ts
+ * const trackTempRoot = trackTempRoots();
+ * const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'fixture-')));
+ * ```
+ *
+ * Registering at creation rather than removing at the end of the test body is the point:
+ * a trailing removal runs only when every assertion above it passed, so the tests most
+ * worth diagnosing are exactly the ones that leak their fixture. It also keeps the
+ * removal off the test's own time budget.
+ *
+ * The invariant is "every root this file created gets torn down", and it holds only while
+ * roots are created through one helper that tracks them. A test that calls `mkdtemp`
+ * inline instead leaks silently, so give each file a single creation helper and route
+ * every fixture through it.
+ *
+ * Not for a teardown that has to do something else first — stopping a child process,
+ * closing a database — before the tree can be removed. Splitting that into two hooks
+ * makes correctness depend on their registration order, which nothing states and a later
+ * edit can invert. Keep those files on one explicit `afterEach` that calls
+ * `removeTempTree` in the right sequence.
+ */
+export function trackTempRoots(): (root: string) => string {
+  const roots: string[] = [];
+  afterEach(async () => {
+    for (const root of roots.splice(0)) await removeTempTree(root);
+  });
+  return root => {
+    roots.push(root);
+    return root;
+  };
 }
