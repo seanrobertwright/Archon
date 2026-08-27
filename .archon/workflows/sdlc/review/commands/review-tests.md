@@ -31,4 +31,6 @@ Coverage targets; tests for getters, wiring, or framework behavior; implementati
 
 Write `$ARTIFACTS_DIR/review/tests.md`: each gap with the four evidence parts and `file:line` references, then the examined-and-protected list citing the decisive assertions. In light mode, a verdict per prior finding. No findings is a valid result.
 
+If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-tests.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`tests`). Write no file for no discovery; never append to another lens's file or record suspicion.
+
 Verify every cited `file:line` is real, then reply with one line: findings count by severity.

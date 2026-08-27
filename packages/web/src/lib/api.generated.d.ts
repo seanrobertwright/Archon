@@ -3431,12 +3431,12 @@ export interface components {
       provider?: string;
       model?: string;
       /** @enum {string} */
-      modelReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+      modelReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
       /** @enum {string} */
       webSearchMode?: 'disabled' | 'cached' | 'live';
       interactive?: boolean;
       /** @enum {string} */
-      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
       thinking?:
         | {
             /** @enum {string} */
@@ -3706,7 +3706,7 @@ export interface components {
         };
       };
       /** @enum {string} */
-      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
       thinking?:
         | {
             /** @enum {string} */

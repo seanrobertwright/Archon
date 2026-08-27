@@ -577,14 +577,14 @@ describe('dagNodeSchema — empty bash/prompt', () => {
 // ---------------------------------------------------------------------------
 
 describe('dagNodeSchema — new Claude SDK options', () => {
-  test('parses effort enum on prompt node', () => {
-    const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', effort: 'high' });
+  test('parses the strongest effort rung on a prompt node', () => {
+    const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', effort: 'ultra' });
     expect(result.success).toBe(true);
-    if (result.success) expect((result.data as AgentNode).effort).toBe('high');
+    if (result.success) expect((result.data as AgentNode).effort).toBe('ultra');
   });
 
   test('rejects invalid effort value', () => {
-    const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', effort: 'ultra' });
+    const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', effort: 'extreme' });
     expect(result.success).toBe(false);
   });
 

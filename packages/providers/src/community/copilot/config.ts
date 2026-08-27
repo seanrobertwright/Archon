@@ -41,9 +41,10 @@ export function parseCopilotConfig(raw: Record<string, unknown>): CopilotProvide
   }
 
   // Accept any rung of Archon's shared ladder and clamp it to the SDK's enum
-  // (which has neither `minimal` nor `max`), so `assistants.copilot.*` takes
-  // the same vocabulary a workflow's `effort:` does. Normalizing at parse time
-  // keeps `CopilotProviderDefaults.modelReasoningEffort` SDK-shaped.
+  // (which has neither `minimal` nor `max`/`ultra`), so
+  // `assistants.copilot.*` takes the same vocabulary a workflow's `effort:`
+  // does. Normalizing at parse time keeps
+  // `CopilotProviderDefaults.modelReasoningEffort` SDK-shaped.
   const effort = clampEffort(raw.modelReasoningEffort, COPILOT_EFFORTS);
   if (effort !== undefined) {
     config.modelReasoningEffort = effort;

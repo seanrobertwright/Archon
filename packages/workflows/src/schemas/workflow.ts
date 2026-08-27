@@ -31,7 +31,15 @@ import { jsonValueSchema } from '../output-ref';
  * The last provider-specific effort vocabulary left inside @archon/workflows;
  * it goes away with the field. `effortLevelSchema` in ./dag-node is the live one.
  */
-export const modelReasoningEffortSchema = z.enum(['minimal', 'low', 'medium', 'high', 'xhigh']);
+export const modelReasoningEffortSchema = z.enum([
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+]);
 
 export type ModelReasoningEffort = z.infer<typeof modelReasoningEffortSchema>;
 

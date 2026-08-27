@@ -29,7 +29,7 @@ export interface CodexProviderDefaults {
   /** The Codex SDK's `ModelReasoningEffort`, restated by hand because this file
    *  may not import an SDK. `CODEX_EFFORTS` in ./codex/config.ts pins the same
    *  values to the SDK's own type, so upstream drift fails type-check there. */
-  modelReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  modelReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /** Structurally matches @archon/workflows WebSearchMode */
   webSearchMode?: 'disabled' | 'cached' | 'live';
   additionalDirectories?: string[];

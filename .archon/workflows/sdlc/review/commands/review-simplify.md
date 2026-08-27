@@ -26,4 +26,6 @@ Duplication across a genuine build or ownership boundary; an abstraction that ow
 
 Write `$ARTIFACTS_DIR/review/simplify.md`: each finding with the five parts, what disappears, and the real tradeoff (or "none found"); then the examined-and-already-simple list naming the primitive or invariant that justifies the current shape. In light mode, a verdict per prior finding. One proven structural simplification beats a catalog of cosmetic edits; no findings is a valid result.
 
+If you prove useful work outside scope.md's accepted contract, keep it separate from the review finding. Write `$ARTIFACTS_DIR/discoveries/review-simplify.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`simplify`). Write no file for no discovery; never append to another lens's file or record suspicion.
+
 Verify every cited `file:line` is real, then reply with one line: findings count (all Suggestions).

@@ -117,11 +117,12 @@ describe('normalizeEffortForAgent', () => {
     expect(normalizeEffortForAgent('claude', 'high', PROVIDERS)).toBe('high');
     // Both of these used to be cleared, because each agent had its own enum.
     expect(normalizeEffortForAgent('codex', 'max', PROVIDERS)).toBe('max');
+    expect(normalizeEffortForAgent('codex', 'ultra', PROVIDERS)).toBe('ultra');
     expect(normalizeEffortForAgent('claude', 'minimal', PROVIDERS)).toBe('minimal');
   });
 
   test('clears a value that is not a rung', () => {
-    expect(normalizeEffortForAgent('claude', 'ultra', PROVIDERS)).toBe('');
+    expect(normalizeEffortForAgent('claude', 'extreme', PROVIDERS)).toBe('');
   });
 
   test('clears any value for agents without an effort concept', () => {

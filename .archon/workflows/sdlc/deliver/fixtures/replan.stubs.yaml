@@ -1,0 +1,36 @@
+# A proved scope conflict must not enter correction or reach validation. The
+# real verdict validator accepts the combination; the real ready gate fails
+# truthfully and leaves the draft PR plus canonical report intact.
+impl__record-start: '{"start":"recorded"}'
+impl__implement:
+  done: true
+  green: true
+  summary: "stub: implemented inside the accepted contract"
+impl__assert-changed: "2 files changed"
+gate-green: '{"gate":"green"}'
+pr__pr: "https://github.com/example/repo/pull/3 (draft)"
+classify:
+  tests: false
+  errors: false
+  comments: false
+  types: false
+  docs: false
+  reasons:
+    tests: "stub: no test changes"
+    errors: "stub: no failure paths"
+    comments: "stub: no prose changes"
+    types: "stub: no type changes"
+    docs: "stub: no docs changes"
+resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+review__scope: "accepted contract and scope conflict recorded"
+review__code: "1 Important scope conflict"
+review__seams: "0 findings"
+review__simplify: "0 findings (suggestions only)"
+review__synthesize:
+  ready: false
+  action: replan
+  findings_summary: "stub: requested outcome requires crossing an explicit boundary"
+fixture:
+  expect: failed
+  fail-node: gate-ready
+exec-code: true

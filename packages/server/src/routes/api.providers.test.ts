@@ -265,7 +265,7 @@ describe('PATCH /api/config/tiers', () => {
   });
 
   test('invalid effort for the provider → 400, no write (not silently dropped)', async () => {
-    const res = await patch({ large: { provider: 'claude', model: 'opus', effort: 'ultra' } });
+    const res = await patch({ large: { provider: 'claude', model: 'opus', effort: 'extreme' } });
     expect(res.status).toBe(400);
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
@@ -340,7 +340,7 @@ describe('PATCH /api/config/aliases', () => {
   });
 
   test('invalid effort for the provider → 400, no write', async () => {
-    const res = await patch({ '@fast': { provider: 'claude', model: 'haiku', effort: 'ultra' } });
+    const res = await patch({ '@fast': { provider: 'claude', model: 'haiku', effort: 'extreme' } });
     expect(res.status).toBe(400);
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });

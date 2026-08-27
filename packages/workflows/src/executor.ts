@@ -1226,7 +1226,7 @@ async function runChildWorkflow(
     // so a run can author a workflow mid-flight and then execute it as a governed
     // child run; a load-time check would compile, pass every existing test, and
     // silently delete that capability. Recorded in the constitution's case-law
-    // table (reference/workflow-language-constitution.md) and locked by
+    // table (.archon/workflow-language-constitution.md) and locked by
     // `describe('workflow: late resolution is a deliberate affordance')` in
     // subrun.test.ts.
     const { workflows } = await discoverWorkflowsWithConfig(

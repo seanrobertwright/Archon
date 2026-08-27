@@ -27,9 +27,9 @@ import { clampEffort, type AssertNever } from '../../shared/effort';
 // ─── Thinking level ────────────────────────────────────────────────────────
 
 /**
- * Pi's `ThinkingLevel` is Archon's ladder exactly — all six rungs, `max`
- * included — so every rung passes through unclamped. The `off` sentinel is
- * handled by the caller, before this runs.
+ * Pi's `ThinkingLevel` spans the shared ladder through `max`; the Codex-native
+ * `ultra` rung clamps to `max`. The `off` sentinel is handled by the caller,
+ * before this runs.
  *
  * `satisfies` alone would not have caught the omission this list previously
  * carried: it proves every element IS a `ThinkingLevel` (containment), not that
@@ -93,16 +93,16 @@ export function resolvePiThinkingLevel(nodeConfig?: NodeConfig): ResolvedThinkin
     return {
       level: undefined,
       warning:
-        'Pi ignored `thinking` (object form is Claude-specific). Use `effort: minimal|low|medium|high|xhigh|max` in YAML — Pi accepts every rung natively.',
+        'Pi ignored `thinking` (object form is Claude-specific). Use `effort: minimal|low|medium|high|xhigh|max|ultra` in YAML — Pi accepts through max natively and maps ultra to max.',
     };
   }
 
-  // String that isn't a known level (e.g. 'ultra') — warn so users fix it.
+  // String that isn't a known level — warn so users fix it.
   if (typeof thinking === 'string' || typeof effort === 'string') {
     const offender = typeof thinking === 'string' ? thinking : effort;
     return {
       level: undefined,
-      warning: `Pi ignored unknown thinking level '${String(offender)}'. Valid: minimal, low, medium, high, xhigh, max, off.`,
+      warning: `Pi ignored unknown thinking level '${String(offender)}'. Valid: minimal, low, medium, high, xhigh, max, ultra, off.`,
     };
   }
 

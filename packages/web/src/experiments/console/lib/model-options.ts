@@ -110,14 +110,30 @@ export function curatedOptionsForAgent(agentId: string): readonly ModelOption[] 
 // ---------------------------------------------------------------------------
 
 /** Mirrors `effortLevelSchema` in packages/workflows/src/schemas/dag-node.ts. */
-export const EFFORT_OPTIONS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const EFFORT_OPTIONS = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+] as const;
 
 export type EffortOption = (typeof EFFORT_OPTIONS)[number];
 
 /** The rungs `assistants.codex.modelReasoningEffort` accepts — the Codex SDK's
  *  own enum, which is NOT the shared ladder: that config key is unchanged by
  *  #2556 and keeps its vendor vocabulary. */
-export const CODEX_CONFIG_EFFORT_OPTIONS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+export const CODEX_CONFIG_EFFORT_OPTIONS = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+] as const;
 
 /**
  * The effort vocabulary an agent's tier/alias `effort` accepts, or null when the

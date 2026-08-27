@@ -37,6 +37,7 @@ const {
   listWorkflowEventsSince,
   createWorkflowEvent,
   listWorkflowEvents,
+  listRecentEvents,
   persistWorkflowEventIfRunning,
 } = await import('./workflow-events');
 const { cancelWorkflowRun } = await import('./workflows');
@@ -181,6 +182,24 @@ describe('listWorkflowEventsSince — real SQLite (catches the C1 datetime misma
   test('a future cursor returns nothing (comparison direction is correct)', async () => {
     const rows = await listWorkflowEventsSince(new Date(Date.now() + 60_000), 100);
     expect(rows).toHaveLength(0);
+  });
+
+  test('listRecentEvents returns same-day SQLite events (dialect-aware since cursor)', async () => {
+    const id = 'recent-same-day';
+    await db.query(
+      `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_name, data, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, 'run-1', 'node_started', 'recent', '{}', '2026-01-01 00:00:30']
+    );
+
+    // An ISO param ("…T…Z") sorts ABOVE the stored "YYYY-MM-DD HH:MM:SS" shape
+    // (T > space), so every same-day event was silently dropped before the
+    // cursor switched to the dialect-aware conversion.
+    const rows = await listRecentEvents('run-1', new Date('2026-01-01T00:00:00.000Z'));
+    expect(rows.map(r => r.id)).toContain(id);
+
+    const none = await listRecentEvents('run-1', new Date(Date.now() + 60_000));
+    expect(none).toHaveLength(0);
   });
 
   test('malformed data degrades to {} instead of throwing the whole batch (I2)', async () => {

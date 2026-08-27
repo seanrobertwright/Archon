@@ -12,6 +12,7 @@ import {
   formatPackagedResourceReference,
   parsePackagedResourceReference,
 } from '../packaged-workflow';
+import { parseWorkflow } from '../loader';
 
 // Resolve the on-disk defaults directories relative to this test file so the
 // tests work regardless of cwd. From packages/workflows/src/defaults go up
@@ -186,6 +187,31 @@ describe('bundled-defaults', () => {
       const content = BUNDLED_COMMANDS['archon-create-pr'];
       expect(content).toContain('echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"');
     });
+
+    it('the SDLC implementation and every review lens own separate discovery records', () => {
+      const expected = new Map([
+        ['__archon_pack__bundled:sdlc:implement::implement', 'discoveries/implement.json'],
+        ['__archon_pack__bundled:sdlc:review::review-code', 'discoveries/review-code.json'],
+        ['__archon_pack__bundled:sdlc:review::review-seams', 'discoveries/review-seams.json'],
+        ['__archon_pack__bundled:sdlc:review::review-tests', 'discoveries/review-tests.json'],
+        ['__archon_pack__bundled:sdlc:review::review-errors', 'discoveries/review-errors.json'],
+        ['__archon_pack__bundled:sdlc:review::review-comments', 'discoveries/review-comments.json'],
+        ['__archon_pack__bundled:sdlc:review::review-types', 'discoveries/review-types.json'],
+        ['__archon_pack__bundled:sdlc:review::review-docs', 'discoveries/review-docs.json'],
+        ['__archon_pack__bundled:sdlc:review::review-simplify', 'discoveries/review-simplify.json'],
+      ]);
+
+      for (const [key, path] of expected) {
+        expect(BUNDLED_COMMANDS[key]).toContain(path);
+        expect(BUNDLED_COMMANDS[key]).toContain('scope_conflict');
+        expect(BUNDLED_COMMANDS[key]).toContain('Write no file');
+      }
+
+      const synthesize = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-synthesize'];
+      expect(synthesize).toContain('$ARTIFACTS_DIR/discoveries.json');
+      expect(synthesize).toContain('$ARTIFACTS_DIR/discoveries.md');
+      expect(synthesize).toContain('an `adjacent` record never affects readiness');
+    });
   });
 
   describe('BUNDLED_WORKFLOWS', () => {
@@ -211,6 +237,90 @@ describe('bundled-defaults', () => {
         'sed "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/" "$ARTIFACTS/state.json" > "$STATE_TMP"'
       );
       expect(content).not.toContain('sed -i "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/"');
+    });
+
+    it('archon-deliver preserves the classifier bindings that gate optional review spend', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+
+      const resolveScope = parsed.workflow.nodes.find(node => node.id === 'resolve-scope');
+      expect(resolveScope).toBeDefined();
+      expect(resolveScope?.kind).toBe('exec');
+      if (resolveScope?.kind !== 'exec') throw new Error('resolve-scope is not executable');
+      expect(resolveScope.runtime).toBe('uv');
+      expect(resolveScope.script).toBe('resolve-review-scope');
+      expect(resolveScope.with).toEqual({
+        c_tests: '$classify.output.tests',
+        c_errors: '$classify.output.errors',
+        c_comments: '$classify.output.comments',
+        c_types: '$classify.output.types',
+        c_docs: '$classify.output.docs',
+      });
+
+      const review = parsed.workflow.nodes.find(node => node.id === 'review');
+      expect(review?.kind).toBe('include');
+      if (review?.kind !== 'include') throw new Error('review is not an include');
+      expect(review.with).toMatchObject({
+        work_order: '$INPUTS.work',
+        tests: '$resolve-scope.output.tests',
+        errors: '$resolve-scope.output.errors',
+        comments: '$resolve-scope.output.comments',
+        types: '$resolve-scope.output.types',
+        docs: '$resolve-scope.output.docs',
+      });
+    });
+
+    it('archon-deliver validates review action before correction and carries the work order into recheck', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+
+      const reviewAction = parsed.workflow.nodes.find(node => node.id === 'review-action');
+      expect(reviewAction?.kind).toBe('exec');
+      if (reviewAction?.kind !== 'exec') throw new Error('review-action is not executable');
+      expect(reviewAction.script).toBe('validate-review-action');
+      expect(reviewAction.with).toEqual({
+        ready: '$review.output.ready',
+        action: '$review.output.action',
+      });
+
+      const corrections = parsed.workflow.nodes.find(node => node.id === 'corrections');
+      expect(corrections?.kind).toBe('loop_group');
+      if (corrections?.kind !== 'loop_group') throw new Error('corrections is not a loop group');
+      expect(corrections.when).toBe("$review-action.output.action == 'correct'");
+      expect(corrections.loop_group.until_bash).toContain(
+        '$recheck-action.output.action != "correct"'
+      );
+
+      const recheck = corrections.loop_group.nodes.find(node => node.id === 'recheck');
+      expect(recheck?.kind).toBe('include');
+      if (recheck?.kind !== 'include') throw new Error('recheck is not an include');
+      expect(recheck.with).toMatchObject({ work_order: '$INPUTS.work' });
+
+      const gateReady = parsed.workflow.nodes.find(node => node.id === 'gate-ready');
+      expect(gateReady?.kind).toBe('exec');
+      if (gateReady?.kind !== 'exec') throw new Error('gate-ready is not executable');
+      expect(gateReady.with).toEqual({
+        review_ready: { from: '$review-action.output.ready', if_skipped: false },
+        review_action: { from: '$review-action.output.action', if_skipped: null },
+        correction_ready: { from: '$corrections.output.ready', if_skipped: false },
+        correction_action: { from: '$corrections.output.action', if_skipped: null },
+      });
+    });
+
+    it('archon-review exposes the three-way action contract', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-review'], 'archon-review.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+
+      expect(parsed.workflow.inputs?.work_order?.default).toBe('');
+      const synthesize = parsed.workflow.nodes.find(node => node.id === 'synthesize');
+      expect(synthesize?.kind).toBe('agent');
+      if (synthesize?.kind !== 'agent') throw new Error('synthesize is not an agent');
+      expect(synthesize.output_format).toMatchObject({
+        properties: {
+          action: { type: 'string', enum: ['none', 'correct', 'replan'] },
+        },
+        required: expect.arrayContaining(['action']),
+      });
     });
 
     it('should have valid YAML structure', () => {

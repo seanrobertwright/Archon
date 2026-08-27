@@ -1128,7 +1128,7 @@ describe('CodexProvider', () => {
       for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
         model: 'gpt-5.6-sol',
         assistantConfig: {
-          modelReasoningEffort: 'medium',
+          modelReasoningEffort: 'ultra',
           webSearchMode: 'live',
           additionalDirectories: ['/other/repo'],
         },
@@ -1139,7 +1139,7 @@ describe('CodexProvider', () => {
       expect(mockStartThread).toHaveBeenCalledWith(
         expect.objectContaining({
           model: 'gpt-5.6-sol',
-          modelReasoningEffort: 'medium',
+          modelReasoningEffort: 'ultra',
           webSearchMode: 'live',
           additionalDirectories: ['/other/repo'],
         })
@@ -1187,23 +1187,27 @@ describe('CodexProvider', () => {
       );
     });
 
-    test('clamps `effort: max` to the SDK top rung, and falls back to config for a non-rung', async () => {
-      mockRunStreamed.mockResolvedValue({
-        events: (async function* () {
-          yield { type: 'turn.completed', usage: defaultUsage };
-        })(),
-      });
+    test.each(['max', 'ultra'] as const)(
+      'passes `effort: %s` to the SDK natively',
+      async effort => {
+        mockRunStreamed.mockResolvedValue({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
 
-      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
-        nodeConfig: { nodeId: 'n1', effort: 'max' },
-      })) {
-        // consume
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          nodeConfig: { nodeId: 'n1', effort },
+        })) {
+          // consume
+        }
+        expect(mockStartThread).toHaveBeenCalledWith(
+          expect.objectContaining({ modelReasoningEffort: effort })
+        );
       }
-      expect(mockStartThread).toHaveBeenCalledWith(
-        expect.objectContaining({ modelReasoningEffort: 'xhigh' })
-      );
+    );
 
-      mockStartThread.mockClear();
+    test('falls back to config for a value outside the shared ladder', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
           yield { type: 'turn.completed', usage: defaultUsage };
