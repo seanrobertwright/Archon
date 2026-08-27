@@ -12,6 +12,7 @@ import {
   formatPackagedResourceReference,
   parsePackagedResourceReference,
 } from '../packaged-workflow';
+import { parseWorkflow } from '../loader';
 
 // Resolve the on-disk defaults directories relative to this test file so the
 // tests work regardless of cwd. From packages/workflows/src/defaults go up
@@ -196,6 +197,36 @@ describe('bundled-defaults', () => {
         'sed "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/" "$ARTIFACTS/state.json" > "$STATE_TMP"'
       );
       expect(content).not.toContain('sed -i "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/"');
+    });
+
+    it('archon-deliver preserves the classifier bindings that gate optional review spend', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+
+      const resolveScope = parsed.workflow.nodes.find(node => node.id === 'resolve-scope');
+      expect(resolveScope).toBeDefined();
+      expect(resolveScope?.kind).toBe('exec');
+      if (resolveScope?.kind !== 'exec') throw new Error('resolve-scope is not executable');
+      expect(resolveScope.runtime).toBe('uv');
+      expect(resolveScope.script).toBe('resolve-review-scope');
+      expect(resolveScope.with).toEqual({
+        c_tests: '$classify.output.tests',
+        c_errors: '$classify.output.errors',
+        c_comments: '$classify.output.comments',
+        c_types: '$classify.output.types',
+        c_docs: '$classify.output.docs',
+      });
+
+      const review = parsed.workflow.nodes.find(node => node.id === 'review');
+      expect(review?.kind).toBe('include');
+      if (review?.kind !== 'include') throw new Error('review is not an include');
+      expect(review.with).toMatchObject({
+        tests: '$resolve-scope.output.tests',
+        errors: '$resolve-scope.output.errors',
+        comments: '$resolve-scope.output.comments',
+        types: '$resolve-scope.output.types',
+        docs: '$resolve-scope.output.docs',
+      });
     });
 
     it('should have valid YAML structure', () => {

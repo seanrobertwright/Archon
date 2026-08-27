@@ -114,20 +114,8 @@ nodes:
   # classifier; 'auto' adopts its judgment. Output values are the strings the
   # lens gates compare against.
   - id: resolve-scope
-    bash: |
-      resolve() {
-        forced="$1"; judged="$2"
-        case "$forced" in
-          true|false) printf '%s' "$forced" ;;
-          *) printf '%s' "$judged" ;;
-        esac
-      }
-      printf '{"tests":"%s","errors":"%s","comments":"%s","types":"%s","docs":"%s"}\n' \
-        "$(resolve "$INPUTS_TESTS" "$INPUTS_C_TESTS")" \
-        "$(resolve "$INPUTS_ERRORS" "$INPUTS_C_ERRORS")" \
-        "$(resolve "$INPUTS_COMMENTS" "$INPUTS_C_COMMENTS")" \
-        "$(resolve "$INPUTS_TYPES" "$INPUTS_C_TYPES")" \
-        "$(resolve "$INPUTS_DOCS" "$INPUTS_C_DOCS")"
+    script: resolve-review-scope
+    runtime: uv
     with:
       c_tests: "$classify.output.tests"
       c_errors: "$classify.output.errors"
