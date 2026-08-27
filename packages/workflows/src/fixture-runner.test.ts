@@ -272,4 +272,47 @@ describe('runFixtures', () => {
     });
     expect(report.passed).toBe(1);
   });
+
+  /** Pack layout like the bundled SDLC pack: `<pack>/<workflow-folder>/fixtures/`. */
+  function writeNestedPackProject(): { cwd: string } {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    for (const folder of ['plan', 'ship']) {
+      const workflowDir = join(cwd, '.archon', 'workflows', 'sdlc', folder);
+      mkdirSync(join(workflowDir, 'fixtures'), { recursive: true });
+      writeFileSync(
+        join(workflowDir, `${folder}-wf.yaml`),
+        `name: ${folder}-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n`
+      );
+      writeFileSync(
+        join(workflowDir, 'fixtures', `${folder}.stubs.yaml`),
+        ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+      );
+    }
+    return { cwd };
+  }
+
+  it('resolves a nested pack by name, workflow folder, and pack directory path', async () => {
+    const { cwd } = writeNestedPackProject();
+    const workflows = [
+      ...workflowsOnDisk(cwd, ['plan-wf'], 'sdlc/plan'),
+      ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+    ];
+    const fixtureLabels = (target: string | undefined) =>
+      runFixtures({ workflows, cwd, ...(target !== undefined ? { target } : {}) }).then(report =>
+        report.results.map(r => r.fixture)
+      );
+
+    const packPath = join(cwd, '.archon', 'workflows', 'sdlc');
+    await expect(fixtureLabels('sdlc')).resolves.toEqual([
+      expect.stringContaining('plan/fixtures/plan.stubs.yaml'),
+      expect.stringContaining('ship/fixtures/ship.stubs.yaml'),
+    ]);
+    await expect(fixtureLabels('ship')).resolves.toEqual([
+      expect.stringContaining('ship/fixtures/ship.stubs.yaml'),
+    ]);
+    await expect(fixtureLabels('.archon/workflows/sdlc')).resolves.toHaveLength(2);
+    await expect(fixtureLabels(packPath)).resolves.toHaveLength(2);
+    await expect(fixtureLabels(undefined)).resolves.toHaveLength(2);
+  });
 });

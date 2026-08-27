@@ -192,9 +192,11 @@ Commands:
                              ('approve'/'reject' are sugar for the dedicated commands)
   workflow search [query]    Search the workflow marketplace
   workflow install <slug>    Install a workflow from the marketplace
-  workflow test [<name>|<pack>]
+  workflow test [<name>|<folder>|<path>]
                              Run declared dry-run fixtures (fixtures/*.stubs.yaml) for a
-                             workflow or pack; never creates a run or contacts a provider
+                             workflow, a workflow folder or pack (by name or directory
+                             path); with no target, runs every fixture. Never creates a
+                             run or contacts a provider
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main

@@ -17,7 +17,7 @@
  * `dryRunWorkflow`, so a fixture can never trigger a real run or provider call.
  */
 import { readdir, stat } from 'node:fs/promises';
-import { join, relative, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
 import { createLogger } from '@archon/paths';
 import {
@@ -120,8 +120,8 @@ async function exists(path: string): Promise<boolean> {
 interface DiscoveredFixture {
   /** Label relative to its discovery scope root, e.g. `sdlc/deliver/fixtures/clean.stubs.yaml`. */
   readonly label: string;
-  /** First path segment under the scope root — the pack, when fixtures are organized in packs. */
-  readonly pack: string | undefined;
+  /** Directory segments between the scope root and `fixtures/`, e.g. `['sdlc', 'deliver']`. */
+  readonly dirs: readonly string[];
   readonly path: string;
   readonly workflowNames: readonly string[];
 }
@@ -152,6 +152,7 @@ async function workflowNamesBeside(fixturesDir: string): Promise<string[]> {
 }
 
 async function walkForFixtures(
+  scopeRoot: string,
   root: string,
   depth: number,
   out: DiscoveredFixture[]
@@ -173,14 +174,16 @@ async function walkForFixtures(
         const rel = relative(labelRoot, join(dirPath, file));
         out.push({
           label: rel.split(sep).join('/'),
-          pack: rel.split(sep).length > 1 ? rel.split(sep)[0] : undefined,
+          dirs: relative(scopeRoot, root)
+            .split(sep)
+            .filter(segment => segment.length > 0),
           path: join(dirPath, file),
           workflowNames: await workflowNamesBeside(dirPath),
         });
       }
       continue;
     }
-    await walkForFixtures(dirPath, depth + 1, out);
+    await walkForFixtures(scopeRoot, dirPath, depth + 1, out);
   }
 }
 
@@ -190,7 +193,7 @@ async function discoverFixtures(roots: readonly string[]): Promise<DiscoveredFix
   for (const root of roots) {
     if (!(await exists(root))) continue;
     const before = found.length;
-    await walkForFixtures(root, 0, found);
+    await walkForFixtures(root, root, 0, found);
     for (let i = before; i < found.length; i++) {
       if (seen.has(found[i].label)) {
         // Higher-precedence scope already discovered this fixture path.
@@ -228,7 +231,7 @@ export interface RunFixturesOptions {
   sourceRoots?: WorkflowSourceRoots;
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
-  /** Restrict to one workflow name or pack prefix; unresolved values are an error. */
+  /** Restrict to a workflow name, a directory above a fixtures dir (pack or workflow folder), or a path to one; unresolved values are an error. */
   target?: string;
 }
 
@@ -251,15 +254,20 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
   let selected = all;
   if (options.target !== undefined) {
     const targetName = options.target;
-    if (byName.has(targetName)) {
-      selected = all.filter(fixture => fixture.workflowNames.includes(targetName));
-    } else {
-      selected = all.filter(fixture => fixture.pack === options.target);
-    }
+    // A target resolves when it names a discovered workflow, a directory above a
+    // fixtures dir (pack name or workflow folder), or a path containing fixtures.
+    const targetDir = resolve(options.cwd, targetName);
+    selected = all.filter(
+      fixture =>
+        fixture.workflowNames.includes(targetName) ||
+        fixture.dirs.includes(targetName) ||
+        fixture.path.startsWith(targetDir + sep)
+    );
     if (selected.length === 0) {
       const names = [...byName.keys()].sort().join(', ');
       throw new Error(
-        `No fixtures found for '${targetName}'. Name a workflow with fixtures (${names}) or a pack directory containing them.`
+        `No fixtures found for '${targetName}'. Name a workflow with fixtures (${names}), ` +
+          'a workflow folder or pack name containing them, or a path to such a directory.'
       );
     }
   }
