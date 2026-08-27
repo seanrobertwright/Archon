@@ -20,6 +20,7 @@ This file is the canonical project guidance for coding agents. Keep it short, du
 - One install serves one operator or client. Client isolation belongs at the deployment layer. Multiple users within one install are supported and are not multi-tenancy.
 - Keep the conversation layer platform-agnostic. Platform adapters translate transport details; core behavior should not depend on Slack, Telegram, GitHub, Discord, CLI, or Web UI semantics.
 - Keep the core self-hostable. Do not make a proprietary hosted service a runtime dependency.
+- Keep the core small and flexible. Agentic engineering changes too quickly for one monolith to encode every useful workflow or integration; give users stable seams to assemble and extend the rest.
 - Treat bundled workflows as reference implementations, not a frozen compatibility surface.
 - A git worktree separates checkouts; it is not an execution or security sandbox.
 - Consult [`.archon/direction.md`](.archon/direction.md) before making product-scope or architecture-direction decisions.

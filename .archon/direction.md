@@ -35,6 +35,8 @@ This file is **committed and shared by all maintainers**. Edit deliberately — 
 
 This is the target architecture, not a description of the current package graph or install. Design work should move toward it without pretending the decomposition is already complete. Tracked in [#2791](https://github.com/coleam00/Archon/issues/2791).
 
+Agentic engineering changes too quickly for a monolith to stay right. Projects that endure keep a small, flexible core and let users build the rest through plugins and extensions.
+
 - **The engine stands alone as an SDK.** Its public surface defines, validates, runs, resumes, governs, and queries workflows without requiring the server, Web UI, platform adapters, provider implementations, or a database.
 - **Core plus CLI is a complete local install.** The engine and CLI must be downloadable and installable without the rest of Archon. Worktree isolation is part of that baseline because it is the default local workspace primitive.
 - **Append-only files are the default persistence.** A standalone install uses append-only JSON or JSONL run records and event logs. A database is an optional persistence adapter, not a prerequisite for the engine.
