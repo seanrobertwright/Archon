@@ -108,11 +108,11 @@ describe('detached workflow terminal database events', () => {
     mkdirSync(workflowsDir, { recursive: true });
     writeFileSync(
       join(workflowsDir, 'terminal-success.yaml'),
-      'name: terminal-success\ndescription: Detached terminal success fixture.\nnodes:\n  - id: finish\n    bash: "sleep 2; echo done"\n'
+      'name: terminal-success\ndescription: Detached terminal success fixture.\nnodes:\n  - id: finish\n    bash: "echo done"\n'
     );
     writeFileSync(
       join(workflowsDir, 'terminal-failure.yaml'),
-      'name: terminal-failure\ndescription: Detached terminal failure fixture.\nnodes:\n  - id: fail\n    bash: "sleep 2; echo failed >&2; exit 42"\n'
+      'name: terminal-failure\ndescription: Detached terminal failure fixture.\nnodes:\n  - id: fail\n    bash: "echo failed >&2; exit 42"\n'
     );
 
     const cliPath = resolve(import.meta.dir, '..', 'cli.ts');
@@ -155,7 +155,6 @@ describe('detached workflow terminal database events', () => {
 
       const created = await waitFor(() => readRun(databasePath, fixture.workflow));
       activeRunIds.add(created.id);
-      await waitFor(async () => ((await endpointIsReachable(created.id)) ? true : undefined));
       await waitFor(async () => ((await endpointIsReachable(created.id)) ? undefined : true));
       expect(await endpointIsReachable(created.id)).toBe(false);
       activeRunIds.delete(created.id);

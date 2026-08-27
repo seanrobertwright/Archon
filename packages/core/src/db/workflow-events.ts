@@ -15,6 +15,7 @@ import { createLogger } from '@archon/paths';
 import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
 import { readFile } from 'node:fs/promises';
 import type { FanOutInstanceSnapshot } from '@archon/workflows/fan-out-identity';
+import type { WorkflowEventType } from '@archon/workflows/store';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -60,7 +61,7 @@ function parseEventRow(row: WorkflowEventRow): WorkflowEventRow {
 /** The column payload for a single workflow-event row. */
 export interface WorkflowEventInput {
   workflow_run_id: string;
-  event_type: string;
+  event_type: WorkflowEventType;
   step_index?: number;
   step_name?: string;
   data?: Record<string, unknown>;

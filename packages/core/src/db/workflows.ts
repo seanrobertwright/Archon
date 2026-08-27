@@ -30,6 +30,7 @@ import { createLogger } from '@archon/paths';
 import type {
   FanOutCancelReason,
   WorkflowCancellationEventDetails,
+  WorkflowEventType,
   WorkflowResumeCursor,
   WorkflowWaitCompletion,
   WorkflowWaitPause,
@@ -208,7 +209,7 @@ function replaceWaitMetadata(paramIndex: number): string {
  * from retrying. `workflow_run_id` is supplied by the CAS function.
  */
 export interface GateResolutionEvent {
-  event_type: string;
+  event_type: WorkflowEventType;
   step_name: string;
   data: Record<string, unknown>;
 }
