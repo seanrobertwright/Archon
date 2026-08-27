@@ -83,9 +83,9 @@ nodes:
   # the diff is information that does not exist until the PR does. classify
   # judges which optional lenses this diff warrants; resolve-scope then merges
   # the operator's declared forces over that judgment deterministically, and
-  # its structured output is what every lens gate reads — round 1 decides once,
-  # and the correction rechecks reuse the same resolved scope so review
-  # coverage never drifts mid-loop.
+  # its structured output is what every lens gate reads. Round 1 decides once,
+  # and correction reviews preserve those concerns while one continuation
+  # reviewer judges the prior report and correction delta.
   - id: classify
     command: classify-review-scope
     depends_on: [pr]
@@ -149,7 +149,8 @@ nodes:
 
   # A ready initial review skips this block. Otherwise each iteration corrects
   # the current canonical findings, proves the correction is green, then runs a
-  # fresh light review over the delta — never an unreviewed final fix. The bound
+  # fresh continuation review over the report and delta, never an unreviewed
+  # final fix. The bound
   # is a runaway backstop, not a pacing device: until_bash ends the loop the
   # moment a recheck certifies ready, so a healthy fix-class run still exits in
   # one or two rounds. Five rounds is calibrated to the feature-class evidence
@@ -205,8 +206,10 @@ nodes:
             scope: ""
             prior_report: "$ARTIFACTS_DIR/review/report.md"
             work_order: "$INPUTS.work"
-            # Round-1's resolved scope, read across the body boundary: rechecks
-            # keep the same lens coverage the initial review had.
+            # These bindings keep the included workflow's full-review `when:`
+            # expressions resolvable after load-time input substitution. In
+            # continuation mode the prior report owns coverage and every
+            # specialist remains skipped regardless of these values.
             tests: "$resolve-scope.output.tests"
             errors: "$resolve-scope.output.errors"
             comments: "$resolve-scope.output.comments"
