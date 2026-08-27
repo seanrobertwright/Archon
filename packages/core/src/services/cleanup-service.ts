@@ -281,10 +281,11 @@ export async function onConversationClosed(
       if (!(err instanceof ConversationNotFoundError)) throw err;
     });
 
-  // Check if other conversations still use this environment
-  const otherConversations = await isolationEnvDb.getConversationsUsingEnv(envId);
-  if (otherConversations.length > 0) {
-    getLog().info({ envId, conversationCount: otherConversations.length }, 'env_still_in_use');
+  // Live work is the only lock — the same rule the merged cleanup sweep follows.
+  // Historical conversations referencing this env are data, not locks.
+  const liveRun = await isolationEnvDb.getLiveRunOwningEnv(envId);
+  if (liveRun) {
+    getLog().info({ envId, runId: liveRun.id, runStatus: liveRun.status }, 'env_has_live_run');
     return;
   }
 
@@ -435,11 +436,11 @@ export async function cleanupToMakeRoom(
 /**
  * Returns the reason the environment cannot be removed, or null if it is safe to remove.
  * Checks uncommitted changes first (avoids a DB query when changes are present),
- * then active conversation references.
+ * then live work: a non-terminal workflow run owning the environment.
  */
 type RemovalBlocker =
   | { reason: 'uncommitted_changes'; display: string }
-  | { reason: 'in_use'; display: string; conversationCount: number };
+  | { reason: 'live_run'; display: string; runId: string; runStatus: string };
 
 async function getRemovalBlocker(env: {
   id: string;
@@ -447,13 +448,18 @@ async function getRemovalBlocker(env: {
 }): Promise<RemovalBlocker | null> {
   const hasChanges = await hasUncommittedChanges(toWorktreePath(env.working_path));
   if (hasChanges) return { reason: 'uncommitted_changes', display: 'has uncommitted changes' };
-  const conversations = await isolationEnvDb.getConversationsUsingEnv(env.id);
-  if (conversations.length > 0)
+  // Live work is the only lock: a non-terminal run owning the env blocks removal.
+  // Historical conversation references are data, not locks (same rule the merged
+  // cleanup sweep follows) — see getLiveRunOwningEnv.
+  const liveRun = await isolationEnvDb.getLiveRunOwningEnv(env.id);
+  if (liveRun) {
     return {
-      reason: 'in_use',
-      display: `still used by ${String(conversations.length)} conversation(s)`,
-      conversationCount: conversations.length,
+      reason: 'live_run',
+      display: `run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`,
+      runId: liveRun.id,
+      runStatus: liveRun.status,
     };
+  }
   return null;
 }
 
@@ -502,10 +508,10 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
           const blocker = await getRemovalBlocker(env);
           if (blocker) {
             report.skipped.push({ id: env.id, reason: `merged but ${blocker.display}` });
-            if (blocker.reason === 'in_use') {
+            if (blocker.reason === 'live_run') {
               getLog().info(
-                { envId: env.id, conversationCount: blocker.conversationCount },
-                'skip_merged_still_in_use'
+                { envId: env.id, runId: blocker.runId, runStatus: blocker.runStatus },
+                'skip_merged_live_run'
               );
             } else {
               getLog().warn({ envId: env.id }, 'skip_merged_uncommitted_changes');
@@ -537,10 +543,10 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
           const blocker = await getRemovalBlocker(env);
           if (blocker) {
             report.skipped.push({ id: env.id, reason: `stale but ${blocker.display}` });
-            if (blocker.reason === 'in_use') {
+            if (blocker.reason === 'live_run') {
               getLog().info(
-                { envId: env.id, conversationCount: blocker.conversationCount },
-                'skip_stale_still_in_use'
+                { envId: env.id, runId: blocker.runId, runStatus: blocker.runStatus },
+                'skip_stale_live_run'
               );
             } else {
               getLog().warn({ envId: env.id }, 'skip_stale_uncommitted_changes');
@@ -689,7 +695,7 @@ export async function getWorktreeStatusBreakdown(
 
 /**
  * Clean up stale worktrees for a codebase
- * Respects uncommitted changes and conversation references
+ * Respects uncommitted changes and live workflow runs
  */
 export async function cleanupStaleWorktrees(
   codebaseId: string,
@@ -705,7 +711,7 @@ export async function cleanupStaleWorktrees(
     // Check if stale
     if (env.days_since_activity < STALE_THRESHOLD_DAYS) continue;
 
-    // Check for uncommitted changes or active conversation references
+    // Check for uncommitted changes or a live owning run
     const blocker = await getRemovalBlocker(env);
     if (blocker) {
       result.skipped.push({ branchName: env.branch_name, reason: blocker.display });
@@ -764,7 +770,7 @@ async function isSafeToRemove(
 
 /**
  * Clean up merged worktrees for a codebase
- * Respects uncommitted changes and conversation references
+ * Respects uncommitted changes and live workflow runs
  */
 export async function cleanupMergedWorktrees(
   codebaseId: string,
@@ -818,7 +824,7 @@ export async function cleanupMergedWorktrees(
       continue;
     }
 
-    // Check for uncommitted changes or active conversation references
+    // Check for uncommitted changes or a live owning run
     const blocker = await getRemovalBlocker(env);
     if (blocker) {
       result.skipped.push({ branchName: env.branch_name, reason: blocker.display });

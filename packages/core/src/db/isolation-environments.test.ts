@@ -21,7 +21,7 @@ import {
   updateStatus,
   updateMetadata,
   countActiveByCodebase,
-  getConversationsUsingEnv,
+  getLiveRunOwningEnv,
   findStaleEnvironments,
   listAllActiveWithCodebase,
 } from './isolation-environments';
@@ -362,25 +362,33 @@ describe('isolation-environments', () => {
     });
   });
 
-  describe('getConversationsUsingEnv', () => {
-    test('returns conversation IDs using the environment', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'conv-1' }, { id: 'conv-2' }]));
+  describe('getLiveRunOwningEnv', () => {
+    test('queries runs through both attachment routes, excluding terminal statuses', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-1', status: 'running' }]));
 
-      const result = await getConversationsUsingEnv('env-123');
+      const result = await getLiveRunOwningEnv('env-123');
 
-      expect(result).toEqual(['conv-1', 'conv-2']);
+      expect(result).toEqual({ id: 'run-1', status: 'running' });
       expect(mockQuery).toHaveBeenCalledWith(
-        'SELECT id FROM remote_agent_conversations WHERE isolation_env_id = $1',
-        ['env-123']
+        expect.stringContaining(
+          'LEFT JOIN remote_agent_conversations c ON c.id = r.conversation_id'
+        ),
+        expect.anything()
       );
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      // env id first, then every terminal status as an excluded value
+      expect(params).toEqual(['env-123', 'completed', 'failed', 'cancelled']);
+      expect(query).toContain("metadata->>'isolation_env_id' = $1 OR c.isolation_env_id = $1");
+      expect(query).toContain('r.status NOT IN ($2, $3, $4)');
+      expect(query).toContain('ORDER BY r.started_at DESC');
     });
 
-    test('returns empty array when no conversations use env', async () => {
+    test('returns null when the env has no live run', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
-      const result = await getConversationsUsingEnv('unused-env');
+      const result = await getLiveRunOwningEnv('unused-env');
 
-      expect(result).toEqual([]);
+      expect(result).toBeNull();
     });
   });
 

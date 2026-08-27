@@ -2,6 +2,7 @@
  * Database operations for isolation environments
  */
 import { pool, getDialect, getDatabaseType } from './connection';
+import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import type {
   IsolationEnvironmentRow,
   IsolationWorkflowType,
@@ -244,14 +245,38 @@ export async function countActiveByCodebase(codebaseId: string): Promise<number>
 }
 
 /**
- * Find conversations using an isolation environment
+ * Find a non-terminal workflow run that owns an environment — the one signal that
+ * still pins an env for cleanup. Historical conversation rows are data, not locks:
+ * every CLI-launched run leaves one behind, so counting references pinned every
+ * environment forever (#2868).
+ *
+ * A run attaches to an env through either route the code stamps:
+ * - its own metadata.isolation_env_id (container runs, sub-run child worktrees)
+ * - its worker conversation's isolation_env_id (top-level runs)
  */
-export async function getConversationsUsingEnv(envId: string): Promise<string[]> {
-  const result = await pool.query<{ id: string }>(
-    'SELECT id FROM remote_agent_conversations WHERE isolation_env_id = $1',
-    [envId]
+export async function getLiveRunOwningEnv(
+  envId: string
+): Promise<{ id: string; status: string } | null> {
+  const envIdExtract =
+    getDatabaseType() === 'postgresql'
+      ? "r.metadata->>'isolation_env_id'"
+      : "json_extract(r.metadata, '$.isolation_env_id')";
+  // Placeholders follow the terminal statuses' length so a new terminal status
+  // extends the IN list without a hand-edited parameter position.
+  const terminalPlaceholders = TERMINAL_WORKFLOW_STATUSES.map((_, i) => `$${String(i + 2)}`).join(
+    ', '
   );
-  return result.rows.map(r => r.id);
+  const result = await pool.query<{ id: string; status: string }>(
+    `SELECT r.id, r.status
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_conversations c ON c.id = r.conversation_id
+     WHERE (r.status NOT IN (${terminalPlaceholders}))
+       AND (${envIdExtract} = $1 OR c.isolation_env_id = $1)
+     ORDER BY r.started_at DESC
+     LIMIT 1`,
+    [envId, ...TERMINAL_WORKFLOW_STATUSES]
+  );
+  return result.rows[0] ?? null;
 }
 
 /**
