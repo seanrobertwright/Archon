@@ -190,7 +190,7 @@ export async function listRecentEvents(
         `SELECT * FROM remote_agent_workflow_events
          WHERE workflow_run_id = $1 AND created_at > $2
          ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
-        [workflowRunId, since.toISOString()]
+        [workflowRunId, toDbDateParam(since)]
       );
       return [...result.rows].map(row => ({
         ...row,
