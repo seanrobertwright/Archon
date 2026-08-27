@@ -100,7 +100,6 @@ import {
   isolationCleanupMergedCommand,
   isolationCompleteCommand,
 } from './commands/isolation';
-import { continueCommand } from './commands/continue';
 import { chatCommand } from './commands/chat';
 import { setupCommand } from './commands/setup';
 import { skillInstallCommand } from './commands/skill';
@@ -198,7 +197,6 @@ Commands:
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main
-  continue <branch> [msg]    Continue work on an existing worktree with prior context
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
   serve                      Start the web UI server (downloads web UI on first run)
   skill install [path]       Install archon-cli into .claude/skills and .agents/skills
@@ -253,8 +251,6 @@ Options:
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
   --open                     For 'workflow runs': the open-work inbox — failed runs nothing has adopted or superseded
   --limit <n>                For 'workflow runs': max rows (default 20)
-  --workflow <name>          Workflow to run for 'continue' (default: archon-assist)
-  --no-context               Skip context injection for 'continue'
   --conversation-id <id>     Reuse a stable conversation scope across runs (enables
                              persist_session resume between separate CLI invocations)
   --port <port>              Override server port for 'serve' (default: 3090)
@@ -275,7 +271,8 @@ Examples:
   archon workflow get <run-id> --json
   archon workflow resume <run-id>
   archon workflow cancel <run-id>
-  archon continue fix/issue-42 --workflow archon-smart-pr-review "Review the changes"
+  archon workflow runs --open
+  archon workflow run archon-smart-pr-review --adopt <run-id> "Review the changes"
   archon skill install
   archon skill install /path/to/project
   archon workflow search "pr review"
@@ -449,6 +446,16 @@ async function main(): Promise<number> {
     if (configOutsideRun) {
       console.error(configOutsideRun);
       return 1;
+    }
+    // `archon continue` was removed (#2846). Intercepted before the git gate so
+    // stale invocations get the replacement pointer in any directory.
+    if (command === 'continue') {
+      return await fail(
+        jsonFlag,
+        "Removed: 'archon continue' inferred a run from a branch name.\n" +
+          'Use: archon workflow run <name> --adopt <run-id> <input>\n' +
+          'Find a prior run id with: archon workflow runs --open (or workflow get <run-id>)'
+      );
     }
     // Note: orphaned run cleanup moved to `workflow cleanup` command only.
     // Running it on every CLI startup killed parallel workflow runs (all
@@ -1068,24 +1075,6 @@ async function main(): Promise<number> {
         }
         const forceFlag = Boolean(values.force);
         await isolationCompleteCommand(branches, { force: forceFlag, deleteRemote: true });
-        break;
-      }
-
-      case 'continue': {
-        const continueBranch = positionals[1];
-        if (!continueBranch) {
-          return await fail(
-            jsonFlag,
-            'Usage: archon continue <branch> [--workflow <name>] "instruction"'
-          );
-        }
-        const continueMessage = positionals.slice(2).join(' ') || '';
-        const continueWorkflow = values.workflow as string | undefined;
-        const noContextFlag = values['no-context'] as boolean | undefined;
-        await continueCommand(continueBranch, continueMessage, {
-          workflow: continueWorkflow,
-          noContext: noContextFlag,
-        });
         break;
       }
 

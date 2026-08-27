@@ -85,6 +85,47 @@ describe('CLI help output', () => {
       'ai login <provider>        Connect a Claude, ChatGPT/Codex, or Copilot subscription'
     );
   });
+
+  it('omits the removed branch-inferred continue command', () => {
+    expect(help.status).toBe(0);
+    expect(help.stdout).not.toMatch(/\bcontinue <branch>/);
+    expect(help.stdout).not.toContain('--workflow <name>');
+    expect(help.stdout).not.toContain('--no-context');
+  });
+
+  it('documents exact run-id adoption as the continuation route', () => {
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain(
+      "--adopt <run-id>           Start a new run adopting a terminal run's worktree/branch + artifacts ($ADOPTED_RUN_DIR)"
+    );
+  });
+});
+
+describe('removed continue command', () => {
+  // Full interpreter startup: the rejection lives in main()'s dispatch, not in
+  // a pure guard, so a subprocess is the only way to pin the actual outcome.
+  it('rejects archon continue and points to explicit run adoption', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, 'continue', 'some/branch', 'carry on'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Removed: 'archon continue'");
+    expect(result.stderr).toContain('--adopt <run-id>');
+  });
+
+  it('no longer parses the continue-only flags', () => {
+    for (const flag of ['--workflow', '--no-context']) {
+      expect(() =>
+        parseArgs({
+          args: ['workflow', 'run', 'x', flag, 'value'],
+          options: cliArgOptions,
+          allowPositionals: true,
+          strict: true,
+        })
+      ).toThrow();
+    }
+  });
 });
 
 describe('workflow model arguments', () => {

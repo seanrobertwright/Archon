@@ -773,24 +773,6 @@ export async function getRunAncestry(runId: string): Promise<WorkflowRun[]> {
   return ancestors;
 }
 
-export async function findLatestRunByWorkingPath(workingPath: string): Promise<WorkflowRun | null> {
-  try {
-    const result = await pool.query<WorkflowRun>(
-      `SELECT * FROM remote_agent_workflow_runs
-       WHERE working_path = $1
-       ORDER BY started_at DESC
-       LIMIT 1`,
-      [workingPath]
-    );
-    const row = result.rows[0];
-    return row ? normalizeWorkflowRun(row) : null;
-  } catch (error) {
-    const err = error as Error;
-    getLog().error({ err, workingPath }, 'db.workflow_run_find_latest_by_path_failed');
-    throw new Error(`Failed to find latest workflow run by path: ${err.message}`);
-  }
-}
-
 export async function getRunningWorkflows(): Promise<
   { id: string; conversation_id: string; workflow_name: string; started_at: string }[]
 > {
