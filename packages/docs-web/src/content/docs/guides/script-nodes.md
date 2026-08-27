@@ -75,9 +75,12 @@ The file `.archon/scripts/fetch-github-pages.ts` is loaded and executed with
 4. **Capture.** `stdout` (with the trailing newline stripped) becomes
    `$nodeId.output`. On a successful run, `stderr` is logged as a warning and
    posted to the conversation but does **not** fail the node. A non-zero exit
-   code fails the node; on failure, `stderr` is the diagnostic surfaced in the
-   error message (`Script node 'X' failed [exit N]: <stderr>`) — the script
-   body is never echoed back to users.
+   code fails the node; on failure, tails of both streams are surfaced in the
+   error message (`Script node 'X' failed [exit N]: [stderr] ... [stdout] ...`),
+   sharing a ~2 KB diagnostic budget — stderr keeps priority, stdout gets the
+   remainder, and a label prefixes each stream only when both are populated.
+   With stderr empty, the stdout tail becomes the diagnostic. The script body
+   is never echoed back to users.
 
 ## YAML Schema
 
