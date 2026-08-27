@@ -1,6 +1,6 @@
 # Review Scope
 
-Establish exactly what this review round examines, and write it down for the lens reviewers. You do not judge anything — you make the target precise.
+Establish exactly what this review round examines, and write it down for the reviewer or reviewers that follow. You do not judge anything; you make the target precise.
 
 ## Inputs
 
@@ -8,7 +8,7 @@ Establish exactly what this review round examines, and write it down for the len
 
 $INPUTS.scope
 
-**Previous round's report** (path; empty — or a path that does not exist yet — means this is the first round, full review):
+**Previous round's report** (path; empty means this is the first round, full review):
 
 $INPUTS.prior_report
 
@@ -33,7 +33,7 @@ $ARGUMENTS
 
 ## Light mode (a prior report exists)
 
-Read the prior report. Extract its **reviewed-head cursor** (the SHA it records) and its findings list. This round's diff is **only the delta**: `git diff <cursor>..HEAD` plus any uncommitted changes. List each prior finding with its ID and status so lens reviewers verify those first instead of re-discovering the whole change.
+When a prior-report path is supplied, require that it exists and read it in full. A missing supplied report is a broken continuation contract: fail with the path named instead of silently starting a full review. Extract its **reviewed-head cursor** (the SHA it records) and its findings list. This round's diff is **only the delta**: `git diff <cursor>..HEAD` plus any uncommitted changes. List each prior finding with its ID and status so the continuation reviewer verifies those first instead of re-discovering the whole change.
 
 ## Write the scope file
 
