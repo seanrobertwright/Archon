@@ -581,7 +581,7 @@ describe('ClaudeProvider', () => {
       });
     });
 
-    test('drops housekeeping task_started when SDK sets skip_transcript', async () => {
+    test('drops the housekeeping task lifecycle when SDK start sets skip_transcript', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
           type: 'system',
@@ -589,6 +589,19 @@ describe('ClaudeProvider', () => {
           task_id: 't-housekeeping',
           description: 'Ambient task',
           skip_transcript: true,
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_progress',
+          task_id: 't-housekeeping',
+          description: 'Ambient task is still running',
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-housekeeping',
+          status: 'completed',
+          summary: 'Ambient task finished',
         };
       });
 
@@ -600,7 +613,7 @@ describe('ClaudeProvider', () => {
       expect(chunks).toHaveLength(0);
     });
 
-    test('drops housekeeping task_started when SDK sets ambient', async () => {
+    test('drops the housekeeping task lifecycle when SDK start sets ambient', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {
           type: 'system',
@@ -608,6 +621,19 @@ describe('ClaudeProvider', () => {
           task_id: 't-ambient',
           description: 'Live update watcher',
           ambient: true,
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_progress',
+          task_id: 't-ambient',
+          description: 'Watching for updates',
+        };
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-ambient',
+          status: 'completed',
+          summary: 'Watcher stopped',
         };
       });
 
@@ -706,6 +732,26 @@ describe('ClaudeProvider', () => {
           status: 'completed',
           summary: 'Watcher stopped',
           ambient: true,
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toHaveLength(0);
+    });
+
+    test('drops housekeeping task_notification when SDK sets skip_transcript', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'system',
+          subtype: 'task_notification',
+          task_id: 't-housekeeping',
+          status: 'completed',
+          summary: 'Housekeeping task finished',
+          skip_transcript: true,
         };
       });
 
@@ -3003,6 +3049,10 @@ describe('API error surfaced as text (#1797)', () => {
     const { error } = await collect(client.sendQuery('test', '/workspace'));
     expect(error?.message).toContain('Claude API error (account_on_hold)');
     expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ errorClass: 'auth' }),
+      'query_error'
+    );
   });
 
   test('api_error result without a preceding synthetic message still throws (belt-and-suspenders)', async () => {

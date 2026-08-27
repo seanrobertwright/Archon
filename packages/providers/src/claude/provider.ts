@@ -955,6 +955,9 @@ async function* streamClaudeMessages(
   // field on a '<synthetic>' assistant message, then `is_error: true` on the
   // result. See ClaudeApiResultError.
   let pendingSdkError: { code: SDKAssistantMessageError; text: string } | undefined;
+  // Progress frames carry no visibility marker, so retain the start decision
+  // for the lifetime of this query and suppress the complete hidden lifecycle.
+  const hiddenTaskIds = new Set<string>();
 
   for await (const msg of events) {
     // Drain tool results captured by hooks before processing the next event
@@ -1046,11 +1049,12 @@ async function* streamClaudeMessages(
         }
       } else if (subtype === 'task_started' && sysMsg.task_id) {
         // Ambient / housekeeping tasks (SDK v0.3.247 signals them directly;
-        // older emitters use skip_transcript) are
-        // SDK-internal — they bloat the Web UI's tasks panel without telling
+        // older emitters use skip_transcript) are SDK-internal — they bloat
+        // the Web UI's tasks panel without telling
         // the user anything actionable. Drop them at the provider boundary;
         // the workflow executor and SSE bridge never see them.
         if (sysMsg.ambient === true || sysMsg.skip_transcript === true) {
+          hiddenTaskIds.add(sysMsg.task_id);
           getLog().debug(
             { taskId: sysMsg.task_id, taskType: sysMsg.task_type },
             'claude.task_started_housekeeping_suppressed'
@@ -1066,6 +1070,9 @@ async function* streamClaudeMessages(
           };
         }
       } else if (subtype === 'task_progress' && sysMsg.task_id) {
+        if (hiddenTaskIds.has(sysMsg.task_id)) {
+          continue;
+        }
         yield {
           type: 'task_progress',
           taskId: sysMsg.task_id,
@@ -1076,7 +1083,10 @@ async function* streamClaudeMessages(
           ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
         };
       } else if (subtype === 'task_notification' && sysMsg.task_id) {
-        if (sysMsg.ambient === true) {
+        if (sysMsg.ambient === true || sysMsg.skip_transcript === true) {
+          hiddenTaskIds.add(sysMsg.task_id);
+        }
+        if (hiddenTaskIds.has(sysMsg.task_id)) {
           getLog().debug(
             { taskId: sysMsg.task_id, taskType: sysMsg.task_type },
             'claude.task_notification_housekeeping_suppressed'
