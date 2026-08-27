@@ -34,6 +34,7 @@ import {
 } from './node-model-resolution';
 import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import { defaultRunInputs } from './workflow-inputs';
 import {
   inputEnvKey,
@@ -438,6 +439,19 @@ interface DryRunContext {
   workflow: WorkflowDefinition;
   userMessage: string;
   cwd: string;
+  /**
+   * The working directory trusted bash/script code EXECUTES in (exec-code nodes only).
+   * Defaults to `cwd`; `workflow test` points it at a scratch worktree of HEAD (#2851)
+   * so executed nodes see a clean checkout and cannot write into the caller's tree.
+   */
+  execWorkspace: string;
+  /**
+   * Where a named script's file and a `command:` node's text are READ from — the same
+   * source/target split a real run makes. Defaults to reading `cwd` live, which is the
+   * direct `--dry-run` path; `workflow test` supplies its capture's roots so a fixture
+   * executes the bytes a real run would freeze (#2851).
+   */
+  sourceRoots: WorkflowSourceRoots;
   stubs: DryRunStubs;
   /**
    * The run's EFFECTIVE `$INPUTS` map — declared defaults layered under caller-supplied
@@ -467,18 +481,22 @@ interface DryRunContext {
   aiProfile?: ResolvedAiProfile;
 }
 
-async function loadDryRunCommand(cwd: string, command: string): Promise<string> {
+async function loadDryRunCommand(ctx: DryRunContext, command: string): Promise<string> {
   const result = await loadCommandPrompt(
     {
-      loadConfig: async () => ({
-        assistant: 'claude',
-        commands: {},
-        assistants: { claude: {}, codex: {} },
-        defaults: { loadDefaultCommands: true },
-      }),
+      // Unreachable: `loadCommandPrompt` consults `loadConfig` only when its source roots
+      // carry no `load_default_commands`, and `ctx.sourceRoots` always does — the field is
+      // a required boolean on every roots value. Throwing rather than returning a stub
+      // config keeps a future signature change from silently resolving commands against a
+      // fabricated policy.
+      loadConfig: () => {
+        throw new Error('dry-run resolves commands from its source roots, never from config');
+      },
     },
-    cwd,
-    command
+    ctx.cwd,
+    command,
+    undefined,
+    ctx.sourceRoots
   );
   if (!result.success) throw new Error(result.message);
   return result.content;
@@ -635,7 +653,7 @@ async function executeCodeNode(
         args = ['run', ...(node.deps ?? []).flatMap(dep => ['--with', dep]), 'python', '-c', code];
       }
     } else {
-      const script = (await discoverScriptsForCwd(ctx.cwd)).get(code);
+      const script = (await discoverScriptsForCwd(ctx.cwd, ctx.sourceRoots)).get(code);
       if (!script) return { error: `Named script '${code}' was not found` };
       command = script.runtime === 'bun' ? 'bun' : 'uv';
       args =
@@ -661,7 +679,7 @@ async function executeCodeNode(
     await mkdir(ctx.artifactsDir, { recursive: true });
     await mkdir(ctx.stateDir, { recursive: true });
     const result = await execFileAsync(command, args, {
-      cwd: ctx.cwd,
+      cwd: ctx.execWorkspace,
       timeout: node.timeout ?? 300_000,
       env: {
         ...process.env,
@@ -795,7 +813,7 @@ async function simulateLoop(
         `Loop node '${node.id}' has malformed compiled command metadata for '${command}' — expected exactly one string prompt or error.`
       );
     } else {
-      template = await loadDryRunCommand(ctx.cwd, command);
+      template = await loadDryRunCommand(ctx, command);
     }
   }
   let resolvedText = template;
@@ -1011,7 +1029,7 @@ async function simulateNode(
     const isCommandSourced = isAgentNode(node) && node.source.kind === 'command';
     const sourceText = isAgentNode(node)
       ? node.source.kind === 'command'
-        ? await loadDryRunCommand(ctx.cwd, node.source.name)
+        ? await loadDryRunCommand(ctx, node.source.name)
         : node.source.prompt
       : isExecNode(node)
         ? node.script
@@ -1120,6 +1138,18 @@ export async function dryRunWorkflow(options: {
    * effective `$INPUTS` map cannot diverge between simulation and execution (#2610).
    */
   inputs?: Record<string, string>;
+  /**
+   * Where exec-code nodes execute. Undefined means `cwd` — the direct
+   * `--dry-run --exec-code` path. `workflow test` supplies an isolated scratch
+   * worktree so a fixture verdict cannot depend on the caller's tree state (#2851).
+   */
+  execWorkspace?: string;
+  /**
+   * Where named scripts and command files are READ from. Undefined means live off
+   * `cwd`, which is the direct `--dry-run` path; `workflow test` passes the roots of
+   * the source capture it froze for the invocation (#2851).
+   */
+  sourceRoots?: WorkflowSourceRoots;
   execCode?: boolean;
   /** Fill reached nodes without explicit stubs using schema-valid deterministic placeholders. */
   defaultStubs?: boolean;
@@ -1143,6 +1173,8 @@ export async function dryRunWorkflow(options: {
     workflow: options.workflow,
     userMessage: options.userMessage,
     cwd: options.cwd,
+    execWorkspace: options.execWorkspace ?? options.cwd,
+    sourceRoots: options.sourceRoots ?? liveSourceRoots(options.cwd),
     stubs: options.stubs ?? {},
     ...(inputs ? { inputs } : {}),
     artifactsDir: join(tempRoot, 'artifacts'),

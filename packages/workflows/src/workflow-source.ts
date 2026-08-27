@@ -65,6 +65,7 @@ import {
 } from './defaults/bundled-defaults';
 import { readWorkflowSourceMetadata, readWorkflowSourceState } from './schemas/workflow-run';
 import { parsePackagedResourceReference } from './packaged-workflow';
+import type { WorkflowConfig } from './deps';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -156,6 +157,22 @@ export const DEFAULT_WORKFLOW_SOURCE_CONFIG: WorkflowSourceConfig = {
   load_default_workflows: true,
   load_default_commands: true,
 };
+
+/**
+ * Narrow an install's config down to the settings a capture must freeze.
+ *
+ * Every caller that captures needs exactly this projection, and a second copy of it is
+ * how one entry point ends up freezing a different set of directories than another:
+ * a repo pointing `commands.folder` outside `.archon/commands` would have its commands
+ * captured by `workflow run` and missed by `workflow test`.
+ */
+export function workflowSourceConfigFrom(config: WorkflowConfig): WorkflowSourceConfig {
+  return {
+    load_default_workflows: config.defaults?.loadDefaultWorkflows ?? true,
+    load_default_commands: config.defaults?.loadDefaultCommands ?? true,
+    ...(config.commands?.folder !== undefined ? { command_folder: config.commands.folder } : {}),
+  };
+}
 
 /** Roots for reading source live off disk, exactly as Archon always has. */
 export function liveSourceRoots(

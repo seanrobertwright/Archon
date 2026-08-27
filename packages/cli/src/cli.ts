@@ -196,7 +196,8 @@ Commands:
                              Run declared dry-run fixtures (fixtures/*.stubs.yaml) for a
                              workflow, a workflow folder or pack (by name or directory
                              path); with no target, runs every fixture. Never creates a
-                             run or contacts a provider
+                             run or contacts a provider; exec-code fixtures execute in a
+                             scratch worktree of HEAD
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main

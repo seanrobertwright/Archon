@@ -26,6 +26,7 @@ deliver__impl__implement:
   done: true
   green: true
   summary: "stub: fix built per the investigation, checks green"
+deliver__review__mode: '{"continuation":false}'
 deliver__review__scope: "target recorded; head sha stubbed"
 deliver__review__code: "0 findings"
 deliver__review__seams: "0 findings"

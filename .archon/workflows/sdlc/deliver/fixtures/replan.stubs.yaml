@@ -22,6 +22,7 @@ classify:
     types: "stub: no type changes"
     docs: "stub: no docs changes"
 resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+review__mode: '{"continuation":false}'
 review__scope: "accepted contract and scope conflict recorded"
 review__code: "1 Important scope conflict"
 review__seams: "0 findings"

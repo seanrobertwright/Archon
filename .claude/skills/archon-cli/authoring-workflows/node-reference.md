@@ -302,7 +302,7 @@ implement:
   done: true
   green: true
   summary: "stub summary"
-exec-code: false             # true executes bash/script nodes for real (clean tree!)
+exec-code: false             # true executes bash/script nodes for real (requires a git checkout)
 ```
 
 Run them:
@@ -313,6 +313,12 @@ archon workflow test my-workflow        # one workflow's fixtures
 ```
 
 Expected-red fixtures are the important ones: a guard that has never been seen
-failing proves nothing. Prove reds red on a CLEAN tree — uncommitted edits
-outside `.archon/` make deterministic change-detectors pass and turn your red
-path green. Validate load-time errors with `archon workflow list`.
+failing proves nothing. Prove reds red before trusting them. `workflow test`
+mirrors what a real run does with its two directories: named scripts and command
+files come from one frozen capture of your working tree taken per invocation —
+uncommitted edits included, so authoring works as normal — while exec-code nodes
+execute against a scratch worktree of HEAD. So a script that reaches outside
+`.archon/` with a `__file__`-relative path fails the fixture exactly as it would
+fail the run, and nothing a node executes can touch your checkout. Exec-code
+fixtures require a git checkout and fail explicitly outside one. Validate
+load-time errors with `archon workflow list`.
