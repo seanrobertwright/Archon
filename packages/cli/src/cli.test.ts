@@ -114,6 +114,22 @@ describe('removed continue command', () => {
     expect(result.stderr).toContain('--adopt <run-id>');
   });
 
+  it('rejects archon continue outside any git repository', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'archon-no-repo-'));
+    try {
+      const result = spawnSync(process.execPath, [CLI_ENTRY, 'continue', 'some/branch'], {
+        encoding: 'utf8',
+        cwd: dir,
+        env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Removed: 'archon continue'");
+      expect(result.stderr).toContain('--adopt <run-id>');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('no longer parses the continue-only flags', () => {
     for (const flag of ['--workflow', '--no-context']) {
       expect(() =>
