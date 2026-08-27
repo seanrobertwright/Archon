@@ -238,7 +238,7 @@ nodes:
 | `mcp` | string | — | Path to MCP server config JSON file. Claude/Codex/Copilot; Codex adds servers to ambient config rather than replacing it. See [MCP Servers](/guides/mcp-servers/) |
 | `skills` | string[] | — | Exact Claude-native skill selection (omission/`[]` selects none); skill declarations for Pi/Copilot. Codex workflow commands/prompts invoke installed skills explicitly with `$skill-name`; OpenCode does not implement this field. See [Skills](/guides/skills/) |
 | `agents` | object | — | Inline sub-agent definitions keyed by kebab-case ID. Claude only. See [Inline sub-agents](#inline-sub-agents) |
-| `effort` | `'minimal'`\|`'low'`\|`'medium'`\|`'high'`\|`'xhigh'`\|`'max'` | — | Reasoning depth. Every provider with a reasoning control — Claude/Codex/Pi/Copilot. Pi accepts all six; the others clamp a rung their model lacks to the nearest one it has. OpenCode configures reasoning in `opencode.json`. Also settable at workflow level |
+| `effort` | `'minimal'`\|`'low'`\|`'medium'`\|`'high'`\|`'xhigh'`\|`'max'`\|`'ultra'` | — | Reasoning depth. Every provider with a reasoning control — Claude/Codex/Pi/Copilot. Codex accepts all seven; the others clamp a rung their SDK lacks to the nearest one it has. OpenCode configures reasoning in `opencode.json`. Also settable at workflow level |
 | `thinking` | string \| object | — | Thinking mode: `'adaptive'`, `'disabled'`, or `{type:'enabled', budgetTokens:N}`. Claude/Pi/Copilot. Also settable at workflow level |
 | `maxBudgetUsd` | number | — | USD cost cap; node fails if exceeded. Claude only. Per-node only |
 | `systemPrompt` | string | — | Override the default `claude_code` system prompt for this node. Claude only. Per-node only |
@@ -297,14 +297,14 @@ Most of these fields map directly to Claude Agent SDK options. `maxBudgetUsd`, `
 ```yaml
 - id: thorough-review
   command: review
-  effort: high   # 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  effort: high   # 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 ```
 
-The ladder is the union of every provider's vocabulary. Pi accepts all six rungs;
-the others clamp a rung their model does not offer to the nearest one it does —
-`max` becomes `xhigh` on Codex and Copilot, `minimal` becomes `low` on Claude and
-Copilot. So `effort: max` always means "as deep as this model goes", whichever
-provider the node resolves to.
+The ladder is the union of every provider's vocabulary. Codex accepts all seven
+rungs. The others clamp a rung their SDK does not offer to the nearest one it
+does: `ultra` becomes `max` on Claude and Pi or `xhigh` on Copilot, while
+`minimal` becomes `low` on Claude and Copilot. So `effort: ultra` always means
+"as deep as this model goes", whichever provider the node resolves to.
 
 **thinking** — extended thinking mode (string shorthand or object form):
 

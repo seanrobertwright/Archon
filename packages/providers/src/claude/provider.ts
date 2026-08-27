@@ -655,9 +655,9 @@ async function applyNodeConfig(
     getLog().info({ agentIds: Object.keys(nodeConfig.agents) }, 'claude.inline_agents_registered');
   }
 
-  // effort — clamped into the SDK's own vocabulary. Claude has no `minimal`
-  // rung, so `effort: minimal` becomes `low`, its shallowest. Everything else
-  // on Archon's ladder is a Claude rung already, `xhigh` included.
+  // effort — clamped into the SDK's own vocabulary. Claude has no `minimal` or
+  // `ultra` rung, so they become its shallowest (`low`) and deepest (`max`)
+  // values respectively.
   if (nodeConfig.effort !== undefined) {
     const effort = clampEffort(nodeConfig.effort, CLAUDE_EFFORTS);
     if (effort === undefined) {

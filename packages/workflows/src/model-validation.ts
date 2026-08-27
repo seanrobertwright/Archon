@@ -588,7 +588,7 @@ export function isLiteralSpec(spec: ResolvedModelSpec): spec is { literal: strin
  * to the nearest one it has. So this answers "does effort reach this provider",
  * and the ladder answers "is this a rung" — which is what the tier-config write
  * paths (`PATCH /api/config/tiers`, `archon ai tier set --effort`) need to
- * reject `--effort ultra` up front instead of accepting a no-op.
+ * reject `--effort extreme` up front instead of accepting a no-op.
  */
 export function validEffortsForProvider(provider: string): readonly string[] | null {
   if (!isRegisteredProvider(provider)) return null;

@@ -1879,13 +1879,14 @@ describe('ClaudeProvider', () => {
     });
 
     // #2556: Archon's ladder is the union of every provider's vocabulary, so a
-    // Claude node can now ask for `xhigh` (the SDK has had it since 0.3.209),
-    // and `minimal` — which Claude has no rung for — lands on its shallowest.
-    test('passes xhigh through and clamps minimal to low', async () => {
+    // Claude node can ask for every shared rung; values outside the SDK's slice
+    // land on its nearest endpoint.
+    test('passes native rungs through and clamps the shared endpoints', async () => {
       for (const [declared, applied] of [
         ['xhigh', 'xhigh'],
         ['minimal', 'low'],
         ['max', 'max'],
+        ['ultra', 'max'],
       ] as const) {
         mockQuery.mockClear();
         mockQuery.mockImplementation(async function* () {

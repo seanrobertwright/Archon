@@ -233,24 +233,27 @@ describe('CopilotProvider.sendQuery', () => {
     expect(opts.reasoningEffort).toBe('high');
   });
 
-  test('workflow `effort: max` maps to SDK `xhigh`', async () => {
-    const session = makeFakeSession();
-    nextCreateSessionResult = session;
+  test.each(['max', 'ultra'] as const)(
+    'workflow `effort: %s` maps to SDK `xhigh`',
+    async effort => {
+      const session = makeFakeSession();
+      nextCreateSessionResult = session;
 
-    const p = new CopilotProvider();
-    const gen = p.sendQuery('hi', '/w', undefined, {
-      model: 'gpt-5',
-      nodeConfig: { effort: 'max' },
-    });
-    const first = gen.next();
-    await new Promise(resolve => setTimeout(resolve, 5));
-    session.resolveSend(undefined);
-    await first;
-    await collect(gen);
+      const p = new CopilotProvider();
+      const gen = p.sendQuery('hi', '/w', undefined, {
+        model: 'gpt-5',
+        nodeConfig: { effort },
+      });
+      const first = gen.next();
+      await new Promise(resolve => setTimeout(resolve, 5));
+      session.resolveSend(undefined);
+      await first;
+      await collect(gen);
 
-    const opts = createSessionSpy.mock.calls[0]![0] as { reasoningEffort?: string };
-    expect(opts.reasoningEffort).toBe('xhigh');
-  });
+      const opts = createSessionSpy.mock.calls[0]![0] as { reasoningEffort?: string };
+      expect(opts.reasoningEffort).toBe('xhigh');
+    }
+  );
 
   // #2556: `minimal` is a rung on Archon's shared ladder that Copilot's SDK
   // lacks, so it clamps to the SDK's shallowest — the same treatment `max`
@@ -282,7 +285,7 @@ describe('CopilotProvider.sendQuery', () => {
     const p = new CopilotProvider();
     const gen = p.sendQuery('hi', '/w', undefined, {
       model: 'gpt-5',
-      nodeConfig: { effort: 'ultra' }, // not a rung on the ladder
+      nodeConfig: { effort: 'extreme' }, // not a rung on the ladder
     });
     const first = gen.next();
     await new Promise(resolve => setTimeout(resolve, 5));
