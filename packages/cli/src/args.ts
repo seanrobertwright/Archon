@@ -31,8 +31,6 @@ export const cliArgOptions: CliArgOptions = {
   comment: { type: 'string' },
   reason: { type: 'string' },
   text: { type: 'string' },
-  workflow: { type: 'string' },
-  'no-context': { type: 'boolean' },
   port: { type: 'string' },
   'download-only': { type: 'boolean' },
   scope: { type: 'string' },
