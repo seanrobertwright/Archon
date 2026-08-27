@@ -28,6 +28,7 @@ import type {
 import { createLogger } from '@archon/paths';
 import type {
   FanOutCancelReason,
+  WorkflowCancellationEventDetails,
   WorkflowResumeCursor,
   WorkflowWaitCompletion,
   WorkflowWaitPause,
@@ -1279,9 +1280,12 @@ export async function failWorkflowRun(
   }
 }
 
-export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolean }> {
+export async function cancelWorkflowRun(
+  id: string,
+  event?: WorkflowCancellationEventDetails
+): Promise<{ cancelled: boolean }> {
   const dialect = getDialect();
-  let result: Awaited<ReturnType<typeof pool.query>>;
+  let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
     // Guard against re-stamping an already-finished run. Cancelling a run that
     // is 'completed' or 'cancelled' must be a no-op, not a re-write of
@@ -1290,12 +1294,23 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
     // to discard it), and a 'running' run stays cancellable — that is
     // cooperative cancellation, which the executor honors via its between-layer
     // status check (dag-executor).
-    result = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'cancelled', completed_at = ${dialect.now()}
-       WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
-      [id]
-    );
+    result = await getDatabase().withTransaction(async query => {
+      const update = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'cancelled', completed_at = ${dialect.now()}
+         WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
+        [id]
+      );
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_cancelled',
+          step_name: event?.step_name,
+          data: event?.reason === undefined ? undefined : { reason: event.reason },
+        });
+      }
+      return update;
+    });
   } catch (error) {
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_cancel_failed');

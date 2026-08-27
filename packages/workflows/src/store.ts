@@ -153,6 +153,11 @@ export const FAN_OUT_CANCEL_REASONS = [
 ] as const;
 export type FanOutCancelReason = (typeof FAN_OUT_CANCEL_REASONS)[number];
 
+export interface WorkflowCancellationEventDetails {
+  step_name?: string;
+  reason?: string;
+}
+
 /**
  * Run-tree navigation (#2121 Phase 2) — a narrow, distinct concern (walking the
  * `parent_run_id` graph) kept out of the fat `IWorkflowStore` per the project's ISP
@@ -328,7 +333,10 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    * re-claim and retry. Best-effort (never throws in the caller's critical path).
    */
   releaseWritebackClaim(id: string): Promise<void>;
-  cancelWorkflowRun(id: string): Promise<{ cancelled: boolean }>;
+  cancelWorkflowRun(
+    id: string,
+    event?: WorkflowCancellationEventDetails
+  ): Promise<{ cancelled: boolean }>;
   /** Atomically identify and cancel a fan-out child owned by the engine. */
   cancelFanOutRun(id: string, reason: FanOutCancelReason): Promise<{ cancelled: boolean }>;
 

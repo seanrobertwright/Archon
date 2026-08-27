@@ -270,8 +270,9 @@ describe('createWorkflowStore', () => {
   test('delegates cancelWorkflowRun to DB', async () => {
     mockCancelWorkflowRun.mockResolvedValueOnce(undefined);
     const store = createWorkflowStore();
-    await store.cancelWorkflowRun('run-123');
-    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123');
+    const event = { step_name: 'halt', reason: 'stopped' };
+    await store.cancelWorkflowRun('run-123', event);
+    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123', event);
   });
 
   test('delegates cancelFanOutRun to DB', async () => {

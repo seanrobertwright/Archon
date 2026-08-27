@@ -14554,6 +14554,10 @@ describe('executeDagWorkflow -- cancel node', () => {
 
     // cancelWorkflowRun should have been called
     expect(store.cancelWorkflowRun.mock.calls.length).toBe(1);
+    expect(store.cancelWorkflowRun).toHaveBeenCalledWith(workflowRun.id, {
+      step_name: 'stop',
+      reason: 'Precondition failed',
+    });
 
     // A message with the cancel reason should have been sent
     const sendCalls = platform.sendMessage.mock.calls;
@@ -15456,6 +15460,10 @@ describe('executeDagWorkflow -- approval node', () => {
     // cancelWorkflowRun should have been called
     const cancelCalls = store.cancelWorkflowRun.mock.calls;
     expect(cancelCalls.length).toBe(1);
+    expect(store.cancelWorkflowRun).toHaveBeenCalledWith(workflowRun.id, {
+      step_name: 'review',
+      reason: 'max_attempts (3) exhausted',
+    });
 
     // pauseWorkflowRun should NOT have been called
     const pauseCalls = (store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>).mock

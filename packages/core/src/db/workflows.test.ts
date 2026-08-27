@@ -1639,16 +1639,31 @@ describe('workflows database', () => {
 
   describe('cancelWorkflowRun', () => {
     test('cancels a non-terminal run and reports { cancelled: true }', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
 
-      const result = await cancelWorkflowRun('workflow-run-123');
+      const result = await cancelWorkflowRun('workflow-run-123', {
+        step_name: 'halt',
+        reason: 'operator requested',
+      });
 
       expect(result).toEqual({ cancelled: true });
+      expect(mockQuery).toHaveBeenCalledTimes(2);
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'cancelled'");
       // Must not re-cancel / re-stamp completed_at on an already-finished run.
       expect(query).toContain("status NOT IN ('completed', 'cancelled')");
       expect(params).toEqual(['workflow-run-123']);
+      const [eventQuery, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(eventQuery).toContain('INSERT INTO remote_agent_workflow_events');
+      expect(eventParams.slice(1)).toEqual([
+        'workflow-run-123',
+        'workflow_cancelled',
+        null,
+        'halt',
+        JSON.stringify({ reason: 'operator requested' }),
+      ]);
     });
 
     test('reports { cancelled: false } when the run is already terminal (no throw)', async () => {
@@ -1656,6 +1671,7 @@ describe('workflows database', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
 
       await expect(cancelWorkflowRun('workflow-run-123')).resolves.toEqual({ cancelled: false });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
     test('throws on database error', async () => {

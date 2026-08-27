@@ -43,6 +43,7 @@ mock.module('./connection', () => ({
 const {
   resumeWorkflowRun,
   recoverCancelledFanOutRun,
+  cancelWorkflowRun,
   cancelFanOutRun,
   pauseWorkflowRun,
   pauseWorkflowRunForWait,
@@ -651,6 +652,46 @@ describe('terminal workflow transitions — real SQLite', () => {
 
     expect((await getWorkflowRun('terminal-complete-atomic'))?.status).toBe('running');
     expect((await getWorkflowRun('terminal-fail-atomic'))?.status).toBe('running');
+  });
+});
+
+describe('workflow cancellation — real SQLite', () => {
+  test('commits cancellation and its matching event together', async () => {
+    await seed('cancelled-with-event', 'running', "datetime('now')");
+
+    await expect(
+      cancelWorkflowRun('cancelled-with-event', {
+        step_name: 'stop',
+        reason: 'requested by operator',
+      })
+    ).resolves.toEqual({ cancelled: true });
+
+    expect((await getWorkflowRun('cancelled-with-event'))?.status).toBe('cancelled');
+    expect(await countEvents('cancelled-with-event', 'workflow_cancelled')).toBe(1);
+    const event = await db.query<{ step_name: string; data: string }>(
+      `SELECT step_name, data FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND event_type = 'workflow_cancelled'`,
+      ['cancelled-with-event']
+    );
+    expect(event.rows[0]?.step_name).toBe('stop');
+    expect(JSON.parse(event.rows[0]?.data ?? '{}')).toEqual({ reason: 'requested by operator' });
+  });
+
+  test('rolls back cancellation when its event cannot be stored', async () => {
+    await seed('cancel-atomic', 'running', "datetime('now')");
+
+    await db.query('ALTER TABLE remote_agent_workflow_events RENAME TO events_stash', []);
+    try {
+      await expect(cancelWorkflowRun('cancel-atomic')).rejects.toThrow(
+        'Failed to cancel workflow run'
+      );
+    } finally {
+      await db.query('ALTER TABLE events_stash RENAME TO remote_agent_workflow_events', []);
+    }
+
+    const run = await getWorkflowRun('cancel-atomic');
+    expect(run?.status).toBe('running');
+    expect(run?.completed_at).toBeNull();
   });
 });
 
