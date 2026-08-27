@@ -8,6 +8,9 @@ import type { IDatabase, QueryResult, SqlDialect } from './types';
 import { createLogger } from '@archon/paths';
 import { APP_VERSION } from '../schema-version';
 
+/** bun:sqlite's get() returns null (not undefined) when the query has no row. */
+type Maybe<T> = T | null;
+
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -149,10 +152,10 @@ export class SqliteAdapter implements IDatabase {
     }
   }
 
-  private prepareGet(sql: string, params: SQLQueryBindings[] = []): unknown {
+  private prepareGet<T>(sql: string, params: SQLQueryBindings[] = []): Maybe<T> {
     const stmt = this.db.prepare(sql);
     try {
-      return stmt.get(...params);
+      return stmt.get(...params) as Maybe<T>;
     } finally {
       stmt.finalize();
     }
@@ -242,9 +245,9 @@ export class SqliteAdapter implements IDatabase {
       return;
     }
     try {
-      const existing = this.prepareGet(
+      const existing = this.prepareGet<{ app_version: string }>(
         'SELECT app_version FROM remote_agent_schema_version WHERE id = 1'
-      ) as { app_version: string } | undefined;
+      );
 
       if (!existing) {
         this.db.run(
@@ -347,9 +350,9 @@ export class SqliteAdapter implements IDatabase {
       // not on every open: an unconditional DROP + CREATE rebuilds the index
       // each time the adapter is constructed, and leaves a window where the
       // index is gone if the re-create fails.
-      const existingCodebaseIdx = this.prepareGet(
+      const existingCodebaseIdx = this.prepareGet<{ sql: string | null }>(
         "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_codebase'"
-      ) as { sql: string | null } | undefined;
+      );
       if (existingCodebaseIdx && !(existingCodebaseIdx.sql ?? '').includes('deleted_at IS NULL')) {
         this.db.run('DROP INDEX idx_conversations_codebase');
       }
