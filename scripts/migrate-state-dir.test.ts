@@ -32,15 +32,28 @@
  * A larger budget would answer the question by silencing it.
  * If it does recur, find the specific colliding bound the way #2473 did; do not
  * reach for the timeout.
+ *
+ * It did recur, for the two C5 cases only (#2575). Coverage instrumentation was
+ * measured on windows-latest and ruled out. What was left was accidental cost:
+ * their fixture spawned a SECOND cold `bun` process purely to write one registry
+ * row, which is now an in-process write. The budget still has not moved.
  */
 import { describe, test, expect } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'fs/promises';
 import { removeTempTree } from '@archon/paths/test-utils';
+import { setLogLevel } from '@archon/paths';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 
+// The C5 fixture opens a real adapter in THIS process, which announces its
+// schema init at info. Every subprocess here is already run with LOG_LEVEL=silent;
+// this is the same suppression for the one piece of work that is no longer a
+// subprocess. Children inherit the level at creation, so it has to happen before
+// the first adapter exists.
+setLogLevel('silent');
+
 const SCRIPT = resolve(import.meta.dir, 'migrate-state-dir.ts');
-const REPO_ROOT = resolve(import.meta.dir, '..');
 
 /** Per-test paths. Immutable, and never shared between tests. */
 interface Sandbox {
@@ -418,10 +431,19 @@ describe('migrate-state-dir', () => {
      * silently disable project resolution: here a database exists, so the lookup
      * must still run and still climb.
      *
-     * Registered in a SUBPROCESS: @archon/core's DB connection is a module-level
-     * singleton, so registering in-process would cache a handle to the first
-     * test's temp ARCHON_HOME and fail with SQLITE_IOERR_VNODE once that
-     * directory is torn down.
+     * The row goes in through the SAME adapter the script's lookup opens, so the
+     * fixture cannot drift from the real schema — but through a dedicated instance
+     * rather than `@archon/core/db/codebases`, whose `pool` resolves the
+     * module-level connection singleton from `ARCHON_HOME`. That singleton would
+     * pin the first test's temp home and then fail with SQLITE_IOERR_VNODE once
+     * the directory is torn down; an instance takes an explicit path and is closed
+     * before the sandbox goes away. `name` and `default_cwd` are the only columns
+     * the destination resolution reads (`resolveRepoProjectIdentity`).
+     *
+     * This used to be a cold `bun -e` subprocess importing @archon/core's whole
+     * module graph to write that one row — the accidental half of these tests'
+     * Windows cost (#2575). The subprocess below it runs the migration script
+     * itself and is the contract under test, so it stays a real process.
      */
     async function withProjectSandbox(body: (ctx: ProjectSandbox) => Promise<void>): Promise<void> {
       return withSandbox(async base => {
@@ -432,24 +454,14 @@ describe('migrate-state-dir', () => {
         };
         await mkdir(ctx.subdir, { recursive: true });
 
-        const src = [
-          "const db = await import('@archon/core/db/codebases');",
-          'await db.createCodebase({',
-          `  name: ${JSON.stringify(PROJECT_NAME)},`,
-          `  repository_url: ${JSON.stringify(`https://github.com/${PROJECT_NAME}`)},`,
-          `  default_cwd: ${JSON.stringify(ctx.repo)},`,
-          "  default_branch: 'main',",
-          '});',
-        ].join('\n');
-        const proc = Bun.spawn(['bun', '-e', src], {
-          cwd: REPO_ROOT,
-          env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent' },
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const { exitCode, stderr } = await collect(proc);
-        if (exitCode !== 0) {
-          throw new Error(`registerProject failed (${String(exitCode)}): ${stderr}`);
+        const registry = new SqliteAdapter(join(ctx.archonHome, 'archon.db'));
+        try {
+          await registry.query(
+            'INSERT INTO remote_agent_codebases (name, default_cwd) VALUES ($1, $2)',
+            [PROJECT_NAME, ctx.repo]
+          );
+        } finally {
+          await registry.close();
         }
 
         await body(ctx);

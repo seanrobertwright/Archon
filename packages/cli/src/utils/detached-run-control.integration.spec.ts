@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
 import {
+  DETACHED_RUN_IPC_TIMEOUT_MS,
   detachedRunControlPath,
   requestDetachedRunStop,
   startDetachedRunControlServer,
@@ -45,6 +46,12 @@ function waitForExit(
 /**
  * Ask the endpoint itself whether it is still serving. Connection refusal is the
  * owner's own answer, so this reports shutdown progress without timing it.
+ *
+ * The bound is the same one production `canConnect` puts on its own probe: a
+ * connect that neither succeeds nor errors would otherwise hang until the test
+ * budget expired, which reads as an unrelated timeout instead of an unreachable
+ * endpoint. It is a backstop, not a measurement — on both the reachable and the
+ * refused path the socket settles immediately.
  */
 function endpointIsReachable(path: string): Promise<boolean> {
   return new Promise<boolean>((resolve: (reachable: boolean) => void): void => {
@@ -53,6 +60,9 @@ function endpointIsReachable(path: string): Promise<boolean> {
       probe.destroy();
       resolve(reachable);
     };
+    probe.setTimeout(DETACHED_RUN_IPC_TIMEOUT_MS, (): void => {
+      settle(false);
+    });
     probe.once('connect', (): void => {
       settle(true);
     });
