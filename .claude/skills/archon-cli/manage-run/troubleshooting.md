@@ -6,7 +6,7 @@ Where to look when a workflow fails, hangs, or does the wrong thing.
 
 Workflow run logs are written as JSONL per run:
 
-```
+```text
 ~/.archon/workspaces/<owner>/<repo>/logs/<run-id>.jsonl
 ```
 
@@ -17,8 +17,8 @@ Each line is a structured event. The discriminator is the `type` field. Values (
 | `workflow_start` / `workflow_complete` / `workflow_error` | Run lifecycle |
 | `node_start` / `node_complete` / `node_error` / `node_skipped` | Node lifecycle |
 | `assistant` | AI assistant message — has `content` field with the full AI output |
-| `tool` | SDK tool invocation — has `tool_name`, `tool_input`, `duration_ms`, and optionally `tokens` |
-| `validation` | Workflow-level validation event — has `check` and `result` (`pass` / `fail` / `warn` / `unknown`) |
+| `tool` | SDK tool invocation — has `tool_name` and `tool_input` |
+| `validation` | Historical compatibility only; current runs do not emit this type |
 
 > **Loop iterations and per-attempt retry events are NOT in the JSONL file.** They go through the workflow event emitter (WebSocket / `workflow_events` DB table) under `loop_iteration_started` / `loop_iteration_completed` etc. To see them, query the DB or the Web UI dashboard — not the JSONL log.
 
@@ -26,7 +26,7 @@ Find the run ID from `archon workflow runs --status failed` (or `archon workflow
 
 ```bash
 # Last assistant message (what the AI said before failure)
-jq 'select(.type == "assistant") | .content' <log-file> | tail -1
+jq -sr 'map(select(.type == "assistant") | .content) | last // empty' <log-file>
 
 # All error events (node failures + workflow-level failures)
 jq 'select(.type == "node_error" or .type == "workflow_error")' <log-file>
@@ -39,7 +39,7 @@ Adapter logs (Slack / Telegram / Web / GitHub) are emitted to stderr when `LOG_L
 
 ## Artifact Locations
 
-```
+```text
 ~/.archon/workspaces/<owner>/<repo>/artifacts/runs/<run-id>/
 ```
 
@@ -106,13 +106,17 @@ archon workflow resume <run-id>
 
 `archon workflow resume <run-id>` targets that exact run and reuses its recorded working path/worktree. As a convenience, `archon workflow run my-workflow --resume` resumes the most recent resumable run for that workflow at the invocation cwd. A bare `archon workflow run my-workflow` starts a fresh run.
 
-**Caveat:** AI session context from prior nodes is NOT restored on resume. If a `context: shared` node depended on in-session memory, re-running it will have fresh context. Artifact-based handoff survives; in-context memory does not.
+**Session caveat:** A cold resume does not reconstruct the ambient sequential
+`context: shared` cursor. Explicit `context: { resume: node-id }` ancestry is
+restored from saved run-scoped handles, and an interactive loop with
+`fresh_context: false` resumes its pre-pause session when the provider supports
+it. Artifact-based handoff remains the provider-independent path.
 
 ### Approval gate not appearing on web UI
 
-You set `interactive: true` on the approval node but the workflow still runs in the background and no chat message appears.
+The workflow has an approval node but still runs in the background and no chat message appears.
 
-**Fix:** Set `interactive: true` at the **workflow level** too. Node-level `interactive` is ignored on web without workflow-level `interactive`. See `references/workflow-dag.md` §Approval Nodes and §Interactive Loops.
+**Fix:** Set `interactive: true` at the **workflow level**. Node-level `interactive` is not a supported field; the loader ignores it and warns that the key is unknown.
 
 ### `MCP server connection failed: <plugin>` noise in chat
 
@@ -158,8 +162,8 @@ A `persist_session` node whose provider couldn't restore the prior session runs 
 # Environment sanity first: binaries, gh auth, DB, adapters
 archon doctor
 
-# One run, any status, with per-node event summary — the fastest "why did node X skip/fail"
-archon workflow get <run-id> --verbose --json | jq '.events[]'
+# One run, any status, with raw events — the fastest "why did node X skip/fail"
+archon workflow get <run-id> --verbose --events --json | jq '.events[]'
 
 # Recent runs for this project, all statuses ("did the review pass?")
 archon workflow runs --json | jq '.runs[]'

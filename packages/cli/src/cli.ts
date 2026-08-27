@@ -200,11 +200,11 @@ Commands:
   continue <branch> [msg]    Continue work on an existing worktree with prior context
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
   serve                      Start the web UI server (downloads web UI on first run)
-  skill install [path]       Install the bundled Archon skill into .claude/skills/archon
+  skill install [path]       Install archon-cli into .claude/skills and .agents/skills
   doctor [--full]            Verify your Archon setup (Claude/Codex binaries, gh auth, DB, adapters; --full also probes the OpenCode runtime SDK)
   auth github                Connect your GitHub identity via device flow (multi-user installs)
   ai key set <provider>      Connect an AI provider API key (multi-user installs; key read from prompt/stdin)
-  ai login <provider>        Connect a subscription (claude/copilot) via OAuth — codex is API-key only
+  ai login <provider>        Connect a Claude, ChatGPT/Codex, or Copilot subscription
   ai list                    List your connected AI provider keys
   ai logout <provider>       Disconnect an AI provider key
   ai tier set <t> <p> <m>    Set a model tier (small/medium/large) → provider/model [--effort <e>] [--scope user|install]
