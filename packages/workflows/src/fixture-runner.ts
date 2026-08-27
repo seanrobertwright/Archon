@@ -257,10 +257,17 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
       selected = all.filter(fixture => fixture.pack === options.target);
     }
     if (selected.length === 0) {
-      const names = [...byName.keys()].sort().join(', ');
-      throw new Error(
-        `No fixtures found for '${targetName}'. Name a workflow with fixtures (${names}) or a pack directory containing them.`
-      );
+      // Suggest only workflows a discovered fixture actually targets; the full catalog
+      // would point the user at workflows that cannot satisfy the command.
+      const names = [...new Set(all.flatMap(f => f.workflowNames))]
+        .filter(name => byName.has(name))
+        .sort()
+        .join(', ');
+      const hint =
+        names.length > 0
+          ? ` Name a workflow with fixtures (${names}) or a pack directory containing them.`
+          : ' No workflow in any discovery scope declares fixtures.';
+      throw new Error(`No fixtures found for '${targetName}'.${hint}`);
     }
   }
 

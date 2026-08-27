@@ -232,6 +232,27 @@ describe('runFixtures', () => {
     );
   });
 
+  it('suggests only workflows that carry fixtures when a target has none', async () => {
+    const { cwd } = writeTempProject({ body: passingBody });
+    const bareDir = join(cwd, '.archon', 'workflows', 'bare');
+    mkdirSync(bareDir, { recursive: true });
+    writeFileSync(
+      join(bareDir, 'bare-wf.yaml'),
+      'name: bare-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hi\n'
+    );
+    const err = await runFixtures({
+      workflows: [
+        ...workflowsOnDisk(cwd, ['test-wf']),
+        ...workflowsOnDisk(cwd, ['bare-wf'], 'bare'),
+      ],
+      cwd,
+      target: 'bare-wf',
+    }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    const suggested = /fixtures \(([^)]*)\)/.exec((err as Error).message)?.[1] ?? '';
+    expect(suggested.split(', ')).toEqual(['test-wf']);
+  });
+
   it('restricts to fixtures of the named workflow via target', async () => {
     const { cwd } = writeTempProject({
       workflowName: 'target-wf',
