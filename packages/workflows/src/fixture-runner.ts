@@ -40,7 +40,6 @@ import type { WorkflowWithSource } from './schemas/workflow';
 import type { WorkflowConfig } from './deps';
 import type { ResolvedAiProfile } from './model-validation';
 import {
-  DEFAULT_WORKFLOW_SOURCE_CONFIG,
   captureWorkflowSource,
   capturedSourceRoots,
   liveSourceRoots,
@@ -247,9 +246,15 @@ export interface RunFixturesOptions {
   /**
    * The install's command and default-loading policy, frozen with the capture so a repo
    * that points `commands.folder` outside `.archon/commands` still resolves its commands.
-   * Defaults to the standard folders — correct for any repo that has not moved them.
+   *
+   * Required, with no default — the same closed seam {@link capturedSourceRoots} enforces
+   * one call deeper, for the same reason. A default here would let a caller that never
+   * read the repo's config freeze a narrower set of directories than the real run takes,
+   * which is exactly the divergence `workflowSourceConfigFrom` exists to prevent. A caller
+   * that genuinely wants the standard folders passes `DEFAULT_WORKFLOW_SOURCE_CONFIG` and
+   * says so.
    */
-  sourceConfig?: WorkflowSourceConfig;
+  sourceConfig: WorkflowSourceConfig;
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
   /** Restrict to one workflow name or pack prefix; unresolved values are an error. */
@@ -340,18 +345,32 @@ async function withExecWorkspace<T>(
   }
 }
 
+/**
+ * Disposal runs in `withExecWorkspace`'s `finally`, so nothing here may throw: an escaping
+ * error would REPLACE the value `fn` already produced, and `checkFixture` would report a
+ * cleanup message as the fixture's verdict. That is the same "a verdict depends on
+ * incidental environment state" bug this module exists to remove, just relocated to the
+ * exit path. Both failures are logged and the debris is left behind instead.
+ */
 async function disposeExecWorkspace(cwd: string, workspace: string): Promise<void> {
   try {
     await execFileAsync('git', ['worktree', 'remove', '--force', workspace], { cwd });
+    return;
   } catch (error) {
-    // The tree itself is disposable; rm covers the case where git cannot remove it
-    // (e.g. the caller repo moved) and would otherwise leave it behind.
-    await rm(workspace, { recursive: true, force: true });
     getLog().warn(
       { workspace, error: error instanceof Error ? error.message : String(error) },
       'fixture_runner.exec_workspace_dispose_failed'
     );
   }
+  // The tree itself is disposable; rm covers the case where git cannot remove it (e.g. the
+  // caller repo moved) and would otherwise leave it behind. `force: true` only suppresses
+  // ENOENT — a permission error or a still-held handle still rejects.
+  await rm(workspace, { recursive: true, force: true }).catch((error: unknown) => {
+    getLog().warn(
+      { workspace, error: error instanceof Error ? error.message : String(error) },
+      'fixture_runner.exec_workspace_remove_failed'
+    );
+  });
 }
 
 /**
@@ -398,7 +417,7 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
 
   const results = await withCapturedFixtureSource(
     options.cwd,
-    options.sourceConfig ?? DEFAULT_WORKFLOW_SOURCE_CONFIG,
+    options.sourceConfig,
     async captured => {
       const collected: FixtureCheckResult[] = [];
       for (const fixture of selected) {

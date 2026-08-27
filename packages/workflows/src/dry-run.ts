@@ -484,12 +484,14 @@ interface DryRunContext {
 async function loadDryRunCommand(ctx: DryRunContext, command: string): Promise<string> {
   const result = await loadCommandPrompt(
     {
-      loadConfig: async () => ({
-        assistant: 'claude',
-        commands: {},
-        assistants: { claude: {}, codex: {} },
-        defaults: { loadDefaultCommands: true },
-      }),
+      // Unreachable: `loadCommandPrompt` consults `loadConfig` only when its source roots
+      // carry no `load_default_commands`, and `ctx.sourceRoots` always does — the field is
+      // a required boolean on every roots value. Throwing rather than returning a stub
+      // config keeps a future signature change from silently resolving commands against a
+      // fabricated policy.
+      loadConfig: () => {
+        throw new Error('dry-run resolves commands from its source roots, never from config');
+      },
     },
     ctx.cwd,
     command,

@@ -9154,6 +9154,49 @@ describe('workflowTestCommand', () => {
     expect(exit).toBe(0);
     expect(fixtureRunner.formatFixtureReport).toHaveBeenCalled();
   });
+
+  it("freezes the repo's own command policy, not the default folders (#2851)", async () => {
+    // The capture decides which directories a fixture can resolve a command from, so a
+    // repo that moved `commands.folder` must have THAT folder frozen. Reading the value
+    // here is the only place it can be read; `runFixtures` cannot load config itself.
+    const core = await import('@archon/core');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    (core.loadConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      commands: { folder: '.archon/prompts' },
+      defaults: { loadDefaultCommands: false },
+    });
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockResolvedValue({
+      results: [],
+      passed: 0,
+      failed: 0,
+    });
+
+    await workflowTestCommand('/test/path', undefined);
+
+    expect(fixtureRunner.runFixtures).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceConfig: {
+          load_default_workflows: true,
+          load_default_commands: false,
+          command_folder: '.archon/prompts',
+        },
+      })
+    );
+  });
+
+  it('fails the fixture run when the config is unreadable instead of freezing defaults', async () => {
+    // `loadConfig` returns defaults when there is no config file, so a throw means a
+    // MALFORMED one. Proceeding would capture the standard folders and report green on
+    // fixtures whose commands the real run would never find.
+    const core = await import('@archon/core');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    (core.loadConfig as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('bad yaml at .archon/config.yaml:7')
+    );
+
+    await expect(workflowTestCommand('/test/path', undefined)).rejects.toThrow(/bad yaml/);
+    expect(fixtureRunner.runFixtures).not.toHaveBeenCalled();
+  });
 });
 
 describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () => {
