@@ -20905,8 +20905,38 @@ describe('executeDagWorkflow -- loop_group node', () => {
     // nested groups. The inner gate combines three scopes: its included body's previous
     // iteration, that body's current output, and the enclosing group's previous iteration.
     // Apostrophes in every carried value make unsafe shell interpolation fail visibly.
+    //
+    // Cost recomposition (flaky-fan-out): executing this 2x2 nesting end-to-end forks a
+    // structurally-fixed TWELVE real `bash -c` processes (seed x2 + included body x4 +
+    // inner gates x4 + outer gates x2), which consumed ~46% of Bun's 5000ms default test
+    // budget on Windows CI in a healthy run. What pins the #2623 regression is exactly
+    // WHICH scoped values the executor compiles into each gate/body invocation, so this
+    // half observes every fork through the established `git.execFileAsync` seam, pins each
+    // compiled script byte-for-byte, and runs zero shells. Real-parse behaviour of the
+    // apostrophed substitutions is proven separately by the shell-safety companion below.
     const outerCounter = join(testDir, 'nested-until-outer-counter');
     const outerCounterRef = `"${outerCounter.replace(/\\/g, '/')}"`;
+
+    // Mirrors the executor's substitution quoting contract (shellQuote): apostrophes are
+    // escaped as '\'' inside single quotes. EDGE H pins the same convention unit-side.
+    const q = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const READY = q("inner's ready");
+    const FIRST = q("outer's first");
+    const SECOND = q("outer's second");
+    const seedScript =
+      `if [ -f ${outerCounterRef} ]; then echo "outer's second"; ` +
+      `else touch ${outerCounterRef}; echo "outer's first"; fi`;
+    /** Outer-group previous-seed scopes: iteration 1 saw none, iteration 2 saw "first". */
+    const innerGateScript = (outerIteration: 1 | 2, seenPrevOutput: boolean) =>
+      `${seenPrevOutput ? `test ${READY}` : "test ''"} = "inner's ready" && ` +
+      `test ${READY} = "inner's ready" && ` +
+      `{ { test ${outerIteration === 1 ? FIRST : SECOND} = "outer's first" && ` +
+      `${outerIteration === 1 ? "test -z ''" : `test -z ${FIRST}`}; } || ` +
+      `{ test ${outerIteration === 1 ? FIRST : SECOND} = "outer's second" && ` +
+      `test ${outerIteration === 1 ? "''" : FIRST} = "outer's first"; }; }`;
+    const outerGateScript = (outerIteration: 1 | 2) =>
+      `test ${outerIteration === 1 ? FIRST : SECOND} = "outer's second" && ` +
+      `test ${READY} = "inner's ready"`;
 
     const block = workflowDefinitionSchema.parse({
       name: 'nested-check-block',
@@ -20927,9 +20957,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
             nodes: [
               {
                 id: 'seed',
-                bash:
-                  `if [ -f ${outerCounterRef} ]; then echo "outer's second"; ` +
-                  `else touch ${outerCounterRef}; echo "outer's first"; fi`,
+                bash: seedScript,
               },
               {
                 id: 'inner',
@@ -20962,25 +20990,77 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(expanded).toBeDefined();
     if (!expanded) throw new Error('expected expanded workflow');
 
-    const store = createMockStore();
-    const result = await executeDagWorkflow(
-      createMockDeps(store),
-      createMockPlatform(),
-      'conv-lg',
-      testDir,
-      ready(expanded),
-      makeWorkflowRun('dag-nested-loopgroup-included-prev'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    const observedScripts: string[] = [];
+    let seedRuns = 0;
+    let innerGatesRun = 0;
+    let outerGatesRun = 0;
+    const exitCodeErr = (code: number) =>
+      Object.assign(new Error(`exit ${String(code)}`), { code });
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async (_cmd, args) => {
+      const script = String(args?.[1] ?? '');
+      observedScripts.push(script);
+      if (script === `echo "inner's ready"`) return { stdout: "inner's ready\n", stderr: '' };
+      if (script === seedScript) {
+        seedRuns += 1;
+        return { stdout: seedRuns === 1 ? "outer's first\n" : "outer's second\n", stderr: '' };
+      }
+      if (script.includes('-z ')) {
+        innerGatesRun += 1;
+        if (innerGatesRun % 2 === 0) return { stdout: '', stderr: '' }; // conditions met
+        throw exitCodeErr(1); // previous-output snapshot still empty -> iterate again
+      }
+      if (script.includes(`= "outer's second"`)) {
+        outerGatesRun += 1;
+        if (outerGatesRun === 2) return { stdout: '', stderr: '' }; // second seed output
+        throw exitCodeErr(1); // first seed output -> repeat the enclosing group
+      }
+      throw new Error(`unexpected bash subprocess while pinning #2623 substitutions: '${script}'`);
+    });
 
-    // Each outer iteration runs two inner iterations: inner iteration 1 sees an empty
+    let store!: ReturnType<typeof createMockStore>;
+    let result: Awaited<ReturnType<typeof executeDagWorkflow>>;
+    try {
+      store = createMockStore();
+      result = await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-lg',
+        testDir,
+        ready(expanded),
+        makeWorkflowRun('dag-nested-loopgroup-included-prev'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      execSpy.mockRestore();
+    }
+
+    // Every fork the executor makes carries exactly the scoped values #2623 fixes: the
+    // included body's previous/current output and the enclosing group's previous/current
+    // seed stay distinct per nesting level and per outer iteration (empty snapshot on
+    // first pass, prior value afterwards).
+    expect(observedScripts).toEqual([
+      seedScript,
+      `echo "inner's ready"`,
+      innerGateScript(1, false),
+      `echo "inner's ready"`,
+      innerGateScript(1, true),
+      outerGateScript(1),
+      seedScript,
+      `echo "inner's ready"`,
+      innerGateScript(2, false),
+      `echo "inner's ready"`,
+      innerGateScript(2, true),
+      outerGateScript(2),
+    ]);
+
+    // Each outer iteration ran two inner iterations: inner iteration 1 sees an empty
     // previous snapshot, while iteration 2 sees the prior included-node output. The outer
     // repeats once, proving its own previous `seed` output remains outer-scoped.
     expect(result).toContain("inner's ready");
@@ -20991,6 +21071,77 @@ describe('executeDagWorkflow -- loop_group node', () => {
           event.event_type === 'node_completed' && event.step_name === 'outer.inner.pass__check'
       );
     expect(includedCompletions.map(event => event.data?.iteration)).toEqual([1, 2, 1, 2]);
+  });
+
+  it('keeps included-block until_bash substitution parseable by real bash end-to-end (#2623)', async () => {
+    // Shell-safety companion to the zero-subprocess #2623 test above: the substituted
+    // gate below carries apostrophed literals through REAL Git-Bash so a quoting
+    // regression (unbalanced quotes, lost escaping) surfaces as a parse failure instead
+    // of passing silent. Four one-line scripts total — the house ceiling for spawned
+    // subprocesses in until_bash tests. Iteration 1's gate fails on the empty
+    // `$LOOP_PREV.pass__check.output` snapshot, forcing the second iteration whose gate
+    // sees the prior included-node output — the exact causal chain of #2623.
+    const block = workflowDefinitionSchema.parse({
+      name: 'shellsafe-check-block',
+      description: 'Reusable apostrophe-emitting check',
+      returns: 'check',
+      nodes: [{ id: 'check', bash: `echo "inner's ready"` }],
+    });
+    const parent = workflowDefinitionSchema.parse({
+      name: 'included-shellsafe-loop-group',
+      description: 'Repeats an included block gated by until_bash',
+      nodes: [
+        {
+          id: 'group',
+          loop_group: {
+            max_iterations: 2,
+            until_bash:
+              `test $LOOP_PREV.pass__check.output = "inner's ready" && ` +
+              `test $pass.output = "inner's ready"`,
+            nodes: [{ id: 'pass', include: 'shellsafe-check-block' }],
+          },
+        },
+      ],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        [block.name, block],
+        [parent.name, parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get(parent.name);
+    expect(expanded).toBeDefined();
+    if (!expanded) throw new Error('expected expanded workflow');
+
+    const store = createMockStore();
+    const result = await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-lg',
+      testDir,
+      ready(expanded),
+      makeWorkflowRun('dag-included-untilbash-shellsafe'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The gate's quoted comparisons parsed correctly: the loop completed via until_bash
+    // on its second iteration only after reading BOTH the included body's previous
+    // iteration and its current output through real bash.
+    expect(result).toContain("inner's ready");
+    const includedCompletions = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .filter(
+        event => event.event_type === 'node_completed' && event.step_name === 'group.pass__check'
+      );
+    expect(includedCompletions.map(event => event.data?.iteration)).toEqual([1, 2]);
   });
 
   it('runs a command-backed loop node inside a loop_group body with namespaced lifecycle events', async () => {
