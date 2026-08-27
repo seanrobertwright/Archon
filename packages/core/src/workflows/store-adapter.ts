@@ -68,6 +68,7 @@ export function createWorkflowStore(): IWorkflowStore {
     findResumableRun: workflowDb.findResumableRun,
     failOrphanedRuns: workflowDb.failOrphanedRuns,
     resumeWorkflowRun: workflowDb.resumeWorkflowRun,
+    recoverCancelledFanOutRun: workflowDb.recoverCancelledFanOutRun,
     updateWorkflowRun: workflowDb.updateWorkflowRun,
     updateWorkflowActivity: workflowDb.updateWorkflowActivity,
     // DB returns string | null; IWorkflowStore declares WorkflowRunStatus | null.
@@ -85,6 +86,7 @@ export function createWorkflowStore(): IWorkflowStore {
     claimWriteback: workflowDb.claimWriteback,
     releaseWritebackClaim: workflowDb.releaseWritebackClaim,
     cancelWorkflowRun: workflowDb.cancelWorkflowRun,
+    cancelFanOutRun: workflowDb.cancelFanOutRun,
     createWorkflowEvent: async (data): Promise<void> => {
       try {
         await workflowEventDb.createWorkflowEvent(data);

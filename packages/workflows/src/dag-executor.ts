@@ -95,7 +95,8 @@ import {
   waitCondition,
 } from './schemas';
 import type { BindingDirective } from './schemas';
-import type { DagResumeSnapshot, PersistedNodeOutput } from './store';
+import { FAN_OUT_CANCEL_REASONS } from './store';
+import type { DagResumeSnapshot, FanOutCancelReason, PersistedNodeOutput } from './store';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger, captureWorkflowCompleted } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
@@ -837,8 +838,10 @@ export interface RunChildWorkflowArgs {
    * non-deterministic items producer changed the item at a given index (never re-keys).
    */
   itemHash?: string;
-  /** Present only when re-driving a FAILED child on parent resume (D5 recovery path). */
-  resumeFailedChild?: WorkflowRun;
+  /** Present only when re-driving an existing child on parent resume. */
+  resumeChild?:
+    | { kind: 'failed'; run: WorkflowRun }
+    | { kind: 'fan-out-cancelled'; run: WorkflowRun };
   /**
    * Named inputs (#2470) — the resolved `with:` map the parent supplied, plus (for a
    * fan-out child) the per-item `fan_out.as` entry. Logical JSON values (#2637).
@@ -7507,25 +7510,16 @@ async function executeApprovalNode(
 
     // Check if max attempts exhausted
     if (rejectionCount >= maxAttempts) {
-      await deps.store.cancelWorkflowRun(workflowRun.id);
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'workflow_cancelled',
-          step_name: stepName,
-          data: { reason: `max_attempts (${String(maxAttempts)}) exhausted` },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
-            'workflow.event_persist_failed'
-          );
-        });
+      const reason = `max_attempts (${String(maxAttempts)}) exhausted`;
+      await deps.store.cancelWorkflowRun(workflowRun.id, {
+        step_name: stepName,
+        reason,
+      });
       getWorkflowEventEmitter().emit({
         type: 'workflow_cancelled',
         runId: workflowRun.id,
         nodeId: node.id,
-        reason: `max_attempts (${String(maxAttempts)}) exhausted`,
+        reason,
       });
       const cancelMsg = `❌ Approval node \`${node.id}\` cancelled after ${String(maxAttempts)} rejections.`;
       await safeSendMessage(platform, conversationId, cancelMsg, msgContext);
@@ -8071,7 +8065,7 @@ async function executeWorkflowNode(
     if (existing.status === 'failed') {
       // Resume-through-parent recovery (D5/#1764): re-drive the failed child once.
       return await interpret(
-        await ctx.runChildWorkflow({ ...childArgs, resumeFailedChild: existing })
+        await ctx.runChildWorkflow({ ...childArgs, resumeChild: { kind: 'failed', run: existing } })
       );
     }
     if (
@@ -8105,16 +8099,7 @@ async function executeWorkflowNode(
  * never re-driven, so the parent would fail every resume with no way back. Delete it only
  * once no resumable run can predate the change.
  */
-type FanOutCancelReason = 'fan_out_gate' | 'fan_out_sibling' | 'fan_out_orphan';
-const FAN_OUT_RECOVERABLE_CANCEL_REASONS: ReadonlySet<string> = new Set<FanOutCancelReason>([
-  'fan_out_gate',
-  'fan_out_sibling',
-  // Every reason above is engine-owned, so every one belongs here — `fan_out_orphan` was
-  // missing, which read an orphan the engine cancelled as a USER cancel. Items shrinking
-  // and then growing back left those slots permanently cancelled: dead under all_done, and
-  // an unrecoverable node failure on every resume under all_success.
-  'fan_out_orphan',
-]);
+const FAN_OUT_RECOVERABLE_CANCEL_REASONS: ReadonlySet<string> = new Set(FAN_OUT_CANCEL_REASONS);
 
 /**
  * A `running`/`pending` child found on re-entry is ambiguous: a crash-orphan of a prior
@@ -8455,21 +8440,14 @@ async function executeFanOutWorkflowNode(
   };
 
   // Cancel a child the fan-out path OWNS, stamping WHY (C2/I4) so the cancel is
-  // attributable AND — unlike a user's out-of-band cancel — recoverable on resume. The
-  // reason is written first (a best-effort metadata merge), then the status is flipped;
-  // both are best-effort so a store hiccup can't unwind the node.
+  // attributable AND — unlike a user's out-of-band cancel — recoverable on resume.
   const cancelChild = async (childId: string, reason: FanOutCancelReason): Promise<void> => {
     if (!childId) return;
-    await deps.store
-      .updateWorkflowRun(childId, { metadata: { cancelled_reason: reason } })
-      .catch((err: unknown) => {
-        getLog().error(
-          { err: err as Error, childRunId: childId, reason },
-          'workflow.fan_out_cancel_reason_write_failed'
-        );
-      });
-    await deps.store.cancelWorkflowRun(childId).catch((err: unknown) => {
-      getLog().error({ err: err as Error, childRunId: childId }, 'workflow.fan_out_cancel_failed');
+    await deps.store.cancelFanOutRun(childId, reason).catch((err: unknown) => {
+      getLog().error(
+        { err: err as Error, childRunId: childId, reason },
+        'workflow.fan_out_cancel_failed'
+      );
     });
   };
 
@@ -8799,22 +8777,12 @@ async function executeFanOutWorkflowNode(
         ...fanOutStaticInputs,
         ...(fanOut.as !== undefined ? { [fanOut.as]: item as JsonValue } : {}),
       };
-      // A fan-out-recoverable-cancelled child (gate/sibling) can't be resumed while
-      // 'cancelled' (resumeWorkflowRun rejects that status) — clear it to 'failed' first,
-      // then re-drive through the failed path. Our own tagged cancel is terminal state we
-      // own, so this recovery heuristic is appropriate (CLAUDE.md).
-      let resumeChild = existing?.status === 'failed' ? existing : undefined;
-      if (existing?.status === 'cancelled' && isFanOutRecoverableCancel(existing)) {
-        await deps.store
-          .updateWorkflowRun(existing.id, { status: 'failed' })
-          .catch((err: unknown) => {
-            getLog().error(
-              { err: err as Error, childRunId: existing.id },
-              'workflow.fan_out_recover_cancel_failed'
-            );
-          });
-        resumeChild = { ...existing, status: 'failed' };
-      }
+      const resumeChild =
+        existing?.status === 'failed'
+          ? ({ kind: 'failed', run: existing } as const)
+          : existing?.status === 'cancelled' && isFanOutRecoverableCancel(existing)
+            ? ({ kind: 'fan-out-cancelled', run: existing } as const)
+            : undefined;
       // Whatever this child returns — completed, failed, cancelled, or paused — it is this
       // child's outcome alone. The join reads them all once every one has settled.
       const outcome = await runChild({
@@ -8831,7 +8799,7 @@ async function executeFanOutWorkflowNode(
         childIndex: i,
         itemHash: hashFanOutItem(input),
         ...(Object.keys(childInputs).length > 0 ? { inputs: childInputs } : {}),
-        ...(resumeChild ? { resumeFailedChild: resumeChild } : {}),
+        ...(resumeChild ? { resumeChild } : {}),
       });
       // A paused child is cancelled HERE rather than at the join, and the timing is
       // load-bearing rather than tidiness. A pause is not terminal, and a non-terminal run
@@ -10688,20 +10656,10 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   workflowId: workflowRun.id,
                   nodeName: node.id,
                 });
-                deps.store
-                  .createWorkflowEvent({
-                    workflow_run_id: workflowRun.id,
-                    event_type: 'workflow_cancelled',
-                    step_name: stepNamePrefix + node.id,
-                    data: { reason },
-                  })
-                  .catch((err: Error) => {
-                    getLog().error(
-                      { err, workflowRunId: workflowRun.id, eventType: 'workflow_cancelled' },
-                      'workflow.event_persist_failed'
-                    );
-                  });
-                await deps.store.cancelWorkflowRun(workflowRun.id);
+                await deps.store.cancelWorkflowRun(workflowRun.id, {
+                  step_name: stepNamePrefix + node.id,
+                  reason,
+                });
                 getWorkflowEventEmitter().emit({
                   type: 'workflow_cancelled',
                   runId: workflowRun.id,
@@ -12498,23 +12456,29 @@ export async function executeDagWorkflow(
         : undefined;
   }
 
+  const duration = Date.now() - dagStartTime;
+
   // Update DB and emit completion
   try {
-    await deps.store.completeWorkflowRun(workflowRun.id, {
-      node_counts: nodeCounts,
-      // Cost and token totals are NOT written here — `persistRunUsage` already wrote
-      // them at the run tail, before this branch was chosen (#2469). Keeping a second
-      // copy here would be two writers of the same three keys, free to drift.
-      // A sub-run persists its terminal summary so the parent can thread it as
-      // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
-      // growth to child runs only (top-level runs return the summary directly).
-      // `summary_value` is the additive logical sibling (#2637): old binaries keep
-      // reading `summary`, new parents prefer the typed value when present.
-      ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
-      ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
-        ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
-        : {}),
-    });
+    await deps.store.completeWorkflowRun(
+      workflowRun.id,
+      { duration_ms: duration },
+      {
+        node_counts: nodeCounts,
+        // Cost and token totals are NOT written here — `persistRunUsage` already wrote
+        // them at the run tail, before this branch was chosen (#2469). Keeping a second
+        // copy here would be two writers of the same three keys, free to drift.
+        // A sub-run persists its terminal summary so the parent can thread it as
+        // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
+        // growth to child runs only (top-level runs return the summary directly).
+        // `summary_value` is the additive logical sibling (#2637): old binaries keep
+        // reading `summary`, new parents prefer the typed value when present.
+        ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
+        ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
+          ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
+          : {}),
+      }
+    );
   } catch (dbErr) {
     getLog().error(
       { err: dbErr as Error, workflowRunId: workflowRun.id },
@@ -12534,7 +12498,6 @@ export async function executeDagWorkflow(
     ...(totalCostUsd > 0 ? { cost_usd: totalCostUsd } : {}),
     ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),
   });
-  const duration = Date.now() - dagStartTime;
   const emitter = getWorkflowEventEmitter();
   emitter.emit({
     type: 'workflow_completed',
@@ -12555,18 +12518,6 @@ export async function executeDagWorkflow(
     nodesTotal: nodeCounts.total,
     ...runUsageProps,
   });
-  deps.store
-    .createWorkflowEvent({
-      workflow_run_id: workflowRun.id,
-      event_type: 'workflow_completed',
-      data: { duration_ms: duration },
-    })
-    .catch((err: Error) => {
-      getLog().error(
-        { err, workflowRunId: workflowRun.id, eventType: 'workflow_completed' },
-        'workflow_event_persist_failed'
-      );
-    });
   emitter.unregisterRun(workflowRun.id);
 
   // terminalOutput (computed above, before the completion write) is the run's

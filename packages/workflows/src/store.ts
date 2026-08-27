@@ -70,9 +70,9 @@ export const WORKFLOW_EVENT_TYPES = [
   'workflow_failed',
   // #2348 — written by the resume CAS ONLY when it clears a non-empty
   // `metadata.error`, carrying that error in `data.error`. It is the audit
-  // record for a failure that resume would otherwise erase (the CLI's SIGTERM
-  // handler records a failure in metadata and nowhere else), NOT a general
-  // "a resume happened" marker: its absence never means the run wasn't resumed.
+  // record for a legacy failure that resume would otherwise erase (older CLI
+  // SIGTERM handlers could record a failure in metadata and nowhere else), NOT
+  // a general "a resume happened" marker: its absence never means the run wasn't resumed.
   'workflow_resumed',
   // Between-run continuation (#2747) — written on the ADOPTING run's log when it
   // starts with `--adopt`/`--supersedes`, so the chain renders from events alone.
@@ -151,6 +151,18 @@ export const WORKFLOW_EVENT_TYPES = [
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
+
+export const FAN_OUT_CANCEL_REASONS = [
+  'fan_out_gate',
+  'fan_out_sibling',
+  'fan_out_orphan',
+] as const;
+export type FanOutCancelReason = (typeof FAN_OUT_CANCEL_REASONS)[number];
+
+export interface WorkflowCancellationEventDetails {
+  step_name?: string;
+  reason?: string;
+}
 
 /**
  * Run-tree navigation (#2121 Phase 2) — a narrow, distinct concern (walking the
@@ -243,6 +255,8 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   findResumableRun(workflowName: string, workingPath: string): Promise<WorkflowRun | null>;
   failOrphanedRuns(): Promise<{ count: number }>;
   resumeWorkflowRun(id: string, cursor?: WorkflowResumeCursor): Promise<WorkflowRun>;
+  /** Claim an engine-cancelled fan-out child for immediate in-process recovery. */
+  recoverCancelledFanOutRun(id: string): Promise<WorkflowRun>;
   /**
    * `output_root` (#2200) is write-once: the executor sets it at run start only
    * when the persisted value is null. Re-writing it on resume would re-derive
@@ -251,13 +265,20 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    */
   updateWorkflowRun(
     id: string,
-    updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+    updates: Partial<Pick<WorkflowRun, 'metadata' | 'output_root'>> & {
+      status?: Exclude<WorkflowRunStatus, 'completed' | 'failed' | 'cancelled'>;
       outcome?: WorkflowRunOutcome;
     }
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
   getWorkflowRunStatus(id: string): Promise<WorkflowRunStatus | null>;
-  completeWorkflowRun(id: string, metadata?: Record<string, unknown>): Promise<void>;
+  /** Atomically complete the run and persist its matching lifecycle event. */
+  completeWorkflowRun(
+    id: string,
+    completion: { duration_ms: number },
+    metadata?: Record<string, unknown>
+  ): Promise<void>;
+  /** Atomically fail the run and persist its matching lifecycle event. */
   failWorkflowRun(
     id: string,
     error: string,
@@ -318,7 +339,12 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    * re-claim and retry. Best-effort (never throws in the caller's critical path).
    */
   releaseWritebackClaim(id: string): Promise<void>;
-  cancelWorkflowRun(id: string): Promise<{ cancelled: boolean }>;
+  cancelWorkflowRun(
+    id: string,
+    event?: WorkflowCancellationEventDetails
+  ): Promise<{ cancelled: boolean }>;
+  /** Atomically identify and cancel a fan-out child owned by the engine. */
+  cancelFanOutRun(id: string, reason: FanOutCancelReason): Promise<{ cancelled: boolean }>;
 
   /**
    * Create a workflow event. Implementations MUST NOT throw — catch all errors

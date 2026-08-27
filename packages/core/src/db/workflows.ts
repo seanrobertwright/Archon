@@ -28,10 +28,14 @@ import type {
 } from '../schemas/workflow-run';
 import { createLogger } from '@archon/paths';
 import type {
+  FanOutCancelReason,
+  WorkflowCancellationEventDetails,
+  WorkflowEventType,
   WorkflowResumeCursor,
   WorkflowWaitCompletion,
   WorkflowWaitPause,
 } from '@archon/workflows/store';
+import { FAN_OUT_CANCEL_REASONS } from '@archon/workflows/store';
 
 /** Best-effort ROLLBACK — log but swallow errors since we're already in an error path. */
 function rollback(): Promise<void> {
@@ -205,7 +209,7 @@ function replaceWaitMetadata(paramIndex: number): string {
  * from retrying. `workflow_run_id` is supplied by the CAS function.
  */
 export interface GateResolutionEvent {
-  event_type: string;
+  event_type: WorkflowEventType;
   step_name: string;
   data: Record<string, unknown>;
 }
@@ -599,6 +603,12 @@ export async function cancelResumableRunsForConversation(
           `Resumable run snapshot changed during reset (expected ${String(resumable.length)}, cancelled ${String(result.rowCount)})`
         );
       }
+      for (const run of resumable) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: run.id,
+          event_type: 'workflow_cancelled',
+        });
+      }
       return resumable.map(run => normalizeWorkflowRun(run));
     });
   } catch (error) {
@@ -906,8 +916,7 @@ export async function resumeWorkflowRun(
     //
     // The CAS also clears `metadata.error` so a run that fails, is resumed, and
     // then completes doesn't keep rendering its old failure (#2329). Because
-    // metadata is the ONLY place some failures are recorded — the CLI's SIGTERM
-    // handler calls failWorkflowRun and writes no event (#2348) — the error being
+    // legacy runs may carry their only failure record in metadata (#2348), the error being
     // cleared is first preserved as a `workflow_resumed` event, in the SAME
     // transaction as the clear, so the audit trail can never lose it. The read,
     // the CAS and the event INSERT are one transaction (mirroring
@@ -1030,6 +1039,59 @@ export async function resumeWorkflowRun(
   return normalizeWorkflowRun(row);
 }
 
+export async function recoverCancelledFanOutRun(id: string): Promise<WorkflowRun> {
+  const dialect = getDialect();
+  const cancelledReason =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->>'cancelled_reason'"
+      : "json_extract(metadata, '$.cancelled_reason')";
+  const metadataWithoutCancelledReason =
+    getDatabaseType() === 'postgresql'
+      ? "metadata - 'cancelled_reason'"
+      : "json_remove(metadata, '$.cancelled_reason')";
+  const eventReason =
+    getDatabaseType() === 'postgresql' ? "data->>'reason'" : "json_extract(data, '$.reason')";
+
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'running',
+             completed_at = NULL,
+             started_at = ${dialect.now()},
+             last_activity_at = ${dialect.now()},
+             metadata = ${metadataWithoutCancelledReason}
+         WHERE id = $1
+           AND status = 'cancelled'
+           AND ${cancelledReason} IN ($2, $3, $4)`,
+        [id, ...FAN_OUT_CANCEL_REASONS]
+      );
+      if ((result.rowCount ?? 0) === 0) {
+        throw new Error(`Workflow run is not an engine-cancelled fan-out child (id: ${id})`);
+      }
+      await query(
+        `DELETE FROM remote_agent_workflow_events
+         WHERE workflow_run_id = $1
+           AND event_type = 'workflow_cancelled'
+           AND ${eventReason} IN ($2, $3, $4)`,
+        [id, ...FAN_OUT_CANCEL_REASONS]
+      );
+      const recovered = await query<WorkflowRun>(
+        'SELECT * FROM remote_agent_workflow_runs WHERE id = $1',
+        [id]
+      );
+      const row = recovered.rows[0];
+      if (!row) throw new Error(`Workflow run not found after fan-out recovery (id: ${id})`);
+      return normalizeWorkflowRun(row);
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run ')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_fan_out_recover_failed');
+    throw new Error(`Failed to recover cancelled fan-out run: ${err.message}`);
+  }
+}
+
 /**
  * Find the most recent workflow run for a worker platform conversation ID.
  * Joins with conversations table to resolve platform_conversation_id → DB id.
@@ -1055,36 +1117,28 @@ export async function getWorkflowRunByWorkerPlatformId(
 }
 
 /**
- * Partially update a workflow run.
- * - Dynamically builds SQL from provided fields
- * - Auto-sets completed_at when status becomes 'completed' or 'failed'
- * - Merges metadata with existing (does not replace)
- * - No-op if updates object is empty
+ * Partially update non-terminal workflow state. Terminal transitions use their
+ * dedicated lifecycle writers so the run row cannot outpace its durable event.
  */
 export async function updateWorkflowRun(
   id: string,
-  updates: Partial<Pick<WorkflowRun, 'status' | 'metadata' | 'output_root'>> & {
+  updates: Partial<Pick<WorkflowRun, 'metadata' | 'output_root'>> & {
+    status?: Exclude<WorkflowRunStatus, 'completed' | 'failed' | 'cancelled'>;
     outcome?: WorkflowRunOutcome;
   }
 ): Promise<void> {
   const dialect = getDialect();
   const setClauses: string[] = [];
   const values: unknown[] = [];
+  const requestedStatus: WorkflowRunStatus | undefined = updates.status;
 
-  if (updates.status !== undefined) {
-    values.push(updates.status);
+  if (requestedStatus !== undefined && TERMINAL_WORKFLOW_STATUSES.includes(requestedStatus)) {
+    throw new Error(`Terminal workflow status '${requestedStatus}' requires a lifecycle writer`);
+  }
+
+  if (requestedStatus !== undefined) {
+    values.push(requestedStatus);
     setClauses.push(`status = $${values.length}`);
-    // Auto-set completed_at for terminal statuses. (Gate approve/reject no
-    // longer stages runs as 'failed' — they stay 'paused' with
-    // metadata.approval.resolved set (#2075) — so a 'failed' write here is
-    // always a real completion.)
-    if (
-      updates.status === 'completed' ||
-      updates.status === 'failed' ||
-      updates.status === 'cancelled'
-    ) {
-      setClauses.push(`completed_at = ${dialect.now()}`);
-    }
   }
   if (updates.metadata !== undefined) {
     // Use dialect helper for JSON merge - need to calculate the param index
@@ -1131,26 +1185,35 @@ export async function updateWorkflowRun(
 
 export async function completeWorkflowRun(
   id: string,
+  completion: { duration_ms: number },
   metadata?: Record<string, unknown>
 ): Promise<void> {
   const dialect = getDialect();
   let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
-    if (metadata) {
-      result = await pool.query(
-        `UPDATE remote_agent_workflow_runs
-         SET status = 'completed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-         WHERE id = $1 AND status = 'running'`,
-        [id, JSON.stringify(metadata)]
-      );
-    } else {
-      result = await pool.query(
-        `UPDATE remote_agent_workflow_runs
-         SET status = 'completed', completed_at = ${dialect.now()}
-         WHERE id = $1 AND status = 'running'`,
-        [id]
-      );
-    }
+    result = await getDatabase().withTransaction(async query => {
+      const update = metadata
+        ? await query(
+            `UPDATE remote_agent_workflow_runs
+             SET status = 'completed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
+             WHERE id = $1 AND status = 'running'`,
+            [id, JSON.stringify(metadata)]
+          )
+        : await query(
+            `UPDATE remote_agent_workflow_runs
+             SET status = 'completed', completed_at = ${dialect.now()}
+             WHERE id = $1 AND status = 'running'`,
+            [id]
+          );
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_completed',
+          data: completion,
+        });
+      }
+      return update;
+    });
   } catch (error) {
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_complete_failed');
@@ -1213,6 +1276,13 @@ export async function failWorkflowRun(
           },
         });
       }
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_failed',
+          data: { error },
+        });
+      }
       return update;
     });
   } catch (dbError) {
@@ -1226,9 +1296,12 @@ export async function failWorkflowRun(
   }
 }
 
-export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolean }> {
+export async function cancelWorkflowRun(
+  id: string,
+  event?: WorkflowCancellationEventDetails
+): Promise<{ cancelled: boolean }> {
   const dialect = getDialect();
-  let result: Awaited<ReturnType<typeof pool.query>>;
+  let result: Awaited<ReturnType<IDatabase['query']>>;
   try {
     // Guard against re-stamping an already-finished run. Cancelling a run that
     // is 'completed' or 'cancelled' must be a no-op, not a re-write of
@@ -1237,12 +1310,23 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
     // to discard it), and a 'running' run stays cancellable — that is
     // cooperative cancellation, which the executor honors via its between-layer
     // status check (dag-executor).
-    result = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'cancelled', completed_at = ${dialect.now()}
-       WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
-      [id]
-    );
+    result = await getDatabase().withTransaction(async query => {
+      const update = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'cancelled', completed_at = ${dialect.now()}
+         WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
+        [id]
+      );
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_cancelled',
+          step_name: event?.step_name,
+          data: event?.reason === undefined ? undefined : { reason: event.reason },
+        });
+      }
+      return update;
+    });
   } catch (error) {
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_cancel_failed');
@@ -1254,6 +1338,43 @@ export async function cancelWorkflowRun(id: string): Promise<{ cancelled: boolea
     // report "nothing to cancel" instead of a false "Cancelled" (see #1830 I1).
     // Same info level as the resume CAS-miss signal for consistency (S2).
     getLog().info({ workflowRunId: id }, 'db.workflow_run_cancel_noop');
+  }
+  return { cancelled };
+}
+
+export async function cancelFanOutRun(
+  id: string,
+  reason: FanOutCancelReason
+): Promise<{ cancelled: boolean }> {
+  const dialect = getDialect();
+  let result: Awaited<ReturnType<IDatabase['query']>>;
+  try {
+    result = await getDatabase().withTransaction(async query => {
+      const update = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'cancelled',
+             completed_at = ${dialect.now()},
+             metadata = ${dialect.jsonMerge('metadata', 2)}
+         WHERE id = $1 AND status NOT IN ('completed', 'cancelled')`,
+        [id, JSON.stringify({ cancelled_reason: reason })]
+      );
+      if ((update.rowCount ?? 0) > 0) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_cancelled',
+          data: { reason },
+        });
+      }
+      return update;
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id, reason }, 'db.workflow_run_fan_out_cancel_failed');
+    throw new Error(`Failed to cancel fan-out run: ${err.message}`);
+  }
+  const cancelled = (result.rowCount ?? 0) > 0;
+  if (!cancelled) {
+    getLog().info({ workflowRunId: id, reason }, 'db.workflow_run_fan_out_cancel_noop');
   }
   return { cancelled };
 }

@@ -102,6 +102,7 @@ function createMockStore(): IWorkflowStore {
         adopted_from_run_id: null,
       })
     ),
+    recoverCancelledFanOutRun: mock(() => Promise.reject(new Error('unused in this test'))),
     updateWorkflowRun: mock(() => Promise.resolve()),
     updateWorkflowActivity: mock(() => Promise.resolve()),
     getWorkflowRunStatus: mock(() => Promise.resolve('running' as const)),
@@ -114,6 +115,7 @@ function createMockStore(): IWorkflowStore {
     claimWriteback: mock(() => Promise.resolve({ claimed: true })),
     releaseWritebackClaim: mock(() => Promise.resolve()),
     cancelWorkflowRun: mock(() => Promise.resolve({ cancelled: false })),
+    cancelFanOutRun: mock(() => Promise.resolve({ cancelled: false })),
     createWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEventIfRunning: mock(() => Promise.resolve({ persisted: true })),

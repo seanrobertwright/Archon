@@ -112,6 +112,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
       costUsd: 0,
     })),
     resumeWorkflowRun: mock(async () => makeRun()),
+    recoverCancelledFanOutRun: mock(async () => makeRun()),
     getCodebase: mock(async () => null),
     getCodebaseEnvVars: mock(async () => ({})),
     updateWorkflowActivity: mock(async () => {}),
@@ -123,6 +124,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
     cancelWorkflowRun: mock(async () => ({ cancelled: false })),
+    cancelFanOutRun: mock(async () => ({ cancelled: false })),
     getWorkflowNodeSession: mock(async () => null),
     listWorkflowRunNodeSessions: mock(async () => []),
     upsertWorkflowRunNodeSession: mock(async () => {}),
@@ -240,10 +242,10 @@ describe('executeWorkflow preamble', () => {
         started_at: recentTime,
         status: 'running',
       });
-      const updateSpy = mock(async () => {});
+      const cancelSpy = mock(async () => ({ cancelled: true }));
       const store = makeStore({
         getActiveWorkflowRunByPath: mock(async () => activeRun),
-        updateWorkflowRun: updateSpy,
+        cancelWorkflowRun: cancelSpy,
       });
       const deps = makeDeps(store);
       const platform = makePlatform();
@@ -275,10 +277,7 @@ describe('executeWorkflow preamble', () => {
       // cancelled — preventing zombie pending rows that would block future
       // dispatches.
       expect((store.createWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
-      const cancelCall = updateSpy.mock.calls.find(
-        (call: unknown[]) => (call[1] as { status?: string })?.status === 'cancelled'
-      );
-      expect(cancelCall).toBeDefined();
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
     });
   });
 

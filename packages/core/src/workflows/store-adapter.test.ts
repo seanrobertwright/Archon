@@ -10,12 +10,14 @@ const mockGetActiveWorkflowRunByPath = mock(() => Promise.resolve(null));
 const mockFailOrphanedRuns = mock(() => Promise.resolve({ count: 0 }));
 const mockFindResumableRun = mock(() => Promise.resolve(null));
 const mockResumeWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
+const mockRecoverCancelledFanOutRun = mock(() => Promise.resolve({ id: 'run-1' }));
 const mockUpdateWorkflowRun = mock(() => Promise.resolve());
 const mockUpdateWorkflowActivity = mock(() => Promise.resolve());
 const mockGetWorkflowRunStatus = mock(() => Promise.resolve('running'));
 const mockCompleteWorkflowRun = mock(() => Promise.resolve());
 const mockFailWorkflowRun = mock(() => Promise.resolve());
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
+const mockCancelFanOutRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRunForWait = mock(() => Promise.resolve());
 const mockClearWorkflowWaitContext = mock(() => Promise.resolve({ cleared: true }));
@@ -34,12 +36,14 @@ mock.module('../db/workflows', () => ({
   failOrphanedRuns: mockFailOrphanedRuns,
   findResumableRun: mockFindResumableRun,
   resumeWorkflowRun: mockResumeWorkflowRun,
+  recoverCancelledFanOutRun: mockRecoverCancelledFanOutRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
   updateWorkflowActivity: mockUpdateWorkflowActivity,
   getWorkflowRunStatus: mockGetWorkflowRunStatus,
   completeWorkflowRun: mockCompleteWorkflowRun,
   failWorkflowRun: mockFailWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
+  cancelFanOutRun: mockCancelFanOutRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
   pauseWorkflowRunForWait: mockPauseWorkflowRunForWait,
   clearWorkflowWaitContext: mockClearWorkflowWaitContext,
@@ -161,6 +165,7 @@ describe('createWorkflowStore', () => {
       'failOrphanedRuns',
       'findResumableRun',
       'resumeWorkflowRun',
+      'recoverCancelledFanOutRun',
       'updateWorkflowRun',
       'updateWorkflowActivity',
       'getWorkflowRunStatus',
@@ -173,6 +178,7 @@ describe('createWorkflowStore', () => {
       'claimWriteback',
       'releaseWritebackClaim',
       'cancelWorkflowRun',
+      'cancelFanOutRun',
       'createWorkflowEvent',
       'persistWorkflowEvent',
       'persistWorkflowEventIfRunning',
@@ -264,8 +270,15 @@ describe('createWorkflowStore', () => {
   test('delegates cancelWorkflowRun to DB', async () => {
     mockCancelWorkflowRun.mockResolvedValueOnce(undefined);
     const store = createWorkflowStore();
-    await store.cancelWorkflowRun('run-123');
-    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123');
+    const event = { step_name: 'halt', reason: 'stopped' };
+    await store.cancelWorkflowRun('run-123', event);
+    expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-123', event);
+  });
+
+  test('delegates cancelFanOutRun to DB', async () => {
+    const store = createWorkflowStore();
+    await store.cancelFanOutRun('run-123', 'fan_out_gate');
+    expect(mockCancelFanOutRun).toHaveBeenCalledWith('run-123', 'fan_out_gate');
   });
 
   test('delegates getCodebase to DB', async () => {

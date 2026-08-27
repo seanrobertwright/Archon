@@ -112,7 +112,7 @@ describe('listWorkflowEventsSince — real SQLite (catches the C1 datetime misma
       await expect(claim).resolves.toEqual({ persisted: false });
 
       const events = await listWorkflowEvents('run-claim-race');
-      expect(events).toHaveLength(0);
+      expect(events.map(event => event.event_type)).toEqual(['workflow_cancelled']);
     } finally {
       db.query = originalQuery;
       releaseClaim();

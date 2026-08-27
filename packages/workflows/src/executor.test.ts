@@ -199,6 +199,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
       costUsd: 0,
     })),
     resumeWorkflowRun: mock(async () => makeRun()),
+    recoverCancelledFanOutRun: mock(async () => makeRun()),
     getCodebase: mock(async () => null),
     getCodebaseEnvVars: mock(async () => ({})),
     updateWorkflowActivity: mock(async () => {}),
@@ -210,6 +211,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
     cancelWorkflowRun: mock(async () => ({ cancelled: false })),
+    cancelFanOutRun: mock(async () => ({ cancelled: false })),
     getWorkflowNodeSession: mock(async () => null),
     listWorkflowRunNodeSessions: mock(async () => []),
     upsertWorkflowRunNodeSession: mock(async () => {}),
@@ -612,11 +614,11 @@ describe('executeWorkflow', () => {
     it('marks self as cancelled when guard fires (no zombie pending row)', async () => {
       const selfRun = makeRun({ id: 'self-run-789' });
       const otherRun = makeRun({ id: 'other-run-456', status: 'running' });
-      const updateSpy = mock(async () => {});
+      const cancelSpy = mock(async () => ({ cancelled: true }));
       const store = makeStore({
         createWorkflowRun: mock(async () => selfRun),
         getActiveWorkflowRunByPath: mock(async () => otherRun),
-        updateWorkflowRun: updateSpy,
+        cancelWorkflowRun: cancelSpy,
       });
       const deps = makeDeps(store);
 
@@ -632,7 +634,7 @@ describe('executeWorkflow', () => {
 
       // Without this, every guard-blocked dispatch would leak a `pending`
       // row that briefly blocks future dispatches via the lock query.
-      expect(updateSpy).toHaveBeenCalledWith('self-run-789', { status: 'cancelled' });
+      expect(cancelSpy).toHaveBeenCalledWith('self-run-789');
     });
 
     it('uses the actionable "in use" message format with workflow name, duration, and short id', async () => {
@@ -2574,12 +2576,12 @@ describe('executeWorkflow', () => {
     // suite — those errors surface at the caller now, not in the executor.
 
     it('cancels workflowRun when guard query throws (no zombie row)', async () => {
-      const updateSpy = mock(async () => {});
+      const cancelSpy = mock(async () => ({ cancelled: true }));
       const store = makeStore({
         getActiveWorkflowRunByPath: mock(async () => {
           throw new Error('DB connection lost during guard');
         }),
-        updateWorkflowRun: updateSpy,
+        cancelWorkflowRun: cancelSpy,
       });
       const deps = makeDeps(store);
 
@@ -2594,10 +2596,7 @@ describe('executeWorkflow', () => {
       );
 
       expect(result.success).toBe(false);
-      const cancelCall = updateSpy.mock.calls.find(
-        (call: unknown[]) => (call[1] as { status?: string })?.status === 'cancelled'
-      );
-      expect(cancelCall).toBeDefined();
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -2954,6 +2953,10 @@ describe('telemetry wiring', () => {
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
     expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
       expect.objectContaining({ outcome: 'failed', exitReason: 'unhandled_error' })
+    );
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(store.createWorkflowEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: 'workflow_failed' })
     );
   });
 
