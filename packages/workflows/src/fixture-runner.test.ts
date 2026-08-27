@@ -431,30 +431,103 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     expect(readFileSync(join(cwd, 'tracked.txt'), 'utf8')).toBe(COMMITTED_YAML);
   });
 
-  it('resolves named scripts from the caller tree, not the scratch worktree (#2851)', async () => {
+  const SCRIPT_YAML = [
+    'name: script-wf',
+    'description: runs a named script',
+    'nodes:',
+    '  - id: run-script',
+    '    script: greet-script',
+    '    runtime: bun',
+  ].join('\n');
+
+  function writeScript(cwd: string, body: string): void {
+    mkdirSync(join(cwd, '.archon', 'scripts'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'scripts', 'greet-script.ts'), body);
+  }
+
+  it('executes the captured copy of a named script, not the caller tree file (#2851)', async () => {
     const { cwd } = writeTempProject({
       workflowName: 'script-wf',
-      workflowYaml: [
-        'name: script-wf',
-        'description: runs a named script',
-        'nodes:',
-        '  - id: run-script',
-        '    script: greet-script',
-        '    runtime: bun',
-      ].join('\n'),
+      workflowYaml: SCRIPT_YAML,
       body: execFixtureBody,
     });
+    // Absolute, so the probe records where the script FILE was, independently of the
+    // directory it executed in.
+    const probe = join(cwd, 'ran-from.txt');
+    writeScript(
+      cwd,
+      `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(probe)}, import.meta.path);\n`
+    );
     await initGitWithCommittedFile(cwd);
-    // Written after the commit, so the scratch worktree of HEAD cannot contain it:
-    // only caller-tree (`cwd`) source resolution can find this script.
-    mkdirSync(join(cwd, '.archon', 'scripts'), { recursive: true });
-    writeFileSync(join(cwd, '.archon', 'scripts', 'greet-script.ts'), 'console.log("ok")\n');
+
     const report = await runFixtures({
       workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
       cwd,
     });
     expect(report.failed).toBe(0);
+
+    // The bytes that ran came from the invocation's source capture, under its project
+    // scope — so every `__file__`-relative read and write a script performs lands in the
+    // capture too, not in the operator's checkout.
+    const ranFrom = readFileSync(probe, 'utf8');
+    expect(ranFrom).toContain('fixture-source-');
+    expect(ranFrom.endsWith(join('project', '.archon', 'scripts', 'greet-script.ts'))).toBe(true);
+  });
+
+  it('captures the working tree, so an uncommitted script edit is what runs (#2851)', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'script-wf',
+      workflowYaml: SCRIPT_YAML,
+      body: execFixtureBody,
+    });
+    // Committed — and therefore the only version a scratch worktree of HEAD holds.
+    writeScript(cwd, 'process.exit(1);\n');
+    await initGitWithCommittedFile(cwd);
+    // Uncommitted: the edit an author is iterating on when they run `workflow test`.
+    writeScript(cwd, 'console.log("ok");\n');
+
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
+      cwd,
+    });
     expect(report.results[0].outcome).toBe('completed');
+  });
+
+  it('captures the command folder the source config names (#2851)', async () => {
+    const body = ['fixture:', '  expect: completed', '', 'run-command: "stub"'].join('\n');
+    const workflowYaml = [
+      'name: command-wf',
+      'description: sources its prompt from a command file',
+      'nodes:',
+      '  - id: run-command',
+      '    command: greet',
+    ].join('\n');
+    const { cwd } = writeTempProject({
+      workflowName: 'command-wf',
+      workflowYaml,
+      body,
+    });
+    // A repo that moved its commands off the default folder; only the source config
+    // says where they are, and the capture is what a command node then reads.
+    mkdirSync(join(cwd, '.archon', 'prompts'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'prompts', 'greet.md'), 'Greet $ARGUMENTS');
+    const workflows = [workflowsOnDisk(cwd, ['command-wf'])[0]];
+
+    const configured = await runFixtures({
+      workflows,
+      cwd,
+      sourceConfig: {
+        load_default_workflows: true,
+        load_default_commands: true,
+        command_folder: '.archon/prompts',
+      },
+    });
+    expect(configured.failed).toBe(0);
+
+    // Without it the folder is outside every captured scope, and the node fails the way
+    // a real run would rather than quietly reading the live file.
+    const unconfigured = await runFixtures({ workflows, cwd });
+    expect(unconfigured.failed).toBe(1);
   });
 
   it('disposes the scratch worktree after each fixture (#2851)', async () => {

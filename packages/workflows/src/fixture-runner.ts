@@ -15,8 +15,13 @@
  * Every remaining key is a node-id → stub-output entry, exactly what
  * `workflow run --dry-run --stubs` accepts. The only execution path is
  * `dryRunWorkflow`, so a fixture can never trigger a real run or provider call.
- * With `exec-code: true`, executed nodes run in a scratch worktree of the caller
- * repo's HEAD (see {@link withExecWorkspace}), never against the operator's tree.
+ *
+ * A fixture run reproduces both halves of a real run's source/target split (#2851).
+ * SOURCE — named scripts and command files — resolves through one frozen
+ * {@link captureWorkflowSource} taken per invocation, the same mechanism `workflow run`
+ * uses, so a fixture cannot pass on a workflow whose capture would break the real run.
+ * The TARGET that `exec-code: true` nodes execute against is a scratch worktree of the
+ * caller repo's HEAD (see {@link withExecWorkspace}), never the operator's tree.
  */
 import { readdir, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -34,7 +39,14 @@ import {
 import type { WorkflowWithSource } from './schemas/workflow';
 import type { WorkflowConfig } from './deps';
 import type { ResolvedAiProfile } from './model-validation';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  DEFAULT_WORKFLOW_SOURCE_CONFIG,
+  captureWorkflowSource,
+  capturedSourceRoots,
+  liveSourceRoots,
+  type WorkflowSourceConfig,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -232,10 +244,63 @@ export interface RunFixturesOptions {
   cwd: string;
   /** Source scopes corresponding to `workflows`; defaults to the live project, global, and bundled scopes. */
   sourceRoots?: WorkflowSourceRoots;
+  /**
+   * The install's command and default-loading policy, frozen with the capture so a repo
+   * that points `commands.folder` outside `.archon/commands` still resolves its commands.
+   * Defaults to the standard folders — correct for any repo that has not moved them.
+   */
+  sourceConfig?: WorkflowSourceConfig;
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
   /** Restrict to one workflow name or pack prefix; unresolved values are an error. */
   target?: string;
+}
+
+/**
+ * Run `fn` against ONE frozen capture of the caller's executable source (#2851).
+ *
+ * A real run freezes its source before it executes a node, and every later lookup goes
+ * to the capture. Fixtures do the same, for the same two reasons: a `__file__`-relative
+ * script resolved live can read and write the operator's checkout no matter where the
+ * node executes, and a workflow that only breaks once captured — the failure class
+ * `workflow-source.ts` documents — has to be reachable from `workflow test` or the
+ * command cannot certify what it claims to.
+ *
+ * One capture per invocation, not per fixture: the capture copies live files, so taking
+ * it once is also what makes the whole run a function of a single snapshot. Uncommitted
+ * authoring is unaffected — the copy is of the working tree, not of HEAD.
+ */
+async function withCapturedFixtureSource<T>(
+  cwd: string,
+  sourceConfig: WorkflowSourceConfig,
+  fn: (roots: WorkflowSourceRoots) => Promise<T>
+): Promise<T> {
+  const captureRoot = join(getArchonTempPath(), `fixture-source-${randomUUID()}`);
+  let capture;
+  try {
+    capture = await captureWorkflowSource({
+      sourceRoot: cwd,
+      captureRoot,
+      ...(sourceConfig.command_folder !== undefined
+        ? { commandFolder: sourceConfig.command_folder }
+        : {}),
+      sourceConfig,
+    });
+  } catch (error) {
+    throw new Error(
+      `Fixtures could not freeze the workflow source in '${cwd}': ${(error as Error).message}`
+    );
+  }
+  try {
+    return await fn(capturedSourceRoots(capture.captureRoot, capture.manifest.source_config));
+  } finally {
+    await rm(captureRoot, { recursive: true, force: true }).catch((error: unknown) => {
+      getLog().warn(
+        { captureRoot, error: error instanceof Error ? error.message : String(error) },
+        'fixture_runner.source_capture_dispose_failed'
+      );
+    });
+  }
 }
 
 /**
@@ -331,10 +396,17 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
     }
   }
 
-  const results: FixtureCheckResult[] = [];
-  for (const fixture of selected) {
-    results.push(...(await runOneFixture(fixture, byName, options)));
-  }
+  const results = await withCapturedFixtureSource(
+    options.cwd,
+    options.sourceConfig ?? DEFAULT_WORKFLOW_SOURCE_CONFIG,
+    async captured => {
+      const collected: FixtureCheckResult[] = [];
+      for (const fixture of selected) {
+        collected.push(...(await runOneFixture(fixture, byName, options, captured)));
+      }
+      return collected;
+    }
+  );
 
   return Object.freeze({
     results,
@@ -346,7 +418,8 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
 async function runOneFixture(
   fixture: DiscoveredFixture,
   byName: Map<string, WorkflowWithSource>,
-  options: RunFixturesOptions
+  options: RunFixturesOptions,
+  captured: WorkflowSourceRoots
 ): Promise<FixtureCheckResult[]> {
   let parsed: ParsedFixtureFile;
   try {
@@ -384,7 +457,7 @@ async function runOneFixture(
   for (const entry of targets) {
     const ws = byName.get(entry.name);
     if (ws === undefined) continue;
-    out.push(await checkFixture(entry.name, ws, fixture, parsed, options));
+    out.push(await checkFixture(entry.name, ws, fixture, parsed, options, captured));
   }
   return out;
 }
@@ -394,7 +467,8 @@ async function checkFixture(
   ws: WorkflowWithSource,
   fixture: DiscoveredFixture,
   parsed: ParsedFixtureFile,
-  options: RunFixturesOptions
+  options: RunFixturesOptions,
+  captured: WorkflowSourceRoots
 ): Promise<FixtureCheckResult> {
   const base = {
     fixture: fixture.label,
@@ -412,6 +486,7 @@ async function checkFixture(
         ...(parsed.declaration.inputs ? { inputs: parsed.declaration.inputs } : {}),
         execCode,
         execWorkspace: workspace,
+        sourceRoots: captured,
         ...(options.config ? { config: options.config } : {}),
         ...(options.aiProfile ? { aiProfile: options.aiProfile } : {}),
       });

@@ -93,9 +93,9 @@ Work through these questions in order, with the user where marked:
 8. **Wiring** into YAML (below), then **fixtures**: every authored workflow ships
    a dry-run fixture under `<pack>/<workflow>/fixtures/*.stubs.yaml` declaring its
    expected outcome. Prove red paths red before trusting them. Fixtures prove the
-   paths that dry-run can execute. A reachable `workflow:` or
-   `include:` + `fan_out:` node fails dry-run by design, so prove that path with a
-   small real acceptance run while keeping fixtures for the surrounding wiring.
+   paths that dry-run can execute. A reachable `workflow:` or `include:` +
+   `fan_out:` node fails dry-run by design, so prove that path with a small real
+   acceptance run while keeping fixtures for the surrounding wiring.
 9. Validate: load-time errors surface in `archon workflow list`; then
    `archon workflow test <workflow>` runs supported fixture paths without AI spend.
 

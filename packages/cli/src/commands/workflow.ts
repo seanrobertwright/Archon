@@ -71,6 +71,7 @@ import {
   recordSelectedWorkflow,
   resolveContinuationWorkflow,
   withCapturedSource,
+  workflowSourceConfigFrom,
   type CapturedSourceOwner,
   type PreparedWorkflowSource,
   type ResolvedContinuation,
@@ -1020,7 +1021,21 @@ export async function workflowTestCommand(
   options: { json?: boolean } = {}
 ): Promise<number> {
   const { workflows } = await loadWorkflows(cwd);
-  const report = await runFixtures({ workflows, cwd, ...(target !== undefined ? { target } : {}) });
+  // The fixture runner freezes this repo's source before executing anything, exactly as
+  // `workflow run` does, and this config decides which directories get frozen. A malformed
+  // one would silently narrow that set, so it fails here instead; `loadConfig` returns
+  // defaults when there is simply no config file.
+  const config = await loadConfig(cwd).catch((error: unknown) => {
+    throw new Error(
+      `Cannot read the workflow source configuration in ${cwd}: ${(error as Error).message}`
+    );
+  });
+  const report = await runFixtures({
+    workflows,
+    cwd,
+    sourceConfig: workflowSourceConfigFrom(config),
+    ...(target !== undefined ? { target } : {}),
+  });
 
   if (options.json) {
     await writeJsonLine({
