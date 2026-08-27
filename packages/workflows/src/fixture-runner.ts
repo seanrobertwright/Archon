@@ -15,11 +15,15 @@
  * Every remaining key is a node-id → stub-output entry, exactly what
  * `workflow run --dry-run --stubs` accepts. The only execution path is
  * `dryRunWorkflow`, so a fixture can never trigger a real run or provider call.
+ * With `exec-code: true`, executed nodes run in a scratch worktree of the caller
+ * repo's HEAD (see {@link withExecWorkspace}), never against the operator's tree.
  */
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, mkdir, rm, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { join, relative, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
-import { createLogger } from '@archon/paths';
+import { createLogger, getArchonTempPath } from '@archon/paths';
+import { execFileAsync } from '@archon/git';
 import {
   RESERVED_FIXTURE_KEYS,
   dryRunStubsSchema,
@@ -233,6 +237,57 @@ export interface RunFixturesOptions {
 }
 
 /**
+ * Run `fn` with an isolated execution workspace for an exec-code fixture (#2851).
+ *
+ * The workspace is a detached scratch worktree of the caller repo's HEAD, so executed
+ * nodes see a clean checkout: pre-existing diffs and untracked files in the caller's
+ * tree cannot leak into a fixture verdict, and anything executed code writes lands in
+ * the scratch tree instead of the caller's checkout. A caller outside any git
+ * repository is a hard failure — the only alternative would be executing in place,
+ * which is exactly the dependency on tree state this prevents.
+ */
+async function withExecWorkspace<T>(
+  cwd: string,
+  fn: (workspace: string) => Promise<T>
+): Promise<T> {
+  try {
+    await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd });
+  } catch {
+    throw new Error(
+      `Exec-code fixtures require a git checkout to isolate execution; '${cwd}' is not inside a git repository`
+    );
+  }
+  const workspace = join(getArchonTempPath(), `fixture-exec-${randomUUID()}`);
+  await mkdir(getArchonTempPath(), { recursive: true });
+  try {
+    await execFileAsync('git', ['worktree', 'add', '--detach', workspace, 'HEAD'], { cwd });
+  } catch (error) {
+    throw new Error(
+      `Exec-code fixture could not create an isolated execution workspace from HEAD: ${(error as Error).message}`
+    );
+  }
+  try {
+    return await fn(workspace);
+  } finally {
+    await disposeExecWorkspace(cwd, workspace);
+  }
+}
+
+async function disposeExecWorkspace(cwd: string, workspace: string): Promise<void> {
+  try {
+    await execFileAsync('git', ['worktree', 'remove', '--force', workspace], { cwd });
+  } catch (error) {
+    // The tree itself is disposable; rm covers the case where git cannot remove it
+    // (e.g. the caller repo moved) and would otherwise leave it behind.
+    await rm(workspace, { recursive: true, force: true });
+    getLog().warn(
+      { workspace, error: error instanceof Error ? error.message : String(error) },
+      'fixture_runner.exec_workspace_dispose_failed'
+    );
+  }
+}
+
+/**
  * Run every discovered fixture through `dryRunWorkflow` and judge each against its
  * declaration. A fixture passes iff the outcome matches, a declared failure fails on
  * exactly the declared node, and no reached node lacked a stub. Unused stubs are a
@@ -335,16 +390,20 @@ async function checkFixture(
     expect: parsed.declaration.expect,
   };
   try {
-    const result = await dryRunWorkflow({
-      workflow: ws.workflow,
-      userMessage: '',
-      cwd: options.cwd,
-      stubs: parsed.stubs,
-      ...(parsed.declaration.inputs ? { inputs: parsed.declaration.inputs } : {}),
-      execCode: parsed.execCode,
-      ...(options.config ? { config: options.config } : {}),
-      ...(options.aiProfile ? { aiProfile: options.aiProfile } : {}),
-    });
+    const execCode = parsed.execCode;
+    const run = (workspace?: string): Promise<DryRunResult> =>
+      dryRunWorkflow({
+        workflow: ws.workflow,
+        userMessage: '',
+        cwd: options.cwd,
+        stubs: parsed.stubs,
+        ...(parsed.declaration.inputs ? { inputs: parsed.declaration.inputs } : {}),
+        execCode,
+        ...(workspace !== undefined ? { execWorkspace: workspace } : {}),
+        ...(options.config ? { config: options.config } : {}),
+        ...(options.aiProfile ? { aiProfile: options.aiProfile } : {}),
+      });
+    const result = execCode ? await withExecWorkspace(options.cwd, run) : await run();
 
     let failureReason: string | undefined;
     if (result.outcome !== parsed.declaration.expect) {

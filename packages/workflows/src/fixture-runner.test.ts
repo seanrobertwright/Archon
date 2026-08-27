@@ -1,8 +1,9 @@
 /** Tests for the declared-data dry-run fixture runner (#2772). */
 import { describe, it, expect, afterEach } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileAsync } from '@archon/git';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
 import type { WorkflowWithSource } from './schemas/workflow';
@@ -271,5 +272,96 @@ describe('runFixtures', () => {
       target: 'pack',
     });
     expect(report.passed).toBe(1);
+  });
+});
+
+describe('runFixtures exec-code isolation (#2851)', () => {
+  const COMMITTED_YAML = 'committed-file\n';
+
+  /** A bash node whose success depends ONLY on the cleanliness of the checkout it executes in. */
+  const GUARD_YAML = [
+    'name: test-wf',
+    'description: probe the checkout it executes in',
+    'nodes:',
+    '  - id: probe',
+    '    bash: |',
+    '      [ -z "$(git status --porcelain)" ]',
+  ].join('\n');
+
+  const WRITER_YAML = [
+    'name: writer-wf',
+    'description: writes a relative-path file where it executes',
+    'nodes:',
+    '  - id: writer',
+    '    bash: echo executed > leak.txt',
+  ].join('\n');
+
+  const execFixtureBody = ['fixture:', '  expect: completed', '', 'exec-code: true'].join('\n');
+
+  const git = (cwd: string, ...args: string[]): Promise<unknown> =>
+    execFileAsync('git', args, { cwd });
+
+  /** Turn a plain temp project into a git repo with one committed file besides the project's own. */
+  async function initGitWithCommittedFile(cwd: string): Promise<void> {
+    await git(cwd, 'init', '-q');
+    await git(cwd, 'config', 'user.email', 't@t');
+    await git(cwd, 'config', 'user.name', 't');
+    writeFileSync(join(cwd, 'tracked.txt'), COMMITTED_YAML);
+    await git(cwd, 'add', '-A');
+    await git(cwd, 'commit', '-qm', 'init');
+  }
+
+  it('gives clean and pre-dirtied callers the same verdict (#2851)', async () => {
+    const clean = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
+    await initGitWithCommittedFile(clean.cwd);
+    const cleanReport = await runFixtures({
+      workflows: [workflowsOnDisk(clean.cwd, ['test-wf'])[0]],
+      cwd: clean.cwd,
+    });
+    expect(cleanReport.failed).toBe(0);
+
+    const dirty = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
+    await initGitWithCommittedFile(dirty.cwd);
+    // Exactly the operator-tree state the issue reports: one modified tracked file,
+    // one untracked stray.
+    writeFileSync(join(dirty.cwd, 'tracked.txt'), `${COMMITTED_YAML}edited\n`);
+    writeFileSync(join(dirty.cwd, 'scratch.txt'), 'untracked stray\n');
+    const dirtyReport = await runFixtures({
+      workflows: [workflowsOnDisk(dirty.cwd, ['test-wf'])[0]],
+      cwd: dirty.cwd,
+    });
+    expect(dirtyReport.passed).toBe(1);
+  });
+
+  it('keeps executed writes out of the caller checkout (#2851)', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'writer-wf',
+      workflowYaml: WRITER_YAML,
+      body: execFixtureBody,
+    });
+    await initGitWithCommittedFile(cwd);
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['writer-wf'])[0]],
+      cwd,
+    });
+    // The node genuinely executed (passing would fail if it had errored); its write
+    // landed somewhere that is not the caller's working tree.
+    expect(report.results[0].outcome).toBe('completed');
+    expect(existsSync(join(cwd, 'leak.txt'))).toBe(false);
+    expect(readFileSync(join(cwd, 'tracked.txt'), 'utf8')).toBe(COMMITTED_YAML);
+  });
+
+  it('fails an exec-code fixture in a directory outside any git repository', async () => {
+    const { cwd } = writeTempProject({
+      workflowName: 'writer-wf',
+      workflowYaml: WRITER_YAML,
+      body: execFixtureBody,
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['writer-wf'])[0]],
+      cwd,
+    });
+    expect(report.failed).toBe(1);
+    expect(report.results[0].failureReason).toContain('not inside a git repository');
   });
 });

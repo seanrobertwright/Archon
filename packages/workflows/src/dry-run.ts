@@ -438,6 +438,13 @@ interface DryRunContext {
   workflow: WorkflowDefinition;
   userMessage: string;
   cwd: string;
+  /**
+   * The working directory trusted bash/script code EXECUTES in (exec-code nodes only).
+   * Defaults to `cwd`; `workflow test` points it at a scratch worktree of HEAD (#2851)
+   * so executed nodes see a clean checkout and cannot write into the caller's tree.
+   * SOURCE resolution (scripts, commands) keeps reading `cwd`.
+   */
+  execWorkspace: string;
   stubs: DryRunStubs;
   /**
    * The run's EFFECTIVE `$INPUTS` map — declared defaults layered under caller-supplied
@@ -661,7 +668,7 @@ async function executeCodeNode(
     await mkdir(ctx.artifactsDir, { recursive: true });
     await mkdir(ctx.stateDir, { recursive: true });
     const result = await execFileAsync(command, args, {
-      cwd: ctx.cwd,
+      cwd: ctx.execWorkspace,
       timeout: node.timeout ?? 300_000,
       env: {
         ...process.env,
@@ -1120,6 +1127,12 @@ export async function dryRunWorkflow(options: {
    * effective `$INPUTS` map cannot diverge between simulation and execution (#2610).
    */
   inputs?: Record<string, string>;
+  /**
+   * Where exec-code nodes execute. Undefined means `cwd` — the direct
+   * `--dry-run --exec-code` path. `workflow test` supplies an isolated scratch
+   * worktree so a fixture verdict cannot depend on the caller's tree state (#2851).
+   */
+  execWorkspace?: string;
   execCode?: boolean;
   /** Fill reached nodes without explicit stubs using schema-valid deterministic placeholders. */
   defaultStubs?: boolean;
@@ -1143,6 +1156,7 @@ export async function dryRunWorkflow(options: {
     workflow: options.workflow,
     userMessage: options.userMessage,
     cwd: options.cwd,
+    execWorkspace: options.execWorkspace ?? options.cwd,
     stubs: options.stubs ?? {},
     ...(inputs ? { inputs } : {}),
     artifactsDir: join(tempRoot, 'artifacts'),

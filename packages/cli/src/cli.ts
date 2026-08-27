@@ -194,7 +194,8 @@ Commands:
   workflow install <slug>    Install a workflow from the marketplace
   workflow test [<name>|<pack>]
                              Run declared dry-run fixtures (fixtures/*.stubs.yaml) for a
-                             workflow or pack; never creates a run or contacts a provider
+                             workflow or pack; never creates a run or contacts a provider.
+                             exec-code fixtures execute in a scratch worktree of HEAD
   isolation list             List all active worktrees/environments
   isolation cleanup [days]   Remove stale environments (default: 7 days)
   isolation cleanup --merged Remove environments with branches merged into main
