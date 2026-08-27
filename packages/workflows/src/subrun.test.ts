@@ -11,8 +11,9 @@
  * NOT mock ./dag-executor, so it cannot share a process with executor.test.ts,
  * which does (mock.module is process-global and irreversible).
  */
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, afterAll, mock } from 'bun:test';
 import { mkdir, writeFile, rm, cp, readdir } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join, sep } from 'path';
 import { tmpdir } from 'os';
 
@@ -31,9 +32,30 @@ const mockLogger = {
   isLevelEnabled: mock(() => true),
   level: 'info',
 };
+// Capture-cost control: captureWorkflowSource copies the BUNDLED defaults scope
+// (the repo's .archon/workflows/defaults + .archon/commands/defaults, ~58 files /
+// ~660KB) into EVERY staged source capture, on every executeWorkflow level of
+// every run in this file — e2e timing evidence (#2121 Phase 2 CI) shows that
+// uncontrolled per-run fs fan-out is what pushed the specimen test past Bun's
+// default 5000ms budget on Windows CI. No test here exercises bundled default
+// CONTENT: every discovery call opts out of loading them (`loadDefaults: false`)
+// and every workflow under test is written to the tmp cwd. Pointing the two
+// bundle path getters at a dedicated EMPTY directory (outside ARCHON_HOME) keeps
+// the capture's bundled-scope semantics (an existing-but-empty tree is scanned,
+// recorded in the manifest with 0 files) while removing ~58 file writes per
+// capture per platform-multiplied runner.
+const bundledDefaultsRoot = join(tmpdir(), `subrun-test-empty-bundled-${process.pid}`);
+await mkdir(join(bundledDefaultsRoot, 'defaults'), { recursive: true });
+afterAll(() => {
+  void rm(bundledDefaultsRoot, { recursive: true, force: true }).catch(() => {});
+});
 const realArchonPaths = await import('@archon/paths');
 mock.module('@archon/paths', () => ({
   ...realArchonPaths,
+  // NB: point these one level DEEP (`<root>/defaults`) — captureWorkflowSource copies
+  // dirname(getDefault*Path()), so the getter's PARENT must be the owned empty tree.
+  getDefaultWorkflowsPath: () => join(bundledDefaultsRoot, 'defaults'),
+  getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
   createLogger: mock(() => mockLogger),
   captureWorkflowInvoked: mock(() => {}),
   captureWorkflowCompleted: mock(() => {}),
@@ -508,7 +530,17 @@ function makeFanResolver(root: string): {
       const idx = req.childIndex ?? 0;
       const dir = join(root, 'wt', `${req.parentRun.id}-child-${String(idx)}`);
       await mkdir(dir, { recursive: true });
-      await cp(join(root, '.archon'), join(dir, '.archon'), { recursive: true });
+      // Copy ONLY the workflows subtree, not all of `.archon`: the child reads no
+      // other fixture state out of its isolated checkout (config comes from the
+      // mocked loadConfig; artifacts land under ARCHON_HOME). A full-tree cp re-copied
+      // every artifact/log directory earlier drives had created into `.archon`,
+      // growing per child per drive — exactly the uncontrolled per-child fs cost this
+      // resolver exists to keep bounded.
+      const workflowsRoot = join(root, '.archon', 'workflows');
+      if (existsSync(workflowsRoot)) {
+        await mkdir(join(dir, '.archon'), { recursive: true });
+        await cp(workflowsRoot, join(dir, '.archon', 'workflows'), { recursive: true });
+      }
       return {
         cwd: dir,
         envId: `env-${req.parentRun.id.slice(0, 8)}-${String(idx)}`,
@@ -3266,7 +3298,10 @@ nodes:
       parent,
       'goal',
       'conv-db',
-      { resolveChildIsolation: resolver }
+      // baseBranch is pinned so the executor's $BASE_BRANCH resolution never falls
+      // through to git auto-detection — nothing in this test asserts that detection,
+      // and every level it reached would otherwise pay for it again.
+      { baseBranch: 'main', resolveChildIsolation: resolver }
     );
     expect(r1.success).toBe(false);
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'fan-resume');
@@ -3293,7 +3328,8 @@ nodes:
       parent,
       'goal',
       'conv-db',
-      { ...resumeOpts, resolveChildIsolation: resolver }
+      // Same auto-detection opt-out as drive 1; nothing here asserts branch detection.
+      { baseBranch: 'main', ...resumeOpts, resolveChildIsolation: resolver }
     );
 
     expect(r2.success).toBe(true);
@@ -4449,7 +4485,11 @@ nodes:
       cwd,
       await discover('parent-defaults'),
       'goal',
-      'conv-db'
+      'conv-db',
+      // baseBranch pinned: this suite asserts input contracts, not branch
+      // auto-detection; pinning it keeps every executeWorkflow level off the
+      // git-detection fallback path.
+      { baseBranch: 'main' }
     );
 
     expect(result.success).toBe(true);
@@ -4486,7 +4526,11 @@ nodes:
       cwd,
       await discover('parent-missing'),
       'goal',
-      'conv-db'
+      'conv-db',
+      // baseBranch pinned: this suite asserts input contracts, not branch
+      // auto-detection; pinning it keeps every executeWorkflow level off the
+      // git-detection fallback path.
+      { baseBranch: 'main' }
     );
 
     expect(result.success).toBe(false);
@@ -4519,7 +4563,11 @@ nodes:
       cwd,
       await discover('parent-undeclared'),
       'goal',
-      'conv-db'
+      'conv-db',
+      // baseBranch pinned: this suite asserts input contracts, not branch
+      // auto-detection; pinning it keeps every executeWorkflow level off the
+      // git-detection fallback path.
+      { baseBranch: 'main' }
     );
 
     expect(result.success).toBe(false);
@@ -4560,7 +4608,11 @@ nodes:
       cwd,
       await discover('parent-passthrough'),
       'goal',
-      'conv-db'
+      'conv-db',
+      // baseBranch pinned: this suite asserts input contracts, not branch
+      // auto-detection; pinning it keeps every executeWorkflow level off the
+      // git-detection fallback path.
+      { baseBranch: 'main' }
     );
 
     expect(result.success).toBe(true);
@@ -4594,7 +4646,11 @@ nodes:
       cwd,
       await discover('top-level-defaults'),
       'goal',
-      'conv-db'
+      'conv-db',
+      // baseBranch pinned: this suite asserts input contracts, not branch
+      // auto-detection; pinning it keeps every executeWorkflow level off the
+      // git-detection fallback path.
+      { baseBranch: 'main' }
     );
 
     expect(result.success).toBe(true);
