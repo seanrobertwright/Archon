@@ -14,7 +14,7 @@ const NODE_REFERENCE = join(
   'authoring-workflows',
   'node-reference.md'
 );
-const reference = readFileSync(NODE_REFERENCE, 'utf8');
+const reference = readFileSync(NODE_REFERENCE, 'utf8').replaceAll('\r\n', '\n');
 
 function yamlFenceAfter(anchor: string): string {
   const anchorIndex = reference.indexOf(anchor);
