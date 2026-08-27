@@ -1,12 +1,4 @@
----
-title: Workflow Language Constitution
-description: The design rules that keep Archon's workflow YAML a coordination language — the admissibility test for new YAML features, the failure smells, and how each is managed.
-category: reference
-audience: [developer]
-status: current
-sidebar:
-  order: 9
----
+# Workflow language constitution
 
 Every workflow engine's configuration format faces the same gravitational pull: it grows until it becomes a bad programming language. Jenkins pipelines grew Groovy. GitHub Actions grew an expression language. Helm grew Turing-complete templating. Airflow grew so much Python-in-config that it eventually surrendered and became workflows-as-code. The pattern is always the same — individually reasonable feature grants, compounding into an informally-specified, untestable, half-language that is worse than code at computing and worse than configuration at declaring.
 

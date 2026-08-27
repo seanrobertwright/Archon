@@ -3864,7 +3864,7 @@ nodes:
 // answer before changing them is: "does agent-authored sub-run composition still
 // work?" — not "should validation be stricter?".
 //
-// See: packages/docs-web/src/content/docs/reference/workflow-language-constitution.md
+// See: .archon/workflow-language-constitution.md
 // ===========================================================================
 describe('workflow: late resolution is a deliberate affordance', () => {
   let cwd: string;

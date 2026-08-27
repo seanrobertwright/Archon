@@ -695,7 +695,7 @@ A wait may be the sole terminal sink in a `loop_group` body. Archon then escalat
 
 Durable waits are not supported in container-isolated workflows. The server cannot reconstruct the CLI-owned container context needed for an automatic continuation, so Archon rejects this combination before creating the run. Automatic quota-window continuation is likewise skipped for container runs.
 
-This node follows the [Workflow Language Constitution](/reference/workflow-language-constitution/): YAML declares the engine-visible coordination condition; computation stays in a `bash:`, `script:`, or `prompt:` node whose structured output can feed the wait.
+YAML declares the engine-visible coordination condition; computation stays in a `bash:`, `script:`, or `prompt:` node whose structured output can feed the wait.
 
 ---
 
@@ -1002,8 +1002,8 @@ value from a producer that was **skipped**. Declare that case per binding with t
 
 `if_skipped` is **data** — the value the binding takes when its producer did not run. The
 coalescing decision ("ready if either branch said so") stays in the consuming script, which
-is the [constitution's](/reference/workflow-language-constitution/) YAML-coordinates /
-code-computes split. A skipped producer with **no** `if_skipped` fails the node with the
+is the YAML-coordinates / code-computes split. A skipped producer with **no**
+`if_skipped` fails the node with the
 binding, producer, and fix named — a binding never silently resolves to `''`.
 
 `if_skipped` only ever covers a producer that **did not run**. A producer that ran and
