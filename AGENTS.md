@@ -138,6 +138,7 @@ The governing rule is: **YAML coordinates. Code computes. Agents judge.** Read [
 - Add tests for meaningful behavior and failure modes. Do not preserve deleted features through regression-test clutter.
 - Prefer deterministic, cheap tests. Remove accidental I/O and unnecessary subprocesses before increasing timeouts.
 - Bun's module mocks pollute the process cache. Use the package test scripts that preserve isolation; do not run `bun test` from the repository root.
+- Always run lint through `bun run lint` or `bun run lint:fix`; the wrapper isolates packages to keep typed lint within its memory budget.
 - Run the narrow checks that prove the changed behavior while iterating.
 - Run `bun run validate` before opening a pull request. CI may contain additional environment-dependent checks; inspect changed-path workflows and run applicable checks when practical.
 - Schema changes also require the PostgreSQL upgrade check documented in the contributor docs and CI.
