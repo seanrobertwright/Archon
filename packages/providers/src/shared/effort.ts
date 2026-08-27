@@ -2,22 +2,20 @@
  * The one Archon reasoning-depth vocabulary, and the clamp every provider uses
  * to land a declared rung inside its own SDK's enum.
  *
- * Archon exposes a single `effort:` field in workflow YAML. Pi's vocabulary is the
- * full ladder; the others offer a contiguous slice — Claude has no `minimal`,
- * Codex has no `max`, Copilot has neither — so a rung the resolved provider
- * doesn't offer is clamped into range rather than dropped (weaker first; see
- * `clampEffort` for why the direction matters). That keeps
- * `effort: max` meaning "as deep as this model goes" everywhere, which is the
- * point of having one spelling (#2556). The precedent is `parseCopilotConfig`,
- * which has mapped `max` → `xhigh` at the provider boundary since Copilot
- * landed.
+ * Archon exposes a single `effort:` field in workflow YAML. The ladder is the
+ * union of the effort-capable SDK vocabularies: Codex spans the full ladder,
+ * while Claude, Pi, and Copilot each offer a contiguous slice. A rung the
+ * resolved provider does not offer is clamped into range rather than dropped
+ * (weaker first; see `clampEffort` for why the direction matters). That keeps
+ * the strongest shared rung meaning "as deep as this model goes" everywhere,
+ * which is the point of having one spelling (#2556).
  *
  * Zero SDK deps by design — `@archon/workflows` derives its `effortLevelSchema`
  * from `EFFORT_LADDER`, so the YAML enum and the clamp can never disagree.
  */
 
 /** Reasoning-depth rungs, weakest → strongest. Order is load-bearing: `clampEffort` walks it. */
-export const EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 
 /**
  * Compile-time proof that a provider's rung list COVERS its SDK's vocabulary.
@@ -52,9 +50,9 @@ export function isEffortRung(value: unknown): value is EffortRung {
  * buy more reasoning than the author asked for. So `clampEffort('high', ['low',
  * 'xhigh'])` is `'low'` — two rungs down — rather than `'xhigh'`, one rung up.
  * On every real provider vocabulary the two rules coincide, because each is a
- * contiguous slice missing only the ladder's extremes (`max` → `xhigh` on Codex,
- * `minimal` → `low` on Claude); the difference would only appear for a
- * vocabulary with an interior gap.
+ * contiguous slice (`ultra` → `max` on Claude/Pi, `ultra` → `xhigh` on Copilot,
+ * and `minimal` → `low` on Claude/Copilot); the difference would only appear
+ * for a vocabulary with an interior gap.
  *
  * Returns `undefined` for anything that is not on the ladder at all; callers own
  * the warning, since each provider surfaces it through its own channel.

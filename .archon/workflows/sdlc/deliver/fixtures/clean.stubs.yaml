@@ -14,7 +14,9 @@ review__code: "0 findings"
 review__seams: "0 findings"
 review__synthesize:
   ready: true
+  action: none
   findings_summary: "stub: clean on initial review"
+review-action: '{"ready":true,"action":"none"}'
 gate-ready: '{"ready":"true"}'
 validate__validate:
   green: true

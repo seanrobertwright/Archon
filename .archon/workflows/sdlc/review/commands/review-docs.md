@@ -29,4 +29,6 @@ A documented statement, option, default, or example made false; removed behavior
 
 Write `$ARTIFACTS_DIR/review/docs.md`: each finding with the four parts (quote the false text), then the examined-and-current list with confirming evidence. In light mode, a verdict per prior finding. No findings is a valid result.
 
+If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-docs.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`docs`). Write no file for no discovery; never append to another lens's file or record suspicion.
+
 Verify every cited path is real, then reply with one line: findings count by severity.

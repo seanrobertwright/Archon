@@ -12,7 +12,9 @@ deliver__impl__implement:
   summary: "stub: coupling removed, 20 consecutive runs green under the trigger condition, test still fails on its planted fault"
 deliver__review__synthesize:
   ready: true
+  action: none
   findings_summary: "stub: no open findings"
+deliver__review-action: '{"ready":true,"action":"none"}'
 deliver__validate__validate:
   green: true
   summary: "stub: project gate green"

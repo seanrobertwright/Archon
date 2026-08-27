@@ -114,20 +114,8 @@ nodes:
   # classifier; 'auto' adopts its judgment. Output values are the strings the
   # lens gates compare against.
   - id: resolve-scope
-    bash: |
-      resolve() {
-        forced="$1"; judged="$2"
-        case "$forced" in
-          true|false) printf '%s' "$forced" ;;
-          *) printf '%s' "$judged" ;;
-        esac
-      }
-      printf '{"tests":"%s","errors":"%s","comments":"%s","types":"%s","docs":"%s"}\n' \
-        "$(resolve "$INPUTS_TESTS" "$INPUTS_C_TESTS")" \
-        "$(resolve "$INPUTS_ERRORS" "$INPUTS_C_ERRORS")" \
-        "$(resolve "$INPUTS_COMMENTS" "$INPUTS_C_COMMENTS")" \
-        "$(resolve "$INPUTS_TYPES" "$INPUTS_C_TYPES")" \
-        "$(resolve "$INPUTS_DOCS" "$INPUTS_C_DOCS")"
+    script: resolve-review-scope
+    runtime: uv
     with:
       c_tests: "$classify.output.tests"
       c_errors: "$classify.output.errors"
@@ -141,12 +129,23 @@ nodes:
     with:
       scope: ""
       prior_report: "$INPUTS.prior_report"
+      work_order: "$INPUTS.work"
       tests: "$resolve-scope.output.tests"
       errors: "$resolve-scope.output.errors"
       comments: "$resolve-scope.output.comments"
       types: "$resolve-scope.output.types"
       docs: "$resolve-scope.output.docs"
     depends_on: [resolve-scope]
+
+  # Validate the authored verdict before it controls a costly branch. `ready`
+  # remains the review outcome; `action` says what delivery may do about it.
+  - id: review-action
+    script: validate-review-action
+    runtime: uv
+    with:
+      ready: "$review.output.ready"
+      action: "$review.output.action"
+    depends_on: [review]
 
   # A ready initial review skips this block. Otherwise each iteration corrects
   # the current canonical findings, proves the correction is green, then runs a
@@ -159,10 +158,13 @@ nodes:
   # bound would need runtime-parameterized composition, which the language
   # deliberately does not have — the flat bound buys the same outcome free.
   - id: corrections
-    depends_on: [review]
-    when: "$review.output.ready == 'false'"
+    depends_on: [review-action]
+    when: "$review-action.output.action == 'correct'"
     loop_group:
-      until_bash: test $recheck.output.ready = "true"
+      # `none` converged and `replan` must stop correction. gate-ready below
+      # accepts only `none`; a replan outcome leaves the PR draft and fails with
+      # the canonical report intact instead of spending another correction.
+      until_bash: test $recheck-action.output.action != "correct"
       max_iterations: 5
       fresh_context: true
       nodes:
@@ -171,10 +173,21 @@ nodes:
           with:
             work: >-
               Fix every open Critical and Important finding recorded in
-              $ARTIFACTS_DIR/review/report.md. When the correction is green,
-              push its commits to the existing PR branch (git push). Do not
-              change the PR's draft state or edit the canonical review comment;
-              the following review owns that public verdict.
+              $ARTIFACTS_DIR/review/report.md, within the accepted work order
+              below. Read both in full before editing. When a causal finding
+              records a finite affected-member inventory, the finding is not
+              fixed until every affected member is handled and the smallest
+              relevant proof passes. Do not cross an explicit boundary to make
+              a finding disappear; the following review must return replan if
+              the requested outcome requires that expansion.
+
+              Accepted work order:
+              $INPUTS.work
+
+              When the correction is green, push its commits to the existing PR
+              branch (git push). Do not change the PR's draft state or edit the
+              canonical review comment; the following review owns that public
+              verdict.
 
         - id: gate-correction-green
           bash: |
@@ -191,6 +204,7 @@ nodes:
           with:
             scope: ""
             prior_report: "$ARTIFACTS_DIR/review/report.md"
+            work_order: "$INPUTS.work"
             # Round-1's resolved scope, read across the body boundary: rechecks
             # keep the same lens coverage the initial review had.
             tests: "$resolve-scope.output.tests"
@@ -200,22 +214,32 @@ nodes:
             docs: "$resolve-scope.output.docs"
           depends_on: [gate-correction-green]
 
-  # all_done joins the mutually exclusive paths as bound values (#2637): the
-  # initial review's verdict directly, and the correction loop's output with an
-  # if_skipped default. A completed loop implies readiness — until_bash on the
-  # recheck verdict is its only success exit — while a failed loop (bound
-  # exhausted) or a failed review surfaces as a binding-resolution failure on
-  # this node, so lifecycle success alone never certifies readiness. The
-  # failed-producer -> failed-binding rule is engine-enforced (#2696/#2710);
-  # if_skipped covers only skipped/pending producers, never failed ones.
+        - id: recheck-action
+          script: validate-review-action
+          runtime: uv
+          with:
+            ready: "$recheck.output.ready"
+            action: "$recheck.output.action"
+          depends_on: [recheck]
+
+  # none_failed_min_one_success joins the mutually exclusive paths as bound
+  # values (#2637): the
+  # initial review's verdict directly, and the correction loop's final verdict
+  # with if_skipped defaults. The loop can stop on `none` (ready) or `replan`
+  # (truthful terminal refusal); the script below owns that final distinction.
+  # A failed loop (bound exhausted) or failed review prevents this node from
+  # running, so lifecycle success alone never certifies readiness. if_skipped
+  # covers only skipped/pending producers, never failed ones.
   - id: gate-ready
     script: gate-ready
     runtime: uv
-    depends_on: [review, corrections]
-    trigger_rule: all_done
+    depends_on: [review-action, corrections]
+    trigger_rule: none_failed_min_one_success
     with:
-      review_ready: { from: "$review.output.ready", if_skipped: false }
-      corrections: { from: "$corrections.output", if_skipped: null }
+      review_ready: { from: "$review-action.output.ready", if_skipped: false }
+      review_action: { from: "$review-action.output.action", if_skipped: null }
+      correction_ready: { from: "$corrections.output.ready", if_skipped: false }
+      correction_action: { from: "$corrections.output.action", if_skipped: null }
 
   # Correction rounds change the diff after `pr` wrote the description, so
   # concrete claims in the body can be falsified by the very fixes the review

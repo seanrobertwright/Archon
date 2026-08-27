@@ -345,7 +345,7 @@ describe('aiTierSetCommand', () => {
   });
 
   it('invalid effort for the provider → 1, no write', async () => {
-    expect(await aiTierSetCommand('large', 'claude', 'opus', 'ultra')).toBe(1);
+    expect(await aiTierSetCommand('large', 'claude', 'opus', 'extreme')).toBe(1);
     expect(out()).toContain('Invalid effort');
     expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });

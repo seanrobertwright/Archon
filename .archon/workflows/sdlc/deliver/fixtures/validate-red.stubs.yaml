@@ -14,6 +14,7 @@ review__code: "0 findings"
 review__seams: "0 findings"
 review__synthesize:
   ready: true
+  action: none
   findings_summary: "stub: clean on initial review"
 # gate-ready is deliberately unstubbed: under --exec-code the real script runs,
 # proving the review_ready binding and the corrections if_skipped default.

@@ -31,4 +31,6 @@ Encapsulation preferences; mutability without a violated invariant; cross-langua
 
 Write `$ARTIFACTS_DIR/review/types.md`: each finding with the four parts, then the examined-and-enforced list citing the boundary that makes each suspected state unreachable. In light mode, a verdict per prior finding. No findings is a valid result.
 
+If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-types.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`types`). Write no file for no discovery; never append to another lens's file or record suspicion.
+
 Verify every cited `file:line` is real, then reply with one line: findings count by severity.
