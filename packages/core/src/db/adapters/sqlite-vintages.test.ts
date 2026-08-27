@@ -26,14 +26,15 @@ import { join } from 'path';
 
 const FIXTURES_DIR = join(import.meta.dir, '..', 'fixtures', 'sqlite-vintages');
 
-let currentDbPath = '';
+const tempDbPaths: string[] = [];
 
 function tempDbPath(): string {
-  currentDbPath = join(
+  const path = join(
     import.meta.dir,
     `.test-sqlite-vintage-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
   );
-  return currentDbPath;
+  tempDbPaths.push(path);
+  return path;
 }
 
 /** Whitespace-normalized SQL, so formatting differences between vintages don't count. */
@@ -145,7 +146,14 @@ function diffCatalogs(fresh: Catalog, upgraded: Catalog): CatalogDiff {
 
 describe('SqliteAdapter upgrades from released schema vintages', () => {
   afterEach(() => {
-    if (currentDbPath && existsSync(currentDbPath)) unlinkSync(currentDbPath);
+    // -wal/-shm sidecars exist while a connection is open; sweep them in case
+    // a failure leaves one behind alongside its database.
+    for (const base of tempDbPaths) {
+      for (const path of [base, `${base}-wal`, `${base}-shm`]) {
+        if (existsSync(path)) unlinkSync(path);
+      }
+    }
+    tempDbPaths.length = 0;
   });
 
   test('every released vintage converges on the fresh-install schema', async () => {

@@ -48,10 +48,10 @@ const SCHEMA_SIGNATURE = 'private createSchema(): void {';
  * manipulating worktrees, which is what `@archon/git` covers. The argument array
  * means no ref ever reaches a shell.
  */
-function git(...args: string[]): { ok: boolean; stdout: string } {
+function git(...args: string[]): { ok: boolean; stdout: string; stderr: string } {
   const r = spawnSync('git', args, { encoding: 'utf8', cwd: REPO_ROOT });
   if (r.error) throw new Error(`git could not be executed: ${r.error.message}`);
-  return { ok: r.status === 0, stdout: r.stdout ?? '' };
+  return { ok: r.status === 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
 /**
@@ -95,16 +95,40 @@ function extractSchemaSql(tag: string): string {
  * can actually have, rather than a sample of recent releases.
  */
 function vintages(): Map<string, string> {
-  const tags = git('tag', '--sort=creatordate').stdout.split('\n').filter(Boolean);
+  const tagResult = git('tag', '--sort=creatordate');
+  if (!tagResult.ok) {
+    throw new Error(`git tag failed: ${tagResult.stderr.trim() || '(no stderr)'}`);
+  }
+  const tags = tagResult.stdout.split('\n').filter(Boolean);
+  if (tags.length === 0) {
+    // An empty tag set would make write mode delete every checked-in fixture
+    // while exiting 0; no release history means this script cannot run.
+    throw new Error(
+      'git tag listed no tags — cannot regenerate vintage fixtures (shallow or broken checkout?)'
+    );
+  }
   const oldestTagPerSchema = new Map<string, string>();
   let withoutAdapter = 0;
+
+  // Tags are sorted oldest-first, and the adapter file has existed continuously
+  // in every release since it was introduced. So a rev-parse miss on a tag that
+  // follows tags carrying the file is not "predates the adapter" — the file was
+  // moved or renamed and extraction would silently end vintage coverage.
+  let seenAdapter = false;
 
   for (const tag of tags) {
     const present = git('rev-parse', `${tag}:${ADAPTER_REPO_PATH}`);
     if (!present.ok) {
+      if (seenAdapter) {
+        throw new Error(
+          `${tag}: ${ADAPTER_REPO_PATH} is missing from a tag newer than tags that carry it — ` +
+            'the adapter file was likely moved or renamed; extractor must be revisited'
+        );
+      }
       withoutAdapter++;
       continue;
     }
+    seenAdapter = true;
     const sql = extractSchemaSql(tag);
     if (!oldestTagPerSchema.has(sql)) oldestTagPerSchema.set(sql, tag);
   }
