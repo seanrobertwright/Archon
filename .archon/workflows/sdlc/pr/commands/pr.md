@@ -24,6 +24,7 @@ Determine the base branch from evidence, in order: an existing PR for this branc
 - Title: concise, human, the meaningful outcome — never an implementation inventory.
 - Link the issue with `Closes #N` only when the PR fully resolves it; `Relates to #N` otherwise. Never infer linkage from a bare number.
 - Never add AI attribution, generated-by footers, or robot emoji.
+- If `$ARTIFACTS_DIR/red-causes.json` exists, this branch is being delivered while a project check is red. Add a short, plainly-titled section near the top of the body giving each record's cause and the evidence for it from `implementation.md`, and say that the PR's own CI is the check that still decides. A reviewer must not have to discover this from a red badge.
 - If you write the body to a file, put it under `$ARTIFACTS_DIR/` — never inside the repository.
 
 ## 4. Push and create

@@ -33,7 +33,7 @@ triage__assert-intact: '{"intact":"true"}'
 planned__assert-intact: '{"intact":"true"}'
 deliver__gate-ready: '{"gate":"ready"}'
 deliver__impl__record-start: '{"start":"recorded"}'
-deliver__gate-validated: '{"validated":"true"}'
+deliver__gate-validated: '{"gate":"green"}'
 deliver__impl__assert-changed: "2 files changed"
 deliver__gate-green: '{"gate":"green"}'
 deliver__flip-ready: "https://github.com/example/repo/pull/1"

@@ -51,6 +51,13 @@ nodes:
           type: boolean
         green:
           type: boolean
+        # Why the checks are red, when they are (#2939). Declared OPTIONAL because
+        # a green turn has no red to explain — an absent declared field resolves to
+        # '' rather than throwing, and the gate that spends on this verdict is what
+        # refuses an unexplained red.
+        red_cause:
+          type: string
+          enum: [introduced, inherited, environment]
         summary:
           type: string
       required: [done, green, summary]

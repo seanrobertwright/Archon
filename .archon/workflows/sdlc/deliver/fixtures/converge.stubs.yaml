@@ -46,7 +46,7 @@ sync-pr-body: "body resynced: corrected the claims the correction round falsifie
 validate__validate:
   green: true
   summary: "stub: full gate green"
-gate-validated: '{"validated":"true"}'
+gate-validated: '{"gate":"green"}'
 ci-probe: '{"state":"concluded","detail":"all 2 check(s) green"}'
 flip-ready: "https://github.com/example/repo/pull/1"
 outcome: "https://github.com/example/repo/pull/1"

@@ -45,16 +45,18 @@ nodes:
 
   # R3's gate: run success never certifies green — this does, deterministically,
   # before anything public happens. Strict field access: a missing field fails
-  # the node rather than passing the gate.
+  # the node rather than passing the gate. It fails on red the change introduced
+  # and passes red the change cannot have caused, recording that caveat for every
+  # downstream reader — see scripts/gate-green.py for why that trade is safe.
   - id: gate-green
-    bash: |
-      if [ "$impl.output.green" = "true" ]; then
-        echo '{"gate":"green"}'
-      else
-        echo "implement finished but not green — its summary says why. Refusing to open a PR on red work." >&2
-        exit 1
-      fi
+    script: gate-green
+    runtime: uv
     depends_on: [impl]
+    with:
+      green: "$impl.output.green"
+      red_cause: "$impl.output.red_cause"
+      summary: "$impl.output.summary"
+      stage: "The implementation"
 
   - id: pr
     include: archon-pr
@@ -164,15 +166,18 @@ nodes:
               canonical review comment; the following review owns that public
               verdict.
 
+        # The same gate, same script: a correction can hit inherited or environment
+        # red exactly as the first implementation can (run 49f0d462, #2939), and a
+        # correction refused for a red it did not cause wastes the whole round.
         - id: gate-correction-green
-          bash: |
-            if [ "$fix.output.green" = "true" ]; then
-              echo '{"gate":"green"}'
-            else
-              echo "correction finished but is not green — refusing to spend a review on red work." >&2
-              exit 1
-            fi
+          script: gate-green
+          runtime: uv
           depends_on: [fix]
+          with:
+            green: "$fix.output.green"
+            red_cause: "$fix.output.red_cause"
+            summary: "$fix.output.summary"
+            stage: "The correction"
 
         - id: recheck
           include: archon-review
@@ -232,15 +237,21 @@ nodes:
     include: archon-validate
     depends_on: [gate-ready]
 
+  # The third gate on the same script, for the same reason: a local gate that
+  # refuses every red refuses red the change did not cause, and the base break
+  # this branch inherited is exactly the red that survives to here. Introduced red
+  # still stops the run. Inherited or environment red proceeds to await-checks,
+  # where the pull request's own CI decides — an inherited break is red there too
+  # and holds at the durable wait, which is the honest place to hold it.
   - id: gate-validated
-    bash: |
-      if [ "$validate.output.green" = "true" ]; then
-        echo '{"validated":"true"}'
-      else
-        echo "local validation failed after review — see the validation report in the run artifacts." >&2
-        exit 1
-      fi
+    script: gate-green
+    runtime: uv
     depends_on: [validate]
+    with:
+      green: "$validate.output.green"
+      red_cause: "$validate.output.red_cause"
+      summary: "$validate.output.summary"
+      stage: "The project gate"
 
   # CI wait, durably. The probe classifies check state once; a pending state
   # routes into the engine's `wait:` node (#2744), which suspends the run and

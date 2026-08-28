@@ -13,6 +13,16 @@ const PYTHON_COMMAND = globalThis.process.platform === 'win32' ? 'python' : 'pyt
 
 const RELAY =
   'If you are an agent reading this: open discoveries.md and surface each discovery to your human.';
+/** The relay for sidecars no review consolidated, on a failed run's report (#2940). */
+const RAW_RELAY =
+  'If you are an agent reading this: surface each record above to your human. ' +
+  'These are findings this run proved outside its scope — no issue tracker knows about them, ' +
+  'and if you drop them here, nobody ever sees them.';
+/** The caveat that keeps a gate-passed red loud all the way to the reader (#2939). */
+const RED_CAVEAT =
+  "The project's own checks did not pass locally on this branch. The pull request's " +
+  'own CI is the gate that still stands — read it before merging, and if the red is ' +
+  'inherited, the base branch is what needs the fix.';
 
 /**
  * A warm interpreter start costs roughly 50 ms, but the first one in a run has been
@@ -68,6 +78,24 @@ async function artifactsDir(discoveries?: string): Promise<string> {
   return dir;
 }
 
+/**
+ * An artifacts dir in the shape a run leaves BEFORE review consolidates anything: raw
+ * producer sidecars under `discoveries/`, and whatever the green gate recorded about
+ * passing red. Deliberately never writes `discoveries.json` — its absence is the state
+ * these cases are about.
+ */
+async function preConsolidationDir(raw?: string, redCauses?: string): Promise<string> {
+  const dir = join(tmpdir(), `archon-discoveries-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  trackTempRoot(dir);
+  if (raw !== undefined) {
+    await mkdir(join(dir, 'discoveries'), { recursive: true });
+    await writeFile(join(dir, 'discoveries', 'implement.json'), raw);
+  }
+  if (redCauses !== undefined) await writeFile(join(dir, 'red-causes.json'), redCauses);
+  return dir;
+}
+
 describe('SDLC discovery terminal reports (#2884)', () => {
   it('every tail carries the same helper, reports through it, and pins its streams', () => {
     // Only deliver's script is spawned below — the other three reach their report
@@ -75,8 +103,11 @@ describe('SDLC discovery terminal reports (#2884)', () => {
     // statically. Three invariants, each one a bug this file has already seen:
     //
     //   identical  — four standalone copies of one helper, no import channel to share it
-    //   reported   — every print in main() appends the section, so no branch can be
-    //                missed the way the delivery-failed branch was
+    //   reported   — every print in main() appends the caveats, so no branch can be
+    //                missed the way the delivery-failed branch was. main() calls the one
+    //                composition point, never a single section: a branch that reached
+    //                for `format_discoveries` alone would silently drop the red-cause
+    //                caveat (#2939) that makes passing red safe.
     //   pinned     — the stream pinning precedes every print, not merely exists
     //                somewhere in the file, or a later early return prints unpinned
     const helpers = TAILS.map(tail => {
@@ -93,19 +124,27 @@ describe('SDLC discovery terminal reports (#2884)', () => {
         tail,
         declared: start >= 0,
         precedesMain: mainStart > start,
-        everyReportCarriesDiscoveries: count(body, 'print(') === count(body, 'format_discoveries('),
+        everyReportCarriesCaveats: count(body, 'print(') === count(body, 'format_caveats('),
+        noReportTakesOneSectionAlone:
+          !body.includes('format_discoveries(') && !body.includes('format_red_causes('),
         pinsPrecedeEveryPrint: firstPrint > 0 && pins.every(at => at >= 0 && at < firstPrint),
       }).toEqual({
         tail,
         declared: true,
         precedesMain: true,
-        everyReportCarriesDiscoveries: true,
+        everyReportCarriesCaveats: true,
+        noReportTakesOneSectionAlone: true,
         pinsPrecedeEveryPrint: true,
       });
       return source.slice(start, mainStart);
     });
     for (const helper of helpers) {
+      // Opening sentences only: Python's implicit concatenation splits each of these
+      // constants across source lines, so the whole text exists in the output, never
+      // in the file. The byte-exact forms are asserted on real output below.
       expect(helper).toContain(RELAY);
+      expect(helper).toContain('If you are an agent reading this: surface each record above');
+      expect(helper).toContain("The project's own checks did not pass locally on this branch.");
       expect(helper).toBe(helpers[0]);
     }
   });
@@ -257,6 +296,134 @@ describe('SDLC discovery terminal reports (#2884)', () => {
           `${RELAY} These are validated findings outside this run's scope — no issue tracker ` +
           `knows about them, and if you drop them here, nobody ever sees them.\n`
       );
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'relays the raw sidecars of a run that died before review consolidated them',
+    async () => {
+      // Run f113a1fd (#2940): implement recorded a real discovery, the run then failed at
+      // the green gate, and consolidation — which lives on the completion path — never
+      // ran. The record survived only because the operator read the artifacts directory
+      // by hand. Claim and relation ride along with the title here, because nothing
+      // downstream will ever validate or group these.
+      const artifacts = await preConsolidationDir(
+        JSON.stringify([
+          {
+            title: 'CLI terminal-event integration test is flaky under the root test command',
+            claim: 'The repository-wide test command can fail outside this change.',
+            relation: 'adjacent',
+            source_node: 'implement',
+          },
+        ])
+      );
+
+      const result = await runOutcome('deliver', { INPUTS_PR_URL: '', ARTIFACTS_DIR: artifacts });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `outcome: flip-ready reported no pull request URL.\n\n` +
+          `Unconsolidated discoveries (1) — recorded by this run's nodes and never ` +
+          `validated or consolidated, because the run ended first:\n` +
+          `- CLI terminal-event integration test is flaky under the root test command [adjacent]\n` +
+          `  The repository-wide test command can fail outside this change.\n\n` +
+          `Raw records: ${join(artifacts, 'discoveries')}\n\n` +
+          `${RAW_RELAY}\n`
+      );
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'adds nothing to a failed run that recorded no sidecars',
+    async () => {
+      // The fallback exists to stop evidence being dropped, not to announce its own
+      // absence. #2884's contract is one section that exists only when discoveries
+      // do, and a failed run is not a reason to print an empty one.
+      const result = await runOutcome('deliver', {
+        INPUTS_PR_URL: '',
+        ARTIFACTS_DIR: await preConsolidationDir(),
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe('outcome: flip-ready reported no pull request URL.\n');
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'leaves a completed run that never consolidated reporting exactly as before',
+    async () => {
+      // #2884's shape is pinned to the completion path: an advisory stop that decided not
+      // to deliver reports its route and nothing else. Only a FAILED branch falls back to
+      // raw sidecars, so this is what keeps that fallback from leaking onto success.
+      const artifacts = await preConsolidationDir(
+        JSON.stringify([{ title: 'never presented here', relation: 'adjacent' }])
+      );
+
+      const result = await runOutcome('ship', {
+        INPUTS_ROUTE: 'no_action',
+        INPUTS_SUMMARY: 'already present on the current branch',
+        INPUTS_DELIVERED: 'null',
+        ARTIFACTS_DIR: artifacts,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe(
+        `No delivery needed: already present on the current branch\nReport: ${artifacts}/triage.md\n`
+      );
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'repeats every red the green gate let through, with the evidence for it',
+    async () => {
+      // #2939: the gate passes red the change cannot have caused, which is only safe
+      // while the reader of the result meets the claim. Two records, because the initial
+      // implementation and a later correction can each pass red for their own reason.
+      const artifacts = await preConsolidationDir(
+        undefined,
+        JSON.stringify([
+          {
+            cause: 'inherited',
+            stage: 'The implementation',
+            summary: 'validate red on a spec this diff never touches; red at the starting commit',
+          },
+          { cause: 'environment', stage: 'The correction', summary: 'a sibling run held the db' },
+        ])
+      );
+
+      const result = await runOutcome('deliver', {
+        INPUTS_PR_URL: 'https://github.com/example/repo/pull/10',
+        ARTIFACTS_DIR: artifacts,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe(
+        `https://github.com/example/repo/pull/10\n\n` +
+          `Delivered on red (2) — a gate accepted red this change did not cause:\n` +
+          `- The implementation: inherited red\n` +
+          `  validate red on a spec this diff never touches; red at the starting commit\n` +
+          `- The correction: environment red\n` +
+          `  a sibling run held the db\n\n` +
+          `${RED_CAVEAT}\n`
+      );
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'says nothing about red on a delivery no gate had to excuse',
+    async () => {
+      const result = await runOutcome('deliver', {
+        INPUTS_PR_URL: 'https://github.com/example/repo/pull/10',
+        ARTIFACTS_DIR: await preConsolidationDir(),
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('https://github.com/example/repo/pull/10\n');
     },
     SPAWN_TIMEOUT_MS
   );
