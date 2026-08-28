@@ -6,6 +6,7 @@ scope:
   docs: false
 code: "0 findings"
 seams: "0 findings"
+simplify: "0 findings"
 tests: "0 findings"
 review-complete: "settled"
 synthesize:
@@ -14,4 +15,4 @@ synthesize:
   findings_summary: "stub: clean, docs lens skipped"
 fixture:
   expect: completed
-  reached: [code, seams, tests]
+  reached: [code, seams, simplify, tests]

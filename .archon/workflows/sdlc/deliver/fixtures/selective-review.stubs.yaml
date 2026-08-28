@@ -21,6 +21,7 @@ review__scope:
   docs: false
 review__code: "0 findings"
 review__seams: "0 findings"
+review__simplify: "0 findings"
 review__tests: "0 findings"
 review__docs: "0 findings"
 review__review-complete: "settled"
@@ -39,4 +40,4 @@ flip-ready: "https://github.com/example/repo/pull/2"
 outcome: "https://github.com/example/repo/pull/2"
 fixture:
   expect: completed
-  reached: [review__code, review__seams, review__tests, review__docs]
+  reached: [review__code, review__seams, review__simplify, review__tests, review__docs]

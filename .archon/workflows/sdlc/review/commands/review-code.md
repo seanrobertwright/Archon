@@ -27,7 +27,7 @@ When execution is practical, run the smallest command that can falsify a finding
 
 ## Not yours
 
-Style, naming, and formatting without an explicit project rule; simplification without a behavioral defect; missing tests (the tests lens owns coverage); type-design quality; docs; generic error-handling preference. Do not apply framework folklore as if it were a project rule.
+Style, naming, and formatting without an explicit project rule; simplification without a behavioral defect (the simplify lens owns structure); missing tests (the tests lens owns coverage); type-design quality; docs; generic error-handling preference. Do not apply framework folklore as if it were a project rule.
 
 ## Severity
 

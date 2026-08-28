@@ -20,6 +20,7 @@ review__mode: '{"continuation":false}'
 review__scope: "accepted contract recorded"
 review__code: "0 findings"
 review__seams: "0 findings"
+review__simplify: "0 findings"
 review__tests: "0 findings"
 review__synthesize:
   ready: true

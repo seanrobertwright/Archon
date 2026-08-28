@@ -1,7 +1,7 @@
 # Choose this delivery's review scope
 
 Decide whether the pull request that was just opened warrants either optional
-review lens. Code, seams, and tests run on every full review; only **errors**
+review lens. Code, seams, simplify, and tests run on every full review; only **errors**
 and **docs** are yours to select. No one watches this run; your structured
 verdict is the only thing downstream nodes read.
 

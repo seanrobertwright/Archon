@@ -201,6 +201,7 @@ describe('bundled-defaults', () => {
         ['__archon_pack__bundled:sdlc:implement::implement', 'discoveries/implement.json'],
         ['__archon_pack__bundled:sdlc:review::review-code', 'discoveries/review-code.json'],
         ['__archon_pack__bundled:sdlc:review::review-seams', 'discoveries/review-seams.json'],
+        ['__archon_pack__bundled:sdlc:review::review-simplify', 'discoveries/review-simplify.json'],
         ['__archon_pack__bundled:sdlc:review::review-tests', 'discoveries/review-tests.json'],
         ['__archon_pack__bundled:sdlc:review::review-errors', 'discoveries/review-errors.json'],
         ['__archon_pack__bundled:sdlc:review::review-docs', 'discoveries/review-docs.json'],
@@ -326,7 +327,7 @@ describe('bundled-defaults', () => {
       const docs = parsed.workflow.nodes.find(node => node.id === 'docs');
       expect(docs?.when).toContain("$INPUTS.docs == 'auto' && $scope.output.docs == true");
 
-      const specialists = ['code', 'seams', 'tests', 'errors', 'docs'];
+      const specialists = ['code', 'seams', 'simplify', 'tests', 'errors', 'docs'];
       const reviewComplete = parsed.workflow.nodes.find(node => node.id === 'review-complete');
       expect(reviewComplete?.kind).toBe('exec');
       expect(reviewComplete?.depends_on).toEqual(specialists);
@@ -355,6 +356,15 @@ describe('bundled-defaults', () => {
       );
       expect(commands['__archon_pack__bundled:sdlc:review::review-seams']).toContain(
         'reachable invalid state with a concrete consequence'
+      );
+      // The lens this restores was cut as inert, not as unwanted (#2898/#2899): its charter
+      // demoted every finding to a Suggestion. Pin the two halves of the posture that
+      // replaced it — the values frame it reasons from, and the blocking severity.
+      expect(commands['__archon_pack__bundled:sdlc:review::review-simplify']).toContain(
+        'Writing code is cheap; maintaining it and recovering option value are not'
+      );
+      expect(commands['__archon_pack__bundled:sdlc:review::review-simplify']).toContain(
+        'a verdict may rest on simplification alone'
       );
       expect(commands['__archon_pack__bundled:sdlc:review::review-synthesize']).toContain(
         'report-round-N.md'

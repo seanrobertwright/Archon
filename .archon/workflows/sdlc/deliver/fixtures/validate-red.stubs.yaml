@@ -18,6 +18,7 @@ review__mode: '{"continuation":false}'
 review__scope: "target recorded; head sha stubbed"
 review__code: "0 findings"
 review__seams: "0 findings"
+review__simplify: "0 findings"
 review__tests: "0 findings"
 review__synthesize:
   ready: true
@@ -39,7 +40,7 @@ classify:
 fixture:
   expect: failed
   fail-node: gate-validated
-  reached: [review__code, review__seams, review__tests]
+  reached: [review__code, review__seams, review__simplify, review__tests]
   inputs:
     errors: "false"
 exec-code: true
