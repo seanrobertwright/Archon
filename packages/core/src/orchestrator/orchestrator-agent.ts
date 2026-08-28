@@ -7,8 +7,8 @@
  * - Does NOT require a project to be selected before starting a conversation
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, realpathSync } from 'fs';
-import { createLogger, captureChatTurn } from '@archon/paths';
+import { existsSync } from 'fs';
+import { createLogger, captureChatTurn, canonicalizeProjectPath } from '@archon/paths';
 import type {
   IPlatformAdapter,
   HandleMessageContext,
@@ -3334,18 +3334,11 @@ async function handleRegisterProject(
     return `Path does not exist: ${projectPath}`;
   }
 
-  // Canonicalize symlinks so the stored default_cwd matches what the CLI gate and
-  // `archon doctor` look up (both resolve against process.cwd(), which resolves
-  // symlinks — e.g. macOS /tmp → /private/tmp). Mirrors registerFolder; without
-  // it a symlinked path registers under one path but is looked up under another.
-  // Best-effort: existsSync already validated the path, so fall back to it if
-  // realpath fails for a rare reason (permission on a parent, race).
-  let canonicalPath = projectPath;
-  try {
-    canonicalPath = realpathSync(projectPath);
-  } catch (err) {
-    getLog().warn({ err: err as Error, projectPath }, 'project.register_realpath_failed');
-  }
+  // Canonicalize through the one shared `default_cwd` canonicalizer, the same
+  // one `registerFolder`, the CLI gate and `archon doctor` use. Calling a
+  // different realpath variant here is what made a chat-registered project and a
+  // CLI-registered project disagree on Windows and register two rows (#2927).
+  const canonicalPath = await canonicalizeProjectPath(projectPath);
 
   // Check if codebase already exists with this name
   const existing = await codebaseDb.listCodebases();
@@ -3424,12 +3417,17 @@ async function handleUpdateProject(message: string): Promise<string> {
   }
 
   const [projectName, ...pathParts] = args;
-  const newPath = pathParts.join(' ');
+  const suppliedPath = pathParts.join(' ');
 
   // Validate path exists
-  if (!existsSync(newPath)) {
-    return `Path does not exist: ${newPath}`;
+  if (!existsSync(suppliedPath)) {
+    return `Path does not exist: ${suppliedPath}`;
   }
+
+  // A repointed project has to land on the same canonical form the lookups ask
+  // for, exactly like a freshly registered one — storing the raw argument here
+  // wrote a `default_cwd` no reader could match (#2927).
+  const newPath = await canonicalizeProjectPath(suppliedPath);
 
   // Find existing codebase by name
   const existing = await codebaseDb.listCodebases();

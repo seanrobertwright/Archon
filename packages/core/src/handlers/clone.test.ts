@@ -57,6 +57,17 @@ const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   expandTilde: mock((p: string) => p.replace(/^~/, '/home/test')),
+  // Mirrors the real canonicalizer's contract (resolve, then realpath, falling
+  // back to the resolved path) and reads `fsPromises.realpath` at call time so
+  // the symlink test's spy still drives it.
+  canonicalizeProjectPath: mock(async (p: string) => {
+    const absolute = resolve(p.replace(/^~/, '/home/test'));
+    try {
+      return await fsPromises.realpath(absolute);
+    } catch {
+      return absolute;
+    }
+  }),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
   ensureProjectStructure: mock(() => Promise.resolve()),
   getProjectSourcePath: mock(
@@ -1275,8 +1286,12 @@ describe('registerFolder', () => {
 
   // ── Validation ─────────────────────────────────────────────────────────
   test('throws when the path does not exist', async () => {
-    // realpath is the first existence gate (runs before stat).
-    spyFsRealpath.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    // Canonicalization is fail-safe (it returns the unresolved path), so `stat`
+    // is the existence gate. Both reject here the way the real fs does for a
+    // missing path, so the registration is refused rather than stored.
+    const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    spyFsRealpath.mockRejectedValueOnce(enoent);
+    spyFsStat.mockRejectedValueOnce(enoent);
 
     await expect(registerFolder('/tmp/does-not-exist')).rejects.toThrow('Path does not exist');
     expect(mockCreateCodebase.mock.calls.length).toBe(0);
