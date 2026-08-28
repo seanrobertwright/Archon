@@ -800,16 +800,18 @@ Remove a branch's worktree, local branch, and remote branch, and mark its isolat
 
 ```bash
 archon complete feature-auth
-archon complete feature-auth --force  # bypass uncommitted-changes check
+archon complete feature-auth --force  # bypass safety checks
 ```
 
 **Flags:**
 
 | Flag | Effect |
 |------|--------|
-| `--force` | Skip uncommitted-changes guard |
+| `--force` | Skip safety checks |
 
-Use this after a PR is merged and you no longer need the worktree or branches. Accepts multiple branch names in one call.
+Use this after a PR is merged and you no longer need the worktree or branches. If GitHub
+has deleted a squash-merged branch, completion verifies its patches are already on the
+configured or detected default branch before removing it. Accepts multiple branch names in one call.
 
 ### `serve`
 
