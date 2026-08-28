@@ -1020,7 +1020,7 @@ export async function workflowTestCommand(
   target: string | undefined,
   options: { json?: boolean } = {}
 ): Promise<number> {
-  const { workflows } = await loadWorkflows(cwd);
+  const { workflows, errors } = await loadWorkflows(cwd);
   // The fixture runner freezes this repo's source before executing anything, exactly as
   // `workflow run` does, and this config decides which directories get frozen. A malformed
   // one would silently narrow that set, so it fails here instead; `loadConfig` returns
@@ -1046,12 +1046,30 @@ export async function workflowTestCommand(
       })),
       passed: report.passed,
       failed: report.failed,
+      errors: errors.map(e => ({
+        filename: e.filename,
+        error: e.error,
+        errorType: e.errorType,
+      })),
     });
   } else {
-    await writeStdout(`${formatFixtureReport(report)}\n`);
+    let output = `${formatFixtureReport(report)}\n`;
+    if (errors.length > 0) {
+      output += `\n${errors.length} workflow(s) failed to load:\n\n`;
+      for (const error of errors) {
+        output += `  ${error.filename}: ${error.error}\n`;
+      }
+    }
+    await writeStdout(output);
   }
 
-  if (report.failed > 0 || (target !== undefined && report.results.length === 0)) return 1;
+  if (
+    errors.length > 0 ||
+    report.failed > 0 ||
+    (target !== undefined && report.results.length === 0)
+  ) {
+    return 1;
+  }
   return 0;
 }
 
