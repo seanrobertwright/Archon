@@ -149,6 +149,44 @@ test('treats setup hooks as cleanup, inline and by reference', () => {
   expect(checkSource('packages/example/src/b.test.ts', referencedAlias)).toHaveLength(1);
 });
 
+test('follows a helper called from inside an inline hook callback', () => {
+  const source = `
+    import { afterEach } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    async function cleanup() { await rm(root, { recursive: true, force: true }); }
+    afterEach(async () => { await cleanup(); });
+  `;
+
+  expect(checkSource('packages/example/src/example.test.ts', source)).toEqual([
+    expect.objectContaining({ rule: 'recursive-cleanup' }),
+  ]);
+});
+
+test('follows a cleanup call chain more than one hop from the hook', () => {
+  const source = `
+    import { afterEach } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    async function removeRoot() { await rm(root, { recursive: true, force: true }); }
+    async function teardown() { await removeRoot(); }
+    afterEach(teardown);
+  `;
+
+  expect(checkSource('packages/example/src/example.test.ts', source)).toEqual([
+    expect.objectContaining({ rule: 'recursive-cleanup' }),
+  ]);
+});
+
+test('ignores a recursive helper reached only from a test body', () => {
+  const source = `
+    import { test } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    async function reset() { await rm(root, { recursive: true, force: true }); }
+    test('example', async () => { await reset(); });
+  `;
+
+  expect(checkSource('packages/example/src/example.test.ts', source)).toEqual([]);
+});
+
 test('ignores a recursive helper that is never passed to a hook', () => {
   const source = `
     import { afterEach } from 'bun:test';

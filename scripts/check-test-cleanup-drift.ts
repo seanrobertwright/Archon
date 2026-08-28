@@ -126,8 +126,41 @@ const HOOK_NAMES = new Set(['afterEach', 'afterAll', 'beforeEach', 'beforeAll'])
 interface CleanupBindings {
   hooks: Set<string>;
   namespaces: Set<string>;
-  /** Same-file callbacks passed to a hook by name rather than written inline. */
-  referenced: Set<string>;
+  /** Same-file functions a hook reaches, by reference or through a call chain. */
+  reachable: Set<string>;
+}
+
+/** Same-file `function` declarations and `const`-bound function expressions, by name. */
+function sameFileFunctions(sourceFile: ts.SourceFile): Map<string, ts.Node> {
+  const byName = new Map<string, ts.Node>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name !== undefined) {
+      byName.set(node.name.text, node);
+    } else if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer !== undefined &&
+      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+    ) {
+      byName.set(node.name.text, node.initializer);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return byName;
+}
+
+/** Bare identifiers called within a node; a `foo.bar()` member call is not one. */
+function calledNames(node: ts.Node): string[] {
+  const names: string[] = [];
+  const visit = (current: ts.Node): void => {
+    if (ts.isCallExpression(current) && ts.isIdentifier(current.expression)) {
+      names.push(current.expression.text);
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return names;
 }
 
 function isHookCall(call: ts.CallExpression, hooks: Set<string>, namespaces: Set<string>): boolean {
@@ -166,18 +199,37 @@ function cleanupBindings(sourceFile: ts.SourceFile): CleanupBindings {
     }
   }
 
-  const referenced = new Set<string>();
+  const functions = sameFileFunctions(sourceFile);
+  const reachable = new Set<string>();
+  const pending: string[] = [];
+  const reach = (name: string): void => {
+    if (reachable.has(name)) return;
+    reachable.add(name);
+    pending.push(name);
+  };
+
   const collect = (node: ts.Node): void => {
     if (ts.isCallExpression(node) && isHookCall(node, hooks, namespaces)) {
       for (const argument of node.arguments) {
-        if (ts.isIdentifier(argument)) referenced.add(argument.text);
+        if (ts.isIdentifier(argument)) reach(argument.text);
+        else if (ts.isArrowFunction(argument) || ts.isFunctionExpression(argument)) {
+          for (const called of calledNames(argument)) reach(called);
+        }
       }
     }
     ts.forEachChild(node, collect);
   };
   collect(sourceFile);
 
-  return { hooks, namespaces, referenced };
+  // Cleanup is routinely one hop further out than the hook body, so follow the call chain to a
+  // fixed point. Names that resolve to no same-file function (an import, `rm` itself) drop out.
+  for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
+    const declaration = functions.get(name);
+    if (declaration === undefined) continue;
+    for (const called of calledNames(declaration)) reach(called);
+  }
+
+  return { hooks, namespaces, reachable };
 }
 
 function isInlineCleanupCallback(node: ts.Node, bindings: CleanupBindings): boolean {
@@ -195,16 +247,16 @@ function isInlineCleanupCallback(node: ts.Node, bindings: CleanupBindings): bool
  * for, so the rule has to follow the reference. Resolution is same-file and by name only: a
  * callback imported from another module is not tracked.
  */
-function isReferencedCleanup(node: ts.Node, referenced: Set<string>): boolean {
+function isReachableCleanup(node: ts.Node, reachable: Set<string>): boolean {
   if (ts.isFunctionDeclaration(node)) {
-    return node.name !== undefined && referenced.has(node.name.text);
+    return node.name !== undefined && reachable.has(node.name.text);
   }
   if (!ts.isArrowFunction(node) && !ts.isFunctionExpression(node)) return false;
   const parent = node.parent;
   return (
     ts.isVariableDeclaration(parent) &&
     ts.isIdentifier(parent.name) &&
-    referenced.has(parent.name.text)
+    reachable.has(parent.name.text)
   );
 }
 
@@ -218,7 +270,7 @@ function isInCleanup(node: ts.Node, bindings: CleanupBindings): boolean {
       return true;
     }
     if (isInlineCleanupCallback(current, bindings)) return true;
-    if (isReferencedCleanup(current, bindings.referenced)) return true;
+    if (isReachableCleanup(current, bindings.reachable)) return true;
   }
   return false;
 }
