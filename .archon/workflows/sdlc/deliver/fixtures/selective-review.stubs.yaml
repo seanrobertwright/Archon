@@ -1,7 +1,6 @@
-# Dry-run fixture: the classifier selects only the test lens. The core lenses
-# still run, the selected specialist runs, and the other costly specialists stay
-# skipped. The fixture keeps deterministic code stubbed; the loader test protects
-# the classifier-binding seam itself.
+# Dry-run fixture: code, seams, and tests run by default while the classifier
+# selects docs. The fixture keeps deterministic code stubbed; the loader test
+# protects the classifier-binding seam itself.
 impl__record-start: '{"start":"recorded"}'
 impl__implement:
   done: true
@@ -11,24 +10,19 @@ impl__assert-changed: "3 files changed"
 gate-green: '{"gate":"green"}'
 pr__pr: "https://github.com/example/repo/pull/2 (draft)"
 classify:
-  tests: true
   errors: false
-  comments: false
-  types: false
-  docs: false
+  docs: true
   reasons:
-    tests: "stub: changed behavior needs coverage review"
     errors: "stub: no failure paths"
-    comments: "stub: no comment changes"
-    types: "stub: no contract changes"
-    docs: "stub: no doc-facing changes"
-resolve-scope: '{"tests":"true","errors":"false","comments":"false","types":"false","docs":"false"}'
+    docs: "stub: changed shipped docs need impact review"
+resolve-scope: '{"errors":"false"}'
 review__mode: '{"continuation":false}'
-review__scope: "target recorded; head sha stubbed"
+review__scope:
+  docs: false
 review__code: "0 findings"
 review__seams: "0 findings"
 review__tests: "0 findings"
-review__simplify: "0 findings (suggestions only)"
+review__docs: "0 findings"
 review__review-complete: "settled"
 review__synthesize:
   ready: true
@@ -45,3 +39,4 @@ flip-ready: "https://github.com/example/repo/pull/2"
 outcome: "https://github.com/example/repo/pull/2"
 fixture:
   expect: completed
+  reached: [review__code, review__seams, review__tests, review__docs]

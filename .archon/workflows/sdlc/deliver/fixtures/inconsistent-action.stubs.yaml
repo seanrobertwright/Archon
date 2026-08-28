@@ -10,23 +10,17 @@ impl__assert-changed: "1 file changed"
 gate-green: '{"gate":"green"}'
 pr__pr: "https://github.com/example/repo/pull/4 (draft)"
 classify:
-  tests: false
   errors: false
-  comments: false
-  types: false
   docs: false
   reasons:
-    tests: "stub"
     errors: "stub"
-    comments: "stub"
-    types: "stub"
     docs: "stub"
-resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+resolve-scope: '{"errors":"false"}'
 review__mode: '{"continuation":false}'
 review__scope: "accepted contract recorded"
 review__code: "0 findings"
 review__seams: "0 findings"
-review__simplify: "0 findings (suggestions only)"
+review__tests: "0 findings"
 review__synthesize:
   ready: true
   action: correct

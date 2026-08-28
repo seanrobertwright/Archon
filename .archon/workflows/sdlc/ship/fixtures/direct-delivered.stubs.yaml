@@ -20,22 +20,15 @@ deliver__validate__validate:
 outcome: "https://github.com/example/repo/pull/4"
 ci-probe: '{"state":"concluded","detail":"all checks green"}'
 deliver__classify:
-  tests: false
   errors: false
-  comments: false
-  types: false
   docs: false
   reasons:
-    tests: "stub: small fixture diff"
     errors: "stub: no failure paths"
-    comments: "stub: no comment changes"
-    types: "stub: no contract changes"
     docs: "stub: no doc-facing changes"
-deliver__resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+deliver__resolve-scope: '{"errors":"false"}'
 fixture:
   expect: completed
 triage__assert-intact: '{"intact":"true"}'
-deliver__review__simplify: "0 findings (suggestions only)"
 deliver__gate-ready: '{"gate":"ready"}'
 deliver__impl__record-start: '{"start":"recorded"}'
 deliver__gate-validated: '{"validated":"true"}'
@@ -48,4 +41,5 @@ deliver__review__mode: '{"continuation":false}'
 deliver__review__scope: "target recorded; head sha stubbed"
 deliver__review__code: "0 findings"
 deliver__review__seams: "0 findings"
+deliver__review__tests: "0 findings"
 deliver__review__review-complete: "settled"

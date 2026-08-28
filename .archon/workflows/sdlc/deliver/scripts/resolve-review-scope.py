@@ -4,7 +4,7 @@ import json
 import os
 import sys
 
-LENSES = ("tests", "errors", "comments", "types", "docs")
+LENSES = ("errors",)
 
 
 def resolve(forced: str, judged: str, lens: str) -> str:

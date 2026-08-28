@@ -2,7 +2,7 @@
 
 Find one defect: **the change establishes or alters meaningful behavior, and no test would fail when that behavior regresses in a plausible way.** Tests protect outcomes and invariants — count, lines, and coverage percentages are not outcomes. Read-only: never modify files, commit, or post anywhere.
 
-Read `$ARTIFACTS_DIR/review/scope.md` first. In light mode, verify prior findings from this lens first, then examine only the delta.
+Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md` first. Anchor the review on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; for an engaged risk, explicitly try to refute the relevant invariant. In light mode, verify prior findings from this lens first, then examine only the delta.
 
 ## A finding needs all four
 
@@ -29,8 +29,8 @@ Coverage targets; tests for getters, wiring, or framework behavior; implementati
 
 ## Output
 
-Write `$ARTIFACTS_DIR/review/tests.md`: each gap with the four evidence parts and `file:line` references, then the examined-and-protected list citing the decisive assertions. In light mode, a verdict per prior finding. No findings is a valid result.
+Write `$ARTIFACTS_DIR/review/tests.md`: each in-scope finding begins with `sources: [tests]`, followed by the four evidence parts and `file:line` references, then the examined-and-protected list citing the decisive assertions. In light mode, a verdict per prior finding. No findings is a valid result.
 
 If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-tests.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`tests`). Write no file for no discovery; never append to another lens's file or record suspicion.
 
-Verify every cited `file:line` is real, then reply with one line: findings count by severity.
+Verify every cited `file:line` is real, then reply with one line pointing to it: `review findings: $ARTIFACTS_DIR/review/tests.md` and the findings count by severity.

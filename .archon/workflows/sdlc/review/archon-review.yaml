@@ -1,8 +1,8 @@
 name: archon-review
 description: |
   Review a change through parallel specialist lenses and produce one evidence-based
-  verdict. On the first round, code, seams, and simplification always run while
-  the other lenses are opt-in inputs. Reviews a PR when given one, otherwise the
+  verdict. On the first round, code, seams, and tests always run; errors are
+  selected for failure-path changes and docs only for shipped-doc changes. Reviews a PR when given one, otherwise the
   working diff. Advisory and read-only: it judges, it never edits. Given the
   previous round's report, one continuation reviewer verifies the prior findings,
   reviews the correction delta, and follows their causal class without repeating
@@ -16,7 +16,7 @@ description: |
   NOT for: fixing findings (implement), running the project's checks (validate),
   or writing code.
 
-model: medium
+model: large
 
 inputs:
   scope:
@@ -36,21 +36,14 @@ inputs:
       The accepted outcome and scope boundaries for this change. Delivery passes
       the same work order implementation received. Standalone review may leave
       this empty and use the PR's problem, outcome, and explicit scope instead.
-  tests:
-    default: false
-    description: Enable the test-coverage lens on a full review.
   errors:
     default: false
     description: Enable the silent-failure lens on a full review.
-  comments:
-    default: false
-    description: Enable the comment-accuracy lens on a full review.
-  types:
-    default: false
-    description: Enable the type-design lens on a full review.
   docs:
-    default: false
-    description: Enable the docs-impact lens on a full review.
+    default: "auto"
+    description: >-
+      Docs-impact lens — auto selects shipped-documentation changes from the
+      reviewed diff; true or false overrides that selection.
 
 returns: synthesize
 outcome_field: ready
@@ -66,8 +59,13 @@ nodes:
     command: review-scope
     context: fresh
     depends_on: [mode]
+    output_format:
+      type: object
+      properties:
+        docs: { type: boolean }
+      required: [docs]
 
-  # ── Always-on lenses ─────────────────────────────────────────────
+  # ── Default-on lenses ─────────────────────────────────────────────
   - id: code
     command: review-code
     context: fresh
@@ -86,12 +84,12 @@ nodes:
       max_attempts: 2
       delay_ms: 20000
 
-  # ── Optional lenses, operator-enabled via inputs ─────────────────
+  # ── Default-on and conditional lenses ─────────────────────────────
   - id: tests
     command: review-tests
     context: fresh
     depends_on: [scope]
-    when: "$mode.output.continuation == false && $INPUTS.tests == 'true'"
+    when: "$mode.output.continuation == false"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -105,41 +103,11 @@ nodes:
       max_attempts: 2
       delay_ms: 20000
 
-  - id: comments
-    command: review-comments
-    context: fresh
-    depends_on: [scope]
-    when: "$mode.output.continuation == false && $INPUTS.comments == 'true'"
-    retry:
-      max_attempts: 2
-      delay_ms: 20000
-
-  - id: types
-    command: review-types
-    context: fresh
-    depends_on: [scope]
-    when: "$mode.output.continuation == false && $INPUTS.types == 'true'"
-    retry:
-      max_attempts: 2
-      delay_ms: 20000
-
   - id: docs
     command: review-docs
     context: fresh
     depends_on: [scope]
-    when: "$mode.output.continuation == false && $INPUTS.docs == 'true'"
-    retry:
-      max_attempts: 2
-      delay_ms: 20000
-
-  # Always-on with code and seams: the three universal questions about any diff
-  # are "is it correct", "do the seams hold", and "is it over-built". Findings
-  # stay suggestions-only; it never blocks.
-  - id: simplify
-    command: review-simplify
-    context: fresh
-    depends_on: [scope]
-    when: "$mode.output.continuation == false"
+    when: "$mode.output.continuation == false && $INPUTS.docs == 'true' || $mode.output.continuation == false && $INPUTS.docs == 'auto' && $scope.output.docs == true"
     retry:
       max_attempts: 2
       delay_ms: 20000
@@ -150,7 +118,7 @@ nodes:
   # mode/scope preflight: synthesize separately requires scope to have succeeded.
   - id: review-complete
     bash: "true"
-    depends_on: [code, seams, tests, errors, comments, types, docs, simplify]
+    depends_on: [code, seams, tests, errors, docs]
     trigger_rule: all_done
 
   # A failed specialist (for example, a provider stream dying mid-review in run
