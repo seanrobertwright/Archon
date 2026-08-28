@@ -592,6 +592,16 @@ async function handleWorktreeCommand(
       const forceFlag = args[1] === '--force';
 
       try {
+        const liveRun = await isolationEnvDb.getLiveRunOwningEnv(isolationEnvId);
+        if (liveRun) {
+          return {
+            success: false,
+            message:
+              `Worktree is still owned by workflow run ${liveRun.id.slice(0, 8)} ` +
+              `(${liveRun.status}). Resume or abandon it before removing the worktree.`,
+          };
+        }
+
         // Use isolation provider for removal (pass the working path, not UUID)
         const provider = getIsolationProvider();
         await provider.destroy(isolationEnv.working_path, { force: forceFlag });
