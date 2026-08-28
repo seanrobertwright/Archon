@@ -122,7 +122,8 @@ Completion channels — declare at least one, pick by tier:
 - `until: TOKEN` — prose sentinel; interactive gates a human reads ONLY (deprecated elsewhere)
 
 Also: `fresh_context: true` (each iteration starts clean), `$LOOP_PREV_OUTPUT`
-and `$LOOP_PREV.<nodeId>.output` inside body prompts for previous-iteration state.
+and `$LOOP_PREV.<nodeId>.output` inside body prompts (text substitution) or body
+`when:` conditions (typed resolution) for previous-iteration state.
 A failed iteration fails the loop at `max_iterations` — bound exhaustion fails
 truthfully rather than blessing a bad last attempt.
 

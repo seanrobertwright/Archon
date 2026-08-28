@@ -632,7 +632,12 @@ nodes:
           prompt: Fix the failing tests. Emit TESTS_PASS only when all pass.
           depends_on: []
         - id: test
-          bash: bun test
+          bash: |
+            if bun test; then
+              printf 'green'
+            else
+              printf 'red'
+            fi
           depends_on: [implement]
         - id: review
           prompt: Summarize the result; echo TESTS_PASS if tests are green.
@@ -715,7 +720,7 @@ A body node can also gate on the previous iteration's typed output with `when:`:
 - id: repair
   prompt: Repair the failing tests.
   depends_on: [test]
-  when: "$LOOP_PREV.test.output.verdict == 'red'"
+  when: "$LOOP_PREV.test.output == 'red'"
 ```
 
 This is a condition reference, not text substitution. On iteration 1 it resolves to
