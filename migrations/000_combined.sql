@@ -671,6 +671,8 @@ COMMENT ON COLUMN remote_agent_isolation_environments.workflow_id IS
   'Identifier for the work (issue number, PR number, thread hash, etc.)';
 
 -- Workflow runs
+COMMENT ON COLUMN remote_agent_workflow_runs.conversation_id IS
+  'Owning conversation. ON DELETE CASCADE erases the run rows on a hard conversation delete, silently dropping the live-run cleanup pin for its isolation environments (#2868); soft delete is the only supported path. A future hard-delete must resolve live runs first.';
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
   ON remote_agent_workflow_runs(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_status

@@ -748,6 +748,10 @@ export class SqliteAdapter implements IDatabase {
         WHERE status = 'active';
 
       -- Workflow runs table
+      -- conversation_id's ON DELETE CASCADE would erase run rows (and with them
+      -- the live-run cleanup pin for isolation environments, #2868) on a hard
+      -- conversation delete; soft delete is the only supported path. Mirrors
+      -- the COMMENT ON COLUMN in migrations/000_combined.sql.
       CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
         conversation_id TEXT NOT NULL REFERENCES remote_agent_conversations(id) ON DELETE CASCADE,
