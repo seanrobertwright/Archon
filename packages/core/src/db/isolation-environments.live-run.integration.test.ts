@@ -64,6 +64,20 @@ async function seedRun(
   );
 }
 
+/** Same as seedRun with an explicit started_at, to order two runs on one env. */
+async function seedRunAt(
+  id: string,
+  conversationId: string,
+  status: string,
+  startedAt: string
+): Promise<void> {
+  await db.query(
+    `INSERT INTO remote_agent_workflow_runs (id, conversation_id, workflow_name, user_message, status, metadata, started_at)
+     VALUES ($1, $2, 'test-wf', 'test', $3, '{}', $4)`,
+    [id, conversationId, status, startedAt]
+  );
+}
+
 describe('getLiveRunOwningEnv — real SQLite behavior', () => {
   test('an env whose conversation holds only terminal runs is NOT pinned (#2868)', async () => {
     const env = await create({
@@ -125,5 +139,63 @@ describe('getLiveRunOwningEnv — real SQLite behavior', () => {
     await seedConversation('conv-empty', env.id);
 
     await expect(getLiveRunOwningEnv(env.id)).resolves.toBeNull();
+  });
+
+  // 'failed' is terminal but resumable. Releasing its env lets cleanup run
+  // `git branch -D` on the only branch `--resume`/`--adopt` can attach to, so a
+  // failed run keeps its pin while completed and cancelled runs let go.
+  test('a failed run still pins the env — it remains resumable', async () => {
+    const env = await create({
+      codebase_id: 'cb-1',
+      workflow_type: 'task',
+      workflow_id: 'task-failed',
+      working_path: '/tmp/ops-client',
+      branch_name: '' as never,
+    });
+    await seedConversation('conv-failed', env.id);
+    await seedRun('run-failed', 'conv-failed', 'failed');
+
+    await expect(getLiveRunOwningEnv(env.id)).resolves.toEqual({
+      id: 'run-failed',
+      status: 'failed',
+    });
+  });
+
+  test.each(['completed', 'cancelled'])(
+    'a %s run does not pin the env — it can never claim it back',
+    async status => {
+      const env = await create({
+        codebase_id: 'cb-1',
+        workflow_type: 'task',
+        workflow_id: `task-${status}`,
+        working_path: '/tmp/ops-client',
+        branch_name: '' as never,
+      });
+      await seedConversation(`conv-${status}`, env.id);
+      await seedRun(`run-${status}`, `conv-${status}`, status);
+
+      await expect(getLiveRunOwningEnv(env.id)).resolves.toBeNull();
+    }
+  );
+
+  // The container reaper used to take the newest run row and only then check its
+  // status, so a newer terminal run hid an older claimable one. Filtering status
+  // inside the query is what makes that impossible.
+  test('a newer terminal run does not shadow an older claimable one', async () => {
+    const env = await create({
+      codebase_id: 'cb-1',
+      workflow_type: 'task',
+      workflow_id: 'task-shadowed',
+      working_path: '/tmp/ops-client',
+      branch_name: '' as never,
+    });
+    await seedConversation('conv-shadowed', env.id);
+    await seedRunAt('run-still-paused', 'conv-shadowed', 'paused', '2026-08-01T00:00:00.000Z');
+    await seedRunAt('run-newer-done', 'conv-shadowed', 'completed', '2026-08-02T00:00:00.000Z');
+
+    await expect(getLiveRunOwningEnv(env.id)).resolves.toEqual({
+      id: 'run-still-paused',
+      status: 'paused',
+    });
   });
 });

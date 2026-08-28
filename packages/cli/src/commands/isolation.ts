@@ -122,7 +122,7 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
     console.log(`\nCleaning: ${env.branch_name ?? env.workflow_id}`);
     console.log(`  Path: ${env.working_path}`);
 
-    // Same lock the cleanup-service sweeps use: a non-terminal run owning the
+    // Same lock the cleanup-service sweeps use: a run that can still claim the
     // environment blocks removal, even when the conversation recency filter
     // marks the env stale.
     const liveRun = await isolationDb.getLiveRunOwningEnv(env.id);

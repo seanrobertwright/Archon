@@ -311,8 +311,8 @@ packages/cli/
                                   │ safe=true
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Guard checks: no uncommitted changes, no non-terminal run       │
-│ owns the env (getRemovalBlocker)                                │
+│ Guard checks: no uncommitted changes, no run can still claim    │
+│ the env (getRemovalBlocker)                                     │
 │ provider.destroy() → remove worktree + delete remote branch     │
 └─────────────────────────────────────────────────────────────────┘
 ```

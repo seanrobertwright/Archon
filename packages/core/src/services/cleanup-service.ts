@@ -10,7 +10,6 @@ import * as codebaseDb from '../db/codebases';
 import * as workflowDb from '../db/workflows';
 import { getIsolationProvider, getPrState, ContainerBackend } from '@archon/isolation';
 import type { WorktreeStatusBreakdown, PrState, ContainerBackendConfig } from '@archon/isolation';
-import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import {
   hasUncommittedChanges,
   worktreeExists,
@@ -154,11 +153,12 @@ export async function listContainerEnvironments(): Promise<readonly ContainerEnv
 
 /**
  * Reap orphaned container isolation environments: remove the container + upper
- * volume of TERMINAL (completed/failed/cancelled) or run-less container envs older
- * than `daysStale`. A PAUSED run's container is NEVER touched — a paused container
- * is awaited state, not garbage (No-Autonomous-Lifecycle-Mutation Across Process
- * Boundaries); it is surfaced by `isolation list` with its age instead. All pruning
- * is label-scoped (via the tracking row), never a bare `docker prune`.
+ * volume of finished-and-unresumable (completed/cancelled) or run-less container
+ * envs older than `daysStale`. A container a run can still claim — running, pending,
+ * paused, or failed-but-resumable — is NEVER touched: it is awaited state, not
+ * garbage (No-Autonomous-Lifecycle-Mutation Across Process Boundaries), and is
+ * surfaced by `isolation list` with its age instead. All pruning is label-scoped
+ * (via the tracking row), never a bare `docker prune`.
  */
 export async function cleanupContainerEnvironments(
   daysStale = STALE_THRESHOLD_DAYS
@@ -174,11 +174,15 @@ export async function cleanupContainerEnvironments(
 
   for (const row of rows) {
     // FAIL CLOSED on an ambiguous lookup (H3): a DB error is NOT "no run" — treating
-    // it as an orphan would destroy an active/paused run's container on a transient
-    // blip (violating No-Autonomous-Lifecycle-Mutation). Report + skip, never destroy.
-    let run: Awaited<ReturnType<typeof workflowDb.getRunByIsolationEnvId>> | null;
+    // it as an orphan would destroy a claimable run's container on a transient blip
+    // (violating No-Autonomous-Lifecycle-Mutation). Report + skip, never destroy.
+    //
+    // Same lock the worktree sweeps use. getRunByIsolationEnvId, which this replaced,
+    // took the newest run row BEFORE filtering status, so a newer terminal run could
+    // shadow an older claimable one and the container would be reaped underneath it.
+    let liveRun: Awaited<ReturnType<typeof isolationEnvDb.getLiveRunOwningEnv>>;
     try {
-      run = await workflowDb.getRunByIsolationEnvId(row.id);
+      liveRun = await isolationEnvDb.getLiveRunOwningEnv(row.id);
     } catch (err) {
       report.errors.push({
         id: row.id,
@@ -187,12 +191,10 @@ export async function cleanupContainerEnvironments(
       getLog().warn({ err, envId: row.id }, 'container_env_reap_lookup_failed');
       continue;
     }
-    // Never reap an awaited (paused) or still-active (running/pending) run's
-    // container — only terminal runs, or orphans with no run at all.
-    if (run && !TERMINAL_WORKFLOW_STATUSES.includes(run.status)) {
+    if (liveRun) {
       report.skipped.push({
         id: row.id,
-        reason: `run ${run.id.slice(0, 8)} is ${run.status}`,
+        reason: `run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`,
       });
       continue;
     }
@@ -206,7 +208,8 @@ export async function cleanupContainerEnvironments(
     try {
       await backend.destroy(row.id);
       report.removed.push(row.id);
-      getLog().info({ envId: row.id, runId: run?.id ?? null }, 'container_env_reaped');
+      // No runId: the reap only happens when no run can still claim this env.
+      getLog().info({ envId: row.id }, 'container_env_reaped');
     } catch (err) {
       report.errors.push({ id: row.id, error: (err as Error).message });
       getLog().warn({ err, envId: row.id }, 'container_env_reap_failed');
@@ -217,8 +220,8 @@ export async function cleanupContainerEnvironments(
 
 /**
  * Called when a platform conversation is closed (e.g., GitHub issue/PR closed)
- * Cleans up the associated isolation environment unless a non-terminal workflow
- * run still owns it. Conversation references are data, not locks (#2868).
+ * Cleans up the associated isolation environment unless a workflow run can still
+ * claim it. Conversation references are data, not locks (#2868).
  */
 export async function onConversationClosed(
   platformType: string,
@@ -439,7 +442,7 @@ export async function cleanupToMakeRoom(
 /**
  * Returns the reason the environment cannot be removed, or null if it is safe to remove.
  * Checks uncommitted changes first (avoids a DB query when changes are present),
- * then live work: a non-terminal workflow run owning the environment.
+ * then live work: a workflow run that can still claim the environment.
  */
 type RemovalBlocker =
   | { reason: 'uncommitted_changes'; display: string }
@@ -451,9 +454,10 @@ async function getRemovalBlocker(env: {
 }): Promise<RemovalBlocker | null> {
   const hasChanges = await hasUncommittedChanges(toWorktreePath(env.working_path));
   if (hasChanges) return { reason: 'uncommitted_changes', display: 'has uncommitted changes' };
-  // Live work is the only lock: a non-terminal run owning the env blocks removal.
-  // Historical conversation references are data, not locks (same rule the merged
-  // cleanup sweep follows) — see getLiveRunOwningEnv.
+  // Live work is the only lock: a run that can still claim the env blocks removal —
+  // running, pending, paused, or failed-but-resumable. Historical conversation
+  // references are data, not locks (same rule the merged cleanup sweep follows) —
+  // see getLiveRunOwningEnv.
   const liveRun = await isolationEnvDb.getLiveRunOwningEnv(env.id);
   if (liveRun) {
     return {

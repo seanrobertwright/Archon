@@ -134,4 +134,16 @@ describe.skipIf(!baseUrl)('getLiveRunOwningEnv — real Postgres behavior', () =
 
     await expect(getLiveRunOwningEnv(env.id)).resolves.toBeNull();
   });
+
+  // The claimable set is one shared parameter list, but prove it on both dialects
+  // so a Postgres-only regression cannot hide behind the SQLite suite.
+  test('a failed run still pins the env — it remains resumable', async () => {
+    const env = await createEnv('pg-failed-resumable');
+    const conversationId = '77777777-7777-4777-8777-777777777777';
+    const runId = '88888888-8888-4888-8888-888888888888';
+    await seedConversation(conversationId, env.id);
+    await seedRun(runId, conversationId, 'failed');
+
+    await expect(getLiveRunOwningEnv(env.id)).resolves.toEqual({ id: runId, status: 'failed' });
+  });
 });

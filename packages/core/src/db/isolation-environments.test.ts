@@ -363,26 +363,19 @@ describe('isolation-environments', () => {
   });
 
   describe('getLiveRunOwningEnv', () => {
-    test('queries runs through both attachment routes, excluding terminal statuses', async () => {
+    // Only the parameters are asserted here. This file hardcodes the Postgres
+    // dialect, so asserting SQL text would pin one branch of a dialect-parallel
+    // query; the real-SQLite and real-Postgres integration tests prove behavior
+    // on both. 'failed' must NOT appear: it is terminal but resumable, so a failed
+    // run keeps its environment (see UNCLAIMABLE_WORKFLOW_STATUSES).
+    test('excludes only the statuses no run can claim back', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-1', status: 'running' }]));
 
       const result = await getLiveRunOwningEnv('env-123');
 
       expect(result).toEqual({ id: 'run-1', status: 'running' });
-      expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining(
-          'LEFT JOIN remote_agent_conversations c ON c.id = r.conversation_id'
-        ),
-        expect.anything()
-      );
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      // env id first, then every terminal status as an excluded value
-      expect(params).toEqual(['env-123', 'completed', 'failed', 'cancelled']);
-      expect(query).toContain(
-        "metadata->>'isolation_env_id' = $1 OR c.isolation_env_id::text = $1"
-      );
-      expect(query).toContain('r.status NOT IN ($2, $3, $4)');
-      expect(query).toContain('ORDER BY r.started_at DESC');
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(params).toEqual(['env-123', 'completed', 'cancelled']);
     });
 
     test('returns null when the env has no live run', async () => {

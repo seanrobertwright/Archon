@@ -81,7 +81,8 @@ mock.module('../db/isolation-environments', () => ({
   createIsolationStore: () => ({}),
 }));
 
-// Mock workflows DB (getRunByIsolationEnvId — reaper run-status lookup)
+// Mock workflows DB (getRunByIsolationEnvId — the run id/status `isolation list`
+// displays for a container env; the reaper's own lock is getLiveRunOwningEnv)
 const mockGetRunByIsolationEnvId = mock(
   (): Promise<{ id: string; status: string } | null> => Promise.resolve(null)
 );
@@ -144,14 +145,15 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
   };
   beforeEach(() => {
     mockListActiveContainerEnvironments.mockReset();
-    mockGetRunByIsolationEnvId.mockReset();
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
     mockContainerDestroy.mockReset();
     mockContainerDestroy.mockImplementation(() => Promise.resolve());
   });
 
   test('does NOT destroy when the run lookup throws — reports the error instead', async () => {
     mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
-    mockGetRunByIsolationEnvId.mockImplementation(() => Promise.reject(new Error('DB down')));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.reject(new Error('DB down')));
 
     const report = await cleanupContainerEnvironments(7);
     expect(mockContainerDestroy).not.toHaveBeenCalled();
@@ -162,7 +164,7 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
 
   test('never reaps a PAUSED run’s container (awaited state)', async () => {
     mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
-    mockGetRunByIsolationEnvId.mockImplementation(() =>
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
       Promise.resolve({ id: 'run-1', status: 'paused' })
     );
     const report = await cleanupContainerEnvironments(7);
@@ -170,11 +172,22 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
     expect(report.skipped).toHaveLength(1);
   });
 
-  test('reaps a terminal run’s container older than the threshold', async () => {
+  // The reaper reads the same lock the worktree sweeps use, so a failed run's
+  // container survives for `--resume` exactly as a paused one does.
+  test('never reaps a FAILED run’s container (still resumable)', async () => {
     mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
-    mockGetRunByIsolationEnvId.mockImplementation(() =>
-      Promise.resolve({ id: 'run-1', status: 'completed' })
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
+      Promise.resolve({ id: 'run-1', status: 'failed' })
     );
+    const report = await cleanupContainerEnvironments(7);
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(report.skipped).toHaveLength(1);
+    expect(report.skipped[0]?.reason).toBe('run run-1 is failed');
+  });
+
+  test('reaps a container no run can claim, older than the threshold', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
     const report = await cleanupContainerEnvironments(7);
     expect(mockContainerDestroy).toHaveBeenCalledTimes(1);
     expect(report.removed).toEqual(['env-1']);
