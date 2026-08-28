@@ -705,7 +705,12 @@ nodes:
             Fix what failed.
           depends_on: []
         - id: test
-          bash: bun test
+          bash: |
+            if bun test; then
+              printf 'green'
+            else
+              printf 'red'
+            fi
           depends_on: [implement]
 ```
 
