@@ -5492,19 +5492,12 @@ describe('workflowRunCommand — detach', () => {
     });
     // The parent resolves the declared adoption before forking (#2872), so this test
     // now has to give it a project and a resolvable lane to pass through.
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (codebaseDb.findCodebaseByPathPrefix as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'cb-1',
-      name: 'test/repo',
+      name: 'test/folder',
       default_cwd: '/test/path',
-      default_branch: 'main',
-      kind: 'repo',
-    });
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
-      id: 'cb-1',
-      name: 'test/repo',
-      default_cwd: '/test/path',
-      default_branch: 'main',
-      kind: 'repo',
+      kind: 'folder',
     });
     (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
       { id: adoptedRunId },
@@ -5521,7 +5514,7 @@ describe('workflowRunCommand — detach', () => {
 
     let spawnCmd: string[] = [];
     try {
-      const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', {
+      const commandPromise = workflowRunCommand('/test/path/subdir', 'assist', 'hello', {
         detach: true,
         adoptRunId: '0b1ee8da',
       });
@@ -5539,6 +5532,9 @@ describe('workflowRunCommand — detach', () => {
     expect(spawnCmd[adoptIndex + 1]).toBe(adoptedRunId);
     expect(workflowDb.findWorkflowRunsByIdPrefix).toHaveBeenCalledWith('0b1ee8da', 'cb-1');
     expect(resolveWorkflowAdoption).toHaveBeenCalledWith(expect.objectContaining({ adoptedRunId }));
+    expect(mockCreateWorkflowRun).toHaveBeenCalledWith(
+      expect.objectContaining({ adopted_from_run_id: adoptedRunId })
+    );
     expect(spawnCmd).not.toContain('--branch');
   });
 
@@ -10008,17 +10004,19 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
     (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockClear();
     setupAdoptMocks();
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockReset();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (codebaseDb.findCodebaseByPathPrefix as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'cb-adopt',
-      name: 'test-repo',
+      name: 'test-folder',
       default_cwd: '/test/path',
-      kind: 'repo',
+      kind: 'folder',
     });
     (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
       { id: adoptedRunId },
     ]);
 
-    await workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: '0b1ee8da' });
+    await workflowRunCommand('/test/path/subdir', 'assist', 'hello', { adoptRunId: '0b1ee8da' });
 
     expect(workflowDb.findWorkflowRunsByIdPrefix).toHaveBeenCalledWith('0b1ee8da', 'cb-adopt');
     expect(adoption.resolveWorkflowAdoption).toHaveBeenCalledWith(

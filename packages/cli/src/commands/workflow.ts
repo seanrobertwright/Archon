@@ -2095,7 +2095,7 @@ async function runWorkflowWithOwnedSource(
         );
       }
       if (options.adoptRunId !== undefined) {
-        adoptedRunId = await resolveRunIdArg(options.adoptRunId, cwd);
+        adoptedRunId = await resolveRunIdArg(options.adoptRunId, cwd, false, detachCodebase.id);
         await resolveWorkflowAdoption({
           adoptedRunId,
           codebaseId: detachCodebase.id,
@@ -2348,7 +2348,7 @@ async function runWorkflowWithOwnedSource(
     // one of the two ids is present.
     if (options.adoptRunId !== undefined) {
       continuationMode = 'adopt';
-      adoptedFromRunId = await resolveRunIdArg(options.adoptRunId, cwd);
+      adoptedFromRunId = await resolveRunIdArg(options.adoptRunId, cwd, false, codebase.id);
     } else if (options.supersedesRunId !== undefined) {
       continuationMode = 'supersede';
       adoptedFromRunId = options.supersedesRunId;
@@ -4035,7 +4035,8 @@ const FULL_RUN_ID_RE =
  * codebase, a unique match resolves, and an ambiguous prefix errors.
  *
  * Full UUIDs skip resolution entirely — exact lookup is global, so full ids
- * keep working from any directory. Project lookup preserves an exact checkout
+ * keep working from any directory. A caller that already resolved a project can
+ * provide its id; otherwise project lookup preserves an exact checkout
  * registration, then falls back to a linked worktree's canonical checkout. By
  * default, an omitted or unregistered cwd and an unmatched prefix pass through
  * unchanged so the downstream exact lookup keeps its existing error surface.
@@ -4044,23 +4045,25 @@ const FULL_RUN_ID_RE =
 async function resolveRunIdArg(
   runId: string,
   cwd?: string,
-  requirePrefixMatch = false
+  requirePrefixMatch = false,
+  codebaseId?: string
 ): Promise<string> {
   if (FULL_RUN_ID_RE.test(runId)) return runId;
-  if (cwd === undefined) {
+  if (cwd === undefined && codebaseId === undefined) {
     if (requirePrefixMatch) {
       throw new Error(`Cannot resolve run id prefix '${runId}' without a project directory.`);
     }
     return runId;
   }
-  const codebase = await findCodebaseForCheckoutPath(cwd);
-  if (!codebase) {
+  const resolvedCodebaseId =
+    codebaseId ?? (cwd === undefined ? undefined : (await findCodebaseForCheckoutPath(cwd))?.id);
+  if (!resolvedCodebaseId) {
     if (requirePrefixMatch) {
       throw new Error(`Cannot resolve run id prefix '${runId}' outside a registered project.`);
     }
     return runId;
   }
-  const matches = await workflowDb.findWorkflowRunsByIdPrefix(runId, codebase.id);
+  const matches = await workflowDb.findWorkflowRunsByIdPrefix(runId, resolvedCodebaseId);
   if (matches.length > 1) {
     const candidates = matches.map(match => `  ${match.id}`).join('\n');
     throw new Error(
