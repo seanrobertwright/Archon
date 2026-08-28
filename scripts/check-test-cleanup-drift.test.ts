@@ -20,8 +20,12 @@ afterEach(async () => {
 /**
  * A repository with no remotes and no branch history, which is the shape the check must work
  * in: the GitHub Actions checkout carries no \`origin/dev\` ref.
+ *
+ * Files are left untracked by default because the scan finds them either way and process
+ * creation is the expensive part of this suite on Windows CI (#2882). One test opts into
+ * `track` to prove the tracked half of the walk.
  */
-function repositoryWith(files: Record<string, string>, { track = true } = {}): string {
+function repositoryWith(files: Record<string, string>, { track = false } = {}): string {
   const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'drift-check-')));
   gitOutput(['init'], root);
   for (const [name, content] of Object.entries(files)) {
@@ -258,19 +262,23 @@ test('rejects recursive cleanup in a file the baseline does not record', () => {
   ]);
 });
 
-test('finds untracked sources', () => {
+test('finds tracked sources too, not only untracked ones', () => {
   const root = repositoryWith(
     { 'packages/lib/src/fresh.test.ts': CLEANUP_SOURCE },
-    { track: false }
+    { track: true }
   );
 
+  expect(gitOutput(['ls-files'], root).trim()).toBe('packages/lib/src/fresh.test.ts');
   expect(checkRepository(root, new Map())).toHaveLength(1);
 });
 
-test('accepts a recorded site at its baseline count', () => {
+test('accepts a recorded site at its count and reports a ledger left above it', () => {
   const root = repositoryWith({ 'packages/lib/src/legacy.test.ts': CLEANUP_SOURCE });
 
   expect(checkRepository(root, new Map([['packages/lib/src/legacy.test.ts', 1]]))).toEqual([]);
+  expect(checkRepository(root, new Map([['packages/lib/src/legacy.test.ts', 4]]))).toEqual([
+    expect.stringContaining('1 recursive cleanup sites, recorded 4; lower its'),
+  ]);
 });
 
 test('rejects a recorded file that gains a site', () => {
@@ -283,15 +291,10 @@ test('rejects a recorded file that gains a site', () => {
   ]);
 });
 
-test('reports a baseline left above a cleaned-up file so the ledger stays honest', () => {
-  const root = repositoryWith({ 'packages/lib/src/legacy.test.ts': CLEANUP_SOURCE });
+test('reports a ledger entry for a file that no longer has any site', () => {
+  const root = repositoryWith({ 'packages/lib/src/clean.test.ts': '' });
 
-  expect(checkRepository(root, new Map([['packages/lib/src/legacy.test.ts', 4]]))).toEqual([
-    expect.stringContaining('1 recursive cleanup sites, recorded 4; lower its'),
-  ]);
-
-  const cleaned = repositoryWith({ 'packages/lib/src/clean.test.ts': '' });
-  expect(checkRepository(cleaned, new Map([['packages/lib/src/deleted.test.ts', 2]]))).toEqual([
+  expect(checkRepository(root, new Map([['packages/lib/src/deleted.test.ts', 2]]))).toEqual([
     expect.stringContaining('0 recursive cleanup sites, recorded 2; delete its'),
   ]);
 });
