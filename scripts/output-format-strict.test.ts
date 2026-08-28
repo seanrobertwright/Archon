@@ -36,6 +36,20 @@ import { join } from 'node:path';
 const REPO_ROOT = join(import.meta.dir, '..');
 const WORKFLOWS_ROOT = join(REPO_ROOT, '.archon', 'workflows');
 
+/**
+ * A discovered file as this check reports it: repo-relative, forward slashes on every
+ * platform.
+ *
+ * `yamlFilesUnder` builds paths with `join`, so on Windows they are backslash-separated,
+ * while every expectation and rendered violation in this file is written with `/`. The two
+ * can never match, which failed 100% of Windows runs (#2954). Deriving the spelling once,
+ * here, is what keeps the next call site from reintroducing the split — patching the
+ * comparisons individually would leave the same trap for the next path added.
+ */
+function repoRelative(file: string): string {
+  return file.slice(REPO_ROOT.length + 1).replaceAll('\\', '/');
+}
+
 interface Violation {
   workflow: string;
   nodeId: string;
@@ -104,7 +118,7 @@ function findViolations(): Violation[] {
         if (outputFormat === undefined) continue;
         const nodeId = String((node as { id?: unknown }).id ?? '(unnamed)');
         for (const found of underRequiredNodes(outputFormat, 'output_format')) {
-          violations.push({ workflow: file.slice(REPO_ROOT.length + 1), nodeId, ...found });
+          violations.push({ workflow: repoRelative(file), nodeId, ...found });
         }
       }
     }
@@ -136,9 +150,7 @@ describe('bundled output_format schemas satisfy OpenAI strict mode (#1843)', () 
       for (const top of doc.nodes ?? []) {
         for (const node of withBodyNodes(top)) {
           if ((node as { output_format?: unknown }).output_format !== undefined) {
-            seen.push(
-              `${file.slice(REPO_ROOT.length + 1)}:${String((node as { id?: unknown }).id)}`
-            );
+            seen.push(`${repoRelative(file)}:${String((node as { id?: unknown }).id)}`);
           }
         }
       }
