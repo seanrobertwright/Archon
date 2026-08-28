@@ -42,6 +42,7 @@ validate__validate:
 gate-validated: '{"validated":"true"}'
 ci-probe: '{"state":"concluded","detail":"all 2 check(s) green"}'
 flip-ready: "https://github.com/example/repo/pull/1"
+outcome: "https://github.com/example/repo/pull/1"
 classify:
   tests: false
   errors: false
