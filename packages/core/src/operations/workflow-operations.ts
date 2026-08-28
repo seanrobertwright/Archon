@@ -806,7 +806,14 @@ export async function rejectWorkflow(
       [rejectionEvent]
     ));
   } else {
-    ({ resolved: won } = await workflowDb.resolveAndCancelApprovalGate(runId, [rejectionEvent]));
+    // The CAS writes `workflow_cancelled` itself; this only names the gate that
+    // ended the run. A stable token, not the user's rejection prose — that is
+    // already on the approval_received event above and does not belong on two
+    // rows (#2906).
+    ({ resolved: won } = await workflowDb.resolveAndCancelApprovalGate(runId, [rejectionEvent], {
+      step_name: approval?.nodeId ?? 'unknown',
+      reason: 'approval_rejected',
+    }));
   }
   if (!won) {
     throw new Error(`Workflow run ${runId} was already resolved and is awaiting resume.`);

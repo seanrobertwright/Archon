@@ -41,7 +41,6 @@ import {
   clearWorkflowWaitContext,
   cancelWorkflowRun,
   cancelFanOutRun,
-  failOrphanedRuns,
   findChildRuns,
   getRunAncestry,
   listWorkflowRuns,
@@ -1343,37 +1342,6 @@ describe('workflows database', () => {
       const result = await listWorkflowRuns();
 
       expect(result).toEqual([mockWorkflowRun]);
-    });
-  });
-
-  describe('failOrphanedRuns', () => {
-    test('transitions all running runs to failed with completed_at and returns count', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 2));
-
-      const result = await failOrphanedRuns();
-
-      expect(result.count).toBe(2);
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
-      expect(query).toContain("status = 'failed'");
-      expect(query).toContain('completed_at = NOW()');
-      expect(query).toContain("status = 'running'");
-      expect(params).toContain(JSON.stringify({ failure_reason: 'server_restart' }));
-    });
-
-    test('returns count 0 when no running runs exist', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
-
-      const result = await failOrphanedRuns();
-
-      expect(result.count).toBe(0);
-    });
-
-    test('throws on database error', async () => {
-      mockQuery.mockRejectedValueOnce(new Error('Connection lost'));
-
-      await expect(failOrphanedRuns()).rejects.toThrow(
-        'Failed to fail orphaned workflow runs: Connection lost'
-      );
     });
   });
 
