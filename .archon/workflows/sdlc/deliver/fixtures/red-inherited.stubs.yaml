@@ -1,0 +1,43 @@
+# Dry-run fixture: red the change cannot have caused passes the green gate, so the
+# PR opens and the review runs on work that is correct (--exec-code, so the real
+# gate script decides). This is run 49f0d462's shape (#2939).
+#
+# It also pins where an inherited break is still terminal: `validate` re-runs the
+# project's own gate later, and a base break that nobody fixed meanwhile is red
+# there too. `reached` proves the delivery got past gate-green to a reviewed PR
+# first — the failure is now a durable one on an existing PR rather than a refusal
+# before anything public exists.
+impl__record-start: '{"start":"recorded"}'
+impl__implement:
+  done: true
+  green: false
+  red_cause: inherited
+  summary: "stub: validate red on a spec this diff never touches; same spec red at the run's starting commit"
+impl__assert-changed: "3 files changed"
+# gate-green is deliberately unstubbed: the real script must pass this red and record it.
+pr__pr: "https://github.com/example/repo/pull/6 (draft)"
+classify:
+  errors: false
+  docs: false
+  reasons:
+    errors: "stub: no failure paths"
+    docs: "stub: no doc-facing changes"
+resolve-scope: '{"errors":"false"}'
+review__mode: '{"continuation":false}'
+review__scope: "target recorded; head sha stubbed"
+review__code: "0 findings"
+review__seams: "0 findings"
+review__simplify: "0 findings"
+review__tests: "0 findings"
+review__synthesize:
+  ready: true
+  action: none
+  findings_summary: "stub: the change itself is clean"
+validate__validate:
+  green: false
+  summary: "stub: the inherited break is still red on the base"
+fixture:
+  expect: failed
+  fail-node: gate-validated
+  reached: [pr__pr, review__synthesize]
+exec-code: true

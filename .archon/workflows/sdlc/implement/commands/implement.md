@@ -54,6 +54,9 @@ No one is watching this run: nothing you print survives unless it lands in this 
 
 - `done` — true when another iteration would not help: the work is complete and green, or you are definitively blocked
 - `green` — true only when the work is complete AND every applicable project check you ran this turn passes
+- `red_cause` — why the checks are red, required whenever a check you ran failed. `introduced`: your change caused it. `inherited`: the same check was already failing at this run's starting commit. `environment`: the machine this run is on caused it, not any code — a database or port a parallel process holds, a missing credential, a network fault. Omit the field when `green` is true, and when you are declaring a blocker without having run checks at all
 - `summary` — a few sentences: what you did, what stands, what (if anything) blocks
+
+`inherited` and `environment` let delivery continue on red, so neither is the comfortable answer — declaring one commits you to evidence. Name the exact failing check and the concrete reason your change cannot have caused it: that check already red at the starting commit, a failure inside a subsystem your diff never touches, a resource another process holds. Put that evidence in `summary` and in your report. Without it the cause is `introduced`. Never relabel a red check to get past a gate; the pull request's real CI checks the same thing again, so a false claim buys nothing and costs a round.
 
 Before declaring `green: true`, verify it: re-read the full diff of this run (`git status`, `git diff`, and `git log` back to the run's starting commit), confirm the work is fully covered with nothing unrelated included, confirm your report is current, and confirm the checks you cite actually ran this turn.

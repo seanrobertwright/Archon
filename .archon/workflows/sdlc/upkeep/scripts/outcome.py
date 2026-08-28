@@ -119,6 +119,63 @@ def format_raw_discoveries(artifacts: str) -> str:
     )
 
 
+RED_CAUSE_CAVEAT = (
+    "The project's own checks did not pass locally on this branch. The pull request's "
+    "own CI is the gate that still stands — read it before merging, and if the red is "
+    "inherited, the base branch is what needs the fix."
+)
+
+
+def format_red_causes(artifacts: str) -> str:
+    """The caveat for red this run's green gate deliberately let through (#2939).
+
+    The gate fails on red the change introduced and passes red it cannot have caused,
+    which is only a safe trade while every reader of this report meets the claim. A
+    run whose gates never passed red has no record and prints nothing.
+
+    Presentation, like the discoveries sections: an unreadable record degrades to a
+    pointer rather than failing a tail that has already done its irreversible work.
+
+    Kept byte-identical across the four SDLC tails.
+    """
+    path = os.path.join(artifacts, "red-causes.json")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as err:
+        return f"\n\nDelivered on red: could not read {path} ({err}). Open it directly."
+    lines = []
+    for record in data if isinstance(data, list) else []:
+        if not isinstance(record, dict):
+            continue
+        cause = str(record.get("cause") or "").strip() or "cause unstated"
+        stage = str(record.get("stage") or "").strip() or "A stage"
+        summary = str(record.get("summary") or "").strip()
+        lines.append(f"- {stage}: {cause} red" + (f"\n  {summary}" if summary else ""))
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    return (
+        f"\n\nDelivered on red ({len(lines)}) — a gate accepted red this change did "
+        f"not cause:\n{body}\n\n{RED_CAUSE_CAVEAT}"
+    )
+
+
+def format_caveats(artifacts: str, failed: bool = False) -> str:
+    """Everything a terminal report owes its reader beyond the result itself.
+
+    Both sections exist because their channel is otherwise write-only — a gate that
+    accepted red (#2939), and discoveries no consolidation ever reached (#2940).
+    Composed in one place so a new branch in main() cannot print a report that
+    quietly drops one.
+
+    Kept byte-identical across the four SDLC tails.
+    """
+    return format_red_causes(artifacts) + format_discoveries(artifacts, failed)
+
+
 def main() -> int:
     # Windows Python writes stdout in the console code page and rewrites '\n' as
     # '\r\n'. A terminal report is stored, posted to GitHub, and compared byte for
@@ -133,20 +190,20 @@ def main() -> int:
 
     if action == "no_action":
         base = f"No update needed: {summary}\nReport: {artifacts}/upkeep-assessment.md"
-        print(base + format_discoveries(artifacts))
+        print(base + format_caveats(artifacts))
         return 0
 
     if delivered == "null":
         if gate_passed:
             print(
                 "outcome: delivery started but did not complete — see the run's "
-                "earliest failed delivery node." + format_discoveries(artifacts, failed=True),
+                "earliest failed delivery node." + format_caveats(artifacts, failed=True),
                 file=sys.stderr,
             )
             return 1
         print(
             "outcome: the assessment chose 'update' but the spend gate never "
-            "passed — see the assessment stage's failed node." + format_discoveries(artifacts, failed=True),
+            "passed — see the assessment stage's failed node." + format_caveats(artifacts, failed=True),
             file=sys.stderr,
         )
         return 1
@@ -172,7 +229,7 @@ def main() -> int:
     if not branch:
         print(
             "outcome: detached HEAD — cannot resolve the PR branch."
-            + format_discoveries(artifacts, failed=True),
+            + format_caveats(artifacts, failed=True),
             file=sys.stderr,
         )
         return 1
@@ -196,11 +253,11 @@ def main() -> int:
     if not url:
         print(
             "outcome: delivery did not finish with a ready pull request."
-            + format_discoveries(artifacts, failed=True),
+            + format_caveats(artifacts, failed=True),
             file=sys.stderr,
         )
         return 1
-    print(url + format_discoveries(artifacts))
+    print(url + format_caveats(artifacts))
     return 0
 
 

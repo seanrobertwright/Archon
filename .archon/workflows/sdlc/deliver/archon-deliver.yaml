@@ -45,16 +45,18 @@ nodes:
 
   # R3's gate: run success never certifies green — this does, deterministically,
   # before anything public happens. Strict field access: a missing field fails
-  # the node rather than passing the gate.
+  # the node rather than passing the gate. It fails on red the change introduced
+  # and passes red the change cannot have caused, recording that caveat for every
+  # downstream reader — see scripts/gate-green.py for why that trade is safe.
   - id: gate-green
-    bash: |
-      if [ "$impl.output.green" = "true" ]; then
-        echo '{"gate":"green"}'
-      else
-        echo "implement finished but not green — its summary says why. Refusing to open a PR on red work." >&2
-        exit 1
-      fi
+    script: gate-green
+    runtime: uv
     depends_on: [impl]
+    with:
+      green: "$impl.output.green"
+      red_cause: "$impl.output.red_cause"
+      summary: "$impl.output.summary"
+      stage: "The implementation"
 
   - id: pr
     include: archon-pr
@@ -164,15 +166,18 @@ nodes:
               canonical review comment; the following review owns that public
               verdict.
 
+        # The same gate, same script: a correction can hit inherited or environment
+        # red exactly as the first implementation can (run 49f0d462, #2939), and a
+        # correction refused for a red it did not cause wastes the whole round.
         - id: gate-correction-green
-          bash: |
-            if [ "$fix.output.green" = "true" ]; then
-              echo '{"gate":"green"}'
-            else
-              echo "correction finished but is not green — refusing to spend a review on red work." >&2
-              exit 1
-            fi
+          script: gate-green
+          runtime: uv
           depends_on: [fix]
+          with:
+            green: "$fix.output.green"
+            red_cause: "$fix.output.red_cause"
+            summary: "$fix.output.summary"
+            stage: "The correction"
 
         - id: recheck
           include: archon-review

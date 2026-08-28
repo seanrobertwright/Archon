@@ -24,6 +24,10 @@ used, so always pass the branch: `gh pr view "$(git branch --show-current)"
    every claim that is still accurate. Do not rewrite from scratch, do not add
    sections, and do not narrate the correction history or this sync.
 4. When nothing is falsified, change nothing.
+   One exception to "add no sections": if `$ARTIFACTS_DIR/red-causes.json` records
+   a red the body does not already disclose, add that disclosure — cause and its
+   evidence from `$ARTIFACTS_DIR/implementation.md`. A correction round can go red after the body
+   was written, and a reviewer must not have to discover that from a red badge.
 5. After an edit, read the body back (`gh pr view`) and confirm it carries your
    corrections.
 
