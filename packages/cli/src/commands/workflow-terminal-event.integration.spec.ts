@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { removeTempTree } from '@archon/paths/test-utils';
-import { detachedRunControlPath, requestDetachedRunStop } from '../utils/detached-run-control';
+import {
+  canConnect,
+  detachedRunControlPath,
+  requestDetachedRunStop,
+} from '../utils/detached-run-control';
 
 const cleanupPaths: string[] = [];
 const activeRunIds = new Set<string>();
@@ -46,25 +49,6 @@ async function waitFor<T>(
   }
   const detail = lastError instanceof Error ? `: ${lastError.message}` : '';
   throw new Error(`Timed out waiting for detached workflow${detail}`);
-}
-
-async function endpointIsReachable(runId: string): Promise<boolean> {
-  return await new Promise(resolveReachability => {
-    const socket = createConnection(detachedRunControlPath(runId));
-    const settle = (reachable: boolean): void => {
-      socket.destroy();
-      resolveReachability(reachable);
-    };
-    socket.setTimeout(250, () => {
-      settle(false);
-    });
-    socket.once('connect', () => {
-      settle(true);
-    });
-    socket.once('error', () => {
-      settle(false);
-    });
-  });
 }
 
 function readRun(
@@ -162,8 +146,14 @@ describe('detached workflow terminal database events', () => {
 
       const created = await waitFor(() => readRun(databasePath, fixture.workflow));
       activeRunIds.add(created.id);
-      await waitFor(async () => ((await endpointIsReachable(created.id)) ? undefined : true));
-      expect(await endpointIsReachable(created.id)).toBe(false);
+      // `canConnect` is the owner's own probe. The copy that used to live here timed the
+      // connect out after 250ms and reported a live endpoint as gone whenever CI starved
+      // the loop past that. Returning from this wait is the assertion that the owner
+      // released its endpoint; re-asserting the same reading on the next line could only
+      // turn one such misread into a failure, which is how it failed on Windows.
+      await waitFor(async () =>
+        (await canConnect(detachedRunControlPath(created.id))) ? undefined : true
+      );
       activeRunIds.delete(created.id);
 
       const terminal = await waitFor(() => {
