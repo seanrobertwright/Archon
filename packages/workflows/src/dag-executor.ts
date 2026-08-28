@@ -6665,34 +6665,33 @@ async function executeLoopNode(
           });
         }
 
-        // Notify on idle timeout
-        if (iterationIdleTimedOut) {
-          await safeSendMessage(
-            platform,
-            conversationId,
-            `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min)`,
-            msgContext
-          );
-        }
-
         // Empty assistant output is an iteration failure for AI loops — same
         // contract as the single-shot AI-node guard in executeNodeInternal. A
         // provider stream that closed cleanly with zero content typically means
         // a silent rejection or interruption; left unchecked, an interactive
         // loop would pause with a blank gate or burn the full max_iterations
-        // budget producing nothing. Idle-timeout exits are exempt — the
-        // notification above has already told the user the iteration completed
-        // via timeout, and flipping that to a failure would contradict it.
+        // budget producing nothing. A timeout before any output is the same
+        // failure as on a single-shot AI node, so it enters the transient retry
+        // path instead of consuming an iteration.
         //
         // A structured payload is also exempt (#2563), matching executeNodeInternal's
         // `nodeOutputText === '' && structuredOutput === undefined` guard: with
         // grammar-constrained decoding the assistant prose is routinely EMPTY because
         // the whole answer arrived as the payload. Failing that would make every
         // Claude/Codex structured loop fail on iteration 1.
-        if (!iterationIdleTimedOut && fullOutput.trim() === '' && attemptStructured === undefined) {
+        //
+        // A timed-out `output_format` iteration is exempt too: the structured branch
+        // below owns it, naming the contract that failed and failing on the first
+        // attempt. That mirrors executeNodeInternal, where this generic guard is
+        // unreachable once `output_format` is set, and mirrors canReask's own
+        // idle-timeout exclusion — a retry would spend another full idle_timeout
+        // window per attempt for the same answer.
+        const structuredTimeout = wantsStructured && iterationIdleTimedOut;
+        if (!structuredTimeout && fullOutput.trim() === '' && attemptStructured === undefined) {
           const iterationDuration = Date.now() - iterationStart;
-          const emptyError =
-            'Loop iteration produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.';
+          const emptyError = iterationIdleTimedOut
+            ? `Loop node '${node.id}' iteration ${String(i)} timed out with no output (idle for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
+            : 'Loop iteration produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.';
           getLog().error(
             { nodeId: node.id, iteration: i, durationMs: iterationDuration },
             'loop_node.iteration_empty_output'
@@ -6728,6 +6727,22 @@ async function executeLoopNode(
             loopIterations: i,
             data: { iteration: i },
           });
+        }
+
+        // A timeout after output can still preserve useful work, as with an
+        // ordinary AI node whose provider process fails to exit cleanly. A
+        // zero-output timeout is a failure on every branch below, so never announce
+        // it as a completion — same condition as executeNodeInternal's notification.
+        if (
+          iterationIdleTimedOut &&
+          (fullOutput.trim() !== '' || attemptStructured !== undefined)
+        ) {
+          await safeSendMessage(
+            platform,
+            conversationId,
+            `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min)`,
+            msgContext
+          );
         }
 
         // ── Structured-output gate for this attempt ───────────────────────────

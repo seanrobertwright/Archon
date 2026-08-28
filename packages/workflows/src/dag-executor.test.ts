@@ -13588,6 +13588,172 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     expect(store.failWorkflowRun).toHaveBeenCalled();
   });
 
+  it('idle-timeout with zero output fails a loop iteration instead of consuming its iteration budget', async () => {
+    mockSendQueryDag.mockImplementationOnce(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: { abortSignal?: AbortSignal }
+    ) {
+      await new Promise<void>(resolve => {
+        if (options?.abortSignal?.aborted) resolve();
+        else options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'COMPLETE' };
+      yield { type: 'result', sessionId: 'implement-recovered' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void) => realSetTimeout(fn, 1)) as typeof setTimeout;
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'loop-idle-timeout-no-output',
+          nodes: [
+            {
+              id: 'implement',
+              kind: 'loop',
+              loop: {
+                fresh_context: false,
+                prompt: 'Implement the change.',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+              idle_timeout: 50,
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag).toHaveBeenCalledTimes(2);
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const loopFailed = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+          (call[0] as Record<string, unknown>).step_name === 'implement'
+      );
+      expect(loopFailed).toBeUndefined();
+      const iterationFailed = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'loop_iteration_failed' &&
+          (call[0] as Record<string, unknown>).step_name === 'implement'
+      );
+      expect(iterationFailed).toBeDefined();
+      const timeoutError = (
+        (iterationFailed![0] as Record<string, unknown>).data as Record<string, unknown>
+      ).error as string;
+      expect(timeoutError).toContain('timed out with no output');
+      // The retried attempt must NOT have been announced as a completion first —
+      // that contradiction is what moving the notification below the guard fixed.
+      const notices = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+        (call: unknown[]) => String(call[1])
+      );
+      expect(notices.some(text => text.includes('completed via idle timeout'))).toBe(false);
+      expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+  });
+
+  it('idle-timeout with zero output fails a structured loop immediately, without transient retries', async () => {
+    // A loop declaring output_format owns its own timeout failure: retrying it would
+    // spend another full idle_timeout window per attempt for no new information, and
+    // the single-shot AI node fails such a node on its first attempt.
+    mockSendQueryDag.mockImplementation(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: { abortSignal?: AbortSignal }
+    ) {
+      await new Promise<void>(resolve => {
+        if (options?.abortSignal?.aborted) resolve();
+        else options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void) => realSetTimeout(fn, 1)) as typeof setTimeout;
+    try {
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'structured-loop-idle-timeout',
+          nodes: [
+            {
+              id: 'implement',
+              kind: 'loop',
+              output_format: {
+                type: 'object',
+                properties: { done: { type: 'boolean' } },
+                required: ['done'],
+              },
+              loop: {
+                fresh_context: false,
+                prompt: 'Implement the change.',
+                max_iterations: 3,
+                until_field: 'done',
+              },
+              idle_timeout: 50,
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failed = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+          (call[0] as Record<string, unknown>).step_name === 'implement'
+      );
+      expect(failed).toBeDefined();
+      expect(
+        String(((failed![0] as Record<string, unknown>).data as Record<string, unknown>).error)
+      ).toContain('timed out before producing the required structured output');
+      const notices = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+        (call: unknown[]) => String(call[1])
+      );
+      expect(notices.some(text => text.includes('completed via idle timeout'))).toBe(false);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+  });
+
   it('output_format set but provider returns no structured output → node_failed (Task 8 fail-fast)', async () => {
     // Provider replied with prose only; no structuredOutput on the result chunk.
     mockSendQueryDag.mockImplementation(async function* () {
