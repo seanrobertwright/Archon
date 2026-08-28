@@ -1115,6 +1115,64 @@ describe('assertApprovable / assertRejectable — shared precondition gate', () 
       assertRejectable(withMeta({ approval: { nodeId: 'g', message: 'm', resolved: 'rejected' } }))
     ).toThrow('was already rejected and is awaiting resume');
   });
+
+  // Both functions now read ONE derivation (`runAttention`). These pin the exact
+  // messages that derivation has to keep producing at this entry point.
+  const childGate = (over: Record<string, unknown> = {}) => ({
+    approval: { nodeId: 'sub', message: 'blocked', type: 'child_workflow', ...over },
+  });
+
+  test('the child redirect names the child run verbatim, for both verbs', () => {
+    expect(() => assertApprovable(withMeta(childGate({ childRunId: 'child-9' })))).toThrow(
+      "Run run-1 is paused waiting on sub-run child-9 ('workflow:' node 'sub'). " +
+        'Approve or reject the child run instead: /workflow approve child-9'
+    );
+    expect(() => assertRejectable(withMeta(childGate({ childRunId: 'child-9' })))).toThrow(
+      "Run run-1 is paused waiting on sub-run child-9 ('workflow:' node 'sub'). " +
+        'Reject the child run instead: /workflow reject child-9 To discard the whole tree, ' +
+        'abandon this run.'
+    );
+  });
+
+  test('a block pointer with no child id says so instead of naming <unknown>', () => {
+    // The old message interpolated '<unknown>' into a command the operator could
+    // not run. A corrupt pointer is now its own state with its own explanation.
+    for (const assertFn of [assertApprovable, assertRejectable]) {
+      expect(() => assertFn(withMeta(childGate()))).toThrow(
+        'Run run-1 cannot be resolved: blocked on a sub-run at node ' +
+          "'sub' but the child run id is missing."
+      );
+      expect(() => assertFn(withMeta(childGate()))).not.toThrow('<unknown>');
+    }
+  });
+
+  test('an unrecognized gate type is refused by both verbs', () => {
+    const unknownType = { approval: { nodeId: 'g', message: 'm', type: 'from_the_future' } };
+    for (const assertFn of [assertApprovable, assertRejectable]) {
+      expect(() => assertFn(withMeta(unknownType))).toThrow(
+        "Run run-1 has an unrecognized gate type 'from_the_future'. " +
+          'This Archon build cannot resolve it.'
+      );
+    }
+  });
+
+  test('a `wait:` pause is not approvable and is silently rejectable', () => {
+    // A durable wait resumes itself; there is no gate to approve, but rejecting a
+    // parked run to cancel it stays legitimate (it never had an approval context).
+    const waiting = {
+      wait: {
+        owner: 'node',
+        nodeId: 'hold',
+        kind: 'time',
+        waitingSince: '2026-08-28T10:00:00.000Z',
+        resumeAt: '2026-08-28T11:00:00.000Z',
+      },
+    };
+    expect(() => assertApprovable(withMeta(waiting))).toThrow(
+      'Workflow run is paused but missing approval context.'
+    );
+    expect(assertRejectable(withMeta(waiting))).toBeUndefined();
+  });
 });
 
 describe('getWorkflowStatus', () => {

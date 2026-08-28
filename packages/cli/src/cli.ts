@@ -78,6 +78,7 @@ import {
   workflowRunCommand,
   workflowStatusCommand,
   workflowGetCommand,
+  workflowWaitCommand,
   workflowRunsCommand,
   workflowResumeCommand,
   workflowCancelCommand,
@@ -185,6 +186,7 @@ Commands:
   workflow status            Show status of running/paused workflows
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
+  workflow wait <run-id>     Block until the run ends or needs a human decision
   workflow resume <run-id>   Resume a failed or paused run from completed nodes
   workflow cancel <run-id>   Stop a running workflow started with --detach
   workflow abandon <run-id>  Mark a run cancelled without stopping host work
@@ -249,13 +251,14 @@ Options:
   --spawn                    Open setup wizard in a new terminal window (for setup command)
   --quiet, -q                Reduce log verbosity to warnings and errors only
   --verbose, -v              Show debug-level output
-  --json                     Output machine-readable JSON (list/status/get/runs/approve/reject/respond/cancel/abandon/resume)
+  --json                     Output machine-readable JSON (list/status/get/wait/runs/approve/reject/respond/cancel/abandon/resume)
   --events                   For verbose JSON status/get: output raw event rows instead of node summaries
   --detach                   Run 'workflow run'/'approve'/'reject'/'respond'/'resume' in a detached background child (returns immediately)
   --all                      For 'workflow runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
   --open                     For 'workflow runs': the open-work inbox — failed runs nothing has adopted or superseded
   --limit <n>                For 'workflow runs': max rows (default 20)
+  --timeout <seconds>        For 'workflow wait': give up after N seconds (default: wait indefinitely)
   --conversation-id <id>     Reuse a stable conversation scope across runs (enables
                              persist_session resume between separate CLI invocations)
   --port <port>              Override server port for 'serve' (default: 3090)
@@ -274,6 +277,7 @@ Examples:
   archon workflow run assist --dry-run --stubs ./stubs.yaml --json
   archon workflow runs --json
   archon workflow get <run-id> --json
+  archon workflow wait <run-id> --json
   archon workflow resume <run-id>
   archon workflow cancel <run-id>
   archon workflow runs --open
@@ -796,6 +800,30 @@ async function main(): Promise<number> {
             );
           }
 
+          case 'wait': {
+            const waitRunId = positionals[2];
+            if (!waitRunId || positionals[3] !== undefined) {
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow wait <run-id> [--json] [--timeout <seconds>]'
+              );
+            }
+            const rawTimeout = values.timeout as string | undefined;
+            let timeoutSeconds: number | undefined;
+            if (rawTimeout !== undefined) {
+              timeoutSeconds = Number(rawTimeout);
+              if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+                return await fail(
+                  jsonFlag,
+                  `Error: --timeout must be a positive number of seconds, got '${rawTimeout}'.`
+                );
+              }
+            }
+            // `return await`, not `break`: the wait's own exit code (3 for a deadline)
+            // has to reach the shell instead of falling through to the generic success.
+            return await workflowWaitCommand(waitRunId, jsonFlag, effectiveCwd, timeoutSeconds);
+          }
+
           case 'runs': {
             const rawLimit = values.limit as string | undefined;
             let limit: number | undefined;
@@ -1015,7 +1043,7 @@ async function main(): Promise<number> {
                 : `Unknown workflow subcommand: ${subcommand}`;
             return await fail(
               jsonFlag,
-              `${problem}\nAvailable: list, run, status, get, runs, resume, cancel, abandon, approve, reject, cleanup, event, search, install`
+              `${problem}\nAvailable: list, run, status, get, wait, runs, resume, cancel, abandon, approve, reject, cleanup, event, search, install`
             );
           }
         }

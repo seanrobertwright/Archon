@@ -60,6 +60,8 @@ import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
 import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
 import { reclaimContainerEnv } from '@archon/core/services/cleanup-service';
+import { waitForRunAttention } from '@archon/core/services/run-attention-watch';
+import type { RunWaitResult } from '@archon/core/services/run-attention-watch';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import {
@@ -3520,6 +3522,107 @@ export async function workflowStatusCommand(
 
     console.log('');
   }
+}
+
+/**
+ * One human-readable line naming the run and what it needs.
+ *
+ * `awaiting_response` deliberately names TWO runs when they differ: a parent blocked on
+ * a sub-run wakes on the child's gate, and the address in the value is the whole
+ * reason the caller can act on it.
+ */
+function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string {
+  switch (result.kind) {
+    case 'deadline':
+      return `Timed out waiting on run ${watchedRunId} — still ${result.observedStatus}.`;
+    case 'aborted':
+      return `Stopped waiting on run ${watchedRunId}.`;
+    case 'not_found':
+      return `Workflow run not found: ${watchedRunId}`;
+    case 'attention':
+      break;
+  }
+  const attention = result.attention;
+  switch (attention.kind) {
+    case 'terminal':
+      return `Run ${watchedRunId} ${attention.status}.`;
+    case 'awaiting_response':
+      return attention.respondTo.runId === watchedRunId
+        ? `Run ${watchedRunId} is waiting for a response at gate '${attention.respondTo.nodeId}'.`
+        : `Run ${watchedRunId} is blocked on sub-run ${attention.respondTo.runId}, which is waiting ` +
+            `for a response at gate '${attention.respondTo.nodeId}'.`;
+    case 'blocked_on_child':
+      // Unreachable through the waiter, which resolves the chain before returning.
+      return `Run ${watchedRunId} is blocked on sub-run ${attention.childRunId}.`;
+    case 'unreadable':
+      return `Run ${watchedRunId} needs a look: ${attention.detail}.`;
+  }
+}
+
+/**
+ * Block until a run finishes or parks on a gate awaiting a response, then say which.
+ *
+ * The point of the verb: a host that launched a run with `--detach` waits on one
+ * command instead of polling `workflow get`. Exit codes describe the COMMAND, not the
+ * run — 0 the run said something, 3 the deadline passed with the run still live, 1 the
+ * wait itself failed. A `failed` or `cancelled` run is still exit 0 with its status on
+ * stdout; mapping run state onto the process exit code would make a legitimately
+ * cancelled run look like a broken command.
+ *
+ * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
+ */
+export async function workflowWaitCommand(
+  runId: string,
+  json?: boolean,
+  cwd?: string,
+  timeoutSeconds?: number
+): Promise<number> {
+  let result: RunWaitResult;
+  let resolvedId: string;
+  try {
+    resolvedId = await resolveRunIdArg(runId, cwd);
+    result = await waitForRunAttention(resolvedId, {
+      // No timeout by default: a wait that ends on its own clock would answer a
+      // question only the run can answer.
+      ...(timeoutSeconds === undefined ? {} : { deadlineMs: timeoutSeconds * 1000 }),
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, runId }, 'cli.workflow_wait_failed');
+    // In --json mode never throw — emit one parseable {ok:false} line (same contract
+    // as `get` and the write commands) so a parsing agent always gets JSON.
+    if (json) {
+      await writeJsonLine({ ok: false, runId, action: 'wait', error: err.message });
+      return 1;
+    }
+    throw new Error(`Failed to wait for workflow run: ${err.message}`);
+  }
+
+  if (result.kind === 'not_found') {
+    if (json) {
+      await writeJsonLine({ ok: false, runId, action: 'wait', error: 'not_found' });
+    } else {
+      console.log(formatWaitOutcome(resolvedId, result));
+    }
+    return 1;
+  }
+
+  if (json) {
+    await writeJsonLine({
+      ok: true,
+      action: 'wait',
+      runId: resolvedId,
+      result: result.kind,
+      ...(result.kind === 'attention' ? { attention: result.attention } : {}),
+      ...(result.kind === 'deadline' ? { observedStatus: result.observedStatus } : {}),
+    });
+  } else {
+    console.log(formatWaitOutcome(resolvedId, result));
+  }
+
+  // 3 keeps "the run is still live" distinguishable from both a real answer (0) and a
+  // broken wait (1).
+  return result.kind === 'deadline' ? 3 : 0;
 }
 
 /**

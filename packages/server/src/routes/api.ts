@@ -99,6 +99,7 @@ import {
   isApprovalContext,
   isGateResolved,
   isWorkflowWaitContext,
+  runAttention,
 } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { MessageRow } from '@archon/core/schemas/message';
@@ -3827,6 +3828,65 @@ export function registerApiRoutes(
     }
   });
 
+  /**
+   * The approve / reject / respond routes' shared precondition, expressed as one
+   * `runAttention` read mapped to this surface's 400s. Returns null when the route may
+   * go on to resolve the gate.
+   *
+   * `requireReadableGate` mirrors the core split (`assertApprovable` vs
+   * `assertRejectable`): approve refuses a run whose gate metadata cannot be read,
+   * while reject and respond still resolve it — they fall back to
+   * `approval?.nodeId ?? 'unknown'` for the audit event.
+   *
+   * The operations throw the same conclusions; mapping them here gives the console the
+   * message instead of an opaque 500.
+   */
+  function pausedGateBlocker(
+    run: WorkflowRun,
+    childRedirectAdvice: string,
+    requireReadableGate: boolean
+  ): string | null {
+    const attention = runAttention(run);
+    const approvalRaw = run.metadata.approval;
+    const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
+    switch (attention?.kind) {
+      case 'blocked_on_child':
+        // Not an approvable gate — the parent resumes automatically when the child
+        // completes. Send the caller to the run where the decision actually lives.
+        return `Run is paused waiting on sub-run ${attention.childRunId}. ${childRedirectAdvice}`;
+      case 'unreadable':
+        if (attention.reason === 'malformed_gate') {
+          return requireReadableGate ? 'Workflow run is paused but missing approval context' : null;
+        }
+        if (attention.reason === 'unrecognized_gate_type') {
+          return `Workflow run has an unrecognized gate type '${String(approval?.type)}' — this Archon build cannot resolve it`;
+        }
+        return `Workflow run cannot be resolved: ${attention.detail}`;
+      case undefined:
+        // Post-#2075 the run stays 'paused' after a resolution, so status alone no
+        // longer distinguishes "awaiting a response" from "awaiting resume".
+        if (approval && isGateResolved(approval)) {
+          return `Workflow run was already ${String(approval.resolved)} — resume in progress`;
+        }
+        // Paused with no gate at all — a durable `wait:`. There is nothing to approve.
+        return requireReadableGate ? 'Workflow run is paused but missing approval context' : null;
+      case 'awaiting_response':
+        // The gate is open and this route may go on to resolve it.
+        return null;
+      case 'terminal':
+        // Unreachable: every route checks `status !== 'paused'` before calling this.
+        return null;
+      default: {
+        // Exhaustive by construction, so a fifth `RunAttention` kind becomes a compile
+        // error here instead of a silently swallowed one — which is how this route
+        // would reintroduce the opaque 500 the precondition exists to remove. The
+        // other three consumers of the union already fail to compile the same way.
+        const unreachable: never = attention;
+        throw new Error(`pausedGateBlocker: unhandled attention ${JSON.stringify(unreachable)}`);
+      }
+    }
+  }
+
   // POST /api/workflows/runs/:runId/approve - Approve a paused workflow run
   registerOpenApiRoute(approveWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
@@ -3838,29 +3898,13 @@ export function registerApiRoutes(
       if (run.status !== 'paused') {
         return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
       }
-      const approvalRaw = run.metadata.approval;
-      const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
-      if (!approval?.nodeId) {
-        return apiError(c, 400, 'Workflow run is paused but missing approval context');
-      }
-      if (approval.type === 'child_workflow') {
-        // Not an approvable gate — the parent resumes automatically when the child
-        // completes. approveWorkflow throws the same redirect; map it to a 400
-        // here so the console gets the message instead of an opaque 500.
-        return apiError(
-          c,
-          400,
-          `Run is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'}. Approve or reject the child run instead.`
-        );
-      }
-      if (isGateResolved(approval)) {
-        // Post-#2075 the run stays 'paused' after approval, so status alone no
-        // longer distinguishes "awaiting the human" from "awaiting resume".
-        return apiError(
-          c,
-          400,
-          `Workflow run was already ${String(approval.resolved)} — resume in progress`
-        );
+      const approveBlocker = pausedGateBlocker(
+        run,
+        'Approve or reject the child run instead.',
+        true
+      );
+      if (approveBlocker) {
+        return apiError(c, 400, approveBlocker);
       }
       // Distinguish "no body sent" (legitimate bare approve) from "body sent but
       // unparseable" (client bug). Since #2074 a bare approve FINALIZES a
@@ -3921,23 +3965,13 @@ export function registerApiRoutes(
       if (run.status !== 'paused') {
         return apiError(c, 400, `Cannot reject workflow in '${run.status}' status`);
       }
-      const approvalRaw = run.metadata.approval;
-      const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
-      if (approval?.type === 'child_workflow') {
-        // Mirror of the approve route's guard — rejectWorkflow throws the same
-        // redirect; map it to a 400 with the child pointer.
-        return apiError(
-          c,
-          400,
-          `Run is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'}. Reject the child run instead, or abandon this run to discard the whole tree.`
-        );
-      }
-      if (approval && isGateResolved(approval)) {
-        return apiError(
-          c,
-          400,
-          `Workflow run was already ${String(approval.resolved)} — resume in progress`
-        );
+      const rejectBlocker = pausedGateBlocker(
+        run,
+        'Reject the child run instead, or abandon this run to discard the whole tree.',
+        false
+      );
+      if (rejectBlocker) {
+        return apiError(c, 400, rejectBlocker);
       }
       // Mirror of the approve route's malformed-body guard: a swallowed parse
       // failure would silently drop the reviewer's reason.
@@ -4008,23 +4042,13 @@ export function registerApiRoutes(
       if (run.status !== 'paused') {
         return apiError(c, 400, `Cannot respond to workflow in '${run.status}' status`);
       }
-      const approvalRaw = run.metadata.approval;
-      const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
-      if (approval?.type === 'child_workflow') {
-        // Mirror of the approve/reject routes' guard — respondToWorkflow throws the
-        // same redirect; map it to a 400 with the child pointer.
-        return apiError(
-          c,
-          400,
-          `Run is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'}. Respond on the child run instead, or abandon this run to discard the whole tree.`
-        );
-      }
-      if (approval && isGateResolved(approval)) {
-        return apiError(
-          c,
-          400,
-          `Workflow run was already ${String(approval.resolved)} — resume in progress`
-        );
+      const respondBlocker = pausedGateBlocker(
+        run,
+        'Respond on the child run instead, or abandon this run to discard the whole tree.',
+        false
+      );
+      if (respondBlocker) {
+        return apiError(c, 400, respondBlocker);
       }
       const rawBody = await c.req.text();
       let body: { decision?: string; text?: string } = {};
