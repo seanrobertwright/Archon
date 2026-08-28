@@ -107,7 +107,15 @@ function listen(server: Server, path: string): Promise<void> {
   });
 }
 
-function canConnect(path: string): Promise<boolean> {
+/**
+ * True when something is listening on `path`. Connection refusal is the endpoint's
+ * own answer, so this reports liveness without timing it; the timeout is a backstop
+ * for a connect that neither succeeds nor errors.
+ *
+ * Exported for testing: the integration spec asks the same question of a shutting-down
+ * endpoint, and a second copy of this probe would be free to drift from this one.
+ */
+export function canConnect(path: string): Promise<boolean> {
   return new Promise(resolve => {
     const socket = createConnection(path);
     const settle = (connected: boolean): void => {
