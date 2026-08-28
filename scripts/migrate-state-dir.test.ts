@@ -41,17 +41,10 @@
 import { describe, test, expect } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'fs/promises';
 import { removeTempTree } from '@archon/paths/test-utils';
-import { setLogLevel } from '@archon/paths';
+import { getLogLevel, setLogLevel } from '@archon/paths';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
-
-// The C5 fixture opens a real adapter in THIS process, which announces its
-// schema init at info. Every subprocess here is already run with LOG_LEVEL=silent;
-// this is the same suppression for the one piece of work that is no longer a
-// subprocess. Children inherit the level at creation, so it has to happen before
-// the first adapter exists.
-setLogLevel('silent');
 
 const SCRIPT = resolve(import.meta.dir, 'migrate-state-dir.ts');
 
@@ -109,11 +102,34 @@ async function collect(proc: Bun.Subprocess<'ignore', 'pipe', 'pipe'>): Promise<
   return { exitCode, stdout, stderr };
 }
 
+/**
+ * Environment for every child, pinned to this sandbox.
+ *
+ * `DATABASE_URL` is REMOVED, not just overridden. A contributor running the
+ * documented Postgres mode (`.env.example`) would otherwise have it inherited
+ * here, which flips `getDatabaseType()` inside the child: `registryIsKnownEmpty`
+ * goes false and `resolveTarget` reads a Postgres registry, while the C5 fixture
+ * writes its row to this sandbox's SQLite file. The two sides would disagree and
+ * both C5 tests would fail looking like a climbing regression rather than an
+ * environment leak. Stripping it makes the dialect deterministic the same way
+ * `ARCHON_HOME` already pins the destination — and it also keeps the fixture from
+ * writing test rows into a contributor's real database, which the old subprocess
+ * did. The one test that wants the Postgres branch passes it back via `extraEnv`.
+ */
+function childEnv(
+  ctx: Sandbox,
+  extraEnv: Record<string, string> = {}
+): Record<string, string | undefined> {
+  const ambient: Record<string, string | undefined> = { ...process.env };
+  delete ambient.DATABASE_URL;
+  return { ...ambient, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent', ...extraEnv };
+}
+
 /** Run with raw argv — no implicit `--cwd`, for argument-parsing cases. */
 async function runRaw(ctx: Sandbox, ...args: string[]): Promise<RunResult> {
   return collect(
     Bun.spawn(['bun', 'run', SCRIPT, ...args], {
-      env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent' },
+      env: childEnv(ctx),
       cwd: ctx.repo,
       stdout: 'pipe',
       stderr: 'pipe',
@@ -139,7 +155,7 @@ async function runWithEnv(
 ): Promise<RunResult> {
   return collect(
     Bun.spawn(['bun', 'run', SCRIPT, '--cwd', cwd, ...args], {
-      env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent', ...extraEnv },
+      env: childEnv(ctx, extraEnv),
       stdout: 'pipe',
       stderr: 'pipe',
     })
@@ -454,6 +470,13 @@ describe('migrate-state-dir', () => {
         };
         await mkdir(ctx.subdir, { recursive: true });
 
+        // Opening the adapter announces its schema init at info, which every
+        // subprocess here already suppresses with LOG_LEVEL=silent. Scoped rather
+        // than set once at module load: `setLogLevel` mutates the process-wide
+        // root logger, and `bun test ./scripts/` runs all five files in one
+        // process, so an unrestored level would silently follow the others.
+        const priorLogLevel = getLogLevel();
+        setLogLevel('silent');
         const registry = new SqliteAdapter(join(ctx.archonHome, 'archon.db'));
         try {
           await registry.query(
@@ -462,6 +485,7 @@ describe('migrate-state-dir', () => {
           );
         } finally {
           await registry.close();
+          setLogLevel(priorLogLevel);
         }
 
         await body(ctx);

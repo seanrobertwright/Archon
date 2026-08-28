@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
 import {
-  DETACHED_RUN_IPC_TIMEOUT_MS,
+  canConnect,
   detachedRunControlPath,
   requestDetachedRunStop,
   startDetachedRunControlServer,
@@ -39,35 +39,6 @@ function waitForExit(
     child.once('error', error => {
       clearTimeout(timer);
       reject(error);
-    });
-  });
-}
-
-/**
- * Ask the endpoint itself whether it is still serving. Connection refusal is the
- * owner's own answer, so this reports shutdown progress without timing it.
- *
- * The bound is the same one production `canConnect` puts on its own probe: a
- * connect that neither succeeds nor errors would otherwise hang until the test
- * budget expired, which reads as an unrelated timeout instead of an unreachable
- * endpoint. It is a backstop, not a measurement — on both the reachable and the
- * refused path the socket settles immediately.
- */
-function endpointIsReachable(path: string): Promise<boolean> {
-  return new Promise<boolean>((resolve: (reachable: boolean) => void): void => {
-    const probe = createConnection(path);
-    const settle = (reachable: boolean): void => {
-      probe.destroy();
-      resolve(reachable);
-    };
-    probe.setTimeout(DETACHED_RUN_IPC_TIMEOUT_MS, (): void => {
-      settle(false);
-    });
-    probe.once('connect', (): void => {
-      settle(true);
-    });
-    probe.once('error', (): void => {
-      settle(false);
     });
   });
 }
@@ -197,13 +168,15 @@ describe('detached run control integration', () => {
     const closing = owner.close();
     // close() is parked on the retained lease and has gone no further: it stops
     // the server and unlinks the endpoint only afterwards, so a close() that
-    // ignored the lease would already have made this probe unreachable.
-    expect(await endpointIsReachable(endpointPath)).toBe(true);
+    // ignored the lease would already have made this probe unreachable. Both
+    // polarities are asserted, so a broken probe fails one of them rather than
+    // quietly agreeing with itself.
+    expect(await canConnect(endpointPath)).toBe(true);
     expect(owner.isStopRequested()).toBe(true);
 
     await closing;
     expect(owner.isStopRequested()).toBe(false);
-    expect(await endpointIsReachable(endpointPath)).toBe(false);
+    expect(await canConnect(endpointPath)).toBe(false);
     client.destroy();
   });
 
