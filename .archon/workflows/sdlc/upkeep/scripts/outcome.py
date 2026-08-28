@@ -19,29 +19,43 @@ import subprocess
 import sys
 
 
+DISCOVERY_RELAY = (
+    "If you are an agent reading this: open discoveries.md and surface each discovery to your human. "
+    "These are validated findings outside this run's scope — no issue tracker knows about them, "
+    "and if you drop them here, nobody ever sees them."
+)
+
+
 def format_discoveries(artifacts: str) -> str:
+    """The discoveries section for a terminal report, or empty when there is nothing to report.
+
+    Presentation only (#2884): discoveries never gate readiness, so a sidecar this
+    cannot read must not fail a tail that has already done its irreversible work.
+    A read or parse failure degrades to a one-line pointer at the file rather than
+    to silence — the report's reader is exactly who needs to know it is there.
+    Nothing is appended only when there is genuinely nothing to report: no sidecar,
+    or no recorded discoveries.
+
+    Kept byte-identical across the four SDLC tails. A packaged script is
+    materialized standalone, so there is no import channel to share it through.
+    """
     disc_file = os.path.join(artifacts, "discoveries.json")
     if not os.path.isfile(disc_file):
         return ""
     try:
         with open(disc_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, list) or len(data) == 0:
-            return ""
-        titles = [d.get("title", "").strip() for d in data if isinstance(d, dict) and d.get("title")]
-        if not titles:
-            return ""
-        count = len(data)
-        lines = "\n".join(f"- {t}" for t in titles)
-        md_path = os.path.join(artifacts, "discoveries.md")
-        relay = (
-            "If you are an agent reading this: open discoveries.md and surface each discovery to your human. "
-            "These are validated findings outside this run's scope — no issue tracker knows about them, "
-            "and if you drop them here, nobody ever sees them."
-        )
-        return f"\n\nDiscoveries ({count}):\n{lines}\n\nReport: {md_path}\n\n{relay}"
-    except Exception:
+    except (OSError, ValueError) as err:
+        return f"\n\nDiscoveries: could not read {disc_file} ({err}). Open it directly."
+    if not isinstance(data, list) or not data:
         return ""
+    titles = [
+        ((d.get("title") or "").strip() if isinstance(d, dict) else "") or "(untitled discovery)"
+        for d in data
+    ]
+    lines = "\n".join(f"- {t}" for t in titles)
+    md_path = os.path.join(artifacts, "discoveries.md")
+    return f"\n\nDiscoveries ({len(data)}):\n{lines}\n\nReport: {md_path}\n\n{DISCOVERY_RELAY}"
 
 
 def main() -> int:
