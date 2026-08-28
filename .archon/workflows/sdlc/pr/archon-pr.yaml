@@ -22,3 +22,16 @@ returns: pr
 nodes:
   - id: pr
     command: pr
+    # This is the durable ownership record for every later public action in
+    # delivery. Consumers name the PR and branch from these fields, never from
+    # gh's ambient branch lookup.
+    output_type: pull-request
+    output_format:
+      type: object
+      properties:
+        number: { type: integer }
+        url: { type: string }
+        head: { type: string }
+        base: { type: string }
+        is_draft: { type: boolean }
+      required: [number, url, head, base, is_draft]

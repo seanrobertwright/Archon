@@ -517,4 +517,22 @@ describe('bundled-defaults', () => {
       assertPinned(BUNDLED_WORKFLOWS);
     });
   });
+
+  describe('run-owned public actions (#2909)', () => {
+    it('records a PR identity and uses it for review and the ready flip', () => {
+      const pr = BUNDLED_WORKFLOWS['archon-pr'];
+      const deliver = BUNDLED_WORKFLOWS['archon-deliver'];
+      const sync = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::sync-pr-body'];
+
+      expect(pr).toContain('output_type: pull-request');
+      expect(pr).toContain('required: [number, url, head, base, is_draft]');
+      expect(deliver).toContain('scope: "$pr.output.number"');
+      expect(deliver).toContain('PR_NUMBER=$pr.output.number');
+      expect(deliver).toContain('EXPECTED_BRANCH=$pr.output.head');
+      expect(deliver).toContain('gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO"');
+      expect(deliver).toContain('EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"');
+      expect(sync).toContain('INPUTS_PR_NUMBER');
+      expect(sync).toContain('INPUTS_PR_HEAD');
+    });
+  });
 });
