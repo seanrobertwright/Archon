@@ -362,6 +362,14 @@ export const dryRunResultSchema = z.object({
   outcome: z.enum(['completed', 'failed', 'paused', 'cancelled']),
   trace: z.array(dryRunTraceEntrySchema),
   missingStubs: z.array(z.string()),
+  /**
+   * The subset of `missingStubs` a `trigger_rule: all_done` join tolerated (#2869) —
+   * hydrated with a generated placeholder rather than failing the node. Always a
+   * subset of `missingStubs`, never a replacement for it: a consumer that only cares
+   * about genuinely blocking gaps filters `missingStubs` by this list; one that wants
+   * every unverified node (the pre-#2869 contract) keeps reading `missingStubs` alone.
+   */
+  toleratedMissingStubs: z.array(z.string()),
   unusedStubs: z.array(z.string()),
   summary: z.string().optional(),
 });
@@ -474,6 +482,8 @@ interface DryRunContext {
   trace: DryRunTraceEntry[];
   consumedStubs: Set<string>;
   missingStubs: Set<string>;
+  /** Always a subset of `missingStubs` — see {@link dryRunResultSchema}'s field doc. */
+  toleratedMissingStubs: Set<string>;
   halted?: 'paused' | 'cancelled';
   /** Workflow-level provider/model fallbacks, for the per-node resolution report. */
   scope: WorkflowModelScope;
@@ -1067,21 +1077,7 @@ async function simulateNode(
             commandInputs
           );
     const stub = stubFor(node, ctx);
-    if (stub !== undefined) {
-      const hydrated = completedOutput(node, stub);
-      outputs.set(node.id, hydrated);
-      ctx.trace.push({
-        nodeId: node.id,
-        nodeType: nodeType(node),
-        state: 'stubbed',
-        resolvedText,
-        output: hydrated.output,
-        ...(iteration ? { iteration } : {}),
-        ...withResolution(node, ctx),
-      });
-      return;
-    }
-    if (isExecNode(node) && ctx.execCode) {
+    if (stub === undefined && isExecNode(node) && ctx.execCode) {
       const executed = await executeCodeNode(node, resolvedText, ctx, nodeBindings);
       if ('error' in executed) {
         recordFailed(node, outputs, ctx, executed.error, resolvedText, iteration);
@@ -1103,17 +1099,27 @@ async function simulateNode(
     // of upstream outcome — a real run reaches it independent of dry-run fixture data,
     // so a missing stub here is an authoring gap, not evidence the simulated run would
     // fail (#2869). Tolerate it the way `--default-stubs` tolerates any missing stub —
-    // a generated placeholder — while still reporting the gap via `missingStubs` so the
-    // fixture stays honest about what it never verified.
-    if (node.trigger_rule === 'all_done') {
-      ctx.missingStubs.add(node.id);
-      const hydrated = completedOutput(node, generatedStubFor(node));
+    // a generated placeholder — while still reporting the gap via `missingStubs` (and,
+    // since the gap never blocks this node, `toleratedMissingStubs`) so the fixture
+    // stays honest about what it never verified.
+    const tolerated = stub === undefined && node.trigger_rule === 'all_done';
+    if (stub !== undefined || tolerated) {
+      if (tolerated) {
+        ctx.missingStubs.add(node.id);
+        ctx.toleratedMissingStubs.add(node.id);
+      }
+      const hydrated = completedOutput(node, stub ?? generatedStubFor(node));
       outputs.set(node.id, hydrated);
       ctx.trace.push({
         nodeId: node.id,
         nodeType: nodeType(node),
         state: 'stubbed',
-        reason: 'Missing stub tolerated by trigger_rule: all_done — using a generated placeholder',
+        ...(tolerated
+          ? {
+              reason:
+                'Missing stub tolerated by trigger_rule: all_done — using a generated placeholder',
+            }
+          : {}),
         resolvedText,
         output: hydrated.output,
         ...(iteration ? { iteration } : {}),
@@ -1209,6 +1215,7 @@ export async function dryRunWorkflow(options: {
     trace: [],
     consumedStubs: new Set<string>(),
     missingStubs: new Set<string>(),
+    toleratedMissingStubs: new Set<string>(),
     scope: resolveWorkflowModelScope(
       options.workflow,
       options.config?.assistant ?? 'claude',
@@ -1253,6 +1260,7 @@ export async function dryRunWorkflow(options: {
     outcome,
     trace: ctx.trace,
     missingStubs: [...ctx.missingStubs].sort(),
+    toleratedMissingStubs: [...ctx.toleratedMissingStubs].sort(),
     unusedStubs: Object.keys(ctx.stubs)
       .filter(id => !ctx.consumedStubs.has(id))
       .sort(),
