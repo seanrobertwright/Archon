@@ -119,8 +119,7 @@ export function canonicalValueText(value: unknown): string {
 
 /**
  * The one shape of a `$nodeId.output` reference — shared with the loader's
- * dangling-ref scan and every scanner that must agree with it (KEEP IN SYNC
- * list in loader.ts). Scanners build their own RegExp from this source (a
+ * dangling-ref scan. Scanners build their own RegExp from this source (a
  * `g`-flagged instance carries mutable lastIndex and must not be shared).
  */
 export const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;

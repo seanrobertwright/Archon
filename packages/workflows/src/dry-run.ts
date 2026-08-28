@@ -683,6 +683,8 @@ async function executeCodeNode(
       timeout: node.timeout ?? 300_000,
       env: {
         ...process.env,
+        PWD: ctx.execWorkspace,
+        OLDPWD: ctx.execWorkspace,
         ...inputEnv,
         USER_MESSAGE: ctx.userMessage,
         ARGUMENTS: ctx.userMessage,

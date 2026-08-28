@@ -259,6 +259,18 @@ describe('WorktreeProvider', () => {
       expect(provider.generateBranchName(request)).toBe('archon/task-add-dark-mode');
     });
 
+    test('uses an explicit task branch name verbatim', () => {
+      const request: IsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'task',
+        identifier: 'archon/task-fix-2926',
+        taskBranch: { kind: 'new', branch: git.toBranchName('archon/task-fix-2926') },
+      };
+
+      expect(provider.generateBranchName(request)).toBe('archon/task-fix-2926');
+    });
+
     test('slugifies task identifiers properly', () => {
       const request: IsolationRequest = {
         codebaseId: 'cb-123',

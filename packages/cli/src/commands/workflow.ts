@@ -2706,9 +2706,17 @@ async function runWorkflowWithOwnedSource(
         identifier: branchIdentifier,
         taskBranch: adoptedTaskBranch
           ? adoptedTaskBranch
-          : options.fromBranch?.trim()
-            ? { kind: 'new', fromBranch: git.toBranchName(options.fromBranch.trim()) }
-            : undefined,
+          : options.branchName
+            ? {
+                kind: 'new',
+                branch: git.toBranchName(options.branchName),
+                ...(options.fromBranch?.trim()
+                  ? { fromBranch: git.toBranchName(options.fromBranch.trim()) }
+                  : {}),
+              }
+            : options.fromBranch?.trim()
+              ? { kind: 'new', fromBranch: git.toBranchName(options.fromBranch.trim()) }
+              : undefined,
         baseBranch: codebaseDefaultBranch ? git.toBranchName(codebaseDefaultBranch) : undefined,
         baseOverride: flagBase ? git.toBranchName(flagBase) : undefined,
         codebaseId: codebase.id,

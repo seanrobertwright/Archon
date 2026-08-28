@@ -2472,6 +2472,32 @@ describe('expandWorkflowIncludes — typed with: values (#2637)', () => {
     expect('with' in call ? call.with : undefined).toEqual({ x: true, label: 'v=true' });
   });
 
+  test('forwards a whole input object through a nested deferred fan-out with value', () => {
+    const leaf = wf('leaf', [{ id: 'run', prompt: 'work' }]);
+    const block = withSignature(
+      wf('fan-block', [
+        {
+          id: 'fan',
+          include: 'leaf',
+          with: { config: '$INPUTS.config' },
+          fan_out: { items: '["one"]', as: 'item' },
+        },
+      ]),
+      { inputs: { config: {} } }
+    );
+    const parent = wf('parent', [
+      { id: 'use', include: 'fan-block', with: { config: { mode: 'strict' } } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(leaf, block, parent));
+    expect(errors).toHaveLength(0);
+    const fan = nodeById(workflows.get('parent')!, 'use__fan');
+    expect(fan).toMatchObject({
+      kind: 'compose_fan_out',
+      with: { config: { mode: 'strict' } },
+    });
+  });
+
   test('the composed-node stamp keeps typed inputs logical for shell env delivery', () => {
     const block = withSignature(wf('stamp-blk', [{ id: 'run', bash: 'echo hi' }]), {
       inputs: { flag: {}, note: {} },

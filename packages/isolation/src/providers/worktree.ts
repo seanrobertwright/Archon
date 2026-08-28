@@ -609,6 +609,9 @@ export class WorktreeProvider implements IIsolationProvider {
         if (request.taskBranch?.kind === 'existing') {
           return request.taskBranch.branch;
         }
+        if (request.taskBranch?.branch) {
+          return request.taskBranch.branch;
+        }
         return `archon/task-${this.slugify(request.identifier)}`;
     }
   }

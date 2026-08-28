@@ -116,12 +116,12 @@ export interface ThreadIsolationRequest extends IsolationRequestBase {
 }
 
 export type TaskBranchSelection =
-  | { kind: 'new'; fromBranch?: BranchName }
+  | { kind: 'new'; branch?: BranchName; fromBranch?: BranchName }
   | { kind: 'existing'; branch: BranchName };
 
 export interface TaskIsolationRequest extends IsolationRequestBase {
   workflowType: 'task';
-  /** Task identifier (will be slugified for branch name, max 50 chars) */
+  /** Task identifier (will be slugified for branch name unless a branch is specified). */
   identifier: string;
   /** Whether this task creates a branch or continues an exact existing branch. */
   taskBranch?: TaskBranchSelection;
