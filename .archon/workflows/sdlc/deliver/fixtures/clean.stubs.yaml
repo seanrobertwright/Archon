@@ -29,17 +29,11 @@ ci-probe: '{"state":"concluded","detail":"no checks configured on this repositor
 flip-ready: "https://github.com/example/repo/pull/2"
 outcome: "https://github.com/example/repo/pull/2"
 classify:
-  tests: false
   errors: false
-  comments: false
-  types: false
   docs: false
   reasons:
-    tests: "stub: small fixture diff"
     errors: "stub: no failure paths"
-    comments: "stub: no comment changes"
-    types: "stub: no contract changes"
     docs: "stub: no doc-facing changes"
-resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+resolve-scope: '{"errors":"false"}'
 fixture:
   expect: completed

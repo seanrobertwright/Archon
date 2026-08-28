@@ -2,6 +2,10 @@
 # its continuation review is ready, and the run flips the PR. `until_bash` is not
 # executed by dry-run, so the simulator honestly assumes completion after this
 # structurally exercised iteration; real multi-iteration convergence is dogfood.
+#
+# This is also the classifier-selects-errors path: `classify` says the diff has
+# failure paths, the operator declared nothing, and resolve-scope is left unstubbed
+# so the real script adopts that judgment. `reached` proves the lens actually ran.
 impl__record-start: '{"start":"recorded"}'
 impl__implement:
   done: true
@@ -15,6 +19,7 @@ review__scope: "target recorded; head sha stubbed"
 review__code: "2 findings (Important)"
 review__seams: "0 findings"
 review__tests: "0 findings"
+review__errors: "0 findings"
 review__synthesize:
   ready: false
   action: correct
@@ -45,18 +50,12 @@ ci-probe: '{"state":"concluded","detail":"all 2 check(s) green"}'
 flip-ready: "https://github.com/example/repo/pull/1"
 outcome: "https://github.com/example/repo/pull/1"
 classify:
-  tests: false
-  errors: false
-  comments: false
-  types: false
+  errors: true
   docs: false
   reasons:
-    tests: "stub: small fixture diff"
-    errors: "stub: no failure paths"
-    comments: "stub: no comment changes"
-    types: "stub: no contract changes"
+    errors: "stub: the diff adds a retry and a fallback"
     docs: "stub: no doc-facing changes"
-resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
 fixture:
   expect: completed
+  reached: [review__errors]
 exec-code: true

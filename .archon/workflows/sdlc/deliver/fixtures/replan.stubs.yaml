@@ -10,18 +10,12 @@ impl__assert-changed: "2 files changed"
 gate-green: '{"gate":"green"}'
 pr__pr: "https://github.com/example/repo/pull/3 (draft)"
 classify:
-  tests: false
   errors: false
-  comments: false
-  types: false
   docs: false
   reasons:
-    tests: "stub: no test changes"
     errors: "stub: no failure paths"
-    comments: "stub: no prose changes"
-    types: "stub: no type changes"
     docs: "stub: no docs changes"
-resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
+resolve-scope: '{"errors":"false"}'
 review__mode: '{"continuation":false}'
 review__scope: "accepted contract and scope conflict recorded"
 review__code: "1 Important scope conflict"

@@ -39,4 +39,4 @@ flip-ready: "https://github.com/example/repo/pull/2"
 outcome: "https://github.com/example/repo/pull/2"
 fixture:
   expect: completed
-  reached: [review__docs]
+  reached: [review__code, review__seams, review__tests, review__docs]
