@@ -187,7 +187,6 @@ function createMockStore(): MockWorkflowStore {
     getActiveWorkflowRunByPath: mock<IWorkflowStore['getActiveWorkflowRunByPath']>(
       async (_workingPath, _self) => null
     ),
-    failOrphanedRuns: mock<IWorkflowStore['failOrphanedRuns']>(async () => ({ count: 0 })),
     findResumableRun: mock<IWorkflowStore['findResumableRun']>(
       async (_workflowName, _workingPath) => null
     ),

@@ -715,14 +715,19 @@ describe('rejectWorkflow', () => {
     expect(result.maxAttemptsReached).toBe(true);
     // Terminal reject resolves + cancels in ONE atomic CAS (#2113) — never a
     // separate cancelWorkflowRun that could fail and strand the run. The audit
-    // event rides the same transaction (#2146).
-    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-1', [
-      {
-        event_type: 'approval_received',
-        step_name: 'review',
-        data: { decision: 'rejected', reason: 'still broken' },
-      },
-    ]);
+    // event rides the same transaction (#2146), as does the workflow_cancelled
+    // terminal event the CAS writes from these details (#2906).
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith(
+      'run-1',
+      [
+        {
+          event_type: 'approval_received',
+          step_name: 'review',
+          data: { decision: 'rejected', reason: 'still broken' },
+        },
+      ],
+      { step_name: 'review', reason: 'approval_rejected' }
+    );
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 
@@ -736,13 +741,17 @@ describe('rejectWorkflow', () => {
 
     expect(result.cancelled).toBe(true);
     expect(result.maxAttemptsReached).toBe(false);
-    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-1', [
-      {
-        event_type: 'approval_received',
-        step_name: 'review',
-        data: { decision: 'rejected', reason: 'no good' },
-      },
-    ]);
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith(
+      'run-1',
+      [
+        {
+          event_type: 'approval_received',
+          step_name: 'review',
+          data: { decision: 'rejected', reason: 'no good' },
+        },
+      ],
+      { step_name: 'review', reason: 'approval_rejected' }
+    );
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 

@@ -2530,13 +2530,17 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     expect(body.success).toBe(true);
     // Terminal reject resolves + cancels atomically (#2113); the audit event rides
     // the same transaction (#2146).
-    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-paused-1', [
-      {
-        event_type: 'approval_received',
-        step_name: 'review-gate',
-        data: { decision: 'rejected', reason: 'needs work' },
-      },
-    ]);
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith(
+      'run-paused-1',
+      [
+        {
+          event_type: 'approval_received',
+          step_name: 'review-gate',
+          data: { decision: 'rejected', reason: 'needs work' },
+        },
+      ],
+      { step_name: 'review-gate', reason: 'approval_rejected' }
+    );
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'rejected' });
   });
@@ -2620,13 +2624,17 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     expect(body.message).toContain('max attempts reached');
     // Terminal reject resolves + cancels atomically (#2113); the audit event rides
     // the same transaction (#2146).
-    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-max-attempts', [
-      {
-        event_type: 'approval_received',
-        step_name: 'review-gate',
-        data: { decision: 'rejected', reason: 'still bad' },
-      },
-    ]);
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith(
+      'run-max-attempts',
+      [
+        {
+          event_type: 'approval_received',
+          step_name: 'review-gate',
+          data: { decision: 'rejected', reason: 'still bad' },
+        },
+      ],
+      { step_name: 'review-gate', reason: 'approval_rejected' }
+    );
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
     expect(mockUpdateWorkflowRun).not.toHaveBeenCalled();
   });
@@ -3109,13 +3117,17 @@ describe('approve/reject auto-resume', () => {
     expect(mockHandleMessage).not.toHaveBeenCalled();
     // Terminal reject resolves + cancels atomically (#2113); the audit event rides
     // the same transaction (#2146).
-    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-paused-1', [
-      {
-        event_type: 'approval_received',
-        step_name: 'review-gate',
-        data: { decision: 'rejected', reason: 'no' },
-      },
-    ]);
+    expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith(
+      'run-paused-1',
+      [
+        {
+          event_type: 'approval_received',
+          step_name: 'review-gate',
+          data: { decision: 'rejected', reason: 'no' },
+        },
+      ],
+      { step_name: 'review-gate', reason: 'approval_rejected' }
+    );
   });
 });
 

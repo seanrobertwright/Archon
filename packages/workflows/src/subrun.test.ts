@@ -431,7 +431,6 @@ class InMemoryStore implements IWorkflowStore {
   upsertWorkflowNodeSession = (): Promise<void> => Promise.resolve();
   deleteWorkflowNodeSessions = (): Promise<{ deleted: number }> => Promise.resolve({ deleted: 0 });
   findResumableRun = (): Promise<null> => Promise.resolve(null);
-  failOrphanedRuns = (): Promise<{ count: number }> => Promise.resolve({ count: 0 });
 
   // --- test helpers ---
   /** Mimic approveWorkflow for a standard approval gate: write node_completed for

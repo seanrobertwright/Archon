@@ -3094,13 +3094,17 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('max attempts reached');
         // Terminal reject resolves + cancels atomically (#2113); the audit event
         // rides the same transaction (#2146).
-        expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-reject-max', [
-          {
-            event_type: 'approval_received',
-            step_name: 'review',
-            data: { decision: 'rejected', reason: 'bad' },
-          },
-        ]);
+        expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith(
+          'run-reject-max',
+          [
+            {
+              event_type: 'approval_received',
+              step_name: 'review',
+              data: { decision: 'rejected', reason: 'bad' },
+            },
+          ],
+          { step_name: 'review', reason: 'approval_rejected' }
+        );
         expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
       });
 
@@ -3134,13 +3138,17 @@ describe('CommandHandler', () => {
         expect(result.success).toBe(true);
         // Terminal reject resolves + cancels atomically (#2113); the audit event
         // rides the same transaction (#2146).
-        expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-reject-plain', [
-          {
-            event_type: 'approval_received',
-            step_name: 'gate',
-            data: { decision: 'rejected', reason: 'reason' },
-          },
-        ]);
+        expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith(
+          'run-reject-plain',
+          [
+            {
+              event_type: 'approval_received',
+              step_name: 'gate',
+              data: { decision: 'rejected', reason: 'reason' },
+            },
+          ],
+          { step_name: 'gate', reason: 'approval_rejected' }
+        );
         expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
       });
     });
