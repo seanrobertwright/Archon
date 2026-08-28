@@ -838,6 +838,41 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     expect(readFileSync(join(cwd, 'tracked.txt'), 'utf8')).toBe(COMMITTED_YAML);
   });
 
+  it('keeps PWD and OLDPWD-based inline code writes in the scratch worktree (#2890)', async () => {
+    const writerYaml = [
+      'name: pwd-writer-wf',
+      'description: writes through the working-directory environment',
+      'nodes:',
+      '  - id: writer',
+      '    script: |',
+      "      for (const dir of [process.env.PWD, process.env.OLDPWD]) await Bun.write(`${dir}/leak.txt`, 'executed');",
+      '    runtime: bun',
+    ].join('\n');
+    const { cwd } = writeTempProject({
+      workflowName: 'pwd-writer-wf',
+      workflowYaml: writerYaml,
+      body: execFixtureBody,
+    });
+    callerFrom(trackedOnlyRepo, cwd);
+    const previousPwd = process.env.PWD;
+    const previousOldPwd = process.env.OLDPWD;
+    process.env.PWD = cwd;
+    process.env.OLDPWD = cwd;
+    try {
+      const report = await runFixtures({
+        workflows: [workflowsOnDisk(cwd, ['pwd-writer-wf'])[0]],
+        cwd,
+      });
+      expect(report.results[0].outcome).toBe('completed');
+      expect(existsSync(join(cwd, 'leak.txt'))).toBe(false);
+    } finally {
+      if (previousPwd === undefined) delete process.env.PWD;
+      else process.env.PWD = previousPwd;
+      if (previousOldPwd === undefined) delete process.env.OLDPWD;
+      else process.env.OLDPWD = previousOldPwd;
+    }
+  });
+
   const SCRIPT_YAML = [
     'name: script-wf',
     'description: runs a named script',
