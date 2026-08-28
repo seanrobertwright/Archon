@@ -63,3 +63,4 @@ A change in these areas gets adversarial review depth: an explicit attempt to re
 - A defect that violates the same invariant through the same mechanism as the change under review is in scope: a correction, not a discovery.
 - Tests prove a decision by varying the input it turns on, against the real primitive. A test that stubs the deciding function passes under every mutation of it and proves nothing.
 - Two individually green changes can compose into a failure. A composition is its own change; checks that passed on the parts are claims about the parts.
+- Simplification found at review is corrected on the produced change, not deferred. Code is cheap to regenerate; merged complexity compounds into drift that every later change pays for. A concrete smaller shape that preserves behavior is a correction-round finding, and a verdict may rest on simplification alone. A simplification that is speculative or risks behavior stays a suggestion.
