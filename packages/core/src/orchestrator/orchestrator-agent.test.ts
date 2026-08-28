@@ -4610,10 +4610,11 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
     await handleMessage(platform, 'conv-1', 'register my project');
 
+    const expectedCwd = await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source');
     expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'ExampleProject',
-      default_cwd: await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source'),
+      default_cwd: expectedCwd,
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4622,9 +4623,8 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       string,
       string,
     ][];
-    expect(allCalls.some(([, msg]) => msg.includes('/.archon/workspaces/owner/repo/source'))).toBe(
-      true
-    );
+    // The confirmation echoes the path that was actually stored.
+    expect(allCalls.some(([, msg]) => msg.includes(expectedCwd))).toBe(true);
   });
 
   test('batch mode — register-project split across 3 chunks', async () => {
@@ -4643,10 +4643,11 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
     await handleMessage(platform, 'conv-1', 'register my project');
 
+    const expectedCwd = await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source');
     expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'ExampleProject',
-      default_cwd: await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source'),
+      default_cwd: expectedCwd,
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4655,9 +4656,8 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       string,
       string,
     ][];
-    expect(allCalls.some(([, msg]) => msg.includes('/.archon/workspaces/owner/repo/source'))).toBe(
-      true
-    );
+    // The confirmation echoes the path that was actually stored.
+    expect(allCalls.some(([, msg]) => msg.includes(expectedCwd))).toBe(true);
   });
 
   test('stream mode — invoke-workflow split across 2 chunks', async () => {
