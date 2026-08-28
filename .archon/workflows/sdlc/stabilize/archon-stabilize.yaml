@@ -25,24 +25,9 @@ inputs:
       reference showing the failure. When empty, the run's trigger message is
       the target; when that names no specific test, the assessment hunts for
       the strongest-evidenced flake in recent default-branch CI history.
-  # The tests lens defaults ON here — the whole diff IS test code, so the
-  # test-coverage reviewer earns its slot by default. Operator can still
-  # disable it per run; the other lenses stay opt-in as everywhere else.
-  tests:
-    default: true
-    description: Test-coverage lens — forced on by default (the diff is test code); auto or false override.
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
-  comments:
-    default: "auto"
-    description: Comment-accuracy lens — auto, true, or false.
-  types:
-    default: "auto"
-    description: Type-design lens — auto, true, or false.
-  docs:
-    default: "auto"
-    description: Docs-impact lens — auto, true, or false.
 
 returns: outcome
 
@@ -93,11 +78,7 @@ nodes:
   - id: deliver
     include: archon-deliver
     with:
-      tests: "$INPUTS.tests"
       errors: "$INPUTS.errors"
-      comments: "$INPUTS.comments"
-      types: "$INPUTS.types"
-      docs: "$INPUTS.docs"
       work: >-
         Fix the flaky or unsound test specified in
         $ARTIFACTS_DIR/stabilize-assessment.md. Read that file in full first —

@@ -30,6 +30,7 @@ deliver__review__mode: '{"continuation":false}'
 deliver__review__scope: "target recorded; head sha stubbed"
 deliver__review__code: "0 findings"
 deliver__review__seams: "0 findings"
+deliver__review__tests: "0 findings"
 deliver__review__review-complete: "settled"
 deliver__review__synthesize:
   ready: true
@@ -53,4 +54,3 @@ deliver__classify:
 deliver__resolve-scope: '{"tests":"false","errors":"false","comments":"false","types":"false","docs":"false"}'
 fixture:
   expect: completed
-deliver__review__simplify: "0 findings (suggestions only)"

@@ -48,4 +48,4 @@ Write `$ARTIFACTS_DIR/review/scope.md` containing:
 
 ## Verify before finishing
 
-Confirm `$ARTIFACTS_DIR/review/scope.md` exists, names the accepted contract and head SHA, and that the diff commands in it actually produce output in this checkout. Reply with the target, mode, head SHA, and file count — nothing else.
+Confirm `$ARTIFACTS_DIR/review/scope.md` exists, names the accepted contract and head SHA, and that the diff commands in it actually produce output in this checkout. Reply only: `review scope: $ARTIFACTS_DIR/review/scope.md`.

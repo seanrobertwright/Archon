@@ -2,7 +2,7 @@
 
 Find defects the change introduces. Do not grade the code, summarize the diff, or reward activity. You are read-only: never modify files, commit, or post anywhere. Your findings go in a file; the synthesizer aggregates them.
 
-Read `$ARTIFACTS_DIR/review/scope.md` first and review exactly the diff it describes. In light mode, verify the prior findings assigned to this lens first, then apply the same bar to the delta only.
+Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md` first, then review exactly the diff it describes. Anchor the review on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; for an engaged risk, explicitly try to refute the relevant invariant. In light mode, verify the prior findings assigned to this lens first, then apply the same bar to the delta only.
 
 ## Evidence bar — report only what is proved
 
@@ -10,6 +10,12 @@ Read `$ARTIFACTS_DIR/review/scope.md` first and review exactly the diff it descr
 2. **Repository-rule violation** — the changed code violates an explicit applicable rule in the repo's steering files (`AGENTS.md`, `CLAUDE.md`, contributor guidance) or enforced configuration.
 
 Every finding needs: the changed line that causes it, the reachable path (caller, input, or state), the incorrect outcome, evidence (code, test, config, or command output), and the smallest correction. If the causal chain contains "might" or "could", investigate until it is concrete or drop it. **Everything else is silence.**
+
+## Comments are part of correctness
+
+Comments clarify functionality and how code is used, and they stay current when behavior changes. Never request a comment on self-explanatory code; request removal or editing of comments on self-explanatory code instead. Code that is not self-explanatory is usually too complex and the finding is simplification, not narration. A missing comment is reportable only when the change introduces durable knowledge that code or types cannot express: a surprising external constraint, a non-obvious safety or ordering requirement, a deliberate compatibility compromise a future maintainer could clean up and break, or operational behavior not discoverable from the local code. Never request narration of control flow, parameter names, or implementation steps.
+
+Report a comment defect only when the changed prose creates the same concrete maintenance or supported-use consequence required by the evidence bar above. Quote the prose and the contradicting behavior. A self-explanatory changed comment is a repository-rule violation: request its removal or editing, never additional narration.
 
 ## Scope of reading
 
@@ -21,7 +27,7 @@ When execution is practical, run the smallest command that can falsify a finding
 
 ## Not yours
 
-Style, naming, and formatting without an explicit project rule; simplification without a behavioral defect; missing tests (the tests lens owns coverage); type-design quality; comment accuracy; docs; generic error-handling preference. Do not apply framework folklore as if it were a project rule.
+Style, naming, and formatting without an explicit project rule; simplification without a behavioral defect; missing tests (the tests lens owns coverage); type-design quality; docs; generic error-handling preference. Do not apply framework folklore as if it were a project rule.
 
 ## Severity
 
@@ -32,8 +38,8 @@ There is no third level from this lens — anything weaker is silence.
 
 ## Output
 
-Write `$ARTIFACTS_DIR/review/code.md`: each finding with severity, the evidence fields above, and `file:line` references; then an "examined and clean" list naming the specific contracts or callers that cleared the suspicious spots; in light mode, a verdict per prior finding (still open / fixed at `<sha>` / disproved, with evidence). If there are no findings, say so and name what was decisively checked — never claim the whole change is correct.
+Write `$ARTIFACTS_DIR/review/code.md`: each in-scope finding begins with `sources: [code]`, followed by severity, the evidence fields above, and `file:line` references; then an "examined and clean" list naming the specific contracts or callers that cleared the suspicious spots; in light mode, a verdict per prior finding (still open / fixed at `<sha>` / disproved, with evidence). If there are no findings, say so and name what was decisively checked — never claim the whole change is correct.
 
 If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-code.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`code`). Write no file for no discovery; never append to another lens's file or record suspicion.
 
-Verify the file exists and every `file:line` in it is real, then reply with one line: findings count by severity.
+Verify the file exists and every `file:line` in it is real, then reply with one line pointing to it: `review findings: $ARTIFACTS_DIR/review/code.md` and the findings count by severity.

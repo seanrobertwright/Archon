@@ -195,10 +195,7 @@ describe('bundled-defaults', () => {
         ['__archon_pack__bundled:sdlc:review::review-seams', 'discoveries/review-seams.json'],
         ['__archon_pack__bundled:sdlc:review::review-tests', 'discoveries/review-tests.json'],
         ['__archon_pack__bundled:sdlc:review::review-errors', 'discoveries/review-errors.json'],
-        ['__archon_pack__bundled:sdlc:review::review-comments', 'discoveries/review-comments.json'],
-        ['__archon_pack__bundled:sdlc:review::review-types', 'discoveries/review-types.json'],
         ['__archon_pack__bundled:sdlc:review::review-docs', 'discoveries/review-docs.json'],
-        ['__archon_pack__bundled:sdlc:review::review-simplify', 'discoveries/review-simplify.json'],
       ]);
 
       for (const [key, path] of expected) {
@@ -239,7 +236,7 @@ describe('bundled-defaults', () => {
       expect(content).not.toContain('sed -i "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/"');
     });
 
-    it('archon-deliver preserves the classifier bindings that gate optional review spend', () => {
+    it('archon-deliver preserves the conditional-lens bindings', () => {
       const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
       if (parsed.workflow === null) throw new Error(parsed.error.error);
 
@@ -250,11 +247,7 @@ describe('bundled-defaults', () => {
       expect(resolveScope.runtime).toBe('uv');
       expect(resolveScope.script).toBe('resolve-review-scope');
       expect(resolveScope.with).toEqual({
-        c_tests: '$classify.output.tests',
         c_errors: '$classify.output.errors',
-        c_comments: '$classify.output.comments',
-        c_types: '$classify.output.types',
-        c_docs: '$classify.output.docs',
       });
 
       const review = parsed.workflow.nodes.find(node => node.id === 'review');
@@ -262,11 +255,8 @@ describe('bundled-defaults', () => {
       if (review?.kind !== 'include') throw new Error('review is not an include');
       expect(review.with).toMatchObject({
         work_order: '$INPUTS.work',
-        tests: '$resolve-scope.output.tests',
         errors: '$resolve-scope.output.errors',
-        comments: '$resolve-scope.output.comments',
-        types: '$resolve-scope.output.types',
-        docs: '$resolve-scope.output.docs',
+        docs: '$classify.output.docs',
       });
     });
 
@@ -315,16 +305,7 @@ describe('bundled-defaults', () => {
       const scope = parsed.workflow.nodes.find(node => node.id === 'scope');
       expect(scope?.depends_on).toEqual(['mode']);
 
-      const specialists = [
-        'code',
-        'seams',
-        'tests',
-        'errors',
-        'comments',
-        'types',
-        'docs',
-        'simplify',
-      ];
+      const specialists = ['code', 'seams', 'tests', 'errors', 'docs'];
       const reviewComplete = parsed.workflow.nodes.find(node => node.id === 'review-complete');
       expect(reviewComplete?.kind).toBe('exec');
       expect(reviewComplete?.depends_on).toEqual(specialists);
@@ -341,6 +322,31 @@ describe('bundled-defaults', () => {
         },
         required: expect.arrayContaining(['action']),
       });
+
+      expect(parsed.workflow.model).toBe('large');
+      expect(parsed.workflow.inputs?.tests).toBeUndefined();
+      expect(parsed.workflow.inputs?.comments).toBeUndefined();
+      expect(parsed.workflow.inputs?.types).toBeUndefined();
+
+      const commands = BUNDLED_COMMANDS;
+      expect(commands['__archon_pack__bundled:sdlc:review::review-code']).toContain(
+        'Comments clarify functionality and how code is used'
+      );
+      expect(commands['__archon_pack__bundled:sdlc:review::review-seams']).toContain(
+        'reachable invalid state with a concrete consequence'
+      );
+      expect(commands['__archon_pack__bundled:sdlc:review::review-synthesize']).toContain(
+        'report-round-N.md'
+      );
+      expect(commands['__archon_pack__bundled:sdlc:review::review-synthesize']).toContain(
+        '`sources`'
+      );
+
+      for (const lens of specialists) {
+        expect(commands[`__archon_pack__bundled:sdlc:review::review-${lens}`]).toContain(
+          `sources: [${lens}]`
+        );
+      }
     });
 
     it('should have valid YAML structure', () => {

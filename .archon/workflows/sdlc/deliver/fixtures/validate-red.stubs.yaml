@@ -13,6 +13,7 @@ review__mode: '{"continuation":false}'
 review__scope: "target recorded; head sha stubbed"
 review__code: "0 findings"
 review__seams: "0 findings"
+review__tests: "0 findings"
 review__synthesize:
   ready: true
   action: none
@@ -41,4 +42,3 @@ fixture:
   expect: failed
   fail-node: gate-validated
 exec-code: true
-review__simplify: "0 findings (suggestions only)"

@@ -36,7 +36,6 @@ deliver__resolve-scope: '{"tests":"false","errors":"false","comments":"false","t
 fixture:
   expect: completed
 triage__assert-intact: '{"intact":"true"}'
-deliver__review__simplify: "0 findings (suggestions only)"
 planned__assert-intact: '{"intact":"true"}'
 deliver__gate-ready: '{"gate":"ready"}'
 deliver__impl__record-start: '{"start":"recorded"}'
@@ -50,4 +49,5 @@ deliver__review__mode: '{"continuation":false}'
 deliver__review__scope: "target recorded; head sha stubbed"
 deliver__review__code: "0 findings"
 deliver__review__seams: "0 findings"
+deliver__review__tests: "0 findings"
 deliver__review__review-complete: "settled"
