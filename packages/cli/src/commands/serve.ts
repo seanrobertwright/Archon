@@ -12,6 +12,16 @@ const log = createLogger('cli.serve');
 
 const GITHUB_REPO = 'coleam00/Archon';
 
+/**
+ * Upper bound on the `tar` child. Extracting the ~2 MB release archive takes
+ * tens of milliseconds, so this leaves three orders of magnitude of headroom for
+ * a slow disk. Its only job is to stop a stalled child from turning
+ * `archon serve` into a silent permanent hang: the parent-owned stdin channel
+ * that caused the observed stall is gone (#2924), but filesystem-side stalls on
+ * windows were never ruled out, and there is no budget in production to end one.
+ */
+const EXTRACTION_TIMEOUT_MS = 60_000;
+
 function toError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
@@ -159,20 +169,50 @@ export async function downloadWebDist(
 
   // Extract to temp dir, then atomic rename
   const tmpDir = `${targetDir}.tmp`;
+  const tarballPath = `${tmpDir}.tar.gz`;
 
   // Clean up any previous failed attempt
   rmSync(tmpDir, { recursive: true, force: true });
   mkdirSync(tmpDir, { recursive: true });
 
-  // Extract tarball using tar (available on macOS/Linux)
-  const proc = Bun.spawn(['tar', 'xzf', '-', '-C', tmpDir, '--strip-components=1'], {
-    stdin: new Uint8Array(tarballBuffer),
-    stderr: 'pipe',
-  });
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) {
-    const stderrText = await new Response(proc.stderr).text();
-    cleanupAndThrow(tmpDir, `tar extraction failed (exit ${exitCode}): ${stderrText.trim()}`);
+  // Stage the archive on disk so `tar` inherits a file descriptor. Passing the
+  // bytes as `stdin` instead makes the parent own a channel it has to pump and
+  // close, and on windows that pump can stall with no upper bound: two spawns in
+  // one process sat with `tar` blocked on an unfed stdin until the test runner
+  // killed them, on a runner where the same extraction took 16 ms minutes later
+  // (#2924). Reading `-` keeps the archive path off the command line, where a
+  // windows drive letter is ambiguous with `tar`'s own `host:path` syntax.
+  await Bun.write(tarballPath, tarballBuffer);
+  const extractionStartedAt = performance.now();
+  try {
+    const proc = Bun.spawn(['tar', 'xzf', '-', '-C', tmpDir, '--strip-components=1'], {
+      stdin: Bun.file(tarballPath),
+      stderr: 'pipe',
+      timeout: EXTRACTION_TIMEOUT_MS,
+    });
+    // Drain stderr while waiting rather than after: a pipe nobody reads is the
+    // same deadlock in the other direction once `tar` fills its buffer.
+    const [exitCode, stderrText] = await Promise.all([
+      proc.exited,
+      new Response(proc.stderr).text(),
+    ]);
+    const details = stderrText.trim();
+    // A signal means `tar` never finished. `proc.killed` cannot say so — it is
+    // true after any exit — and a signal can also come from outside this process,
+    // so report how long it actually ran instead of asserting the bound fired.
+    if (proc.signalCode !== null) {
+      const elapsedMs = Math.round(performance.now() - extractionStartedAt);
+      cleanupAndThrow(
+        tmpDir,
+        `tar extraction was killed by ${proc.signalCode} after ${elapsedMs}ms without finishing ` +
+          `(limit ${EXTRACTION_TIMEOUT_MS}ms): ${details}`
+      );
+    }
+    if (exitCode !== 0) {
+      cleanupAndThrow(tmpDir, `tar extraction failed (exit ${exitCode}): ${details}`);
+    }
+  } finally {
+    rmSync(tarballPath, { force: true });
   }
 
   // Verify extraction produced expected layout
