@@ -1,17 +1,20 @@
-"""The spend gate: run success never certifies green — this does, deterministically.
+"""The green gate: run success never certifies green — this does, deterministically.
 
-Implement declares whether the project's own checks pass. A completed run does not
-mean they did (the loop completes on `done`, blocked declines included), so nothing
-public or paid happens until this node reads that verdict.
+The delivery tail asks the question three times, and the same script answers it each
+time: after the implementation, after each correction, and after the project's own
+full gate runs post-review. A node that produced a verdict is not a node that passed;
+the loop completes on `done`, blocked declines included, so no spend and no public
+step happens until this reads the verdict itself.
 
 Red is not one thing, though, and treating it as one killed two correct deliveries
 (#2939). A change that breaks a check must never reach a pull request. A check that
 was already red at the run's starting commit, or that failed because a parallel
 process held the database this run needed, is not evidence about the change at all —
-and the chain re-checks reality later regardless: flip-ready refuses to make the PR
-ready while its real CI is not green. So this gate fails on `introduced` and lets
+and reality gets checked again downstream regardless: flip-ready refuses to make the
+PR ready while its real CI is not green. So this fails on `introduced` and lets
 `inherited` and `environment` through with the claim recorded where every downstream
-reader meets it.
+reader meets it. An inherited base break stays red on the PR too, and holds at the
+durable CI wait, which is the honest place to hold it.
 
 That trade is only safe while it stays loud, so a passed red is never silent: the
 record below is what the terminal report and the pull request body repeat. A record
@@ -19,13 +22,13 @@ that cannot be written fails the gate — passing red work with no trace of why 
 one outcome worse than refusing.
 
 `red_cause` is agent judgment. This validates the resolved value and nothing else;
-the evidence behind it belongs to implement's prompt and its report.
+the evidence behind it belongs to the declaring node's prompt and its report.
 
 Bound inputs (`with:` bindings, canonical text in env):
-- INPUTS_GREEN: the implement verdict, canonical boolean text.
+- INPUTS_GREEN: the declaring node's verdict, canonical boolean text.
 - INPUTS_RED_CAUSE: `introduced`, `inherited`, `environment`, or '' when the
   declared-optional field is absent.
-- INPUTS_SUMMARY: implement's summary, which carries the evidence for the claim.
+- INPUTS_SUMMARY: that node's summary, which carries the evidence for the claim.
 - INPUTS_STAGE: which gate this is, for the record a human reads later.
 """
 
@@ -40,8 +43,8 @@ CAUSES = ("introduced", *PASSES_RED)
 def record_red_cause(artifacts: str, cause: str, stage: str, summary: str) -> None:
     """Append this gate's decision to the run's red-cause record.
 
-    A list, not a document: the initial implementation and a later correction can each
-    pass red for their own reason, and the second must not erase the first. An
+    A list, not a document: the implementation, a correction, and the project gate can
+    each pass red for their own reason, and a later one must not erase an earlier. An
     unreadable existing file is replaced rather than parsed around — the alternative is
     failing a delivery over a file only this gate writes — while a failed WRITE
     propagates, because the record is the whole reason passing red is allowed.
@@ -68,7 +71,7 @@ def main() -> int:
     green = os.environ.get("INPUTS_GREEN", "").strip()
     cause = os.environ.get("INPUTS_RED_CAUSE", "").strip()
     summary = os.environ.get("INPUTS_SUMMARY", "").strip()
-    stage = os.environ.get("INPUTS_STAGE", "").strip() or "implementation"
+    stage = os.environ.get("INPUTS_STAGE", "").strip() or "The work"
 
     if green == "true":
         print(json.dumps({"gate": "green"}))
@@ -76,7 +79,7 @@ def main() -> int:
 
     if cause not in CAUSES:
         print(
-            f"{stage} finished not green and declared no usable red_cause "
+            f"{stage} is red and declared no usable red_cause "
             f"(got '{cause}'; expected one of {', '.join(CAUSES)}). Red that nobody "
             "explained is red this gate refuses — its summary says what happened.",
             file=sys.stderr,
@@ -85,7 +88,7 @@ def main() -> int:
 
     if cause == "introduced":
         print(
-            f"{stage} finished not green: its own change broke a check it ran. "
+            f"{stage} is red, and the cause is the change itself. "
             "Refusing to open or advance a pull request on red work.",
             file=sys.stderr,
         )
@@ -102,7 +105,7 @@ def main() -> int:
         return 1
 
     print(
-        f"{stage} is not green, and declared the red {cause} rather than introduced. "
+        f"{stage} is red, and declared that red {cause} rather than introduced. "
         "Proceeding: the pull request's own CI is the gate that still stands.",
         file=sys.stderr,
     )

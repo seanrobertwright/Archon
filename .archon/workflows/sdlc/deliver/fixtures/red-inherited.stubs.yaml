@@ -1,12 +1,12 @@
-# Dry-run fixture: red the change cannot have caused passes the green gate, so the
-# PR opens and the review runs on work that is correct (--exec-code, so the real
-# gate script decides). This is run 49f0d462's shape (#2939).
+# Dry-run fixture: red the change cannot have caused passes BOTH green gates, and
+# the run rides to the durable CI wait (--exec-code, so both real gate scripts
+# decide). This is run 49f0d462's shape (#2939).
 #
-# It also pins where an inherited break is still terminal: `validate` re-runs the
-# project's own gate later, and a base break that nobody fixed meanwhile is red
-# there too. `reached` proves the delivery got past gate-green to a reviewed PR
-# first — the failure is now a durable one on an existing PR rather than a refusal
-# before anything public exists.
+# An inherited base break survives the whole tail: implement meets it, and so does
+# the project gate after review, because nobody fixed the base meanwhile. Neither
+# gate refuses it — the pull request's own CI is what decides, and it is red there
+# too, so `ci-probe` reports pending and the run suspends at `ci-pause` rather than
+# dying locally. That pause is the intended terminus: resume once the base is fixed.
 impl__record-start: '{"start":"recorded"}'
 impl__implement:
   done: true
@@ -14,7 +14,8 @@ impl__implement:
   red_cause: inherited
   summary: "stub: validate red on a spec this diff never touches; same spec red at the run's starting commit"
 impl__assert-changed: "3 files changed"
-# gate-green is deliberately unstubbed: the real script must pass this red and record it.
+# gate-green and gate-validated are deliberately unstubbed: both real scripts must
+# pass this red and record it.
 pr__pr: "https://github.com/example/repo/pull/6 (draft)"
 classify:
   errors: false
@@ -35,9 +36,10 @@ review__synthesize:
   findings_summary: "stub: the change itself is clean"
 validate__validate:
   green: false
-  summary: "stub: the inherited break is still red on the base"
+  red_cause: inherited
+  summary: "stub: the same inherited break, still red on the base"
+ci-probe: '{"state":"pending","detail":"stub: 1 check still running"}'
 fixture:
-  expect: failed
-  fail-node: gate-validated
-  reached: [pr__pr, review__synthesize]
+  expect: paused
+  reached: [pr__pr, review__synthesize, gate-validated, ci-probe]
 exec-code: true

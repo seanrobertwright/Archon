@@ -237,15 +237,21 @@ nodes:
     include: archon-validate
     depends_on: [gate-ready]
 
+  # The third gate on the same script, for the same reason: a local gate that
+  # refuses every red refuses red the change did not cause, and the base break
+  # this branch inherited is exactly the red that survives to here. Introduced red
+  # still stops the run. Inherited or environment red proceeds to await-checks,
+  # where the pull request's own CI decides — an inherited break is red there too
+  # and holds at the durable wait, which is the honest place to hold it.
   - id: gate-validated
-    bash: |
-      if [ "$validate.output.green" = "true" ]; then
-        echo '{"validated":"true"}'
-      else
-        echo "local validation failed after review — see the validation report in the run artifacts." >&2
-        exit 1
-      fi
+    script: gate-green
+    runtime: uv
     depends_on: [validate]
+    with:
+      green: "$validate.output.green"
+      red_cause: "$validate.output.red_cause"
+      summary: "$validate.output.summary"
+      stage: "The project gate"
 
   # CI wait, durably. The probe classifies check state once; a pending state
   # routes into the engine's `wait:` node (#2744), which suspends the run and
