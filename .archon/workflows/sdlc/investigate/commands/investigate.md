@@ -28,6 +28,8 @@ After each observation, name what uncertainty remains and choose the next observ
 
 Trigger the symptom yourself whenever reasonably possible, using the project's own commands or a minimal script. Save any repro script under `$ARTIFACTS_DIR/repro/` so the fixer can rerun it. When reproduction is not reasonable — external state, prohibitive cost, timing you cannot control — say so in the report and establish the chain by other concrete evidence instead: code reading with exact locations, logs, git history. Never describe a reproduction you did not actually run.
 
+A reproduction that needs a real service creates it: a scratch database you create and drop, a temp file, an in-memory instance. A configured live DSN is read-only at most, and DDL or writes never touch a resource you did not create. If only a live resource could reproduce the symptom, treat it as unavailable external state and record the gap.
+
 Compete only the hypotheses that remain plausible after grounding the symptom. Design the observation that separates them and rule each out with evidence. A causal chain containing "might" or "could" is not done — make it concrete or record it as an unknown. Every link in the chain cites its evidence: a file and line, a command you ran and its output, a log line, or a commit.
 
 ## The root cause, not the symptom

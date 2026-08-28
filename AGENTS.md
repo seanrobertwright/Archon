@@ -143,6 +143,7 @@ The governing rule is: **YAML coordinates. Code computes. Agents judge.** Read [
 - Run `bun run validate` before opening a pull request. CI may contain additional environment-dependent checks; inspect changed-path workflows and run applicable checks when practical.
 - Schema changes also require the PostgreSQL upgrade check documented in the contributor docs and CI.
 - For visual or runtime behavior, add direct evidence when static tests cannot prove the outcome.
+- Destructive verification, including DDL, migrations, and data writes, runs only against a scratch database you create and drop. A configured live DSN is read-only at most; when only a live resource exists, stop and surface it to the operator.
 
 ## Pull requests
 
