@@ -3,13 +3,13 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
-import { checkRepository, checkSource, gitOutput } from './check-test-cleanup-drift';
+import { buildLedger, checkRepository, checkSource, gitOutput } from './check-test-cleanup-drift';
 
 const trackTempRoot = trackTempRoots();
 
 const RETRY_SOURCE =
   "import { rm } from 'node:fs/promises';\nawait rm(root, { maxRetries: 10 });\n";
-const TEARDOWN_SOURCE = `
+const CLEANUP_SOURCE = `
 import { afterEach } from 'bun:test';
 import { rm } from 'node:fs/promises';
 afterEach(async () => {
@@ -47,7 +47,7 @@ test('rejects Bun-inert rm retry options', () => {
   ]);
 });
 
-test('identifies bare recursive teardown', () => {
+test('identifies bare recursive cleanup', () => {
   const violations = checkSource(
     'scripts/migrate-state-dir.test.ts',
     "import { rm } from 'node:fs/promises';\ntry { await run(); } finally { await rm(root, { recursive: true, force: true }); }"
@@ -55,8 +55,8 @@ test('identifies bare recursive teardown', () => {
 
   expect(violations).toEqual([
     expect.objectContaining({
-      rule: 'recursive-teardown',
-      message: 'recursive rm test teardown must use removeTempTree or trackTempRoots',
+      rule: 'recursive-cleanup',
+      message: 'recursive rm test cleanup must use removeTempTree or trackTempRoots',
     }),
   ]);
 });
@@ -94,7 +94,7 @@ test('recognizes static fs promises bindings', () => {
   expect(checkSource('scripts/example.ts', source)).toHaveLength(2);
 });
 
-test('recognizes imported Bun teardown hooks', () => {
+test('recognizes imported Bun cleanup hooks', () => {
   const source = `
     import { afterEach as cleanup } from 'bun:test';
     import * as Bun from 'bun:test';
@@ -104,6 +104,72 @@ test('recognizes imported Bun teardown hooks', () => {
   `;
 
   expect(checkSource('scripts/example.test.ts', source)).toHaveLength(2);
+});
+
+test('follows a named cleanup function passed to a hook by reference', () => {
+  const source = `
+    import { afterEach } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    async function cleanup() { await rm(root, { recursive: true, force: true }); }
+    afterEach(cleanup);
+  `;
+
+  expect(checkSource('packages/example/src/example.test.ts', source)).toEqual([
+    expect.objectContaining({ rule: 'recursive-cleanup' }),
+  ]);
+});
+
+test('follows a const-bound cleanup arrow passed to a hook by reference', () => {
+  const source = `
+    import { afterAll } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    const cleanup = async () => { await rm(root, { recursive: true, force: true }); };
+    afterAll(cleanup);
+  `;
+
+  expect(checkSource('packages/example/src/example.test.ts', source)).toEqual([
+    expect.objectContaining({ rule: 'recursive-cleanup' }),
+  ]);
+});
+
+test('treats setup hooks as cleanup, inline and by reference', () => {
+  const inline = `
+    import { beforeEach } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    beforeEach(async () => { await rm(root, { recursive: true, force: true }); });
+  `;
+  const referencedAlias = `
+    import { beforeAll as prepare } from 'bun:test';
+    import { rmSync } from 'node:fs';
+    const wipe = () => rmSync(root, { recursive: true, force: true });
+    prepare(wipe);
+  `;
+
+  expect(checkSource('packages/example/src/a.test.ts', inline)).toHaveLength(1);
+  expect(checkSource('packages/example/src/b.test.ts', referencedAlias)).toHaveLength(1);
+});
+
+test('ignores a recursive helper that is never passed to a hook', () => {
+  const source = `
+    import { afterEach } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    async function nukeFixture() { await rm(root, { recursive: true, force: true }); }
+    afterEach(() => removeTempTree(root));
+  `;
+
+  expect(checkSource('packages/example/src/example.test.ts', source)).toEqual([]);
+});
+
+test('rejects a malformed or duplicated ledger entry at construction', () => {
+  expect(() =>
+    buildLedger([
+      ['a.test.ts', 1],
+      ['a.test.ts', 2],
+    ])
+  ).toThrow('Duplicate cleanup ledger entry for a.test.ts');
+  expect(() => buildLedger([['a.test.ts', 0]])).toThrow('must be a positive integer');
+  expect(() => buildLedger([['a.test.ts', 1.5]])).toThrow('must be a positive integer');
+  expect(buildLedger([['a.test.ts', 3]]).get('a.test.ts')).toBe(3);
 });
 
 test('allows single-file cleanup and shared recursive cleanup', () => {
@@ -146,17 +212,17 @@ test('rejects retry options anywhere, in source and test files alike', () => {
   ]);
 });
 
-test('rejects recursive teardown in a file the baseline does not record', () => {
-  const root = repositoryWith({ 'packages/lib/src/fresh.test.ts': TEARDOWN_SOURCE });
+test('rejects recursive cleanup in a file the baseline does not record', () => {
+  const root = repositoryWith({ 'packages/lib/src/fresh.test.ts': CLEANUP_SOURCE });
 
   expect(checkRepository(root, new Map())).toEqual([
-    'packages/lib/src/fresh.test.ts:5 recursive rm test teardown must use removeTempTree or trackTempRoots',
+    'packages/lib/src/fresh.test.ts:5 recursive rm test cleanup must use removeTempTree or trackTempRoots',
   ]);
 });
 
 test('finds untracked sources', () => {
   const root = repositoryWith(
-    { 'packages/lib/src/fresh.test.ts': TEARDOWN_SOURCE },
+    { 'packages/lib/src/fresh.test.ts': CLEANUP_SOURCE },
     { track: false }
   );
 
@@ -164,30 +230,30 @@ test('finds untracked sources', () => {
 });
 
 test('accepts a recorded site at its baseline count', () => {
-  const root = repositoryWith({ 'packages/lib/src/legacy.test.ts': TEARDOWN_SOURCE });
+  const root = repositoryWith({ 'packages/lib/src/legacy.test.ts': CLEANUP_SOURCE });
 
   expect(checkRepository(root, new Map([['packages/lib/src/legacy.test.ts', 1]]))).toEqual([]);
 });
 
 test('rejects a recorded file that gains a site', () => {
   const root = repositoryWith({
-    'packages/lib/src/legacy.test.ts': `${TEARDOWN_SOURCE}\nafterEach(() => rm(other, { recursive: true }));\n`,
+    'packages/lib/src/legacy.test.ts': `${CLEANUP_SOURCE}\nafterEach(() => rm(other, { recursive: true }));\n`,
   });
 
   expect(checkRepository(root, new Map([['packages/lib/src/legacy.test.ts', 1]]))).toEqual([
-    expect.stringContaining('2 recursive teardown sites exceed the recorded 1'),
+    expect.stringContaining('2 recursive cleanup sites exceed the recorded 1'),
   ]);
 });
 
 test('reports a baseline left above a cleaned-up file so the ledger stays honest', () => {
-  const root = repositoryWith({ 'packages/lib/src/legacy.test.ts': TEARDOWN_SOURCE });
+  const root = repositoryWith({ 'packages/lib/src/legacy.test.ts': CLEANUP_SOURCE });
 
   expect(checkRepository(root, new Map([['packages/lib/src/legacy.test.ts', 4]]))).toEqual([
-    expect.stringContaining('1 recursive teardown sites, recorded 4; lower its'),
+    expect.stringContaining('1 recursive cleanup sites, recorded 4; lower its'),
   ]);
 
   const cleaned = repositoryWith({ 'packages/lib/src/clean.test.ts': '' });
   expect(checkRepository(cleaned, new Map([['packages/lib/src/deleted.test.ts', 2]]))).toEqual([
-    expect.stringContaining('0 recursive teardown sites, recorded 2; delete its'),
+    expect.stringContaining('0 recursive cleanup sites, recorded 2; delete its'),
   ]);
 });

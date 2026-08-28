@@ -11,10 +11,10 @@ const RETRY_OPTIONS = new Set(['maxRetries', 'retryDelay']);
 
 /**
  * `retry-options` is repo-wide law: Bun parses and ignores `maxRetries`/`retryDelay`, so any
- * occurrence is inert code. `recursive-teardown` predates the shared helpers and still has a
- * frozen inventory, so it is scoped per file against `LEGACY_RECURSIVE_TEARDOWN`.
+ * occurrence is inert code. `recursive-cleanup` predates the shared helpers and still has a
+ * frozen inventory, so it is scoped per file against `LEGACY_RECURSIVE_CLEANUP`.
  */
-export type DriftRule = 'retry-options' | 'recursive-teardown';
+export type DriftRule = 'retry-options' | 'recursive-cleanup';
 
 export interface DriftViolation {
   file: string;
@@ -95,32 +95,53 @@ function propertyName(property: ts.PropertyAssignment): string | undefined {
     : undefined;
 }
 
-function hasRecursiveOption(call: ts.CallExpression): boolean {
+function hasOption(
+  call: ts.CallExpression,
+  matches: (property: ts.PropertyAssignment) => boolean
+): boolean {
   const options = call.arguments[1];
   if (options === undefined || !ts.isObjectLiteralExpression(options)) return false;
   return options.properties.some(
+    property => ts.isPropertyAssignment(property) && matches(property)
+  );
+}
+
+const hasRecursiveOption = (call: ts.CallExpression): boolean =>
+  hasOption(
+    call,
     property =>
-      ts.isPropertyAssignment(property) &&
       propertyName(property) === 'recursive' &&
       property.initializer.kind === ts.SyntaxKind.TrueKeyword
   );
+
+const hasRetryOption = (call: ts.CallExpression): boolean =>
+  hasOption(call, property => RETRY_OPTIONS.has(propertyName(property) ?? ''));
+
+/**
+ * `before*` counts as cleanup too: clearing stale state at setup time removes the same tree with
+ * the same Windows lock exposure, so the shared helpers apply there for the same reason.
+ */
+const HOOK_NAMES = new Set(['afterEach', 'afterAll', 'beforeEach', 'beforeAll']);
+
+interface CleanupBindings {
+  hooks: Set<string>;
+  namespaces: Set<string>;
+  /** Same-file callbacks passed to a hook by name rather than written inline. */
+  referenced: Set<string>;
 }
 
-function hasRetryOption(call: ts.CallExpression): boolean {
-  const options = call.arguments[1];
-  if (options === undefined || !ts.isObjectLiteralExpression(options)) return false;
-  return options.properties.some(
-    property => ts.isPropertyAssignment(property) && RETRY_OPTIONS.has(propertyName(property) ?? '')
+function isHookCall(call: ts.CallExpression, hooks: Set<string>, namespaces: Set<string>): boolean {
+  if (ts.isIdentifier(call.expression)) return hooks.has(call.expression.text);
+  return (
+    ts.isPropertyAccessExpression(call.expression) &&
+    ts.isIdentifier(call.expression.expression) &&
+    namespaces.has(call.expression.expression.text) &&
+    HOOK_NAMES.has(call.expression.name.text)
   );
 }
 
-interface TeardownBindings {
-  hooks: Set<string>;
-  namespaces: Set<string>;
-}
-
-function teardownBindings(sourceFile: ts.SourceFile): TeardownBindings {
-  const hooks = new Set(['afterEach', 'afterAll']);
+function cleanupBindings(sourceFile: ts.SourceFile): CleanupBindings {
+  const hooks = new Set(HOOK_NAMES);
   const namespaces = new Set<string>();
 
   for (const statement of sourceFile.statements) {
@@ -141,28 +162,53 @@ function teardownBindings(sourceFile: ts.SourceFile): TeardownBindings {
     }
     for (const element of bindings.elements) {
       const importedName = element.propertyName?.text ?? element.name.text;
-      if (importedName === 'afterEach' || importedName === 'afterAll') hooks.add(element.name.text);
+      if (HOOK_NAMES.has(importedName)) hooks.add(element.name.text);
     }
   }
 
-  return { hooks, namespaces };
+  const referenced = new Set<string>();
+  const collect = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && isHookCall(node, hooks, namespaces)) {
+      for (const argument of node.arguments) {
+        if (ts.isIdentifier(argument)) referenced.add(argument.text);
+      }
+    }
+    ts.forEachChild(node, collect);
+  };
+  collect(sourceFile);
+
+  return { hooks, namespaces, referenced };
 }
 
-function isTeardownCallback(node: ts.Node, bindings: TeardownBindings): boolean {
+function isInlineCleanupCallback(node: ts.Node, bindings: CleanupBindings): boolean {
   if (!ts.isArrowFunction(node) && !ts.isFunctionExpression(node)) return false;
   const parent = node.parent;
-  if (!ts.isCallExpression(parent)) return false;
-  if (!parent.arguments.includes(node)) return false;
-  if (ts.isIdentifier(parent.expression)) return bindings.hooks.has(parent.expression.text);
   return (
-    ts.isPropertyAccessExpression(parent.expression) &&
-    ts.isIdentifier(parent.expression.expression) &&
-    bindings.namespaces.has(parent.expression.expression.text) &&
-    (parent.expression.name.text === 'afterEach' || parent.expression.name.text === 'afterAll')
+    ts.isCallExpression(parent) &&
+    parent.arguments.includes(node as ts.Expression) &&
+    isHookCall(parent, bindings.hooks, bindings.namespaces)
   );
 }
 
-function isInTeardown(node: ts.Node, bindings: TeardownBindings): boolean {
+/**
+ * Extracting a hook body into a shared function is exactly what this checker's own message asks
+ * for, so the rule has to follow the reference. Resolution is same-file and by name only: a
+ * callback imported from another module is not tracked.
+ */
+function isReferencedCleanup(node: ts.Node, referenced: Set<string>): boolean {
+  if (ts.isFunctionDeclaration(node)) {
+    return node.name !== undefined && referenced.has(node.name.text);
+  }
+  if (!ts.isArrowFunction(node) && !ts.isFunctionExpression(node)) return false;
+  const parent = node.parent;
+  return (
+    ts.isVariableDeclaration(parent) &&
+    ts.isIdentifier(parent.name) &&
+    referenced.has(parent.name.text)
+  );
+}
+
+function isInCleanup(node: ts.Node, bindings: CleanupBindings): boolean {
   for (let current: ts.Node | undefined = node; current !== undefined; current = current.parent) {
     if (
       ts.isBlock(current) &&
@@ -171,7 +217,8 @@ function isInTeardown(node: ts.Node, bindings: TeardownBindings): boolean {
     ) {
       return true;
     }
-    if (isTeardownCallback(current, bindings)) return true;
+    if (isInlineCleanupCallback(current, bindings)) return true;
+    if (isReferencedCleanup(current, bindings.referenced)) return true;
   }
   return false;
 }
@@ -179,7 +226,7 @@ function isInTeardown(node: ts.Node, bindings: TeardownBindings): boolean {
 export function checkSource(file: string, source: string): DriftViolation[] {
   const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const bindings = fsBindings(sourceFile);
-  const teardown = teardownBindings(sourceFile);
+  const cleanup = cleanupBindings(sourceFile);
   const violations: DriftViolation[] = [];
 
   const visit = (node: ts.Node): void => {
@@ -195,12 +242,12 @@ export function checkSource(file: string, source: string): DriftViolation[] {
             message: `${name} options must not use maxRetries or retryDelay; Bun ignores them`,
           });
         }
-        if (TEST_FILE.test(file) && hasRecursiveOption(node) && isInTeardown(node, teardown)) {
+        if (TEST_FILE.test(file) && hasRecursiveOption(node) && isInCleanup(node, cleanup)) {
           violations.push({
             file,
             line,
-            rule: 'recursive-teardown',
-            message: `recursive ${name} test teardown must use removeTempTree or trackTempRoots`,
+            rule: 'recursive-cleanup',
+            message: `recursive ${name} test cleanup must use removeTempTree or trackTempRoots`,
           });
         }
       }
@@ -213,13 +260,30 @@ export function checkSource(file: string, source: string): DriftViolation[] {
 }
 
 /**
- * Recursive test teardown that predates the shared helpers from PR #2874. Rewriting this
+ * The ledger is edited by hand on every cleanup, so it validates itself at module load: a
+ * duplicate key would otherwise keep the last value silently, which a conflict resolution can
+ * produce and no later check would notice.
+ */
+export function buildLedger(entries: readonly (readonly [string, number])[]): Map<string, number> {
+  const ledger = new Map<string, number>();
+  for (const [file, count] of entries) {
+    if (ledger.has(file)) throw new Error(`Duplicate cleanup ledger entry for ${file}`);
+    if (!Number.isInteger(count) || count < 1) {
+      throw new Error(`Cleanup ledger entry for ${file} must be a positive integer, got ${count}`);
+    }
+    ledger.set(file, count);
+  }
+  return ledger;
+}
+
+/**
+ * Recursive test cleanup that predates the shared helpers from PR #2874. Rewriting this
  * inventory is out of scope for #2885, so these counts freeze it: a file may not gain a site,
  * and an entry must be lowered or deleted once a file is cleaned up. The counts are exact
  * rather than a ceiling so the ledger cannot rot high after a cleanup and quietly reopen the
  * hole it was recording.
  */
-export const LEGACY_RECURSIVE_TEARDOWN: ReadonlyMap<string, number> = new Map([
+export const LEGACY_RECURSIVE_CLEANUP: ReadonlyMap<string, number> = buildLedger([
   ['.archon/scripts/__tests__/marketplace-fetch-source.test.ts', 2],
   ['.archon/scripts/maintainer-standup-persist.test.ts', 1],
   ['packages/cli/src/commands/doctor.test.ts', 2],
@@ -295,34 +359,41 @@ function repositorySources(root: string): Set<string> {
  * Scans the whole working tree rather than the changed files: both rules are repository law, and
  * a diff-scoped check would accept drift that an earlier merge already introduced.
  */
-export function checkRepository(root = REPO_ROOT, baseline = LEGACY_RECURSIVE_TEARDOWN): string[] {
+export function checkRepository(root = REPO_ROOT, baseline = LEGACY_RECURSIVE_CLEANUP): string[] {
   const failures: string[] = [];
-  const teardown = new Map<string, DriftViolation[]>();
+  const cleanup = new Map<string, DriftViolation[]>();
 
   for (const file of repositorySources(root)) {
     const path = join(root, file);
     if (!existsSync(path)) continue;
     for (const violation of checkSource(file, readFileSync(path, 'utf8'))) {
-      if (violation.rule === 'retry-options') {
-        failures.push(`${file}:${violation.line} ${violation.message}`);
-        continue;
+      switch (violation.rule) {
+        case 'retry-options':
+          failures.push(`${file}:${violation.line} ${violation.message}`);
+          break;
+        case 'recursive-cleanup':
+          cleanup.set(file, [...(cleanup.get(file) ?? []), violation]);
+          break;
+        default:
+          // A new DriftRule must choose its scope here rather than inherit the ledger's.
+          violation.rule satisfies never;
+          throw new Error(`Unhandled drift rule: ${String(violation.rule)}`);
       }
-      teardown.set(file, [...(teardown.get(file) ?? []), violation]);
     }
   }
 
-  for (const file of new Set([...teardown.keys(), ...baseline.keys()])) {
-    const found = teardown.get(file) ?? [];
+  for (const file of new Set([...cleanup.keys(), ...baseline.keys()])) {
+    const found = cleanup.get(file) ?? [];
     const recorded = baseline.get(file) ?? 0;
     if (found.length === recorded) continue;
 
     if (found.length < recorded) {
       const correction =
         found.length === 0
-          ? 'delete its LEGACY_RECURSIVE_TEARDOWN entry'
-          : `lower its LEGACY_RECURSIVE_TEARDOWN entry to ${found.length}`;
+          ? 'delete its LEGACY_RECURSIVE_CLEANUP entry'
+          : `lower its LEGACY_RECURSIVE_CLEANUP entry to ${found.length}`;
       failures.push(
-        `${file}: ${found.length} recursive teardown sites, recorded ${recorded}; ${correction}`
+        `${file}: ${found.length} recursive cleanup sites, recorded ${recorded}; ${correction}`
       );
     } else if (recorded === 0) {
       // Nothing recorded, so every site is new and its line is the actionable detail.
@@ -330,7 +401,7 @@ export function checkRepository(root = REPO_ROOT, baseline = LEGACY_RECURSIVE_TE
     } else {
       // Listing every line of a legacy file buries the new one; the author's diff has it.
       failures.push(
-        `${file}: ${found.length} recursive teardown sites exceed the recorded ${recorded}; new recursive teardown must use removeTempTree or trackTempRoots`
+        `${file}: ${found.length} recursive cleanup sites exceed the recorded ${recorded}; new recursive cleanup must use removeTempTree or trackTempRoots`
       );
     }
   }
