@@ -1107,6 +1107,7 @@ export async function updateWorkflowRun(
   updates: Partial<Pick<WorkflowRun, 'metadata' | 'output_root'>> & {
     status?: Exclude<WorkflowRunStatus, 'completed' | 'failed' | 'cancelled'>;
     outcome?: WorkflowRunOutcome;
+    working_path?: string;
   }
 ): Promise<void> {
   const dialect = getDialect();
@@ -1141,6 +1142,14 @@ export async function updateWorkflowRun(
     // executor, which already guards on a null pointer — this is the backstop
     // for any future caller that forgets to.
     setClauses.push(`output_root = COALESCE(output_root, $${values.length})`);
+  }
+  if (updates.working_path !== undefined) {
+    values.push(updates.working_path);
+    // Write-once, structurally, exactly like `output_root` above (#2872): a run
+    // row created before its checkout existed — `run --detach` creates it in the
+    // launching process, before the fork — gets its path from the process that
+    // resolves the checkout, and no later writer can repoint a live run.
+    setClauses.push(`working_path = COALESCE(working_path, $${values.length})`);
   }
 
   if (setClauses.length === 0) return;

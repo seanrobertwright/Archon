@@ -757,6 +757,7 @@ async function main(): Promise<number> {
               detachedRunConfigPayload: values['internal-detached-run-config'] as
                 | string
                 | undefined,
+              detachedRunId: values['internal-detached-run-id'] as string | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;

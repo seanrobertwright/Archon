@@ -341,6 +341,32 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
+    // The guard keys on "is this a fresh dispatch", not on who wrote the row. A row
+    // pre-created by a launching process (#2872, `--detach`) is still a fresh dispatch.
+    it('refuses the same durable wait when the fresh run row was pre-created', async () => {
+      const workflow = workflowDefinitionSchema.parse({
+        name: 'container-wait',
+        description: 'unsupported durable wait in container isolation',
+        nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+      });
+
+      await expect(
+        executeWorkflow(
+          makeDeps(makeStore()),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          workflow,
+          'msg',
+          'db-conv-1',
+          {
+            execContext: { kind: 'container', containerId: 'cid' },
+            preCreatedRun: makeRun({ id: 'pending-run', status: 'pending' }),
+          }
+        )
+      ).rejects.toThrow('durable wait, which is not supported in container isolation');
+    });
+
     it('fails a container run resumed without a container context, pointing at the CLI', async () => {
       const failSpy = mock(async () => {});
       const store = makeStore({ failWorkflowRun: failSpy });
@@ -899,6 +925,88 @@ describe('executeWorkflow', () => {
         })
       );
       expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+    });
+
+    // #2872 — `run --detach` writes the row before it forks, so `Started` names a
+    // queryable run. Only the child knows the checkout, so it fills the path in.
+    it('fills in the working path of a row created before its checkout existed', async () => {
+      const updateRun = mock<IWorkflowStore['updateWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({ id: 'pending-run', status: 'pending', working_path: null });
+
+      await executeWorkflow(
+        makeDeps(makeStore({ updateWorkflowRun: updateRun })),
+        makePlatform(),
+        'conv-1',
+        '/tmp/worktree',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun }
+      );
+
+      expect(updateRun).toHaveBeenCalledWith(
+        'pending-run',
+        expect.objectContaining({ working_path: '/tmp/worktree' })
+      );
+    });
+
+    // Without this stamp a resume of a detached container run (#2872) would silently
+    // restart in place on the live root instead of rediscovering its container.
+    it('stamps container isolation onto a fresh pre-created row', async () => {
+      const updateRun = mock<IWorkflowStore['updateWorkflowRun']>(async () => {});
+      const backend = {
+        suspend: mock(async () => {}),
+        finalize: mock(async () => ({ requiresApproval: false })),
+        applyChanges: mock(async () => ({ filesApplied: 0, filesDeleted: 0, warnings: [] })),
+        discardChanges: mock(async () => {}),
+      };
+
+      await executeWorkflow(
+        makeDeps(makeStore({ updateWorkflowRun: updateRun })),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({ id: 'pending-run', status: 'pending', working_path: null }),
+          execContext: { kind: 'container', containerId: 'cid' },
+          container: { envId: 'env-x', writeBack: 'approve', backend },
+        }
+      );
+
+      expect(updateRun).toHaveBeenCalledWith(
+        'pending-run',
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            isolation: 'container',
+            isolation_env_id: 'env-x',
+          }),
+        })
+      );
+    });
+
+    it('never rewrites the working path of a row that already has one', async () => {
+      const updateRun = mock<IWorkflowStore['updateWorkflowRun']>(async () => {});
+      const preCreatedRun = makeRun({
+        id: 'pending-run',
+        status: 'pending',
+        working_path: '/tmp/original',
+      });
+
+      await executeWorkflow(
+        makeDeps(makeStore({ updateWorkflowRun: updateRun })),
+        makePlatform(),
+        'conv-1',
+        '/tmp/somewhere-else',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun }
+      );
+
+      expect(updateRun.mock.calls[0]?.[1]).not.toHaveProperty('working_path');
     });
 
     it('fails a pre-created run when its effective bindings cannot be recorded', async () => {

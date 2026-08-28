@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -87,6 +87,27 @@ function readRun(
   }
 }
 
+/** The run row named by an ack, without waiting for it to appear (#2872). */
+function readRunById(
+  databasePath: string,
+  runId: string
+): { id: string; status: string; working_path: string | null } | undefined {
+  if (!existsSync(databasePath)) return undefined;
+  const database = new Database(databasePath, { readonly: true });
+  try {
+    return (
+      database
+        .query<
+          { id: string; status: string; working_path: string | null },
+          [string]
+        >('SELECT id, status, working_path FROM remote_agent_workflow_runs WHERE id = ?')
+        .get(runId) ?? undefined
+    );
+  } finally {
+    database.close();
+  }
+}
+
 function readTerminalEvents(
   databasePath: string,
   runId: string,
@@ -158,9 +179,25 @@ describe('detached workflow terminal database events', () => {
         new Response(launcher.stderr).text(),
       ]);
       if (exitCode !== 0) throw new Error(`Detached launcher failed: ${stderr || stdout}`);
-      expect(JSON.parse(stdout.trim())).toMatchObject({ ok: true, detached: true });
+      const ack = JSON.parse(stdout.trim()) as { runId?: unknown };
+      expect(ack).toMatchObject({ ok: true, detached: true });
+      // #2872: `Started` means a queryable run. The launcher wrote the row before it
+      // forked, so the id it acked names a row NOW — no waiting, no discovery query.
+      const ackRunId = ack.runId;
+      if (typeof ackRunId !== 'string') throw new Error(`ack carried no run id: ${stdout}`);
+      expect(readRunById(databasePath, ackRunId)?.id).toBe(ackRunId);
 
       const created = await waitFor(() => readRun(databasePath, fixture.workflow));
+      expect(created.id).toBe(ackRunId);
+      // The child fills in the checkout the parent could not know at fork time.
+      // `realpathSync` because macOS's tmpdir is a symlink and the run records the
+      // resolved path.
+      const resolvedProjectRoot = realpathSync(projectRoot);
+      await waitFor(() =>
+        readRunById(databasePath, created.id)?.working_path === resolvedProjectRoot
+          ? true
+          : undefined
+      );
       activeRunIds.add(created.id);
       await waitFor(async () => ((await endpointIsReachable(created.id)) ? undefined : true));
       expect(await endpointIsReachable(created.id)).toBe(false);

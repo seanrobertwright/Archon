@@ -262,12 +262,19 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
    * when the persisted value is null. Re-writing it on resume would re-derive
    * the path from a possibly-renamed codebase and orphan the run's artifacts,
    * defeating the whole point of persisting it.
+   *
+   * `working_path` (#2872) is write-once for the same reason and exists for the
+   * same shape: a row created before its checkout was decided. `run --detach`
+   * creates the row in the launching process — so `Started` means a queryable
+   * run — and forks before any worktree exists, so the child fills the path in
+   * once it has one. Every other caller supplies it at creation.
    */
   updateWorkflowRun(
     id: string,
     updates: Partial<Pick<WorkflowRun, 'metadata' | 'output_root'>> & {
       status?: Exclude<WorkflowRunStatus, 'completed' | 'failed' | 'cancelled'>;
       outcome?: WorkflowRunOutcome;
+      working_path?: string;
     }
   ): Promise<void>;
   updateWorkflowActivity(id: string): Promise<void>;
