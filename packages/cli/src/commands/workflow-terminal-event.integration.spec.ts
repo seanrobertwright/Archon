@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { canonicalizeProjectPath } from '@archon/paths';
 import { removeTempTree } from '@archon/paths/test-utils';
 import {
   canConnect,
@@ -175,9 +176,11 @@ describe('detached workflow terminal database events', () => {
       activeRunIds.add(created.id);
       expect(created.id).toBe(ackRunId);
       // The child fills in the checkout the parent could not know at fork time.
-      // `realpathSync` because macOS's tmpdir is a symlink and the run records the
-      // resolved path.
-      const resolvedProjectRoot = realpathSync(projectRoot);
+      // Canonicalize with the same function the CLI does (macOS's tmpdir is a
+      // symlink; Windows CI's is an 8.3 short path), because the recorded
+      // `working_path` is whatever that function returned — a different realpath
+      // variant here disagrees with it on Windows (#2927).
+      const resolvedProjectRoot = await canonicalizeProjectPath(projectRoot);
       await waitFor(() =>
         readRunById(databasePath, created.id)?.working_path === resolvedProjectRoot
           ? true

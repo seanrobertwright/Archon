@@ -7,8 +7,8 @@
  * - Does NOT require a project to be selected before starting a conversation
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, realpathSync } from 'fs';
-import { createLogger, captureChatTurn } from '@archon/paths';
+import { existsSync } from 'fs';
+import { createLogger, captureChatTurn, canonicalizeProjectPath } from '@archon/paths';
 import type {
   IPlatformAdapter,
   HandleMessageContext,
@@ -3345,22 +3345,17 @@ async function handleRegisterProject(
   const [projectName, ...pathParts] = args;
   const projectPath = pathParts.join(' ');
 
-  // Validate path exists
-  if (!existsSync(projectPath)) {
-    return `Path does not exist: ${projectPath}`;
-  }
+  // Canonicalize through the one shared `default_cwd` canonicalizer, the same
+  // one `registerFolder`, the CLI gate and `archon doctor` use. Calling a
+  // different realpath variant here is what made a chat-registered project and a
+  // CLI-registered project disagree on Windows and register two rows (#2927).
+  // It runs BEFORE the existence check so the path being validated is the path
+  // being stored — and because chat input gets no shell expansion, so `~/work`
+  // arrives literally and only this call can resolve it.
+  const canonicalPath = await canonicalizeProjectPath(projectPath);
 
-  // Canonicalize symlinks so the stored default_cwd matches what the CLI gate and
-  // `archon doctor` look up (both resolve against process.cwd(), which resolves
-  // symlinks — e.g. macOS /tmp → /private/tmp). Mirrors registerFolder; without
-  // it a symlinked path registers under one path but is looked up under another.
-  // Best-effort: existsSync already validated the path, so fall back to it if
-  // realpath fails for a rare reason (permission on a parent, race).
-  let canonicalPath = projectPath;
-  try {
-    canonicalPath = realpathSync(projectPath);
-  } catch (err) {
-    getLog().warn({ err: err as Error, projectPath }, 'project.register_realpath_failed');
+  if (!existsSync(canonicalPath)) {
+    return `Path does not exist: ${canonicalPath}`;
   }
 
   // Check if codebase already exists with this name
@@ -3440,9 +3435,15 @@ async function handleUpdateProject(message: string): Promise<string> {
   }
 
   const [projectName, ...pathParts] = args;
-  const newPath = pathParts.join(' ');
+  const suppliedPath = pathParts.join(' ');
 
-  // Validate path exists
+  // A repointed project has to land on the same canonical form the lookups ask
+  // for, exactly like a freshly registered one — storing the raw argument here
+  // wrote a `default_cwd` no reader could match (#2927). Canonicalize before
+  // validating, so the path checked is the path stored and a chat-supplied
+  // `~/work` resolves (chat input gets no shell expansion).
+  const newPath = await canonicalizeProjectPath(suppliedPath);
+
   if (!existsSync(newPath)) {
     return `Path does not exist: ${newPath}`;
   }

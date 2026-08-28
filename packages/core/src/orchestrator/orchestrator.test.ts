@@ -1,9 +1,8 @@
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
-import { mkdtemp } from 'fs/promises';
+import { mkdtemp, realpath } from 'fs/promises';
 import { removeTempTree } from '@archon/paths/test-utils';
-import { realpathSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import { createMockLogger } from '../test/mocks/logger';
 import {
@@ -18,7 +17,16 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 // ─── Mock setup (BEFORE importing module under test) ─────────────────────────
 
 const mockLogger = createMockLogger();
+// Stands in for the real shared canonicalizer. Tests build their expected
+// `default_cwd` by calling THIS function, so the expectation can never drift
+// from what the product resolved, on any platform.
+async function canonicalizeForTest(p: string): Promise<string> {
+  const absolute = resolve(p);
+  return await realpath(absolute).catch(() => absolute);
+}
+const mockCanonicalizeProjectPath = mock(canonicalizeForTest);
 mock.module('@archon/paths', () => ({
+  canonicalizeProjectPath: mockCanonicalizeProjectPath,
   captureApprovalResolved: () => undefined,
   createLogger: mock(() => mockLogger),
   getArchonWorkspacesPath: mock(() => '/home/test/.archon/workspaces'),
@@ -45,11 +53,13 @@ mock.module('../db/conversations', () => ({
 const mockGetCodebase = mock(() => Promise.resolve(null));
 const mockListCodebases = mock(() => Promise.resolve([]));
 const mockCreateCodebase = mock(() => Promise.resolve({ id: 'new-codebase-id' }));
+const mockUpdateCodebase = mock(() => Promise.resolve());
 
 mock.module('../db/codebases', () => ({
   getCodebase: mockGetCodebase,
   listCodebases: mockListCodebases,
   createCodebase: mockCreateCodebase,
+  updateCodebase: mockUpdateCodebase,
 }));
 
 const mockGetActiveSession = mock(() => Promise.resolve(null));
@@ -391,6 +401,12 @@ function clearAllMocks(): void {
   mockBuildOrchestratorSystemAppend.mockClear();
   mockLoadConfig.mockClear();
   mockExistsSync.mockClear();
+  mockUpdateCodebase.mockClear();
+  // Reset, not clear: a `mockImplementationOnce` that its test never reached
+  // (because the handler returned early) would otherwise be consumed by the
+  // next test and report a second, misleading failure.
+  mockCanonicalizeProjectPath.mockReset();
+  mockCanonicalizeProjectPath.mockImplementation(canonicalizeForTest);
   mockGenerateAndSetTitle.mockClear();
   mockClient.sendQuery.mockClear();
   mockClient.getType.mockClear();
@@ -1598,10 +1614,7 @@ describe('orchestrator-agent handleMessage', () => {
       // definitive "not a git repository" path (deterministic) — not the
       // exception-fallback branch a fake/nonexistent path would take.
       const projectPath = await mkdtemp(join(tmpdir(), 'archon-register-folder-'));
-      // Build the expectation with the SAME canonicalization the product uses
-      // (realpathSync from 'fs'). fs/promises.realpath differs on Windows 8.3
-      // short names (RUNNER~1 vs runneradmin), so mixing the two flakes there.
-      const canonicalPath = realpathSync(projectPath);
+      const canonicalPath = await mockCanonicalizeProjectPath(projectPath);
       try {
         mockExistsSync.mockReturnValue(true);
         mockListCodebases.mockResolvedValue([]);
@@ -1631,11 +1644,9 @@ describe('orchestrator-agent handleMessage', () => {
 
     test('/register-project stores detected current branch', async () => {
       const projectPath = await mkdtemp(join(tmpdir(), 'archon-register-project-'));
-      // handleRegisterProject canonicalizes via realpathSync (macOS tmpdir lives
-      // under /var → /private/var), so the stored default_cwd is the realpath'd
-      // path. Use the SAME function as the product — fs/promises.realpath differs
-      // on Windows 8.3 short names.
-      const canonicalPath = realpathSync(projectPath);
+      // handleRegisterProject canonicalizes before storing (macOS tmpdir lives
+      // under /var → /private/var), so the stored default_cwd is canonical.
+      const canonicalPath = await mockCanonicalizeProjectPath(projectPath);
       try {
         await Bun.spawn(['git', 'init', '-b', 'develop'], { cwd: projectPath }).exited;
         await Bun.spawn(['git', 'commit', '--allow-empty', '-m', 'init'], {
@@ -1702,6 +1713,88 @@ describe('orchestrator-agent handleMessage', () => {
         'chat-456',
         expect.stringContaining('Usage')
       );
+    });
+
+    // ── default_cwd canonicalization seam (#2927) ────────────────────────
+    // Both chat writers must store the SHARED canonicalizer's output, not a
+    // path they resolved themselves. These make the canonicalizer answer a
+    // different real directory than the one passed in, which no second
+    // realpath call could ever produce — so a writer that goes its own way
+    // fails here on every platform, not only on the Windows short paths that
+    // exposed the split.
+    test('/register-project stores exactly the shared canonicalizer output', async () => {
+      const suppliedPath = await mkdtemp(join(tmpdir(), 'archon-register-supplied-'));
+      const canonicalPath = await mkdtemp(join(tmpdir(), 'archon-register-canonical-'));
+      mockCanonicalizeProjectPath.mockImplementationOnce(() => Promise.resolve(canonicalPath));
+      try {
+        mockExistsSync.mockReturnValue(true);
+        mockListCodebases.mockResolvedValue([]);
+        mockCreateCodebase.mockResolvedValue({
+          id: 'new-id',
+          name: 'my-app',
+          default_cwd: canonicalPath,
+        });
+
+        await handleMessage(platform, 'chat-456', `/register-project my-app ${suppliedPath}`);
+
+        expect(mockCreateCodebase).toHaveBeenCalledWith(
+          expect.objectContaining({ default_cwd: canonicalPath })
+        );
+      } finally {
+        await removeTempTree(suppliedPath);
+        await removeTempTree(canonicalPath);
+      }
+    });
+
+    // Chat input gets no shell expansion, so `~/work` arrives literally and only
+    // the canonicalizer can resolve it. Canonicalizing after the existence check
+    // rejected a path that exists — and validated a different string than the one
+    // it would have stored.
+    test('/register-project validates the canonical path, not the raw argument', async () => {
+      const realPath = await mkdtemp(join(tmpdir(), 'archon-register-tilde-'));
+      mockCanonicalizeProjectPath.mockImplementationOnce(() => Promise.resolve(realPath));
+      // Only the canonical path exists; the literal argument does not.
+      mockExistsSync.mockImplementation((p: string) => p === realPath);
+      try {
+        mockListCodebases.mockResolvedValue([]);
+        mockCreateCodebase.mockResolvedValue({
+          id: 'new-id',
+          name: 'my-app',
+          default_cwd: realPath,
+        });
+
+        await handleMessage(platform, 'chat-456', '/register-project my-app ~/some-project');
+
+        expect(mockCreateCodebase).toHaveBeenCalledWith(
+          expect.objectContaining({ default_cwd: realPath })
+        );
+      } finally {
+        mockExistsSync.mockReturnValue(true);
+        await removeTempTree(realPath);
+      }
+    });
+
+    test('/update-project stores exactly the shared canonicalizer output', async () => {
+      const suppliedPath = await mkdtemp(join(tmpdir(), 'archon-update-supplied-'));
+      const canonicalPath = await mkdtemp(join(tmpdir(), 'archon-update-canonical-'));
+      mockCanonicalizeProjectPath.mockImplementationOnce(() => Promise.resolve(canonicalPath));
+      try {
+        mockExistsSync.mockReturnValue(true);
+        mockListCodebases.mockResolvedValue([mockCodebase]);
+
+        await handleMessage(
+          platform,
+          'chat-456',
+          `/update-project ${mockCodebase.name} ${suppliedPath}`
+        );
+
+        expect(mockUpdateCodebase).toHaveBeenCalledWith(mockCodebase.id, {
+          default_cwd: canonicalPath,
+        });
+      } finally {
+        await removeTempTree(suppliedPath);
+        await removeTempTree(canonicalPath);
+      }
     });
   });
 

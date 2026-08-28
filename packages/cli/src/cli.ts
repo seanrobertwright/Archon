@@ -53,7 +53,7 @@ installPipeSafeConsole();
 import { parseArgs } from 'util';
 import { cliArgOptions } from './args';
 import { resolve } from 'path';
-import { existsSync, realpathSync } from 'fs';
+import { existsSync } from 'fs';
 import { stat } from 'fs/promises';
 
 // Smart defaults for Claude auth
@@ -133,6 +133,7 @@ import {
   captureArchonStarted,
   isVerboseBoot,
   refreshCompiledInstallManifest,
+  canonicalizeProjectPath,
 } from '@archon/paths';
 import * as git from '@archon/git';
 
@@ -521,16 +522,13 @@ async function main(): Promise<number> {
       } else {
         // Not a git repo. It may still be a registered FOLDER project (a
         // multi-repo root or plain ops folder). Consult the DB before rejecting.
-        // Canonicalize symlinks first so the lookup matches the realpath'd
-        // default_cwd that registration stores: process.cwd() resolves symlinks,
-        // but an explicit --cwd does not, so realpath here covers both. (cwd is
-        // already validated to exist above; fall back to cwd if realpath fails.)
-        let realCwd = cwd;
-        try {
-          realCwd = realpathSync(cwd);
-        } catch {
-          // keep the resolved cwd
-        }
+        // Canonicalize through the one shared `default_cwd` canonicalizer, so
+        // this lookup asks for exactly the string registration stored. Using a
+        // different realpath variant here is what hid every CLI-registered
+        // folder project on Windows behind a false "Not in a git repository"
+        // (#2927). It also covers an explicit `--cwd`, which — unlike
+        // `process.cwd()` — arrives with its symlinks unresolved.
+        const realCwd = await canonicalizeProjectPath(cwd);
         // The DB may be unreachable. A lookup failure must NOT crash pre-dispatch
         // (workflow/isolation commands still need to surface a clear error rather
         // than a stack trace) — capture it and, if connection-shaped, report
