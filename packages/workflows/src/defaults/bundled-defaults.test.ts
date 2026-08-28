@@ -11,6 +11,7 @@ import {
 } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { removeTempTree } from '@archon/paths/test-utils';
 import {
   isBinaryBuild,
   BUNDLED_COMMANDS,
@@ -444,6 +445,74 @@ describe('bundled-defaults', () => {
         expect(commands[`__archon_pack__bundled:sdlc:review::review-${lens}`]).toContain(
           `sources: [${lens}]`
         );
+      }
+    });
+
+    it('runs the delivery-owned review preflight with its declared inputs', async () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-review'], 'archon-review.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+      const target = parsed.workflow.nodes.find(node => node.id === 'target');
+      if (target?.kind !== 'exec') throw new Error('target is not executable');
+
+      const directory = mkdtempSync(join(tmpdir(), 'archon-review-target-'));
+      const bin = join(directory, 'bin');
+      const log = join(directory, 'gh.log');
+      const previousPath = process.env.PATH;
+      const previousLog = process.env.GH_LOG;
+
+      try {
+        mkdirSync(bin);
+        writeFileSync(
+          join(bin, 'git'),
+          [
+            '#!/bin/sh',
+            'case "$1 $2 $3" in',
+            '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
+            '  "branch --show-current ") printf "%s\\n" "recorded-branch" ;;',
+            'esac',
+          ].join('\n')
+        );
+        writeFileSync(
+          join(bin, 'gh'),
+          [
+            '#!/bin/sh',
+            'printf "%s\\n" "$*" >> "$GH_LOG"',
+            'printf "%s\\n" "recorded-branch"',
+          ].join('\n')
+        );
+        chmodSync(join(bin, 'git'), 0o755);
+        chmodSync(join(bin, 'gh'), 0o755);
+        process.env.PATH = `${bin}:${previousPath ?? ''}`;
+        process.env.GH_LOG = log;
+
+        const workflow = {
+          ...parsed.workflow,
+          name: 'run-owned-review-target',
+          nodes: [{ ...target, when: undefined }],
+        };
+        const result = await dryRunWorkflow({
+          workflow,
+          userMessage: '',
+          cwd: directory,
+          inputs: { pr_number: '42', pr_head: 'recorded-branch' },
+          execCode: true,
+        });
+
+        expect(result.outcome).toBe('completed');
+        expect(result.trace[0]).toMatchObject({
+          nodeId: 'target',
+          state: 'completed',
+          output: 'PR #42 on recorded-branch',
+        });
+        expect(readFileSync(log, 'utf-8')).toContain(
+          'pr view 42 --repo owner/repo --json headRefName --jq .headRefName'
+        );
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        if (previousLog === undefined) delete process.env.GH_LOG;
+        else process.env.GH_LOG = previousLog;
+        await removeTempTree(directory);
       }
     });
 

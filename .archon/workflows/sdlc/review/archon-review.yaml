@@ -69,8 +69,8 @@ nodes:
         printf 'review target: %s\n' "$1" >&2
         exit 1
       }
-      PR_NUMBER=$INPUTS.pr_number
-      EXPECTED_BRANCH=$INPUTS.pr_head
+      PR_NUMBER=$INPUTS_PR_NUMBER
+      EXPECTED_BRANCH=$INPUTS_PR_HEAD
       if [ -z "$PR_NUMBER" ] || [ -z "$EXPECTED_BRANCH" ]; then
         fail "delivery-owned review requires both pr_number and pr_head."
       fi
