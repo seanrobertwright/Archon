@@ -7,6 +7,7 @@ import type { IsolationEnvironmentRow } from '@archon/isolation';
 // (or the workflow engine) before the mock.module() calls below take effect.
 import type { WorkflowRoutingContext } from './orchestrator';
 import type { PreparedWorkflowSource } from '@archon/workflows/executor';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import {
   makeTestComposedWorkflow,
@@ -473,6 +474,39 @@ describe('dispatchBackgroundWorkflow', () => {
     await dispatchBackgroundWorkflow(makeRoutingCtx(), makeTestComposedWorkflow([own], 'own-gate'));
     expect(mockGetOrCreateConversation).toHaveBeenCalled();
     await flushBackgroundExecution();
+  });
+
+  // #2910: a rejected terminal write means the row still says 'running' and the run's
+  // real outcome is unknown. Both sides of the branch are asserted — an ordinary
+  // rejection keeps its compensating write and its "failed" card; a terminal-write
+  // rejection gets neither, because a second write over the channel that just failed
+  // would either fail again or bury the real error.
+  test('marks the run failed and says so when execution rejects with an ordinary error', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    mockExecuteWorkflow.mockRejectedValueOnce(new Error('exec boom'));
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+    await flushBackgroundExecution();
+
+    expect(mockFailWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockFailWorkflowRun.mock.calls[0]?.[0]).toBe('run-1');
+    const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+    expect(sent.some(m => m.includes('failed: exec boom'))).toBe(true);
+  });
+
+  test('does not compensate or claim failure when the terminal write rejects', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    mockExecuteWorkflow.mockRejectedValueOnce(
+      new TerminalStatusWriteError(new Error('db is gone'))
+    );
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+    await flushBackgroundExecution();
+
+    expect(mockFailWorkflowRun).not.toHaveBeenCalled();
+    const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+    expect(sent.some(m => m.includes('final status could not be saved'))).toBe(true);
+    expect(sent.some(m => m.includes('failed: Failed to persist'))).toBe(false);
   });
 
   test('worktree.enabled: false skips isolation and runs in the parent cwd', async () => {

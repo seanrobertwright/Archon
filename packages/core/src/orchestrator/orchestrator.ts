@@ -50,6 +50,7 @@ import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
   prepareWorkflowSource,
@@ -706,7 +707,11 @@ async function dispatchBackgroundWorkflowOwned(
         }
       } catch (error) {
         const err = toError(error);
-        if (preCreatedRun) {
+        const terminalWriteFailed = error instanceof TerminalStatusWriteError;
+        // A rejected terminal write leaves the row saying `running`. Do not compensate
+        // with a second failWorkflowRun over the write channel that just failed, and do
+        // not tell the user the workflow "failed" — its real outcome is unknown.
+        if (preCreatedRun && !terminalWriteFailed) {
           await workflowDeps.store.failWorkflowRun(preCreatedRun.id, err.message).catch(dbError => {
             getLog().error(
               { err: toError(dbError), workflowRunId: preCreatedRun.id },
@@ -720,12 +725,17 @@ async function dispatchBackgroundWorkflowOwned(
             workflowName: workflow.name,
             workerConversationId: workerPlatformId,
           },
-          'background_workflow_failed'
+          terminalWriteFailed
+            ? 'background_workflow_terminal_write_failed'
+            : 'background_workflow_failed'
         );
         // Surface error to parent conversation — include workflowResult metadata when
         // we have a pre-created run ID so the chat renders a result card with "View full logs"
         const failureRunId = preCreatedRun?.id;
-        const failureMessage = `Workflow **${workflow.name}** failed: ${err.message}`;
+        const failureMessage = terminalWriteFailed
+          ? `⚠️ Workflow **${workflow.name}** finished, but its final status could not be saved. ` +
+            'It may still show as running — check it before starting another.'
+          : `Workflow **${workflow.name}** failed: ${err.message}`;
         await ctx.platform
           .sendMessage(
             ctx.conversationId,

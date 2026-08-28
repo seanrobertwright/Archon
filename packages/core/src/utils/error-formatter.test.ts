@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import { classifyAndFormatError } from './error-formatter';
 import { WorkflowAdoptionError } from '../operations/workflow-adoption';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 
 describe('classifyAndFormatError', () => {
   describe('rate limit errors', () => {
@@ -713,6 +714,26 @@ describe('classifyAndFormatError', () => {
         "Cannot adopt run 'prior-run': this conversation already continues run 'x' (paused).";
       const result = classifyAndFormatError(new WorkflowAdoptionError(refusal));
       expect(result).toBe(`⚠️ ${refusal}`);
+    });
+  });
+
+  describe('terminal status write failures', () => {
+    // #2910: this is the terminus for the orchestrator's /invoke-workflow and
+    // /workflow run dispatch paths — neither has a closer catch, so handleMessage's
+    // catch formats the error here. A run whose status was never recorded must not
+    // read as a generic error the user is told to /reset away from.
+    test('names the unrecorded status instead of the generic fallback', () => {
+      const result = classifyAndFormatError(
+        new TerminalStatusWriteError(new Error('SQLITE_BUSY: database is locked'))
+      );
+      expect(result).toContain('final status could not be saved');
+      expect(result).toContain('/workflow status');
+      expect(result).not.toContain('/reset');
+    });
+
+    test('an ordinary database error still gets the generic database guidance', () => {
+      const result = classifyAndFormatError(new Error('database is locked'));
+      expect(result).not.toContain('final status could not be saved');
     });
   });
 });

@@ -431,6 +431,7 @@ import {
   continueResolvedGateRun,
 } from './orchestrator-agent';
 import { buildAiProfile } from '@archon/workflows/model-validation';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -6287,5 +6288,44 @@ describe('continueResolvedGateRun — chat gate continuation source (#2646)', ()
       c => (c as unknown[])[1] as string
     );
     expect(messages.some(m => m.includes('digest mismatch'))).toBe(true);
+  });
+
+  // #2910: both sides of the recovery branch. An ordinary resume failure leaves the
+  // run resumable, so `/workflow resume` is right. A rejected terminal write leaves the
+  // row non-terminal — `/workflow resume` refuses those, so that advice would send the
+  // operator down a dead end for a run that may well have finished its work.
+  async function continueWithRejection(
+    platform: ReturnType<typeof makePlatform>,
+    rejection: unknown
+  ): Promise<string[]> {
+    mockExecuteWorkflow.mockRejectedValueOnce(rejection);
+    await continueResolvedGateRun(
+      platform,
+      'conv-1',
+      makeConversation({ codebase_id: 'codebase-1' }),
+      makeGateCodebase(),
+      [makeTestWorkflowWithSource({ name: 'gated', description: 'live' })],
+      makeGateRun(),
+      'approve'
+    );
+    return (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      c => (c as unknown[])[1] as string
+    );
+  }
+
+  test('an ordinary resume failure points at /workflow resume', async () => {
+    const messages = await continueWithRejection(makePlatform(), new Error('resume boom'));
+
+    expect(messages.some(m => m.includes('retry with `/workflow resume run-gated`'))).toBe(true);
+  });
+
+  test('a rejected terminal write says the status is unknown, not "retry the resume"', async () => {
+    const messages = await continueWithRejection(
+      makePlatform(),
+      new TerminalStatusWriteError(new Error('db is gone'))
+    );
+
+    expect(messages.some(m => m.includes('final status could not be saved'))).toBe(true);
+    expect(messages.some(m => m.includes('retry with `/workflow resume'))).toBe(false);
   });
 });

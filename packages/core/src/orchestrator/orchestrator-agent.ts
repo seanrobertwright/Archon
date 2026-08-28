@@ -52,6 +52,7 @@ import {
   recordSelectedWorkflow,
   type PreparedWorkflowSource,
 } from '@archon/workflows/executor';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import { liveSourceRoots } from '@archon/workflows/workflow-discovery';
 import {
   assertWorkflowRequirementsMet,
@@ -1693,6 +1694,21 @@ export async function continueResolvedGateRun(
       );
     } catch (error) {
       const err = toError(error);
+      // The run's terminal status could not be written, so its row still says `running`
+      // and its true outcome is unknown. `/workflow resume` is the wrong advice — it
+      // refuses a non-terminal row, and the run may well have finished its work.
+      if (error instanceof TerminalStatusWriteError) {
+        getLog().error(
+          { err, conversationId, workflowRunId: run.id, action },
+          'orchestrator.gate_continuation_terminal_write_failed'
+        );
+        await notify(
+          `${decision}, and **${workflow.name}** ran, but its final status could not be saved ` +
+            `(${err.message}). The decision is recorded — check \`/workflow status ${run.id}\` ` +
+            'before starting another run on this project.'
+        );
+        return;
+      }
       getLog().error(
         { err, errorType: err.constructor.name, conversationId, workflowRunId: run.id, action },
         'orchestrator.gate_continuation_failed'
