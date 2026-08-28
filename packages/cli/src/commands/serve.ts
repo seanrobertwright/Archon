@@ -193,8 +193,8 @@ export async function downloadWebDist(
   await Bun.write(tarballPath, tarballBuffer);
   const extractionStartedAt = performance.now();
   // Covers the temp-dir reset above as well as the write — both are filesystem
-  // work on the extraction target, which is the suspect this event exists to
-  // measure.
+  // work on the extraction target, and a stall there is indistinguishable from a
+  // stall in `tar` without this boundary.
   log.info(
     {
       tarballPath,
@@ -211,8 +211,10 @@ export async function downloadWebDist(
       stderr: 'pipe',
       timeout: EXTRACTION_TIMEOUT_MS,
     });
-    // Separate from the wait below: on windows a real-time scanner hooks process
-    // creation, so a slow spawn call and a slow child are different diagnoses.
+    // Separate from the wait below because process creation is a real share of
+    // the cost, not a rounding error: on a healthy windows run the spawn call is
+    // 24ms against the child's 133ms, so folding them together would hide a
+    // stalled `CreateProcess` behind a slow-looking `tar`.
     // `tarPid`, not `pid` — pino already binds the parent's pid at the root, and
     // a second `pid` key would silently win on parse.
     const spawnedAt = performance.now();
