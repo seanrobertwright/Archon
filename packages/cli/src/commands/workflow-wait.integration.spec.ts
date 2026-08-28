@@ -84,6 +84,25 @@ async function runCli(
   return { exitCode, stdout, stderr };
 }
 
+/**
+ * Assert the wait's exit code, naming the JSON envelope when it disagrees.
+ *
+ * `--json` always emits a reason — a failed wait writes `{ ok: false, error }` — and a
+ * bare `expect(exitCode).toBe(0)` throws it away, leaving "expected 0, received 1" as
+ * the only diagnostic. Windows CI failed five of these at once and reported nothing
+ * about why; the reason was sitting in the payload the whole time.
+ */
+function expectWaitExit(
+  result: { exitCode: number; payload: Record<string, unknown> },
+  expected: number
+): void {
+  if (result.exitCode !== expected) {
+    throw new Error(
+      `wait exited ${String(result.exitCode)}, expected ${String(expected)} — payload: ${JSON.stringify(result.payload)}`
+    );
+  }
+}
+
 interface PendingWait {
   settled(): Promise<{ exitCode: number; payload: Record<string, unknown> }>;
 }
@@ -225,11 +244,12 @@ describe('archon workflow wait against a detached run', () => {
       // Started while the run is still live: the wake, not a durable read, is what
       // ends this wait. The waiter runs exactly one command — no `workflow get` loop.
       const waiter = startWait(fixture, runId, 60);
-      const { exitCode, payload } = await waiter.settled();
+      const settled = await waiter.settled();
       activeRunIds.delete(runId);
 
       // Exit 0 for `failed` too: the exit code describes the WAIT, not the run.
-      expect(exitCode).toBe(0);
+      expectWaitExit(settled, 0);
+      const { payload } = settled;
       expect(payload).toMatchObject({
         ok: true,
         action: 'wait',
@@ -279,7 +299,7 @@ describe('archon workflow wait against a detached run', () => {
     const gateWaiter = startWait(fixture, runId, 60);
     const gate = await gateWaiter.settled();
 
-    expect(gate.exitCode).toBe(0);
+    expectWaitExit(gate, 0);
     expect(gate.payload).toMatchObject({
       result: 'attention',
       attention: {
@@ -322,10 +342,11 @@ describe('archon workflow wait against a detached run', () => {
     if (cancelled.exitCode !== 0) {
       throw new Error(`cancel failed: ${cancelled.stderr || cancelled.stdout}`);
     }
-    const { exitCode, payload } = await waiter.settled();
+    const settled = await waiter.settled();
     activeRunIds.delete(runId);
 
-    expect(exitCode).toBe(0);
+    expectWaitExit(settled, 0);
+    const { payload } = settled;
     expect(payload).toMatchObject({
       result: 'attention',
       attention: { kind: 'terminal', runId, status: 'cancelled' },
@@ -344,7 +365,7 @@ describe('archon workflow wait against a detached run', () => {
       expect(payload).not.toHaveProperty('attention');
     } else {
       // The 1s run beat the 1s deadline; the only other honest outcome.
-      expect(exitCode).toBe(0);
+      expectWaitExit({ exitCode, payload }, 0);
       expect(payload).toMatchObject({ result: 'attention' });
     }
   }, 90_000);
@@ -359,7 +380,7 @@ describe('archon workflow wait against a detached run', () => {
 
     const { exitCode, payload } = await startWait(fixture, missing, 30).settled();
 
-    expect(exitCode).toBe(1);
+    expectWaitExit({ exitCode, payload }, 1);
     expect(payload).toMatchObject({ ok: false, action: 'wait', error: 'not_found' });
   }, 60_000);
 });

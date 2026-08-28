@@ -3864,14 +3864,26 @@ export function registerApiRoutes(
         return `Workflow run cannot be resolved: ${attention.detail}`;
       case undefined:
         // Post-#2075 the run stays 'paused' after a resolution, so status alone no
-        // longer distinguishes "awaiting the human" from "awaiting resume".
+        // longer distinguishes "awaiting a response" from "awaiting resume".
         if (approval && isGateResolved(approval)) {
           return `Workflow run was already ${String(approval.resolved)} — resume in progress`;
         }
         // Paused with no gate at all — a durable `wait:`. There is nothing to approve.
         return requireReadableGate ? 'Workflow run is paused but missing approval context' : null;
-      default:
+      case 'awaiting_response':
+        // The gate is open and this route may go on to resolve it.
         return null;
+      case 'terminal':
+        // Unreachable: every route checks `status !== 'paused'` before calling this.
+        return null;
+      default: {
+        // Exhaustive by construction, so a fifth `RunAttention` kind becomes a compile
+        // error here instead of a silently swallowed one — which is how this route
+        // would reintroduce the opaque 500 the precondition exists to remove. The
+        // other three consumers of the union already fail to compile the same way.
+        const unreachable: never = attention;
+        throw new Error(`pausedGateBlocker: unhandled attention ${JSON.stringify(unreachable)}`);
+      }
     }
   }
 
