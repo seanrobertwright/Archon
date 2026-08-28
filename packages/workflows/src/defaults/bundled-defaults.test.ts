@@ -370,6 +370,46 @@ describe('bundled-defaults', () => {
       }
     });
 
+    // Attribution is only measurable if it lands somewhere a script can read (#2898):
+    // `scripts/lens-yield.ts` tallies these records, so the instruction that produces
+    // them and the fields it names are the contract that script depends on.
+    it('review synthesis writes findings attribution as a machine-readable sidecar', () => {
+      const synthesize = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-synthesize'];
+      expect(synthesize).toContain('$ARTIFACTS_DIR/review/findings.json');
+      expect(synthesize).toContain('{id, severity, sources, claim, status, round}');
+      // Carried-forward findings keep the lens that found them, or a multi-round review
+      // reattributes every surviving finding to its last round.
+      expect(synthesize).toContain('keeping the `sources` it was first attributed to');
+    });
+
+    // The same "does this diff earn a docs review" call is made in two packs — at
+    // delivery time by the classifier, and at review time when `docs` is `auto`. They
+    // drifted apart once already; the criterion is one sentence, shared verbatim.
+    it('states the docs-lens criterion identically in both classifiers', () => {
+      const criterion =
+        'Choose docs when the diff changes shipped documentation and the change is\n' +
+        'substantial enough for the lens to earn its attention; a version bump, a\n' +
+        'one-line fix, a rename, or a test-only tweak earns nothing.';
+      expect(
+        BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::classify-review-scope']
+      ).toContain(criterion);
+      expect(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-scope']).toContain(
+        criterion
+      );
+    });
+
+    // Calibration lesson 4 (#2898): the run that motivated this rewrite produced a false
+    // Critical from a `bun test` invoked the one way AGENTS.md forbids.
+    it('requires falsifying commands to follow the repository invocation rules', () => {
+      const discipline = 'the package scripts and invocation rules its steering files name';
+      expect(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-code']).toContain(
+        discipline
+      );
+      expect(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-synthesize']).toContain(
+        discipline
+      );
+    });
+
     it('should have valid YAML structure', () => {
       for (const content of Object.values(BUNDLED_WORKFLOWS)) {
         expect(content).toContain('name:');

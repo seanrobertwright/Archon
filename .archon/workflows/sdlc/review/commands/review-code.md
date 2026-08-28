@@ -23,7 +23,7 @@ Leave the diff far enough to understand the changed behavior: read full changed 
 
 The two-hop bound governs ordinary search. Once one concrete defect proves that a member of a finite class violates the same invariant, enumerate that class with a deterministic repository search and finish it before reporting. Emit one causal finding with the invariant, discovery method, all affected members, and all examined-clean members. Do not use class completion to start an unrelated audit.
 
-When execution is practical, run the smallest command that can falsify a finding. A passing broad suite is not proof an untested path is correct. A falsifying command creates whatever it needs — a scratch database you create and drop, never a configured live DSN — and never writes to a resource you did not create. If only a live resource could settle a finding, leave it unfalsified and say so.
+When execution is practical, run the smallest command that can falsify a finding. Invoke it the way this repository documents its own commands — the package scripts and invocation rules its steering files name, never an ad-hoc variant one of them warns against — and treat an environment-dependent failure as suspect until you reproduce it that documented way. A passing broad suite is not proof an untested path is correct. A falsifying command creates whatever it needs — a scratch database you create and drop, never a configured live DSN — and never writes to a resource you did not create. If only a live resource could settle a finding, leave it unfalsified and say so.
 
 ## Not yours
 

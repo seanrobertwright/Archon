@@ -18,7 +18,7 @@ In full mode, `code`, `seams`, and `tests` are required; `errors` and `docs` are
 
 ## Continuation judgment
 
-The previous report is accumulated review state, not a hint. Carry every prior finding and its stable ID forward as fixed at `<sha>`, still open, or disproved. Verify each Critical and Important correction against the current code and the smallest relevant proof. Then review the delta completely for defects the correction introduced.
+The previous report is accumulated review state, not a hint. Carry every prior finding and its stable ID forward as fixed at `<sha>`, still open, or disproved, keeping the `sources` it was first attributed to — attribution belongs to the lens that found the defect, not to the round that last touched it. A finding you raise yourself in continuation mode carries `sources: [synthesize]`. Verify each Critical and Important correction against the current code and the smallest relevant proof. Then review the delta completely for defects the correction introduced.
 
 Follow the behavior far enough to judge the accepted outcome. Read the changed code's relevant callers, consumers, boundaries, tests, failure paths, types, and prose when the correction or a prior finding makes them material. These are examples of evidence, not a mandatory checklist. Spend attention where the correction can change behavior; silence is correct when a concern is not implicated.
 
@@ -34,7 +34,7 @@ When findings keep expanding across correction rounds, do not reveal one nearby 
 ## Full-review aggregation
 
 - Merge duplicate findings across lenses into one **causal** finding; every in-scope finding record must carry `sources: [<lens>, ...]` listing every contributing lens, and preserve genuine disagreement.
-- **Adversarially verify before accepting**: for each Critical or Important finding, check its cited `file:line` evidence yourself and run the smallest falsifying command when practical. Record a disproved finding with the reason rather than silently dropping it.
+- **Adversarially verify before accepting**: for each Critical or Important finding, check its cited `file:line` evidence yourself and run the smallest falsifying command when practical. Invoke it the way this repository documents its own commands — the package scripts and invocation rules its steering files name, never an ad-hoc variant one of them warns against — and treat an environment-dependent failure as suspect until you reproduce it that documented way. Record a disproved finding with the reason rather than silently dropping it.
 - Assign stable IDs (`R1`, `R2`, …).
 - Severity: Critical and Important block. Suggestions never block.
 - Judge findings against scope.md's accepted contract. A defect outside that contract is an adjacent discovery. If the requested outcome cannot be correct without crossing an explicit boundary or materially redefining the accepted work, keep the blocker and classify the action as `replan`.
@@ -74,6 +74,8 @@ Never emit `ready:true` with `correct` or `replan`, or `ready:false` with `none`
 
 Write `$ARTIFACTS_DIR/review/report.md`, then write the identical complete report to `$ARTIFACTS_DIR/review/report-round-N.md`, where `N` is one greater than the highest existing `report-round-N.md` in that directory (or `1` when none exists). The canonical `report.md` remains the latest report; the round artifact is immutable history.
 
+Then write `$ARTIFACTS_DIR/review/findings.json`, the same findings as machine-readable records — what `discoveries.json` is to discoveries. A JSON array of `{id, severity, sources, claim, status, round}`: `severity` is `Critical`, `Important`, or `Suggestion`; `sources` is the lens list that finding carries in the report; `claim` is its one-sentence claim; `status` is `open`, `fixed`, or `disproved`; `round` is the round that first raised it (`N` for one new this round). Include every finding this round accounts for, carried-forward and rejected ones included, so the latest file is the complete attributed record. Write an empty array when there are no findings. This file is what makes lens value measurable by reading artifacts instead of reconstructing history from edited PR comments, so a finding without its `sources` is an incomplete record.
+
 The report contains:
 
 1. **Verdict:** ready or not, the action (`none`, `correct`, or `replan`), and the one-sentence reason.
@@ -90,7 +92,7 @@ When scope.md names a PR, publish the complete report there as **one canonical c
 
 ## Verify before finishing
 
-Confirm both report files exist, the reviewed head SHA appears verbatim in both, every accepted finding has `sources` and evidence you checked, every prior finding is accounted for in continuation mode, and the canonical PR comment read-back matched when applicable. Then declare:
+Confirm both report files and `findings.json` exist, that `findings.json` parses and holds one record per finding in the report with the same IDs and `sources`, the reviewed head SHA appears verbatim in both reports, every accepted finding has `sources` and evidence you checked, every prior finding is accounted for in continuation mode, and the canonical PR comment read-back matched when applicable. Then declare:
 
 - `ready`: the verdict above.
 - `action`: exactly `none`, `correct`, or `replan`.
