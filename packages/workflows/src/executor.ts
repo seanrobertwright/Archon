@@ -1159,9 +1159,9 @@ async function gatherDescendantRunIds(deps: WorkflowDeps, rootId: string): Promi
  * does not cover runtime targets). The child shares the parent's checkout;
  * executeWorkflow derives the ancestor chain from the child's own parent_run_id
  * to exclude it from the path-lock.
- * Never throws — every failure is returned as a `{ status: 'failed' }` outcome so
- * the calling node fails cleanly rather than the whole DAG throwing. (Every step,
- * including the recursive executeWorkflow call, is guarded — keep it that way.)
+ * Ordinary failures return a `{ status: 'failed' }` outcome so the calling node
+ * fails cleanly rather than the whole DAG throwing. Terminal status-write failures
+ * propagate because the child has no trustworthy terminal outcome to return.
  */
 async function runChildWorkflow(
   deps: WorkflowDeps,
@@ -1525,6 +1525,8 @@ async function runChildWorkflow(
     }
     return childOutcomeFromRun(finalChild);
   } catch (err) {
+    if (err instanceof TerminalStatusWriteError) throw err;
+
     // Honor the never-throws contract: executeWorkflow can throw from its early
     // setup (before its own failWorkflowRun catch-all), and the read-back can
     // throw on a DB error — both must surface as a failed node outcome, not an
@@ -1726,6 +1728,8 @@ async function maybeResumeParentRun(
       }
     );
   } catch (err) {
+    if (err instanceof TerminalStatusWriteError) throw err;
+
     // The hydrate CAS above already flipped the parent paused→running, and
     // executeWorkflow's own failWorkflowRun catch-all doesn't cover its early
     // setup (config load, env/credential resolution). Without this handler a
@@ -2733,6 +2737,7 @@ export async function executeWorkflow(
   // early-return validation paths above never leak an unpaired acquire; the
   // matching release is the first statement of this try's finally.
   keepAwake.acquire();
+  let terminalStatusWriteFailed = false;
   try {
     getLog().info(
       {
@@ -3070,7 +3075,10 @@ export async function executeWorkflow(
       };
     }
   } catch (error) {
-    if (error instanceof TerminalStatusWriteError) throw error;
+    if (error instanceof TerminalStatusWriteError) {
+      terminalStatusWriteFailed = true;
+      throw error;
+    }
 
     // Top-level error handler: ensure workflow is marked as failed
     const err = error as Error;
@@ -3141,7 +3149,7 @@ export async function executeWorkflow(
     // calling failWorkflowRun (e.g. a generator cleanup that exits without
     // throwing). Only fires when the process stays alive long enough to run
     // this finally — see #1561 for the originating zombie-state incident.
-    if (workflowRun) {
+    if (workflowRun && !terminalStatusWriteFailed) {
       const runId = workflowRun.id;
       const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
       if (backstopStatus === 'running') {

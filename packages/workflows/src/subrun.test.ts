@@ -704,6 +704,108 @@ nodes:
     expect(child?.conversation_id).toBe('conv-db');
   });
 
+  it('propagates a child terminal write failure through a workflow node', async () => {
+    await writeWorkflow(
+      'child-terminal-write',
+      `
+name: child-terminal-write
+description: child whose completion write fails
+nodes:
+  - id: work
+    prompt: "work"
+`
+    );
+    await writeWorkflow(
+      'parent-terminal-write',
+      `
+name: parent-terminal-write
+description: parent that invokes the child
+nodes:
+  - id: sub
+    workflow: child-terminal-write
+`
+    );
+
+    const store = new InMemoryStore();
+    const completeWorkflowRun = store.completeWorkflowRun.bind(store);
+    const failWorkflowRun = store.failWorkflowRun.bind(store);
+    const parentFailureWrites: string[] = [];
+    store.completeWorkflowRun = (runId, completion, metadata) => {
+      if (store.runs.get(runId)?.workflow_name === 'child-terminal-write') {
+        return Promise.reject(new Error('child terminal write failed'));
+      }
+      return completeWorkflowRun(runId, completion, metadata);
+    };
+    store.failWorkflowRun = (runId, error) => {
+      if (store.runs.get(runId)?.workflow_name === 'parent-terminal-write') {
+        parentFailureWrites.push(error);
+      }
+      return failWorkflowRun(runId, error);
+    };
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-plat',
+        cwd,
+        await discover('parent-terminal-write'),
+        'goal',
+        'conv-db'
+      )
+    ).rejects.toThrow('child terminal write failed');
+
+    expect(parentFailureWrites).toEqual([]);
+  });
+
+  it('propagates a child terminal write failure through a fan-out node', async () => {
+    await writeWorkflow(
+      'fan-child-terminal-write',
+      `
+name: fan-child-terminal-write
+description: read-only child whose completion write fails
+mutates_checkout: false
+nodes:
+  - id: work
+    prompt: "work"
+`
+    );
+    await writeWorkflow(
+      'fan-parent-terminal-write',
+      `
+name: fan-parent-terminal-write
+description: parent that fans out to the child
+nodes:
+  - id: work
+    workflow: fan-child-terminal-write
+    mutates_checkout: false
+    fan_out:
+      items: '["one"]'
+`
+    );
+
+    const store = new InMemoryStore();
+    const completeWorkflowRun = store.completeWorkflowRun.bind(store);
+    store.completeWorkflowRun = (runId, completion, metadata) => {
+      if (store.runs.get(runId)?.workflow_name === 'fan-child-terminal-write') {
+        return Promise.reject(new Error('fan-out child terminal write failed'));
+      }
+      return completeWorkflowRun(runId, completion, metadata);
+    };
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-plat',
+        cwd,
+        await discover('fan-parent-terminal-write'),
+        'goal',
+        'conv-db'
+      )
+    ).rejects.toThrow('fan-out child terminal write failed');
+  });
+
   it('propagates sparse model bindings into a child run and its effective profile', async () => {
     await writeWorkflow(
       'child-model-binding',

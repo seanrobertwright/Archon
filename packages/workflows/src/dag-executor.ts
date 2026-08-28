@@ -101,7 +101,7 @@ import { formatToolCall } from './utils/tool-formatter';
 import { createLogger, captureWorkflowCompleted } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
-import { requireTerminalStatusWrite } from './terminal-status-write';
+import { TerminalStatusWriteError, requireTerminalStatusWrite } from './terminal-status-write';
 import { evaluateCondition } from './condition-evaluator';
 import {
   declaredFieldsFromSchema,
@@ -8097,6 +8097,8 @@ async function executeWorkflowNode(
     // freshly-run child uses (interpret handles both).
     return await interpret(childOutcomeFromRun(existing));
   } catch (err) {
+    if (err instanceof TerminalStatusWriteError) throw err;
+
     return failResult(`Sub-run '${node.workflow}' errored: ${(err as Error).message}`);
   }
 }
@@ -8834,8 +8836,14 @@ async function executeFanOutWorkflowNode(
     }
   );
 
-  // mapWithLimit never rejects here (runChild honors the never-throws contract), but be
-  // defensive: a rejected slot becomes a synthetic failed outcome.
+  const terminalWriteFailure = settled.find(
+    (result): result is PromiseRejectedResult =>
+      result.status === 'rejected' && result.reason instanceof TerminalStatusWriteError
+  );
+  if (terminalWriteFailure) throw terminalWriteFailure.reason;
+
+  // Terminal status-write failures propagate above. Other unexpected rejections become a
+  // synthetic failed outcome.
   const outcomes: ChildWorkflowOutcome[] = settled.map((r, i) =>
     r.status === 'fulfilled'
       ? r.value
@@ -11038,6 +11046,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
 
             return { nodeId: node.id, output, sessionProvider: provider };
           } catch (error) {
+            if (error instanceof TerminalStatusWriteError) throw error;
+
             const err = error as Error;
             getLog().error({ err, nodeId: node.id }, 'dag_node_pre_execution_failed');
             deps.store
@@ -11176,6 +11186,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
         }
         if (output.state === 'failed') layerHadFailure = true;
       } else {
+        if (result.reason instanceof TerminalStatusWriteError) throw result.reason;
+
         // Should not happen — all errors are caught in the inner try-catch
         // Handle defensively: log the unexpected rejection
         getLog().error({ err: result.reason as Error, layerIdx }, 'dag_node_unexpected_rejection');
