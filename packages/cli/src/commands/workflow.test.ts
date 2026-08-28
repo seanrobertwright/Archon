@@ -5476,9 +5476,11 @@ describe('workflowRunCommand — detach', () => {
     expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
   });
 
-  it('passes adoption to the detached child without generating a conflicting branch', async () => {
+  it('resolves an adopted run prefix before passing it to the detached child', async () => {
+    const adoptedRunId = '0b1ee8da-1111-2222-3333-444455556666';
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
     const { resolveWorkflowAdoption } = await import('@archon/core/operations/workflow-adoption');
     const paths = await import('@archon/paths');
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
@@ -5497,8 +5499,18 @@ describe('workflowRunCommand — detach', () => {
       default_branch: 'main',
       kind: 'repo',
     });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-1',
+      name: 'test/repo',
+      default_cwd: '/test/path',
+      default_branch: 'main',
+      kind: 'repo',
+    });
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: adoptedRunId },
+    ]);
     (resolveWorkflowAdoption as ReturnType<typeof mock>).mockResolvedValueOnce({
-      adoptedRun: { id: 'run-old', status: 'completed', working_path: '/test/worktree' },
+      adoptedRun: { id: adoptedRunId, status: 'completed', working_path: '/test/worktree' },
       lane: { kind: 'reuse-worktree', workingPath: '/test/worktree' },
     });
 
@@ -5511,7 +5523,7 @@ describe('workflowRunCommand — detach', () => {
     try {
       const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', {
         detach: true,
-        adoptRunId: 'run-old',
+        adoptRunId: '0b1ee8da',
       });
       await finishStartupWindow(commandPromise, spawnSpy);
       spawnCmd = (
@@ -5524,7 +5536,9 @@ describe('workflowRunCommand — detach', () => {
 
     const adoptIndex = spawnCmd.indexOf('--adopt');
     expect(adoptIndex).toBeGreaterThan(-1);
-    expect(spawnCmd[adoptIndex + 1]).toBe('run-old');
+    expect(spawnCmd[adoptIndex + 1]).toBe(adoptedRunId);
+    expect(workflowDb.findWorkflowRunsByIdPrefix).toHaveBeenCalledWith('0b1ee8da', 'cb-1');
+    expect(resolveWorkflowAdoption).toHaveBeenCalledWith(expect.objectContaining({ adoptedRunId }));
     expect(spawnCmd).not.toContain('--branch');
   });
 
@@ -9947,7 +9961,7 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     const prepareMock = require('@archon/workflows/executor').prepareWorkflowSource as ReturnType<
       typeof mock
     >;
-    discoverMock.mockClear();
+    discoverMock.mockReset();
     prepareMock.mockClear();
     // First discovery runs against the invoking checkout; the second must run against
     // the adopted lane's worktree and resolve the branch's vintage of the workflow.
@@ -9985,6 +9999,75 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
       lane,
     });
   }
+
+  it('adopts a normal run from a unique short run id prefix', async () => {
+    const adoptedRunId = '0b1ee8da-1111-2222-3333-444455556666';
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const adoption = await import('@archon/core/operations/workflow-adoption');
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockClear();
+    setupAdoptMocks();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-adopt',
+      name: 'test-repo',
+      default_cwd: '/test/path',
+      kind: 'repo',
+    });
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: adoptedRunId },
+    ]);
+
+    await workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: '0b1ee8da' });
+
+    expect(workflowDb.findWorkflowRunsByIdPrefix).toHaveBeenCalledWith('0b1ee8da', 'cb-adopt');
+    expect(adoption.resolveWorkflowAdoption).toHaveBeenCalledWith(
+      expect.objectContaining({ adoptedRunId })
+    );
+  });
+
+  it('rejects an ambiguous adopted run prefix with its candidates', async () => {
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const adoption = await import('@archon/core/operations/workflow-adoption');
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockClear();
+    setupAdoptMocks();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-adopt',
+      name: 'test-repo',
+      default_cwd: '/test/path',
+      kind: 'repo',
+    });
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: '0b1ee8da-1111-2222-3333-444455556666' },
+      { id: '0b1ee8da-9999-8888-7777-666655554444' },
+    ]);
+
+    await expect(
+      workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: '0b1ee8da' })
+    ).rejects.toThrow(
+      '0b1ee8da-1111-2222-3333-444455556666\n  0b1ee8da-9999-8888-7777-666655554444'
+    );
+    expect(adoption.resolveWorkflowAdoption).not.toHaveBeenCalled();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockReset();
+  });
+
+  it('passes a full adopted run id through unchanged', async () => {
+    const adoptedRunId = '0b1ee8da-1111-2222-3333-444455556666';
+    const workflowDb = await import('@archon/core/db/workflows');
+    const adoption = await import('@archon/core/operations/workflow-adoption');
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockClear();
+    setupAdoptMocks();
+
+    await workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: adoptedRunId });
+
+    expect(workflowDb.findWorkflowRunsByIdPrefix).not.toHaveBeenCalled();
+    expect(adoption.resolveWorkflowAdoption).toHaveBeenCalledWith(
+      expect.objectContaining({ adoptedRunId })
+    );
+  });
 
   it('re-freezes workflow source from the inherited worktree on the reuse-worktree lane', async () => {
     setupAdoptMocks();

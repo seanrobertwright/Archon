@@ -2087,6 +2087,7 @@ async function runWorkflowWithOwnedSource(
     // pure resolution with no filesystem or database mutation, so running it as a
     // pre-flight costs nothing and the child still re-resolves it against the live
     // checkout when it starts (its lane binds a worktree this process never touches).
+    let adoptedRunId: string | undefined;
     if (options.adoptRunId !== undefined || options.supersedesRunId !== undefined) {
       if (!detachCodebase) {
         throw new Error(
@@ -2094,8 +2095,9 @@ async function runWorkflowWithOwnedSource(
         );
       }
       if (options.adoptRunId !== undefined) {
+        adoptedRunId = await resolveRunIdArg(options.adoptRunId, cwd);
         await resolveWorkflowAdoption({
-          adoptedRunId: options.adoptRunId,
+          adoptedRunId,
           codebaseId: detachCodebase.id,
           codebasePath: detachCodebase.default_cwd,
           codebaseKind: detachCodebase.kind,
@@ -2137,8 +2139,8 @@ async function runWorkflowWithOwnedSource(
       }
       const detachedUserId = await resolveCliUserRecordId();
       const continuationDeclaration =
-        options.adoptRunId !== undefined
-          ? { mode: 'adopt' as const, runId: options.adoptRunId }
+        adoptedRunId !== undefined
+          ? { mode: 'adopt' as const, runId: adoptedRunId }
           : options.supersedesRunId !== undefined
             ? { mode: 'supersede' as const, runId: options.supersedesRunId }
             : undefined;
@@ -2193,7 +2195,7 @@ async function runWorkflowWithOwnedSource(
     }
     // Between-run continuation (#2747) — the child re-resolves the adoption
     // against the live filesystem/database, so pass the declaration through.
-    if (options.adoptRunId !== undefined) extraArgs.push('--adopt', options.adoptRunId);
+    if (adoptedRunId !== undefined) extraArgs.push('--adopt', adoptedRunId);
     if (options.supersedesRunId !== undefined)
       extraArgs.push('--supersedes', options.supersedesRunId);
     // Re-pin the source as an ABSOLUTE path (parseArgs is last-wins, same as --cwd).
@@ -2346,7 +2348,7 @@ async function runWorkflowWithOwnedSource(
     // one of the two ids is present.
     if (options.adoptRunId !== undefined) {
       continuationMode = 'adopt';
-      adoptedFromRunId = options.adoptRunId;
+      adoptedFromRunId = await resolveRunIdArg(options.adoptRunId, cwd);
     } else if (options.supersedesRunId !== undefined) {
       continuationMode = 'supersede';
       adoptedFromRunId = options.supersedesRunId;
