@@ -255,6 +255,26 @@ describe('downloadWebDist', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  // The mismatch test above cannot reach this path: verification runs before
+  // anything is staged, so it never leaves temp state behind. Checksum-valid
+  // bytes that are not a gzip stream are the only cheap way in — staging happens,
+  // then `tar` exits non-zero.
+  it('leaves nothing behind when tar exits non-zero', async () => {
+    const notAnArchive = new TextEncoder().encode('checksum-valid, but not gzip');
+    const hasher = new Bun.CryptoHasher('sha256');
+    hasher.update(notAnArchive);
+    fetchSpy.mockImplementation(async () => new Response(notAnArchive));
+    const targetDir = join(tmpRoot, 'target-tar-failure');
+
+    await expect(downloadWebDist('9.9.9', targetDir, hasher.digest('hex'))).rejects.toThrow(
+      'tar extraction failed'
+    );
+
+    expect(existsSync(`${targetDir}.tmp.tar.gz`)).toBe(false);
+    expect(existsSync(`${targetDir}.tmp`)).toBe(false);
+    expect(existsSync(targetDir)).toBe(false);
+  });
+
   it('falls back to remote checksums.txt when the embedded hash is empty', async () => {
     fetchSpy.mockImplementation(async (url: string | URL | Request) => {
       if (String(url).includes('checksums.txt')) {
