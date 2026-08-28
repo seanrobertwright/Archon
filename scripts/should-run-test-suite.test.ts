@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { shouldRunTestSuite } from './should-run-test-suite';
 
+const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
+
 describe('test-suite change decision', () => {
   test.each(['push', 'pull_request'])('%s skips Markdown-only changes', () => {
     expect(shouldRunTestSuite(['README.md', 'packages/core/notes.md'])).toBe(false);
@@ -30,21 +32,36 @@ describe('test-suite change decision', () => {
     expect(shouldRunTestSuite(changedFiles)).toBe(true);
   });
 
+  test('runs for a push that creates a branch', () => {
+    const script = resolve(import.meta.dir, 'should-run-test-suite.ts');
+    const result = Bun.spawnSync(['bun', script, 'push', EMPTY_GIT_SHA, 'unavailable-head'], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString().trim()).toBe('true');
+  });
+
   test('the workflow delegates both automatic routes to the complete-diff decision', () => {
     const workflow = readFileSync(
       resolve(import.meta.dir, '../.github/workflows/test.yml'),
       'utf8'
     );
+    const changesJob = workflow.slice(workflow.indexOf('  changes:'), workflow.indexOf('  test:'));
 
+    expect(workflow).toContain('  push:\n');
+    expect(workflow).toContain('  pull_request:\n');
     expect(workflow).not.toContain('\n    paths:');
-    expect(workflow).toContain('EVENT_NAME: ${{ github.event_name }}');
-    expect(workflow).toContain(
+    expect(changesJob).toContain('EVENT_NAME: ${{ github.event_name }}');
+    expect(changesJob).toContain(
       'BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}'
     );
-    expect(workflow).toContain(
+    expect(changesJob).toContain(
       'HEAD_SHA: ${{ github.event.after || github.event.pull_request.head.sha }}'
     );
-    expect(workflow).toContain('git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"');
-    expect(workflow).toContain('bun scripts/should-run-test-suite.ts');
+    expect(changesJob).toContain('fetch-depth: 0');
+    expect(changesJob).toContain('uses: oven-sh/setup-bun@v2');
+    expect(changesJob).toContain('bun scripts/should-run-test-suite.ts');
   });
 });

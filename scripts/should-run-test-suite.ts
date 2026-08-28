@@ -1,5 +1,6 @@
 const DOCS_MANIFEST = 'packages/docs-web/package.json';
 const DOCS_DIRECTORY = 'packages/docs-web/';
+const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
 
 export function shouldRunTestSuite(changedFiles: Iterable<string>): boolean {
   for (const file of changedFiles) {
@@ -29,6 +30,10 @@ function main(): void {
   }
   if ((eventName !== 'push' && eventName !== 'pull_request') || !base || !head) {
     throw new Error(`Unsupported GitHub event: ${eventName ?? '(missing)'}`);
+  }
+  if (base === EMPTY_GIT_SHA) {
+    console.log('true');
+    return;
   }
   console.log(shouldRunTestSuite(changedFiles(base, head)));
 }

@@ -19,7 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
 
       - name: Decide whether tests are needed
         id: decision
@@ -28,9 +33,6 @@ jobs:
           BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.after || github.event.pull_request.head.sha }}
         run: |
-          if [ "$EVENT_NAME" != workflow_dispatch ]; then
-            git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
-          fi
           echo "run-tests=$(bun scripts/should-run-test-suite.ts "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
 
   test:
