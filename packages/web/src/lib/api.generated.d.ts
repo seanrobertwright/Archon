@@ -1515,7 +1515,7 @@ export interface paths {
     put?: never;
     /**
      * Run a workflow via the orchestrator (JSON or multipart with file uploads)
-     * @description Accepts `application/json` with `{ conversationId, message, inputs?, tiers?, aliases? }` or `multipart/form-data` with `conversationId`, `message`, an optional `inputs` field holding the same map JSON-encoded, optional `tiers` and `aliases` JSON object fields, and optional file attachments (max 5 files, 10 MB each). `inputs` supplies values for the workflow's declared `inputs:` (#2554); it is validated against the declaration before any worktree, clone, or AI cost, so a missing required input or an undeclared key is refused up front.
+     * @description Accepts `application/json` with `{ conversationId, message, inputs?, config?, tiers?, aliases? }` or `multipart/form-data` with `conversationId`, `message`, optional `inputs` and `config` fields holding their objects JSON-encoded, optional `tiers` and `aliases` JSON object fields, and optional file attachments (max 5 files, 10 MB each). `inputs` supplies values for the workflow's declared `inputs:` (#2554); it is validated against the declaration before any worktree, clone, or AI cost, so a missing required input or an undeclared key is refused up front. `config` supplies a sparse runtime layer; `tiers` and `aliases` rebind named model presets above it. Caller-supplied filesystem config paths are rejected.
      */
     post: {
       parameters: {
@@ -1769,6 +1769,7 @@ export interface paths {
         content: {
           'application/json': {
             event: string;
+            /** Format: date-time */
             resumeAt: string;
             payload?: unknown;
           };
@@ -2272,6 +2273,7 @@ export interface paths {
           codebaseId?: string;
           limit?: string;
           mine?: 'true' | 'false';
+          open?: 'true' | 'false';
         };
         header?: never;
         path?: never;
@@ -3508,6 +3510,9 @@ export interface components {
       };
       returns?: string;
       outcome_field?: string;
+      deprecated?: {
+        message: string;
+      };
       nodes: components['schemas']['DagNode'][];
     };
     DagNode: {
@@ -3758,6 +3763,7 @@ export interface components {
         [key: string]: unknown;
       };
       always_run?: boolean;
+      mutates_checkout?: boolean;
       persist_session?: boolean;
       output_type?: string;
       command?: string;
@@ -3875,6 +3881,7 @@ export interface components {
       working_path: string | null;
       user_id: string | null;
       parent_run_id: string | null;
+      adopted_from_run_id: string | null;
       output_root: string | null;
       codebase_name: string | null;
       platform_type: string | null;
@@ -3932,6 +3939,7 @@ export interface components {
       working_path: string | null;
       user_id: string | null;
       parent_run_id: string | null;
+      adopted_from_run_id: string | null;
       output_root: string | null;
     };
     /** @enum {string|null} */

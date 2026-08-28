@@ -24,6 +24,7 @@
     "check:pi-vendor-map": "bun run scripts/generate-pi-vendor-map.ts --check",
     "generate:capability-matrix": "bun run scripts/generate-capability-matrix.ts",
     "check:capability-matrix": "bun run scripts/generate-capability-matrix.ts --check",
+    "check:api-types": "bun run --cwd=packages/server check:api-types",
     "generate:sqlite-vintages": "bun run scripts/generate-sqlite-vintages.ts",
     "check:sqlite-vintages": "bun run scripts/generate-sqlite-vintages.ts --check",
     "check:schema-upgrades": "bun run scripts/check-schema-upgrades.ts",
@@ -40,7 +41,7 @@
     "build:web": "bun --filter @archon/web build",
     "dev:docs": "bun --filter @archon/docs-web dev",
     "build:docs": "bun --filter @archon/docs-web build",
-    "validate": "bun run check:bundled && bun run check:bundled-skill && bun run check:bundled-schema && bun run check:pi-vendor-map && bun run check:capability-matrix && bun run type-check && bun run lint --max-warnings 0 && bun run format:check && bun run test:install && bun run test",
+    "validate": "bun run check:bundled && bun run check:bundled-skill && bun run check:bundled-schema && bun run check:pi-vendor-map && bun run check:capability-matrix && bun run check:api-types && bun run type-check && bun run lint --max-warnings 0 && bun run format:check && bun run test:install && bun run test",
     "prepare": "husky",
     "setup-auth": "bun --filter @archon/server setup-auth"
   },
