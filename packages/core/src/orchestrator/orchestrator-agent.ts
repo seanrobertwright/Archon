@@ -3329,16 +3329,18 @@ async function handleRegisterProject(
   const [projectName, ...pathParts] = args;
   const projectPath = pathParts.join(' ');
 
-  // Validate path exists
-  if (!existsSync(projectPath)) {
-    return `Path does not exist: ${projectPath}`;
-  }
-
   // Canonicalize through the one shared `default_cwd` canonicalizer, the same
   // one `registerFolder`, the CLI gate and `archon doctor` use. Calling a
   // different realpath variant here is what made a chat-registered project and a
   // CLI-registered project disagree on Windows and register two rows (#2927).
+  // It runs BEFORE the existence check so the path being validated is the path
+  // being stored — and because chat input gets no shell expansion, so `~/work`
+  // arrives literally and only this call can resolve it.
   const canonicalPath = await canonicalizeProjectPath(projectPath);
+
+  if (!existsSync(canonicalPath)) {
+    return `Path does not exist: ${canonicalPath}`;
+  }
 
   // Check if codebase already exists with this name
   const existing = await codebaseDb.listCodebases();
@@ -3419,15 +3421,16 @@ async function handleUpdateProject(message: string): Promise<string> {
   const [projectName, ...pathParts] = args;
   const suppliedPath = pathParts.join(' ');
 
-  // Validate path exists
-  if (!existsSync(suppliedPath)) {
-    return `Path does not exist: ${suppliedPath}`;
-  }
-
   // A repointed project has to land on the same canonical form the lookups ask
   // for, exactly like a freshly registered one — storing the raw argument here
-  // wrote a `default_cwd` no reader could match (#2927).
+  // wrote a `default_cwd` no reader could match (#2927). Canonicalize before
+  // validating, so the path checked is the path stored and a chat-supplied
+  // `~/work` resolves (chat input gets no shell expansion).
   const newPath = await canonicalizeProjectPath(suppliedPath);
+
+  if (!existsSync(newPath)) {
+    return `Path does not exist: ${newPath}`;
+  }
 
   // Find existing codebase by name
   const existing = await codebaseDb.listCodebases();

@@ -20,10 +20,11 @@ const mockLogger = createMockLogger();
 // Stands in for the real shared canonicalizer. Tests build their expected
 // `default_cwd` by calling THIS function, so the expectation can never drift
 // from what the product resolved, on any platform.
-const mockCanonicalizeProjectPath = mock(async (p: string) => {
+async function canonicalizeForTest(p: string): Promise<string> {
   const absolute = resolve(p);
   return await realpath(absolute).catch(() => absolute);
-});
+}
+const mockCanonicalizeProjectPath = mock(canonicalizeForTest);
 mock.module('@archon/paths', () => ({
   canonicalizeProjectPath: mockCanonicalizeProjectPath,
   captureApprovalResolved: () => undefined,
@@ -401,7 +402,11 @@ function clearAllMocks(): void {
   mockLoadConfig.mockClear();
   mockExistsSync.mockClear();
   mockUpdateCodebase.mockClear();
-  mockCanonicalizeProjectPath.mockClear();
+  // Reset, not clear: a `mockImplementationOnce` that its test never reached
+  // (because the handler returned early) would otherwise be consumed by the
+  // next test and report a second, misleading failure.
+  mockCanonicalizeProjectPath.mockReset();
+  mockCanonicalizeProjectPath.mockImplementation(canonicalizeForTest);
   mockGenerateAndSetTitle.mockClear();
   mockClient.sendQuery.mockClear();
   mockClient.getType.mockClear();
@@ -1738,6 +1743,34 @@ describe('orchestrator-agent handleMessage', () => {
       } finally {
         await removeTempTree(suppliedPath);
         await removeTempTree(canonicalPath);
+      }
+    });
+
+    // Chat input gets no shell expansion, so `~/work` arrives literally and only
+    // the canonicalizer can resolve it. Canonicalizing after the existence check
+    // rejected a path that exists — and validated a different string than the one
+    // it would have stored.
+    test('/register-project validates the canonical path, not the raw argument', async () => {
+      const realPath = await mkdtemp(join(tmpdir(), 'archon-register-tilde-'));
+      mockCanonicalizeProjectPath.mockImplementationOnce(() => Promise.resolve(realPath));
+      // Only the canonical path exists; the literal argument does not.
+      mockExistsSync.mockImplementation((p: string) => p === realPath);
+      try {
+        mockListCodebases.mockResolvedValue([]);
+        mockCreateCodebase.mockResolvedValue({
+          id: 'new-id',
+          name: 'my-app',
+          default_cwd: realPath,
+        });
+
+        await handleMessage(platform, 'chat-456', '/register-project my-app ~/some-project');
+
+        expect(mockCreateCodebase).toHaveBeenCalledWith(
+          expect.objectContaining({ default_cwd: realPath })
+        );
+      } finally {
+        mockExistsSync.mockReturnValue(true);
+        await removeTempTree(realPath);
       }
     });
 
