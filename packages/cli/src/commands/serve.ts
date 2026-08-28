@@ -159,20 +159,36 @@ export async function downloadWebDist(
 
   // Extract to temp dir, then atomic rename
   const tmpDir = `${targetDir}.tmp`;
+  const tarballPath = `${tmpDir}.tar.gz`;
 
   // Clean up any previous failed attempt
   rmSync(tmpDir, { recursive: true, force: true });
   mkdirSync(tmpDir, { recursive: true });
 
-  // Extract tarball using tar (available on macOS/Linux)
-  const proc = Bun.spawn(['tar', 'xzf', '-', '-C', tmpDir, '--strip-components=1'], {
-    stdin: new Uint8Array(tarballBuffer),
-    stderr: 'pipe',
-  });
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) {
-    const stderrText = await new Response(proc.stderr).text();
-    cleanupAndThrow(tmpDir, `tar extraction failed (exit ${exitCode}): ${stderrText.trim()}`);
+  // Stage the archive on disk so `tar` inherits a file descriptor. Passing the
+  // bytes as `stdin` instead makes the parent own a channel it has to pump and
+  // close, and on windows that pump can stall with no upper bound: two spawns in
+  // one process sat with `tar` blocked on an unfed stdin until the test runner
+  // killed them, on a runner where the same extraction took 16 ms minutes later
+  // (#2924). Reading `-` keeps the archive path off the command line, where a
+  // windows drive letter is ambiguous with `tar`'s own `host:path` syntax.
+  await Bun.write(tarballPath, tarballBuffer);
+  try {
+    const proc = Bun.spawn(['tar', 'xzf', '-', '-C', tmpDir, '--strip-components=1'], {
+      stdin: Bun.file(tarballPath),
+      stderr: 'pipe',
+    });
+    // Drain stderr while waiting rather than after: a pipe nobody reads is the
+    // same deadlock in the other direction once `tar` fills its buffer.
+    const [exitCode, stderrText] = await Promise.all([
+      proc.exited,
+      new Response(proc.stderr).text(),
+    ]);
+    if (exitCode !== 0) {
+      cleanupAndThrow(tmpDir, `tar extraction failed (exit ${exitCode}): ${stderrText.trim()}`);
+    }
+  } finally {
+    rmSync(tarballPath, { force: true });
   }
 
   // Verify extraction produced expected layout
