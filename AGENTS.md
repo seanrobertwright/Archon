@@ -2,7 +2,7 @@
 
 Archon is a self-hostable, governed agentic automation engine. It runs workflows that mix deterministic steps, AI agents, human gates, and audit trails. Coding automation is its most mature surface, but the engine is intended for general business operations too.
 
-This file is the canonical project guidance for coding agents. Keep it short, durable, and about judgment. Put changing product direction in [`.archon/direction.md`](.archon/direction.md), workflow-language design in [`.archon/workflow-language-constitution.md`](.archon/workflow-language-constitution.md), user documentation in the docs site, and machine-checkable rules in code, types, tests, lint, or CI.
+This file is the canonical project guidance for coding agents. Keep it short, durable, and about judgment. Put changing product direction in [`.archon/direction.md`](.archon/direction.md), workflow-language design in [`.archon/workflow-language-constitution.md`](.archon/workflow-language-constitution.md), aspirational engineering craft and review values in [`.archon/engineering.md`](.archon/engineering.md), user documentation in the docs site, and machine-checkable rules in code, types, tests, lint, or CI.
 
 ## Read before changing code
 
@@ -159,6 +159,7 @@ Do not expand this file with copied reference material. Use the owning source:
 
 - Product direction: [`.archon/direction.md`](.archon/direction.md)
 - Workflow-language design: [`.archon/workflow-language-constitution.md`](.archon/workflow-language-constitution.md)
+- Engineering craft and review values: [`.archon/engineering.md`](.archon/engineering.md)
 - Contributor setup and checks: [`packages/docs-web/src/content/docs/contributing/index.md`](packages/docs-web/src/content/docs/contributing/index.md)
 - Architecture: [`packages/docs-web/src/content/docs/reference/architecture.md`](packages/docs-web/src/content/docs/reference/architecture.md) and package manifests
 - Configuration: [`packages/docs-web/src/content/docs/reference/configuration.md`](packages/docs-web/src/content/docs/reference/configuration.md) and the config schema
