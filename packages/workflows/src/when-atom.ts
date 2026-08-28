@@ -16,6 +16,7 @@
  *   $nodeId.output.field      — a field of a node's JSON output
  *   $nodeId.field             — shorthand for the line above (cannot nest)
  *   $INPUTS.name              — a named workflow input (#2470)
+ *   $LOOP_PREV.node.output    — prior loop-group body output (loop context only)
  *   <op> is == != <= >= < >, RHS is a single-quoted literal or a bare
  *   number/boolean.
  */
@@ -81,12 +82,23 @@ export const WHEN_ATOM_PATTERN = new RegExp(
     String.raw`(?:'([^']*)'|(-?\d+(?:\.\d+)?|true|false))$`
 );
 
+const LOOP_PREV_WHEN_ATOM_PATTERN = new RegExp(
+  String.raw`^\$LOOP_PREV\.(${NODE_ID_SOURCE})\.output(?:\.(${PATH_SEGMENT_SOURCE}))?` +
+    String.raw`\s*(${WHEN_OPERATORS.join('|')})\s*` +
+    String.raw`(?:'([^']*)'|(-?\d+(?:\.\d+)?|true|false))$`
+);
+
 /** What the left-hand side of an atom refers to. */
 export type WhenAtomRef =
   | {
       kind: 'node';
       nodeId: string;
       /** `undefined` for a whole-output `$node.output`; the field name otherwise. */
+      field: string | undefined;
+    }
+  | {
+      kind: 'loop_prev';
+      nodeId: string;
       field: string | undefined;
     }
   | { kind: 'input'; name: string };
@@ -135,11 +147,39 @@ export function whenAtoms(expr: string): string[] {
 }
 
 /**
- * Parse one atom. Returns `null` when the text is not a well-formed atom — every
+ * Parse one ordinary atom. Returns `null` when the text is not a well-formed atom — every
  * caller treats that as a parse failure (the evaluator fails closed and skips the
  * node; the loader leaves the atom to that runtime behaviour).
  */
 export function parseWhenAtom(expr: string): WhenAtom | null {
+  return parseWhenAtomInternal(expr, false);
+}
+
+/** Parse a loop-group atom, including its scoped `$LOOP_PREV` reference form. */
+export function parseLoopPrevWhenAtom(expr: string): WhenAtom | null {
+  return parseWhenAtomInternal(expr, true);
+}
+
+function parseWhenAtomInternal(expr: string, allowLoopPrev: boolean): WhenAtom | null {
+  if (allowLoopPrev) {
+    const loopPrevMatch = LOOP_PREV_WHEN_ATOM_PATTERN.exec(expr.trim());
+    if (loopPrevMatch) {
+      const [, nodeId, field, operator, quotedValue, unquotedValue] = loopPrevMatch;
+      const expected = quotedValue !== undefined ? quotedValue : unquotedValue;
+      if (
+        nodeId !== undefined &&
+        operator !== undefined &&
+        isWhenOperator(operator) &&
+        expected !== undefined
+      ) {
+        return {
+          ref: { kind: 'loop_prev', nodeId, field },
+          operator,
+          expected,
+        };
+      }
+    }
+  }
   const match = WHEN_ATOM_PATTERN.exec(expr.trim());
   if (!match) return null;
 
@@ -164,6 +204,7 @@ export function parseWhenAtom(expr: string): WhenAtom | null {
   //   - `$node.output.field`  → field access on the output
   //   - `$node.field`         → shorthand, equivalent to `$node.output.field`
   // The shorthand form cannot carry a sub-field (`$node.field.sub` is rejected).
+  if (nodeId === 'LOOP_PREV') return null;
   if (segment1 === 'output') {
     return { ref: { kind: 'node', nodeId, field: segment2 }, operator, expected };
   }

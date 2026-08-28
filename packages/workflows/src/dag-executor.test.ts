@@ -22719,7 +22719,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect('reason' in cancelNode ? cancelNode.reason : undefined).toBe("stopping: it's done");
   });
 
-  it('leaves when conditions for the condition evaluator to resolve', () => {
+  it('leaves when conditions for loop-group condition evaluation', () => {
     const node = applyLoopPrevToBodyNode(
       {
         id: 'guarded',
@@ -22732,6 +22732,64 @@ describe('executeDagWorkflow -- loop_group node', () => {
       ''
     );
     expect(node.when).toBe("$LOOP_PREV.work.output == 'done'");
+  });
+
+  it('evaluates a loop-group body when against the prior iteration output', async () => {
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      calls++;
+      yield { type: 'assistant', content: calls === 3 ? 'guarded\nDONE' : 'done' };
+      yield { type: 'result', sessionId: `loop-prev-when-${calls}` };
+    });
+
+    const result = await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-loop-prev-when',
+      testDir,
+      {
+        name: 'loop-prev-when',
+        nodes: [
+          {
+            id: 'refine',
+            kind: 'loop_group',
+            loop_group: {
+              until: 'DONE',
+              max_iterations: 2,
+              fresh_context: false,
+              nodes: [
+                {
+                  id: 'work',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'work' },
+                  depends_on: [],
+                },
+                {
+                  id: 'guarded',
+                  kind: 'agent',
+                  source: { kind: 'inline', prompt: 'guarded' },
+                  when: "$LOOP_PREV.work.output == 'done'",
+                  depends_on: ['work'],
+                },
+              ],
+            },
+            depends_on: [],
+          },
+        ],
+      },
+      makeWorkflowRun('loop-prev-when'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(calls).toBe(3);
+    expect(result).toContain('guarded');
   });
 
   it('EDGE H (#2623): resolves namespaced $LOOP_PREV across AI config and compiled loop prompts', () => {

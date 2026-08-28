@@ -65,7 +65,7 @@ import type {
 } from './schemas/workflow';
 import { INPUT_NAME_PATTERN, inputEnvKey } from './schemas/dag-node';
 import { workflowNodeHooksSchema } from './schemas/hooks';
-import { parseWhenAtom, whenAtoms, WHEN_INPUTS_SCOPE } from './when-atom';
+import { parseLoopPrevWhenAtom, parseWhenAtom, whenAtoms, WHEN_INPUTS_SCOPE } from './when-atom';
 import { declaredFieldsFromSchema, OUTPUT_REF_SOURCE, parseWholeOutputRef } from './output-ref';
 import { isBindingDirective } from './schemas/dag-node';
 import { visitNodeTemplateSlots } from './template-walker';
@@ -940,6 +940,7 @@ export function validateDagStructure(
         // `$INPUTS.name` is an input macro. In particular, `$INPUTS.output` also
         // matches the canonical node-ref grammar, so the macro must take precedence.
         if (refNodeId === WHEN_INPUTS_SCOPE) continue;
+        if (refNodeId === 'LOOP_PREV' && enclosingNodes !== undefined) continue;
         // Output refs (unlike depends_on) may also reach ENCLOSING-scope nodes: the
         // executor seeds a loop_group iteration's scoped output map with the outer
         // DAG's outputs, so `$outerNode.output` inside a body prompt is valid.
@@ -989,6 +990,7 @@ export function validateDagStructure(
         // `$INPUTS.name` is an include-time macro at load and a run-time input scope in
         // a sub-run — either way it is not a node reference.
         if (refNodeId === WHEN_INPUTS_SCOPE) continue;
+        if (refNodeId === 'LOOP_PREV' && enclosingNodes !== undefined) continue;
         if (
           refNodeId !== undefined &&
           !nodesById.has(refNodeId) &&
@@ -1011,7 +1013,8 @@ export function validateDagStructure(
       // `$n.output.field`. An atom that does not parse is left alone: the executor
       // already fails closed on it, loudly.
       for (const atomText of whenAtoms(node.when)) {
-        const atom = parseWhenAtom(atomText);
+        const atom =
+          enclosingNodes !== undefined ? parseLoopPrevWhenAtom(atomText) : parseWhenAtom(atomText);
         if (atom?.ref.kind !== 'node' || atom.ref.field !== undefined) continue;
         const producerId = atom.ref.nodeId;
         const producer = nodesById.get(producerId) ?? enclosingNodes?.get(producerId);

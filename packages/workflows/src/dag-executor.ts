@@ -5019,6 +5019,7 @@ async function executeLoopGroupNode(
       // "$LOOP_USER_INPUT" token into the script source; this env var covers indirect reads
       // (${LOOP_USER_INPUT}, printenv, env) that splice can't reach.
       bodyLoopUserInput: userInputForIter,
+      loopPrevOutputs: prevSnapshot ?? new Map(),
     };
     await runLayers(iterCtx);
 
@@ -5489,9 +5490,8 @@ async function executeLoopGroupNode(
  * $LOOP_USER_INPUT must be resolved here, at the loop-group level).
  *
  * Prompt-bearing fields include node prompts, AI configuration, and load-time compiled loop
- * command prompts. `when:` conditions are NOT substituted (they use evaluateCondition, which
- * does not call substituteLoopPrevRefs). Body authors who need cross-iteration gating should
- * branch on prompt content, not `when:`.
+ * command prompts. `when:` conditions remain expressions: runLayers resolves their
+ * `$LOOP_PREV` references against this iteration's prior-output snapshot.
  *
  * `knownBodyIds` (transitive body-id set) and `directBodyIds` (this group's immediate body
  * ids) are threaded UNCHANGED into every substituteLoopPrevRefs call AND into the
@@ -9643,6 +9643,8 @@ interface RunLayersContext {
   layers: DagNode[][];
   /** Shared node-output map (caller owns; runLayers writes node results here). */
   nodeOutputs: Map<string, NodeOutput>;
+  /** Prior body outputs available to a loop-group iteration's `when:` conditions. */
+  loopPrevOutputs?: ReadonlyMap<string, NodeOutput>;
   /**
    * Awaited after a complete layer has been aggregated and before lifecycle status is
    * observed. The top-level DAG uses this to durably capture authored run state at
@@ -10150,7 +10152,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               const { result: conditionPasses, parsed: conditionParsed } = evaluateCondition(
                 node.when,
                 ctx.nodeOutputs,
-                resolveRunInputs(workflowRun)
+                resolveRunInputs(workflowRun),
+                { loopPrevOutputs: ctx.loopPrevOutputs }
               );
               if (!conditionParsed) {
                 const parseErrMsg = `⚠️ Node '${node.id}': unparseable \`when:\` expression "${node.when}" — node skipped (fail-closed). Check syntax: \`$nodeId.output == 'VALUE'\`, \`$nodeId.output > '5'\`, or compound \`$a.output == 'X' && $b.output != 'Y'\`.`;
