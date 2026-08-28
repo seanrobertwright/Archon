@@ -46,13 +46,10 @@ import {
   isLoopNode,
   isLoopGroupNode,
   isGateNode,
-  isHaltNode,
-  isExecNode,
   isWorkflowNode,
   isWaitNode,
   isPersistableNode,
   isNodeContextResume,
-  isBindingDirective,
   isComposeFanOutNode,
   INPUT_NAME_SOURCE,
 } from './schemas';
@@ -62,6 +59,7 @@ import { validateDagStructure, validateWorkflowOutcomeDeclaration } from './load
 import { resolveDeclaredInputs } from './workflow-inputs';
 import { resolveWorkflowName } from './router';
 import { parseWhenAtom, whenAtoms } from './when-atom';
+import { mapNodeTemplateSlots, mapNodeTemplateValueSlots } from './template-walker';
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
@@ -472,101 +470,19 @@ function rewriteNodeOutputRefs(
     node.context.resume = renameOutputRef(node.context.resume);
   }
 
-  // The composed-input stamp holds caller-supplied VALUES, which are live code/expression
-  // ref surfaces exactly like `workflow.with` above it — a value naming a node of the
-  // level now being inlined has to follow that node's rename. Walked outside the mode
-  // chain because any node type can carry a stamp. Only strings can carry refs (#2637);
-  // typed values pass through untouched.
-  const stamped = readComposedMeta(node)?.inputs;
-  if (stamped !== undefined) {
-    for (const [key, value] of Object.entries(stamped)) {
-      if (typeof value === 'string') stamped[key] = code(value);
-    }
-  }
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
     boundary.dependsOn = boundary.dependsOn.flatMap(expandDependency);
     if (boundary.when !== undefined) boundary.when = whenExpr(boundary.when);
   }
 
-  // Node-level AI configuration is a runtime ref surface too (#2476/#1764): the executor
-  // substitutes `$node.output` into these before the provider sees them, so an included
-  // block's refs must be namespaced here or they point at the pre-flatten id.
-  if (node.systemPrompt !== undefined) node.systemPrompt = code(node.systemPrompt);
-  if (node.agents !== undefined) {
-    for (const agent of Object.values(node.agents)) {
-      agent.prompt = code(agent.prompt);
-      agent.description = code(agent.description);
-    }
-  }
-
-  if (isLoopNode(node)) {
-    if (node.loop.prompt !== undefined) node.loop.prompt = code(node.loop.prompt);
-    const compiled = (node.loop as typeof node.loop & LoopWithCompiledCommand)[
-      COMPILED_LOOP_COMMAND
-    ];
-    if (compiled?.prompt !== undefined) compiled.prompt = code(compiled.prompt);
-    if (node.loop.until_bash !== undefined) node.loop.until_bash = code(node.loop.until_bash);
-  } else if (isLoopGroupNode(node)) {
-    if (node.loop_group.until_bash !== undefined) {
-      node.loop_group.until_bash = code(node.loop_group.until_bash);
-    }
-    for (const body of node.loop_group.nodes) {
-      if (!isIncludeDirective(body)) {
-        rewriteNodeOutputRefs(body, renameOutputRef, expandDependency, renameLoopPrevRef);
-      }
-    }
-  } else if (isGateNode(node)) {
-    node.message = code(node.message);
-    for (const decision of node.decisions) {
-      if (decision.rework !== undefined) decision.rework.prompt = code(decision.rework.prompt);
-    }
-  } else if (isExecNode(node)) {
-    node.script = code(node.script);
-  } else if (isWaitNode(node)) {
-    if (node.wait.until !== undefined) node.wait.until = code(node.wait.until);
-    if (node.wait.event !== undefined) node.wait.event = code(node.wait.event);
-  } else if (isWorkflowNode(node)) {
-    // workflow.input, workflow.with values and workflow.fan_out.items are live
-    // code/expression ref surfaces (data strings), so refs inside an included block's
-    // `workflow:` node namespace verbatim. Non-string with values carry no refs (#2637).
-    if (node.input !== undefined) node.input = code(node.input);
-    if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) {
-        if (typeof value === 'string') node.with[key] = code(value);
-      }
-    }
-    if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
-  } else if (isComposeFanOutNode(node)) {
-    // A deferred composition fan-out (#2512) carries the same live ref surfaces as a
-    // `workflow:` node — its `with:` values and `fan_out.items` resolve at run time.
-    if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) {
-        if (typeof value === 'string') node.with[key] = code(value);
-      }
-    }
-    if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
-  } else if (isHaltNode(node)) {
-    node.reason = code(node.reason);
-  } else if (isAgentNode(node) && node.source.kind === 'inline') {
-    node.source.prompt = code(node.source.prompt);
-  }
-
-  // Node-local bindings (#2637) — an agent's command-sourced `with:` and an exec node's
-  // `with:` string values, plus directive `from` refs, are live ref surfaces (KEEP IN
-  // SYNC item 2), so an included block's bindings follow its nodes' namespace rename.
-  // Outside the mode chain above because a command-sourced agent node has no other
-  // inline text surface of its own.
-  const nodeWith = isExecNode(node)
-    ? node.with
-    : isAgentNode(node) && node.source.kind === 'command'
-      ? node.source.with
-      : undefined;
-  if (nodeWith !== undefined) {
-    for (const [key, value] of Object.entries(nodeWith)) {
-      if (typeof value === 'string') nodeWith[key] = code(value);
-      else if (isBindingDirective(value)) value.from = code(value.from);
-    }
-  }
+  const rewritten = mapNodeTemplateSlots(node, slot =>
+    slot.surface === 'binding_default'
+      ? slot.value
+      : slot.surface === 'condition'
+        ? whenExpr(slot.value)
+        : code(slot.value)
+  );
+  Object.assign(node, rewritten);
 }
 
 /**
@@ -643,125 +559,36 @@ function applyInputsMacro(
     return expanded;
   };
 
-  if (node.when !== undefined) node.when = substituteWhen(node.when);
-
-  // An inherited stamp's values may reference THIS level's inputs — `with: { plan:
-  // '$INPUTS.topic' }` one file down. Without this walk the stamp keeps the literal
-  // `$INPUTS.topic` and the composed script receives the token instead of the value.
-  // Value-position semantics (#2637): a whole-`$INPUTS.<name>` stamp forwards the
-  // logical value; typed stamps pass through.
-  const stamped = readComposedMeta(node)?.inputs;
-  if (stamped !== undefined) {
-    for (const [key, value] of Object.entries(stamped)) stamped[key] = substituteValue(value);
-  }
   for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
     if (boundary.when !== undefined) boundary.when = substituteWhen(boundary.when);
   }
 
-  // Base AI-turn fields — valid on every AI node mode (command / prompt / loop_group), so
-  // they are walked outside the mode chain, like `when:`. Both go straight to the provider
-  // with no substitution of their own downstream.
-  if (node.systemPrompt !== undefined) node.systemPrompt = substitute(node.systemPrompt);
-  if (node.agents !== undefined) {
-    for (const agent of Object.values(node.agents)) {
-      agent.prompt = substitute(agent.prompt);
-      agent.description = substitute(agent.description);
+  const textMapped = mapNodeTemplateSlots(node, slot => {
+    if (slot.surface === 'binding_from' || slot.name === 'binding.if_skipped') return slot.value;
+    if (
+      slot.name.endsWith('with.*') ||
+      slot.name === 'binding.value' ||
+      slot.name === 'composed.inputs.*'
+    )
+      return slot.value;
+    return slot.surface === 'condition' ? substituteWhen(slot.value) : substitute(slot.value);
+  });
+  const valueMapped = mapNodeTemplateValueSlots(textMapped, slot => {
+    const value = substituteValue(slot.value);
+    if (
+      slot.position === 'binding' &&
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value)
+    ) {
+      const bindingName = slot.path.slice(slot.path.lastIndexOf('with.') + 'with.'.length);
+      throw new IncludeExpansionError(
+        `Node '${includeNode.id}': input substitution supplied an OBJECT to binding '${bindingName}' of included node '${node.id}' (value '${canonicalValueText(slot.value)}'). Command/script binding values must be strings, numbers, booleans, null, or arrays; a binding directive must be authored in the block itself, never forwarded through an input.`
+      );
     }
-  }
-
-  if (isLoopNode(node)) {
-    if (node.loop.prompt !== undefined) node.loop.prompt = substitute(node.loop.prompt);
-    const compiled = (node.loop as typeof node.loop & LoopWithCompiledCommand)[
-      COMPILED_LOOP_COMMAND
-    ];
-    if (compiled?.prompt !== undefined) compiled.prompt = substitute(compiled.prompt);
-    if (node.loop.until_bash !== undefined) {
-      node.loop.until_bash = substitute(node.loop.until_bash);
-    }
-  } else if (isLoopGroupNode(node)) {
-    if (node.loop_group.until_bash !== undefined) {
-      node.loop_group.until_bash = substitute(node.loop_group.until_bash);
-    }
-    for (const body of node.loop_group.nodes) {
-      if (!isIncludeDirective(body)) applyInputsMacro(body, args, missing, includeNode);
-    }
-  } else if (isGateNode(node)) {
-    node.message = substitute(node.message);
-    for (const decision of node.decisions) {
-      if (decision.rework !== undefined)
-        decision.rework.prompt = substitute(decision.rework.prompt);
-    }
-  } else if (isExecNode(node)) {
-    node.script = substitute(node.script);
-  } else if (isWaitNode(node)) {
-    if (node.wait.until !== undefined) node.wait.until = substitute(node.wait.until);
-    if (node.wait.event !== undefined) node.wait.event = substitute(node.wait.event);
-  } else if (isWorkflowNode(node)) {
-    // `input:` is the child's $ARGUMENTS — a TEXT channel by construction, so a typed
-    // input splices as canonical text there; `with:` values are typed positions.
-    if (node.input !== undefined) node.input = substitute(node.input);
-    if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) {
-        node.with[key] = substituteValue(value);
-      }
-    }
-    if (node.fan_out !== undefined) node.fan_out.items = substitute(node.fan_out.items);
-  } else if (isComposeFanOutNode(node)) {
-    // Same $INPUTS surfaces as a `workflow:` node (#2512): the deferred fan-out binds
-    // its block inputs exactly where the static directive does — typed positions in
-    // `with:`, text substitution in `fan_out.items`.
-    if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) {
-        node.with[key] = substituteValue(value);
-      }
-    }
-    if (node.fan_out !== undefined) node.fan_out.items = substitute(node.fan_out.items);
-  } else if (isHaltNode(node)) {
-    node.reason = substitute(node.reason);
-  } else if (isAgentNode(node) && node.source.kind === 'inline') {
-    node.source.prompt = substitute(node.source.prompt);
-  }
-
-  // Node-local bindings (#2637): an agent's command-sourced `with:` and an exec node's
-  // `with:` value positions accept block inputs like every other with map; a
-  // directive's `from` is a node ref (never an input), while a string `if_skipped`
-  // default may carry the macro.
-  //
-  // Re-validate what substitution could have broken (the same pass substituteWhen
-  // runs for `when:` grammar): the schema promises that on a command-sourced agent or
-  // exec node an object `with:` value is a load error unless it is a binding
-  // directive, and only substitution can put an object here after that check ran — a
-  // caller forwarding an object through a whole-`$INPUTS.<name>` value. Letting it
-  // through would turn the promised load error into a mid-run node failure after
-  // every upstream node has already spent its cost; and treating a directive-SHAPED
-  // caller object as a live directive would let data inject reference semantics the
-  // block never wrote.
-  const nodeWith = isExecNode(node)
-    ? node.with
-    : isAgentNode(node) && node.source.kind === 'command'
-      ? node.source.with
-      : undefined;
-  if (nodeWith !== undefined) {
-    for (const [key, value] of Object.entries(nodeWith)) {
-      if (isBindingDirective(value)) {
-        if (typeof value.if_skipped === 'string') {
-          value.if_skipped = substituteValue(value.if_skipped);
-        }
-      } else {
-        const substituted = substituteValue(value);
-        if (
-          substituted !== null &&
-          typeof substituted === 'object' &&
-          !Array.isArray(substituted)
-        ) {
-          throw new IncludeExpansionError(
-            `Node '${includeNode.id}': input substitution supplied an OBJECT to binding '${key}' of included node '${node.id}' (value '${canonicalValueText(value)}'). Command/script binding values must be strings, numbers, booleans, null, or arrays; a binding directive must be authored in the block itself, never forwarded through an input.`
-          );
-        }
-        nodeWith[key] = substituted;
-      }
-    }
-  }
+    return value;
+  });
+  Object.assign(node, valueMapped);
 }
 
 export interface ExpandedInclude {

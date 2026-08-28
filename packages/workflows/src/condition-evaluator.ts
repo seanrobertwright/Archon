@@ -42,7 +42,12 @@ import {
   canonicalValueText,
   type JsonValue,
 } from './output-ref';
-import { parseWhenAtom, splitOutsideQuotes, type WhenAtomRef } from './when-atom';
+import {
+  parseLoopPrevWhenAtom,
+  parseWhenAtom,
+  splitOutsideQuotes,
+  type WhenAtomRef,
+} from './when-atom';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -68,7 +73,7 @@ function getLog(): ReturnType<typeof createLogger> {
 function resolveOutputRef(
   nodeId: string,
   field: string | undefined,
-  nodeOutputs: Map<string, NodeOutput>
+  nodeOutputs: ReadonlyMap<string, NodeOutput>
 ): string {
   const nodeOutput = nodeOutputs.get(nodeId);
   if (!nodeOutput) {
@@ -167,11 +172,18 @@ function resolveInputRef(name: string, inputs: Record<string, JsonValue> | undef
 function resolveAtomRef(
   ref: WhenAtomRef,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs: Record<string, JsonValue> | undefined
+  inputs: Record<string, JsonValue> | undefined,
+  loopPrevOutputs: ReadonlyMap<string, NodeOutput> | undefined
 ): string {
-  return ref.kind === 'input'
-    ? resolveInputRef(ref.name, inputs)
-    : resolveOutputRef(ref.nodeId, ref.field, nodeOutputs);
+  if (ref.kind === 'input') return resolveInputRef(ref.name, inputs);
+  // No prior iteration is an ordinary first-iteration condition, not an unknown-node
+  // authoring error. Once a prior body node exists, retain normal output-field checks.
+  if (ref.kind === 'loop_prev' && !loopPrevOutputs?.has(ref.nodeId)) return '';
+  return resolveOutputRef(
+    ref.nodeId,
+    ref.field,
+    ref.kind === 'loop_prev' ? (loopPrevOutputs ?? new Map()) : nodeOutputs
+  );
 }
 
 /**
@@ -180,9 +192,10 @@ function resolveAtomRef(
 function evaluateAtom(
   expr: string,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs: Record<string, JsonValue> | undefined
+  inputs: Record<string, JsonValue> | undefined,
+  loopPrevOutputs: ReadonlyMap<string, NodeOutput> | undefined
 ): { result: boolean; parsed: boolean } {
-  const atom = parseWhenAtom(expr);
+  const atom = loopPrevOutputs !== undefined ? parseLoopPrevWhenAtom(expr) : parseWhenAtom(expr);
 
   if (!atom) {
     getLog().debug({ expr }, 'condition_parse_failed');
@@ -196,7 +209,7 @@ function evaluateAtom(
   // `$INPUTS.<name>`. Deliberately NOT caught here: under the no-silent-drop contract
   // it must propagate to fail the node, not fail-closed to a silent skip. (Pure-syntax
   // parse failures still return {parsed:false} via the parse miss above.)
-  const actual = resolveAtomRef(ref, nodeOutputs, inputs);
+  const actual = resolveAtomRef(ref, nodeOutputs, inputs, loopPrevOutputs);
 
   let result: boolean;
   if (operator === '==' || operator === '!=') {
@@ -218,7 +231,15 @@ function evaluateAtom(
   getLog().debug(
     ref.kind === 'input'
       ? { input: ref.name, operator, expected, actual, result }
-      : { nodeId: ref.nodeId, field: ref.field ?? null, operator, expected, actual, result },
+      : {
+          nodeId: ref.nodeId,
+          field: ref.field ?? null,
+          source: ref.kind,
+          operator,
+          expected,
+          actual,
+          result,
+        },
     'condition_evaluated'
   );
   return { result, parsed: true };
@@ -237,7 +258,8 @@ function evaluateAtom(
 export function evaluateCondition(
   expr: string,
   nodeOutputs: Map<string, NodeOutput>,
-  inputs?: Record<string, JsonValue>
+  inputs?: Record<string, JsonValue>,
+  options?: { loopPrevOutputs?: ReadonlyMap<string, NodeOutput> }
 ): { result: boolean; parsed: boolean } {
   const trimmed = expr.trim();
 
@@ -250,7 +272,7 @@ export function evaluateCondition(
     let orClauseResult = true;
 
     for (const atom of andAtoms) {
-      const { result, parsed } = evaluateAtom(atom, nodeOutputs, inputs);
+      const { result, parsed } = evaluateAtom(atom, nodeOutputs, inputs, options?.loopPrevOutputs);
       if (!parsed) return { result: false, parsed: false }; // fail-closed on any parse error
       if (!result) {
         orClauseResult = false;

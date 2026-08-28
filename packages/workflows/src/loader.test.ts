@@ -2521,6 +2521,35 @@ nodes:
       expect(result.errors[0].error).toContain('clasify');
     });
 
+    it('accepts $LOOP_PREV only in a loop_group body when condition', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-prev-when.yaml'),
+        `
+name: loop-prev-when
+description: Prior iteration condition
+nodes:
+  - id: refine
+    loop_group:
+      until: DONE
+      max_iterations: 2
+      nodes:
+        - id: work
+          prompt: work
+        - id: guarded
+          prompt: guarded
+          depends_on: [work]
+          when: "$LOOP_PREV.work.output == 'done'"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toEqual([]);
+      expect(result.workflows).toHaveLength(1);
+    });
+
     it('should reject a workflow where prompt: references an unknown node output', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
@@ -8401,6 +8430,27 @@ nodes:
       'bind-directive-race.yaml'
     );
     expect(notUpstream.error?.error).toContain("add 'producer' to 'consume'.depends_on");
+  });
+
+  it('does not validate output references in an if_skipped literal default', () => {
+    const result = parseWorkflow(
+      `
+name: bind-default-literal
+description: defaults are delivered literally when a producer is skipped
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    depends_on: [producer]
+    with:
+      value:
+        from: $producer.output
+        if_skipped: $not-a-producer.output
+`,
+      'bind-default-literal.yaml'
+    );
+    expect(result.error).toBeNull();
   });
 
   it('rejects an object binding value that is not the directive shape, naming both accepted forms', () => {
