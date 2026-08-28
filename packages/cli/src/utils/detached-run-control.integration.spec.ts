@@ -77,6 +77,31 @@ async function rejectedError(action: () => Promise<unknown>): Promise<Error> {
   throw new Error('Expected the operation to reject');
 }
 
+/**
+ * A control endpoint that hands out `pid` and commits the termination lease.
+ *
+ * The handshake is not what these tests are about: committing it puts the terminator
+ * itself in front of a PID the test chose, which is the only way to stage a target
+ * that is already gone, or one that is alive and out of reach.
+ */
+function stubOwner(pid: number): Server {
+  return createServer((socket: Socket): void => {
+    socket.setEncoding('utf8');
+    let request = '';
+    socket.on('data', (chunk: string): void => {
+      request += chunk;
+      if (request.includes('stop\n')) {
+        socket.write(`${JSON.stringify({ pid })}\n`);
+        request = request.replace('stop\n', '');
+      }
+      if (request.includes('terminate\n')) {
+        socket.write('ready\n');
+        request = request.replace('terminate\n', '');
+      }
+    });
+  });
+}
+
 describe('detached run control integration', () => {
   it('stops the detached owner process group before its descendant can leak work', async () => {
     const runId = `tree-${crypto.randomUUID()}`;
@@ -121,6 +146,69 @@ describe('detached run control integration', () => {
         }
       }
       if (process.platform !== 'win32') rmSync(detachedRunControlPath(runId), { force: true });
+    }
+  });
+
+  it('treats an already-gone target as a stopped tree, not a failed stop', async () => {
+    // #2946: `taskkill /T` walks the tree PID by PID and exits non-zero when one of
+    // them is already gone. Reading that exit code as failure made `archon workflow
+    // cancel` report a failure on Windows for a run whose tree had in fact stopped,
+    // and left the run row saying `running`. POSIX has always tolerated the same
+    // condition as ESRCH; the contract is one tree-is-gone outcome on both branches.
+    const runId = `already-gone-${crypto.randomUUID()}`;
+    const path = detachedRunControlPath(runId);
+    const doomed = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
+    if (doomed.pid === undefined) throw new Error('Failed to spawn the short-lived target');
+    const gonePid = doomed.pid;
+    await waitForExit(doomed);
+    // The premise, asserted rather than assumed: the terminator is aimed at nothing.
+    await waitFor(() => !processExists(gonePid));
+
+    const server = stubOwner(gonePid);
+    await listen(server, path);
+    try {
+      const target = await requestDetachedRunStop(runId);
+      // Resolving IS the assertion, and letting a rejection through reports the real
+      // reason rather than a matcher's. The old Windows branch rejected here, carrying
+      // taskkill's "There is no running instance of the task" as a stop failure.
+      await target.stop();
+    } finally {
+      await close(server);
+      if (process.platform !== 'win32') rmSync(path, { force: true });
+    }
+  });
+
+  it('still fails when the target is alive and the kill cannot reach it', async () => {
+    // The guardrail for the tolerance above: an unreachable kill must never read as a
+    // stopped tree, or the terminator stops protecting anything. Staged on POSIX,
+    // where a live process that is not a group leader makes `kill(-pid)` raise the
+    // same ESRCH that an entirely absent group raises — so only the follow-up check
+    // on the process itself can tell the two apart. The Windows equivalent, a live
+    // root that survives `taskkill /F`, needs a process the runner is not permitted
+    // to kill and is not worth staging in CI.
+    if (process.platform === 'win32') return;
+
+    const runId = `alive-${crypto.randomUUID()}`;
+    const path = detachedRunControlPath(runId);
+    // Not `detached`, so it joins this spec's process group and no process group
+    // carrying its own PID exists for the terminator to signal.
+    const survivor = spawn(process.execPath, ['-e', 'setInterval(() => undefined, 1000)'], {
+      stdio: 'ignore',
+    });
+    if (survivor.pid === undefined) throw new Error('Failed to spawn the surviving target');
+    const survivorPid = survivor.pid;
+
+    const server = stubOwner(survivorPid);
+    await listen(server, path);
+    try {
+      const target = await requestDetachedRunStop(runId);
+      const error = await rejectedError(async (): Promise<void> => target.stop());
+      expect(error.message).toContain('does not own process group');
+      expect(processExists(survivorPid)).toBe(true);
+    } finally {
+      survivor.kill('SIGKILL');
+      await close(server);
+      rmSync(path, { force: true });
     }
   });
 
