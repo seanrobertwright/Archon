@@ -8,7 +8,7 @@
  *   fixture:
  *     expect: completed          # or failed / paused / cancelled
  *     fail-node: gate-ready      # required iff expect: failed
- *     reached: [review__docs]    # nodes that must complete or be stubbed
+ *     reached: [review__docs]    # nodes that must complete or be stubbed, under any expect
  *     inputs:                    # caller-supplied declared-input values
  *       branch: "task-123"
  *   exec-code: false             # execute script/bash nodes instead of stubbing
@@ -554,7 +554,11 @@ async function checkFixture(
           `expected exactly one failed trace entry on '${parsed.declaration['fail-node']}', got ` +
           failures.map(f => f.nodeId).join(', ');
       }
-    } else if (parsed.declaration.reached !== undefined) {
+    }
+    // Checked whenever declared, never chained after the outcome branches above: a
+    // fixture that expects a later gate to fail still has to prove the nodes before it
+    // ran, and a declaration that can silently prove nothing is worse than none.
+    if (failureReason === undefined && parsed.declaration.reached !== undefined) {
       const missingReached = parsed.declaration.reached.filter(
         nodeId =>
           !result.trace.some(

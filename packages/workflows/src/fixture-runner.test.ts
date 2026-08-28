@@ -198,6 +198,84 @@ describe('runFixtures', () => {
     expect(report.results[0].failureReason).toBe('required nodes did not complete: node-b');
   });
 
+  // `reached:` used to be chained after the `expect: failed` branch, so declaring both
+  // silently evaluated neither — the declaration proved nothing while looking like a guard.
+  it('enforces reached nodes under expect: failed', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    prompt: hello\n' +
+        '  - id: node-b\n    prompt: $NODE_OUTPUT.node-a.missing\n    depends_on: [node-a]\n' +
+        '  - id: node-c\n    prompt: never\n    depends_on: [node-b]\n',
+      body: [
+        'fixture:',
+        '  expect: failed',
+        '  fail-node: node-b',
+        '  reached: [node-c]',
+        'node-a: "stub"',
+      ].join('\n'),
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.failed).toBe(1);
+    expect(report.results[0].outcome).toBe('failed');
+    expect(report.results[0].failureReason).toBe('required nodes did not complete: node-c');
+  });
+
+  it('passes an expected failure whose reached nodes all ran before it', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    prompt: hello\n' +
+        '  - id: node-b\n    prompt: $NODE_OUTPUT.node-a.missing\n    depends_on: [node-a]\n',
+      body: [
+        'fixture:',
+        '  expect: failed',
+        '  fail-node: node-b',
+        '  reached: [node-a]',
+        'node-a: "stub"',
+      ].join('\n'),
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.passed).toBe(1);
+  });
+
+  // The two checks are independent: satisfying `reached:` must not excuse a node that ran
+  // without a stub anywhere else in the graph. A durable wait holds the outcome at
+  // `paused`, which is the case where the stub-completeness check is the one that speaks.
+  it('still reports missing stubs on a fixture whose reached nodes all ran', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    prompt: hello\n' +
+        '  - id: node-b\n    prompt: b\n    depends_on: [node-a]\n' +
+        '  - id: node-c\n    prompt: c\n    depends_on: [node-a]\n' +
+        '  - id: hold\n    wait:\n      duration_ms: 60000\n    depends_on: [node-b, node-c]\n' +
+        '    trigger_rule: all_done\n',
+      body: [
+        'fixture:',
+        '  expect: paused',
+        '  reached: [node-b]',
+        'node-a: "stub"',
+        'node-b: "stub"',
+      ].join('\n'),
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.failed).toBe(1);
+    expect(report.results[0].failureReason).toBe('reached nodes without stubs: node-c');
+  });
+
   it('passes an expected failure that fails on exactly the declared node', async () => {
     // A `when:` referencing a missing producer makes node-b fail deterministically.
     const { cwd } = writeTempProject({
