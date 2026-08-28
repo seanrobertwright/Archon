@@ -44,10 +44,13 @@ describe('test-suite change decision', () => {
   });
 
   test('the workflow delegates both automatic routes to the complete-diff decision', () => {
+    // A Windows checkout writes the workflow with CRLF endings, and every assertion below
+    // anchors on LF. Normalize at the read site: what is asserted is YAML structure, not
+    // the line terminator the working tree happens to carry.
     const workflow = readFileSync(
       resolve(import.meta.dir, '../.github/workflows/test.yml'),
       'utf8'
-    );
+    ).replaceAll('\r\n', '\n');
     const changesJob = workflow.slice(workflow.indexOf('  changes:'), workflow.indexOf('  test:'));
 
     expect(workflow).toContain('  push:\n');
