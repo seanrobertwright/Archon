@@ -20,21 +20,9 @@ inputs:
     description: >-
       The update to assess — a dependency name, version, or advisory. When
       empty, the run's trigger message is the target.
-  tests:
-    default: "auto"
-    description: Test-coverage lens — auto (post-PR classifier decides), true, or false.
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
-  comments:
-    default: "auto"
-    description: Comment-accuracy lens — auto, true, or false.
-  types:
-    default: "auto"
-    description: Type-design lens — auto, true, or false.
-  docs:
-    default: "auto"
-    description: Docs-impact lens — auto, true, or false.
 
 returns: outcome
 
@@ -85,11 +73,7 @@ nodes:
   - id: deliver
     include: archon-deliver
     with:
-      tests: "$INPUTS.tests"
       errors: "$INPUTS.errors"
-      comments: "$INPUTS.comments"
-      types: "$INPUTS.types"
-      docs: "$INPUTS.docs"
       work: >-
         Apply the dependency update specified in
         $ARTIFACTS_DIR/upkeep-assessment.md. Read that file in full first — it

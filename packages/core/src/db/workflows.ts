@@ -282,15 +282,25 @@ export async function resolveApprovalGate(
  * resolved-but-not-cancelled state that a failed second write could strand — a
  * reject retry could not self-heal past the fast-path gate guard. No `resolved`
  * marker is written: that marker only matters for the stay-paused rework path,
- * and the rejection reason is preserved in the approval_received event. The
- * status flip and that audit event commit in ONE transaction (#2146), so a
+ * and the rejection reason is preserved in the approval_received event.
+ *
+ * Writes `workflow_cancelled` itself (#2906) rather than trusting the caller to
+ * pass it: this is a terminal status write, and every other terminal writer here
+ * (completeWorkflowRun, failWorkflowRun, cancelWorkflowRun, cancelFanOutRun)
+ * owns its own lifecycle event. `cancellation` supplies only the event's detail —
+ * which gate ended the run, and why — so the event log records the transition
+ * even for a caller that only knows about its gate events. Those caller events
+ * go in first: the decision precedes the termination it caused.
+ *
+ * The status flip and every audit event commit in ONE transaction (#2146), so a
  * failed event write rolls the cancellation back rather than terminating the run
  * with no audit trail. Returns `{ resolved }`; `false` means a concurrent
  * resolver already won (the gate is no longer open), so nothing is written.
  */
 export async function resolveAndCancelApprovalGate(
   id: string,
-  events: GateResolutionEvent[]
+  events: GateResolutionEvent[],
+  cancellation: WorkflowCancellationEventDetails
 ): Promise<{ resolved: boolean }> {
   const dialect = getDialect();
   try {
@@ -307,6 +317,12 @@ export async function resolveAndCancelApprovalGate(
         for (const event of events) {
           await insertWorkflowEvent(query, { workflow_run_id: id, ...event });
         }
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_cancelled',
+          step_name: cancellation.step_name,
+          data: cancellation.reason === undefined ? undefined : { reason: cancellation.reason },
+        });
       }
       return { resolved };
     });
@@ -2051,35 +2067,6 @@ export async function updateWorkflowActivity(id: string): Promise<void> {
     `UPDATE remote_agent_workflow_runs SET last_activity_at = ${dialect.now()} WHERE id = $1`,
     [id]
   );
-}
-
-/**
- * Transition all 'running' workflow runs to 'failed'.
- * Called on server startup to mark runs orphaned by process termination.
- * The next invocation of the same workflow at the same path will auto-resume
- * from completed nodes via findResumableRun.
- */
-export async function failOrphanedRuns(): Promise<{ count: number }> {
-  const dialect = getDialect();
-  try {
-    const result = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'failed',
-           completed_at = ${dialect.now()},
-           metadata = ${dialect.jsonMerge('metadata', 1)}
-       WHERE status = 'running'`,
-      [JSON.stringify({ failure_reason: 'server_restart' })]
-    );
-    const count = result.rowCount ?? 0;
-    if (count > 0) {
-      getLog().info({ count }, 'db.orphaned_workflow_runs_failed');
-    }
-    return { count };
-  } catch (error) {
-    const err = error as Error;
-    getLog().error({ err }, 'db.orphaned_workflow_runs_fail_failed');
-    throw new Error(`Failed to fail orphaned workflow runs: ${err.message}`);
-  }
 }
 
 /**

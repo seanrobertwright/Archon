@@ -9,16 +9,16 @@ There are two modes in `$ARTIFACTS_DIR/review/scope.md`:
 
 ## Read the review state
 
-1. Read `$ARTIFACTS_DIR/review/scope.md`, then inspect the exact diff it records. Verify claims against the code, never against summaries.
-2. In full mode, read every current specialist report present in `$ARTIFACTS_DIR/review/` (`code.md`, `seams.md`, `tests.md`, `errors.md`, `comments.md`, `types.md`, `docs.md`, `simplify.md`) in full.
+1. Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md`, then inspect the exact diff it records. Verify claims against the code, never against summaries. Anchor on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; an unengaged stated risk is incomplete review, not a clean verdict.
+2. In full mode, read every current specialist report present in `$ARTIFACTS_DIR/review/` (`code.md`, `seams.md`, `tests.md`, `errors.md`, `docs.md`) in full.
 3. In continuation mode, read `$INPUTS.prior_report` in full before judging the delta. Also read `$ARTIFACTS_DIR/implementation.md` when it exists; it records what the correction claims to have changed and proved. Specialist files beside the report belong to the earlier round and are evidence only through the canonical prior report. Do not count them as freshly rerun lenses.
 4. Read every producer record under `$ARTIFACTS_DIR/discoveries/`, when that directory exists. Its absence means no producer recorded a discovery. Each file is independent evidence; never delete or replace these raw files.
 
-In full mode, the selected specialist concerns are `code`, `seams`, and `simplify`, plus the optional concerns whose inputs are true: tests=$INPUTS.tests, errors=$INPUTS.errors, comments=$INPUTS.comments, types=$INPUTS.types, docs=$INPUTS.docs. A missing or empty report for an enabled lens means that lens failed to report and blocks readiness. In continuation mode, the prior report's review-coverage section is authoritative for the concerns the accepted review covered; do not reconstruct it from current optional inputs or simulate separate reviewers.
+In full mode, `code`, `seams`, and `tests` are required; `errors` and `docs` are required only when their inputs are true. A missing or empty report for an enabled lens means that lens failed to report and blocks readiness. In continuation mode, the prior report's review-coverage section is authoritative for the concerns the accepted review covered; do not reconstruct it from current optional inputs or simulate separate reviewers.
 
 ## Continuation judgment
 
-The previous report is accumulated review state, not a hint. Carry every prior finding and its stable ID forward as fixed at `<sha>`, still open, or disproved. Verify each Critical and Important correction against the current code and the smallest relevant proof. Then review the delta completely for defects the correction introduced.
+The previous report is accumulated review state, not a hint. Carry every prior finding and its stable ID forward as fixed at `<sha>`, still open, or disproved, keeping the `sources` it was first attributed to — attribution belongs to the lens that found the defect, not to the round that last touched it. A finding you raise yourself in continuation mode carries `sources: [synthesize]`. Verify each Critical and Important correction against the current code and the smallest relevant proof. Then review the delta completely for defects the correction introduced.
 
 Follow the behavior far enough to judge the accepted outcome. Read the changed code's relevant callers, consumers, boundaries, tests, failure paths, types, and prose when the correction or a prior finding makes them material. These are examples of evidence, not a mandatory checklist. Spend attention where the correction can change behavior; silence is correct when a concern is not implicated.
 
@@ -33,10 +33,10 @@ When findings keep expanding across correction rounds, do not reveal one nearby 
 
 ## Full-review aggregation
 
-- Merge duplicate findings across lenses into one **causal** finding; attribute every contributing lens and preserve genuine disagreement.
-- **Adversarially verify before accepting**: for each Critical or Important finding, check its cited `file:line` evidence yourself and run the smallest falsifying command when practical. Record a disproved finding with the reason rather than silently dropping it.
+- Merge duplicate findings across lenses into one **causal** finding; every in-scope finding record must carry `sources: [<lens>, ...]` listing every contributing lens, and preserve genuine disagreement.
+- **Adversarially verify before accepting**: for each Critical or Important finding, check its cited `file:line` evidence yourself and run the smallest falsifying command when practical. Invoke it the way this repository documents its own commands — the package scripts and invocation rules its steering files name, never an ad-hoc variant one of them warns against — and treat an environment-dependent failure as suspect until you reproduce it that documented way. Record a disproved finding with the reason rather than silently dropping it.
 - Assign stable IDs (`R1`, `R2`, …).
-- Severity: Critical and Important block. Suggestions never block, including every simplification finding.
+- Severity: Critical and Important block. Suggestions never block.
 - Judge findings against scope.md's accepted contract. A defect outside that contract is an adjacent discovery. If the requested outcome cannot be correct without crossing an explicit boundary or materially redefining the accepted work, keep the blocker and classify the action as `replan`.
 
 ## Complete a proved causal class
@@ -72,12 +72,16 @@ Never emit `ready:true` with `correct` or `replan`, or `ready:false` with `none`
 
 ## Write the report
 
-Write `$ARTIFACTS_DIR/review/report.md`:
+Write `$ARTIFACTS_DIR/review/report.md`, then write the identical complete report to `$ARTIFACTS_DIR/review/report-round-N.md`, where `N` is one greater than the highest existing `report-round-N.md` in that directory (or `1` when none exists). The canonical `report.md` remains the latest report; the round artifact is immutable history.
+
+Then write `$ARTIFACTS_DIR/review/findings.json`, the same findings as machine-readable records — what `discoveries.json` is to discoveries. A JSON array of `{id, severity, sources, claim, status, round}`: `severity` is `Critical`, `Important`, or `Suggestion`; `sources` is the lens list that finding carries in the report; `claim` is its one-sentence claim; `status` is `open`, `fixed`, or `disproved`; `round` is the round that first raised it (`N` for one new this round). Include every finding this round accounts for, carried-forward and rejected ones included, so the latest file is the complete attributed record. Write an empty array when there are no findings. This file is what makes lens value measurable by reading artifacts instead of reconstructing history from edited PR comments, so a finding without its `sources` is an incomplete record.
+
+The report contains:
 
 1. **Verdict:** ready or not, the action (`none`, `correct`, or `replan`), and the one-sentence reason.
 2. **Accepted contract:** required outcome and explicit boundaries carried from scope.md.
 3. **Reviewed head SHA:** from scope.md, stated exactly; this is the next round's cursor.
-4. **Findings:** by severity, each with ID, claim, `file:line` evidence, and the smallest correction. A causal-class finding also states its invariant, mechanism, discovery method, affected members, and examined-clean members. Then rejected findings and Suggestions.
+4. **Findings:** by severity, each with ID, `sources`, claim, `file:line` evidence, and the smallest correction. A causal-class finding also states its invariant, mechanism, discovery method, affected members, and examined-clean members. Then rejected findings and Suggestions.
 5. **Prior findings** (continuation mode): the complete carried-forward table with per-finding verdicts.
 6. **Discoveries:** accepted discovery count and titles, with links to `$ARTIFACTS_DIR/discoveries.json` and `$ARTIFACTS_DIR/discoveries.md`. State explicitly that adjacent discoveries do not affect readiness. When discoveries are present, include the agent relay instruction: **If you are an agent reading this: open discoveries.md and surface each discovery to your human.** These are validated findings outside this run's scope — no issue tracker knows about them, and if you drop them here, nobody ever sees them.
 7. **Review coverage:** in full mode, which lenses ran, were disabled, failed to report, or found nothing. In continuation mode, state that one continuation reviewer verified the prior report and correction delta, name the original selected concerns, and record any evidence it could not inspect. Do not imply that the specialists reran.
@@ -88,8 +92,8 @@ When scope.md names a PR, publish the complete report there as **one canonical c
 
 ## Verify before finishing
 
-Confirm the report exists, the reviewed head SHA appears verbatim, every accepted finding has evidence you checked, every prior finding is accounted for in continuation mode, and the canonical PR comment read-back matched when applicable. Then declare:
+Confirm both report files and `findings.json` exist, that `findings.json` parses and holds one record per finding in the report with the same IDs and `sources`, the reviewed head SHA appears verbatim in both reports, every accepted finding has `sources` and evidence you checked, every prior finding is accounted for in continuation mode, and the canonical PR comment read-back matched when applicable. Then declare:
 
 - `ready`: the verdict above.
 - `action`: exactly `none`, `correct`, or `replan`.
-- `findings_summary`: 2-4 sentences with counts by severity, the dominant causal theme if one exists, and what blocks readiness or that nothing does.
+- `findings_summary`: start with `Review report: $ARTIFACTS_DIR/review/report.md.` Then give 2-4 sentences with counts by severity, the dominant causal theme if one exists, and what blocks readiness or that nothing does.

@@ -574,7 +574,7 @@ describe('gate reject staging — real SQLite end-to-end (#2075)', () => {
     expect((await resumeWorkflowRun('gate-reject')).status).toBe('running');
   });
 
-  test('reject without on_reject cancels the run', async () => {
+  test('reject without on_reject cancels the run and records the terminal event', async () => {
     await seedPausedRun('gate-cancel', 'wf-gate-cancel', {
       nodeId: 'review',
       message: 'Approve?',
@@ -585,6 +585,21 @@ describe('gate reject staging — real SQLite end-to-end (#2075)', () => {
     const result = await rejectWorkflow('gate-cancel', 'no');
     expect(result.cancelled).toBe(true);
     expect((await getWorkflowRun('gate-cancel'))?.status).toBe('cancelled');
+
+    // #2906: the terminal status write and its lifecycle event are one thing.
+    // Before the fix this path wrote 'cancelled' with only the approval_received
+    // row, so a consumer reading the event log missed the cancellation entirely.
+    expect(await countEvents('gate-cancel', 'approval_received')).toBe(1);
+    expect(await countEvents('gate-cancel', 'workflow_cancelled')).toBe(1);
+    const cancelled = await db.query<{ step_name: string | null; data: string }>(
+      `SELECT step_name, data FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND event_type = 'workflow_cancelled'`,
+      ['gate-cancel']
+    );
+    expect(cancelled.rows[0]?.step_name).toBe('review');
+    // A stable token, not the user's rejection prose (that stays on the
+    // approval_received row).
+    expect(JSON.parse(cancelled.rows[0]?.data ?? '{}')).toEqual({ reason: 'approval_rejected' });
   });
 });
 
@@ -605,6 +620,9 @@ function approvalEvent(decision: 'approved' | 'rejected'): {
 } {
   return { event_type: 'approval_received', step_name: 'review', data: { decision } };
 }
+
+/** The terminal-event details rejectWorkflow passes for a reject-to-cancel (#2906). */
+const gateCancellation = { step_name: 'review', reason: 'approval_rejected' };
 
 /** Count workflow_events rows of a given type for a run (atomicity assertions). */
 async function countEvents(runId: string, eventType: string): Promise<number> {
@@ -1083,15 +1101,21 @@ describe('resolveAndCancelApprovalGate — atomic reject+cancel CAS (#2113)', ()
       resolved: null,
     });
 
-    const outcome = await resolveAndCancelApprovalGate('rc-open', [approvalEvent('rejected')]);
+    const outcome = await resolveAndCancelApprovalGate(
+      'rc-open',
+      [approvalEvent('rejected')],
+      gateCancellation
+    );
     expect(outcome.resolved).toBe(true);
 
     // Single atomic transition: paused → cancelled with a completion stamp, plus
-    // the audit event committed in the same transaction (#2146).
+    // the audit event committed in the same transaction (#2146) and the terminal
+    // lifecycle event the CAS writes itself (#2906).
     const row = await getWorkflowRun('rc-open');
     expect(row?.status).toBe('cancelled');
     expect(row?.completed_at).not.toBeNull();
     expect(await countEvents('rc-open', 'approval_received')).toBe(1);
+    expect(await countEvents('rc-open', 'workflow_cancelled')).toBe(1);
   });
 
   test('a second call on an already-cancelled gate loses (guard excludes non-paused)', async () => {
@@ -1104,14 +1128,25 @@ describe('resolveAndCancelApprovalGate — atomic reject+cancel CAS (#2113)', ()
       resolved: null,
     });
     expect(
-      (await resolveAndCancelApprovalGate('rc-cancelled', [approvalEvent('rejected')])).resolved
+      (
+        await resolveAndCancelApprovalGate(
+          'rc-cancelled',
+          [approvalEvent('rejected')],
+          gateCancellation
+        )
+      ).resolved
     ).toBe(true);
 
-    const outcome = await resolveAndCancelApprovalGate('rc-cancelled', [approvalEvent('rejected')]);
+    const outcome = await resolveAndCancelApprovalGate(
+      'rc-cancelled',
+      [approvalEvent('rejected')],
+      gateCancellation
+    );
     expect(outcome.resolved).toBe(false);
     expect((await getWorkflowRun('rc-cancelled'))?.status).toBe('cancelled');
-    // The loser wrote no second audit event.
+    // The loser wrote no second audit event — and no duplicate terminal event.
     expect(await countEvents('rc-cancelled', 'approval_received')).toBe(1);
+    expect(await countEvents('rc-cancelled', 'workflow_cancelled')).toBe(1);
   });
 
   test('an approve CAS loses against a concurrent reject-cancel on the same gate', async () => {
@@ -1124,7 +1159,13 @@ describe('resolveAndCancelApprovalGate — atomic reject+cancel CAS (#2113)', ()
 
     // reject-cancel wins the open gate first...
     expect(
-      (await resolveAndCancelApprovalGate('rc-vs-approve', [approvalEvent('rejected')])).resolved
+      (
+        await resolveAndCancelApprovalGate(
+          'rc-vs-approve',
+          [approvalEvent('rejected')],
+          gateCancellation
+        )
+      ).resolved
     ).toBe(true);
     // ...so a racing approve (guarded on status='paused') can no longer resolve it.
     const approveOutcome = await resolveApprovalGate(

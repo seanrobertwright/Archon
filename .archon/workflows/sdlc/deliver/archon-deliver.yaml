@@ -29,25 +29,11 @@ inputs:
       Cross-run review continuity: the previous delivery run's review report
       path. Round 1 then verifies prior findings (rejections included) instead
       of relitigating them from scratch. Empty on a first delivery.
-  # Review lens controls, three-state: 'auto' (default) lets the post-PR
-  # classifier decide from the actual diff; 'true'/'false' force the lens on or
-  # off and beat the classifier. Code, seams, and simplify always run and have
-  # no control.
-  tests:
-    default: "auto"
-    description: Test-coverage lens — auto, true, or false.
+  # Error review can be forced on or off. Code, seams, and tests always run;
+  # docs runs only when the classifier finds shipped documentation in the diff.
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
-  comments:
-    default: "auto"
-    description: Comment-accuracy lens — auto, true, or false.
-  types:
-    default: "auto"
-    description: Type-design lens — auto, true, or false.
-  docs:
-    default: "auto"
-    description: Docs-impact lens — auto, true, or false.
 
 returns: pr
 
@@ -81,9 +67,10 @@ nodes:
   # runs instead of being relitigated).
   # Review scope is decided from the actual PR, not declared blind at launch:
   # the diff is information that does not exist until the PR does. classify
-  # judges which optional lenses this diff warrants; resolve-scope then merges
-  # the operator's declared forces over that judgment deterministically, and
-  # its structured output is what every lens gate reads. Round 1 decides once,
+  # judges whether errors and docs warrant their conditional lenses; resolve-scope
+  # then merges the operator's declared error override over that judgment. Its
+  # output feeds the errors gate, while the classifier feeds the docs gate. Round
+  # 1 decides once,
   # and correction reviews preserve those concerns while one continuation
   # reviewer judges the prior report and correction delta.
   - id: classify
@@ -94,21 +81,15 @@ nodes:
     output_format:
       type: object
       properties:
-        tests: { type: boolean }
         errors: { type: boolean }
-        comments: { type: boolean }
-        types: { type: boolean }
         docs: { type: boolean }
         reasons:
           type: object
           properties:
-            tests: { type: string }
             errors: { type: string }
-            comments: { type: string }
-            types: { type: string }
             docs: { type: string }
-          required: [tests, errors, comments, types, docs]
-      required: [tests, errors, comments, types, docs, reasons]
+          required: [errors, docs]
+      required: [errors, docs, reasons]
 
   # Deterministic merge at the boundary: a declared 'true'/'false' beats the
   # classifier; 'auto' adopts its judgment. Output values are the strings the
@@ -117,11 +98,7 @@ nodes:
     script: resolve-review-scope
     runtime: uv
     with:
-      c_tests: "$classify.output.tests"
       c_errors: "$classify.output.errors"
-      c_comments: "$classify.output.comments"
-      c_types: "$classify.output.types"
-      c_docs: "$classify.output.docs"
     depends_on: [classify]
 
   - id: review
@@ -130,11 +107,8 @@ nodes:
       scope: ""
       prior_report: "$INPUTS.prior_report"
       work_order: "$INPUTS.work"
-      tests: "$resolve-scope.output.tests"
       errors: "$resolve-scope.output.errors"
-      comments: "$resolve-scope.output.comments"
-      types: "$resolve-scope.output.types"
-      docs: "$resolve-scope.output.docs"
+      docs: "$classify.output.docs"
     depends_on: [resolve-scope]
 
   # Validate the authored verdict before it controls a costly branch. `ready`
@@ -206,15 +180,10 @@ nodes:
             scope: ""
             prior_report: "$ARTIFACTS_DIR/review/report.md"
             work_order: "$INPUTS.work"
-            # These bindings keep the included workflow's full-review `when:`
-            # expressions resolvable after load-time input substitution. In
-            # continuation mode the prior report owns coverage and every
-            # specialist remains skipped regardless of these values.
-            tests: "$resolve-scope.output.tests"
+            # Continuation mode owns coverage and skips every specialist,
+            # regardless of these conditional-lens bindings.
             errors: "$resolve-scope.output.errors"
-            comments: "$resolve-scope.output.comments"
-            types: "$resolve-scope.output.types"
-            docs: "$resolve-scope.output.docs"
+            docs: "$classify.output.docs"
           depends_on: [gate-correction-green]
 
         - id: recheck-action

@@ -94,7 +94,6 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     getActiveWorkflowRunByPath: mock(async () => null),
     findChildRuns: mock(async () => []),
     getRunAncestry: mock(async () => []),
-    failOrphanedRuns: mock(async () => ({ count: 0 })),
     createWorkflowRun: mock(async () => makeRun()),
     updateWorkflowRun: mock(async () => {}),
     failWorkflowRun: mock(async () => {}),

@@ -8,6 +8,7 @@
  *   fixture:
  *     expect: completed          # or failed / paused / cancelled
  *     fail-node: gate-ready      # required iff expect: failed
+ *     reached: [review__docs]    # nodes that must complete or be stubbed, under any expect
  *     inputs:                    # caller-supplied declared-input values
  *       branch: "task-123"
  *   exec-code: false             # execute script/bash nodes instead of stubbing
@@ -58,6 +59,7 @@ export const fixtureDeclarationSchema = z
   .object({
     expect: z.enum(['completed', 'failed', 'paused', 'cancelled']).default('completed'),
     'fail-node': z.string().optional(),
+    reached: z.array(z.string()).optional(),
     inputs: z.record(z.string(), z.string()).optional(),
   })
   .refine(decl => decl.expect !== 'failed' || decl['fail-node'] !== undefined, {
@@ -391,8 +393,9 @@ async function disposeExecWorkspace(cwd: string, workspace: string): Promise<voi
 /**
  * Run every discovered fixture through `dryRunWorkflow` and judge each against its
  * declaration. A fixture passes iff the outcome matches, a declared failure fails on
- * exactly the declared node, and no reached node lacked a stub. Unused stubs are a
- * warning, not a failure — stubs for conditionally-skipped branches are legitimate.
+ * exactly the declared node, every declared reached node completes or is stubbed, and
+ * no reached node lacked a stub. Unused stubs are a warning, not a failure — stubs for
+ * conditionally-skipped branches are legitimate.
  */
 export async function runFixtures(options: RunFixturesOptions): Promise<FixtureReport> {
   const roots = options.sourceRoots ?? liveSourceRoots(options.cwd);
@@ -551,7 +554,27 @@ async function checkFixture(
           `expected exactly one failed trace entry on '${parsed.declaration['fail-node']}', got ` +
           failures.map(f => f.nodeId).join(', ');
       }
-    } else if (result.missingStubs.length > 0) {
+    }
+    // Checked whenever declared, never chained after the outcome branches above: a
+    // fixture that expects a later gate to fail still has to prove the nodes before it
+    // ran, and a declaration that can silently prove nothing is worse than none.
+    if (failureReason === undefined && parsed.declaration.reached !== undefined) {
+      const missingReached = parsed.declaration.reached.filter(
+        nodeId =>
+          !result.trace.some(
+            entry =>
+              entry.nodeId === nodeId && (entry.state === 'completed' || entry.state === 'stubbed')
+          )
+      );
+      if (missingReached.length > 0) {
+        failureReason = `required nodes did not complete: ${missingReached.join(', ')}`;
+      }
+    }
+    if (
+      failureReason === undefined &&
+      parsed.declaration.expect !== 'failed' &&
+      result.missingStubs.length > 0
+    ) {
       failureReason = `reached nodes without stubs: ${result.missingStubs.join(', ')}`;
     }
 

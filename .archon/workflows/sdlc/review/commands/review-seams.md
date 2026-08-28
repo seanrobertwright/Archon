@@ -2,7 +2,7 @@
 
 Hunt one defect: **a type is missing at a seam, and something downstream pays for it** — a parser that mis-reads, a hand-maintained list that drifts, a second route that skips the validator, a value that silently loses fields across a re-entry. Read-only: never modify files, commit, or post anywhere.
 
-Read `$ARTIFACTS_DIR/review/scope.md` first. In light mode, verify prior seam findings first, then examine only the delta.
+Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md` first. Anchor the review on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; for an engaged risk, explicitly try to refute the relevant invariant. In light mode, verify prior seam findings first, then examine only the delta.
 
 **A seam** is where a value crosses to something that must interpret it: serialization, process/language boundaries, events, persisted formats, pause/resume re-entry, load-time→run-time handoffs. A plain function call is not a seam.
 
@@ -27,10 +27,14 @@ Mechanical starting points that pay off: grep the changed area for the KEEP-IN-S
 
 When you clear a seam, your reason must be a **quotation** from the code or build config — never your own characterization. If you cannot quote it, mark it unverified and leave it off the clean list.
 
+## Reachable invalid states
+
+Also report a seam defect when a changed type permits a reachable invalid state with a concrete consequence. Name the invariant, a constructor, parser, mutation, or public call that reaches the invalid state, and the downstream consumer that fails, guesses around it, or silently mishandles it. A cast-only or test-only path does not count. Check an earlier boundary does not already reject the state, and do not propose abstract domain-model advice: the correction must be proportional and make the affected seam carry the proof it needs.
+
 ## Output
 
-Write `$ARTIFACTS_DIR/review/seams.md`: each finding with severity (Critical if it already failed or fails silently on a supported path; Important otherwise), **both sides quoted with `file:line`**, what the missing type would carry, the concrete failure, and the smallest change that keeps the type. Then carve-outs applied, and the examined-and-clean list with its quotations. In light mode, a verdict per prior finding. No findings is a valid result — but only quoted silence.
+Write `$ARTIFACTS_DIR/review/seams.md`: each in-scope finding begins with `sources: [seams]`, followed by severity (Critical if it already failed or fails silently on a supported path; Important otherwise), **both sides quoted with `file:line`**, what the missing type would carry, the concrete failure, and the smallest change that keeps the type. Then carve-outs applied, and the examined-and-clean list with its quotations. In light mode, a verdict per prior finding. No findings is a valid result — but only quoted silence.
 
 If you prove useful work outside scope.md's accepted contract, do not turn it into a blocking finding. Write `$ARTIFACTS_DIR/discoveries/review-seams.json` as a JSON array of records with `title`, `claim`, `evidence` (concrete `file:line` facts or command results), `relation` (`adjacent` or `scope_conflict`), and `source_node` (`seams`). Write no file for no discovery; never append to another lens's file or record suspicion.
 
-Verify every `file:line` cited is real, then reply with one line: findings count by severity.
+Verify every `file:line` cited is real, then reply with one line pointing to it: `review findings: $ARTIFACTS_DIR/review/seams.md` and the findings count by severity.

@@ -183,6 +183,14 @@ describe('bundled-defaults', () => {
       expect(content).toContain('PR_NUMBER=$(cat $ARTIFACTS_DIR/.pr-number');
     });
 
+    it('classify-review-scope declares only its structured output fields', () => {
+      const content =
+        BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::classify-review-scope'];
+      expect(content).toContain('- `errors`, `docs` — booleans');
+      expect(content).toContain('- `reasons` — `{errors, docs}`');
+      expect(content).not.toContain('`tests`, `errors`, `comments`, `types`, `docs`');
+    });
+
     it('archon-create-pr should write .pr-number to artifacts', () => {
       const content = BUNDLED_COMMANDS['archon-create-pr'];
       expect(content).toContain('echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"');
@@ -195,10 +203,7 @@ describe('bundled-defaults', () => {
         ['__archon_pack__bundled:sdlc:review::review-seams', 'discoveries/review-seams.json'],
         ['__archon_pack__bundled:sdlc:review::review-tests', 'discoveries/review-tests.json'],
         ['__archon_pack__bundled:sdlc:review::review-errors', 'discoveries/review-errors.json'],
-        ['__archon_pack__bundled:sdlc:review::review-comments', 'discoveries/review-comments.json'],
-        ['__archon_pack__bundled:sdlc:review::review-types', 'discoveries/review-types.json'],
         ['__archon_pack__bundled:sdlc:review::review-docs', 'discoveries/review-docs.json'],
-        ['__archon_pack__bundled:sdlc:review::review-simplify', 'discoveries/review-simplify.json'],
       ]);
 
       for (const [key, path] of expected) {
@@ -242,7 +247,7 @@ describe('bundled-defaults', () => {
       expect(content).not.toContain('sed -i "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/"');
     });
 
-    it('archon-deliver preserves the classifier bindings that gate optional review spend', () => {
+    it('archon-deliver preserves the conditional-lens bindings', () => {
       const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
       if (parsed.workflow === null) throw new Error(parsed.error.error);
 
@@ -253,11 +258,7 @@ describe('bundled-defaults', () => {
       expect(resolveScope.runtime).toBe('uv');
       expect(resolveScope.script).toBe('resolve-review-scope');
       expect(resolveScope.with).toEqual({
-        c_tests: '$classify.output.tests',
         c_errors: '$classify.output.errors',
-        c_comments: '$classify.output.comments',
-        c_types: '$classify.output.types',
-        c_docs: '$classify.output.docs',
       });
 
       const review = parsed.workflow.nodes.find(node => node.id === 'review');
@@ -265,11 +266,8 @@ describe('bundled-defaults', () => {
       if (review?.kind !== 'include') throw new Error('review is not an include');
       expect(review.with).toMatchObject({
         work_order: '$INPUTS.work',
-        tests: '$resolve-scope.output.tests',
         errors: '$resolve-scope.output.errors',
-        comments: '$resolve-scope.output.comments',
-        types: '$resolve-scope.output.types',
-        docs: '$resolve-scope.output.docs',
+        docs: '$classify.output.docs',
       });
     });
 
@@ -317,17 +315,18 @@ describe('bundled-defaults', () => {
       expect(parsed.workflow.inputs?.work_order?.default).toBe('');
       const scope = parsed.workflow.nodes.find(node => node.id === 'scope');
       expect(scope?.depends_on).toEqual(['mode']);
+      expect(scope?.kind).toBe('agent');
+      if (scope?.kind !== 'agent') throw new Error('scope is not an agent');
+      expect(scope.output_format).toEqual({
+        type: 'object',
+        properties: { docs: { type: 'boolean' } },
+        required: ['docs'],
+      });
+      expect(parsed.workflow.inputs?.docs?.default).toBe('auto');
+      const docs = parsed.workflow.nodes.find(node => node.id === 'docs');
+      expect(docs?.when).toContain("$INPUTS.docs == 'auto' && $scope.output.docs == true");
 
-      const specialists = [
-        'code',
-        'seams',
-        'tests',
-        'errors',
-        'comments',
-        'types',
-        'docs',
-        'simplify',
-      ];
+      const specialists = ['code', 'seams', 'tests', 'errors', 'docs'];
       const reviewComplete = parsed.workflow.nodes.find(node => node.id === 'review-complete');
       expect(reviewComplete?.kind).toBe('exec');
       expect(reviewComplete?.depends_on).toEqual(specialists);
@@ -344,6 +343,71 @@ describe('bundled-defaults', () => {
         },
         required: expect.arrayContaining(['action']),
       });
+
+      expect(parsed.workflow.model).toBe('large');
+      expect(parsed.workflow.inputs?.tests).toBeUndefined();
+      expect(parsed.workflow.inputs?.comments).toBeUndefined();
+      expect(parsed.workflow.inputs?.types).toBeUndefined();
+
+      const commands = BUNDLED_COMMANDS;
+      expect(commands['__archon_pack__bundled:sdlc:review::review-code']).toContain(
+        'Comments clarify functionality and how code is used'
+      );
+      expect(commands['__archon_pack__bundled:sdlc:review::review-seams']).toContain(
+        'reachable invalid state with a concrete consequence'
+      );
+      expect(commands['__archon_pack__bundled:sdlc:review::review-synthesize']).toContain(
+        'report-round-N.md'
+      );
+      expect(commands['__archon_pack__bundled:sdlc:review::review-synthesize']).toContain(
+        '`sources`'
+      );
+
+      for (const lens of specialists) {
+        expect(commands[`__archon_pack__bundled:sdlc:review::review-${lens}`]).toContain(
+          `sources: [${lens}]`
+        );
+      }
+    });
+
+    // Attribution is only measurable if it lands somewhere a script can read (#2898):
+    // `scripts/lens-yield.ts` tallies these records, so the instruction that produces
+    // them and the fields it names are the contract that script depends on.
+    it('review synthesis writes findings attribution as a machine-readable sidecar', () => {
+      const synthesize = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-synthesize'];
+      expect(synthesize).toContain('$ARTIFACTS_DIR/review/findings.json');
+      expect(synthesize).toContain('{id, severity, sources, claim, status, round}');
+      // Carried-forward findings keep the lens that found them, or a multi-round review
+      // reattributes every surviving finding to its last round.
+      expect(synthesize).toContain('keeping the `sources` it was first attributed to');
+    });
+
+    // The same "does this diff earn a docs review" call is made in two packs — at
+    // delivery time by the classifier, and at review time when `docs` is `auto`. They
+    // drifted once: only the delivery copy carried the trivial-diff carve-out, so the
+    // same doc-adjacent typo fix earned the lens through one entry point and not the
+    // other. Whitespace-normalized so the guard survives either file being rewrapped.
+    it('applies the trivial-diff carve-out in both docs classifiers', () => {
+      const squash = (text: string): string => text.replace(/\s+/g, ' ');
+      const carveOut = 'a version bump, a one-line fix, a rename, a test-only tweak';
+      expect(
+        squash(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::classify-review-scope'])
+      ).toContain(carveOut);
+      expect(
+        squash(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-scope'])
+      ).toContain(carveOut);
+    });
+
+    // Calibration lesson 4 (#2898): the run that motivated this rewrite produced a false
+    // Critical from a `bun test` invoked the one way AGENTS.md forbids.
+    it('requires falsifying commands to follow the repository invocation rules', () => {
+      const discipline = 'the package scripts and invocation rules its steering files name';
+      expect(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-code']).toContain(
+        discipline
+      );
+      expect(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-synthesize']).toContain(
+        discipline
+      );
     });
 
     it('should have valid YAML structure', () => {
