@@ -94,6 +94,22 @@ def main() -> int:
         )
         return 1
 
+    # The label is not the claim. A pass on non-introduced red is worth exactly the
+    # evidence behind it — the failing check named, and why this change cannot have
+    # caused it — and an empty summary carries none, so the caveat it records says
+    # nothing a reader can act on. Refused for the same reason an unwritable record is:
+    # red that leaves no trace of why is worse than red that stops here. Emptiness is
+    # all this checks; whether the prose is genuine evidence is the declaring agent's
+    # judgment and the reviewer's, never something to reconstruct from the text.
+    if not summary:
+        print(
+            f"{stage} declared its red {cause}, but recorded no evidence for the claim. "
+            "A pass on red the change did not cause is only as good as the failing check "
+            "it names — refusing without it.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         record_red_cause(artifacts, cause, stage, summary)
     except OSError as err:
