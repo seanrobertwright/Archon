@@ -1387,12 +1387,8 @@ function requiredOutputRefError(
  * Substitute $node_id.output and $node_id.output.field references in a prompt.
  * Called AFTER the standard substituteWorkflowVariables pass.
  *
- * KEEP IN SYNC: public YAML call sites, the loader's validateDagStructure scan, and
- * rewriteNodeOutputRefs must cover the same runtime node-ref surfaces. Included
- * loop-command bodies are validated separately during materialization. applyInputsMacro
- * walks the same set since #1764 — `systemPrompt` and `agents.*` used to accept include
- * inputs without receiving runtime substitution, which made one file behave differently
- * composed and standalone (#2476); they are ordinary runtime surfaces now.
+ * Callers select one text value with their execution-specific escaping and timing.
+ * template-walker.ts owns whole-node traversal where it is needed.
  *
  * @param escapedForBash - When true, wraps substituted values in single quotes so
  *   they are safe to embed in bash scripts passed to `bash -c`. Set true only for

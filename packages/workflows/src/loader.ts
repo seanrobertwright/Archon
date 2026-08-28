@@ -906,40 +906,8 @@ export function validateDagStructure(
     }
   }
 
-  // Check $nodeId.output references across every public YAML field the executor substitutes at
-  // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
-  // (prompt, systemPrompt, agents.*.prompt/description, bash, script,
-  // approval.message/on_reject.prompt, wait.until/event, cancel, loop.prompt, loop.until_bash,
-  // loop_group.until_bash, workflow.input/with/fan_out.items,
-  // compose_fan_out.with/fan_out.items). A dangling ref in any of
-  // them can bind the wrong flat-DAG output or fail at run time, so all must be validated
-  // here.
-  //
-  // KEEP IN SYNC (public runtime node-ref surfaces):
-  //   1. this scan (loader validateDagStructure) — validates refs,
-  //   2. rewriteNodeOutputRefs (include-expander.ts) — renames refs on inline,
-  //   3. the substituteNodeOutputRefs call sites (dag-executor.ts) — resolves refs at run,
-  //   4. the console builder's `baseTextBodies`/`variantTextBodies`
-  //      (@archon/web .../builder/validation/content.ts) — warns while the author edits,
-  //      before this scan ever runs. It is a separate package and cannot import from here,
-  //      so it is the copy most likely to fall behind; a miss there is a silent UX gap
-  //      rather than a wrong run, since (1) still rejects the workflow. It covers the
-  //      surfaces of the 8 node variants the builder can author — `workflow:` and
-  //      `loop_group:` are not authorable there, so their surfaces are out of its scope
-  //      rather than missing from it.
-  // Adding a substituted field to one means updating all four. Included loop-command
-  // bodies are validated separately while materialized, then rewritten by (2).
-  //
-  // applyInputsMacro (include-expander.ts) walks the same set. It used to be a deliberate
-  // SUPERSET, because systemPrompt / agents.*.prompt / agents.*.description accepted
-  // include inputs without being runtime node-ref surfaces — which meant a workflow using
-  // `$INPUTS.<name>` in a systemPrompt resolved when composed and stayed literal when run
-  // standalone (#2476). Those three became runtime surfaces in #1764, so the two sets now
-  // agree; a future field that accepts include inputs but not node refs would reopen the
-  // gap and belongs in only one of them.
-  //
-  // Runtime substitution is syntax-agnostic: canonical refs inside Markdown fences and
-  // inline code are live too. Validation therefore scans every surface verbatim.
+  // template-walker.ts owns every engine template/reference field. Runtime substitution
+  // is syntax-agnostic, so this scan checks each text slot verbatim.
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
   const whenRefPattern = new RegExp(WHEN_REF_SOURCE, 'g');
   for (const node of nodes) {

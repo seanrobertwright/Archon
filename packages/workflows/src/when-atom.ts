@@ -9,9 +9,7 @@
  *     `$node.output.field` — a distinction the loader's coarse `WHEN_REF_SOURCE`
  *     ref sweep cannot make, because it captures only the first path segment.
  *
- * A second hand-written copy of this grammar is precisely the drift the
- * "KEEP IN SYNC" comment in `loader.ts` already exists to warn about, so the
- * grammar lives here once and nowhere else.
+ * The grammar lives here once so validation and runtime evaluation agree.
  *
  * Grammar (compound expressions are split into atoms by {@link whenAtoms}):
  *   $nodeId.output            — whole output text of a node
