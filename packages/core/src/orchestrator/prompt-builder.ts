@@ -5,7 +5,12 @@
  */
 import type { Codebase, Conversation } from '../types';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
-import { isApprovalContext, isGateResolved } from '@archon/workflows/schemas/workflow-run';
+import {
+  isApprovalContext,
+  isContainerRun,
+  runAttention,
+} from '@archon/workflows/schemas/workflow-run';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 
 /**
  * Format a single project for the orchestrator prompt.
@@ -68,16 +73,12 @@ export function formatWorkflowContextSection(results: readonly WorkflowResultCon
 
 /** The paused run a conversation's approval gate belongs to. */
 export interface PausedGateContext {
-  runId: string;
-  workflowName: string;
-  /** The run's raw `metadata.approval` — may be absent or malformed. */
-  approval: unknown;
   /**
-   * The run executed inside an isolation container, so chat cannot continue it
-   * (`isContainerRun`). The section promises continuation, and that promise is
-   * false here — the executor refuses a resume it cannot rewire.
+   * The paused run itself. The whole row, not a pre-chewed gate: `runAttention`
+   * decides what the run needs from outside, and a hand-copied subset would be a
+   * second place that decision could be made differently.
    */
-  containerRun?: boolean;
+  run: Pick<WorkflowRun, 'id' | 'workflow_name' | 'status' | 'metadata'>;
   /**
    * This turn actually has a route to the approve/reject verbs — i.e. the
    * conversation is project-scoped, which is what gates both the `manage_run`
@@ -103,42 +104,52 @@ export interface PausedGateContext {
  */
 export function formatPausedGateSection(gate: PausedGateContext): string {
   const header = '## Paused Approval Gate\n\n';
-  const approval = gate.approval;
+  const runId = gate.run.id;
+  const workflowName = gate.run.workflow_name;
+  const attention = runAttention(gate.run);
 
-  if (!isApprovalContext(approval)) {
-    // Paused, but the gate cannot be described. Preserve the explicit-command
-    // guidance the old natural-language branch sent directly to the user.
+  // Nothing needs a person: a resolved gate awaiting resume, a durable `wait:`, or a
+  // run that already finished. Offering any of those to the agent invites a second
+  // decision the operations reject.
+  if (attention === null || attention.kind === 'terminal') return '';
+
+  if (attention.kind === 'unreadable') {
+    // Paused, but the gate cannot be described — unreadable metadata, or a gate type
+    // this build cannot resolve. Preserve the explicit-command guidance the old
+    // natural-language branch sent directly to the user.
     return (
       header +
-      `Run \`${gate.runId}\` (**${gate.workflowName}**) is paused, but its approval context is ` +
+      `Run \`${runId}\` (**${workflowName}**) is paused, but its approval context is ` +
       'missing or malformed, so the gate cannot be described. Tell the user to resolve it ' +
-      `explicitly with \`/workflow approve ${gate.runId}\` or \`/workflow reject ${gate.runId} <reason>\`.`
+      `explicitly with \`/workflow approve ${runId}\` or \`/workflow reject ${runId} <reason>\`.`
     );
   }
 
-  if (isGateResolved(approval)) return '';
-
-  if (approval.type === 'child_workflow') {
-    const childRunId = approval.childRunId ?? '<unknown>';
+  if (attention.kind === 'blocked_on_child') {
     return (
       header +
-      `Run \`${gate.runId}\` (**${gate.workflowName}**) is paused waiting on its sub-run ` +
-      `\`${childRunId}\`, which has a gate of its own. This run has no gate you can resolve — ` +
+      `Run \`${runId}\` (**${workflowName}**) is paused waiting on its sub-run ` +
+      `\`${attention.childRunId}\`, which has a gate of its own. This run has no gate you can resolve — ` +
       'the decision belongs to the child run, and this one continues on its own once the child ' +
       'finishes.'
     );
   }
 
+  // `awaiting_response`. The projection reports it only for a well-formed, unresolved
+  // gate; the context read here carries the DETAIL the attention value omits.
+  const rawApproval = gate.run.metadata.approval;
+  const approval = isApprovalContext(rawApproval) ? rawApproval : undefined;
+
   const facts = [
-    `- Run id: \`${gate.runId}\``,
-    `- Workflow: **${gate.workflowName}**`,
-    `- Gate node: \`${approval.nodeId}\``,
+    `- Run id: \`${runId}\``,
+    `- Workflow: **${workflowName}**`,
+    `- Gate node: \`${attention.respondTo.nodeId}\``,
   ];
-  if (approval.type === 'interactive_loop' && typeof approval.iteration === 'number') {
+  if (approval?.type === 'interactive_loop' && typeof approval.iteration === 'number') {
     facts.push(`- Loop iteration: ${String(approval.iteration)}`);
   }
 
-  const explicitCommands = `\`/workflow approve ${gate.runId} [comment]\` or \`/workflow reject ${gate.runId} <reason>\``;
+  const explicitCommands = `\`/workflow approve ${runId} [comment]\` or \`/workflow reject ${runId} <reason>\``;
 
   const preamble =
     header +
@@ -146,7 +157,7 @@ export function formatPausedGateSection(gate: PausedGateContext): string {
     'continue until the gate is resolved.\n\n' +
     facts.join('\n') +
     '\n\nWhat the run is asking:\n\n' +
-    `> ${approval.message.replace(/\n/g, '\n> ')}\n\n`;
+    `> ${attention.message.replace(/\n/g, '\n> ')}\n\n`;
 
   // No project is attached, so neither the `manage_run` tool nor the CLI-pointer
   // section is present this turn. Relay the gate rather than instructing the
@@ -161,11 +172,13 @@ export function formatPausedGateSection(gate: PausedGateContext): string {
     );
   }
 
-  // A container run can only be resumed where the container can be rewired.
-  const continuation = gate.containerRun
+  // A container run can only be resumed where the container can be rewired. The
+  // section promises continuation, and that promise is false here — the executor
+  // refuses a resume it cannot rewire.
+  const continuation = isContainerRun(gate.run)
     ? 'This run executed inside an isolation container, so resolving the gate records the ' +
       'decision but CANNOT continue the run from here — only the CLI can rewire the ' +
-      `container. Tell the user to finish it with \`archon workflow resume ${gate.runId}\` ` +
+      `container. Tell the user to finish it with \`archon workflow resume ${runId}\` ` +
       'from the CLI in the same project.'
     : 'Resolving the gate also continues the run — there is no separate resume step.';
 

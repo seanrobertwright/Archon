@@ -51,9 +51,19 @@ nodes:
           type: boolean
         green:
           type: boolean
+        # Why the checks are red, when they are (#2939). A green turn has no red to
+        # explain, and the empty string is how it says so: OpenAI strict mode rejects
+        # any schema whose `required` omits a declared property, so optionality has to
+        # live inside the type rather than in what `required` leaves out (#1843 —
+        # every archon-deliver run on a Codex config died at the first turn when this
+        # was optional by omission). '' is the value gate-green.py already treats as
+        # no cause declared, so the gate that spends on this verdict is unchanged.
+        red_cause:
+          type: string
+          enum: [introduced, inherited, environment, ""]
         summary:
           type: string
-      required: [done, green, summary]
+      required: [done, green, red_cause, summary]
 
   # Decline is not success: an AI node that declines its task still exits 0. This
   # deterministic guard proves work actually happened before anything downstream

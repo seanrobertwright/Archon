@@ -29,6 +29,7 @@ import {
   workflowRunCommand,
   workflowStatusCommand,
   workflowGetCommand,
+  workflowWaitCommand,
   workflowRunsCommand,
   workflowResumeCommand,
   workflowAbandonCommand,
@@ -116,6 +117,16 @@ mock.module(
     reclaimContainerEnv: mockReclaimContainerEnv,
   })
 );
+
+// The waiter itself is proven in @archon/core and against a real detached run in
+// workflow-wait.integration.spec.ts. Here the command's OWN responsibilities are
+// under test: prefix resolution, both output modes, and the exit code per outcome.
+const mockWaitForRunAttention = mock(
+  (): Promise<unknown> => Promise.resolve({ kind: 'not_found', runId: 'unset' })
+);
+mock.module('@archon/core/services/run-attention-watch', () => ({
+  waitForRunAttention: mockWaitForRunAttention,
+}));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
 const mockFolderBackendPrepare = mock(() =>
@@ -10057,5 +10068,166 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
       workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: 'run-old' })
     ).rejects.toThrow(/requires input/);
     expect(executeWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+describe('workflowWaitCommand', () => {
+  const FULL_ID = '0b1ee8da-1111-2222-3333-444455556666';
+  let consoleSpy: ReturnType<typeof spyOn>;
+  let stdoutSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    stdoutSpy = spyOnJsonStdout();
+    mockWaitForRunAttention.mockClear();
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+    stdoutSpy.mockRestore();
+  });
+
+  const terminal = (status: string) => ({
+    kind: 'attention',
+    attention: { kind: 'terminal', runId: FULL_ID, status, at: new Date('2026-08-28T12:00:00Z') },
+  });
+
+  it('exits 0 and names the terminal status', async () => {
+    mockWaitForRunAttention.mockResolvedValueOnce(terminal('failed'));
+
+    const code = await workflowWaitCommand(FULL_ID, undefined, '/repo');
+
+    expect(code).toBe(0);
+    // A failed run is a successful WAIT — mapping run state onto the exit code would
+    // make a legitimately cancelled run look like a broken command.
+    expect(consoleSpy.mock.calls.flat().join(' ')).toContain(`Run ${FULL_ID} failed.`);
+  });
+
+  it('names the child run when the gate lives below the run being watched', async () => {
+    mockWaitForRunAttention.mockResolvedValueOnce({
+      kind: 'attention',
+      attention: {
+        kind: 'awaiting_response',
+        runId: 'child-9',
+        respondTo: { runId: 'child-9', nodeId: 'review' },
+        message: 'Approve?',
+      },
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, undefined, '/repo');
+
+    expect(code).toBe(0);
+    const printed = consoleSpy.mock.calls.flat().join(' ');
+    expect(printed).toContain('blocked on sub-run child-9');
+    expect(printed).toContain("gate 'review'");
+  });
+
+  it('exits 3 with the observed status when the deadline passes', async () => {
+    mockWaitForRunAttention.mockResolvedValueOnce({
+      kind: 'deadline',
+      runId: FULL_ID,
+      observedStatus: 'running',
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo', 5);
+
+    expect(code).toBe(3);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: true,
+      action: 'wait',
+      runId: FULL_ID,
+      result: 'deadline',
+      observedStatus: 'running',
+    });
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, { deadlineMs: 5000 });
+  });
+
+  it('waits indefinitely when no timeout is given', async () => {
+    mockWaitForRunAttention.mockResolvedValueOnce(terminal('completed'));
+
+    await workflowWaitCommand(FULL_ID, undefined, '/repo');
+
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {});
+  });
+
+  it('exits 1 with an {ok:false} line for an unknown run', async () => {
+    mockWaitForRunAttention.mockResolvedValueOnce({ kind: 'not_found', runId: FULL_ID });
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo');
+
+    expect(code).toBe(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'wait',
+      error: 'not_found',
+    });
+  });
+
+  it('emits the attention value verbatim under --json', async () => {
+    mockWaitForRunAttention.mockResolvedValueOnce({
+      kind: 'attention',
+      attention: {
+        kind: 'awaiting_response',
+        runId: FULL_ID,
+        respondTo: { runId: FULL_ID, nodeId: 'review' },
+        message: 'Approve?',
+      },
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo');
+
+    expect(code).toBe(0);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
+      ok: true,
+      action: 'wait',
+      runId: FULL_ID,
+      result: 'attention',
+      attention: {
+        kind: 'awaiting_response',
+        runId: FULL_ID,
+        respondTo: { runId: FULL_ID, nodeId: 'review' },
+        message: 'Approve?',
+      },
+    });
+  });
+
+  it('resolves a short prefix before waiting (#2871 defect class)', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-1',
+      name: 'proj',
+      default_cwd: '/repo',
+    });
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: FULL_ID },
+    ]);
+    mockWaitForRunAttention.mockResolvedValueOnce(terminal('completed'));
+
+    const code = await workflowWaitCommand('0b1ee8da', undefined, '/repo');
+
+    expect(code).toBe(0);
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {});
+  });
+
+  it('never throws in --json mode when the wait itself fails', async () => {
+    mockWaitForRunAttention.mockRejectedValueOnce(new Error('database unreachable'));
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo');
+
+    expect(code).toBe(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'wait',
+      error: 'database unreachable',
+    });
+  });
+
+  it('throws in human mode when the wait itself fails', async () => {
+    mockWaitForRunAttention.mockRejectedValueOnce(new Error('database unreachable'));
+
+    await expect(workflowWaitCommand(FULL_ID, undefined, '/repo')).rejects.toThrow(
+      'Failed to wait for workflow run: database unreachable'
+    );
   });
 });
