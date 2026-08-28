@@ -25,9 +25,11 @@ mock.module('@archon/core/handlers', () => ({
   resolveRunContinuation: mockResolveRunContinuation,
 }));
 mock.module('@archon/core/db/codebases', () => ({ getCodebase: mock(async () => null) }));
+const mockFailWorkflowRun = mock(async () => undefined);
 mock.module('@archon/core/db/workflows', () => ({
   listDueWorkflowContinuations: mockListDueWorkflowContinuations,
   deferWorkflowContinuation: mockDeferWorkflowContinuation,
+  failWorkflowRun: mockFailWorkflowRun,
   WorkflowNotResumableError: class WorkflowNotResumableError extends Error {},
 }));
 mock.module('@archon/paths', () => ({
@@ -43,6 +45,8 @@ mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
   hydrateResumableRun: mockHydrateResumableRun,
 }));
+
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 
 import {
   resumeWorkflowRunFromServer,
@@ -90,6 +94,90 @@ describe('workflow continuation scanner', () => {
       success: true,
       workflowRunId: 'run-1',
       summary: 'done',
+    });
+    mockFailWorkflowRun.mockReset();
+    mockFailWorkflowRun.mockResolvedValue(undefined);
+  });
+
+  // #2910: the headless scanner is the unattended path — nothing revisits a row it
+  // leaves at 'running' (listDueWorkflowContinuations selects paused/failed only).
+  // Both sides of the branch are asserted: an ordinary rejection still gets its
+  // compensating write, a rejected terminal write must not get a second one.
+  describe('rejected execution', () => {
+    const startHeadlessResume = async (rejection: unknown): Promise<void> => {
+      const paused = run('wait-headless', 'paused', {});
+      mockResolveRunContinuation.mockResolvedValueOnce({
+        ok: true,
+        workflowName: 'deliver',
+        workflow: { definition: { name: 'deliver', nodes: [] } },
+      });
+      mockHydrateResumableRun.mockResolvedValueOnce({
+        preCreatedRun: { ...paused, status: 'running' },
+        priorCompletedNodes: new Map(),
+        priorUsage: { costUsd: 0 },
+        priorNodeSessions: [],
+      });
+      mockExecuteWorkflow.mockRejectedValueOnce(rejection);
+
+      await expect(resumeWorkflowRunFromServer(paused)).resolves.toBe(true);
+      // The rejection handler runs off the voided promise.
+      await Promise.resolve();
+      await Promise.resolve();
+    };
+
+    test('marks the run failed when execution rejects with an ordinary error', async () => {
+      await startHeadlessResume(new Error('resume boom'));
+
+      expect(mockFailWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(mockFailWorkflowRun.mock.calls[0]?.[0]).toBe('wait-headless');
+    });
+
+    test('does not compensate a rejected terminal write with a second failure write', async () => {
+      await startHeadlessResume(new TerminalStatusWriteError(new Error('db is gone')));
+
+      expect(mockFailWorkflowRun).not.toHaveBeenCalled();
+    });
+
+    test('tells a watching conversation the status could not be saved', async () => {
+      const paused = run('wait-headless-web', 'paused', {});
+      mockResolveRunContinuation.mockResolvedValueOnce({
+        ok: true,
+        workflowName: 'deliver',
+        workflow: { definition: { name: 'deliver', nodes: [] } },
+      });
+      mockHydrateResumableRun.mockResolvedValueOnce({
+        preCreatedRun: { ...paused, status: 'running' },
+        priorCompletedNodes: new Map(),
+        priorUsage: { costUsd: 0 },
+        priorNodeSessions: [],
+      });
+      mockExecuteWorkflow.mockRejectedValueOnce(
+        new TerminalStatusWriteError(new Error('db is gone'))
+      );
+      const platform = {
+        sendMessage: mock(async () => undefined),
+        getStreamingMode: () => 'batch' as const,
+        getPlatformType: () => 'web',
+      } satisfies IWorkflowPlatform;
+
+      await expect(
+        resumeWorkflowRunFromServer(paused, undefined, {
+          kind: 'platform',
+          destination: {
+            platform,
+            conversationId: 'web-worker-conv',
+            resultConversationId: 'visible-web-conv',
+          },
+        })
+      ).resolves.toBe(true);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mockFailWorkflowRun).not.toHaveBeenCalled();
+      const message = (platform.sendMessage.mock.calls[0] as unknown[] | undefined)?.[1] as
+        | string
+        | undefined;
+      expect(message).toContain('final status could not be saved');
     });
   });
 

@@ -4,6 +4,7 @@
  * Classifies errors and provides user-friendly messages
  * without leaking sensitive information
  */
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import { WorkflowAdoptionError } from '../operations/workflow-adoption';
 
 /**
@@ -20,6 +21,17 @@ export function classifyAndFormatError(error: Error): string {
   // the generic fallback below.
   if (error instanceof WorkflowAdoptionError) {
     return `⚠️ ${message}`;
+  }
+
+  // The run finished but its terminal status was not recorded, so its row still says
+  // `running` and its true outcome is unknown. Distinct from an ordinary failure: the
+  // generic fallbacks below would tell the user to `/reset`, which fixes nothing and
+  // hides a run that will otherwise sit non-terminal holding its working path.
+  if (error instanceof TerminalStatusWriteError) {
+    return (
+      '⚠️ The workflow ran, but its final status could not be saved, so it may still show ' +
+      'as running. Check `/workflow status` before starting another run on this project.'
+    );
   }
 
   // AI-provider rate-limit / usage-cap classification

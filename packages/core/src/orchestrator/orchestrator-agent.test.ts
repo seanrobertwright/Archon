@@ -82,6 +82,11 @@ const mockLogger = createMockLogger();
 const mockEnsureArchonWorkspacesPath = mock(() => Promise.resolve('/home/test/.archon/workspaces'));
 const mockCaptureChatTurn = mock(() => undefined);
 const mockCaptureApprovalResolved = mock(() => undefined);
+// The one canonicalizer every `default_cwd` writer resolves through (#2927).
+// Tests below derive their expected path from it rather than from a POSIX
+// literal: it makes a path absolute, and on Windows `resolve('/path')` is
+// drive-qualified (`D:\path`).
+const { canonicalizeProjectPath } = await import('@archon/paths');
 mock.module('@archon/paths', () => ({
   captureApprovalResolved: mockCaptureApprovalResolved,
   createLogger: mock(() => mockLogger),
@@ -431,6 +436,7 @@ import {
   continueResolvedGateRun,
 } from './orchestrator-agent';
 import { buildAiProfile } from '@archon/workflows/model-validation';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -4605,10 +4611,11 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('stream');
     await handleMessage(platform, 'conv-1', 'register my project');
 
+    const expectedCwd = await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source');
     expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'ExampleProject',
-      default_cwd: '/.archon/workspaces/owner/repo/source',
+      default_cwd: expectedCwd,
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4617,9 +4624,8 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       string,
       string,
     ][];
-    expect(allCalls.some(([, msg]) => msg.includes('/.archon/workspaces/owner/repo/source'))).toBe(
-      true
-    );
+    // The confirmation echoes the path that was actually stored.
+    expect(allCalls.some(([, msg]) => msg.includes(expectedCwd))).toBe(true);
   });
 
   test('batch mode — register-project split across 3 chunks', async () => {
@@ -4638,10 +4644,11 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue('batch');
     await handleMessage(platform, 'conv-1', 'register my project');
 
+    const expectedCwd = await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source');
     expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'ExampleProject',
-      default_cwd: '/.archon/workspaces/owner/repo/source',
+      default_cwd: expectedCwd,
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4650,9 +4657,8 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
       string,
       string,
     ][];
-    expect(allCalls.some(([, msg]) => msg.includes('/.archon/workspaces/owner/repo/source'))).toBe(
-      true
-    );
+    // The confirmation echoes the path that was actually stored.
+    expect(allCalls.some(([, msg]) => msg.includes(expectedCwd))).toBe(true);
   });
 
   test('stream mode — invoke-workflow split across 2 chunks', async () => {
@@ -4762,7 +4768,7 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
 
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'MyApp',
-      default_cwd: '/path/to/app',
+      default_cwd: await canonicalizeProjectPath('/path/to/app'),
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4802,7 +4808,7 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     expect(sentTexts).not.toContain(' extra trailing');
     // createCodebase was called with the clean parsed path
     expect(mockCreateCodebase).toHaveBeenCalledWith(
-      expect.objectContaining({ name: 'Foo', default_cwd: '/path' })
+      expect.objectContaining({ name: 'Foo', default_cwd: await canonicalizeProjectPath('/path') })
     );
   });
 });
@@ -5321,7 +5327,9 @@ describe('handleMessage — /update-project dispatch', () => {
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', '/update-project my-app /');
 
-    expect(mockUpdateCodebase).toHaveBeenCalledWith('id-my-app', { default_cwd: '/' });
+    expect(mockUpdateCodebase).toHaveBeenCalledWith('id-my-app', {
+      default_cwd: await canonicalizeProjectPath('/'),
+    });
     const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
     expect(msg).toContain('updated');
     expect(msg).toContain('/repos/my-app');
@@ -6287,5 +6295,44 @@ describe('continueResolvedGateRun — chat gate continuation source (#2646)', ()
       c => (c as unknown[])[1] as string
     );
     expect(messages.some(m => m.includes('digest mismatch'))).toBe(true);
+  });
+
+  // #2910: both sides of the recovery branch. An ordinary resume failure leaves the
+  // run resumable, so `/workflow resume` is right. A rejected terminal write leaves the
+  // row non-terminal — `/workflow resume` refuses those, so that advice would send the
+  // operator down a dead end for a run that may well have finished its work.
+  async function continueWithRejection(
+    platform: ReturnType<typeof makePlatform>,
+    rejection: unknown
+  ): Promise<string[]> {
+    mockExecuteWorkflow.mockRejectedValueOnce(rejection);
+    await continueResolvedGateRun(
+      platform,
+      'conv-1',
+      makeConversation({ codebase_id: 'codebase-1' }),
+      makeGateCodebase(),
+      [makeTestWorkflowWithSource({ name: 'gated', description: 'live' })],
+      makeGateRun(),
+      'approve'
+    );
+    return (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      c => (c as unknown[])[1] as string
+    );
+  }
+
+  test('an ordinary resume failure points at /workflow resume', async () => {
+    const messages = await continueWithRejection(makePlatform(), new Error('resume boom'));
+
+    expect(messages.some(m => m.includes('retry with `/workflow resume run-gated`'))).toBe(true);
+  });
+
+  test('a rejected terminal write says the status is unknown, not "retry the resume"', async () => {
+    const messages = await continueWithRejection(
+      makePlatform(),
+      new TerminalStatusWriteError(new Error('db is gone'))
+    );
+
+    expect(messages.some(m => m.includes('final status could not be saved'))).toBe(true);
+    expect(messages.some(m => m.includes('retry with `/workflow resume'))).toBe(false);
   });
 });

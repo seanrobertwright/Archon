@@ -1,6 +1,7 @@
 // Archon path resolution utilities
 export {
   expandTilde,
+  canonicalizeProjectPath,
   isDocker,
   isWSL,
   getWSLDistroName,

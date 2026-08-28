@@ -69,6 +69,7 @@ import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { keepAwake } from './utils/keep-awake';
 import { getWorkflowEventEmitter } from './event-emitter';
+import { TerminalStatusWriteError, requireTerminalStatusWrite } from './terminal-status-write';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
@@ -1167,9 +1168,9 @@ async function gatherDescendantRunIds(deps: WorkflowDeps, rootId: string): Promi
  * does not cover runtime targets). The child shares the parent's checkout;
  * executeWorkflow derives the ancestor chain from the child's own parent_run_id
  * to exclude it from the path-lock.
- * Never throws — every failure is returned as a `{ status: 'failed' }` outcome so
- * the calling node fails cleanly rather than the whole DAG throwing. (Every step,
- * including the recursive executeWorkflow call, is guarded — keep it that way.)
+ * Ordinary failures return a `{ status: 'failed' }` outcome so the calling node
+ * fails cleanly rather than the whole DAG throwing. Terminal status-write failures
+ * propagate because the child has no trustworthy terminal outcome to return.
  */
 async function runChildWorkflow(
   deps: WorkflowDeps,
@@ -1533,6 +1534,8 @@ async function runChildWorkflow(
     }
     return childOutcomeFromRun(finalChild);
   } catch (err) {
+    if (err instanceof TerminalStatusWriteError) throw err;
+
     // Honor the never-throws contract: executeWorkflow can throw from its early
     // setup (before its own failWorkflowRun catch-all), and the read-back can
     // throw on a DB error — both must surface as a failed node outcome, not an
@@ -1568,10 +1571,9 @@ async function runChildWorkflow(
  *  - the parent's gate isn't a `child_workflow` gate, or
  *  - a DIFFERENT child of the same parent terminated (childRunId mismatch).
  *
- * Never throws — the child's own result must not be corrupted by a parent-resume
- * failure. Every await is guarded here (a parent-side failure is logged, and a
- * post-CAS failure marks the parent 'failed' so it stays resumable); the caller's
- * `.catch` is a belt-and-braces backstop, not the contract.
+ * Failures before the parent resumes leave the child result intact. Once the parent
+ * has resumed, a rejected terminal status write propagates because the child cannot
+ * report an ordinary result while the parent remains running.
  *
  * `resolveChildIsolation` is a plain parameter rather than part of the resume state:
  * {@link ResumePayload} carries what was RECORDED about the prior run, and a resolver
@@ -1735,6 +1737,8 @@ async function maybeResumeParentRun(
       }
     );
   } catch (err) {
+    if (err instanceof TerminalStatusWriteError) throw err;
+
     // The hydrate CAS above already flipped the parent paused→running, and
     // executeWorkflow's own failWorkflowRun catch-all doesn't cover its early
     // setup (config load, env/credential resolution). Without this handler a
@@ -1745,14 +1749,13 @@ async function maybeResumeParentRun(
       { err: err as Error, parentRunId, childRunId: childRun.id },
       'workflow.parent_auto_resume_execute_failed'
     );
-    await deps.store
-      .failWorkflowRun(parentRunId, `Auto-resume after sub-run failed: ${(err as Error).message}`)
-      .catch((failErr: unknown) => {
-        getLog().error(
-          { err: failErr as Error, parentRunId },
-          'workflow.parent_auto_resume_fail_mark_failed'
-        );
-      });
+    await requireTerminalStatusWrite(
+      deps.store.failWorkflowRun(
+        parentRunId,
+        `Auto-resume after sub-run failed: ${(err as Error).message}`
+      ),
+      { workflowRunId: parentRunId, site: 'workflow.parent_auto_resume_fail_mark_failed' }
+    );
   }
 }
 
@@ -1859,13 +1862,11 @@ export async function executeWorkflow(
       'CLI in the same project (`archon workflow approve/reject/resume <id>`), where the ' +
       'container is rediscovered — chat/web resume cannot rewire it.';
     getLog().warn({ workflowRunId: preCreatedRun.id }, 'workflow.container_resume_without_backend');
-    await deps.store.failWorkflowRun(preCreatedRun.id, msg).catch((err: unknown) => {
-      getLog().error(
-        { err, workflowRunId: preCreatedRun.id },
-        'workflow.container_resume_guard_fail_failed'
-      );
-    });
     await safeSendMessage(platform, conversationId, `⚠️ ${msg}`);
+    await requireTerminalStatusWrite(deps.store.failWorkflowRun(preCreatedRun.id, msg), {
+      workflowRunId: preCreatedRun.id,
+      site: 'workflow.container_resume_guard_fail_failed',
+    });
     return { success: false, workflowRunId: preCreatedRun.id, error: msg };
   }
 
@@ -1894,14 +1895,10 @@ export async function executeWorkflow(
     }
   } catch (error) {
     if (preCreatedRun) {
-      await deps.store
-        .failWorkflowRun(preCreatedRun.id, (error as Error).message)
-        .catch((dbError: Error) => {
-          getLog().error(
-            { err: dbError, workflowRunId: preCreatedRun.id },
-            'workflow.run_config_fail_db_record_failed'
-          );
-        });
+      await requireTerminalStatusWrite(
+        deps.store.failWorkflowRun(preCreatedRun.id, (error as Error).message),
+        { workflowRunId: preCreatedRun.id, site: 'workflow.run_config_fail_db_record_failed' }
+      );
     }
     throw error;
   }
@@ -2052,14 +2049,10 @@ export async function executeWorkflow(
     // lock indefinitely just because validation happens before the executor's main
     // lifecycle catch.
     if (preCreatedRun) {
-      await deps.store
-        .failWorkflowRun(preCreatedRun.id, (error as Error).message)
-        .catch((dbError: Error) => {
-          getLog().error(
-            { err: dbError, workflowRunId: preCreatedRun.id },
-            'workflow.model_overrides_fail_db_record_failed'
-          );
-        });
+      await requireTerminalStatusWrite(
+        deps.store.failWorkflowRun(preCreatedRun.id, (error as Error).message),
+        { workflowRunId: preCreatedRun.id, site: 'workflow.model_overrides_fail_db_record_failed' }
+      );
     }
     throw error;
   }
@@ -2240,18 +2233,22 @@ export async function executeWorkflow(
         { err, workflowRunId: preCreatedRun.id },
         'workflow.invocation_metadata_persist_failed'
       );
-      await deps.store
-        .failWorkflowRun(preCreatedRun.id, 'Database error recording workflow invocation settings')
-        .catch((dbError: Error) => {
-          getLog().error(
-            { err: dbError, workflowRunId: preCreatedRun.id },
-            'workflow.invocation_metadata_failure_record_failed'
-          );
-        });
+      // Notify before the terminal write: the write can now reject, and the operator
+      // must still learn why the run stopped when it does.
       await sendCriticalMessage(
         platform,
         conversationId,
         '❌ **Workflow failed**: Unable to record the run invocation settings. Please try again later.'
+      );
+      await requireTerminalStatusWrite(
+        deps.store.failWorkflowRun(
+          preCreatedRun.id,
+          'Database error recording workflow invocation settings'
+        ),
+        {
+          workflowRunId: preCreatedRun.id,
+          site: 'workflow.invocation_metadata_failure_record_failed',
+        }
       );
       return {
         success: false,
@@ -2516,18 +2513,17 @@ export async function executeWorkflow(
       { err, artifactsDir, stateDir, workflowRunId: workflowRun.id },
       'workflow.artifacts_dir_create_failed'
     );
-    await deps.store
-      .failWorkflowRun(workflowRun.id, `Artifacts directory creation failed: ${err.message}`)
-      .catch((dbErr: Error) => {
-        getLog().error(
-          { err: dbErr, workflowRunId: workflowRun.id },
-          'workflow.artifacts_dir_fail_db_record_failed'
-        );
-      });
     await sendCriticalMessage(
       platform,
       conversationId,
       `❌ **Workflow failed**: Could not create artifacts directory \`${artifactsDir}\`: ${err.message}`
+    );
+    await requireTerminalStatusWrite(
+      deps.store.failWorkflowRun(
+        workflowRun.id,
+        `Artifacts directory creation failed: ${err.message}`
+      ),
+      { workflowRunId: workflowRun.id, site: 'workflow.artifacts_dir_fail_db_record_failed' }
     );
     return {
       success: false,
@@ -2599,13 +2595,11 @@ export async function executeWorkflow(
 
   const failRunOnSource = async (message: string): Promise<WorkflowExecutionResult> => {
     getLog().error({ workflowRunId: workflowRun.id, message }, 'workflow.source_unavailable');
-    await deps.store.failWorkflowRun(workflowRun.id, message).catch((dbErr: Error) => {
-      getLog().error(
-        { err: dbErr, workflowRunId: workflowRun.id },
-        'workflow.source_fail_db_record_failed'
-      );
-    });
     await sendCriticalMessage(platform, conversationId, `❌ **Workflow failed**: ${message}`);
+    await requireTerminalStatusWrite(deps.store.failWorkflowRun(workflowRun.id, message), {
+      workflowRunId: workflowRun.id,
+      site: 'workflow.source_fail_db_record_failed',
+    });
     return { success: false, workflowRunId: workflowRun.id, error: message };
   };
 
@@ -2746,17 +2740,15 @@ export async function executeWorkflow(
       { err, workflowRunId: workflowRun.id },
       'workflow.user_provider_files_cleanup_failed'
     );
-    await deps.store.failWorkflowRun(workflowRun.id, message).catch((dbErr: Error) => {
-      getLog().error(
-        { err: dbErr, workflowRunId: workflowRun.id },
-        'workflow.user_provider_files_cleanup_fail_db_record_failed'
-      );
-    });
     await sendCriticalMessage(
       platform,
       conversationId,
       'Workflow blocked: Unable to safely prepare provider credentials. Please retry.'
     );
+    await requireTerminalStatusWrite(deps.store.failWorkflowRun(workflowRun.id, message), {
+      workflowRunId: workflowRun.id,
+      site: 'workflow.user_provider_files_cleanup_fail_db_record_failed',
+    });
     return { success: false, workflowRunId: workflowRun.id, error: message };
   }
 
@@ -2790,6 +2782,11 @@ export async function executeWorkflow(
   // early-return validation paths above never leak an unpaired acquire; the
   // matching release is the first statement of this try's finally.
   keepAwake.acquire();
+  // Set by every path that observes a rejected terminal status write — one arriving
+  // from the DAG or a sub-run (the catch below), and the catch's own recovery write.
+  // The finally-block backstop reads it: a second write over a channel that just
+  // failed would either fail again or mask the real error.
+  let terminalStatusWriteFailed = false;
   try {
     getLog().info(
       {
@@ -3095,8 +3092,7 @@ export async function executeWorkflow(
     const finalStatus = await deps.store.getWorkflowRun(workflowRun.id);
     // Sub-run re-entry (#2121 Phase 2): if this run is a `workflow:` child that just
     // reached a terminal state, re-enter its paused parent in-process. Guarded to be
-    // a no-op on the synchronous first-run path (parent still 'running'). Wrapped in
-    // catch — a parent-resume failure must not corrupt the child's own result.
+    // a no-op on the synchronous first-run path (parent still 'running').
     if (
       finalStatus?.parent_run_id &&
       (finalStatus.status === 'completed' ||
@@ -3114,16 +3110,7 @@ export async function executeWorkflow(
         // did inject. Same resolver the child ran with — it is codebase-bound and the
         // child shares the parent's codebase.
         resolveChildIsolation
-      ).catch((err: unknown) => {
-        getLog().error(
-          {
-            err: err as Error,
-            childRunId: workflowRun.id,
-            parentRunId: finalStatus.parent_run_id,
-          },
-          'workflow.parent_auto_resume_failed'
-        );
-      });
+      );
     }
     if (finalStatus?.status === 'completed') {
       return { success: true, workflowRunId: workflowRun.id, summary: dagSummary };
@@ -3137,6 +3124,11 @@ export async function executeWorkflow(
       };
     }
   } catch (error) {
+    if (error instanceof TerminalStatusWriteError) {
+      terminalStatusWriteFailed = true;
+      throw error;
+    }
+
     // Top-level error handler: ensure workflow is marked as failed
     const err = error as Error;
     getLog().error(
@@ -3144,16 +3136,11 @@ export async function executeWorkflow(
       'workflow_execution_unhandled_error'
     );
 
-    // Record failure in database (non-blocking - log but don't re-throw on DB error)
-    try {
-      await deps.store.failWorkflowRun(workflowRun.id, err.message);
-    } catch (dbError) {
-      getLog().error(
-        { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
-        'db_record_failure_failed'
-      );
-    }
-
+    // Everything below is independent of the terminal write and used to run whether
+    // or not it succeeded (it was try/caught here before #2910). The write moved to
+    // the end of this block so a rejection cannot silence the log file, the live
+    // event, telemetry, or the user's failure notification.
+    //
     // Log to file (separate from database - non-blocking)
     try {
       await logWorkflowError(logDir, workflowRun.id, err.message);
@@ -3199,6 +3186,21 @@ export async function executeWorkflow(
         'user_failure_notification_failed'
       );
     }
+
+    // A terminal status write is part of the result: if it fails, reject instead of
+    // reporting a completed process for a row that still says running. Record that it
+    // failed so the finally-block backstop below does not fire a second write over a
+    // write channel that just proved unreliable — that write would mask this error.
+    try {
+      await requireTerminalStatusWrite(deps.store.failWorkflowRun(workflowRun.id, err.message), {
+        workflowRunId: workflowRun.id,
+        site: 'db_record_failure_failed',
+      });
+    } catch (writeError) {
+      terminalStatusWriteFailed = true;
+      throw writeError;
+    }
+
     // Return failure result instead of re-throwing
     return { success: false, workflowRunId: workflowRun.id, error: err.message };
   } finally {
@@ -3212,16 +3214,15 @@ export async function executeWorkflow(
     // calling failWorkflowRun (e.g. a generator cleanup that exits without
     // throwing). Only fires when the process stays alive long enough to run
     // this finally — see #1561 for the originating zombie-state incident.
-    if (workflowRun) {
+    if (workflowRun && !terminalStatusWriteFailed) {
       const runId = workflowRun.id;
       const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
       if (backstopStatus === 'running') {
         getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
-        await deps.store
-          .failWorkflowRun(runId, 'Workflow exited without finalizing — see logs')
-          .catch((err: unknown) => {
-            getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
-          });
+        await requireTerminalStatusWrite(
+          deps.store.failWorkflowRun(runId, 'Workflow exited without finalizing — see logs'),
+          { workflowRunId: runId, site: 'executor.backstop_fail_failed' }
+        );
       }
     }
   }

@@ -24,7 +24,7 @@
  * For Docker: /.archon/
  */
 
-import { join, dirname, normalize, basename, sep } from 'path';
+import { join, dirname, normalize, basename, resolve, sep } from 'path';
 import { homedir } from 'os';
 import { access, mkdir, symlink, lstat, readdir, readlink, realpath, rm, stat } from 'fs/promises';
 import { readFileSync } from 'fs';
@@ -46,6 +46,43 @@ export function expandTilde(path: string): string {
     return join(homedir(), pathAfterTilde);
   }
   return path;
+}
+
+/**
+ * Canonicalize a directory path into the single form stored in and looked up
+ * from `remote_agent_codebases.default_cwd`.
+ *
+ * Every writer and every reader of that column MUST resolve through this one
+ * function. The column is matched by exact string equality (and by a
+ * separator-anchored prefix), so two call sites using two different
+ * canonicalizers silently stop finding each other's rows. That is issue #2927:
+ * on Windows `fs/promises.realpath` expands an 8.3 short component
+ * (`C:\Users\RUNNER~1\…` → `C:\Users\runneradmin\…`) while `fs.realpathSync`
+ * does not, so a folder project registered by the CLI became invisible to every
+ * later command run in that same directory.
+ *
+ * `fs/promises.realpath` is the chosen implementation for two reasons. It is the
+ * only variant whose Windows short-name behaviour has actually been observed
+ * here (`fs.realpathSync.native` is believed equivalent but is unverified on
+ * Windows, so nothing depends on it). And expansion is what makes this a
+ * canonicalization at all: the long name is the one name a directory has, so
+ * the non-expanding variant would leave two spellings of one directory able to
+ * register two rows.
+ *
+ * Fail-safe: a path that cannot be resolved (missing, unreadable parent, race)
+ * canonicalizes to its own absolute form rather than throwing, so a lookup still
+ * gets an answer to reject. Nothing is swallowed — callers that require the path
+ * to exist detect it immediately afterwards (`registerFolder` stats the result;
+ * a reader misses the lookup and reports an unregistered directory).
+ */
+export async function canonicalizeProjectPath(path: string): Promise<string> {
+  const absolute = resolve(expandTilde(path));
+  try {
+    return await realpath(absolute);
+  } catch (err) {
+    getLog().debug({ err, path: absolute }, 'paths.canonicalize_project_path_failed');
+    return absolute;
+  }
 }
 
 /**

@@ -4,6 +4,7 @@ import * as codebaseDb from '@archon/core/db/codebases';
 import * as workflowDb from '@archon/core/db/workflows';
 import { createLogger, getArchonWorkspacesPath } from '@archon/paths';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowResumeCursor } from '@archon/workflows/store';
@@ -197,6 +198,34 @@ export async function resumeWorkflowRunFromServer(
           });
       },
       (error: unknown) => {
+        // A run whose terminal status could not be written is NOT an ordinary failure:
+        // its row still reads `running`, and `listDueWorkflowContinuations` only selects
+        // paused/failed rows, so nothing will revisit it. Marking it failed here would
+        // use the write channel that just failed — either it fails again, or it succeeds
+        // and buries the real error under a generic "headless resume failed". Escalate
+        // under its own tag instead and leave the row for an operator to resolve.
+        if (error instanceof TerminalStatusWriteError) {
+          log.error(
+            { err: error, runId: run.id, workflowName: run.workflow_name },
+            'workflow_resume_headless_terminal_write_failed'
+          );
+          if (destination?.resultConversationId !== undefined) {
+            void platform
+              .sendMessage(
+                destination.resultConversationId,
+                `⚠️ Run \`${run.id.slice(0, 8)}\` of **${run.workflow_name}** finished, but its ` +
+                  'final status could not be saved. The run may still show as running — check it ' +
+                  `with \`/workflow status ${run.id}\` before starting another.`
+              )
+              .catch((sendError: unknown) => {
+                log.warn(
+                  { err: sendError as Error, runId: run.id },
+                  'workflow_resume_result_surface_failed'
+                );
+              });
+          }
+          return;
+        }
         log.error(
           { err: error as Error, runId: run.id },
           'workflow_resume_headless_execute_failed'

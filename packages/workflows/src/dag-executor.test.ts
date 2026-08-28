@@ -10,6 +10,7 @@ import {
   type Mock,
 } from 'bun:test';
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -19162,6 +19163,35 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
     expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
   });
 
+  it('surfaces a failed completion write', async () => {
+    const mockStore = createMockStore();
+    (mockStore.completeWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('terminal completion write failed')
+    );
+    const platform = createMockPlatform();
+    await mkdir(artifactsDir, { recursive: true });
+    await writeFile(join(artifactsDir, 'evidence.json'), '{"proof": "landed"}');
+
+    await expect(runEvidenceWorkflow({ store: mockStore, platform })).rejects.toThrow(
+      'terminal completion write failed'
+    );
+  });
+
+  it('surfaces a failed failure write', async () => {
+    const mockStore = createMockStore();
+    (mockStore.failWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('terminal failure write failed')
+    );
+
+    await expect(
+      runEvidenceWorkflow({
+        store: mockStore,
+        platform: createMockPlatform(),
+        evidencePolicy: { required: true },
+      })
+    ).rejects.toThrow('terminal failure write failed');
+  });
+
   it('no evidence_policy declared -> completes without checking for evidence.json', async () => {
     const mockStore = createMockStore();
     const platform = createMockPlatform();
@@ -33419,5 +33449,103 @@ describe('executeDagWorkflow -- node-level mutates_checkout: false (#2771)', () 
       true
     );
     expect(nodeFailedError(deps, 'guarded')).toBeUndefined();
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Terminal status write ordering (#2910 R3)
+//
+// The terminal write can now reject. Everything that never depended on it —
+// the transcript, the live SSE event, telemetry, and the chat notification —
+// used to run unconditionally under the old log-and-continue catch, and must
+// keep doing so. These pin the ordering at the completion and failure sites.
+// ───────────────────────────────────────────────────────────────────────────
+describe('executeDagWorkflow -- side effects survive a failed terminal write', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-terminal-order-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockCaptureWorkflowCompleted.mockClear();
+  });
+
+  afterEach(async () => {
+    await removeTempTree(testDir);
+  });
+
+  /** One always-succeeding bash node, so the run reaches the completion site. */
+  const okNode: ExecNode = { id: 'ok', kind: 'exec', runtime: 'sh', script: 'echo done' };
+  /** One always-failing bash node, so the run reaches the node-failure site. */
+  const badNode: ExecNode = { id: 'bad', kind: 'exec', runtime: 'sh', script: 'exit 3' };
+
+  async function run(
+    store: MockWorkflowStore,
+    platform: MockWorkflowPlatform,
+    nodes: ExecNode[],
+    emitted: string[]
+  ): Promise<unknown> {
+    const workflowRun = makeWorkflowRun('terminal-order-run');
+    const unsubscribe = getWorkflowEventEmitter().subscribe((event: WorkflowEmitterEvent) => {
+      if ('runId' in event && event.runId === workflowRun.id) emitted.push(event.type);
+    });
+    try {
+      return await executeDagWorkflow(
+        createMockDeps(store),
+        platform,
+        'conv-terminal-order',
+        testDir,
+        { name: 'terminal-order', nodes },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  it('still emits workflow_completed and telemetry when the completion write rejects', async () => {
+    const store = createMockStore();
+    store.completeWorkflowRun = mock(async () => {
+      throw new Error('completion write failed');
+    });
+    const emitted: string[] = [];
+
+    await expect(run(store, createMockPlatform(), [okNode], emitted)).rejects.toThrow(
+      'Failed to persist terminal workflow status'
+    );
+
+    expect(emitted).toContain('workflow_completed');
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'completed' })
+    );
+  });
+
+  it('still emits workflow_failed and notifies the user when the failure write rejects', async () => {
+    const store = createMockStore();
+    store.failWorkflowRun = mock(async () => {
+      throw new Error('failure write failed');
+    });
+    const platform = createMockPlatform();
+    const emitted: string[] = [];
+
+    // One node succeeds and one fails, so the run reaches the node-failure site
+    // rather than the no-nodes-completed one.
+    await expect(run(store, platform, [okNode, badNode], emitted)).rejects.toThrow(
+      'Failed to persist terminal workflow status'
+    );
+
+    expect(emitted).toContain('workflow_failed');
+    const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+    expect(sent.some(m => m.includes('completed with failures'))).toBe(true);
   });
 });
