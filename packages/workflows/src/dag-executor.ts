@@ -6679,7 +6679,15 @@ async function executeLoopNode(
         // grammar-constrained decoding the assistant prose is routinely EMPTY because
         // the whole answer arrived as the payload. Failing that would make every
         // Claude/Codex structured loop fail on iteration 1.
-        if (fullOutput.trim() === '' && attemptStructured === undefined) {
+        //
+        // A timed-out `output_format` iteration is exempt too: the structured branch
+        // below owns it, naming the contract that failed and failing on the first
+        // attempt. That mirrors executeNodeInternal, where this generic guard is
+        // unreachable once `output_format` is set, and mirrors canReask's own
+        // idle-timeout exclusion — a retry would spend another full idle_timeout
+        // window per attempt for the same answer.
+        const structuredTimeout = wantsStructured && iterationIdleTimedOut;
+        if (!structuredTimeout && fullOutput.trim() === '' && attemptStructured === undefined) {
           const iterationDuration = Date.now() - iterationStart;
           const emptyError = iterationIdleTimedOut
             ? `Loop node '${node.id}' iteration ${String(i)} timed out with no output (idle for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
@@ -6722,8 +6730,13 @@ async function executeLoopNode(
         }
 
         // A timeout after output can still preserve useful work, as with an
-        // ordinary AI node whose provider process fails to exit cleanly.
-        if (iterationIdleTimedOut) {
+        // ordinary AI node whose provider process fails to exit cleanly. A
+        // zero-output timeout is a failure on every branch below, so never announce
+        // it as a completion — same condition as executeNodeInternal's notification.
+        if (
+          iterationIdleTimedOut &&
+          (fullOutput.trim() !== '' || attemptStructured !== undefined)
+        ) {
           await safeSendMessage(
             platform,
             conversationId,
