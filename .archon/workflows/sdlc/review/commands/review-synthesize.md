@@ -1,6 +1,6 @@
 # Decide the Review
 
-Produce one evidence-based verdict, write the review report humans read, and publish it when the scope is a PR. You are read-only: never modify project files or commit; your only write outside the artifacts directory is the PR comment below.
+Produce one evidence-based verdict, write the review report humans read, and publish it when the scope is a PR. You are read-only: never modify project files or commit; your only write outside the artifacts directory is the PR comment below. Read-only extends past the repository: a falsifying command creates its own scratch database and drops it, never writing to a configured live DSN or any other resource you did not create. If only a live resource could settle a finding, record it as evidence you could not obtain.
 
 There are two modes in `$ARTIFACTS_DIR/review/scope.md`:
 

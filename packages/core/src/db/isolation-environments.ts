@@ -2,6 +2,10 @@
  * Database operations for isolation environments
  */
 import { pool, getDialect, getDatabaseType } from './connection';
+import {
+  TERMINAL_WORKFLOW_STATUSES,
+  RESUMABLE_WORKFLOW_STATUSES,
+} from '@archon/workflows/schemas/workflow-run';
 import type {
   IsolationEnvironmentRow,
   IsolationWorkflowType,
@@ -244,14 +248,58 @@ export async function countActiveByCodebase(codebaseId: string): Promise<number>
 }
 
 /**
- * Find conversations using an isolation environment
+ * A run releases its environment only once it can never claim it again: terminal
+ * AND not resumable. 'failed' is terminal but resumable, and its worktree/branch is
+ * the only estate `workflow run --resume` and `--adopt` can attach to — cleanup's
+ * destroy path force-deletes the local branch (`git branch -D`, regardless of merge
+ * state), so releasing a failed run's env discards committed-but-unpushed work with
+ * no recovery path. Derived rather than hand-listed so a new resumable status keeps
+ * its pin automatically.
  */
-export async function getConversationsUsingEnv(envId: string): Promise<string[]> {
-  const result = await pool.query<{ id: string }>(
-    'SELECT id FROM remote_agent_conversations WHERE isolation_env_id = $1',
-    [envId]
+const UNCLAIMABLE_WORKFLOW_STATUSES = TERMINAL_WORKFLOW_STATUSES.filter(
+  status => !RESUMABLE_WORKFLOW_STATUSES.includes(status)
+);
+
+/**
+ * Find a workflow run that still owns an environment — the one signal that pins an
+ * env for cleanup. Historical conversation rows are data, not locks: every
+ * CLI-launched run leaves one behind, so counting references pinned every
+ * environment forever (#2868).
+ *
+ * "Owns" means the run can still act on the estate: it is running, pending or
+ * paused, or it failed and remains resumable. See UNCLAIMABLE_WORKFLOW_STATUSES.
+ *
+ * A run attaches to an env through either route the code stamps:
+ * - its own metadata.isolation_env_id (container runs, sub-run child worktrees)
+ * - its worker conversation's isolation_env_id (top-level runs)
+ */
+export async function getLiveRunOwningEnv(
+  envId: string
+): Promise<{ id: string; status: string } | null> {
+  const postgres = getDatabaseType() === 'postgresql';
+  const envIdExtract = postgres
+    ? "r.metadata->>'isolation_env_id'"
+    : "json_extract(r.metadata, '$.isolation_env_id')";
+  // Postgres types conversations.isolation_env_id as UUID; the cast keeps the
+  // shared $1 parameter text-typed across both OR branches — an untyped $1
+  // compared against text and UUID columns in one OR is rejected at parse time.
+  const conversationEnvMatch = postgres ? 'c.isolation_env_id::text' : 'c.isolation_env_id';
+  // Placeholders follow the unclaimable statuses' length so a new status extends
+  // the IN list without a hand-edited parameter position.
+  const unclaimablePlaceholders = UNCLAIMABLE_WORKFLOW_STATUSES.map(
+    (_, i) => `$${String(i + 2)}`
+  ).join(', ');
+  const result = await pool.query<{ id: string; status: string }>(
+    `SELECT r.id, r.status
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_conversations c ON c.id = r.conversation_id
+     WHERE (r.status NOT IN (${unclaimablePlaceholders}))
+       AND (${envIdExtract} = $1 OR ${conversationEnvMatch} = $1)
+     ORDER BY r.started_at DESC
+     LIMIT 1`,
+    [envId, ...UNCLAIMABLE_WORKFLOW_STATUSES]
   );
-  return result.rows.map(r => r.id);
+  return result.rows[0] ?? null;
 }
 
 /**

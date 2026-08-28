@@ -14,10 +14,14 @@ mock.module('@archon/git', () => ({
 const mockListAllActiveWithCodebase = mock(() => Promise.resolve([]));
 const mockListByCodebaseWithAge = mock(() => Promise.resolve([]));
 const mockUpdateStatus = mock(() => Promise.resolve());
+const mockGetLiveRunOwningEnv = mock(
+  (): Promise<{ id: string; status: string } | null> => Promise.resolve(null)
+);
 mock.module('../db/isolation-environments', () => ({
   listAllActiveWithCodebase: mockListAllActiveWithCodebase,
   listByCodebaseWithAge: mockListByCodebaseWithAge,
   updateStatus: mockUpdateStatus,
+  getLiveRunOwningEnv: mockGetLiveRunOwningEnv,
 }));
 
 const mockCleanupStale = mock(() => Promise.resolve({ removed: 0, errors: [] }));
@@ -77,6 +81,8 @@ describe('listEnvironments', () => {
     mockListByCodebaseWithAge.mockClear();
     mockWorktreeExists.mockClear();
     mockUpdateStatus.mockClear();
+    mockGetLiveRunOwningEnv.mockClear();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
     mockLogger.info.mockClear();
     mockLogger.warn.mockClear();
   });
@@ -107,6 +113,31 @@ describe('listEnvironments', () => {
     expect(mockUpdateStatus).toHaveBeenCalledWith('env-ghost', 'destroyed');
     expect(result.ghostsReconciled).toBe(1);
     expect(result.totalEnvironments).toBe(0); // re-fetch returned empty
+  });
+
+  // listEnvironments() runs ahead of the per-item live-run guard in the `isolation
+  // cleanup` commands, so ghosting a row here would hide it from that guard and
+  // invalidate the owning run's resume handle.
+  test('leaves a missing worktree active when a run can still claim it', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([makeActiveEnv()]);
+    const env = makeEnvWithAge({ id: 'env-owned', working_path: '/worktrees/gone' });
+    mockListByCodebaseWithAge.mockResolvedValueOnce([env]);
+    mockWorktreeExists.mockResolvedValueOnce(false);
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
+      Promise.resolve({ id: 'run-abcdef12', status: 'failed' })
+    );
+
+    const result = await listEnvironments();
+
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(result.ghostsReconciled).toBe(0);
+    // No re-fetch, and the env stays visible so the operator can act on it.
+    expect(mockListByCodebaseWithAge).toHaveBeenCalledTimes(1);
+    expect(result.totalEnvironments).toBe(1);
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ envId: 'env-owned', runId: 'run-abcdef12', runStatus: 'failed' }),
+      'isolation.ghost_kept_for_live_run'
+    );
   });
 
   test('does not re-fetch when no ghosts found', async () => {

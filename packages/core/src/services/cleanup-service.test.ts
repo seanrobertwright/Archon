@@ -61,7 +61,9 @@ mock.module('@archon/isolation', () => ({
 // Mock isolation-environments DB
 const mockListAllActiveWithCodebase = mock(() => Promise.resolve([]));
 const mockUpdateStatus = mock(() => Promise.resolve());
-const mockGetConversationsUsingEnv = mock(() => Promise.resolve([]));
+const mockGetLiveRunOwningEnv = mock(
+  (): Promise<{ id: string; status: string } | null> => Promise.resolve(null)
+);
 const mockGetById = mock(() => Promise.resolve(null));
 const mockListByCodebase = mock(() => Promise.resolve([]));
 const mockListByCodebaseWithAge = mock(() => Promise.resolve([]));
@@ -70,7 +72,7 @@ const mockListActiveContainerEnvironments = mock((): Promise<unknown[]> => Promi
 mock.module('../db/isolation-environments', () => ({
   listAllActiveWithCodebase: mockListAllActiveWithCodebase,
   updateStatus: mockUpdateStatus,
-  getConversationsUsingEnv: mockGetConversationsUsingEnv,
+  getLiveRunOwningEnv: mockGetLiveRunOwningEnv,
   getById: mockGetById,
   listByCodebase: mockListByCodebase,
   listByCodebaseWithAge: mockListByCodebaseWithAge,
@@ -79,7 +81,8 @@ mock.module('../db/isolation-environments', () => ({
   createIsolationStore: () => ({}),
 }));
 
-// Mock workflows DB (getRunByIsolationEnvId — reaper run-status lookup)
+// Mock workflows DB (getRunByIsolationEnvId — the run id/status `isolation list`
+// displays for a container env; the reaper's own lock is getLiveRunOwningEnv)
 const mockGetRunByIsolationEnvId = mock(
   (): Promise<{ id: string; status: string } | null> => Promise.resolve(null)
 );
@@ -142,14 +145,15 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
   };
   beforeEach(() => {
     mockListActiveContainerEnvironments.mockReset();
-    mockGetRunByIsolationEnvId.mockReset();
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
     mockContainerDestroy.mockReset();
     mockContainerDestroy.mockImplementation(() => Promise.resolve());
   });
 
   test('does NOT destroy when the run lookup throws — reports the error instead', async () => {
     mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
-    mockGetRunByIsolationEnvId.mockImplementation(() => Promise.reject(new Error('DB down')));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.reject(new Error('DB down')));
 
     const report = await cleanupContainerEnvironments(7);
     expect(mockContainerDestroy).not.toHaveBeenCalled();
@@ -160,7 +164,7 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
 
   test('never reaps a PAUSED run’s container (awaited state)', async () => {
     mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
-    mockGetRunByIsolationEnvId.mockImplementation(() =>
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
       Promise.resolve({ id: 'run-1', status: 'paused' })
     );
     const report = await cleanupContainerEnvironments(7);
@@ -168,11 +172,22 @@ describe('cleanupContainerEnvironments — H3 fail-closed on lookup error', () =
     expect(report.skipped).toHaveLength(1);
   });
 
-  test('reaps a terminal run’s container older than the threshold', async () => {
+  // The reaper reads the same lock the worktree sweeps use, so a failed run's
+  // container survives for `--resume` exactly as a paused one does.
+  test('never reaps a FAILED run’s container (still resumable)', async () => {
     mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
-    mockGetRunByIsolationEnvId.mockImplementation(() =>
-      Promise.resolve({ id: 'run-1', status: 'completed' })
+    mockGetLiveRunOwningEnv.mockImplementation(() =>
+      Promise.resolve({ id: 'run-1', status: 'failed' })
     );
+    const report = await cleanupContainerEnvironments(7);
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+    expect(report.skipped).toHaveLength(1);
+    expect(report.skipped[0]?.reason).toBe('run run-1 is failed');
+  });
+
+  test('reaps a container no run can claim, older than the threshold', async () => {
+    mockListActiveContainerEnvironments.mockImplementation(() => Promise.resolve([oldRow]));
+    mockGetLiveRunOwningEnv.mockImplementation(() => Promise.resolve(null));
     const report = await cleanupContainerEnvironments(7);
     expect(mockContainerDestroy).toHaveBeenCalledTimes(1);
     expect(report.removed).toEqual(['env-1']);
@@ -560,7 +575,7 @@ describe('runScheduledCleanup', () => {
     mockDestroy.mockClear();
     mockListAllActiveWithCodebase.mockClear();
     mockUpdateStatus.mockClear();
-    mockGetConversationsUsingEnv.mockClear();
+    mockGetLiveRunOwningEnv.mockClear();
     mockGetById.mockClear();
     mockGetCodebase.mockClear();
     mockDeleteOldSessions.mockClear();
@@ -654,7 +669,6 @@ describe('runScheduledCleanup', () => {
     mockIsBranchMerged.mockResolvedValueOnce(true);
     // hasUncommittedChanges returns false (default)
     // No conversations using it
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     // For removeEnvironment: getById returns the env
     mockGetById.mockResolvedValueOnce({
       id: 'env-456',
@@ -698,7 +712,6 @@ describe('runScheduledCleanup', () => {
     mockIsBranchMerged.mockResolvedValueOnce(true);
     // hasUncommittedChanges returns false (default)
     // No conversations
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     // For removeEnvironment: getById
     mockGetById.mockResolvedValueOnce({
       id: 'env-merged-remote',
@@ -757,6 +770,101 @@ describe('runScheduledCleanup', () => {
       reason: 'merged but has uncommitted changes',
     });
     expect(report.removed).toHaveLength(0);
+  });
+
+  test('skips merged branches with a live owning run and a live-run reason', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-live',
+        working_path: '/workspace/repo/worktrees/issue-11',
+        branch_name: 'issue-11',
+        status: 'active',
+        created_by_platform: 'github',
+        created_at: new Date(),
+        codebase_default_cwd: '/workspace/repo',
+        codebase_id: 'codebase-1',
+        workflow_type: 'issue',
+        workflow_id: '11',
+        provider: 'worktree',
+        metadata: {},
+      },
+    ]);
+    mockWorktreeExists.mockResolvedValueOnce(true);
+    mockIsBranchMerged.mockResolvedValueOnce(true);
+    // hasUncommittedChanges returns false (default from beforeEach)
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live-1', status: 'paused' });
+
+    const report = await runScheduledCleanup();
+
+    expect(report.skipped).toContainEqual({
+      id: 'env-live',
+      reason: 'merged but run run-live is paused',
+    });
+    expect(report.removed).toHaveLength(0);
+  });
+
+  test('skips stale environments with a live owning run', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-stale-live',
+        working_path: '/workspace/repo/worktrees/issue-12',
+        branch_name: 'issue-12',
+        status: 'active',
+        created_by_platform: 'github',
+        created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), // 30 days old
+        codebase_default_cwd: '/workspace/repo',
+        codebase_id: 'codebase-1',
+        workflow_type: 'issue',
+        workflow_id: '12',
+        provider: 'worktree',
+        metadata: {},
+      },
+    ]);
+    mockWorktreeExists.mockResolvedValueOnce(true);
+    // isBranchMerged stays false (default from beforeEach)
+    // getLastCommitDate stays null (default from beforeEach), so staleness
+    // falls back to the 30-day creation age.
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live-stale-1', status: 'running' });
+
+    const report = await runScheduledCleanup();
+
+    expect(report.skipped).toContainEqual({
+      id: 'env-stale-live',
+      reason: 'stale but run run-live is running',
+    });
+    expect(report.removed).toHaveLength(0);
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+  });
+
+  test('skips path-missing environments owned by a live run', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-missing-live',
+        working_path: '/workspace/repo/worktrees/issue-13',
+        branch_name: 'issue-13',
+        status: 'active',
+        created_by_platform: 'github',
+        created_at: new Date(),
+        codebase_default_cwd: '/workspace/repo',
+        codebase_id: 'codebase-1',
+        workflow_type: 'issue',
+        workflow_id: '13',
+        provider: 'worktree',
+        metadata: {},
+      },
+    ]);
+    // worktreeExists stays false (default from beforeEach): path missing
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-missing-live', status: 'paused' });
+
+    const report = await runScheduledCleanup();
+
+    expect(report.skipped).toContainEqual({
+      id: 'env-missing-live',
+      reason: 'path missing but run run-miss is paused',
+    });
+    expect(report.removed).toHaveLength(0);
+    expect(mockDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
   });
 
   test('skips telegram environments', async () => {
@@ -1046,7 +1154,7 @@ describe('cleanupMergedWorktrees', () => {
   beforeEach(() => {
     mockExecFileAsync.mockClear();
     mockDestroy.mockClear();
-    mockGetConversationsUsingEnv.mockClear();
+    mockGetLiveRunOwningEnv.mockClear();
     mockGetById.mockClear();
     mockListByCodebase.mockClear();
     mockGetDefaultBranch.mockClear();
@@ -1083,7 +1191,6 @@ describe('cleanupMergedWorktrees', () => {
     mockIsBranchMerged.mockResolvedValueOnce(true);
     // hasUncommittedChanges returns false (default from beforeEach)
     // No conversations
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     // For removeEnvironment: getById
     mockGetById.mockResolvedValueOnce({
       id: 'env-merged',
@@ -1180,12 +1287,12 @@ describe('cleanupMergedWorktrees', () => {
     });
   });
 
-  test('skips merged branches with conversation references', async () => {
+  test('skips merged branches with a live owning run', async () => {
     mockListByCodebase.mockResolvedValueOnce([
       {
-        id: 'env-in-use',
-        branch_name: 'in-use-branch',
-        working_path: '/workspace/repo/worktrees/in-use-branch',
+        id: 'env-live-run',
+        branch_name: 'live-run-branch',
+        working_path: '/workspace/repo/worktrees/live-run-branch',
         status: 'active',
       },
     ]);
@@ -1194,16 +1301,44 @@ describe('cleanupMergedWorktrees', () => {
     // isBranchMerged returns true
     mockIsBranchMerged.mockResolvedValueOnce(true);
     // hasUncommittedChanges returns false (default from beforeEach)
-    // Has conversation references
-    mockGetConversationsUsingEnv.mockResolvedValueOnce(['conv-1', 'conv-2']);
+    // A running workflow owns the environment
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-abc12345-6789', status: 'running' });
 
     const result = await cleanupMergedWorktrees('codebase-1', '/workspace/repo');
 
     expect(result.removed).toHaveLength(0);
     expect(result.skipped).toContainEqual({
-      branchName: 'in-use-branch',
-      reason: 'still used by 2 conversation(s)',
+      branchName: 'live-run-branch',
+      reason: 'run run-abc1 is running',
     });
+  });
+
+  test('cleans a merged environment pinned only by historical conversation references (#2868)', async () => {
+    mockListByCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-historical',
+        branch_name: 'historical-branch',
+        working_path: '/workspace/repo/worktrees/historical-branch',
+        status: 'active',
+      },
+    ]);
+
+    mockIsBranchMerged.mockResolvedValueOnce(true);
+    // No live work: the env's conversation and runs are all terminal history.
+    // getLiveRunOwningEnv default (null) covers this — nothing to stub.
+
+    // For removeEnvironment: getById returns the env
+    mockGetById.mockResolvedValueOnce({
+      id: 'env-historical',
+      working_path: '/workspace/repo/worktrees/historical-branch',
+      status: 'active',
+    });
+    // worktreeExists returns false (default) — destroy still runs for branch cleanup
+
+    const result = await cleanupMergedWorktrees('codebase-1', '/workspace/repo');
+
+    expect(result.removed).toContain('historical-branch');
+    expect(result.skipped).toHaveLength(0);
   });
 
   test('removes branch when git-cherry detects squash-merge', async () => {
@@ -1217,7 +1352,6 @@ describe('cleanupMergedWorktrees', () => {
     ]);
     mockIsBranchMerged.mockResolvedValueOnce(false);
     mockIsPatchEquivalent.mockResolvedValueOnce(true);
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     mockGetById.mockResolvedValueOnce({
       id: 'env-squash',
       working_path: '/workspace/repo/worktrees/squash-branch',
@@ -1242,7 +1376,6 @@ describe('cleanupMergedWorktrees', () => {
     mockIsBranchMerged.mockResolvedValueOnce(false);
     mockIsPatchEquivalent.mockResolvedValueOnce(false);
     mockGetPrState.mockResolvedValueOnce('MERGED');
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     mockGetById.mockResolvedValueOnce({
       id: 'env-pr-merged',
       working_path: '/workspace/repo/worktrees/pr-merged-branch',
@@ -1307,7 +1440,6 @@ describe('cleanupMergedWorktrees', () => {
     mockIsBranchMerged.mockResolvedValueOnce(false);
     mockIsPatchEquivalent.mockResolvedValueOnce(false);
     mockGetPrState.mockResolvedValueOnce('CLOSED');
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     mockGetById.mockResolvedValueOnce({
       id: 'env-pr-closed-include',
       working_path: '/workspace/repo/worktrees/pr-closed-branch',
@@ -1508,7 +1640,7 @@ describe('onConversationClosed', () => {
     mockUpdateStatus.mockClear();
     mockGetById.mockClear();
     mockGetCodebase.mockClear();
-    mockGetConversationsUsingEnv.mockClear();
+    mockGetLiveRunOwningEnv.mockClear();
     mockGetConversationByPlatformId.mockClear();
     mockGetActiveSession.mockClear();
     mockUpdateConversation.mockClear();
@@ -1539,8 +1671,6 @@ describe('onConversationClosed', () => {
       branch_name: 'feature-y',
       status: 'active',
     });
-
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
 
     mockGetById.mockResolvedValueOnce({
       id: 'env-with-session',
@@ -1583,7 +1713,6 @@ describe('onConversationClosed', () => {
     });
 
     // No other conversations use this env
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
 
     // For removeEnvironment: getById
     mockGetById.mockResolvedValueOnce({
@@ -1633,7 +1762,6 @@ describe('onConversationClosed', () => {
     });
 
     // No other conversations use this env
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
 
     // For removeEnvironment: getById
     mockGetById.mockResolvedValueOnce({
@@ -1679,7 +1807,6 @@ describe('onConversationClosed', () => {
       status: 'active',
     };
     mockGetById.mockResolvedValueOnce(env);
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     mockGetById.mockResolvedValueOnce(env);
     mockGetCodebase.mockResolvedValueOnce({
       id: 'codebase-1',
@@ -1694,6 +1821,31 @@ describe('onConversationClosed', () => {
       isolation_env_id: null,
       cwd: null,
     });
+  });
+
+  test('a live owning run keeps the env AND the conversation reference intact', async () => {
+    mockGetConversationByPlatformId.mockResolvedValueOnce({
+      id: 'conv-live-run',
+      isolation_env_id: 'env-live-run',
+      cwd: '/workspace/worktrees/pr-400',
+    });
+    mockGetActiveSession.mockResolvedValueOnce(null);
+    mockGetById.mockResolvedValueOnce({
+      id: 'env-live-run',
+      codebase_id: 'codebase-1',
+      working_path: '/workspace/worktrees/pr-400',
+      branch_name: 'feature-live',
+      status: 'active',
+    });
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live', status: 'paused' });
+
+    await onConversationClosed('github', 'owner/repo#400');
+
+    expect(mockDestroy).not.toHaveBeenCalled();
+    // The null-out runs only AFTER the live-run check: a top-level run attaches
+    // to its env solely through this reference, so clearing before checking
+    // would erase the pin and let the env be removed under a live run.
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
   });
 
   test('leaves an unrelated cwd untouched', async () => {
@@ -1712,7 +1864,6 @@ describe('onConversationClosed', () => {
       status: 'active',
     };
     mockGetById.mockResolvedValueOnce(env);
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     mockGetById.mockResolvedValueOnce(env);
     mockGetCodebase.mockResolvedValueOnce({
       id: 'codebase-1',
@@ -1732,7 +1883,7 @@ describe('cleanupStaleWorktrees', () => {
   beforeEach(() => {
     mockExecFileAsync.mockClear();
     mockDestroy.mockClear();
-    mockGetConversationsUsingEnv.mockClear();
+    mockGetLiveRunOwningEnv.mockClear();
     mockGetById.mockClear();
     mockListByCodebaseWithAge.mockClear();
     mockHasUncommittedChanges.mockClear();
@@ -1758,7 +1909,6 @@ describe('cleanupStaleWorktrees', () => {
 
     // hasUncommittedChanges returns false (default from beforeEach)
     // No conversations
-    mockGetConversationsUsingEnv.mockResolvedValueOnce([]);
     // For removeEnvironment: getById
     mockGetById.mockResolvedValueOnce({
       id: 'env-stale',
@@ -1832,5 +1982,30 @@ describe('cleanupStaleWorktrees', () => {
       branchName: 'dirty-stale-branch',
       reason: 'has uncommitted changes',
     });
+  });
+
+  test('skips stale worktrees owned by a live run', async () => {
+    mockListByCodebaseWithAge.mockResolvedValueOnce([
+      {
+        id: 'env-live-stale',
+        branch_name: 'live-stale-branch',
+        working_path: '/workspace/repo/worktrees/live-stale-branch',
+        created_by_platform: 'slack',
+        days_since_activity: 30,
+        status: 'active',
+      },
+    ]);
+
+    // hasUncommittedChanges returns false (default from beforeEach)
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live-stale', status: 'paused' });
+
+    const result = await cleanupStaleWorktrees('codebase-1', '/workspace/repo');
+
+    expect(result.removed).toHaveLength(0);
+    expect(result.skipped).toContainEqual({
+      branchName: 'live-stale-branch',
+      reason: 'run run-live is paused',
+    });
+    expect(mockGetById).not.toHaveBeenCalled();
   });
 });
