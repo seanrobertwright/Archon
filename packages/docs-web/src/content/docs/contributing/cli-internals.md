@@ -311,7 +311,8 @@ packages/cli/
                                   │ safe=true
                                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ Guard checks: no uncommitted changes, no active conversations   │
+│ Guard checks: no uncommitted changes, no non-terminal run       │
+│ owns the env (getRemovalBlocker)                                │
 │ provider.destroy() → remove worktree + delete remote branch     │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -320,7 +321,7 @@ Signals are evaluated in order — the first positive match short-circuits to av
 unnecessary `gh` API calls. The `gh` CLI is a soft dependency: if missing or failing,
 only git signals are used and the result degrades gracefully to `NONE`.
 
-**Code:** `packages/core/src/services/cleanup-service.ts` — `isSafeToRemove()`, `cleanupMergedWorktrees()`
+**Code:** `packages/core/src/services/cleanup-service.ts` — `isSafeToRemove()`, `cleanupMergedWorktrees()`, `getRemovalBlocker()`
 **Code:** `packages/isolation/src/pr-state.ts` — `getPrState()`
 **Code:** `packages/git/src/branch.ts` — `isPatchEquivalent()`
 
