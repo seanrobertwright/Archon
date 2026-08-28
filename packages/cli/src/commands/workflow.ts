@@ -1170,7 +1170,7 @@ interface WorkflowJsonEntry {
 export async function workflowTestCommand(
   cwd: string,
   target: string | undefined,
-  options: { json?: boolean } = {}
+  options: { json?: boolean; targetCwd?: string } = {}
 ): Promise<number> {
   const { workflows, errors } = await loadWorkflows(cwd);
   // The fixture runner freezes this repo's source before executing anything, exactly as
@@ -1187,6 +1187,7 @@ export async function workflowTestCommand(
     report = await runFixtures({
       workflows,
       cwd,
+      ...(options.targetCwd !== undefined ? { targetCwd: options.targetCwd } : {}),
       sourceConfig: workflowSourceConfigFrom(config),
       ...(target !== undefined ? { target } : {}),
     });

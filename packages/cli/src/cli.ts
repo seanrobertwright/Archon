@@ -198,7 +198,8 @@ Commands:
   workflow test [<name>|<folder>|<path>]
                              Run declared dry-run fixtures (fixtures/*.stubs.yaml) for a
                              workflow, a workflow folder or pack (by name or directory
-                             path); with no target, runs every fixture. Never creates a
+                             path); relative paths resolve from the invoking directory before the
+                             repository root. With no target, runs every fixture. Never creates a
                              run or contacts a provider; exec-code fixtures execute in a
                              scratch worktree of HEAD
   isolation list             List all active worktrees/environments
@@ -495,7 +496,7 @@ async function main(): Promise<number> {
         // Resolve to the repo root like the git gate below does, so project
         // workflow discovery reads the repository, not a subdirectory of it.
         const testCwd = requiresGitRepo ? ((await git.findRepoRoot(cwd)) ?? cwd) : cwd;
-        return await workflowTestCommand(testCwd, target, { json: jsonFlag });
+        return await workflowTestCommand(testCwd, target, { json: jsonFlag, targetCwd: cwd });
       } catch (error) {
         const err = error as Error;
         if (jsonFlag) {

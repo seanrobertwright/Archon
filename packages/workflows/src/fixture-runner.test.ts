@@ -544,6 +544,47 @@ describe('runFixtures', () => {
     await expect(fixtureLabels(undefined)).resolves.toHaveLength(3);
   });
 
+  it('resolves relative path targets from the invoking directory before the project root', async () => {
+    const { cwd } = writeNestedPackProject();
+    const invokingDir = join(cwd, 'tools');
+    mkdirSync(invokingDir, { recursive: true });
+    const workflows = [
+      ...workflowsOnDisk(cwd, ['plan-wf'], 'sdlc/plan'),
+      ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+      ...workflowsOnDisk(cwd, ['ext-wf'], 'sdlc-ext/ext'),
+    ];
+
+    await expect(
+      runFixtures({
+        workflows,
+        cwd,
+        targetCwd: invokingDir,
+        target: '../.archon/workflows/sdlc/plan',
+      }).then(report => report.results.map(result => result.fixture))
+    ).resolves.toEqual(['sdlc/plan/fixtures/plan.stubs.yaml']);
+
+    await expect(
+      runFixtures({
+        workflows,
+        cwd,
+        targetCwd: invokingDir,
+        target: '.archon/workflows/sdlc',
+      }).then(report => report.results.map(result => result.fixture))
+    ).resolves.toEqual([
+      'sdlc/plan/fixtures/plan.stubs.yaml',
+      'sdlc/ship/fixtures/ship.stubs.yaml',
+    ]);
+
+    await expect(
+      runFixtures({ workflows, cwd, targetCwd: invokingDir, target: 'sdlc' }).then(report =>
+        report.results.map(result => result.fixture)
+      )
+    ).resolves.toEqual([
+      'sdlc/plan/fixtures/plan.stubs.yaml',
+      'sdlc/ship/fixtures/ship.stubs.yaml',
+    ]);
+  });
+
   // Junctions would also resolve on Windows, but fs.realpath's junction handling is
   // platform-dependent; ubuntu CI already runs this, and that is where the tmpdir
   // realpath is the identity and the symlink spelling is the only protection.
