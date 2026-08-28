@@ -200,7 +200,7 @@ export function parsePiRunConfig(raw: Record<string, unknown>): ParsedPiConfig {
   if (model !== undefined) {
     const parsedModel = parsePiModelRef(model);
     if (parsedModel === undefined) {
-      invalidRunConfigValue('model', "'<provider>/<model>'");
+      invalidRunConfigValue('model', "a Pi vendor/model reference such as 'minimax/minimax-m3'");
     }
     model = `${parsedModel.provider}/${parsedModel.modelId}`;
   }

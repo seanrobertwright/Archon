@@ -9665,6 +9665,123 @@ describe('workflowTestCommand', () => {
     expect(fixtureRunner.formatFixtureReport).toHaveBeenCalled();
   });
 
+  it('reports load failures alongside passing fixture results and exits 1', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [
+        {
+          filename: 'broken.yaml',
+          error: 'YAML parse error: unexpected end of document',
+          errorType: 'parse_error',
+        },
+      ],
+    });
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockResolvedValue({
+      results: [],
+      passed: 1,
+      failed: 0,
+    });
+
+    const exit = await workflowTestCommand('/test/path', undefined);
+
+    expect(exit).toBe(1);
+    expect(fixtureRunner.runFixtures).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      })
+    );
+    expect(firstJsonPayload(stdoutSpy)).toContain('1 workflow(s) failed to load:');
+    expect(firstJsonPayload(stdoutSpy)).toContain(
+      '  broken.yaml: YAML parse error: unexpected end of document'
+    );
+  });
+
+  it('includes load failures in JSON fixture reports and exits 1', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    const error = {
+      filename: 'broken.yaml',
+      error: 'YAML parse error: unexpected end of document',
+      errorType: 'parse_error' as const,
+    };
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'plan' }, 'project')],
+      errors: [error],
+    });
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockResolvedValue({
+      results: [],
+      passed: 1,
+      failed: 0,
+    });
+
+    const exit = await workflowTestCommand('/test/path', undefined, { json: true });
+
+    expect(exit).toBe(1);
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
+      results: [],
+      passed: 1,
+      failed: 0,
+      errors: [error],
+    });
+  });
+
+  it('reports load failures when fixture target selection fails', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [],
+      errors: [
+        {
+          filename: 'broken.yaml',
+          error: 'YAML parse error: unexpected end of document',
+          errorType: 'parse_error',
+        },
+      ],
+    });
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error("No fixtures found for 'missing'.")
+    );
+
+    const exit = await workflowTestCommand('/test/path', 'missing');
+
+    expect(exit).toBe(1);
+    expect(firstJsonPayload(stdoutSpy)).toContain("Error: No fixtures found for 'missing'.");
+    expect(firstJsonPayload(stdoutSpy)).toContain('1 workflow(s) failed to load:');
+    expect(firstJsonPayload(stdoutSpy)).toContain(
+      '  broken.yaml: YAML parse error: unexpected end of document'
+    );
+  });
+
+  it('includes load failures when fixture target selection fails in JSON', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    const error = {
+      filename: 'broken.yaml',
+      error: 'YAML parse error: unexpected end of document',
+      errorType: 'parse_error' as const,
+    };
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [],
+      errors: [error],
+    });
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error("No fixtures found for 'missing'.")
+    );
+
+    const exit = await workflowTestCommand('/test/path', 'missing', { json: true });
+
+    expect(exit).toBe(1);
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
+      ok: false,
+      error: "No fixtures found for 'missing'.",
+      errors: [error],
+    });
+  });
+
   it("freezes the repo's own command policy, not the default folders (#2851)", async () => {
     // The capture decides which directories a fixture can resolve a command from, so a
     // repo that moved `commands.folder` must have THAT folder frozen. Reading the value
