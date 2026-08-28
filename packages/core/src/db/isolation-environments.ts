@@ -257,10 +257,14 @@ export async function countActiveByCodebase(codebaseId: string): Promise<number>
 export async function getLiveRunOwningEnv(
   envId: string
 ): Promise<{ id: string; status: string } | null> {
-  const envIdExtract =
-    getDatabaseType() === 'postgresql'
-      ? "r.metadata->>'isolation_env_id'"
-      : "json_extract(r.metadata, '$.isolation_env_id')";
+  const postgres = getDatabaseType() === 'postgresql';
+  const envIdExtract = postgres
+    ? "r.metadata->>'isolation_env_id'"
+    : "json_extract(r.metadata, '$.isolation_env_id')";
+  // Postgres types conversations.isolation_env_id as UUID; the cast keeps the
+  // shared $1 parameter text-typed across both OR branches — an untyped $1
+  // compared against text and UUID columns in one OR is rejected at parse time.
+  const conversationEnvMatch = postgres ? 'c.isolation_env_id::text' : 'c.isolation_env_id';
   // Placeholders follow the terminal statuses' length so a new terminal status
   // extends the IN list without a hand-edited parameter position.
   const terminalPlaceholders = TERMINAL_WORKFLOW_STATUSES.map((_, i) => `$${String(i + 2)}`).join(
@@ -271,7 +275,7 @@ export async function getLiveRunOwningEnv(
      FROM remote_agent_workflow_runs r
      LEFT JOIN remote_agent_conversations c ON c.id = r.conversation_id
      WHERE (r.status NOT IN (${terminalPlaceholders}))
-       AND (${envIdExtract} = $1 OR c.isolation_env_id = $1)
+       AND (${envIdExtract} = $1 OR ${conversationEnvMatch} = $1)
      ORDER BY r.started_at DESC
      LIMIT 1`,
     [envId, ...TERMINAL_WORKFLOW_STATUSES]

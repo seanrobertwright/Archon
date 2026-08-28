@@ -1746,6 +1746,31 @@ describe('onConversationClosed', () => {
     });
   });
 
+  test('a live owning run keeps the env AND the conversation reference intact', async () => {
+    mockGetConversationByPlatformId.mockResolvedValueOnce({
+      id: 'conv-live-run',
+      isolation_env_id: 'env-live-run',
+      cwd: '/workspace/worktrees/pr-400',
+    });
+    mockGetActiveSession.mockResolvedValueOnce(null);
+    mockGetById.mockResolvedValueOnce({
+      id: 'env-live-run',
+      codebase_id: 'codebase-1',
+      working_path: '/workspace/worktrees/pr-400',
+      branch_name: 'feature-live',
+      status: 'active',
+    });
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live', status: 'paused' });
+
+    await onConversationClosed('github', 'owner/repo#400');
+
+    expect(mockDestroy).not.toHaveBeenCalled();
+    // The null-out runs only AFTER the live-run check: a top-level run attaches
+    // to its env solely through this reference, so clearing before checking
+    // would erase the pin and let the env be removed under a live run.
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+  });
+
   test('leaves an unrelated cwd untouched', async () => {
     mockGetConversationByPlatformId.mockResolvedValueOnce({
       id: 'conv-other-cwd',

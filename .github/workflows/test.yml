@@ -119,6 +119,44 @@ jobs:
       - name: Upgrade from released schemas
         run: bun run check:schema-upgrades
 
+  postgres-parity:
+    # The unit suite mocks the pg driver, so the Postgres dialect branch of
+    # getLiveRunOwningEnv (cleanup's lock query) only executes here, against a
+    # real server: an untyped parameter compared against text and UUID columns
+    # in one OR parses fine on SQLite and would reach every Postgres install.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The test creates and drops its own scratch database; the 'postgres'
+      # database named in the URL is only used to reach the server.
+      - name: Run Postgres parity test
+        env:
+          ARCHON_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: bun test packages/core/src/db/isolation-environments.live-run.postgres.integration.test.ts
+
   docker-build:
     runs-on: ubuntu-latest
     permissions:

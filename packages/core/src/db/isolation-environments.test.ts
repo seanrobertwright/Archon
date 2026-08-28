@@ -378,7 +378,9 @@ describe('isolation-environments', () => {
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       // env id first, then every terminal status as an excluded value
       expect(params).toEqual(['env-123', 'completed', 'failed', 'cancelled']);
-      expect(query).toContain("metadata->>'isolation_env_id' = $1 OR c.isolation_env_id = $1");
+      expect(query).toContain(
+        "metadata->>'isolation_env_id' = $1 OR c.isolation_env_id::text = $1"
+      );
       expect(query).toContain('r.status NOT IN ($2, $3, $4)');
       expect(query).toContain('ORDER BY r.started_at DESC');
     });

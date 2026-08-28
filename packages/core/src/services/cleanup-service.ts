@@ -217,7 +217,8 @@ export async function cleanupContainerEnvironments(
 
 /**
  * Called when a platform conversation is closed (e.g., GitHub issue/PR closed)
- * Cleans up the associated isolation environment if no other conversations use it
+ * Cleans up the associated isolation environment unless a non-terminal workflow
+ * run still owns it. Conversation references are data, not locks (#2868).
  */
 export async function onConversationClosed(
   platformType: string,
@@ -264,6 +265,17 @@ export async function onConversationClosed(
     return;
   }
 
+  // Live work is the only lock — the same rule the merged cleanup sweep follows.
+  // Historical conversations referencing this env are data, not locks. This must
+  // read before the null-out below: a top-level run attaches to its env ONLY
+  // through this conversation's reference, so clearing first would erase the
+  // pin and let the env be removed under a running or paused run.
+  const liveRun = await isolationEnvDb.getLiveRunOwningEnv(envId);
+  if (liveRun) {
+    getLog().info({ envId, runId: liveRun.id, runStatus: liveRun.status }, 'env_has_live_run');
+    return;
+  }
+
   // Clear this conversation's reference (best-effort - conversation may be deleted).
   // `cwd` is cleared alongside it when it names the environment being torn down:
   // leaving it set would strand the conversation on a directory that is about to
@@ -281,15 +293,6 @@ export async function onConversationClosed(
       if (!(err instanceof ConversationNotFoundError)) throw err;
     });
 
-  // Live work is the only lock — the same rule the merged cleanup sweep follows.
-  // Historical conversations referencing this env are data, not locks.
-  const liveRun = await isolationEnvDb.getLiveRunOwningEnv(envId);
-  if (liveRun) {
-    getLog().info({ envId, runId: liveRun.id, runStatus: liveRun.status }, 'env_has_live_run');
-    return;
-  }
-
-  // No other users - attempt removal
   await removeEnvironment(envId, {
     force: false,
     deleteRemoteBranch: options?.merged,
