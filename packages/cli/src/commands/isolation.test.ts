@@ -1,8 +1,12 @@
 /**
- * Tests for isolation complete command
+ * Tests for isolation commands (complete, cleanup, cleanup-merged)
  */
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
-import { isolationCompleteCommand, isolationCleanupMergedCommand } from './isolation';
+import {
+  isolationCompleteCommand,
+  isolationCleanupCommand,
+  isolationCleanupMergedCommand,
+} from './isolation';
 
 const mockLogger = {
   fatal: mock(() => undefined),
@@ -19,15 +23,21 @@ mock.module('@archon/paths', () => ({
 }));
 
 const mockFindActiveByBranchName = mock(() => Promise.resolve(null));
+const mockFindStaleEnvironments = mock(() => Promise.resolve([]));
+const mockGetLiveRunOwningEnv = mock(
+  (): Promise<{ id: string; status: string } | null> => Promise.resolve(null)
+);
+const mockUpdateStatus = mock(() => Promise.resolve());
 
 mock.module('@archon/core/db/isolation-environments', () => ({
   findActiveByBranchName: mockFindActiveByBranchName,
   findActiveByWorkflow: mock(() => Promise.resolve(null)),
   listAllActiveWithCodebase: mock(() => Promise.resolve([])),
   listByCodebaseWithAge: mock(() => Promise.resolve([])),
-  findStaleEnvironments: mock(() => Promise.resolve([])),
+  findStaleEnvironments: mockFindStaleEnvironments,
+  getLiveRunOwningEnv: mockGetLiveRunOwningEnv,
   create: mock(() => Promise.resolve({ id: 'iso-123' })),
-  updateStatus: mock(() => Promise.resolve()),
+  updateStatus: mockUpdateStatus,
 }));
 
 const mockGetActiveWorkflowRunByPath = mock(() => Promise.resolve(null));
@@ -46,10 +56,14 @@ const mockRemoveEnvironment = mock(() =>
   Promise.resolve({ worktreeRemoved: true, branchDeleted: true, warnings: [] })
 );
 const mockCleanupMergedWorktrees = mock(() => Promise.resolve({ removed: [], skipped: [] }));
+const mockCleanupContainerEnvironments = mock(() =>
+  Promise.resolve({ removed: [], skipped: [], errors: [] })
+);
 
 mock.module('@archon/core/services/cleanup-service', () => ({
   removeEnvironment: mockRemoveEnvironment,
   cleanupMergedWorktrees: mockCleanupMergedWorktrees,
+  cleanupContainerEnvironments: mockCleanupContainerEnvironments,
 }));
 
 const mockListEnvironments = mock(() =>
@@ -91,9 +105,11 @@ mock.module('@archon/git', () => ({
   getUniqueCommitCount: mockGetUniqueCommitCount,
 }));
 
+const mockDestroyWorktree = mock(() => Promise.resolve({ warnings: [] }));
+
 mock.module('@archon/isolation', () => ({
   getIsolationProvider: mock(() => ({
-    destroy: mock(() => Promise.resolve({ warnings: [] })),
+    destroy: mockDestroyWorktree,
   })),
 }));
 
@@ -589,5 +605,57 @@ describe('isolationCleanupMergedCommand', () => {
   it('defaults to includeClosed=false', async () => {
     await isolationCleanupMergedCommand();
     expect(mockCleanupMergedEnvironments).toHaveBeenCalledWith('cb-1', '/test/repo', {});
+  });
+});
+
+describe('isolationCleanupCommand', () => {
+  let consoleLogSpy: ReturnType<typeof spyOn>;
+  let consoleErrorSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    consoleLogSpy = spyOn(console, 'log').mockImplementation(() => {});
+    consoleErrorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    mockFindStaleEnvironments.mockReset();
+    mockFindStaleEnvironments.mockResolvedValue([]);
+    mockGetLiveRunOwningEnv.mockReset();
+    mockGetLiveRunOwningEnv.mockResolvedValue(null);
+    mockDestroyWorktree.mockReset();
+    mockUpdateStatus.mockReset();
+  });
+
+  afterEach(() => {
+    consoleLogSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('destroys a stale environment with no live owning run', async () => {
+    mockFindStaleEnvironments.mockResolvedValueOnce([
+      { ...mockEnv, id: 'env-stale-1', branch_name: 'stale-branch' },
+    ]);
+
+    await isolationCleanupCommand(7);
+
+    expect(mockDestroyWorktree).toHaveBeenCalledWith('/test/worktree', {
+      branchName: 'stale-branch',
+      canonicalRepoPath: '/test/repo',
+    });
+    expect(mockUpdateStatus).toHaveBeenCalledWith('env-stale-1', 'destroyed');
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Status: Cleaned');
+  });
+
+  it('skips a stale environment owned by a live run without destroying it', async () => {
+    mockFindStaleEnvironments.mockResolvedValueOnce([
+      { ...mockEnv, id: 'env-stale-2', branch_name: 'stale-branch' },
+    ]);
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live-1', status: 'paused' });
+
+    await isolationCleanupCommand(7);
+
+    expect(mockDestroyWorktree).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+    expect(consoleLogSpy).toHaveBeenCalledWith('  Status: Skipped — run run-live is paused');
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      '\nCleanup complete: 0 cleaned, 1 skipped, 0 failed'
+    );
   });
 });

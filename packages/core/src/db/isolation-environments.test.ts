@@ -21,7 +21,7 @@ import {
   updateStatus,
   updateMetadata,
   countActiveByCodebase,
-  getConversationsUsingEnv,
+  getLiveRunOwningEnv,
   findStaleEnvironments,
   listAllActiveWithCodebase,
 } from './isolation-environments';
@@ -362,25 +362,28 @@ describe('isolation-environments', () => {
     });
   });
 
-  describe('getConversationsUsingEnv', () => {
-    test('returns conversation IDs using the environment', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'conv-1' }, { id: 'conv-2' }]));
+  describe('getLiveRunOwningEnv', () => {
+    // Only the parameters are asserted here. This file hardcodes the Postgres
+    // dialect, so asserting SQL text would pin one branch of a dialect-parallel
+    // query; the real-SQLite and real-Postgres integration tests prove behavior
+    // on both. 'failed' must NOT appear: it is terminal but resumable, so a failed
+    // run keeps its environment (see UNCLAIMABLE_WORKFLOW_STATUSES).
+    test('excludes only the statuses no run can claim back', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-1', status: 'running' }]));
 
-      const result = await getConversationsUsingEnv('env-123');
+      const result = await getLiveRunOwningEnv('env-123');
 
-      expect(result).toEqual(['conv-1', 'conv-2']);
-      expect(mockQuery).toHaveBeenCalledWith(
-        'SELECT id FROM remote_agent_conversations WHERE isolation_env_id = $1',
-        ['env-123']
-      );
+      expect(result).toEqual({ id: 'run-1', status: 'running' });
+      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(params).toEqual(['env-123', 'completed', 'cancelled']);
     });
 
-    test('returns empty array when no conversations use env', async () => {
+    test('returns null when the env has no live run', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
-      const result = await getConversationsUsingEnv('unused-env');
+      const result = await getLiveRunOwningEnv('unused-env');
 
-      expect(result).toEqual([]);
+      expect(result).toBeNull();
     });
   });
 
