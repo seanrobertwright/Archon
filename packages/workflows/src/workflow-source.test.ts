@@ -2,10 +2,35 @@
  * Source capture: what a run freezes, and what it must keep resolving after the
  * authoring checkout moves on.
  */
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, afterAll, mock } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, rm, readFile, readdir, symlink, stat } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+
+// Capture-cost control, same lever and same reason as `subrun.test.ts` (#2882):
+// every `captureWorkflowSource` call here copies and digests the repo's OWN bundled
+// scope — `.archon/workflows` plus `.archon/commands`, ~178 files — on top of the
+// handful of fixture files the test wrote. Twenty-five captures in this file is ~4,400
+// incidental file copies, and that bulk IO is what puts this suite at Bun's 5000ms
+// budget on a contended Windows runner. No test here reads bundled CONTENT: the
+// assertions count the PROJECT scope (`countScopeFiles`) and resolve fixture-written
+// commands. Pointing the two bundle getters at an owned EMPTY tree keeps the bundled
+// scope's semantics intact — an existing directory is still scanned, still copied,
+// still recorded in the manifest — while removing the file fan-out.
+// NB: point these one level DEEP (`<root>/defaults`) — captureWorkflowSource copies
+// dirname(getDefault*Path()), so the getter's PARENT must be the owned empty tree.
+const bundledDefaultsRoot = join(tmpdir(), `workflow-source-test-empty-bundled-${process.pid}`);
+await mkdir(join(bundledDefaultsRoot, 'defaults'), { recursive: true });
+afterAll(async () => {
+  await rm(bundledDefaultsRoot, { recursive: true, force: true }).catch(() => {});
+});
+const realArchonPaths = await import('@archon/paths');
+mock.module('@archon/paths', () => ({
+  ...realArchonPaths,
+  getDefaultWorkflowsPath: () => join(bundledDefaultsRoot, 'defaults'),
+  getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
+}));
+
 import {
   captureWorkflowSource,
   capturedSourceRoots,
@@ -22,11 +47,48 @@ import { discoverScriptsForCwd } from './script-discovery';
 import { loadCommandPrompt } from './executor-shared';
 import { withCapturedSource } from './executor';
 import type { WorkflowDeps } from './deps';
+import { trackTempRoots } from '@archon/paths/test-utils';
 
-let root: string;
-let source: string;
-let target: string;
-let runArtifacts: string;
+/** One test's paths. Created by the test, never shared with another. */
+interface Sandbox {
+  readonly root: string;
+  readonly source: string;
+  readonly target: string;
+  readonly runArtifacts: string;
+}
+
+const trackTempRoot = trackTempRoots();
+
+/**
+ * A temp root owned by one test.
+ *
+ * Each test holds its own paths as locals, so an assertion left running by a timed-out
+ * test can only ever describe its own sandbox (#2306). These used to be module-level
+ * `let` bindings reassigned in `beforeEach`, which let such an orphaned assertion read
+ * the NEXT test's paths and report a mutation that never happened.
+ */
+async function createTempRoot(): Promise<string> {
+  return trackTempRoot(await mkdtemp(join(tmpdir(), 'archon-source-')));
+}
+
+async function createSandbox(): Promise<Sandbox> {
+  const root = await createTempRoot();
+  const sandbox: Sandbox = {
+    root,
+    source: join(root, 'authoring'),
+    target: join(root, 'target'),
+    runArtifacts: join(root, 'artifacts'),
+  };
+  await mkdir(join(sandbox.source, '.archon', 'workflows', 'pack', 'flow', 'commands'), {
+    recursive: true,
+  });
+  await mkdir(join(sandbox.source, '.archon', 'commands'), { recursive: true });
+  await mkdir(join(sandbox.source, '.archon', 'scripts'), { recursive: true });
+  // A clean target: it is a real checkout, it just never held the authoring source.
+  await mkdir(join(sandbox.target, '.archon', 'workflows'), { recursive: true });
+  await mkdir(sandbox.runArtifacts, { recursive: true });
+  return sandbox;
+}
 
 /**
  * Files captured under one scope.
@@ -57,27 +119,9 @@ const deps = {
     Promise.resolve({} as unknown as Awaited<ReturnType<WorkflowDeps['loadConfig']>>),
 } satisfies Pick<WorkflowDeps, 'loadConfig'>;
 
-beforeEach(async () => {
-  root = await mkdtemp(join(tmpdir(), 'archon-source-'));
-  source = join(root, 'authoring');
-  target = join(root, 'target');
-  runArtifacts = join(root, 'artifacts');
-  await mkdir(join(source, '.archon', 'workflows', 'pack', 'flow', 'commands'), {
-    recursive: true,
-  });
-  await mkdir(join(source, '.archon', 'commands'), { recursive: true });
-  await mkdir(join(source, '.archon', 'scripts'), { recursive: true });
-  // A clean target: it is a real checkout, it just never held the authoring source.
-  await mkdir(join(target, '.archon', 'workflows'), { recursive: true });
-  await mkdir(runArtifacts, { recursive: true });
-});
-
-afterEach(async () => {
-  await rm(root, { recursive: true, force: true });
-});
-
 describe('captureWorkflowSource', () => {
   test('freezes commands and scripts so the target never needs them', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'review the diff');
     await writeFile(join(source, '.archon', 'scripts', 'check.ts'), 'console.log("ok")');
 
@@ -97,6 +141,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('keeps a script tree whole so sibling imports and data still resolve', async () => {
+    const { source, runArtifacts } = await createSandbox();
     // The reason a capture copies whole directories rather than the files a DAG names:
     // a script's imports and data reads are invisible to the workflow graph.
     await writeFile(join(source, '.archon', 'scripts', 'main.ts'), "import './helper';");
@@ -119,6 +164,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('a later edit or deletion of the authoring source does not change the capture', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'original');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
@@ -144,6 +190,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('a fresh capture after an edit sees the new bytes', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'v1');
     const first = await captureWorkflowSource({
       sourceRoot: source,
@@ -164,6 +211,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('dereferences symlinks so nothing in the capture points back out', async () => {
+    const { root, source, runArtifacts } = await createSandbox();
     const outside = join(root, 'outside.md');
     await writeFile(outside, 'external');
     await symlink(outside, join(source, '.archon', 'commands', 'linked.md'));
@@ -181,6 +229,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('keeps script dependencies but drops derived bytecode', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'scripts', 'main.py'), 'print(1)');
     await mkdir(join(source, '.archon', 'scripts', '__pycache__'), { recursive: true });
     await writeFile(join(source, '.archon', 'scripts', '__pycache__', 'main.pyc'), 'junk');
@@ -208,6 +257,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('cuts a directory symlink that points back into its own tree', async () => {
+    const { source, runArtifacts } = await createSandbox();
     // Directory symlinks are FOLLOWED (that is what dereferencing means), so a link to an
     // ancestor re-enters the tree. Without a cycle guard the walk only stops when the
     // kernel refuses the path with ELOOP, having copied the same files at every level.
@@ -228,6 +278,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('captures nothing under project scope when the source holds none', async () => {
+    const { root, runArtifacts } = await createSandbox();
     const empty = join(root, 'empty');
     await mkdir(empty, { recursive: true });
     const capture = await captureWorkflowSource({
@@ -244,6 +295,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('leaves no usable capture behind when it cannot finish', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
     const captureRoot = getRunSourceCapturePath(runArtifacts);
     // A file where the staging directory must go: the copy fails part-way through.
@@ -260,6 +312,7 @@ describe('captureWorkflowSource', () => {
   });
 
   test('replaces a stale capture rather than merging two vintages', async () => {
+    const { source, runArtifacts } = await createSandbox();
     const captureRoot = getRunSourceCapturePath(runArtifacts);
     await writeFile(join(source, '.archon', 'commands', 'gone.md'), 'old');
     await captureWorkflowSource({ sourceRoot: source, captureRoot });
@@ -280,6 +333,7 @@ describe('captureWorkflowSource', () => {
 
 describe('resolving against a capture instead of the target', () => {
   test('a command resolves from the source even though the target lacks it', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'from authoring');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
@@ -301,6 +355,7 @@ describe('resolving against a capture instead of the target', () => {
   });
 
   test('a packaged command resolves from the source under its owner identity', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
     await writeFile(
       join(source, '.archon', 'workflows', 'pack', 'flow', 'commands', 'step.md'),
       'packaged body'
@@ -321,6 +376,7 @@ describe('resolving against a capture instead of the target', () => {
   });
 
   test('a named script resolves from the source, at a path outside the target', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'scripts', 'check.ts'), 'console.log(1)');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
@@ -345,6 +401,7 @@ describe('resolving against a capture instead of the target', () => {
   });
 
   test('the target cannot shadow a command the run captured', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'authoring version');
     await mkdir(join(target, '.archon', 'commands'), { recursive: true });
     await writeFile(join(target, '.archon', 'commands', 'review.md'), 'TARGET VERSION');
@@ -379,6 +436,7 @@ describe("a run's own source versus a child's discovery root", () => {
   });
 
   test('a run reloads its OWN graph from the frozen copy, not from authoring', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'c.md'), 'x');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
@@ -390,6 +448,7 @@ describe("a run's own source versus a child's discovery root", () => {
   });
 
   test('a not-yet-started child resolves from LIVE authoring, so a fix can land', async () => {
+    const { source, runArtifacts } = await createSandbox();
     // The load-bearing difference. A `workflow:` child is not a run until it starts, so
     // freezing it into the parent would make an authoring fix — removing a gate from a
     // child workflow and resuming the parent — permanently ineffective.
@@ -407,6 +466,7 @@ describe("a run's own source versus a child's discovery root", () => {
   });
 
   test('a recorded run FAILS when its capture is gone; a child falls back to live', async () => {
+    const root = await createTempRoot();
     // The asymmetry is the contract. A run that recorded a source must execute that
     // source or stop — falling back would resume it against different bytes. A child's
     // origin is only a hint about where to capture FROM, so its absence is recoverable.
@@ -439,6 +499,7 @@ describe("a run's own source versus a child's discovery root", () => {
   });
 
   test('a record from a newer Archon fails closed rather than resuming live', async () => {
+    const { source } = await createSandbox();
     // The tempting mistake is to treat "I cannot parse this" as "there is nothing here".
     // Only a genuinely absent record — a run predating capture — may resume live.
     const future = { [WORKFLOW_SOURCE_METADATA_KEY]: { version: 99, root: source } };
@@ -449,6 +510,7 @@ describe("a run's own source versus a child's discovery root", () => {
 
 describe('the capture is authoritative, not advisory', () => {
   test('a tampered capture fails to load instead of executing quietly', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'original');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
@@ -468,6 +530,7 @@ describe('the capture is authoritative, not advisory', () => {
   });
 
   test('a run whose capture no longer verifies refuses to resolve a source root', async () => {
+    const { source, runArtifacts } = await createSandbox();
     const capture = await captureWorkflowSource({
       sourceRoot: source,
       captureRoot: getRunSourceCapturePath(runArtifacts),
@@ -491,6 +554,7 @@ describe('the capture is authoritative, not advisory', () => {
   });
 
   test('freezes every statically reachable scope, not just the project', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
@@ -499,12 +563,18 @@ describe('the capture is authoritative, not advisory', () => {
     // A project workflow can `include:` a global or bundled one, so leaving those live
     // would let an included workflow change shape across a resume.
     expect(capture.manifest.scopes).toContain('project');
+    // Named explicitly because this file redirects the bundle getters at an EMPTY tree to
+    // keep capture cost off the Windows budget (#2882). That lever is only safe while an
+    // empty bundled tree is still SCANNED and recorded; if it ever silently stopped being
+    // captured, every other assertion here would keep passing.
+    expect(capture.manifest.scopes).toContain('bundled');
     const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
     expect(roots.globalWorkflows.startsWith(capture.captureRoot)).toBe(true);
     expect(roots.globalCommands.startsWith(capture.captureRoot)).toBe(true);
   });
 
   test('records the selected workflow without disturbing what was frozen', async () => {
+    const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
@@ -522,6 +592,7 @@ describe('the capture is authoritative, not advisory', () => {
 
 describe("the source's own settings travel with its bytes", () => {
   test('a custom commands.folder is captured and resolves from the capture', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
     // Discovery honors `commands.folder`, so a capture taken without it finds the command
     // at selection time and loses it at execution time.
     await mkdir(join(source, 'team-commands'), { recursive: true });
@@ -553,6 +624,7 @@ describe("the source's own settings travel with its bytes", () => {
   });
 
   test('without the recorded folder the same command is not found', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
     await mkdir(join(source, 'team-commands'), { recursive: true });
     await writeFile(join(source, 'team-commands', 'shipit.md'), 'ship it');
     const capture = await captureWorkflowSource({
@@ -575,6 +647,7 @@ describe("the source's own settings travel with its bytes", () => {
 
 describe('continuing a run resolves with the settings it froze', () => {
   test('the manifest supplies the config, so a custom command folder survives resume', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
     // The regression: continuation built roots with DEFAULT_WORKFLOW_SOURCE_CONFIG, which
     // is worse than degraded — a defined-but-default config also suppresses discovery's
     // live-config fallback, so the result is confidently wrong.
@@ -604,7 +677,7 @@ describe('continuing a run resolves with the settings it froze', () => {
 
 describe('a capture is adopted or reclaimed, whichever way the caller leaves', () => {
   /** Stand in for a staged capture: what the owner is handed and may have to reclaim. */
-  async function stage(name: string): Promise<{ captureRoot: string }> {
+  async function stage(root: string, name: string): Promise<{ captureRoot: string }> {
     const captureRoot = join(root, name);
     await mkdir(captureRoot, { recursive: true });
     await writeFile(join(captureRoot, 'manifest.json'), '{}');
@@ -618,21 +691,23 @@ describe('a capture is adopted or reclaimed, whichever way the caller leaves', (
     );
 
   test('reclaims when the body returns without adopting', async () => {
+    const root = await createTempRoot();
     // The shape of every early exit that used to leak: an unknown workflow, a refused
     // input contract, the "resume or force?" menu. None of them adopt.
     let staged: { captureRoot: string } | undefined;
     await withCapturedSource(async owner => {
-      staged = await stage('returned');
+      staged = await stage(root, 'returned');
       owner.hold(staged);
     });
     expect(await exists(staged!.captureRoot)).toBe(false);
   });
 
   test('reclaims when the body throws', async () => {
+    const root = await createTempRoot();
     let staged: { captureRoot: string } | undefined;
     await expect(
       withCapturedSource(async owner => {
-        staged = await stage('threw');
+        staged = await stage(root, 'threw');
         owner.hold(staged);
         throw new Error('a gate refused this run');
       })
@@ -641,9 +716,10 @@ describe('a capture is adopted or reclaimed, whichever way the caller leaves', (
   });
 
   test('leaves an adopted capture alone — a run owns it now', async () => {
+    const root = await createTempRoot();
     let staged: { captureRoot: string } | undefined;
     await withCapturedSource(async owner => {
-      staged = await stage('adopted');
+      staged = await stage(root, 'adopted');
       owner.hold(staged);
       owner.adopt();
     });
@@ -651,14 +727,15 @@ describe('a capture is adopted or reclaimed, whichever way the caller leaves', (
   });
 
   test('reclaims the CURRENT path after a container run moves the capture', async () => {
+    const root = await createTempRoot();
     // `finalizeWorkflowSource` moves a container run's capture out of staging early. If
     // the owner kept tracking the pre-move path it would reclaim a directory that is
     // already gone and leave the real one behind, looking like it had cleaned up.
     let moved: { captureRoot: string } | undefined;
     await withCapturedSource(async owner => {
-      const staged = await stage('pre-move');
+      const staged = await stage(root, 'pre-move');
       owner.hold(staged);
-      moved = await stage('post-move');
+      moved = await stage(root, 'post-move');
       owner.hold(moved);
     });
     expect(await exists(moved!.captureRoot)).toBe(false);

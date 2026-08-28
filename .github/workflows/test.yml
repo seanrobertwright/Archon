@@ -119,6 +119,12 @@ jobs:
       - name: Upgrade from released schemas
         run: bun run check:schema-upgrades
 
+      - name: Check SQLite vintage fixtures
+        # Regenerates packages/core/src/db/fixtures/sqlite-vintages/ in memory
+        # from release tags and fails on any drift, so new release tags carrying
+        # a new distinct SQLite schema land with their fixture.
+        run: bun run check:sqlite-vintages
+
   postgres-parity:
     # The unit suite mocks the pg driver, so the Postgres dialect branch of
     # getLiveRunOwningEnv (cleanup's lock query) only executes here, against a

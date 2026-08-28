@@ -33084,12 +33084,17 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
 describe('executeDagWorkflow -- node-level mutates_checkout: false (#2771)', () => {
   let testDir: string;
 
+  // Three git processes, not five: the identity travels as `-c` overrides on the commit
+  // rather than as two separate `git config` writes. Six tests here pay this cost, and
+  // process creation is the expensive part on Windows CI (#2882).
   const initRepo = async (dir: string): Promise<void> => {
     await git.execFileAsync('git', ['init', '-q'], { cwd: dir });
-    await git.execFileAsync('git', ['config', 'user.email', 't@t'], { cwd: dir });
-    await git.execFileAsync('git', ['config', 'user.name', 't'], { cwd: dir });
     await git.execFileAsync('git', ['add', '-A'], { cwd: dir });
-    await git.execFileAsync('git', ['commit', '-qm', 'init', '--allow-empty'], { cwd: dir });
+    await git.execFileAsync(
+      'git',
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init', '--allow-empty'],
+      { cwd: dir }
+    );
   };
 
   const runBashNode = async (

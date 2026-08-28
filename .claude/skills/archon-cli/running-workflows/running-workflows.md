@@ -84,7 +84,8 @@ node summaries. Read the report before telling the user what the run concluded.
 ## Continuing finished work
 
 ```bash
-archon continue fix/issue-42 "Now also update the docs"     # start a new run on the existing branch
+archon workflow runs --open                                 # find the prior run id
+archon workflow run docs --adopt <run-id> "Now also update the docs"  # new run on the adopted worktree/branch
 archon complete fix/issue-42                                # remove worktree + branches
 archon isolation cleanup                                    # prune stale environments (7d)
 archon isolation cleanup --merged                           # prune merged ones now

@@ -9,8 +9,9 @@ import { Database } from 'bun:sqlite';
 import { parseArgs } from 'util';
 import { cliArgOptions } from './args';
 import * as git from '@archon/git';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -85,6 +86,63 @@ describe('CLI help output', () => {
       'ai login <provider>        Connect a Claude, ChatGPT/Codex, or Copilot subscription'
     );
   });
+
+  it('omits the removed branch-inferred continue command', () => {
+    expect(help.status).toBe(0);
+    expect(help.stdout).not.toMatch(/\bcontinue <branch>/);
+    expect(help.stdout).not.toContain('--workflow <name>');
+    expect(help.stdout).not.toContain('--no-context');
+  });
+
+  it('documents exact run-id adoption as the continuation route', () => {
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain(
+      "--adopt <run-id>           Start a new run adopting a terminal run's worktree/branch + artifacts ($ADOPTED_RUN_DIR)"
+    );
+  });
+});
+
+describe('removed continue command', () => {
+  // Full interpreter startup: the rejection lives in main()'s dispatch, not in
+  // a pure guard, so a subprocess is the only way to pin the actual outcome.
+  it('rejects archon continue and points to explicit run adoption', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, 'continue', 'some/branch', 'carry on'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Removed: 'archon continue'");
+    expect(result.stderr).toContain('--adopt <run-id>');
+  });
+
+  it('rejects archon continue outside any git repository', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'archon-no-repo-'));
+    try {
+      const result = spawnSync(process.execPath, [CLI_ENTRY, 'continue', 'some/branch'], {
+        encoding: 'utf8',
+        cwd: dir,
+        env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Removed: 'archon continue'");
+      expect(result.stderr).toContain('--adopt <run-id>');
+    } finally {
+      await removeTempTree(dir);
+    }
+  });
+
+  it('no longer parses the continue-only flags', () => {
+    for (const flag of ['--workflow', '--no-context']) {
+      expect(() =>
+        parseArgs({
+          args: ['workflow', 'run', 'x', flag, 'value'],
+          options: cliArgOptions,
+          allowPositionals: true,
+          strict: true,
+        })
+      ).toThrow();
+    }
+  });
 });
 
 describe('workflow model arguments', () => {
@@ -149,7 +207,7 @@ describe('workflow run config argument', () => {
     expect(message).toContain('--config can only be used with workflow run');
   });
 
-  it('resolves a relative config path from the requested subdirectory cwd', () => {
+  it('resolves a relative config path from the requested subdirectory cwd', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'archon-cli-config-cwd-'));
     const subdir = join(repo, 'bench');
     mkdirSync(subdir, { recursive: true });
@@ -166,11 +224,11 @@ describe('workflow run config argument', () => {
       expect(result.stderr).toContain("Run config key 'paths' cannot apply");
       expect(result.stderr).not.toContain('Unable to read run config');
     } finally {
-      rmSync(repo, { recursive: true, force: true });
+      await removeTempTree(repo);
     }
   });
 
-  it('keeps a detached config handoff outside repo env overrides', () => {
+  it('keeps a detached config handoff outside repo env overrides', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'archon-cli-detached-config-'));
     const archonHome = join(repo, 'archon-home');
     mkdirSync(join(repo, '.archon'), { recursive: true });
@@ -233,11 +291,11 @@ describe('workflow run config argument', () => {
       expect(result.stderr).not.toContain('could not be decrypted');
       expect(result.stderr).toContain('--resume and --config are mutually exclusive');
     } finally {
-      rmSync(repo, { recursive: true, force: true });
+      await removeTempTree(repo);
     }
   });
 
-  it('keeps a detached Docker install classified through target env loading', () => {
+  it('keeps a detached Docker install classified through target env loading', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'archon-cli-detached-docker-'));
     mkdirSync(join(repo, '.archon'), { recursive: true });
     writeFileSync(
@@ -305,7 +363,7 @@ describe('workflow run config argument', () => {
         },
       });
     } finally {
-      rmSync(repo, { recursive: true, force: true });
+      await removeTempTree(repo);
     }
   });
 
@@ -383,7 +441,7 @@ describe('workflow get arguments', () => {
 });
 
 describe('CLI workflow event dispatch', () => {
-  it('resolves a run prefix using the registered effective cwd', () => {
+  it('resolves a run prefix using the registered effective cwd', async () => {
     const scratch = mkdtempSync(join(tmpdir(), 'archon-cli-event-'));
     const archonHome = join(scratch, 'home');
     const repoDir = join(scratch, 'repo');
@@ -466,7 +524,7 @@ describe('CLI workflow event dispatch', () => {
         verify.close();
       }
     } finally {
-      rmSync(scratch, { recursive: true, force: true });
+      await removeTempTree(scratch);
     }
   }, 30_000);
 });

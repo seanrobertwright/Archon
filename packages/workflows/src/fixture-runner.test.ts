@@ -1,5 +1,5 @@
 /** Tests for the declared-data dry-run fixture runner (#2772). */
-import { describe, it, expect, afterEach } from 'bun:test';
+import { describe, it, expect, afterEach, afterAll, mock } from 'bun:test';
 import {
   existsSync,
   mkdirSync,
@@ -7,10 +7,38 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Capture-cost control, same lever and same reason as `subrun.test.ts` (#2882): every
+// `runFixtures` call takes one source capture, and a capture copies and digests the
+// repo's OWN bundled scope — `.archon/workflows` plus `.archon/commands`, ~178 files —
+// alongside the handful of fixture files the test wrote. Thirty captures in this file
+// is ~5,300 incidental file copies, and that bulk IO is what puts this suite at Bun's
+// 5000ms budget on a contended Windows runner. No test here reads bundled CONTENT: the
+// bundled SCOPE tests drive `sourceRoots.bundledWorkflows`, which is a discovery root
+// this file already points at a temp directory. Pointing the two bundle getters at an
+// owned EMPTY tree keeps the bundled scope's semantics intact — an existing directory
+// is still scanned, still copied, still recorded in the manifest — while removing the
+// file fan-out.
+// NB: point these one level DEEP (`<root>/defaults`) — captureWorkflowSource copies
+// dirname(getDefault*Path()), so the getter's PARENT must be the owned empty tree.
+const bundledDefaultsRoot = join(tmpdir(), `fixture-runner-test-empty-bundled-${process.pid}`);
+await mkdir(join(bundledDefaultsRoot, 'defaults'), { recursive: true });
+afterAll(async () => {
+  await rm(bundledDefaultsRoot, { recursive: true, force: true }).catch(() => {});
+});
+const realArchonPaths = await import('@archon/paths');
+mock.module('@archon/paths', () => ({
+  ...realArchonPaths,
+  getDefaultWorkflowsPath: () => join(bundledDefaultsRoot, 'defaults'),
+  getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
+}));
+
 import { execFileAsync } from '@archon/git';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
@@ -68,7 +96,9 @@ async function runFixtures(
   return runFixturesFromSource({
     ...options,
     sourceConfig: options.sourceConfig ?? DEFAULT_WORKFLOW_SOURCE_CONFIG,
-    sourceRoots: isolatedSourceRoots(options.cwd),
+    // Default to empty global/bundled scopes so a test cannot read the real ones; a test
+    // that is specifically about cross-scope behavior passes its own populated roots.
+    sourceRoots: options.sourceRoots ?? isolatedSourceRoots(options.cwd),
   });
 }
 
@@ -366,6 +396,210 @@ describe('runFixtures', () => {
     });
     expect(report.passed).toBe(1);
   });
+
+  /** Pack layout like the bundled SDLC pack: `<pack>/<workflow-folder>/fixtures/`, plus a sibling pack whose name extends `sdlc` so the path-containment anchor cannot drift. */
+  function writeNestedPackProject(): { cwd: string } {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    for (const folder of ['plan', 'ship']) {
+      const workflowDir = join(cwd, '.archon', 'workflows', 'sdlc', folder);
+      mkdirSync(join(workflowDir, 'fixtures'), { recursive: true });
+      writeFileSync(
+        join(workflowDir, `${folder}-wf.yaml`),
+        `name: ${folder}-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n`
+      );
+      writeFileSync(
+        join(workflowDir, 'fixtures', `${folder}.stubs.yaml`),
+        ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+      );
+    }
+    const extDir = join(cwd, '.archon', 'workflows', 'sdlc-ext', 'ext');
+    mkdirSync(join(extDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(extDir, 'ext-wf.yaml'),
+      'name: ext-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(extDir, 'fixtures', 'ext.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+    return { cwd };
+  }
+
+  it('resolves a nested pack by name, workflow folder, and pack directory path', async () => {
+    const { cwd } = writeNestedPackProject();
+    const workflows = [
+      ...workflowsOnDisk(cwd, ['plan-wf'], 'sdlc/plan'),
+      ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+      ...workflowsOnDisk(cwd, ['ext-wf'], 'sdlc-ext/ext'),
+    ];
+    const fixtureLabels = (target: string | undefined) =>
+      runFixtures({ workflows, cwd, ...(target !== undefined ? { target } : {}) }).then(report =>
+        report.results.map(r => r.fixture)
+      );
+
+    const packPath = join(cwd, '.archon', 'workflows', 'sdlc');
+    // Exact labels pin both the scope-root-relative shape and the boundary against the
+    // prefix-named `sdlc-ext` sibling: the `dir + sep` containment anchor must never match it.
+    await expect(fixtureLabels('sdlc')).resolves.toEqual([
+      'sdlc/plan/fixtures/plan.stubs.yaml',
+      'sdlc/ship/fixtures/ship.stubs.yaml',
+    ]);
+    await expect(fixtureLabels('ship')).resolves.toEqual(['sdlc/ship/fixtures/ship.stubs.yaml']);
+    await expect(fixtureLabels('sdlc-ext')).resolves.toEqual([
+      'sdlc-ext/ext/fixtures/ext.stubs.yaml',
+    ]);
+    await expect(fixtureLabels('.archon/workflows/sdlc')).resolves.toHaveLength(2);
+    await expect(fixtureLabels(packPath)).resolves.toHaveLength(2);
+    await expect(fixtureLabels(undefined)).resolves.toHaveLength(3);
+  });
+
+  // Junctions would also resolve on Windows, but fs.realpath's junction handling is
+  // platform-dependent; ubuntu CI already runs this, and that is where the tmpdir
+  // realpath is the identity and the symlink spelling is the only protection.
+  it.skipIf(process.platform === 'win32')(
+    'resolves a target spelled through a symlink to the pack directory',
+    async () => {
+      const { cwd } = writeNestedPackProject();
+      const linkPath = join(cwd, 'sdlc-link');
+      symlinkSync(join(cwd, '.archon', 'workflows', 'sdlc'), linkPath, 'dir');
+      const workflows = [
+        ...workflowsOnDisk(cwd, ['plan-wf'], 'sdlc/plan'),
+        ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+        ...workflowsOnDisk(cwd, ['ext-wf'], 'sdlc-ext/ext'),
+      ];
+      const report = await runFixtures({ workflows, cwd, target: linkPath });
+      // Selection outcomes, not implementation details: drops both the containment
+      // anchor and the discovery-side realpath, so a revert cannot pass silently.
+      expect(report.results.map(r => r.fixture)).toEqual([
+        'sdlc/plan/fixtures/plan.stubs.yaml',
+        'sdlc/ship/fixtures/ship.stubs.yaml',
+      ]);
+    }
+  );
+
+  it('selects by the union of workflow name and folder: a target that is both picks both', async () => {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    // Workflow `ship` inside folder `plan`: its fixture matches by name only.
+    const planDir = join(cwd, '.archon', 'workflows', 'sdlc', 'plan');
+    mkdirSync(join(planDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(planDir, 'ship.yaml'),
+      'name: ship\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(planDir, 'fixtures', 'ship.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+    // Folder `ship` with a differently-named workflow: its fixture matches by folder only.
+    const shipDir = join(cwd, '.archon', 'workflows', 'sdlc', 'ship');
+    mkdirSync(join(shipDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(shipDir, 'ship-wf.yaml'),
+      'name: ship-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(shipDir, 'fixtures', 'ship.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+    const report = await runFixtures({
+      workflows: [
+        ...workflowsOnDisk(cwd, ['ship'], 'sdlc/plan'),
+        ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+      ],
+      cwd,
+      target: 'ship',
+    });
+    // Name-first precedence would drop the ship-folder fixture; dir-first would drop the plan one.
+    expect(report.results.map(r => r.fixture).sort()).toEqual([
+      'sdlc/plan/fixtures/ship.stubs.yaml',
+      'sdlc/ship/fixtures/ship.stubs.yaml',
+    ]);
+  });
+
+  it('rejects a target naming a workflow that is on disk but not in the catalog', async () => {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    // `broken-wf` parses far enough to declare a name but never reaches the catalog — the
+    // shape of an unfinished or unloadable workflow file that still has fixtures beside it.
+    const brokenDir = join(cwd, '.archon', 'workflows', 'broken');
+    mkdirSync(join(brokenDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(brokenDir, 'broken-wf.yaml'),
+      'name: broken-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(brokenDir, 'fixtures', 'orphan.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+    // A loaded workflow elsewhere, so the failure is "this target is unresolved" rather
+    // than "nothing is loaded at all" — and so the hint names a real alternative.
+    const okDir = join(cwd, '.archon', 'workflows', 'ok');
+    mkdirSync(join(okDir, 'fixtures'), { recursive: true });
+    writeFileSync(
+      join(okDir, 'ok-wf.yaml'),
+      'name: ok-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(okDir, 'fixtures', 'ok.stubs.yaml'),
+      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
+    );
+
+    // Ungated name matching selects the orphan fixture and reports it as a per-fixture
+    // "no discovered workflow matches" failure, which blames the fixture for a target problem.
+    await expect(
+      runFixtures({ workflows: workflowsOnDisk(cwd, ['ok-wf'], 'ok'), cwd, target: 'broken-wf' })
+    ).rejects.toThrow("No fixtures found for 'broken-wf'. Name a workflow with fixtures (ok-wf)");
+
+    // The gate must not cost the loaded name its own resolution.
+    const loaded = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['ok-wf'], 'ok'),
+      cwd,
+      target: 'ok-wf',
+    });
+    expect(loaded.results.map(r => r.fixture)).toEqual(['ok/fixtures/ok.stubs.yaml']);
+  });
+
+  it('lets a project fixture shadow the bundled fixture it overrides', async () => {
+    const cwd = makeTempProject();
+    cleanups.push(cwd);
+    const bundled = makeTempProject();
+    cleanups.push(bundled);
+    // The same relative fixture in two scopes: a project that copied a bundled workflow
+    // folder to customize it. Both declare the same workflow name, so both would be checked
+    // against the same catalog entry and print the same label — indistinguishable in output.
+    const write = (root: string, expectOutcome: string) => {
+      const dir = join(root, 'ship');
+      mkdirSync(join(dir, 'fixtures'), { recursive: true });
+      writeFileSync(
+        join(dir, 'ship-wf.yaml'),
+        'name: ship-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+      );
+      writeFileSync(
+        join(dir, 'fixtures', 'x.stubs.yaml'),
+        ['fixture:', `  expect: ${expectOutcome}`, 'node-a: "stub output"', ''].join('\n')
+      );
+    };
+    write(join(cwd, '.archon', 'workflows'), 'completed');
+    write(bundled, 'failed');
+
+    const report = await runFixtures({
+      workflows: workflowsOnDisk(cwd, ['ship-wf'], 'ship'),
+      cwd,
+      sourceRoots: {
+        ...liveSourceRoots(cwd),
+        globalWorkflows: join(cwd, '.empty', 'global-workflows'),
+        bundledWorkflows: bundled,
+      },
+    });
+
+    // One result, and it is the project's: a path-keyed `seen` never dedups across scopes
+    // (absolute paths are scope-unique) and yields two, while dedup that kept the wrong
+    // side would report the bundled `expect: failed` under an identical label.
+    expect(report.results.map(r => r.fixture)).toEqual(['ship/fixtures/x.stubs.yaml']);
+    expect(report.results[0].expect).toBe('completed');
+  });
 });
 
 describe('runFixtures exec-code isolation (#2851)', () => {
@@ -394,14 +628,18 @@ describe('runFixtures exec-code isolation (#2851)', () => {
   const git = (cwd: string, ...args: string[]): Promise<unknown> =>
     execFileAsync('git', args, { cwd });
 
-  /** Turn a plain temp project into a git repo with one committed file besides the project's own. */
+  /**
+   * Turn a plain temp project into a git repo with one committed file besides the project's own.
+   *
+   * Three git processes, not five: the identity travels as `-c` overrides on the commit
+   * itself rather than as two separate `git config` writes. Every test in this block pays
+   * this cost, and process creation is the expensive part on Windows CI (#2882).
+   */
   async function initGitWithCommittedFile(cwd: string): Promise<void> {
     await git(cwd, 'init', '-q');
-    await git(cwd, 'config', 'user.email', 't@t');
-    await git(cwd, 'config', 'user.name', 't');
     writeFileSync(join(cwd, 'tracked.txt'), COMMITTED_YAML);
     await git(cwd, 'add', '-A');
-    await git(cwd, 'commit', '-qm', 'init');
+    await git(cwd, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
   }
 
   it('gives clean and pre-dirtied callers the same verdict (#2851)', async () => {
