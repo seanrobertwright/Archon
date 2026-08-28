@@ -221,6 +221,44 @@ describe('bundled-defaults', () => {
         'If you are an agent reading this: open discoveries.md and surface each discovery to your human.'
       );
     });
+
+    // A reusable pack must not hardcode one project's context paths (AGENTS.md,
+    // "Project guidance should be available, not sprayed everywhere"). Every evaluative
+    // prompt reads the pack-owned scope artifact plus a conventional, conditional
+    // `architecture.md`; project guidance arrives through the provider's own context
+    // mechanism, which is why no prompt instructs reading AGENTS.md either. The rules the
+    // prompts used to delegate to a project file are stated in the prompts themselves.
+    it('no review prompt hardcodes a project context path', () => {
+      const lenses = [
+        'review-code',
+        'review-seams',
+        'review-simplify',
+        'review-tests',
+        'review-errors',
+        'review-docs',
+      ];
+      for (const name of [...lenses, 'review-synthesize']) {
+        const content = BUNDLED_COMMANDS[`__archon_pack__bundled:sdlc:review::${name}`];
+        expect(content).toBeDefined();
+        expect(content).not.toContain('.archon/engineering.md');
+        expect(content).not.toContain('Read `AGENTS.md`');
+        expect(content).toContain("the project's `architecture.md` if it has one");
+        expect(content).toContain('$ARTIFACTS_DIR/review/scope.md');
+        // The risk taxonomy the removed file used to own, now stated in every prompt
+        // that depends on it rather than cited.
+        expect(content).toContain(
+          'irreversible or destructive paths, lifecycle ownership, persisted contracts and ' +
+            'schemas, credentials and auth boundaries, integration boundaries'
+        );
+      }
+      // Synthesis judges whether the lenses engaged those risks; the lenses scale their
+      // own depth by them.
+      for (const name of lenses) {
+        expect(BUNDLED_COMMANDS[`__archon_pack__bundled:sdlc:review::${name}`]).toContain(
+          'scale depth to what the change can destroy'
+        );
+      }
+    });
   });
 
   describe('BUNDLED_WORKFLOWS', () => {

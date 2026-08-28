@@ -2,7 +2,7 @@
 
 Hunt one defect: **a type is missing at a seam, and something downstream pays for it** — a parser that mis-reads, a hand-maintained list that drifts, a second route that skips the validator, a value that silently loses fields across a re-entry. Read-only: never modify files, commit, or post anywhere.
 
-Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md` first. Anchor the review on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; for an engaged risk, explicitly try to refute the relevant invariant. In light mode, verify prior seam findings first, then examine only the delta.
+Read `$ARTIFACTS_DIR/review/scope.md` first, and the project's `architecture.md` if it has one. Anchor the review on the accepted work order's stated invariants, and scale depth to what the change can destroy: irreversible or destructive paths, lifecycle ownership, persisted contracts and schemas, credentials and auth boundaries, integration boundaries, and concurrency over shared state each get an explicit attempt to refute the invariant they rest on; a prose-only change gets the minimum. In light mode, verify prior seam findings first, then examine only the delta.
 
 **A seam** is where a value crosses to something that must interpret it: serialization, process/language boundaries, events, persisted formats, pause/resume re-entry, load-time→run-time handoffs. A plain function call is not a seam.
 
