@@ -988,6 +988,77 @@ nodes:
     expect(String(finalParent?.metadata.error)).toContain('Auto-resume after sub-run failed');
   });
 
+  it('surfaces a rejected parent terminal write after the child completes', async () => {
+    await writeWorkflow(
+      'child-gated',
+      `
+name: child-gated
+description: child with an approval gate
+interactive: true
+nodes:
+  - id: implement
+    prompt: "implement $ARGUMENTS"
+  - id: review-gate
+    approval:
+      message: "review the sub-run"
+    depends_on: [implement]
+`
+    );
+    await writeWorkflow(
+      'parent-gated',
+      `
+name: parent-gated
+description: parent composing a gated child
+interactive: true
+nodes:
+  - id: sub
+    workflow: child-gated
+    input: "goal"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-gated');
+    await executeWorkflow(deps, makePlatform(), 'conv-plat', cwd, parent, 'goal', 'conv-db');
+
+    const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'parent-gated');
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-gated');
+    expect(parentRun?.status).toBe('paused');
+
+    parentRun!.codebase_id = 'cb-1';
+    store.getCodebaseEnvVars = () => Promise.reject(new Error('env lookup exploded'));
+    const failWorkflowRun = store.failWorkflowRun.bind(store);
+    const parentFailureWrites: string[] = [];
+    store.failWorkflowRun = (runId, error) => {
+      if (runId === parentRun!.id) {
+        parentFailureWrites.push(error);
+        return Promise.reject(new Error('parent terminal write failed'));
+      }
+      return failWorkflowRun(runId, error);
+    };
+
+    store.approveGate(child!.id);
+    const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(child!.id))!);
+    const childWf = await discover('child-gated');
+    await expect(
+      executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-plat',
+        cwd,
+        childWf,
+        child!.user_message,
+        'conv-db',
+        { ...hydrated! }
+      )
+    ).rejects.toThrow('parent terminal write failed');
+
+    expect((await store.getWorkflowRun(child!.id))?.status).toBe('completed');
+    expect((await store.getWorkflowRun(parentRun!.id))?.status).toBe('running');
+    expect(parentFailureWrites).toHaveLength(1);
+  });
+
   it('child failure fails the sub node and the parent run', async () => {
     await writeWorkflow(
       'child-fail',

@@ -173,6 +173,7 @@ import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './
 import { RUN_METADATA_KEYS, workflowDefinitionSchema } from './schemas';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 import { substituteWorkflowVariables } from './executor-shared';
+import { TerminalStatusWriteError } from './terminal-status-write';
 
 // --- Helpers ---
 
@@ -2978,6 +2979,28 @@ describe('telemetry wiring', () => {
         'db-conv-1'
       )
     ).rejects.toThrow('terminal failure write failed');
+  });
+
+  it('does not recover a rejected DAG terminal write with a second failure write', async () => {
+    mockExecuteDagWorkflow.mockRejectedValueOnce(
+      new TerminalStatusWriteError(new Error('terminal completion write failed'))
+    );
+    const failWorkflowRun = mock(async () => {});
+    const store = makeStore({ failWorkflowRun });
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1'
+      )
+    ).rejects.toThrow('terminal completion write failed');
+
+    expect(failWorkflowRun).not.toHaveBeenCalled();
   });
 
   it('reports feature-adoption booleans on workflow_invoked', async () => {

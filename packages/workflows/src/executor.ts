@@ -69,6 +69,7 @@ import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { keepAwake } from './utils/keep-awake';
 import { getWorkflowEventEmitter } from './event-emitter';
+import { TerminalStatusWriteError, requireTerminalStatusWrite } from './terminal-status-write';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
@@ -1559,10 +1560,9 @@ async function runChildWorkflow(
  *  - the parent's gate isn't a `child_workflow` gate, or
  *  - a DIFFERENT child of the same parent terminated (childRunId mismatch).
  *
- * Never throws — the child's own result must not be corrupted by a parent-resume
- * failure. Every await is guarded here (a parent-side failure is logged, and a
- * post-CAS failure marks the parent 'failed' so it stays resumable); the caller's
- * `.catch` is a belt-and-braces backstop, not the contract.
+ * Failures before the parent resumes leave the child result intact. Once the parent
+ * has resumed, a rejected terminal status write propagates because the child cannot
+ * report an ordinary result while the parent remains running.
  *
  * `resolveChildIsolation` is a plain parameter rather than part of the resume state:
  * {@link ResumePayload} carries what was RECORDED about the prior run, and a resolver
@@ -1736,9 +1736,11 @@ async function maybeResumeParentRun(
       { err: err as Error, parentRunId, childRunId: childRun.id },
       'workflow.parent_auto_resume_execute_failed'
     );
-    await deps.store.failWorkflowRun(
-      parentRunId,
-      `Auto-resume after sub-run failed: ${(err as Error).message}`
+    await requireTerminalStatusWrite(
+      deps.store.failWorkflowRun(
+        parentRunId,
+        `Auto-resume after sub-run failed: ${(err as Error).message}`
+      )
     );
   }
 }
@@ -3036,8 +3038,7 @@ export async function executeWorkflow(
     const finalStatus = await deps.store.getWorkflowRun(workflowRun.id);
     // Sub-run re-entry (#2121 Phase 2): if this run is a `workflow:` child that just
     // reached a terminal state, re-enter its paused parent in-process. Guarded to be
-    // a no-op on the synchronous first-run path (parent still 'running'). Wrapped in
-    // catch — a parent-resume failure must not corrupt the child's own result.
+    // a no-op on the synchronous first-run path (parent still 'running').
     if (
       finalStatus?.parent_run_id &&
       (finalStatus.status === 'completed' ||
@@ -3055,16 +3056,7 @@ export async function executeWorkflow(
         // did inject. Same resolver the child ran with — it is codebase-bound and the
         // child shares the parent's codebase.
         resolveChildIsolation
-      ).catch((err: unknown) => {
-        getLog().error(
-          {
-            err: err as Error,
-            childRunId: workflowRun.id,
-            parentRunId: finalStatus.parent_run_id,
-          },
-          'workflow.parent_auto_resume_failed'
-        );
-      });
+      );
     }
     if (finalStatus?.status === 'completed') {
       return { success: true, workflowRunId: workflowRun.id, summary: dagSummary };
@@ -3078,6 +3070,8 @@ export async function executeWorkflow(
       };
     }
   } catch (error) {
+    if (error instanceof TerminalStatusWriteError) throw error;
+
     // Top-level error handler: ensure workflow is marked as failed
     const err = error as Error;
     getLog().error(
