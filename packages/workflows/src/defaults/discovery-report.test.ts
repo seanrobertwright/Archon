@@ -1,9 +1,10 @@
-import { afterAll, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { trackTempRoots } from '@archon/paths/test-utils';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
 /** Every SDLC tail whose terminal report can carry the discovery section (#2884). */
@@ -28,7 +29,7 @@ function count(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1;
 }
 
-const createdDirs: string[] = [];
+const trackTempRoot = trackTempRoots();
 
 /**
  * Start the interpreter once, for one input.
@@ -62,14 +63,10 @@ async function artifactsDir(discoveries?: string): Promise<string> {
   const dir = join(tmpdir(), `archon-discoveries-${randomUUID()}`);
   if (discoveries === undefined) return dir; // never created: the "no sidecar" case
   await mkdir(dir, { recursive: true });
-  createdDirs.push(dir);
+  trackTempRoot(dir);
   await writeFile(join(dir, 'discoveries.json'), discoveries);
   return dir;
 }
-
-afterAll(async () => {
-  await Promise.all(createdDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
-});
 
 describe('SDLC discovery terminal reports (#2884)', () => {
   it('every tail carries the same helper, reports through it, and pins its streams', () => {
