@@ -1356,6 +1356,36 @@ describe('CommandHandler', () => {
           });
           mockGetLiveRunOwningEnv.mockResolvedValue({ id: 'run-live-1234', status: 'paused' });
 
+          const result = await handleCommand(convWithWorktree, '/worktree remove');
+
+          expect(result.success).toBe(false);
+          expect(result.message).toContain('run-live');
+          expect(result.message).toContain('paused');
+          expect(mockGetLiveRunOwningEnv).toHaveBeenCalledWith('env-uuid-feat-x');
+          expect(mockIsolationDestroy).not.toHaveBeenCalled();
+          expect(mockIsolationEnvDbUpdate).not.toHaveBeenCalled();
+          expect(mockUpdateConversation).not.toHaveBeenCalled();
+        });
+
+        test('refuses forced removal of a worktree owned by a live workflow run', async () => {
+          const convWithWorktree: Conversation = {
+            ...conversationWithCodebase,
+            isolation_env_id: 'env-uuid-feat-x',
+          };
+          mockIsolationEnvDbGet.mockResolvedValue({
+            id: 'env-uuid-feat-x',
+            codebase_id: 'codebase-123',
+            workflow_type: 'task',
+            workflow_id: 'task-feat-x',
+            provider: 'worktree',
+            working_path: '/workspace/my-repo/worktrees/feat-x',
+            branch_name: 'feat-x',
+            status: 'active',
+            created_at: new Date(),
+            created_by_platform: 'test',
+          });
+          mockGetLiveRunOwningEnv.mockResolvedValue({ id: 'run-live-1234', status: 'paused' });
+
           const result = await handleCommand(convWithWorktree, '/worktree remove --force');
 
           expect(result.success).toBe(false);
