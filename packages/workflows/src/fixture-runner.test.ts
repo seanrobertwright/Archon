@@ -585,6 +585,27 @@ describe('runFixtures', () => {
     ]);
   });
 
+  it.skipIf(process.platform === 'win32')(
+    'keeps a bare workflow name out of a same-named invoking-directory symlink',
+    async () => {
+      const { cwd } = writeNestedPackProject();
+      const invokingDir = join(cwd, 'tools');
+      mkdirSync(invokingDir, { recursive: true });
+      symlinkSync(join(cwd, '.archon', 'workflows', 'sdlc'), join(invokingDir, 'plan-wf'), 'dir');
+      const workflows = [
+        ...workflowsOnDisk(cwd, ['plan-wf'], 'sdlc/plan'),
+        ...workflowsOnDisk(cwd, ['ship-wf'], 'sdlc/ship'),
+        ...workflowsOnDisk(cwd, ['ext-wf'], 'sdlc-ext/ext'),
+      ];
+
+      await expect(
+        runFixtures({ workflows, cwd, targetCwd: invokingDir, target: 'plan-wf' }).then(report =>
+          report.results.map(result => result.fixture)
+        )
+      ).resolves.toEqual(['sdlc/plan/fixtures/plan.stubs.yaml']);
+    }
+  );
+
   // Junctions would also resolve on Windows, but fs.realpath's junction handling is
   // platform-dependent; ubuntu CI already runs this, and that is where the tmpdir
   // realpath is the identity and the symlink spelling is the only protection.

@@ -26,7 +26,7 @@
  */
 import { readdir, realpath, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
 import { createLogger, getArchonTempPath } from '@archon/paths';
 import { execFileAsync } from '@archon/git';
@@ -281,6 +281,20 @@ export interface RunFixturesOptions {
   target?: string;
 }
 
+function isCallerRelativePathTarget(target: string): boolean {
+  return (
+    !isAbsolute(target) &&
+    (target === '.' ||
+      target === '..' ||
+      target.startsWith('./') ||
+      target.startsWith('../') ||
+      target.startsWith('.\\') ||
+      target.startsWith('..\\') ||
+      target.includes('/') ||
+      target.includes('\\'))
+  );
+}
+
 /**
  * Run `fn` against ONE frozen capture of the caller's executable source (#2851).
  *
@@ -416,9 +430,10 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
     // A target resolves when it names a discovered workflow, a directory above a
     // fixtures dir (pack name or workflow folder), or a path containing fixtures.
     const targetFromInvocation = resolve(options.targetCwd ?? options.cwd, targetName);
-    const targetDir = (await exists(targetFromInvocation))
-      ? targetFromInvocation
-      : resolve(options.cwd, targetName);
+    const targetDir =
+      isCallerRelativePathTarget(targetName) && (await exists(targetFromInvocation))
+        ? targetFromInvocation
+        : resolve(options.cwd, targetName);
     // Discovery reports fixture paths as real paths, so canonicalize the target
     // before the containment check; a nonexistent target can never contain a
     // fixture, so keeping its resolved spelling there is safe.
