@@ -162,6 +162,60 @@ function getLog(): ReturnType<typeof createLogger> {
 const DETACHED_STARTUP_WINDOW_MS = 500;
 const DETACHED_LOG_TAIL_MAX_CHARS = 4_000;
 const DETACHED_LOG_TAIL_MAX_LINES = 40;
+
+/**
+ * Exit status a detached child uses to tell its launcher that the workflow RAN and
+ * reported failure, rather than dying before it started (#2914's startup window).
+ *
+ * The window observes the only thing a launcher can see — that the child's process is
+ * gone — and a bare non-zero exit cannot separate "never started" from "ran and failed".
+ * A one-node workflow that legitimately fails finishes well inside the window on a fast
+ * machine, so classifying on the window alone reports a completed run as a launch
+ * failure at some machine speed. This code is the child stating which one it was.
+ *
+ * Private to the launcher/child protocol: only a process that started under
+ * `DETACHED_RUN_OWNER_ENV` issues it, so `archon workflow run` on a terminal still exits
+ * 1 for a failed run.
+ */
+export const DETACHED_RUN_FAILED_EXIT_CODE = 90;
+
+/**
+ * The workflow ran and did not succeed — the run owns that outcome and recorded it.
+ *
+ * Distinct from every other error out of a run command, all of which mean the run never
+ * got started. Only that distinction can tell a detached launcher whether to ack the run
+ * it created or refuse the launch.
+ */
+export class WorkflowRunFailedError extends Error {
+  /**
+   * Status the process should exit with. The reserved code is issued only by a detached
+   * child, whose exit status nothing but its launcher reads; a run failing on someone's
+   * terminal still exits 1.
+   */
+  readonly exitCode: number;
+
+  constructor(reason: string | undefined, detachedChild: boolean) {
+    super(`Workflow failed: ${String(reason)}`);
+    this.name = 'WorkflowRunFailedError';
+    this.exitCode = detachedChild ? DETACHED_RUN_FAILED_EXIT_CODE : 1;
+  }
+}
+
+/**
+ * Exit status for a CLI failure: whatever a run reported about its own outcome, 1 for
+ * everything else.
+ *
+ * The commands that continue a run (`resume`, `approve`, `reject`, `respond`) re-throw
+ * with their own explanation, so the outcome is read off the `cause` chain rather than
+ * the outermost error.
+ */
+export function resolveCliExitCode(error: unknown): number {
+  for (let current: unknown = error; current instanceof Error; current = current.cause) {
+    if (current instanceof WorkflowRunFailedError) return current.exitCode;
+  }
+  return 1;
+}
+
 function parseDetachedRunConfig(payload: string | undefined): WorkflowRunConfigInput | undefined {
   if (payload === undefined) return undefined;
 
@@ -209,19 +263,24 @@ async function waitForDetachedStartup(
   execPath: string,
   conversationId: string
 ): Promise<void> {
-  const outcome = await new Promise<'completed' | 'survived'>((resolve, reject) => {
+  const outcome = await new Promise<'completed' | 'failed' | 'survived'>((resolve, reject) => {
     const cleanup = (): void => {
       clearTimeout(timer);
       child.off('exit', onExit);
       child.off('error', onStartupError);
     };
-    const settle = (result: 'completed' | 'survived' | Error): void => {
+    const settle = (result: 'completed' | 'failed' | 'survived' | Error): void => {
       cleanup();
       if (result instanceof Error) reject(result);
       else resolve(result);
     };
+    // A child that is gone before the window closes either finished the run that fast or
+    // never started it, and only the child can say which: `DETACHED_RUN_FAILED_EXIT_CODE`
+    // is it reporting its run's own failure. Everything else non-zero is a death this
+    // process could not have caused and the run cannot explain — a launch failure.
     const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (code === 0) settle('completed');
+      else if (code === DETACHED_RUN_FAILED_EXIT_CODE) settle('failed');
       else settle(detachedStartupExitError(code, signal, logPath));
     };
     const onStartupError = (error: Error): void => {
@@ -3181,7 +3240,7 @@ async function runWorkflowWithOwnedSource(
     }
     console.log('\nWorkflow completed successfully.');
   } else {
-    throw new Error(`Workflow failed: ${result.error}`);
+    throw new WorkflowRunFailedError(result.error, detachedProcessOwner);
   }
 }
 
@@ -4215,7 +4274,9 @@ export async function workflowResumeCommand(
       { err, runId: resolvedId, workflowName: run.workflow_name },
       'cli.workflow_resume_run_failed'
     );
-    throw new Error(`Failed to resume workflow '${run.workflow_name}': ${err.message}`);
+    throw new Error(`Failed to resume workflow '${run.workflow_name}': ${err.message}`, {
+      cause: err,
+    });
   }
 }
 
@@ -4512,7 +4573,8 @@ export async function workflowApproveCommand(
     );
     throw new Error(
       `Approved but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
-        `The approval was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
+        `The approval was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`,
+      { cause: err }
     );
   }
 }
@@ -4649,7 +4711,8 @@ export async function workflowRejectCommand(
     );
     throw new Error(
       `Rejected but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
-        `The rejection was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
+        `The rejection was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`,
+      { cause: err }
     );
   }
 }
@@ -4774,7 +4837,8 @@ export async function workflowRespondCommand(
     );
     throw new Error(
       `Response recorded but failed to resume workflow '${result.workflowName}': ${err.message}\n` +
-        `The response was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`
+        `The response was recorded. Run 'bun run cli workflow resume ${resolvedId}' to retry.`,
+      { cause: err }
     );
   }
 }

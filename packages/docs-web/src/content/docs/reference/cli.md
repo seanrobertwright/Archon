@@ -608,8 +608,10 @@ hands the whole command to a detached child that owns all state mutation in its 
 process group. A shell that dies mid-flight can no longer wedge the run.
 
 The parent also waits out the child's startup window before acking, so a child that
-dies immediately surfaces as an error carrying the tail of its log rather than as a
-success you only discover was false minutes later.
+dies before it starts the run surfaces as an error carrying the tail of its log rather
+than as a success you only discover was false minutes later. A run that simply finishes
+inside that window — a short workflow, or one that fails on its first node — is acked
+normally; its outcome belongs to the run, and `workflow get <run-id>` reports it.
 
 ```bash
 archon workflow approve <run-id> --detach
