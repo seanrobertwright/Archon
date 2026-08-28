@@ -85,8 +85,9 @@ def format_raw_discoveries(artifacts: str) -> str:
     the same reason: an agent wrote them from prose against no schema, and one
     malformed record must not raise past the last thing this run can say.
 
-    Always prints something, empty form included, so a failed run's reader learns that
-    nothing was recorded instead of guessing whether the channel ran.
+    Silent when there is nothing to report, like the consolidated section above:
+    #2884's contract is one section that exists only when discoveries do, and a failed
+    run is not a reason to print an empty one.
 
     Kept byte-identical across the four SDLC tails.
     """
@@ -113,7 +114,7 @@ def format_raw_discoveries(artifacts: str) -> str:
             claim = str(record.get("claim") or "").strip()
             lines.append(f"- {title} [{relation}]" + (f"\n  {claim}" if claim else ""))
     if not lines and not unreadable:
-        return "\n\nDiscoveries: none recorded before this run ended."
+        return ""
     body = "\n".join(lines + unreadable)
     return (
         f"\n\nUnconsolidated discoveries ({len(lines)}) — recorded by this run's nodes and "

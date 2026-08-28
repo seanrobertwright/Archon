@@ -336,17 +336,18 @@ describe('SDLC discovery terminal reports (#2884)', () => {
   );
 
   it(
-    'tells a failed run that nothing was recorded, rather than staying silent',
+    'adds nothing to a failed run that recorded no sidecars',
     async () => {
+      // The fallback exists to stop evidence being dropped, not to announce its own
+      // absence. #2884's contract is one section that exists only when discoveries
+      // do, and a failed run is not a reason to print an empty one.
       const result = await runOutcome('deliver', {
         INPUTS_PR_URL: '',
         ARTIFACTS_DIR: await preConsolidationDir(),
       });
 
       expect(result.exitCode).toBe(1);
-      expect(result.stderr).toBe(
-        'outcome: flip-ready reported no pull request URL.\n\nDiscoveries: none recorded before this run ended.\n'
-      );
+      expect(result.stderr).toBe('outcome: flip-ready reported no pull request URL.\n');
     },
     SPAWN_TIMEOUT_MS
   );
