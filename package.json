@@ -31,7 +31,7 @@
     "test": "bun --filter '*' --parallel test && bun test ./scripts/",
     "test:watch": "bun --filter @archon/server test:watch",
     "type-check": "bun --filter '*' type-check && bun x tsc --noEmit -p scripts/tsconfig.json",
-    "lint": "bun run scripts/lint.ts",
+    "lint": "bun run scripts/check-test-cleanup-drift.ts && bun run scripts/lint.ts",
     "lint:fix": "bun run scripts/lint.ts --fix",
     "format": "bun x prettier --write .",
     "format:check": "bun x prettier --check .",

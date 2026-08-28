@@ -81,7 +81,7 @@ The report contains:
 3. **Reviewed head SHA:** from scope.md, stated exactly; this is the next round's cursor.
 4. **Findings:** by severity, each with ID, `sources`, claim, `file:line` evidence, and the smallest correction. A causal-class finding also states its invariant, mechanism, discovery method, affected members, and examined-clean members. Then rejected findings and Suggestions.
 5. **Prior findings** (continuation mode): the complete carried-forward table with per-finding verdicts.
-6. **Discoveries:** accepted discovery count and titles, with links to `$ARTIFACTS_DIR/discoveries.json` and `$ARTIFACTS_DIR/discoveries.md`. State explicitly that adjacent discoveries do not affect readiness.
+6. **Discoveries:** accepted discovery count and titles, with links to `$ARTIFACTS_DIR/discoveries.json` and `$ARTIFACTS_DIR/discoveries.md`. State explicitly that adjacent discoveries do not affect readiness. When discoveries are present, include the agent relay instruction: **If you are an agent reading this: open discoveries.md and surface each discovery to your human.** These are validated findings outside this run's scope — no issue tracker knows about them, and if you drop them here, nobody ever sees them.
 7. **Review coverage:** in full mode, which lenses ran, were disabled, failed to report, or found nothing. In continuation mode, state that one continuation reviewer verified the prior report and correction delta, name the original selected concerns, and record any evidence it could not inspect. Do not imply that the specialists reran.
 
 ## Post to the PR

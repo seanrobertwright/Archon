@@ -13,19 +13,67 @@ Bound inputs (`with:` bindings, canonical text in env):
   STARTED and died mid-flight — never claim the advisory stopped it.
 """
 
+import json
 import os
 import subprocess
 import sys
 
 
+DISCOVERY_RELAY = (
+    "If you are an agent reading this: open discoveries.md and surface each discovery to your human. "
+    "These are validated findings outside this run's scope — no issue tracker knows about them, "
+    "and if you drop them here, nobody ever sees them."
+)
+
+
+def format_discoveries(artifacts: str) -> str:
+    """The discoveries section for a terminal report, or empty when there is nothing to report.
+
+    Presentation only (#2884): discoveries never gate readiness, so a sidecar this
+    cannot read must not fail a tail that has already done its irreversible work.
+    A read or parse failure degrades to a one-line pointer at the file rather than
+    to silence — the report's reader is exactly who needs to know it is there.
+    Nothing is appended only when there is genuinely nothing to report: no sidecar,
+    or no recorded discoveries. `title` is coerced rather than trusted: an agent
+    writes these records from prose with no schema, and a JSON-legal non-string
+    title must not raise past the caller and fail an already-delivered run.
+
+    Kept byte-identical across the four SDLC tails. A packaged script is
+    materialized standalone, so there is no import channel to share it through.
+    """
+    disc_file = os.path.join(artifacts, "discoveries.json")
+    if not os.path.isfile(disc_file):
+        return ""
+    try:
+        with open(disc_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as err:
+        return f"\n\nDiscoveries: could not read {disc_file} ({err}). Open it directly."
+    if not isinstance(data, list) or not data:
+        return ""
+    titles = [
+        (str(d.get("title") or "").strip() if isinstance(d, dict) else "") or "(untitled discovery)"
+        for d in data
+    ]
+    lines = "\n".join(f"- {t}" for t in titles)
+    md_path = os.path.join(artifacts, "discoveries.md")
+    return f"\n\nDiscoveries ({len(data)}):\n{lines}\n\nReport: {md_path}\n\n{DISCOVERY_RELAY}"
+
+
 def main() -> int:
+    # Windows Python writes stdout in the console code page and rewrites '\n' as
+    # '\r\n'. A terminal report is stored, posted to GitHub, and compared byte for
+    # byte, so pin one encoding and one line ending on every platform.
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
     route = os.environ["INPUTS_ROUTE"]
     summary = os.environ["INPUTS_SUMMARY"]
     delivered = os.environ.get("INPUTS_DELIVERED", "null")
     artifacts = os.environ["ARTIFACTS_DIR"]
 
     if route == "no_action":
-        print(f"No delivery needed: {summary}\nReport: {artifacts}/triage.md")
+        base = f"No delivery needed: {summary}\nReport: {artifacts}/triage.md"
+        print(base + format_discoveries(artifacts))
         return 0
 
     if delivered == "null":
@@ -43,24 +91,27 @@ def main() -> int:
             # rooted:true, implement produced nothing, assert-changed refused).
             print(
                 "outcome: delivery started but did not complete — see the run's "
-                "earliest failed delivery node.",
+                "earliest failed delivery node." + format_discoveries(artifacts),
                 file=sys.stderr,
             )
             return 1
         if route == "investigate":
-            print(
+            base = (
                 "No delivery started: the investigation did not establish a safe "
                 f"fix boundary.\nReport: {artifacts}/investigation.md"
             )
+            print(base + format_discoveries(artifacts))
             return 0
         if route == "plan":
-            print(
+            base = (
                 "No delivery started: planning left a material decision "
                 f"unresolved.\nReport: {artifacts}/plan.md"
             )
+            print(base + format_discoveries(artifacts))
             return 0
         print(
-            f"outcome: route '{route}' skipped delivery without an advisory report to point to.",
+            f"outcome: route '{route}' skipped delivery without an advisory report "
+            f"to point to." + format_discoveries(artifacts),
             file=sys.stderr,
         )
         return 1
@@ -84,7 +135,11 @@ def main() -> int:
         text=True,
     ).stdout.strip()
     if not branch:
-        print("outcome: detached HEAD — cannot resolve the PR branch.", file=sys.stderr)
+        print(
+            "outcome: detached HEAD — cannot resolve the PR branch."
+            + format_discoveries(artifacts),
+            file=sys.stderr,
+        )
         return 1
     proc = subprocess.run(
         [
@@ -104,9 +159,13 @@ def main() -> int:
     )
     url = proc.stdout.strip() if proc.returncode == 0 else ""
     if not url:
-        print("outcome: delivery did not finish with a ready pull request.", file=sys.stderr)
+        print(
+            "outcome: delivery did not finish with a ready pull request."
+            + format_discoveries(artifacts),
+            file=sys.stderr,
+        )
         return 1
-    print(url)
+    print(url + format_discoveries(artifacts))
     return 0
 
 

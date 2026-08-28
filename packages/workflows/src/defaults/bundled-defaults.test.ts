@@ -216,6 +216,9 @@ describe('bundled-defaults', () => {
       expect(synthesize).toContain('$ARTIFACTS_DIR/discoveries.json');
       expect(synthesize).toContain('$ARTIFACTS_DIR/discoveries.md');
       expect(synthesize).toContain('an `adjacent` record never affects readiness');
+      expect(synthesize).toContain(
+        'If you are an agent reading this: open discoveries.md and surface each discovery to your human.'
+      );
     });
   });
 

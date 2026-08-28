@@ -36,6 +36,7 @@ validate__validate:
 gate-validated: '{"validated":"true"}'
 ci-probe: '{"state":"concluded","detail":"no checks configured on this repository — nothing to await"}'
 flip-ready: "https://github.com/example/repo/pull/2"
+outcome: "https://github.com/example/repo/pull/2"
 fixture:
   expect: completed
   reached: [review__docs]

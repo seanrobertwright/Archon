@@ -19,6 +19,7 @@ deliver__gate-green: '{"gate":"green"}'
 deliver__pr__pr: "https://github.com/example/repo/pull/2 (draft)"
 ci-probe: '{"state":"concluded","detail":"all checks passed"}'
 deliver__flip-ready: "https://github.com/example/repo/pull/2"
+deliver__outcome: "https://github.com/example/repo/pull/2"
 deliver__validate__validate:
   green: true
   summary: "stub: project gate green"

@@ -39,5 +39,6 @@ validate__validate:
 gate-validated: '{"validated":"true"}'
 ci-probe: '{"state":"concluded","detail":"no checks configured"}'
 flip-ready: "https://github.com/example/repo/pull/5"
+outcome: "https://github.com/example/repo/pull/5"
 fixture:
   expect: completed

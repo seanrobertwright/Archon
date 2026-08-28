@@ -137,6 +137,8 @@ The governing rule is: **YAML coordinates. Code computes. Agents judge.** Read [
 
 - Add tests for meaningful behavior and failure modes. Do not preserve deleted features through regression-test clutter.
 - Prefer deterministic, cheap tests. Remove accidental I/O and unnecessary subprocesses before increasing timeouts.
+- Remove test temp trees with `removeTempTree` or `trackTempRoots` from `@archon/paths/test-utils`.
+- Spawn a subprocess only when the subprocess is the subject under test. To suppress an inherited env key for a Bun child, pass it as `''`; deleting it allows `.env` loading to restore it.
 - Bun's module mocks pollute the process cache. Use the package test scripts that preserve isolation; do not run `bun test` from the repository root.
 - Always run lint through `bun run lint` or `bun run lint:fix`; the wrapper isolates packages to keep typed lint within its memory budget.
 - Run the narrow checks that prove the changed behavior while iterating.
