@@ -24,6 +24,10 @@ function outcomeScript(tail: (typeof TAILS)[number]): string {
   return join(REPO_ROOT, '.archon', 'workflows', 'sdlc', tail, 'scripts', 'outcome.py');
 }
 
+function count(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
 const createdDirs: string[] = [];
 
 /**
@@ -68,24 +72,40 @@ afterAll(async () => {
 });
 
 describe('SDLC discovery terminal reports (#2884)', () => {
-  it('every tail carries the same helper and pins its output streams', () => {
-    // A packaged script is materialized standalone, so the four tails hold four copies
-    // of one helper. This is the check that keeps them one thing: edit the report format
-    // in one tail and every other tail fails here rather than drifting quietly. Only
-    // deliver's script is spawned below, so the stream pinning is asserted statically
-    // for all four — a tail that loses it emits mojibake and CRLF on Windows alone.
+  it('every tail carries the same helper, reports through it, and pins its streams', () => {
+    // Only deliver's script is spawned below — the other three reach their report
+    // branches through `gh` and `git`, so their call sites can only be checked
+    // statically. Three invariants, each one a bug this file has already seen:
+    //
+    //   identical  — four standalone copies of one helper, no import channel to share it
+    //   reported   — every print in main() appends the section, so no branch can be
+    //                missed the way the delivery-failed branch was
+    //   pinned     — the stream pinning precedes every print, not merely exists
+    //                somewhere in the file, or a later early return prints unpinned
     const helpers = TAILS.map(tail => {
       const source = readFileSync(outcomeScript(tail), 'utf-8');
       const start = source.indexOf('DISCOVERY_RELAY = (');
-      const end = source.indexOf('def main() -> int:');
+      const mainStart = source.indexOf('def main() -> int:');
+      const body = source.slice(mainStart);
+      const firstPrint = source.indexOf('print(');
+      const pins = [
+        source.indexOf('sys.stdout.reconfigure(encoding="utf-8", newline="\\n")'),
+        source.indexOf('sys.stderr.reconfigure(encoding="utf-8", newline="\\n")'),
+      ];
       expect({
         tail,
         declared: start >= 0,
-        precedesMain: end > start,
-        pinsStdout: source.includes('sys.stdout.reconfigure(encoding="utf-8", newline="\\n")'),
-        pinsStderr: source.includes('sys.stderr.reconfigure(encoding="utf-8", newline="\\n")'),
-      }).toEqual({ tail, declared: true, precedesMain: true, pinsStdout: true, pinsStderr: true });
-      return source.slice(start, end);
+        precedesMain: mainStart > start,
+        everyReportCarriesDiscoveries: count(body, 'print(') === count(body, 'format_discoveries('),
+        pinsPrecedeEveryPrint: firstPrint > 0 && pins.every(at => at >= 0 && at < firstPrint),
+      }).toEqual({
+        tail,
+        declared: true,
+        precedesMain: true,
+        everyReportCarriesDiscoveries: true,
+        pinsPrecedeEveryPrint: true,
+      });
+      return source.slice(start, mainStart);
     });
     for (const helper of helpers) {
       expect(helper).toContain(RELAY);
@@ -96,15 +116,19 @@ describe('SDLC discovery terminal reports (#2884)', () => {
   it(
     'reports the count, titles, sidecar path, and relay instruction when discoveries exist',
     async () => {
-      // The fixture carries non-ASCII and the spawn forces a legacy console encoding on
-      // purpose. Windows Python otherwise writes stdout in the console code page and
-      // rewrites '\n' as '\r\n', which turned the relay's em dash into U+FFFD and every
-      // line ending into CRLF on CI. Comparing the whole report byte for byte is what
-      // proves the pinning, so this stays one contract rather than two spawns.
+      // One spawn, one exact-bytes assertion, three properties — the sidecar is written
+      // by an agent from prose with no schema, so "what the reader receives" has to hold
+      // for what an agent actually writes:
+      //   - non-ASCII under a legacy console encoding. Windows Python otherwise writes
+      //     stdout in the console code page and rewrites '\n' as '\r\n', which turned the
+      //     relay's em dash into U+FFFD and every line ending into CRLF on CI.
+      //   - a title that is valid JSON but not a string, which used to raise
+      //     AttributeError past the caller and fail a run whose PR was already public.
       const artifacts = await artifactsDir(
         JSON.stringify([
           { title: 'dev branch: rmSync missing import', relation: 'adjacent' },
           { title: 'café — naïve encoding regression', relation: 'adjacent' },
+          { title: 42, relation: 'adjacent' },
         ])
       );
 
@@ -117,9 +141,10 @@ describe('SDLC discovery terminal reports (#2884)', () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe(
         `https://github.com/example/repo/pull/10\n\n` +
-          `Discoveries (2):\n` +
+          `Discoveries (3):\n` +
           `- dev branch: rmSync missing import\n` +
-          `- café — naïve encoding regression\n\n` +
+          `- café — naïve encoding regression\n` +
+          `- 42\n\n` +
           `Report: ${join(artifacts, 'discoveries.md')}\n\n` +
           `${RELAY} These are validated findings outside this run's scope — no issue tracker ` +
           `knows about them, and if you drop them here, nobody ever sees them.\n`
@@ -175,6 +200,35 @@ describe('SDLC discovery terminal reports (#2884)', () => {
       );
       expect(result.stdout).toContain('Open it directly.');
       expect(result.stdout).not.toContain(RELAY);
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'still relays discoveries on the branch that reports a delivery failure',
+    async () => {
+      // The branch that fires when no ready PR is confirmed is the one most likely to
+      // already hold discoveries: a review ran and recorded something adjacent before
+      // corrections were exhausted. A failed script node's stderr reaches the operator
+      // through the node_failed event, so the section has to ride the failure report too
+      // — the run still fails, it just stops dropping what it found on the way.
+      const artifacts = await artifactsDir(JSON.stringify([{ title: 'type drift in the store' }]));
+
+      const result = await runOutcome('deliver', {
+        INPUTS_PR_URL: '',
+        ARTIFACTS_DIR: artifacts,
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe(
+        `outcome: flip-ready reported no pull request URL.\n\n` +
+          `Discoveries (1):\n` +
+          `- type drift in the store\n\n` +
+          `Report: ${join(artifacts, 'discoveries.md')}\n\n` +
+          `${RELAY} These are validated findings outside this run's scope — no issue tracker ` +
+          `knows about them, and if you drop them here, nobody ever sees them.\n`
+      );
     },
     SPAWN_TIMEOUT_MS
   );

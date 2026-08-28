@@ -34,7 +34,9 @@ def format_discoveries(artifacts: str) -> str:
     A read or parse failure degrades to a one-line pointer at the file rather than
     to silence — the report's reader is exactly who needs to know it is there.
     Nothing is appended only when there is genuinely nothing to report: no sidecar,
-    or no recorded discoveries.
+    or no recorded discoveries. `title` is coerced rather than trusted: an agent
+    writes these records from prose with no schema, and a JSON-legal non-string
+    title must not raise past the caller and fail an already-delivered run.
 
     Kept byte-identical across the four SDLC tails. A packaged script is
     materialized standalone, so there is no import channel to share it through.
@@ -50,7 +52,7 @@ def format_discoveries(artifacts: str) -> str:
     if not isinstance(data, list) or not data:
         return ""
     titles = [
-        ((d.get("title") or "").strip() if isinstance(d, dict) else "") or "(untitled discovery)"
+        (str(d.get("title") or "").strip() if isinstance(d, dict) else "") or "(untitled discovery)"
         for d in data
     ]
     lines = "\n".join(f"- {t}" for t in titles)
@@ -79,13 +81,13 @@ def main() -> int:
         if gate_passed:
             print(
                 "outcome: delivery started but did not complete — see the run's "
-                "earliest failed delivery node.",
+                "earliest failed delivery node." + format_discoveries(artifacts),
                 file=sys.stderr,
             )
             return 1
         print(
             "outcome: the assessment chose 'update' but the spend gate never "
-            "passed — see the assessment stage's failed node.",
+            "passed — see the assessment stage's failed node." + format_discoveries(artifacts),
             file=sys.stderr,
         )
         return 1
@@ -109,7 +111,11 @@ def main() -> int:
         text=True,
     ).stdout.strip()
     if not branch:
-        print("outcome: detached HEAD — cannot resolve the PR branch.", file=sys.stderr)
+        print(
+            "outcome: detached HEAD — cannot resolve the PR branch."
+            + format_discoveries(artifacts),
+            file=sys.stderr,
+        )
         return 1
     proc = subprocess.run(
         [
@@ -129,7 +135,11 @@ def main() -> int:
     )
     url = proc.stdout.strip() if proc.returncode == 0 else ""
     if not url:
-        print("outcome: delivery did not finish with a ready pull request.", file=sys.stderr)
+        print(
+            "outcome: delivery did not finish with a ready pull request."
+            + format_discoveries(artifacts),
+            file=sys.stderr,
+        )
         return 1
     print(url + format_discoveries(artifacts))
     return 0
