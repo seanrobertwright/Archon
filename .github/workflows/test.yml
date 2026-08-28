@@ -4,27 +4,38 @@ on:
   workflow_dispatch:
   push:
     branches: [main, dev]
-    paths:
-      - '**'
-      - '!**.md'
-      - '!packages/docs-web/**'
-      # Docker's dependency layer copies this workspace manifest.
-      - 'packages/docs-web/package.json'
   pull_request:
     branches: [main, dev]
-    paths:
-      - '**'
-      - '!**.md'
-      - '!packages/docs-web/**'
-      # Docker's dependency layer copies this workspace manifest.
-      - 'packages/docs-web/package.json'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run-tests: ${{ steps.decision.outputs.run-tests }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Decide whether tests are needed
+        id: decision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.after || github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" != workflow_dispatch ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          fi
+          echo "run-tests=$(bun scripts/should-run-test-suite.ts "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
     strategy:
       # Both legs must always report. With the default fail-fast, an ubuntu
       # failure cancels windows, so a windows-only break stays invisible until
@@ -88,6 +99,8 @@ jobs:
         run: bun run test
 
   schema-upgrade:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
     # Nothing else in CI applies migrations/000_combined.sql to a real database,
     # and every test that touches a schema starts from an empty one. That blind
     # spot is exactly how #2508 shipped green and then crash-looped every
@@ -145,6 +158,8 @@ jobs:
         run: bun run check:sqlite-vintages
 
   postgres-parity:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
     # The unit suite mocks the pg driver, so the Postgres dialect branch of
     # getLiveRunOwningEnv (cleanup's lock query) only executes here, against a
     # real server: an untyped parameter compared against text and UUID columns
@@ -183,6 +198,8 @@ jobs:
         run: bun test packages/core/src/db/isolation-environments.live-run.postgres.integration.test.ts
 
   docker-build:
+    needs: changes
+    if: needs.changes.outputs.run-tests == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -227,3 +244,29 @@ jobs:
       - name: Cleanup smoke test container
         if: always()
         run: docker rm -f archon-smoke || true
+
+  test-suite:
+    name: Test Suite
+    needs: [changes, test, schema-upgrade, postgres-parity, docker-build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report test-suite outcome
+        env:
+          RUN_TESTS: ${{ needs.changes.outputs.run-tests }}
+          TEST: ${{ needs.test.result }}
+          SCHEMA_UPGRADE: ${{ needs.schema-upgrade.result }}
+          POSTGRES_PARITY: ${{ needs.postgres-parity.result }}
+          DOCKER_BUILD: ${{ needs.docker-build.result }}
+        run: |
+          if [ "$RUN_TESTS" = false ]; then
+            echo "Skipped tests for documentation-only changes."
+            exit 0
+          fi
+
+          for result in "$TEST" "$SCHEMA_UPGRADE" "$POSTGRES_PARITY" "$DOCKER_BUILD"; do
+            if [ "$result" != success ]; then
+              echo "A test-suite job finished with $result."
+              exit 1
+            fi
+          done
