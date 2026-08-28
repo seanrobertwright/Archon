@@ -810,8 +810,16 @@ archon complete feature-auth --force  # bypass safety checks
 | `--force` | Skip safety checks |
 
 Use this after a PR is merged and you no longer need the worktree or branches. If GitHub
-has deleted a squash-merged branch, completion verifies its patches are already on the
-configured or detected default branch before removing it. Accepts multiple branch names in one call.
+has deleted a squash-merged branch, first prune its remote-tracking ref so the local clone
+reflects that deletion:
+
+```bash
+git fetch --prune origin # replace origin with the configured remote when needed
+archon complete feature-auth
+```
+
+Completion verifies its patches are already on the configured or detected remote default branch
+before removing it. Accepts multiple branch names in one call.
 
 ### `serve`
 

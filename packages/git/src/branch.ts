@@ -272,20 +272,21 @@ export async function isBranchMerged(
  * Returns true if every reported commit is patch-equivalent (or if there are no
  * commits to compare). Returns false if any commit is unmerged.
  *
- * Returns false for expected errors (branch/repo not found).
+ * Returns false for expected errors (branch/repo not found), unless callers
+ * need those errors surfaced to distinguish an unmerged branch from an
+ * unverifiable comparison.
  * Throws for unexpected errors (permission denied, corruption).
  */
 export async function isPatchEquivalent(
   repoPath: RepoPath,
   branchName: BranchName,
-  baseBranch: BranchName
+  baseRef: string,
+  options: { throwOnExpectedError?: boolean } = {}
 ): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['-C', repoPath, 'cherry', baseBranch, branchName],
-      { timeout: 15000 }
-    );
+    const { stdout } = await execFileAsync('git', ['-C', repoPath, 'cherry', baseRef, branchName], {
+      timeout: 15000,
+    });
     const lines = stdout.split('\n').filter(line => line.trim());
     if (lines.length === 0) return true;
     return lines.every(line => line.startsWith('-'));
@@ -300,14 +301,14 @@ export async function isPatchEquivalent(
       errorText.includes('no such file') ||
       err.code === 'ENOENT';
 
-    if (isExpectedError) return false;
+    if (isExpectedError && !options.throwOnExpectedError) return false;
 
     getLog().error(
-      { err: error, repoPath, branchName, baseBranch },
+      { err: error, repoPath, branchName, baseRef },
       'branch.patch_equivalent_check_failed'
     );
     throw new Error(
-      `Failed to check if ${branchName} is patch-equivalent to ${baseBranch}: ${err.message}`
+      `Failed to check if ${branchName} is patch-equivalent to ${baseRef}: ${err.message}`
     );
   }
 }

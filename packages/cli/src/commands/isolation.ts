@@ -314,8 +314,9 @@ export async function isolationCompleteCommand(
       // Check 4: commits that would become unreachable after branch deletion.
       let remote = 'origin';
       let uniqueCommitCount: number | undefined;
+      let repoConfig: Awaited<ReturnType<typeof loadRepoConfig>> | undefined;
       try {
-        const repoConfig = await loadRepoConfig(env.codebase_default_cwd);
+        repoConfig = await loadRepoConfig(env.codebase_default_cwd);
         remote = repoConfig.worktree?.remote?.trim() || remote;
         uniqueCommitCount = await getUniqueCommitCount(
           toRepoPath(env.codebase_default_cwd),
@@ -349,23 +350,24 @@ export async function isolationCompleteCommand(
         if (err.message.includes('unknown revision') || err.message.includes('bad revision')) {
           if (uniqueCommitCount !== undefined && uniqueCommitCount > 0) {
             try {
-              const repoConfig = await loadRepoConfig(env.codebase_default_cwd);
-              const configuredBase = repoConfig.worktree?.baseBranch?.trim();
+              const configuredBase = repoConfig?.worktree?.baseBranch?.trim();
               const baseBranch = configuredBase
                 ? toBranchName(configuredBase)
                 : await getDefaultBranch(toRepoPath(env.codebase_default_cwd), remote);
+              const remoteBaseRef = `${remote}/${baseBranch}`;
               if (
                 await isPatchEquivalent(
                   toRepoPath(env.codebase_default_cwd),
                   toBranchName(branch),
-                  baseBranch
+                  remoteBaseRef,
+                  { throwOnExpectedError: true }
                 )
               ) {
                 console.log(
-                  `  Note: remote branch deleted; content is already on ${baseBranch} (squash-merged).`
+                  `  Note: remote branch deleted; content is already on ${remoteBaseRef} (squash-merged).`
                 );
               } else {
-                blockers.push(`remote branch deleted and content not found on ${baseBranch}`);
+                blockers.push(`remote branch deleted and content not found on ${remoteBaseRef}`);
               }
             } catch (patchCheckError) {
               const patchCheckErr = patchCheckError as Error;

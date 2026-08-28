@@ -333,10 +333,12 @@ describe('isolationCompleteCommand', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
   });
 
-  it('allows a squash-merged branch whose remote ref was deleted', async () => {
+  it('allows a squash-merged branch whose remote default has its patches', async () => {
     mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
     mockGetUniqueCommitCount.mockResolvedValueOnce(1);
-    mockIsPatchEquivalent.mockResolvedValueOnce(true);
+    mockIsPatchEquivalent.mockImplementation((_repo: string, _branch: string, baseRef: string) =>
+      Promise.resolve(baseRef === 'origin/dev')
+    );
     mockRemoveEnvironment.mockResolvedValueOnce({
       worktreeRemoved: true,
       branchDeleted: true,
@@ -354,17 +356,27 @@ describe('isolationCompleteCommand', () => {
 
     await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
 
-    expect(mockIsPatchEquivalent).toHaveBeenCalledWith('/test/repo', 'feature-branch', 'dev');
+    expect(mockIsPatchEquivalent).toHaveBeenCalledWith(
+      '/test/repo',
+      'feature-branch',
+      'origin/dev',
+      {
+        throwOnExpectedError: true,
+      }
+    );
     expect(consoleLogSpy).toHaveBeenCalledWith(
-      '  Note: remote branch deleted; content is already on dev (squash-merged).'
+      '  Note: remote branch deleted; content is already on origin/dev (squash-merged).'
     );
     expect(mockRemoveEnvironment).toHaveBeenCalled();
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 1 completed, 0 failed, 0 not found');
   });
 
-  it('reports deleted remote content missing from the default branch', async () => {
+  it('does not accept patches present only on the local default branch', async () => {
     mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
     mockGetUniqueCommitCount.mockResolvedValueOnce(1);
+    mockIsPatchEquivalent.mockImplementation((_repo: string, _branch: string, baseRef: string) =>
+      Promise.resolve(baseRef === 'dev')
+    );
     mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'gh') {
         return Promise.resolve({ stdout: '[]', stderr: '' });
@@ -380,9 +392,32 @@ describe('isolationCompleteCommand', () => {
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      '    ✗ remote branch deleted and content not found on dev'
+      '    ✗ remote branch deleted and content not found on origin/dev'
     );
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
+  });
+
+  it('blocks when the remote default branch cannot be verified', async () => {
+    mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    mockGetUniqueCommitCount.mockResolvedValueOnce(1);
+    mockIsPatchEquivalent.mockRejectedValueOnce(new Error('unknown revision origin/dev'));
+    mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'gh') {
+        return Promise.resolve({ stdout: '[]', stderr: '' });
+      }
+      if (cmd === 'git' && args.some((a: string) => a.startsWith('origin/'))) {
+        return Promise.reject(new Error('fatal: unknown revision origin/feature-branch'));
+      }
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+
+    await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
+
+    expect(mockRemoveEnvironment).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      '    ✗ could not verify whether remote-deleted branch was merged (unknown revision origin/dev)'
+    );
   });
 
   it('allows never-pushed branch with 0 unique commits to complete without --force', async () => {
