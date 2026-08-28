@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "type-check": "tsc --noEmit",
     "test": "bun test src/lib/ && bun test src/stores/ && bun test src/hooks/ && bun test src/components/ && bun test src/experiments/console/",
-    "generate:types": "openapi-typescript http://localhost:3090/api/openapi.json -o src/lib/api.generated.d.ts"
+    "generate:types": "bun --cwd=../server run generate:api-types"
   },
   "dependencies": {
     "@dagrejs/dagre": "^2.0.4",

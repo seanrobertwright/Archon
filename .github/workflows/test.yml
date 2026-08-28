@@ -84,6 +84,9 @@ jobs:
       - name: Check provider capability matrix
         run: bun run check:capability-matrix
 
+      - name: Check generated API types
+        run: bun run check:api-types
+
       - name: Type check
         run: bun run type-check
 
