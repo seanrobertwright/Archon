@@ -354,7 +354,7 @@ describe('per-run model bindings', () => {
     });
   });
 
-  test('registered agent refs switch provider and Pi refs validate their nested model', () => {
+  test('registered agent refs switch provider and Pi refs require their vendor prefix', () => {
     expect(
       resolveRunModelOverrides(base, { tiers: { large: 'codex/gpt-5.6-sol' } }).tiers?.large
     ).toEqual({ provider: 'codex', model: 'gpt-5.6-sol' });
@@ -362,7 +362,7 @@ describe('per-run model bindings', () => {
       resolveRunModelOverrides(base, { tiers: { large: 'pi/openrouter/qwen/qwen3' } }).tiers?.large
     ).toEqual({ provider: 'pi', model: 'openrouter/qwen/qwen3' });
     expect(() => resolveRunModelOverrides(base, { tiers: { large: 'pi/not-a-model' } })).toThrow(
-      /expected '<provider>\/<model>'/
+      "Pi overrides need a vendor prefix, e.g. 'pi/minimax/minimax-m3'"
     );
   });
 

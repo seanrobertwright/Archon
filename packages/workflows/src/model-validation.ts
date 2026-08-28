@@ -356,6 +356,12 @@ function resolveRunOverrideSpec(
     if (remainder.length === 0) {
       throw new Error(`Model override '${targetName}' has an empty model id.`);
     }
+    if (prefix === 'pi' && !parsePiModelRef(remainder)) {
+      throw new Error(
+        `Model override '${targetName}' has invalid Pi model '${remainder}'. ` +
+          "Pi overrides need a vendor prefix, e.g. 'pi/minimax/minimax-m3'."
+      );
+    }
     return normalizeRunOverridePreset(targetName, { provider: prefix, model: remainder });
   }
 
