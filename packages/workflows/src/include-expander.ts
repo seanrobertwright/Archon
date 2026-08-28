@@ -62,6 +62,7 @@ import { validateDagStructure, validateWorkflowOutcomeDeclaration } from './load
 import { resolveDeclaredInputs } from './workflow-inputs';
 import { resolveWorkflowName } from './router';
 import { parseWhenAtom, whenAtoms } from './when-atom';
+import { mapNodeTemplateSlots } from './template-walker';
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
@@ -488,85 +489,14 @@ function rewriteNodeOutputRefs(
     if (boundary.when !== undefined) boundary.when = whenExpr(boundary.when);
   }
 
-  // Node-level AI configuration is a runtime ref surface too (#2476/#1764): the executor
-  // substitutes `$node.output` into these before the provider sees them, so an included
-  // block's refs must be namespaced here or they point at the pre-flatten id.
-  if (node.systemPrompt !== undefined) node.systemPrompt = code(node.systemPrompt);
-  if (node.agents !== undefined) {
-    for (const agent of Object.values(node.agents)) {
-      agent.prompt = code(agent.prompt);
-      agent.description = code(agent.description);
-    }
-  }
-
-  if (isLoopNode(node)) {
-    if (node.loop.prompt !== undefined) node.loop.prompt = code(node.loop.prompt);
-    const compiled = (node.loop as typeof node.loop & LoopWithCompiledCommand)[
-      COMPILED_LOOP_COMMAND
-    ];
-    if (compiled?.prompt !== undefined) compiled.prompt = code(compiled.prompt);
-    if (node.loop.until_bash !== undefined) node.loop.until_bash = code(node.loop.until_bash);
-  } else if (isLoopGroupNode(node)) {
-    if (node.loop_group.until_bash !== undefined) {
-      node.loop_group.until_bash = code(node.loop_group.until_bash);
-    }
-    for (const body of node.loop_group.nodes) {
-      if (!isIncludeDirective(body)) {
-        rewriteNodeOutputRefs(body, renameOutputRef, expandDependency, renameLoopPrevRef);
-      }
-    }
-  } else if (isGateNode(node)) {
-    node.message = code(node.message);
-    for (const decision of node.decisions) {
-      if (decision.rework !== undefined) decision.rework.prompt = code(decision.rework.prompt);
-    }
-  } else if (isExecNode(node)) {
-    node.script = code(node.script);
-  } else if (isWaitNode(node)) {
-    if (node.wait.until !== undefined) node.wait.until = code(node.wait.until);
-    if (node.wait.event !== undefined) node.wait.event = code(node.wait.event);
-  } else if (isWorkflowNode(node)) {
-    // workflow.input, workflow.with values and workflow.fan_out.items are live
-    // code/expression ref surfaces (data strings), so refs inside an included block's
-    // `workflow:` node namespace verbatim. Non-string with values carry no refs (#2637).
-    if (node.input !== undefined) node.input = code(node.input);
-    if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) {
-        if (typeof value === 'string') node.with[key] = code(value);
-      }
-    }
-    if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
-  } else if (isComposeFanOutNode(node)) {
-    // A deferred composition fan-out (#2512) carries the same live ref surfaces as a
-    // `workflow:` node — its `with:` values and `fan_out.items` resolve at run time.
-    if (node.with !== undefined) {
-      for (const [key, value] of Object.entries(node.with)) {
-        if (typeof value === 'string') node.with[key] = code(value);
-      }
-    }
-    if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
-  } else if (isHaltNode(node)) {
-    node.reason = code(node.reason);
-  } else if (isAgentNode(node) && node.source.kind === 'inline') {
-    node.source.prompt = code(node.source.prompt);
-  }
-
-  // Node-local bindings (#2637) — an agent's command-sourced `with:` and an exec node's
-  // `with:` string values, plus directive `from` refs, are live ref surfaces (KEEP IN
-  // SYNC item 2), so an included block's bindings follow its nodes' namespace rename.
-  // Outside the mode chain above because a command-sourced agent node has no other
-  // inline text surface of its own.
-  const nodeWith = isExecNode(node)
-    ? node.with
-    : isAgentNode(node) && node.source.kind === 'command'
-      ? node.source.with
-      : undefined;
-  if (nodeWith !== undefined) {
-    for (const [key, value] of Object.entries(nodeWith)) {
-      if (typeof value === 'string') nodeWith[key] = code(value);
-      else if (isBindingDirective(value)) value.from = code(value.from);
-    }
-  }
+  const rewritten = mapNodeTemplateSlots(node, slot =>
+    slot.surface === 'binding_default'
+      ? slot.value
+      : slot.surface === 'condition'
+        ? whenExpr(slot.value)
+        : code(slot.value)
+  );
+  Object.assign(node, rewritten);
 }
 
 /**

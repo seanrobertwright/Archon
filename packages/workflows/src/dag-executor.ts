@@ -75,10 +75,8 @@ import type {
 import {
   isExecNode,
   isAgentNode,
-  isLoopNode,
   isLoopGroupNode,
   isGateNode,
-  isWaitNode,
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
   isHaltNode,
@@ -95,6 +93,7 @@ import {
   waitCondition,
 } from './schemas';
 import type { BindingDirective } from './schemas';
+import { mapNodeTemplateSlots } from './template-walker';
 import { FAN_OUT_CANCEL_REASONS } from './store';
 import type { DagResumeSnapshot, FanOutCancelReason, PersistedNodeOutput } from './store';
 import { formatToolCall } from './utils/tool-formatter';
@@ -119,10 +118,8 @@ import { buildTruncationMarker } from './utils/output-truncation';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import {
   COMPILED_LOOP_COMMAND,
-  COMPOSED_NODE,
   readComposedMeta,
   type LoopWithCompiledCommand,
-  type NodeWithComposedMeta,
   type IncludeCommandContent,
 } from './compiled-command';
 import { assistantModelDefaults, resolveNodeModel } from './node-model-resolution';
@@ -5552,170 +5549,14 @@ export function applyLoopPrevToBodyNode(
   // token. Directives stay untouched: `from` must remain a current-iteration node
   // ref (the loader rejects `$LOOP_PREV` there, naming this string form), and only
   // a string `if_skipped` default carries the splice, mirroring the include macro.
-  const subWithMap = (
-    withMap: Record<string, JsonValue | BindingDirective>
-  ): Record<string, JsonValue | BindingDirective> =>
-    Object.fromEntries(
-      Object.entries(withMap).map(([name, value]): [string, JsonValue | BindingDirective] => {
-        if (isBindingDirective(value)) {
-          return [
-            name,
-            typeof value.if_skipped === 'string'
-              ? { ...value, if_skipped: sub(value.if_skipped) }
-              : value,
-          ];
-        }
-        return [name, typeof value === 'string' ? sub(value) : value];
-      })
-    );
-  // AI configuration is live prompt text too. Resolve it in this same per-iteration pass
-  // before the ordinary workflow-variable/node-output pass runs in `runLayers`, otherwise
-  // a namespaced `$LOOP_PREV` inside an included block reaches the provider literally.
-  const substitutedNode: DagNode = {
-    ...node,
-    ...(node.systemPrompt !== undefined ? { systemPrompt: sub(node.systemPrompt) } : {}),
-    ...(node.agents !== undefined
-      ? {
-          agents: Object.fromEntries(
-            Object.entries(node.agents).map(([id, agent]) => [
-              id,
-              {
-                ...agent,
-                description: sub(agent.description),
-                prompt: sub(agent.prompt),
-              },
-            ])
-          ),
-        }
-      : {}),
-  };
-  const composedMeta = readComposedMeta(node);
-  if (composedMeta?.inputs !== undefined) {
-    (substitutedNode as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = {
-      ...composedMeta,
-      inputs: Object.fromEntries(
-        // Only strings carry substitutable refs (#2637); typed values pass through.
-        Object.entries(composedMeta.inputs).map(([name, value]) => [
-          name,
-          typeof value === 'string' ? sub(value) : value,
-        ])
-      ),
-    };
-  }
-
-  if (isLoopNode(substitutedNode)) {
-    // until_bash is shell-bound: an unresolved $LOOP_PREV would silently degrade to an
-    // (empty) shell variable expansion inside bash -c.
-    const loop = {
-      ...substitutedNode.loop,
-      ...(substitutedNode.loop.prompt !== undefined
-        ? { prompt: sub(substitutedNode.loop.prompt) }
-        : {}),
-      ...(substitutedNode.loop.until_bash !== undefined
-        ? { until_bash: sub(substitutedNode.loop.until_bash, true) }
-        : {}),
-    };
-    const compiled = (
-      substitutedNode.loop as typeof substitutedNode.loop & LoopWithCompiledCommand
-    )[COMPILED_LOOP_COMMAND];
-    if (compiled?.prompt !== undefined) {
-      (loop as typeof loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND] = {
-        prompt: sub(compiled.prompt),
-      };
-    }
-    return {
-      ...substitutedNode,
-      loop: {
-        ...loop,
-      },
-    };
-  }
-  if (isLoopGroupNode(substitutedNode)) {
-    // Nested loop_group: recurse into the body. `knownBodyIds`/`directBodyIds` are the OUTER
-    // group's sets, threaded UNCHANGED — so during this OUTER pass a ref to an inner-owned id
-    // (in knownBodyIds but not directBodyIds) is left intact (return match) for the inner
-    // group's own pass, while a ref to an OUTER-direct id resolves here at the outer
-    // granularity and a true typo still throws. The inner group's own executeLoopGroupNode
-    // computes fresh sets when it runs, so inner-owned refs in both body nodes and its
-    // completion script resolve at the inner iteration granularity. This outer pass still
-    // resolves enclosing-group refs in the nested until_bash before that inner execution.
-    return {
-      ...substitutedNode,
-      loop_group: {
-        ...substitutedNode.loop_group,
-        ...(substitutedNode.loop_group.until_bash !== undefined
-          ? { until_bash: sub(substitutedNode.loop_group.until_bash, true) }
-          : {}),
-        // The executor only ever receives already-expanded nodes (runLayers throws on any
-        // surviving IncludeDirective before node execution begins), so a loop_group body
-        // here is always include-free even though the type admits IncludeDirective for
-        // the general pre-expansion case (#2486).
-        nodes: (substitutedNode.loop_group.nodes as DagNode[]).map(n =>
-          applyLoopPrevToBodyNode(
-            n,
-            loopPrevOutputs,
-            loopUserInput,
-            outputFileDir,
-            knownBodyIds,
-            directBodyIds
-          )
-        ),
-      },
-    };
-  }
-  if (isGateNode(substitutedNode)) {
-    return {
-      ...substitutedNode,
-      message: sub(substitutedNode.message),
-      decisions: substitutedNode.decisions.map(decision =>
-        decision.rework !== undefined
-          ? { ...decision, rework: { ...decision.rework, prompt: sub(decision.rework.prompt) } }
-          : decision
-      ),
-    };
-  }
-  if (isWaitNode(substitutedNode)) {
-    const condition = waitCondition(substitutedNode.wait);
-    if (condition.kind === 'duration') return substitutedNode;
-    return condition.kind === 'until'
-      ? { ...substitutedNode, wait: { until: sub(condition.timestamp) } }
-      : {
-          ...substitutedNode,
-          wait: { event: sub(condition.event), deadline_ms: condition.deadlineMs },
-        };
-  }
-  // Bash never passes through a shell escape hazard-free path — escapedForBash=true
-  // shell-quotes $LOOP_PREV/$LOOP_USER_INPUT before splicing into the `bash -c` body.
-  // Scripts never pass through a shell (execFile argv) — bash-quoting would inject
-  // literal quote artifacts into TS/Python source. $LOOP_PREV.* refs are spliced raw
-  // (mirroring executeScriptNode's substituteNodeOutputRefs(..., false)); $LOOP_USER_INPUT
-  // is skipped here (skipUserInput) and delivered via env by executeScriptNode (#2115).
-  if (isExecNode(substitutedNode)) {
-    return substitutedNode.runtime === 'sh'
-      ? { ...substitutedNode, script: sub(substitutedNode.script, true) }
-      : {
-          ...substitutedNode,
-          script: sub(substitutedNode.script, false, true),
-          ...(substitutedNode.with !== undefined ? { with: subWithMap(substitutedNode.with) } : {}),
-        };
-  }
-  // Halt reason is display text, never executed — mirrors the normal-path default.
-  if (isHaltNode(substitutedNode))
-    return { ...substitutedNode, reason: sub(substitutedNode.reason) };
-  if (isAgentNode(substitutedNode)) {
-    return {
-      ...substitutedNode,
-      source:
-        substitutedNode.source.kind === 'command'
-          ? {
-              ...substitutedNode.source,
-              name: sub(substitutedNode.source.name),
-              ...(substitutedNode.source.with !== undefined
-                ? { with: subWithMap(substitutedNode.source.with) }
-                : {}),
-            }
-          : { ...substitutedNode.source, prompt: sub(substitutedNode.source.prompt) },
-    };
+  const substitutedNode = mapNodeTemplateSlots(node, slot => {
+    if (slot.surface === 'binding_from') return slot.value;
+    if (slot.surface === 'shell') return sub(slot.value, true);
+    if (slot.surface === 'script') return sub(slot.value, false, true);
+    return sub(slot.value);
+  });
+  if (isAgentNode(substitutedNode) && substitutedNode.source.kind === 'command') {
+    substitutedNode.source.name = sub(substitutedNode.source.name);
   }
   return substitutedNode;
 }

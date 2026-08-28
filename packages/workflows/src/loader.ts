@@ -68,6 +68,7 @@ import { workflowNodeHooksSchema } from './schemas/hooks';
 import { parseWhenAtom, whenAtoms, WHEN_INPUTS_SCOPE } from './when-atom';
 import { declaredFieldsFromSchema, OUTPUT_REF_SOURCE, parseWholeOutputRef } from './output-ref';
 import { isBindingDirective } from './schemas/dag-node';
+import { visitNodeTemplateSlots } from './template-walker';
 import { z } from '@hono/zod-openapi';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -947,110 +948,20 @@ export function validateDagStructure(
       text: string;
       bodyNodes?: readonly (DagNode | IncludeDirective)[];
     }[] = [];
-    // An include directive has no execution surface of its own — its `with:`
-    // values were never scanned by this function even before #2486 (they are the
-    // composed workflow's business once inlined). Its `when:` (below) IS still
-    // scanned, unlike its sources here.
     if (!isIncludeDirective(node)) {
-      if (isAgentNode(node) && node.source.kind === 'inline') {
-        sources.push({ field: 'prompt', text: node.source.prompt });
-      }
-      // Node-level AI configuration, valid on every AI node mode — pushed outside the mode
-      // chain like `when:`. Substituted at run time since #1764, so a dangling ref here
-      // fails at load rather than reaching the provider as literal text.
-      if (node.systemPrompt !== undefined) {
-        sources.push({ field: 'systemPrompt', text: node.systemPrompt });
-      }
-      if (node.agents !== undefined) {
-        for (const [agentId, agent] of Object.entries(node.agents)) {
-          sources.push({ field: `agents.${agentId}.prompt`, text: agent.prompt });
-          sources.push({ field: `agents.${agentId}.description`, text: agent.description });
-        }
-      }
-      if (isExecNode(node)) {
-        sources.push({ field: node.runtime === 'sh' ? 'bash' : 'script', text: node.script });
-      }
-      if (isWaitNode(node)) {
-        if (node.wait.until !== undefined) {
-          sources.push({ field: 'wait.until', text: node.wait.until });
-        }
-        if (node.wait.event !== undefined) {
-          sources.push({ field: 'wait.event', text: node.wait.event });
-        }
-      }
-      // Node-local bindings (#2637): an agent's command-sourced `with:` and an exec
-      // node's `with:` string values are live ref surfaces (whole refs and
-      // templates), and a directive's `from` is one whole ref. KEEP IN SYNC item 1 —
-      // rewriteNodeOutputRefs and the builder scan walk the same surface. Non-string
-      // literals carry no refs.
-      const nodeWith = isExecNode(node)
-        ? node.with
-        : isAgentNode(node) && node.source.kind === 'command'
-          ? node.source.with
-          : isComposeFanOutNode(node)
-            ? node.with
-            : undefined;
-      if (nodeWith !== undefined) {
-        for (const [name, value] of Object.entries(nodeWith)) {
-          if (typeof value === 'string') {
-            sources.push({ field: `with.${name}`, text: value });
-          } else if (isBindingDirective(value)) {
-            sources.push({ field: `with.${name}.from`, text: value.from });
-          }
-        }
-      }
-      // workflow.input is a live ref surface (a data string), scanned verbatim like
-      // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
-      // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
-      // A `compose_fan_out` node's `with:` values resolve at run time exactly like a
-      // `workflow:` node's (via nodeWith above); its `fan_out.items` is the same live
-      // `$node.output` ref surface as a `workflow:` node's.
-      if (isComposeFanOutNode(node)) {
-        sources.push({ field: 'fan_out.items', text: node.fan_out.items });
-      }
-      if (isWorkflowNode(node)) {
-        if (node.input) sources.push({ field: 'input', text: node.input });
-        if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
-        // A `workflow:` node's `with:` values (#2470) are live ref surfaces: unlike
-        // an `include:` node's `with:` (inlined by the macro and caught post-expansion
-        // by this same scan), sub-run `with:` values are never inlined — they resolve
-        // at runtime into `$INPUTS.<name>` — so scan them here for dangling refs.
-        // Only strings can carry refs (#2637); typed literals pass through untouched.
-        if (node.with) {
-          for (const [name, value] of Object.entries(node.with)) {
-            if (typeof value === 'string') sources.push({ field: `with.${name}`, text: value });
-          }
-        }
-      }
-      if (isHaltNode(node)) sources.push({ field: 'cancel', text: node.reason });
-      if (isGateNode(node)) {
-        sources.push({ field: 'approval.message', text: node.message });
-        const rework = node.decisions.find(d => d.rework !== undefined)?.rework;
-        if (rework !== undefined) {
+      visitNodeTemplateSlots(
+        node,
+        slot => {
           sources.push({
-            field: 'approval.on_reject.prompt',
-            text: rework.prompt,
+            field: slot.path,
+            text: slot.value,
+            ...(slot.path === 'loop_group.until_bash' && isLoopGroupNode(node)
+              ? { bodyNodes: node.loop_group.nodes }
+              : {}),
           });
-        }
-      }
-      if (isLoopNode(node)) {
-        if (typeof node.loop.prompt === 'string') {
-          sources.push({ field: 'loop.prompt', text: node.loop.prompt });
-        }
-        if (node.loop.until_bash) {
-          sources.push({ field: 'loop.until_bash', text: node.loop.until_bash });
-        }
-      }
-      if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-        // The group evaluates this field after each body iteration against the same output
-        // map the body populated, so its direct body nodes are visible here in addition to
-        // the current and enclosing DAG scopes.
-        sources.push({
-          field: 'loop_group.until_bash',
-          text: node.loop_group.until_bash,
-          bodyNodes: node.loop_group.nodes,
-        });
-      }
+        },
+        { recursive: false }
+      );
     }
     for (const source of sources) {
       let m: RegExpExecArray | null;
