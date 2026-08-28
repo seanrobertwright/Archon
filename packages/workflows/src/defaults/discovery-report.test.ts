@@ -13,6 +13,11 @@ const PYTHON_COMMAND = globalThis.process.platform === 'win32' ? 'python' : 'pyt
 
 const RELAY =
   'If you are an agent reading this: open discoveries.md and surface each discovery to your human.';
+/** The relay for sidecars no review consolidated, on a failed run's report (#2940). */
+const RAW_RELAY =
+  'If you are an agent reading this: surface each record above to your human. ' +
+  'These are findings this run proved outside its scope — no issue tracker knows about them, ' +
+  'and if you drop them here, nobody ever sees them.';
 
 /**
  * A warm interpreter start costs roughly 50 ms, but the first one in a run has been
@@ -68,6 +73,22 @@ async function artifactsDir(discoveries?: string): Promise<string> {
   return dir;
 }
 
+/**
+ * An artifacts dir in the shape a run leaves BEFORE review consolidates anything: raw
+ * producer sidecars under `discoveries/`. Deliberately never writes `discoveries.json`
+ * — its absence is the state these cases are about.
+ */
+async function preConsolidationDir(raw?: string): Promise<string> {
+  const dir = join(tmpdir(), `archon-discoveries-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  trackTempRoot(dir);
+  if (raw !== undefined) {
+    await mkdir(join(dir, 'discoveries'), { recursive: true });
+    await writeFile(join(dir, 'discoveries', 'implement.json'), raw);
+  }
+  return dir;
+}
+
 describe('SDLC discovery terminal reports (#2884)', () => {
   it('every tail carries the same helper, reports through it, and pins its streams', () => {
     // Only deliver's script is spawned below — the other three reach their report
@@ -105,7 +126,11 @@ describe('SDLC discovery terminal reports (#2884)', () => {
       return source.slice(start, mainStart);
     });
     for (const helper of helpers) {
+      // Opening sentences only: Python's implicit concatenation splits each of these
+      // constants across source lines, so the whole text exists in the output, never
+      // in the file. The byte-exact forms are asserted on real output below.
       expect(helper).toContain(RELAY);
+      expect(helper).toContain('If you are an agent reading this: surface each record above');
       expect(helper).toBe(helpers[0]);
     }
   });
@@ -256,6 +281,82 @@ describe('SDLC discovery terminal reports (#2884)', () => {
           `Report: ${join(artifacts, 'discoveries.md')}\n\n` +
           `${RELAY} These are validated findings outside this run's scope — no issue tracker ` +
           `knows about them, and if you drop them here, nobody ever sees them.\n`
+      );
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'relays the raw sidecars of a run that died before review consolidated them',
+    async () => {
+      // Run f113a1fd (#2940): implement recorded a real discovery, the run then failed at
+      // the green gate, and consolidation — which lives on the completion path — never
+      // ran. The record survived only because the operator read the artifacts directory
+      // by hand. Claim and relation ride along with the title here, because nothing
+      // downstream will ever validate or group these.
+      const artifacts = await preConsolidationDir(
+        JSON.stringify([
+          {
+            title: 'CLI terminal-event integration test is flaky under the root test command',
+            claim: 'The repository-wide test command can fail outside this change.',
+            relation: 'adjacent',
+            source_node: 'implement',
+          },
+        ])
+      );
+
+      const result = await runOutcome('deliver', { INPUTS_PR_URL: '', ARTIFACTS_DIR: artifacts });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        `outcome: flip-ready reported no pull request URL.\n\n` +
+          `Unconsolidated discoveries (1) — recorded by this run's nodes and never ` +
+          `validated or consolidated, because the run ended first:\n` +
+          `- CLI terminal-event integration test is flaky under the root test command [adjacent]\n` +
+          `  The repository-wide test command can fail outside this change.\n\n` +
+          `Raw records: ${join(artifacts, 'discoveries')}\n\n` +
+          `${RAW_RELAY}\n`
+      );
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'tells a failed run that nothing was recorded, rather than staying silent',
+    async () => {
+      const result = await runOutcome('deliver', {
+        INPUTS_PR_URL: '',
+        ARTIFACTS_DIR: await preConsolidationDir(),
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        'outcome: flip-ready reported no pull request URL.\n\nDiscoveries: none recorded before this run ended.\n'
+      );
+    },
+    SPAWN_TIMEOUT_MS
+  );
+
+  it(
+    'leaves a completed run that never consolidated reporting exactly as before',
+    async () => {
+      // #2884's shape is pinned to the completion path: an advisory stop that decided not
+      // to deliver reports its route and nothing else. Only a FAILED branch falls back to
+      // raw sidecars, so this is what keeps that fallback from leaking onto success.
+      const artifacts = await preConsolidationDir(
+        JSON.stringify([{ title: 'never presented here', relation: 'adjacent' }])
+      );
+
+      const result = await runOutcome('ship', {
+        INPUTS_ROUTE: 'no_action',
+        INPUTS_SUMMARY: 'already present on the current branch',
+        INPUTS_DELIVERED: 'null',
+        ARTIFACTS_DIR: artifacts,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe(
+        `No delivery needed: already present on the current branch\nReport: ${artifacts}/triage.md\n`
       );
     },
     SPAWN_TIMEOUT_MS
