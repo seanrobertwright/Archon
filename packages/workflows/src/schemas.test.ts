@@ -1938,9 +1938,9 @@ describe('runAttention', () => {
     test.each(humanReasons)('addresses the decision at this run for type %s', type => {
       const approval = type === undefined ? gate() : gate({ type });
       expect(runAttention(pausedOn(approval))).toEqual({
-        kind: 'awaiting_human',
+        kind: 'awaiting_response',
         runId: 'run-1',
-        decideOn: { runId: 'run-1', nodeId: 'review' },
+        respondTo: { runId: 'run-1', nodeId: 'review' },
         message: 'Approve the plan.',
       });
     });
@@ -1949,7 +1949,7 @@ describe('runAttention', () => {
   describe('blocked on a child', () => {
     test('reports the block and never claims a human is needed', () => {
       // The parent row cannot tell "child on a gate" from "child still running",
-      // so asserting awaiting_human here would wake a host for normal progress.
+      // so asserting awaiting_response here would wake a host for normal progress.
       const attention = runAttention(
         pausedOn(gate({ type: 'child_workflow', nodeId: 'sub', childRunId: 'kid' }))
       );
@@ -2026,7 +2026,7 @@ describe('runAttention', () => {
         },
       },
     });
-    expect(attention?.kind).toBe('awaiting_human');
+    expect(attention?.kind).toBe('awaiting_response');
   });
 
   test('an absent metadata bag on a paused run is unreadable, not silence', () => {

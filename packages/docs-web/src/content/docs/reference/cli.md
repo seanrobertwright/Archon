@@ -475,9 +475,13 @@ debugging. Raw events are not the recommended integration surface.
 ### `workflow wait`
 
 Block until a run reaches a state it will not leave on its own — it finished, or it
-parked on a gate that needs a human — then print what it needs. This is the intended
+parked on a gate awaiting a response — then print what it needs. This is the intended
 partner of `--detach --json`: take the `runId` from the launch ack and wait on it,
 instead of polling `workflow get` in a loop.
+
+The response a gate is waiting for does not have to come from a person. An
+orchestrating agent can supply it with `workflow respond` just as a reviewer can; the
+engine only reports that one is owed, and who answers is the waiting host's business.
 
 ```bash
 archon workflow wait <run-id>
@@ -493,7 +497,7 @@ its own clock would be answering a question only the run can answer. `--timeout
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | The run said something — it finished (`completed`, `failed`, or `cancelled`) or it needs a human. The status is data on stdout. |
+| `0` | The run said something — it finished (`completed`, `failed`, or `cancelled`) or it is waiting for a response. The status is data on stdout. |
 | `3` | The timeout passed with the run still live. The `--json` payload carries `observedStatus`. |
 | `1` | The wait itself failed — unknown run id, database unreachable. |
 
@@ -510,17 +514,17 @@ exit code would make a legitimately cancelled run look like a broken command.
 `attention.kind` is one of:
 
 - `terminal` — the run finished; `status` is `completed`, `failed`, or `cancelled`.
-- `awaiting_human` — a gate needs a decision. `decideOn` names the run and node where
-  it is made. **That run is not always the one you waited on**: a parent blocked on a
-  `workflow:` sub-run wakes when the chain below it reaches a gate, and `decideOn.runId`
-  is the child you approve. A parent blocked on a child that is merely still running
-  wakes nobody.
+- `awaiting_response` — a gate is waiting for a decision. `respondTo` names the run and
+  node where that response is recorded. **That run is not always the one you waited on**:
+  a parent blocked on a `workflow:` sub-run wakes when the chain below it reaches a gate,
+  and `respondTo.runId` is the child you answer. A parent blocked on a child that is
+  merely still running wakes nobody.
 - `unreadable` — the run is parked but cannot describe itself (corrupt gate metadata, a
   gate type this build does not know, a sub-run pointer with no row). `detail` says which.
 
-Two pauses deliberately do **not** wake a waiter, because neither is waiting on a
-person: a gate that has already been approved or rejected and is awaiting auto-resume,
-and a [`wait:` node](/guides/authoring-workflows/) whose timer or event has not fired.
+Two pauses deliberately do **not** wake a waiter, because neither is owed a response: a
+gate that has already been approved or rejected and is awaiting auto-resume, and a
+[`wait:` node](/guides/authoring-workflows/) whose timer or event has not fired.
 
 The run id may be the short prefix printed by `workflow runs`. Once the wait returns,
 inspect the run normally with `workflow get <run-id>`.

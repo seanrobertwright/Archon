@@ -9898,9 +9898,9 @@ describe('workflowWaitCommand', () => {
     mockWaitForRunAttention.mockResolvedValueOnce({
       kind: 'attention',
       attention: {
-        kind: 'awaiting_human',
+        kind: 'awaiting_response',
         runId: 'child-9',
-        decideOn: { runId: 'child-9', nodeId: 'review' },
+        respondTo: { runId: 'child-9', nodeId: 'review' },
         message: 'Approve?',
       },
     });
@@ -9958,9 +9958,9 @@ describe('workflowWaitCommand', () => {
     mockWaitForRunAttention.mockResolvedValueOnce({
       kind: 'attention',
       attention: {
-        kind: 'awaiting_human',
+        kind: 'awaiting_response',
         runId: FULL_ID,
-        decideOn: { runId: FULL_ID, nodeId: 'review' },
+        respondTo: { runId: FULL_ID, nodeId: 'review' },
         message: 'Approve?',
       },
     });
@@ -9974,9 +9974,9 @@ describe('workflowWaitCommand', () => {
       runId: FULL_ID,
       result: 'attention',
       attention: {
-        kind: 'awaiting_human',
+        kind: 'awaiting_response',
         runId: FULL_ID,
-        decideOn: { runId: FULL_ID, nodeId: 'review' },
+        respondTo: { runId: FULL_ID, nodeId: 'review' },
         message: 'Approve?',
       },
     });

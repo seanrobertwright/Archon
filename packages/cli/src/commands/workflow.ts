@@ -3415,7 +3415,7 @@ export async function workflowStatusCommand(
 /**
  * One human-readable line naming the run and what it needs.
  *
- * `awaiting_human` deliberately names TWO runs when they differ: a parent blocked on
+ * `awaiting_response` deliberately names TWO runs when they differ: a parent blocked on
  * a sub-run wakes on the child's gate, and the address in the value is the whole
  * reason the caller can act on it.
  */
@@ -3434,11 +3434,11 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
   switch (attention.kind) {
     case 'terminal':
       return `Run ${watchedRunId} ${attention.status}.`;
-    case 'awaiting_human':
-      return attention.decideOn.runId === watchedRunId
-        ? `Run ${watchedRunId} is waiting for a human decision at gate '${attention.decideOn.nodeId}'.`
-        : `Run ${watchedRunId} is blocked on sub-run ${attention.decideOn.runId}, which is waiting ` +
-            `for a human decision at gate '${attention.decideOn.nodeId}'.`;
+    case 'awaiting_response':
+      return attention.respondTo.runId === watchedRunId
+        ? `Run ${watchedRunId} is waiting for a response at gate '${attention.respondTo.nodeId}'.`
+        : `Run ${watchedRunId} is blocked on sub-run ${attention.respondTo.runId}, which is waiting ` +
+            `for a response at gate '${attention.respondTo.nodeId}'.`;
     case 'blocked_on_child':
       // Unreachable through the waiter, which resolves the chain before returning.
       return `Run ${watchedRunId} is blocked on sub-run ${attention.childRunId}.`;
@@ -3448,7 +3448,7 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
 }
 
 /**
- * Block until a run finishes or parks on a human gate, then say which.
+ * Block until a run finishes or parks on a gate awaiting a response, then say which.
  *
  * The point of the verb: a host that launched a run with `--detach` waits on one
  * command instead of polling `workflow get`. Exit codes describe the COMMAND, not the

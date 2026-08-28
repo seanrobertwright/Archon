@@ -273,12 +273,12 @@ export function assertApprovable(run: WorkflowRun): ApprovalContext {
   const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
     ? rawApproval
     : undefined;
-  // `runAttention` owns the decision — is a human needed, and on which run. This
+  // `runAttention` owns the decision — is a response needed, and on which run. This
   // function still reads the gate CONTEXT afterwards, because its callers need the
   // decisions, session, and iteration the attention value deliberately omits.
   const attention = runAttention(run);
   switch (attention?.kind) {
-    case 'awaiting_human':
+    case 'awaiting_response':
       // Reported only for a well-formed, unresolved gate, so the context read above
       // is present; the check keeps that provable to the compiler.
       if (!approval) throw new Error('Workflow run is paused but missing approval context.');
@@ -365,7 +365,7 @@ export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined 
         );
       }
       break;
-    case 'awaiting_human':
+    case 'awaiting_response':
     case 'terminal':
       // 'terminal' is unreachable: the status guard above already returned for it.
       break;

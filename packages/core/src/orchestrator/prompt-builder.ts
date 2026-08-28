@@ -135,7 +135,7 @@ export function formatPausedGateSection(gate: PausedGateContext): string {
     );
   }
 
-  // `awaiting_human`. The projection reports it only for a well-formed, unresolved
+  // `awaiting_response`. The projection reports it only for a well-formed, unresolved
   // gate; the context read here carries the DETAIL the attention value omits.
   const rawApproval = gate.run.metadata.approval;
   const approval = isApprovalContext(rawApproval) ? rawApproval : undefined;
@@ -143,7 +143,7 @@ export function formatPausedGateSection(gate: PausedGateContext): string {
   const facts = [
     `- Run id: \`${runId}\``,
     `- Workflow: **${workflowName}**`,
-    `- Gate node: \`${attention.decideOn.nodeId}\``,
+    `- Gate node: \`${attention.respondTo.nodeId}\``,
   ];
   if (approval?.type === 'interactive_loop' && typeof approval.iteration === 'number') {
     facts.push(`- Loop iteration: ${String(approval.iteration)}`);

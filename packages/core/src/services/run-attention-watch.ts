@@ -88,7 +88,7 @@ function unreadable(
  * A parent pauses blocked on a child whether that child sits on its own gate or is
  * merely still running, and the parent row cannot tell those apart. So the walk asks
  * the child directly:
- *  - the child needs a human → return that, addressed at the CHILD and its node. This
+ *  - the child needs a response → return that, addressed at the CHILD and its node. This
  *    is the case a parent-row-only rule gets wrong in the dangerous direction: nothing
  *    moves until someone decides.
  *  - the child is terminal → return null and keep waiting. The parent's auto-resume

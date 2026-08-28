@@ -724,9 +724,9 @@ export function isApprovalContext(val: unknown): val is ApprovalContext {
 // RunAttention — "what does this run need from outside, if anything"
 // ---------------------------------------------------------------------------
 
-/** Where a human decision must be made — this run, or the child blocking it. */
+/** Where a gate's response must be recorded — this run, or the child blocking it. */
 export interface GateAddress {
-  /** The run the decision is recorded against. NOT always the run that was asked about. */
+  /** The run the response is recorded against. NOT always the run that was asked about. */
   runId: string;
   /** The gate node inside that run. */
   nodeId: string;
@@ -757,18 +757,18 @@ export type RunAttentionUnreadableReason =
  * power, which includes a resolved gate awaiting auto-resume and a `wait:` node
  * whose timer or event has not fired.
  *
- * `blocked_on_child` is deliberately NOT an answer to "does a human need to act".
+ * `blocked_on_child` is deliberately NOT an answer to "does someone need to respond".
  * A parent pauses blocked on a child whether that child is sitting on its own gate
  * or merely still running (`pauseParentOnChild` is reached from two sites in
  * dag-executor.ts, the second on a child that is `paused`, `running`, OR `pending`),
- * and the parent row cannot tell those apart. Claiming `awaiting_human` here would
+ * and the parent row cannot tell those apart. Claiming `awaiting_response` here would
  * wake a host for normal progress; returning null would strand one when the child
  * really is on a gate. So the projection reports what it knows — this run is blocked
  * on that child — and a reader with database access resolves the chain.
  */
 export type RunAttention =
   | { kind: 'terminal'; runId: string; status: RunTerminalStatus; at: Date | null }
-  | { kind: 'awaiting_human'; runId: string; decideOn: GateAddress; message: string }
+  | { kind: 'awaiting_response'; runId: string; respondTo: GateAddress; message: string }
   | { kind: 'blocked_on_child'; runId: string; childRunId: string; nodeId: string }
   | { kind: 'unreadable'; runId: string; reason: RunAttentionUnreadableReason; detail: string };
 
@@ -812,7 +812,7 @@ export function runAttention(run: RunAttentionInput): RunAttention | null {
   if (raw === undefined) {
     // No gate recorded. A durable `wait:` owns its own resumption — the clock or the
     // awaited event, not a person. Anything else is a run parked with nothing that
-    // describes why, which only a human can unstick.
+    // describes why, which nothing but an outside response can unstick.
     return isWorkflowWaitContext(run.metadata?.wait)
       ? null
       : unreadableAttention(
@@ -822,7 +822,7 @@ export function runAttention(run: RunAttentionInput): RunAttention | null {
         );
   }
   if (!isApprovalContext(raw) || raw.nodeId === '') {
-    // A gate WAS recorded but cannot be read, or names no node. An `awaiting_human`
+    // A gate WAS recorded but cannot be read, or names no node. An `awaiting_response`
     // with an empty address would be a lie, so this stays unreadable.
     return unreadableAttention(
       run.id,
@@ -837,7 +837,8 @@ export function runAttention(run: RunAttentionInput): RunAttention | null {
       `unrecognized gate type '${String(raw.type)}'`
     );
   }
-  // Resolved: the machine is next, not a human (see `isGateResolved`).
+  // Resolved: the run is waiting on the machine to resume it, not on a response
+  // (see `isGateResolved`).
   if (isGateResolved(raw)) return null;
 
   if (raw.type === 'child_workflow') {
@@ -859,11 +860,13 @@ export function runAttention(run: RunAttentionInput): RunAttention | null {
   }
 
   // Every remaining recognized reason — `approval`, `interactive_loop`, `writeback`,
-  // and `undefined` for legacy plain gates — is a person's decision.
+  // and `undefined` for legacy plain gates — needs a response from outside the run.
+  // Who supplies it is the host's business: a person, or an agent through
+  // `archon workflow respond`. The engine only says that one is owed.
   return {
-    kind: 'awaiting_human',
+    kind: 'awaiting_response',
     runId: run.id,
-    decideOn: { runId: run.id, nodeId: raw.nodeId },
+    respondTo: { runId: run.id, nodeId: raw.nodeId },
     message: raw.message,
   };
 }

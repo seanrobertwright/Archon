@@ -121,7 +121,7 @@ describe('waitForRunAttention', () => {
     }
   );
 
-  test('wakes with awaiting_human when the run parks on a gate', async () => {
+  test('wakes with awaiting_response when the run parks on a gate', async () => {
     putRun('r1', { status: 'running' });
     const pending = wait('r1');
     await Bun.sleep(20);
@@ -130,9 +130,9 @@ describe('waitForRunAttention', () => {
     expect(await pending).toEqual({
       kind: 'attention',
       attention: {
-        kind: 'awaiting_human',
+        kind: 'awaiting_response',
         runId: 'r1',
-        decideOn: { runId: 'r1', nodeId: 'review' },
+        respondTo: { runId: 'r1', nodeId: 'review' },
         message: 'Approve the plan.',
       },
     });
@@ -189,9 +189,9 @@ describe('waitForRunAttention', () => {
       expect(await pending).toEqual({
         kind: 'attention',
         attention: {
-          kind: 'awaiting_human',
+          kind: 'awaiting_response',
           runId: 'child',
-          decideOn: { runId: 'child', nodeId: 'child-gate' },
+          respondTo: { runId: 'child', nodeId: 'child-gate' },
           message: 'Approve the plan.',
         },
       });
@@ -204,7 +204,10 @@ describe('waitForRunAttention', () => {
 
       expect(await wait('grandparent')).toMatchObject({
         kind: 'attention',
-        attention: { kind: 'awaiting_human', decideOn: { runId: 'child', nodeId: 'deep-gate' } },
+        attention: {
+          kind: 'awaiting_response',
+          respondTo: { runId: 'child', nodeId: 'deep-gate' },
+        },
       });
     });
 

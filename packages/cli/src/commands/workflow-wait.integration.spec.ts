@@ -249,7 +249,7 @@ describe('archon workflow wait against a detached run', () => {
     90_000
   );
 
-  test('wakes with awaiting_human on a gate, then with cancelled when it is rejected', async () => {
+  test('wakes with awaiting_response on a gate, then with cancelled when it is rejected', async () => {
     const fixture = makeFixture('archon-wait-gate-', { 'wait-gated': GATED });
     // Owned by another process; it exits on its own once the run parks on the gate.
     const owner = Bun.spawn(
@@ -283,9 +283,9 @@ describe('archon workflow wait against a detached run', () => {
     expect(gate.payload).toMatchObject({
       result: 'attention',
       attention: {
-        kind: 'awaiting_human',
+        kind: 'awaiting_response',
         runId,
-        decideOn: { runId, nodeId: 'review' },
+        respondTo: { runId, nodeId: 'review' },
         message: 'Approve the plan?',
       },
     });
