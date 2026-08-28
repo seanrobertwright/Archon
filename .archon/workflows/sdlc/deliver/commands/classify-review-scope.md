@@ -23,13 +23,9 @@ Cost is not the constraint; wasted attention is. A small, mechanical,
 likely-correct diff — a version bump, a one-line fix, a rename, a test-only
 tweak — often earns neither optional lens. A substantial or risky diff earns
 each lens whose failure class plausibly lives in it: when the diff genuinely
-contains new failure paths, choose errors.
-
-Choose docs when the diff changes shipped documentation and the change is
-substantial enough for the lens to earn its attention; a version bump, a
-one-line fix, a rename, or a test-only tweak earns nothing.
-
-Do not economize on real risk, and do not manufacture scope for its absence.
+contains new failure paths, choose errors; when it changes shipped documentation,
+choose docs. Do not economize on real risk, and do not
+manufacture scope for its absence.
 
 The test for each lens is the same: does this diff contain material that its
 failure class could plausibly live in? Decide from what you saw, not from the

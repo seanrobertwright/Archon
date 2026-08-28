@@ -384,18 +384,18 @@ describe('bundled-defaults', () => {
 
     // The same "does this diff earn a docs review" call is made in two packs — at
     // delivery time by the classifier, and at review time when `docs` is `auto`. They
-    // drifted apart once already; the criterion is one sentence, shared verbatim.
-    it('states the docs-lens criterion identically in both classifiers', () => {
-      const criterion =
-        'Choose docs when the diff changes shipped documentation and the change is\n' +
-        'substantial enough for the lens to earn its attention; a version bump, a\n' +
-        'one-line fix, a rename, or a test-only tweak earns nothing.';
+    // drifted once: only the delivery copy carried the trivial-diff carve-out, so the
+    // same doc-adjacent typo fix earned the lens through one entry point and not the
+    // other. Whitespace-normalized so the guard survives either file being rewrapped.
+    it('applies the trivial-diff carve-out in both docs classifiers', () => {
+      const squash = (text: string): string => text.replace(/\s+/g, ' ');
+      const carveOut = 'a version bump, a one-line fix, a rename, a test-only tweak';
       expect(
-        BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::classify-review-scope']
-      ).toContain(criterion);
-      expect(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-scope']).toContain(
-        criterion
-      );
+        squash(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::classify-review-scope'])
+      ).toContain(carveOut);
+      expect(
+        squash(BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:review::review-scope'])
+      ).toContain(carveOut);
     });
 
     // Calibration lesson 4 (#2898): the run that motivated this rewrite produced a false

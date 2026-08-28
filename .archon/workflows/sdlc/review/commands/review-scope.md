@@ -33,14 +33,11 @@ $ARGUMENTS
 
 ## Select docs review
 
-Choose docs when the diff changes shipped documentation and the change is
-substantial enough for the lens to earn its attention; a version bump, a
-one-line fix, a rename, or a test-only tweak earns nothing.
-
-Return `docs` true when it is chosen and false otherwise. This selection applies
-only when the workflow's `docs` input is `auto`; an explicit input overrides it.
-Delivery's classifier makes the same call with that criterion word for word, so
-the same diff earns the same lens whichever entry point asked.
+Set `docs` true when the reviewed diff changes shipped documentation, unless the
+diff is small, mechanical, and likely-correct — a version bump, a one-line fix, a
+rename, a test-only tweak — in which case a doc-adjacent touch alone does not
+earn the lens. Otherwise set it false. This selection applies only when the
+workflow's `docs` input is `auto`; an explicit input overrides it.
 
 ## Light mode (a prior report exists)
 
