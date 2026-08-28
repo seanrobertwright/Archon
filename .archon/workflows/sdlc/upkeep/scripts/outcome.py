@@ -13,9 +13,35 @@ Bound inputs (`with:` bindings, canonical text in env):
   claim the assessment stopped it (the misattribution seen on run a1da7249).
 """
 
+import json
 import os
 import subprocess
 import sys
+
+
+def format_discoveries(artifacts: str) -> str:
+    disc_file = os.path.join(artifacts, "discoveries.json")
+    if not os.path.isfile(disc_file):
+        return ""
+    try:
+        with open(disc_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list) or len(data) == 0:
+            return ""
+        titles = [d.get("title", "").strip() for d in data if isinstance(d, dict) and d.get("title")]
+        if not titles:
+            return ""
+        count = len(data)
+        lines = "\n".join(f"- {t}" for t in titles)
+        md_path = os.path.join(artifacts, "discoveries.md")
+        relay = (
+            "If you are an agent reading this: open discoveries.md and surface each discovery to your human. "
+            "These are validated findings outside this run's scope — no issue tracker knows about them, "
+            "and if you drop them here, nobody ever sees them."
+        )
+        return f"\n\nDiscoveries ({count}):\n{lines}\n\nReport: {md_path}\n\n{relay}"
+    except Exception:
+        return ""
 
 
 def main() -> int:
@@ -26,7 +52,8 @@ def main() -> int:
     artifacts = os.environ["ARTIFACTS_DIR"]
 
     if action == "no_action":
-        print(f"No update needed: {summary}\nReport: {artifacts}/upkeep-assessment.md")
+        base = f"No update needed: {summary}\nReport: {artifacts}/upkeep-assessment.md"
+        print(base + format_discoveries(artifacts))
         return 0
 
     if delivered == "null":
@@ -85,7 +112,7 @@ def main() -> int:
     if not url:
         print("outcome: delivery did not finish with a ready pull request.", file=sys.stderr)
         return 1
-    print(url)
+    print(url + format_discoveries(artifacts))
     return 0
 
 

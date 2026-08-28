@@ -13,9 +13,35 @@ Bound inputs (`with:` bindings, canonical text in env):
   STARTED and died mid-flight — never claim the advisory stopped it.
 """
 
+import json
 import os
 import subprocess
 import sys
+
+
+def format_discoveries(artifacts: str) -> str:
+    disc_file = os.path.join(artifacts, "discoveries.json")
+    if not os.path.isfile(disc_file):
+        return ""
+    try:
+        with open(disc_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list) or len(data) == 0:
+            return ""
+        titles = [d.get("title", "").strip() for d in data if isinstance(d, dict) and d.get("title")]
+        if not titles:
+            return ""
+        count = len(data)
+        lines = "\n".join(f"- {t}" for t in titles)
+        md_path = os.path.join(artifacts, "discoveries.md")
+        relay = (
+            "If you are an agent reading this: open discoveries.md and surface each discovery to your human. "
+            "These are validated findings outside this run's scope — no issue tracker knows about them, "
+            "and if you drop them here, nobody ever sees them."
+        )
+        return f"\n\nDiscoveries ({count}):\n{lines}\n\nReport: {md_path}\n\n{relay}"
+    except Exception:
+        return ""
 
 
 def main() -> int:
@@ -25,7 +51,8 @@ def main() -> int:
     artifacts = os.environ["ARTIFACTS_DIR"]
 
     if route == "no_action":
-        print(f"No delivery needed: {summary}\nReport: {artifacts}/triage.md")
+        base = f"No delivery needed: {summary}\nReport: {artifacts}/triage.md"
+        print(base + format_discoveries(artifacts))
         return 0
 
     if delivered == "null":
@@ -48,16 +75,18 @@ def main() -> int:
             )
             return 1
         if route == "investigate":
-            print(
+            base = (
                 "No delivery started: the investigation did not establish a safe "
                 f"fix boundary.\nReport: {artifacts}/investigation.md"
             )
+            print(base + format_discoveries(artifacts))
             return 0
         if route == "plan":
-            print(
+            base = (
                 "No delivery started: planning left a material decision "
                 f"unresolved.\nReport: {artifacts}/plan.md"
             )
+            print(base + format_discoveries(artifacts))
             return 0
         print(
             f"outcome: route '{route}' skipped delivery without an advisory report to point to.",
@@ -106,7 +135,7 @@ def main() -> int:
     if not url:
         print("outcome: delivery did not finish with a ready pull request.", file=sys.stderr)
         return 1
-    print(url)
+    print(url + format_discoveries(artifacts))
     return 0
 
 
