@@ -112,6 +112,12 @@ export async function downloadWebDist(
   const tarballUrl = `https://github.com/${GITHUB_REPO}/releases/download/v${version}/archon-web.tar.gz`;
   const checksumsUrl = `https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.txt`;
 
+  // Phase markers, not metrics. When this stalls on windows CI the only surviving
+  // evidence is the log, and a single start line cannot say whether the wait sat
+  // in the fetch, the staged write, the spawn call, the child, or the rename
+  // afterwards (#2924). Each `web_dist.*` event below closes one phase and
+  // carries that phase's own durationMs, so the phases chain from here.
+  const downloadStartedAt = performance.now();
   log.info({ version, targetDir }, 'web_dist.download_started');
   console.log(`Web UI not found locally — downloading from release v${version}...`);
 
@@ -166,6 +172,8 @@ export async function downloadWebDist(
     throw new Error(`Checksum mismatch: expected ${expectedHash}, got ${actualHash}`);
   }
   console.log('Checksum verified.');
+  const verifiedAt = performance.now();
+  log.info({ durationMs: Math.round(verifiedAt - downloadStartedAt) }, 'web_dist.tarball_verified');
 
   // Extract to temp dir, then atomic rename
   const tmpDir = `${targetDir}.tmp`;
@@ -184,24 +192,55 @@ export async function downloadWebDist(
   // windows drive letter is ambiguous with `tar`'s own `host:path` syntax.
   await Bun.write(tarballPath, tarballBuffer);
   const extractionStartedAt = performance.now();
+  // Covers the temp-dir reset above as well as the write — both are filesystem
+  // work on the extraction target, which is the suspect this event exists to
+  // measure.
+  log.info(
+    {
+      tarballPath,
+      bytes: tarballBuffer.byteLength,
+      durationMs: Math.round(extractionStartedAt - verifiedAt),
+    },
+    'web_dist.archive_staged'
+  );
+  // Only read after a clean `tar` exit, so the throw paths never see the seed.
+  let extractionEndedAt = extractionStartedAt;
   try {
     const proc = Bun.spawn(['tar', 'xzf', '-', '-C', tmpDir, '--strip-components=1'], {
       stdin: Bun.file(tarballPath),
       stderr: 'pipe',
       timeout: EXTRACTION_TIMEOUT_MS,
     });
+    // Separate from the wait below: on windows a real-time scanner hooks process
+    // creation, so a slow spawn call and a slow child are different diagnoses.
+    // `tarPid`, not `pid` — pino already binds the parent's pid at the root, and
+    // a second `pid` key would silently win on parse.
+    const spawnedAt = performance.now();
+    log.info(
+      { tarPid: proc.pid, durationMs: Math.round(spawnedAt - extractionStartedAt) },
+      'web_dist.extract_spawned'
+    );
     // Drain stderr while waiting rather than after: a pipe nobody reads is the
     // same deadlock in the other direction once `tar` fills its buffer.
     const [exitCode, stderrText] = await Promise.all([
       proc.exited,
       new Response(proc.stderr).text(),
     ]);
+    extractionEndedAt = performance.now();
+    log.info(
+      {
+        exitCode,
+        signalCode: proc.signalCode,
+        durationMs: Math.round(extractionEndedAt - spawnedAt),
+      },
+      'web_dist.extract_exited'
+    );
     const details = stderrText.trim();
     // A signal means `tar` never finished. `proc.killed` cannot say so — it is
     // true after any exit — and a signal can also come from outside this process,
     // so report how long it actually ran instead of asserting the bound fired.
     if (proc.signalCode !== null) {
-      const elapsedMs = Math.round(performance.now() - extractionStartedAt);
+      const elapsedMs = Math.round(extractionEndedAt - extractionStartedAt);
       cleanupAndThrow(
         tmpDir,
         `tar extraction was killed by ${proc.signalCode} after ${elapsedMs}ms without finishing ` +
@@ -233,6 +272,12 @@ export async function downloadWebDist(
       `Failed to move extracted web UI from ${tmpDir} to ${targetDir}: ${toError(err).message}`
     );
   }
+  // Closes the last phase: staged-archive removal, layout check, and the rename
+  // of a freshly written tree — all after-tar filesystem work.
+  log.info(
+    { targetDir, durationMs: Math.round(performance.now() - extractionEndedAt) },
+    'web_dist.installed'
+  );
   console.log(`Extracted to ${targetDir}`);
 }
 

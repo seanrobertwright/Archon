@@ -104,6 +104,34 @@ jobs:
         if: runner.os != 'Windows'
         run: bun run test:install
 
+      # Defender real-time scanning of the extraction target is the last
+      # unruled-out suspect behind the downloadWebDist stalls in #2924, which
+      # recurred on 28 Aug after the parent-owned-pipe fix (#2928) landed. This
+      # is a targeted mitigation, not a skip: no budget and no platform coverage
+      # changes. Two paths because they differ on hosted runners — RUNNER_TEMP is
+      # D:\a\_temp, while the suite's fixtures extract into os.tmpdir(), which
+      # reads $env:TEMP under the runner profile.
+      - name: Exclude test temp dirs from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # A missing exclusion only costs speed, so it must not fail the job — but
+        # it must stay visible, or a later timing sample gets attributed to a
+        # mitigation that never applied.
+        run: |
+          $paths = @($env:RUNNER_TEMP, $env:TEMP) | Where-Object { $_ } | Select-Object -Unique
+          Write-Host "Requesting Defender exclusions for: $($paths -join ', ')"
+          try {
+            Add-MpPreference -ExclusionPath $paths -ErrorAction Stop
+            $applied = @((Get-MpPreference).ExclusionPath)
+            Write-Host "Defender ExclusionPath now: $($applied -join ', ')"
+            $missing = $paths | Where-Object { $applied -notcontains $_ }
+            if ($missing) {
+              Write-Host "::warning::Defender did not record exclusions for: $($missing -join ', '). downloadWebDist timing (#2924) stays unmitigated for those paths."
+            }
+          } catch {
+            Write-Host "::warning::Could not apply Windows Defender exclusions for $($paths -join ', '): $($_.Exception.Message). Tests still run; downloadWebDist timing (#2924) stays unmitigated on this run."
+          }
+
       - name: Run tests
         run: bun run test
 
