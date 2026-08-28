@@ -38,7 +38,7 @@ mock.module('@archon/paths', () => ({
   getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
 }));
 
-import { execFileAsync } from '@archon/git';
+import { execFileAsync, resolveBashPath } from '@archon/git';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
 import type { WorkflowWithSource } from './schemas/workflow';
@@ -595,6 +595,18 @@ describe('runFixtures', () => {
 describe('runFixtures exec-code isolation (#2851)', () => {
   const COMMITTED_YAML = 'committed-file\n';
 
+  /**
+   * The probe body {@link GUARD_YAML} runs.
+   *
+   * Captured and tested separately, not as `[ -z "$(git status --porcelain)" ]`: a git
+   * that FAILS also prints nothing, so the inline form reads its silence as a clean tree
+   * and the guard passes without having observed anything.
+   *
+   * Shared with the test that proves that, rather than restated there — a second copy
+   * would keep passing after this one was reverted, which is the whole failure mode.
+   */
+  const GUARD_PROBE = ['status="$(git status --porcelain)" || exit 1', '[ -z "$status" ]'];
+
   /** A bash node whose success depends ONLY on the cleanliness of the checkout it executes in. */
   const GUARD_YAML = [
     'name: test-wf',
@@ -602,11 +614,7 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     'nodes:',
     '  - id: probe',
     '    bash: |',
-    // Captured and tested separately, not as `[ -z "$(git status --porcelain)" ]`: a git
-    // that FAILS also prints nothing, so the inline form reads its silence as a clean
-    // tree and the guard passes without having observed anything.
-    '      status="$(git status --porcelain)" || exit 1',
-    '      [ -z "$status" ]',
+    ...GUARD_PROBE.map(line => `      ${line}`),
   ].join('\n');
 
   const WRITER_YAML = [
@@ -691,6 +699,29 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     writeFileSync(join(cwd, 'scratch.txt'), 'untracked stray\n');
     const dirtyReport = await runFixtures({ workflows, cwd });
     expect(dirtyReport.passed).toBe(1);
+  });
+
+  it('fails the guard when git cannot report status, rather than passing on its silence', async () => {
+    // What the test above rests on: the guard must distinguish "the tree is clean" from
+    // "I never got to look". A failing `git status` prints nothing, so the shorter
+    // `[ -z "$(git status --porcelain)" ]` reads that silence as cleanliness — measured,
+    // not supposed: with the scratch worktree replaced by a plain empty directory, the
+    // inline form passed BOTH halves above, certifying a checkout that never happened.
+    //
+    // `GIT_DIR` pointing nowhere reproduces exactly that condition — git exits non-zero
+    // having written nothing to stdout — and needs no repository, no scratch worktree and
+    // no process beyond the one the guard itself runs in.
+    const cwd = makeTempProject();
+    const exit = await execFileAsync(resolveBashPath(), ['-c', GUARD_PROBE.join('\n')], {
+      cwd,
+      env: { ...process.env, GIT_DIR: join(cwd, 'no-such-git-dir') },
+    }).then(
+      () => 'the guard passed',
+      (error: { code?: unknown }) => error.code
+    );
+    // Bash's exit status, so specifically the guard's own `|| exit 1`. A string here would
+    // be a spawn failure — bash never ran — which must not read as the guard working.
+    expect(exit).toBe(1);
   });
 
   it('keeps executed writes out of the caller checkout (#2851)', async () => {
