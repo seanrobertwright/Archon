@@ -709,6 +709,18 @@ string. Field access uses the same strict semantics as `$nodeId.output.field`
 (a field not in the producer's declared schema fails the consuming node rather
 than silently degrading).
 
+A body node can also gate on the previous iteration's typed output with `when:`:
+
+```yaml
+- id: repair
+  prompt: Repair the failing tests.
+  depends_on: [test]
+  when: "$LOOP_PREV.test.output.verdict == 'red'"
+```
+
+This is a condition reference, not text substitution. On iteration 1 it resolves to
+`''`, so the non-empty equality is false. See [Condition Syntax](/guides/authoring-workflows/#when-condition-syntax).
+
 `$LOOP_PREV` works in a body node's `with:` binding **string values** too, with the
 same text semantics as every other body surface: the previous iteration's output is
 substituted into the value each pass (so `with: { prev: $LOOP_PREV.test.output }`
