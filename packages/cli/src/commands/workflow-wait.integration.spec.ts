@@ -183,6 +183,32 @@ function readRunId(archonHome: string, workflowName: string): string | undefined
   }
 }
 
+/**
+ * Poll `read` until it produces a value.
+ *
+ * The catch is load bearing, not defensive: an owner process creates `archon.db`
+ * BEFORE it applies the schema, so a reader that opens the file inside that window
+ * gets `SQLiteError: no such table` out of `prepare()` — a throw, not an empty
+ * result. Windows widens the same window to `disk I/O error` while a commit settles
+ * (#2306). `workflow-terminal-event.integration.spec.ts` catches for exactly this
+ * reason; a bare loop here would surface a startup race as a test failure.
+ */
+async function waitFor<T>(read: () => T | undefined, timeoutMs = 30_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const value = read();
+      if (value !== undefined) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await Bun.sleep(50);
+  }
+  const detail = lastError instanceof Error ? `: ${lastError.message}` : '';
+  throw new Error(`Timed out waiting for the run row${detail}`);
+}
+
 describe('archon workflow wait against a detached run', () => {
   test.each([
     { workflow: 'wait-success', status: 'completed' },
@@ -246,13 +272,7 @@ describe('archon workflow wait against a detached run', () => {
 
     // Discovering the id is test setup, not the contract under test — the launcher
     // above has no `--detach --json` ack to carry one.
-    let runId: string | undefined;
-    const discoveryDeadline = Date.now() + 30_000;
-    while (runId === undefined && Date.now() < discoveryDeadline) {
-      runId = readRunId(fixture.archonHome, 'wait-gated');
-      if (runId === undefined) await Bun.sleep(50);
-    }
-    if (runId === undefined) throw new Error('the run row never appeared');
+    const runId = await waitFor(() => readRunId(fixture.archonHome, 'wait-gated'));
     activeRunIds.add(runId);
 
     // Attached while the warm-up node is still running, so the gate is a WAKE.
