@@ -9,7 +9,6 @@ const GENERATOR_PATH = resolve(
   import.meta.dir,
   '../../../web/node_modules/openapi-typescript/bin/cli.js'
 );
-const CHECK_ONLY = process.argv.includes('--check');
 
 async function generateApiTypes(): Promise<string> {
   const app = new OpenAPIHono();
@@ -32,24 +31,44 @@ async function generateApiTypes(): Promise<string> {
   return format(output, { ...(await resolveConfig(OUTPUT_PATH)), parser: 'typescript' });
 }
 
-async function main(): Promise<void> {
-  const types = await generateApiTypes();
+export type ApiTypesOutcome = 'ok' | 'stale' | 'written';
 
-  if (CHECK_ONLY) {
-    const existing = await readFile(OUTPUT_PATH, 'utf8');
-    if (existing.replace(/\r\n/g, '\n') !== types) {
+/**
+ * Decides what to do with freshly generated types. Check mode must never write:
+ * the CI guard only means anything if a stale tree stays stale, so the same
+ * `--check` a developer runs reproduces the failure instead of quietly fixing it.
+ */
+export async function applyApiTypes(options: {
+  outputPath: string;
+  generated: string;
+  checkOnly: boolean;
+}): Promise<ApiTypesOutcome> {
+  const { outputPath, generated, checkOnly } = options;
+  if (!checkOnly) {
+    await writeFile(outputPath, generated);
+    return 'written';
+  }
+
+  // A Windows checkout with core.autocrlf holds byte-different but equivalent
+  // content, so compare on normalized line endings rather than failing the guard.
+  const existing = await readFile(outputPath, 'utf8');
+  return existing.replace(/\r\n/g, '\n') === generated ? 'ok' : 'stale';
+}
+
+if (import.meta.main) {
+  try {
+    const outcome = await applyApiTypes({
+      outputPath: OUTPUT_PATH,
+      generated: await generateApiTypes(),
+      checkOnly: process.argv.includes('--check'),
+    });
+    if (outcome === 'stale') {
       console.error('api.generated.d.ts is stale.\nRun: bun run generate:api-types');
       process.exit(2);
     }
-    console.log('check:api-types OK');
-    return;
+    console.log(outcome === 'ok' ? 'check:api-types OK' : `Generated ${OUTPUT_PATH}`);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error);
+    process.exit(1);
   }
-
-  await writeFile(OUTPUT_PATH, types);
-  console.log(`Generated ${OUTPUT_PATH}`);
 }
-
-main().catch(error => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exit(1);
-});
