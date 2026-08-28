@@ -46,6 +46,9 @@ import {
   resolveContainerBackendConfig,
   hasUnresolvedWriteback,
   buildNodeSummaries,
+  resolveCliExitCode,
+  WorkflowRunFailedError,
+  DETACHED_RUN_FAILED_EXIT_CODE,
 } from './workflow';
 
 beforeAll(async () => {
@@ -5322,6 +5325,40 @@ describe('write command --json output', () => {
   });
 });
 
+/**
+ * The launcher/child exit-status protocol behind the startup window. The window can only
+ * see that the child's process is gone; whether the run ever started is the child's to
+ * report, and this is the channel it reports on.
+ */
+describe('resolveCliExitCode', () => {
+  it('reserves a distinct status for a detached child reporting its own run failure', () => {
+    expect(resolveCliExitCode(new WorkflowRunFailedError('node failed', true))).toBe(
+      DETACHED_RUN_FAILED_EXIT_CODE
+    );
+  });
+
+  it('keeps the ordinary status for a run that failed on a terminal', () => {
+    expect(resolveCliExitCode(new WorkflowRunFailedError('node failed', false))).toBe(1);
+  });
+
+  it('reads the run outcome through a continuation command re-throw', () => {
+    // `resume`/`approve`/`reject`/`respond` re-throw with their own explanation, so the
+    // outermost error is never the run's. Losing the cause here would make every
+    // detached continuation of a fast-failing run look like a launch failure again.
+    const wrapped = new Error("Approved but failed to resume workflow 'assist': Workflow failed", {
+      cause: new WorkflowRunFailedError('node failed', true),
+    });
+    expect(resolveCliExitCode(wrapped)).toBe(DETACHED_RUN_FAILED_EXIT_CODE);
+  });
+
+  it('reports a failure that is not a run outcome as an ordinary failure', () => {
+    // The startup deaths #2914 exists to surface land here: the launcher must keep
+    // reading these as a launch that never took.
+    expect(resolveCliExitCode(new Error('Cannot determine git remote'))).toBe(1);
+    expect(resolveCliExitCode('not an error')).toBe(1);
+  });
+});
+
 describe('workflowRunCommand — detach', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let stdoutSpy: ReturnType<typeof spyOn>;
@@ -5889,6 +5926,57 @@ describe('workflowRunCommand — detach', () => {
       spawnSpy.mockRestore();
     }
     expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
+  });
+
+  // A one-node workflow that fails legitimately finishes inside the 500 ms startup
+  // window on a fast machine. #2914 read the child's non-zero exit as a launch failure,
+  // so the same command passed or failed depending on how quickly the machine got
+  // through the run — locally it broke `bun run validate` outright. The child now names
+  // its run's own failure, and only that reading acks it.
+  it('acks a run whose workflow failed inside the startup window', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const paths = await import('@archon/paths');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    (workflowDb.failWorkflowRun as ReturnType<typeof mock>).mockClear();
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+
+    try {
+      const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', { detach: true });
+      for (let attempt = 0; attempt < 20 && spawnSpy.mock.calls.length === 0; attempt++) {
+        await Promise.resolve();
+      }
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+      const spawnOptions = spawnSpy.mock.calls[0]?.[0] as
+        | {
+            onExit?: (
+              subprocess: ReturnType<typeof Bun.spawn>,
+              exitCode: number | null,
+              signalCode: number | null,
+              error?: Error
+            ) => void;
+          }
+        | undefined;
+      spawnOptions?.onExit?.(child.child, DETACHED_RUN_FAILED_EXIT_CODE, null);
+      await commandPromise;
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
+    // The run recorded its own failure. A launcher that fails the row here would
+    // overwrite the run's reason with a launch failure that never happened.
+    expect(workflowDb.failWorkflowRun).not.toHaveBeenCalled();
   });
 
   // #2872 — the parent is the row's only owner until the child claims it. A child that
