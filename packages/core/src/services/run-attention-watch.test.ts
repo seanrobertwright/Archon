@@ -332,14 +332,27 @@ describe('waitForRunAttention', () => {
       });
       putRun('r1', { status: 'running' });
 
-      const pending = waitForRunAttention('r1', { pollIntervalMs: 60_000, deadlineMs: 120 });
+      // A 60s interval and NO deadline: between the opening read and the abort,
+      // the doorbell is the only thing that can cause another read. So the count
+      // measures the doorbell directly instead of racing a deadline timer against
+      // the clock — pinning an exact total across a deadline made this assertion a
+      // function of timer alignment, and CI duly read 3 where a laptop read 2.
+      const controller = new AbortController();
+      const pending = waitForRunAttention('r1', {
+        pollIntervalMs: 60_000,
+        signal: controller.signal,
+      });
       await Bun.sleep(20);
-      ring?.('some-other-run');
+      const readsBeforeRing = mockGetWorkflowRun.mock.calls.length;
 
-      expect(await pending).toMatchObject({ kind: 'deadline' });
-      // Exactly two reads: the opening one and the deadline's final re-read. The
-      // foreign notification woke nothing, or there would be a third.
-      expect(mockGetWorkflowRun).toHaveBeenCalledTimes(2);
+      ring?.('some-other-run');
+      await Bun.sleep(50);
+
+      // The whole point: a payload naming a different run woke nothing.
+      expect(mockGetWorkflowRun.mock.calls.length).toBe(readsBeforeRing);
+
+      controller.abort();
+      expect(await pending).toMatchObject({ kind: 'aborted' });
     });
   });
 });
