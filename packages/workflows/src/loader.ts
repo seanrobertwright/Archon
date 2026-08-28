@@ -920,6 +920,7 @@ export function validateDagStructure(
       visitNodeTemplateSlots(
         node,
         slot => {
+          if (!slot.outputReference) return;
           sources.push({
             field: slot.path,
             text: slot.value,

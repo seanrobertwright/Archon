@@ -5546,7 +5546,7 @@ export function applyLoopPrevToBodyNode(
   // ref (the loader rejects `$LOOP_PREV` there, naming this string form), and only
   // a string `if_skipped` default carries the splice, mirroring the include macro.
   const substitutedNode = mapNodeTemplateSlots(node, slot => {
-    if (slot.surface === 'binding_from') return slot.value;
+    if (slot.surface === 'binding_from' || slot.surface === 'condition') return slot.value;
     if (slot.surface === 'shell') return sub(slot.value, true);
     if (slot.surface === 'script') return sub(slot.value, false, true);
     return sub(slot.value);

@@ -66,42 +66,52 @@ export type TemplateValuePosition =
 
 interface SlotDefinition {
   surface: TemplateSurface;
+  outputReference: boolean;
   valuePosition?: TemplateValuePosition;
 }
 
 /** The complete engine-owned template surface. */
 const SLOT_SPEC = {
-  when: { surface: 'condition' },
-  systemPrompt: { surface: 'prompt' },
-  'agents.*.prompt': { surface: 'prompt' },
-  'agents.*.description': { surface: 'prompt' },
-  'agent.prompt': { surface: 'prompt' },
-  'binding.value': { surface: 'value', valuePosition: 'binding' },
-  'binding.from': { surface: 'binding_from' },
-  'binding.if_skipped': { surface: 'binding_default', valuePosition: 'binding_default' },
-  'exec.bash': { surface: 'shell' },
-  'exec.script': { surface: 'script' },
-  'loop.prompt': { surface: 'prompt' },
-  'loop.until_bash': { surface: 'shell' },
-  'loop.compiled_prompt': { surface: 'prompt' },
-  'loop_group.until_bash': { surface: 'shell' },
-  'approval.message': { surface: 'prompt' },
-  'approval.on_reject.prompt': { surface: 'prompt' },
-  'cancel.reason': { surface: 'prompt' },
-  'wait.until': { surface: 'value' },
-  'wait.event': { surface: 'value' },
-  'workflow.input': { surface: 'value' },
-  'workflow.with.*': { surface: 'value', valuePosition: 'workflow_with' },
-  'workflow.fan_out.items': { surface: 'value' },
-  'compose_fan_out.with.*': { surface: 'value', valuePosition: 'compose_fan_out_with' },
-  'compose_fan_out.fan_out.items': { surface: 'value' },
-  'composed.inputs.*': { surface: 'value', valuePosition: 'composed_input' },
+  when: { surface: 'condition', outputReference: true },
+  systemPrompt: { surface: 'prompt', outputReference: true },
+  'agents.*.prompt': { surface: 'prompt', outputReference: true },
+  'agents.*.description': { surface: 'prompt', outputReference: true },
+  'agent.prompt': { surface: 'prompt', outputReference: true },
+  'binding.value': { surface: 'value', outputReference: true, valuePosition: 'binding' },
+  'binding.from': { surface: 'binding_from', outputReference: true },
+  'binding.if_skipped': {
+    surface: 'binding_default',
+    outputReference: false,
+    valuePosition: 'binding_default',
+  },
+  'exec.bash': { surface: 'shell', outputReference: true },
+  'exec.script': { surface: 'script', outputReference: true },
+  'loop.prompt': { surface: 'prompt', outputReference: true },
+  'loop.until_bash': { surface: 'shell', outputReference: true },
+  'loop.compiled_prompt': { surface: 'prompt', outputReference: true },
+  'loop_group.until_bash': { surface: 'shell', outputReference: true },
+  'approval.message': { surface: 'prompt', outputReference: true },
+  'approval.on_reject.prompt': { surface: 'prompt', outputReference: true },
+  'cancel.reason': { surface: 'prompt', outputReference: true },
+  'wait.until': { surface: 'value', outputReference: true },
+  'wait.event': { surface: 'value', outputReference: true },
+  'workflow.input': { surface: 'value', outputReference: true },
+  'workflow.with.*': { surface: 'value', outputReference: true, valuePosition: 'workflow_with' },
+  'workflow.fan_out.items': { surface: 'value', outputReference: true },
+  'compose_fan_out.with.*': {
+    surface: 'value',
+    outputReference: true,
+    valuePosition: 'compose_fan_out_with',
+  },
+  'compose_fan_out.fan_out.items': { surface: 'value', outputReference: true },
+  'composed.inputs.*': { surface: 'value', outputReference: true, valuePosition: 'composed_input' },
 } satisfies Record<TemplateSlotName, SlotDefinition>;
 
 export interface TemplateSlot {
   name: TemplateSlotName;
   path: string;
   surface: TemplateSurface;
+  outputReference: boolean;
   value: string;
 }
 
@@ -127,7 +137,16 @@ function walk(
     value: string,
     replace: (value: string) => void
   ): void => {
-    callback({ name, path: `${prefix}${path}`, surface: SLOT_SPEC[name].surface, value }, replace);
+    callback(
+      {
+        name,
+        path: `${prefix}${path}`,
+        surface: SLOT_SPEC[name].surface,
+        outputReference: SLOT_SPEC[name].outputReference,
+        value,
+      },
+      replace
+    );
   };
   const valueSlot = (
     name: TemplateSlotName,

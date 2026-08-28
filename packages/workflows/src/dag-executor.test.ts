@@ -22719,6 +22719,21 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect('reason' in cancelNode ? cancelNode.reason : undefined).toBe("stopping: it's done");
   });
 
+  it('leaves when conditions for the condition evaluator to resolve', () => {
+    const node = applyLoopPrevToBodyNode(
+      {
+        id: 'guarded',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'work' },
+        when: "$LOOP_PREV.work.output == 'done'",
+        depends_on: [],
+      } as DagNode,
+      new Map([['work', makeOutput('completed', 'done', undefined)]]),
+      ''
+    );
+    expect(node.when).toBe("$LOOP_PREV.work.output == 'done'");
+  });
+
   it('EDGE H (#2623): resolves namespaced $LOOP_PREV across AI config and compiled loop prompts', () => {
     const prev = new Map<string, NodeOutput>([
       ['block__review', makeOutput('completed', 'PRIOR', undefined)],

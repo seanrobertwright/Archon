@@ -8403,6 +8403,27 @@ nodes:
     expect(notUpstream.error?.error).toContain("add 'producer' to 'consume'.depends_on");
   });
 
+  it('does not validate output references in an if_skipped literal default', () => {
+    const result = parseWorkflow(
+      `
+name: bind-default-literal
+description: defaults are delivered literally when a producer is skipped
+nodes:
+  - id: producer
+    prompt: emit
+  - id: consume
+    command: review
+    depends_on: [producer]
+    with:
+      value:
+        from: $producer.output
+        if_skipped: $not-a-producer.output
+`,
+      'bind-default-literal.yaml'
+    );
+    expect(result.error).toBeNull();
+  });
+
   it('rejects an object binding value that is not the directive shape, naming both accepted forms', () => {
     const result = parseWorkflow(
       `
