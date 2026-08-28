@@ -323,6 +323,40 @@ describe('workflows database', () => {
       ]);
     });
 
+    // working_path (#2872) is write-once for the same reason as output_root, and it
+    // exists for a row created before its checkout was decided: `run --detach` writes
+    // the row in the launching process so `Started` names a queryable run, then forks
+    // before any worktree exists.
+    test('writes working_path through COALESCE so the first value wins', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', { working_path: '/home/u/worktrees/task' });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('working_path = COALESCE(working_path, $1)');
+      expect(params).toEqual(['/home/u/worktrees/task', 'workflow-run-123']);
+    });
+
+    test('working_path placeholder is numbered correctly alongside other fields', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateWorkflowRun('workflow-run-123', {
+        metadata: { step: 'plan' },
+        output_root: '/root/x',
+        working_path: '/home/u/worktrees/task',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('output_root = COALESCE(output_root, $2)');
+      expect(query).toContain('working_path = COALESCE(working_path, $3)');
+      expect(params).toEqual([
+        JSON.stringify({ step: 'plan' }),
+        '/root/x',
+        '/home/u/worktrees/task',
+        'workflow-run-123',
+      ]);
+    });
+
     test('omitting output_root leaves it out of the SET clause entirely', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 

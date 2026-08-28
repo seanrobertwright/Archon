@@ -722,6 +722,9 @@ export type ExecuteWorkflowOptions = ResumePayload & {
  * run's own artifacts path so a container can bind it and cleanup can reclaim it, but it
  * has to exist before discovery — and therefore before the run row. Reserving the id up
  * front is cheaper than inventing a second staging lifecycle for the gap.
+ *
+ * When the row already exists (a `--detach` child executing the row its parent created),
+ * the caller supplies that id instead and the same invariant holds from the other side.
  */
 export interface PreparedWorkflowSource {
   /** Reserved run id; the caller passes it back so the row and the capture agree. */
@@ -981,6 +984,12 @@ export async function prepareWorkflowSource(
   opts: {
     /** Directory to freeze. */
     sourceRoot: string;
+    /**
+     * File the capture under an id the caller already owns instead of reserving a new
+     * one. Set when the run row exists before its source is frozen — a `--detach` child
+     * whose parent created the row (#2872) — so the capture and the row still agree.
+     */
+    runId?: string;
   }
 ): Promise<PreparedWorkflowSource> {
   // Read the SOURCE's command policy, not the target's. A repo may point `commands.folder`
@@ -998,7 +1007,7 @@ export async function prepareWorkflowSource(
     );
   }
   await sweepStaleStagedSources();
-  const runId = randomUUID();
+  const runId = opts.runId ?? randomUUID();
   // Staged, not final. The run's artifacts path depends on its registered project
   // identity, which the caller often has not resolved yet at capture time — and looking
   // it up early would duplicate a lookup the run does properly later. Staging under
@@ -1818,11 +1827,11 @@ export async function executeWorkflow(
       if (isWaitNode(node)) return true;
       return isLoopGroupNode(node) && containsWait(node.loop_group.nodes);
     });
-  if (
-    preCreatedRun === undefined &&
-    execContext.kind === 'container' &&
-    containsWait(workflow.nodes)
-  ) {
+  // Fresh dispatch only — a resume of a run that already committed to this shape has
+  // nothing left to refuse. `isContinuation`, not `preCreatedRun === undefined`: a row
+  // pre-created by a launching process (#2872) is still a fresh dispatch and must meet
+  // the same refusal.
+  if (!isContinuation && execContext.kind === 'container' && containsWait(workflow.nodes)) {
     throw new Error(
       `Workflow '${workflow.name}' contains a durable wait, which is not supported in container isolation because server continuation cannot rewire the container. Run it without container isolation.`
     );
@@ -2192,12 +2201,21 @@ export async function executeWorkflow(
   }
 
   if (preCreatedRun && !isContinuation) {
+    // The stamps a fresh row would have received at creation, for a row someone
+    // else created. `isolation` + `isolation_env_id` are what a later resume reads
+    // to rediscover a container (see the creation branch above), and `working_path`
+    // is null on a row created before its checkout existed (#2872, `run --detach`)
+    // — write-once in the store, so re-running this can never repoint a live run.
+    const invocationMetadata: Record<string, unknown> = {
+      [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata,
+      ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
+      ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),
+      ...(containerCtx ? { isolation_env_id: containerCtx.envId } : {}),
+    };
     try {
       await deps.store.updateWorkflowRun(preCreatedRun.id, {
-        metadata: {
-          [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata,
-          ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
-        },
+        metadata: invocationMetadata,
+        ...(preCreatedRun.working_path === null ? { working_path: cwd } : {}),
       });
     } catch (error) {
       const err = error as Error;
@@ -2222,10 +2240,10 @@ export async function executeWorkflow(
     }
     workflowRun = {
       ...preCreatedRun,
+      working_path: preCreatedRun.working_path ?? cwd,
       metadata: {
         ...preCreatedRun.metadata,
-        [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata,
-        ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
+        ...invocationMetadata,
       },
     };
   }

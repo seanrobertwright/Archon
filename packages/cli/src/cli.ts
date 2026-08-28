@@ -92,6 +92,7 @@ import {
   workflowTestCommand,
   workflowInstallCommand,
   isValidEventType,
+  resolveCliExitCode,
 } from './commands/workflow';
 import { WORKFLOW_EVENT_TYPES } from '@archon/workflows/store';
 import {
@@ -757,6 +758,7 @@ async function main(): Promise<number> {
               detachedRunConfigPayload: values['internal-detached-run-config'] as
                 | string
                 | undefined,
+              detachedRunId: values['internal-detached-run-id'] as string | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
             break;
@@ -1236,15 +1238,18 @@ async function main(): Promise<number> {
     return 0;
   } catch (error) {
     const err = error as Error;
+    // A detached child reports its run's own failure with a reserved status so its
+    // launcher can tell that apart from a child that died before the run started.
+    const exitCode = resolveCliExitCode(err);
     if (values.json as boolean | undefined) {
       await writeJsonLine({ ok: false, error: err.message });
-      return 1;
+      return exitCode;
     }
     console.error(`Error: ${err.message}`);
     if (process.env.DEBUG) {
       console.error(err.stack);
     }
-    return 1;
+    return exitCode;
   } finally {
     // Flush queued telemetry events before the CLI process exits.
     // Short-lived CLI commands lose buffered events if shutdown() is skipped.

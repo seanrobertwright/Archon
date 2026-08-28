@@ -37,6 +37,20 @@
  * measured on windows-latest and ruled out. What was left was accidental cost:
  * their fixture spawned a SECOND cold `bun` process purely to write one registry
  * row, which is now an in-process write. The budget still has not moved.
+ *
+ * It recurred a third time (#2882, both C5 cases in one windows-latest run at
+ * 6266/5016 ms, carrying Bun's body-timeout message rather than its hook-timeout
+ * one). This time the body was phase-attributed and nothing accidental was left
+ * to remove: spawning the migration script is 88% of it (61-68 ms of a 69-74 ms
+ * body locally), and that subprocess IS the contract. The registry fixture is
+ * the remaining 8-11%; building it once and copying the file per test measured
+ * 2-3 ms cheaper and would have to either share one database across the two
+ * cases — the cross-test coupling the paragraph above exists to prevent — or
+ * rewrite the row anyway, because `default_cwd` is the per-test sandbox path.
+ * The other 17 tests in this file sit at the same one-spawn floor (58-65 ms), so
+ * the C5 pair are not special; they are ~15% above a floor that a contended
+ * Windows runner puts at the budget line. That is a runner-capacity question,
+ * not a cost this file can spend less of. Still do not reach for the timeout.
  */
 import { describe, test, expect } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'fs/promises';

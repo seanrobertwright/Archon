@@ -59,4 +59,6 @@ export const cliArgOptions: CliArgOptions = {
   config: { type: 'string' },
   // Private sealed handoff appended by the parent of a detached workflow run.
   'internal-detached-run-config': { type: 'string' },
+  // Private handoff: the run row the detached parent created before forking (#2872).
+  'internal-detached-run-id': { type: 'string' },
 };
