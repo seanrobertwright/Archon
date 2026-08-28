@@ -1013,7 +1013,7 @@ interface WorkflowJsonEntry {
  * Read-only by construction — the only execution path is `dryRunWorkflow`, so no
  * run state is created and no provider is contacted. Returns the process exit code:
  * 0 when everything passes (including the nothing-declared case), 1 when any fixture
- * fails or an explicitly named target has none.
+ * fails, a workflow cannot load, or an explicitly named target has none.
  */
 export async function workflowTestCommand(
   cwd: string,
@@ -1030,12 +1030,39 @@ export async function workflowTestCommand(
       `Cannot read the workflow source configuration in ${cwd}: ${(error as Error).message}`
     );
   });
-  const report = await runFixtures({
-    workflows,
-    cwd,
-    sourceConfig: workflowSourceConfigFrom(config),
-    ...(target !== undefined ? { target } : {}),
-  });
+  let report: Awaited<ReturnType<typeof runFixtures>>;
+  try {
+    report = await runFixtures({
+      workflows,
+      cwd,
+      sourceConfig: workflowSourceConfigFrom(config),
+      ...(target !== undefined ? { target } : {}),
+    });
+  } catch (error) {
+    if (errors.length === 0) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (options.json) {
+      await writeJsonLine({
+        ok: false,
+        error: message,
+        errors: errors.map(e => ({
+          filename: e.filename,
+          error: e.error,
+          errorType: e.errorType,
+        })),
+      });
+    } else {
+      let output = `Error: ${message}\n`;
+      if (errors.length > 0) {
+        output += `\n${errors.length} workflow(s) failed to load:\n\n`;
+        for (const loadError of errors) {
+          output += `  ${loadError.filename}: ${loadError.error}\n`;
+        }
+      }
+      await writeStdout(output);
+    }
+    return 1;
+  }
 
   if (options.json) {
     await writeJsonLine({

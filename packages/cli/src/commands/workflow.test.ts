@@ -9226,6 +9226,60 @@ describe('workflowTestCommand', () => {
     });
   });
 
+  it('reports load failures when fixture target selection fails', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [],
+      errors: [
+        {
+          filename: 'broken.yaml',
+          error: 'YAML parse error: unexpected end of document',
+          errorType: 'parse_error',
+        },
+      ],
+    });
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error("No fixtures found for 'missing'.")
+    );
+
+    const exit = await workflowTestCommand('/test/path', 'missing');
+
+    expect(exit).toBe(1);
+    expect(firstJsonPayload(stdoutSpy)).toContain("Error: No fixtures found for 'missing'.");
+    expect(firstJsonPayload(stdoutSpy)).toContain('1 workflow(s) failed to load:');
+    expect(firstJsonPayload(stdoutSpy)).toContain(
+      '  broken.yaml: YAML parse error: unexpected end of document'
+    );
+  });
+
+  it('includes load failures when fixture target selection fails in JSON', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    const error = {
+      filename: 'broken.yaml',
+      error: 'YAML parse error: unexpected end of document',
+      errorType: 'parse_error' as const,
+    };
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [],
+      errors: [error],
+    });
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error("No fixtures found for 'missing'.")
+    );
+
+    const exit = await workflowTestCommand('/test/path', 'missing', { json: true });
+
+    expect(exit).toBe(1);
+    expect(stdoutSpy).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toEqual({
+      ok: false,
+      error: "No fixtures found for 'missing'.",
+      errors: [error],
+    });
+  });
+
   it("freezes the repo's own command policy, not the default folders (#2851)", async () => {
     // The capture decides which directories a fixture can resolve a command from, so a
     // repo that moved `commands.folder` must have THAT folder frozen. Reading the value
