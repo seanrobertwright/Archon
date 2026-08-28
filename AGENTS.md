@@ -160,9 +160,6 @@ Do not expand this file with copied reference material. Use the owning source:
 - Product direction: [`.archon/direction.md`](.archon/direction.md)
 - Workflow-language design: [`.archon/workflow-language-constitution.md`](.archon/workflow-language-constitution.md)
 - Engineering craft and review values: [`.archon/engineering.md`](.archon/engineering.md)
-- Contributor setup and checks: [`packages/docs-web/src/content/docs/contributing/index.md`](packages/docs-web/src/content/docs/contributing/index.md)
-- Architecture: [`packages/docs-web/src/content/docs/reference/architecture.md`](packages/docs-web/src/content/docs/reference/architecture.md) and package manifests
-- Configuration: [`packages/docs-web/src/content/docs/reference/configuration.md`](packages/docs-web/src/content/docs/reference/configuration.md) and the config schema
 - CLI: [`packages/docs-web/src/content/docs/reference/cli.md`](packages/docs-web/src/content/docs/reference/cli.md) and `archon --help`
 - Workflow authoring: [`packages/docs-web/src/content/docs/guides/authoring-workflows.md`](packages/docs-web/src/content/docs/guides/authoring-workflows.md) and workflow schemas
 - Database behavior: [`packages/docs-web/src/content/docs/reference/database.md`](packages/docs-web/src/content/docs/reference/database.md), migrations, and adapter tests

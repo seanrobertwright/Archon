@@ -8,6 +8,7 @@ This document is what work gets checked against, not instructions for doing work
 - Anything here that becomes machine-checkable graduates to a lint rule, a type, or a CI check, and then leaves this file. One owner per rule. This file holds what needs judgment; checkers hold what needs enforcement.
 - Entries are phrased so drift is catchable: prefer claims that can be audited against the codebase over vibes. A periodic pass grades entries confirmed or drifted. Drifted entries are deleted, not annotated; a stale correction is worse than none.
 - Facts that change (counts, paths, inventories) do not belong here at all. Point at the owning source.
+- Rules here earned their place through real failures or operator decisions. The stories stay in run artifacts and git history; this file keeps only the rule.
 
 ## The objective function
 
@@ -34,6 +35,9 @@ These describe where the engineering is going. Do not reject a change for failin
 - Types carry invariants. Invalid states should be hard to represent; a sound type beats a runtime check beats a comment. Escape hatches carry a justification or they are findings.
 - Explicit control flow over meta-programming, shared mutable state, or hidden coupling. Duplicate small local logic until a pattern has repeated and stabilized.
 - Fail early and loudly on unsupported, ambiguous, or unsafe states. A fallback is intentional, documented at the branch, and observable, or it is a bug.
+- Derive shared vocabularies; never re-enumerate them at a use site. A status set or capability list spelled out where it is consumed drifts from its owner. Derived, a new member inherits the right behavior automatically.
+- A guard is evidence only after it has been seen red. Before trusting any check, retry, or validation, watch it fail against the condition it claims to catch. This applies to tests, lint rules, and platform behavior alike: built-in options are claims until probed.
+- When isolating a boundary, prove the isolation against every path in, not only the one you thought of.
 - Comments clarify functionality and how code is used, and they stay current when behavior changes. Never request a comment on self-explanatory code; request removal or editing of comments on self-explanatory code instead. Code that is not self-explanatory is usually too complex and the finding is simplification, not narration. A missing comment is reportable only when the change introduces durable knowledge that code or types cannot express: a surprising external constraint, a non-obvious safety or ordering requirement, a deliberate compatibility compromise a future maintainer could clean up and break, or operational behavior not discoverable from the local code. Never request narration of control flow, parameter names, or implementation steps.
 
 ## Risk taxonomy
@@ -49,20 +53,13 @@ What raises the stakes of a change, and therefore the depth of its review:
 
 A change in these areas gets adversarial review depth: an explicit attempt to refute, input-set variation, and a stated answer to "what would make this merge wrong." A docs or prose change gets the minimum. The review orchestrator's depth signal derives from this list, and so do the pre-triage script's path weights; this section is their single source.
 
-## Case law
-
-Proven rules from real failures. Each entry states the rule, then the mechanism that made it necessary. Origins are dated in prose; this file does not index by tracker numbers.
-
-1. **Status sets near destructive actions are derived, never enumerated, and tests vary them.** A cleanup path defined "live" as "non-terminal" while the codebase's own vocabulary made failed runs resumable; the sweep would have force-deleted recoverable branches. Two review rounds missed it because every test stubbed the deciding primitive and no test varied the status set. Rule: derive such sets from the owning vocabulary so a new status inherits safety automatically; in tests, exercise the real primitive and vary the one input the decision turns on. (Proven live, August 2026, isolation cleanup.)
-2. **The work order outranks the implementation's account of itself.** An implementation narrowed a contract, its PR body described the narrowed version, and review verified the narrowed claims instead of the requested outcome. Rule: review anchors on the original request; the implementor's self-report is a file of claims to verify, never a scope definition. (Proven live, August 2026, fixture isolation.)
-3. **Same function, same invariant: in scope.** A review filed a regression inside the exact function the change rewrote as an out-of-scope discovery. Rule: a defect that violates the same invariant through the same mechanism as the change under review is a correction, not a discovery, no matter how the implementation frames it. (Proven live, August 2026, fixture targeting.)
-4. **A guard is evidence only once seen red.** Cleanup retries via built-in options shipped twice as fixes while the runtime silently ignored those options; the pattern read as safety and did nothing. Rule: before trusting any guard, watch it fail against the condition it claims to catch; a probe beats a documented promise. (Proven live, August 2026, the runtime retry options.)
-5. **Green plus green can be red.** Two individually green changes composed into a runtime failure because no check ever ran on the composition, and the file class involved was invisible to both static gates. Rule: compositions need their own verification, and "the checks passed" is a claim about what the checks cover, not about the code. (Proven live, August 2026, the parallel-merge break.)
-6. **Suppressing inherited state requires an explicit presence, not an absence.** Deleting an environment key from a child process's env did nothing because the child reloaded it from its own configuration files; only an explicitly present empty value suppressed it. Rule: when isolating a boundary, prove the isolation against every path in, not the one you thought of. (Proven live, August 2026, the test sandbox env.)
-
 ## Review posture
 
 - An unengaged risk is a failure. If the orchestrator names a risk and no lens engages it, the review is not clean, it is incomplete, and the verdict must say so.
 - "Could not tell" is a verdict. Ambiguity, lens disagreement, and low confidence produce an inconclusive outcome for a human, never a silent pass and never a manufactured correction.
 - A malformed or failed verdict call defaults conservative: toward not-ready, never toward pass.
 - Findings and discoveries carry their source. Attribution is what makes calibration possible; an unattributed finding cannot teach anything.
+- Review anchors on the original work order. The implementation's account of itself, including the PR body and any self-report, is a set of claims to verify, never a scope definition.
+- A defect that violates the same invariant through the same mechanism as the change under review is in scope: a correction, not a discovery.
+- Tests prove a decision by varying the input it turns on, against the real primitive. A test that stubs the deciding function passes under every mutation of it and proves nothing.
+- Two individually green changes can compose into a failure. A composition is its own change; checks that passed on the parts are claims about the parts.
