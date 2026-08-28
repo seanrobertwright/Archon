@@ -2458,7 +2458,11 @@ describe('workflowRunCommand', () => {
       expect.objectContaining({
         workflowType: 'task',
         identifier: 'test-adapters',
-        taskBranch: { kind: 'new', fromBranch: 'feature/extract-adapters' },
+        taskBranch: {
+          kind: 'new',
+          branch: 'test-adapters',
+          fromBranch: 'feature/extract-adapters',
+        },
       })
     );
   });
