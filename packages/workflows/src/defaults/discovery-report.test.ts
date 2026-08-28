@@ -61,19 +61,23 @@ afterAll(async () => {
 });
 
 describe('SDLC discovery terminal reports (#2884)', () => {
-  it('every tail carries the same discovery helper', () => {
+  it('every tail carries the same helper and pins its output streams', () => {
     // A packaged script is materialized standalone, so the four tails hold four copies
     // of one helper. This is the check that keeps them one thing: edit the report format
-    // in one tail and every other tail fails here rather than drifting quietly.
+    // in one tail and every other tail fails here rather than drifting quietly. Only
+    // deliver's script is spawned below, so the stream pinning is asserted statically
+    // for all four — a tail that loses it emits mojibake and CRLF on Windows alone.
     const helpers = TAILS.map(tail => {
       const source = readFileSync(outcomeScript(tail), 'utf-8');
       const start = source.indexOf('DISCOVERY_RELAY = (');
       const end = source.indexOf('def main() -> int:');
-      expect({ tail, declared: start >= 0, precedesMain: end > start }).toEqual({
+      expect({
         tail,
-        declared: true,
-        precedesMain: true,
-      });
+        declared: start >= 0,
+        precedesMain: end > start,
+        pinsStdout: source.includes('sys.stdout.reconfigure(encoding="utf-8", newline="\\n")'),
+        pinsStderr: source.includes('sys.stderr.reconfigure(encoding="utf-8", newline="\\n")'),
+      }).toEqual({ tail, declared: true, precedesMain: true, pinsStdout: true, pinsStderr: true });
       return source.slice(start, end);
     });
     for (const helper of helpers) {
@@ -105,6 +109,25 @@ describe('SDLC discovery terminal reports (#2884)', () => {
         `${RELAY} These are validated findings outside this run's scope — no issue tracker ` +
         `knows about them, and if you drop them here, nobody ever sees them.\n`
     );
+  });
+
+  it('emits UTF-8 and LF whatever the host console encoding is', async () => {
+    // Windows Python writes stdout in the console code page and rewrites '\n' as
+    // '\r\n', which turned the relay's em dash into a replacement character and every
+    // line ending into CRLF on CI. PYTHONIOENCODING reproduces the first half of that
+    // on any platform; the CR assertion is what the Windows runner proves.
+    const artifacts = await artifactsDir(JSON.stringify([{ title: 'café — naïve' }]));
+
+    const result = await runOutcome('deliver', {
+      INPUTS_PR_URL: 'https://github.com/example/repo/pull/10',
+      ARTIFACTS_DIR: artifacts,
+      PYTHONIOENCODING: 'cp1252',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('- café — naïve\n');
+    expect(result.stdout).toContain("outside this run's scope — no issue tracker");
+    expect(result.stdout).not.toContain('\r');
   });
 
   it('reports the PR URL alone when the run recorded no sidecar', async () => {

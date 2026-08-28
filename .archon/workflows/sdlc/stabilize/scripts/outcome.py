@@ -62,6 +62,11 @@ def format_discoveries(artifacts: str) -> str:
 
 
 def main() -> int:
+    # Windows Python writes stdout in the console code page and rewrites '\n' as
+    # '\r\n'. A terminal report is stored, posted to GitHub, and compared byte for
+    # byte, so pin one encoding and one line ending on every platform.
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
     action = os.environ["INPUTS_ACTION"]
     summary = os.environ["INPUTS_SUMMARY"]
     delivered = os.environ.get("INPUTS_DELIVERED", "null")
