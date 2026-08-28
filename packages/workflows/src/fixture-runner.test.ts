@@ -324,6 +324,29 @@ describe('runFixtures', () => {
     expect(report.results[0].missingStubs).toEqual(['node-b']);
   });
 
+  // The exact `workflow test` regression this fix closes (#2807): before it, a new
+  // `all_done` join with no stub failed `dryRunWorkflow`'s own outcome AND this
+  // independent gate. `dryRunWorkflow`'s outcome is now `completed`, but that alone is
+  // not the fix — this fixture must also stop treating the tolerated node as blocking.
+  it('passes a completing fixture whose only missing stub is tolerated by an all_done join (#2869)', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    prompt: hi\n' +
+        '  - id: node-b\n    prompt: there\n    depends_on: [node-a]\n' +
+        '    trigger_rule: all_done\n',
+      body: 'node-a: "stub"\n',
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.passed).toBe(1);
+    expect(report.results[0].outcome).toBe('completed');
+    expect(report.results[0].missingStubs).toEqual(['node-b']);
+  });
+
   it('warns on unused stubs without failing', async () => {
     const { cwd } = writeTempProject({
       body: ['node-a: "stub"', 'unused-node: "never reached"'].join('\n'),

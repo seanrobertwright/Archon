@@ -570,12 +570,18 @@ async function checkFixture(
         failureReason = `required nodes did not complete: ${missingReached.join(', ')}`;
       }
     }
+    // A `trigger_rule: all_done` join tolerates its own missing stub (#2869) — it never
+    // blocked this simulated outcome, so it must not block the fixture either. Only the
+    // untolerated remainder still means "this fixture never verified a reached node."
+    const blockingMissingStubs = result.missingStubs.filter(
+      nodeId => !result.toleratedMissingStubs.includes(nodeId)
+    );
     if (
       failureReason === undefined &&
       parsed.declaration.expect !== 'failed' &&
-      result.missingStubs.length > 0
+      blockingMissingStubs.length > 0
     ) {
-      failureReason = `reached nodes without stubs: ${result.missingStubs.join(', ')}`;
+      failureReason = `reached nodes without stubs: ${blockingMissingStubs.join(', ')}`;
     }
 
     return {
