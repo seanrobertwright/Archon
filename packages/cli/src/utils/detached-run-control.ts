@@ -491,15 +491,28 @@ async function terminateDetachedProcessTree(
   }
 
   if (process.platform === 'win32') {
-    // A zero exit from taskkill /T is the platform's positive tree-termination
-    // result. Never translate a timeout or partial failure into success merely
-    // because the root disappeared; descendants are part of this contract.
-    await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
-      timeout: TERMINATION_GRACE_MS,
-      windowsHide: true,
-    });
+    // `taskkill /T` walks the tree PID by PID and exits non-zero when any of them is
+    // already gone — the outcome this function wants, reached early. Nothing in that
+    // exit code separates it from a kill that genuinely failed, so it is not the
+    // proof: the confirmation below is, the same way the POSIX branch tolerates ESRCH
+    // and then re-checks. A tree still running, or a taskkill that never ran, still
+    // throws here, carrying the command's own error as the evidence. `/T` is what
+    // takes the descendants with the root; that they actually die is proved by the
+    // descendant-leak case in the integration spec, not by this exit code.
+    let killFailure: Error | undefined;
+    try {
+      await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        timeout: TERMINATION_GRACE_MS,
+        windowsHide: true,
+      });
+    } catch (error) {
+      killFailure = error instanceof Error ? error : new Error(String(error));
+    }
     if (!(await waitUntilGone(() => processExists(pid), TERMINATION_CONFIRM_MS))) {
-      throw new Error(`Detached workflow process tree ${String(pid)} is still running`);
+      throw new Error(
+        `Detached workflow process tree ${String(pid)} is still running` +
+          (killFailure ? `: ${killFailure.message}` : '')
+      );
     }
     return;
   }
