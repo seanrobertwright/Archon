@@ -82,6 +82,11 @@ const mockLogger = createMockLogger();
 const mockEnsureArchonWorkspacesPath = mock(() => Promise.resolve('/home/test/.archon/workspaces'));
 const mockCaptureChatTurn = mock(() => undefined);
 const mockCaptureApprovalResolved = mock(() => undefined);
+// The one canonicalizer every `default_cwd` writer resolves through (#2927).
+// Tests below derive their expected path from it rather than from a POSIX
+// literal: it makes a path absolute, and on Windows `resolve('/path')` is
+// drive-qualified (`D:\path`).
+const { canonicalizeProjectPath } = await import('@archon/paths');
 mock.module('@archon/paths', () => ({
   captureApprovalResolved: mockCaptureApprovalResolved,
   createLogger: mock(() => mockLogger),
@@ -4608,7 +4613,7 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'ExampleProject',
-      default_cwd: '/.archon/workspaces/owner/repo/source',
+      default_cwd: await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source'),
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4641,7 +4646,7 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'ExampleProject',
-      default_cwd: '/.archon/workspaces/owner/repo/source',
+      default_cwd: await canonicalizeProjectPath('/.archon/workspaces/owner/repo/source'),
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4762,7 +4767,7 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
 
     expect(mockCreateCodebase).toHaveBeenCalledWith({
       name: 'MyApp',
-      default_cwd: '/path/to/app',
+      default_cwd: await canonicalizeProjectPath('/path/to/app'),
       default_branch: null,
       ai_assistant_type: 'claude',
       kind: 'repo',
@@ -4802,7 +4807,7 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
     expect(sentTexts).not.toContain(' extra trailing');
     // createCodebase was called with the clean parsed path
     expect(mockCreateCodebase).toHaveBeenCalledWith(
-      expect.objectContaining({ name: 'Foo', default_cwd: '/path' })
+      expect.objectContaining({ name: 'Foo', default_cwd: await canonicalizeProjectPath('/path') })
     );
   });
 });
@@ -5321,7 +5326,9 @@ describe('handleMessage — /update-project dispatch', () => {
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', '/update-project my-app /');
 
-    expect(mockUpdateCodebase).toHaveBeenCalledWith('id-my-app', { default_cwd: '/' });
+    expect(mockUpdateCodebase).toHaveBeenCalledWith('id-my-app', {
+      default_cwd: await canonicalizeProjectPath('/'),
+    });
     const msg = (platform.sendMessage as ReturnType<typeof mock>).mock.calls[0]?.[1] as string;
     expect(msg).toContain('updated');
     expect(msg).toContain('/repos/my-app');
