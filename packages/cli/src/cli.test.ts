@@ -1019,11 +1019,22 @@ describe('main catch --json error envelope', () => {
     // An unknown workflow name makes workflowRunCommand throw with no local
     // handling, so the error escapes to main()'s outer catch — the last route
     // that could still leak bare stderr text under --json.
+    //
+    // `--dry-run` is not part of the contract; it is how this test avoids
+    // paying for one. A real run freezes the workflow source BEFORE resolving
+    // the name (workflow.ts: prepareWorkflowSource precedes
+    // resolveWorkflowName, deliberately — discovery must read the frozen
+    // bytes, #2660/#2747), so without the flag this single spawn copies and
+    // digests every project, global, and bundled workflow file this repository
+    // has — thousands of filesystem operations, and growing — then deletes
+    // them, only to report that the workflow does not exist. The throw, its
+    // route to main()'s catch, and the envelope are identical either way.
     const { status, envelope } = spawnJsonError([
       'workflow',
       'run',
       'definitely-not-a-workflow',
       '--json',
+      '--dry-run',
       '--cwd',
       repoRoot,
     ]);
