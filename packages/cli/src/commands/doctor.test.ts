@@ -13,6 +13,7 @@ import { join } from 'path';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'fs';
 import * as git from '@archon/git';
 import { canonicalizeProjectPath } from '@archon/paths';
+import { removeTempTree } from '@archon/paths/test-utils';
 import {
   checkClaudeBinary,
   checkCodexBinary,
@@ -676,7 +677,7 @@ describe('checkFolderProject', () => {
 
       expect(lookedUp).toEqual([await canonicalizeProjectPath(target)]);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      await removeTempTree(root);
     }
   });
 });

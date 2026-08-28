@@ -3,6 +3,7 @@ import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { mkdir, rm, writeFile, lstat, readlink, symlink as fsSymlink } from 'fs/promises';
+import { removeTempTree } from './test-utils';
 
 const isWindows = process.platform === 'win32';
 
@@ -113,7 +114,7 @@ describe('archon-paths', () => {
     });
 
     afterEach(async () => {
-      await rm(canonRoot, { recursive: true, force: true });
+      await removeTempTree(canonRoot);
     });
 
     test('collapses two spellings of one directory to a single string', async () => {
