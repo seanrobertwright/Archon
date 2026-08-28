@@ -12236,11 +12236,7 @@ export async function executeDagWorkflow(
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
       return undefined;
     });
-    await deps.store
-      .failWorkflowRun(workflowRun.id, failMsg, scheduledResume)
-      .catch((dbErr: Error) => {
-        getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
-      });
+    await deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume);
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -12288,11 +12284,7 @@ export async function executeDagWorkflow(
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
       return undefined;
     });
-    await deps.store
-      .failWorkflowRun(workflowRun.id, failMsg, scheduledResume)
-      .catch((dbErr: Error) => {
-        getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
-      });
+    await deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume);
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -12372,9 +12364,7 @@ export async function executeDagWorkflow(
             'dag.evidence_metadata_write_failed'
           );
         });
-      await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
-        getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
-      });
+      await deps.store.failWorkflowRun(workflowRun.id, failMsg);
       // Persist the reason into the workflow-events log (contract: never throws).
       await deps.store.createWorkflowEvent({
         workflow_run_id: workflowRun.id,
@@ -12474,38 +12464,25 @@ export async function executeDagWorkflow(
   const duration = Date.now() - dagStartTime;
 
   // Update DB and emit completion
-  try {
-    await deps.store.completeWorkflowRun(
-      workflowRun.id,
-      { duration_ms: duration },
-      {
-        node_counts: nodeCounts,
-        // Cost and token totals are NOT written here — `persistRunUsage` already wrote
-        // them at the run tail, before this branch was chosen (#2469). Keeping a second
-        // copy here would be two writers of the same three keys, free to drift.
-        // A sub-run persists its terminal summary so the parent can thread it as
-        // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
-        // growth to child runs only (top-level runs return the summary directly).
-        // `summary_value` is the additive logical sibling (#2637): old binaries keep
-        // reading `summary`, new parents prefer the typed value when present.
-        ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
-        ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
-          ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
-          : {}),
-      }
-    );
-  } catch (dbErr) {
-    getLog().error(
-      { err: dbErr as Error, workflowRunId: workflowRun.id },
-      'dag_db_complete_failed'
-    );
-    await safeSendMessage(
-      platform,
-      conversationId,
-      'Warning: workflow completed but the run status could not be saved. The workflow result may appear inconsistent.',
-      { workflowId: workflowRun.id }
-    );
-  }
+  await deps.store.completeWorkflowRun(
+    workflowRun.id,
+    { duration_ms: duration },
+    {
+      node_counts: nodeCounts,
+      // Cost and token totals are NOT written here — `persistRunUsage` already wrote
+      // them at the run tail, before this branch was chosen (#2469). Keeping a second
+      // copy here would be two writers of the same three keys, free to drift.
+      // A sub-run persists its terminal summary so the parent can thread it as
+      // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
+      // growth to child runs only (top-level runs return the summary directly).
+      // `summary_value` is the additive logical sibling (#2637): old binaries keep
+      // reading `summary`, new parents prefer the typed value when present.
+      ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
+      ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
+        ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
+        : {}),
+    }
+  );
   await logWorkflowComplete(logDir, workflowRun.id, {
     // `> 0` rather than `!== undefined`, mirroring persistRunUsage above: the accumulator
     // is a plain number seeded at 0, so zero is the only way it can say "no AI usage" —

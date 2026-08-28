@@ -1736,14 +1736,10 @@ async function maybeResumeParentRun(
       { err: err as Error, parentRunId, childRunId: childRun.id },
       'workflow.parent_auto_resume_execute_failed'
     );
-    await deps.store
-      .failWorkflowRun(parentRunId, `Auto-resume after sub-run failed: ${(err as Error).message}`)
-      .catch((failErr: unknown) => {
-        getLog().error(
-          { err: failErr as Error, parentRunId },
-          'workflow.parent_auto_resume_fail_mark_failed'
-        );
-      });
+    await deps.store.failWorkflowRun(
+      parentRunId,
+      `Auto-resume after sub-run failed: ${(err as Error).message}`
+    );
   }
 }
 
@@ -1850,12 +1846,7 @@ export async function executeWorkflow(
       'CLI in the same project (`archon workflow approve/reject/resume <id>`), where the ' +
       'container is rediscovered — chat/web resume cannot rewire it.';
     getLog().warn({ workflowRunId: preCreatedRun.id }, 'workflow.container_resume_without_backend');
-    await deps.store.failWorkflowRun(preCreatedRun.id, msg).catch((err: unknown) => {
-      getLog().error(
-        { err, workflowRunId: preCreatedRun.id },
-        'workflow.container_resume_guard_fail_failed'
-      );
-    });
+    await deps.store.failWorkflowRun(preCreatedRun.id, msg);
     await safeSendMessage(platform, conversationId, `⚠️ ${msg}`);
     return { success: false, workflowRunId: preCreatedRun.id, error: msg };
   }
@@ -1885,14 +1876,7 @@ export async function executeWorkflow(
     }
   } catch (error) {
     if (preCreatedRun) {
-      await deps.store
-        .failWorkflowRun(preCreatedRun.id, (error as Error).message)
-        .catch((dbError: Error) => {
-          getLog().error(
-            { err: dbError, workflowRunId: preCreatedRun.id },
-            'workflow.run_config_fail_db_record_failed'
-          );
-        });
+      await deps.store.failWorkflowRun(preCreatedRun.id, (error as Error).message);
     }
     throw error;
   }
@@ -2043,14 +2027,7 @@ export async function executeWorkflow(
     // lock indefinitely just because validation happens before the executor's main
     // lifecycle catch.
     if (preCreatedRun) {
-      await deps.store
-        .failWorkflowRun(preCreatedRun.id, (error as Error).message)
-        .catch((dbError: Error) => {
-          getLog().error(
-            { err: dbError, workflowRunId: preCreatedRun.id },
-            'workflow.model_overrides_fail_db_record_failed'
-          );
-        });
+      await deps.store.failWorkflowRun(preCreatedRun.id, (error as Error).message);
     }
     throw error;
   }
@@ -2222,14 +2199,10 @@ export async function executeWorkflow(
         { err, workflowRunId: preCreatedRun.id },
         'workflow.invocation_metadata_persist_failed'
       );
-      await deps.store
-        .failWorkflowRun(preCreatedRun.id, 'Database error recording workflow invocation settings')
-        .catch((dbError: Error) => {
-          getLog().error(
-            { err: dbError, workflowRunId: preCreatedRun.id },
-            'workflow.invocation_metadata_failure_record_failed'
-          );
-        });
+      await deps.store.failWorkflowRun(
+        preCreatedRun.id,
+        'Database error recording workflow invocation settings'
+      );
       await sendCriticalMessage(
         platform,
         conversationId,
@@ -2498,14 +2471,10 @@ export async function executeWorkflow(
       { err, artifactsDir, stateDir, workflowRunId: workflowRun.id },
       'workflow.artifacts_dir_create_failed'
     );
-    await deps.store
-      .failWorkflowRun(workflowRun.id, `Artifacts directory creation failed: ${err.message}`)
-      .catch((dbErr: Error) => {
-        getLog().error(
-          { err: dbErr, workflowRunId: workflowRun.id },
-          'workflow.artifacts_dir_fail_db_record_failed'
-        );
-      });
+    await deps.store.failWorkflowRun(
+      workflowRun.id,
+      `Artifacts directory creation failed: ${err.message}`
+    );
     await sendCriticalMessage(
       platform,
       conversationId,
@@ -2581,12 +2550,7 @@ export async function executeWorkflow(
 
   const failRunOnSource = async (message: string): Promise<WorkflowExecutionResult> => {
     getLog().error({ workflowRunId: workflowRun.id, message }, 'workflow.source_unavailable');
-    await deps.store.failWorkflowRun(workflowRun.id, message).catch((dbErr: Error) => {
-      getLog().error(
-        { err: dbErr, workflowRunId: workflowRun.id },
-        'workflow.source_fail_db_record_failed'
-      );
-    });
+    await deps.store.failWorkflowRun(workflowRun.id, message);
     await sendCriticalMessage(platform, conversationId, `❌ **Workflow failed**: ${message}`);
     return { success: false, workflowRunId: workflowRun.id, error: message };
   };
@@ -2728,12 +2692,7 @@ export async function executeWorkflow(
       { err, workflowRunId: workflowRun.id },
       'workflow.user_provider_files_cleanup_failed'
     );
-    await deps.store.failWorkflowRun(workflowRun.id, message).catch((dbErr: Error) => {
-      getLog().error(
-        { err: dbErr, workflowRunId: workflowRun.id },
-        'workflow.user_provider_files_cleanup_fail_db_record_failed'
-      );
-    });
+    await deps.store.failWorkflowRun(workflowRun.id, message);
     await sendCriticalMessage(
       platform,
       conversationId,
@@ -3126,15 +3085,9 @@ export async function executeWorkflow(
       'workflow_execution_unhandled_error'
     );
 
-    // Record failure in database (non-blocking - log but don't re-throw on DB error)
-    try {
-      await deps.store.failWorkflowRun(workflowRun.id, err.message);
-    } catch (dbError) {
-      getLog().error(
-        { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
-        'db_record_failure_failed'
-      );
-    }
+    // A terminal status write is part of the result: if it fails, reject instead of
+    // reporting a completed process for a row that still says running.
+    await deps.store.failWorkflowRun(workflowRun.id, err.message);
 
     // Log to file (separate from database - non-blocking)
     try {
@@ -3199,11 +3152,7 @@ export async function executeWorkflow(
       const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
       if (backstopStatus === 'running') {
         getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
-        await deps.store
-          .failWorkflowRun(runId, 'Workflow exited without finalizing — see logs')
-          .catch((err: unknown) => {
-            getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
-          });
+        await deps.store.failWorkflowRun(runId, 'Workflow exited without finalizing — see logs');
       }
     }
   }

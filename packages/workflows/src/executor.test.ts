@@ -2959,6 +2959,27 @@ describe('telemetry wiring', () => {
     );
   });
 
+  it('surfaces a failed terminal failure write', async () => {
+    mockExecuteDagWorkflow.mockRejectedValueOnce(new Error('dag boom'));
+    const store = makeStore({
+      failWorkflowRun: mock(async () => {
+        throw new Error('terminal failure write failed');
+      }),
+    });
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1'
+      )
+    ).rejects.toThrow('terminal failure write failed');
+  });
+
   it('reports feature-adoption booleans on workflow_invoked', async () => {
     mockCaptureWorkflowInvoked.mockClear();
     const store = makeStore();

@@ -19162,6 +19162,35 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
     expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
   });
 
+  it('surfaces a failed completion write', async () => {
+    const mockStore = createMockStore();
+    (mockStore.completeWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('terminal completion write failed')
+    );
+    const platform = createMockPlatform();
+    await mkdir(artifactsDir, { recursive: true });
+    await writeFile(join(artifactsDir, 'evidence.json'), '{"proof": "landed"}');
+
+    await expect(runEvidenceWorkflow({ store: mockStore, platform })).rejects.toThrow(
+      'terminal completion write failed'
+    );
+  });
+
+  it('surfaces a failed failure write', async () => {
+    const mockStore = createMockStore();
+    (mockStore.failWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('terminal failure write failed')
+    );
+
+    await expect(
+      runEvidenceWorkflow({
+        store: mockStore,
+        platform: createMockPlatform(),
+        evidencePolicy: { required: true },
+      })
+    ).rejects.toThrow('terminal failure write failed');
+  });
+
   it('no evidence_policy declared -> completes without checking for evidence.json', async () => {
     const mockStore = createMockStore();
     const platform = createMockPlatform();
