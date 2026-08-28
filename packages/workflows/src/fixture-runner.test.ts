@@ -1,18 +1,19 @@
 /** Tests for the declared-data dry-run fixture runner (#2772). */
-import { describe, it, expect, afterEach, afterAll, mock } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { removeTempTree, trackTempRoots } from '@archon/paths/test-utils';
 
 // Capture-cost control, same lever and same reason as `subrun.test.ts` (#2882): every
 // `runFixtures` call takes one source capture, and a capture copies and digests the
@@ -29,9 +30,7 @@ import { join } from 'node:path';
 // dirname(getDefault*Path()), so the getter's PARENT must be the owned empty tree.
 const bundledDefaultsRoot = join(tmpdir(), `fixture-runner-test-empty-bundled-${process.pid}`);
 await mkdir(join(bundledDefaultsRoot, 'defaults'), { recursive: true });
-afterAll(async () => {
-  await rm(bundledDefaultsRoot, { recursive: true, force: true }).catch(() => {});
-});
+afterAll(() => removeTempTree(bundledDefaultsRoot));
 const realArchonPaths = await import('@archon/paths');
 mock.module('@archon/paths', () => ({
   ...realArchonPaths,
@@ -39,7 +38,7 @@ mock.module('@archon/paths', () => ({
   getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
 }));
 
-import { execFileAsync } from '@archon/git';
+import { execFileAsync, resolveBashPath } from '@archon/git';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
 import type { WorkflowWithSource } from './schemas/workflow';
@@ -72,8 +71,10 @@ import {
   type RunFixturesOptions,
 } from './fixture-runner';
 
-function makeTempProject(): string {
-  return mkdtempSync(join(tmpdir(), 'fixture-runner-'));
+/** The file's one temp-root creator, so every fixture tree is tracked for teardown. */
+const trackTempRoot = trackTempRoots();
+function makeTempProject(prefix = 'fixture-runner-'): string {
+  return trackTempRoot(mkdtempSync(join(tmpdir(), prefix)));
 }
 
 function isolatedSourceRoots(cwd: string): WorkflowSourceRoots {
@@ -102,22 +103,18 @@ async function runFixtures(
   });
 }
 
-const cleanups: string[] = [];
-afterEach(() => {
-  for (const dir of cleanups.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
-
 interface TempFixtureOptions {
   workflowName?: string;
   fixtureName?: string;
   body: string;
   /** Workflow yaml written next to fixtures/ — defaults to a one-node stub target. */
   workflowYaml?: string;
+  /** Existing directory to write into, for a tree whose lifetime is not one test. */
+  cwd?: string;
 }
 
 function writeTempProject(options: TempFixtureOptions): { cwd: string; fixturePath: string } {
-  const cwd = makeTempProject();
-  cleanups.push(cwd);
+  const cwd = options.cwd ?? makeTempProject();
   const packDir = join(cwd, '.archon', 'workflows', 'pack');
   const fixturesDir = join(packDir, 'fixtures');
   mkdirSync(fixturesDir, { recursive: true });
@@ -366,7 +363,6 @@ describe('runFixtures', () => {
 
   it('returns zero results and no failure when nothing is declared', async () => {
     const cwd = makeTempProject();
-    cleanups.push(cwd);
     const report = await runFixtures({ workflows: [], cwd });
     expect(report.results).toHaveLength(0);
     expect(report.passed).toBe(0);
@@ -435,7 +431,6 @@ describe('runFixtures', () => {
 
   it('says no workflow declares fixtures when discovery found no fixtures at all', async () => {
     const cwd = makeTempProject();
-    cleanups.push(cwd);
     const packDir = join(cwd, '.archon', 'workflows', 'pack');
     mkdirSync(packDir, { recursive: true });
     writeFileSync(
@@ -496,7 +491,6 @@ describe('runFixtures', () => {
   /** Pack layout like the bundled SDLC pack: `<pack>/<workflow-folder>/fixtures/`, plus a sibling pack whose name extends `sdlc` so the path-containment anchor cannot drift. */
   function writeNestedPackProject(): { cwd: string } {
     const cwd = makeTempProject();
-    cleanups.push(cwd);
     for (const folder of ['plan', 'ship']) {
       const workflowDir = join(cwd, '.archon', 'workflows', 'sdlc', folder);
       mkdirSync(join(workflowDir, 'fixtures'), { recursive: true });
@@ -576,7 +570,6 @@ describe('runFixtures', () => {
 
   it('selects by the union of workflow name and folder: a target that is both picks both', async () => {
     const cwd = makeTempProject();
-    cleanups.push(cwd);
     // Workflow `ship` inside folder `plan`: its fixture matches by name only.
     const planDir = join(cwd, '.archon', 'workflows', 'sdlc', 'plan');
     mkdirSync(join(planDir, 'fixtures'), { recursive: true });
@@ -616,7 +609,6 @@ describe('runFixtures', () => {
 
   it('rejects a target naming a workflow that is on disk but not in the catalog', async () => {
     const cwd = makeTempProject();
-    cleanups.push(cwd);
     // `broken-wf` parses far enough to declare a name but never reaches the catalog — the
     // shape of an unfinished or unloadable workflow file that still has fixtures beside it.
     const brokenDir = join(cwd, '.archon', 'workflows', 'broken');
@@ -659,9 +651,7 @@ describe('runFixtures', () => {
 
   it('lets a project fixture shadow the bundled fixture it overrides', async () => {
     const cwd = makeTempProject();
-    cleanups.push(cwd);
     const bundled = makeTempProject();
-    cleanups.push(bundled);
     // The same relative fixture in two scopes: a project that copied a bundled workflow
     // folder to customize it. Both declare the same workflow name, so both would be checked
     // against the same catalog entry and print the same label — indistinguishable in output.
@@ -701,6 +691,18 @@ describe('runFixtures', () => {
 describe('runFixtures exec-code isolation (#2851)', () => {
   const COMMITTED_YAML = 'committed-file\n';
 
+  /**
+   * The probe body {@link GUARD_YAML} runs.
+   *
+   * Captured and tested separately, not as `[ -z "$(git status --porcelain)" ]`: a git
+   * that FAILS also prints nothing, so the inline form reads its silence as a clean tree
+   * and the guard passes without having observed anything.
+   *
+   * Shared with the test that proves that, rather than restated there — a second copy
+   * would keep passing after this one was reverted, which is the whole failure mode.
+   */
+  const GUARD_PROBE = ['status="$(git status --porcelain)" || exit 1', '[ -z "$status" ]'];
+
   /** A bash node whose success depends ONLY on the cleanliness of the checkout it executes in. */
   const GUARD_YAML = [
     'name: test-wf',
@@ -708,7 +710,7 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     'nodes:',
     '  - id: probe',
     '    bash: |',
-    '      [ -z "$(git status --porcelain)" ]',
+    ...GUARD_PROBE.map(line => `      ${line}`),
   ].join('\n');
 
   const WRITER_YAML = [
@@ -725,11 +727,13 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     execFileAsync('git', args, { cwd });
 
   /**
-   * Turn a plain temp project into a git repo with one committed file besides the project's own.
+   * Turn a plain temp project into a git repo, committing everything already in it plus
+   * one file of its own.
    *
    * Three git processes, not five: the identity travels as `-c` overrides on the commit
-   * itself rather than as two separate `git config` writes. Every test in this block pays
-   * this cost, and process creation is the expensive part on Windows CI (#2882).
+   * itself rather than as two separate `git config` writes. Only the prepared repos below
+   * and the one test whose premise is what HEAD holds pay this; process creation is the
+   * expensive part on Windows CI (#2882).
    */
   async function initGitWithCommittedFile(cwd: string): Promise<void> {
     await git(cwd, 'init', '-q');
@@ -738,26 +742,82 @@ describe('runFixtures exec-code isolation (#2851)', () => {
     await git(cwd, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
   }
 
+  /**
+   * Caller checkouts prepared once for the block and copied per test (#2882).
+   *
+   * `git worktree add` has nothing to check out without a HEAD commit, so every exec-code
+   * test needs its caller to be a real repository. Built in place that is three git
+   * processes per test, and process creation is what this block costs on a contended
+   * Windows runner — the parity test below spent 5015ms of a 5000ms budget there. A plain
+   * repository's metadata holds no absolute paths, so copying a prepared one is an
+   * independent repository at file-copy price: ~0.8ms measured locally against ~50ms for
+   * the three processes.
+   *
+   * Two shapes, because what HEAD holds is part of some tests' premise. `trackedOnlyRepo`
+   * commits `tracked.txt` alone, for tests whose own project files may sit untracked
+   * beside it. `guardRepo` commits the guard workflow and its fixture as well, so a caller
+   * copied from it is genuinely clean — the state the parity test contrasts dirt against.
+   */
+  let trackedOnlyRepo: string;
+  let guardRepo: string;
+
+  beforeAll(async () => {
+    trackedOnlyRepo = mkdtempSync(join(tmpdir(), 'fixture-runner-repo-'));
+    await initGitWithCommittedFile(trackedOnlyRepo);
+    guardRepo = mkdtempSync(join(tmpdir(), 'fixture-runner-repo-'));
+    writeTempProject({ cwd: guardRepo, workflowYaml: GUARD_YAML, body: execFixtureBody });
+    await initGitWithCommittedFile(guardRepo);
+  });
+
+  // Outlives the per-test roots `trackTempRoots` tears down, so it needs its own hook.
+  afterAll(async () => {
+    for (const repo of [trackedOnlyRepo, guardRepo]) await removeTempTree(repo);
+  });
+
+  /** A caller checkout copied from a prepared repo — a HEAD commit with no git process. */
+  function callerFrom(template: string, cwd = makeTempProject()): string {
+    cpSync(template, cwd, { recursive: true });
+    return cwd;
+  }
+
   it('gives clean and pre-dirtied callers the same verdict (#2851)', async () => {
-    const clean = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
-    await initGitWithCommittedFile(clean.cwd);
-    const cleanReport = await runFixtures({
-      workflows: [workflowsOnDisk(clean.cwd, ['test-wf'])[0]],
-      cwd: clean.cwd,
-    });
+    // One caller, invoked twice: the dirt is then the ONLY difference between the two
+    // verdicts. Two separately built repos would also differ in identity and history.
+    const cwd = callerFrom(guardRepo);
+    const workflows = [workflowsOnDisk(cwd, ['test-wf'])[0]];
+
+    const cleanReport = await runFixtures({ workflows, cwd });
     expect(cleanReport.failed).toBe(0);
 
-    const dirty = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
-    await initGitWithCommittedFile(dirty.cwd);
     // Exactly the operator-tree state the issue reports: one modified tracked file,
     // one untracked stray.
-    writeFileSync(join(dirty.cwd, 'tracked.txt'), `${COMMITTED_YAML}edited\n`);
-    writeFileSync(join(dirty.cwd, 'scratch.txt'), 'untracked stray\n');
-    const dirtyReport = await runFixtures({
-      workflows: [workflowsOnDisk(dirty.cwd, ['test-wf'])[0]],
-      cwd: dirty.cwd,
-    });
+    writeFileSync(join(cwd, 'tracked.txt'), `${COMMITTED_YAML}edited\n`);
+    writeFileSync(join(cwd, 'scratch.txt'), 'untracked stray\n');
+    const dirtyReport = await runFixtures({ workflows, cwd });
     expect(dirtyReport.passed).toBe(1);
+  });
+
+  it('fails the guard when git cannot report status, rather than passing on its silence', async () => {
+    // What the test above rests on: the guard must distinguish "the tree is clean" from
+    // "I never got to look". A failing `git status` prints nothing, so the shorter
+    // `[ -z "$(git status --porcelain)" ]` reads that silence as cleanliness — measured,
+    // not supposed: with the scratch worktree replaced by a plain empty directory, the
+    // inline form passed BOTH halves above, certifying a checkout that never happened.
+    //
+    // `GIT_DIR` pointing nowhere reproduces exactly that condition — git exits non-zero
+    // having written nothing to stdout — and needs no repository, no scratch worktree and
+    // no process beyond the one the guard itself runs in.
+    const cwd = makeTempProject();
+    const exit = await execFileAsync(resolveBashPath(), ['-c', GUARD_PROBE.join('\n')], {
+      cwd,
+      env: { ...process.env, GIT_DIR: join(cwd, 'no-such-git-dir') },
+    }).then(
+      () => 'the guard passed',
+      (error: { code?: unknown }) => error.code
+    );
+    // Bash's exit status, so specifically the guard's own `|| exit 1`. A string here would
+    // be a spawn failure — bash never ran — which must not read as the guard working.
+    expect(exit).toBe(1);
   });
 
   it('keeps executed writes out of the caller checkout (#2851)', async () => {
@@ -766,7 +826,7 @@ describe('runFixtures exec-code isolation (#2851)', () => {
       workflowYaml: WRITER_YAML,
       body: execFixtureBody,
     });
-    await initGitWithCommittedFile(cwd);
+    callerFrom(trackedOnlyRepo, cwd);
     const report = await runFixtures({
       workflows: [workflowsOnDisk(cwd, ['writer-wf'])[0]],
       cwd,
@@ -805,7 +865,7 @@ describe('runFixtures exec-code isolation (#2851)', () => {
       cwd,
       `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(probe)}, import.meta.path);\n`
     );
-    await initGitWithCommittedFile(cwd);
+    callerFrom(trackedOnlyRepo, cwd);
 
     const report = await runFixtures({
       workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
@@ -839,7 +899,7 @@ describe('runFixtures exec-code isolation (#2851)', () => {
       cwd,
       `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(probe)}, import.meta.path + '\\n');\n`
     );
-    await initGitWithCommittedFile(cwd);
+    callerFrom(trackedOnlyRepo, cwd);
 
     const report = await runFixtures({
       workflows: [workflowsOnDisk(cwd, ['script-wf'])[0]],
@@ -865,7 +925,9 @@ describe('runFixtures exec-code isolation (#2851)', () => {
       workflowYaml: SCRIPT_YAML,
       body: execFixtureBody,
     });
-    // Committed — and therefore the only version a scratch worktree of HEAD holds.
+    // Committed — and therefore the only version a scratch worktree of HEAD holds. This
+    // test builds its repo in place rather than copying a prepared one precisely because
+    // what HEAD holds is its premise.
     writeScript(cwd, 'process.exit(1);\n');
     await initGitWithCommittedFile(cwd);
     // Uncommitted: the edit an author is iterating on when they run `workflow test`.
@@ -920,10 +982,8 @@ describe('runFixtures exec-code isolation (#2851)', () => {
   });
 
   it('disposes both the scratch worktree and the source capture (#2851)', async () => {
-    const { cwd } = writeTempProject({ workflowYaml: GUARD_YAML, body: execFixtureBody });
-    await initGitWithCommittedFile(cwd);
-    const home = mkdtempSync(join(tmpdir(), 'fixture-runner-home-'));
-    cleanups.push(home);
+    const cwd = callerFrom(guardRepo);
+    const home = makeTempProject('fixture-runner-home-');
     const previousHome = process.env.ARCHON_HOME;
     process.env.ARCHON_HOME = home;
     try {
