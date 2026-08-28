@@ -379,7 +379,6 @@ export const LEGACY_RECURSIVE_CLEANUP: ReadonlyMap<string, number> = buildLedger
   ['packages/workflows/src/dry-run.test.ts', 1],
   ['packages/workflows/src/executor-preamble.test.ts', 1],
   ['packages/workflows/src/executor.test.ts', 3],
-  ['packages/workflows/src/fixture-runner.test.ts', 2],
   ['packages/workflows/src/load-command-prompt.test.ts', 3],
   ['packages/workflows/src/loader.test.ts', 7],
   ['packages/workflows/src/logger.test.ts', 1],
