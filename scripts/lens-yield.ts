@@ -77,6 +77,9 @@ function asFindings(parsed: unknown): FindingRecord[] {
 /**
  * The artifacts directory of every project under the Archon workspaces tree that has one.
  * A project that never ran anything has no artifacts directory and contributes nothing.
+ *
+ * Sorted, like every path list here: `readdir` and glob iteration order differ by platform,
+ * and this order reaches the operator's report.
  */
 export async function defaultRoots(
   workspaces: string = getArchonWorkspacesPath()
@@ -91,13 +94,16 @@ export async function defaultRoots(
       if (existsSync(artifacts)) roots.push(artifacts);
     }
   }
-  return roots;
+  return roots.sort();
 }
 
 /**
  * Read every findings file under `roots`. Roots are artifacts directories, never repository
  * checkouts: the glob walks everything below them. A root that does not exist is reported
  * rather than read as zero findings — a mistyped path must not look like a clean result.
+ *
+ * Each root's matches are read in sorted order, so both returned lists are ordered by path
+ * and the report reads the same on every platform.
  */
 export async function collectFindings(
   roots: readonly string[]
@@ -111,7 +117,11 @@ export async function collectFindings(
       unreadable.push({ path: root, reason: 'no such directory' });
       continue;
     }
+    const matches: string[] = [];
     for await (const path of glob.scan({ cwd: root, absolute: true, onlyFiles: true })) {
+      matches.push(path);
+    }
+    for (const path of matches.sort()) {
       if (seen.has(path)) continue;
       seen.add(path);
       try {
@@ -121,7 +131,7 @@ export async function collectFindings(
       }
     }
   }
-  return { files: files.sort((a, b) => a.path.localeCompare(b.path)), unreadable };
+  return { files, unreadable };
 }
 
 export function tallyLenses(files: readonly FindingsFile[]): LensTally[] {

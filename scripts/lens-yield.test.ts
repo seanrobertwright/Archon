@@ -68,6 +68,9 @@ test('reports an unreadable findings file instead of dropping it', async () => {
 
   const { files, unreadable } = await collectFindings([root]);
   expect(files).toHaveLength(1);
+  // Ordered by path, which `collectFindings` guarantees by sorting each root's matches —
+  // do not relax this to an order-insensitive check: unsorted output was a Windows-only
+  // failure, and the ordering is the operator-facing behavior it was hiding.
   expect(unreadable.map(entry => entry.reason)).toEqual([
     'expected a JSON array of finding records',
     "record 0 has no 'sources' string array",
@@ -82,7 +85,8 @@ test('derives one artifacts root per project that has one', async () => {
   // A project that never ran anything: no artifacts directory, and scanning it threw.
   mkdirSync(join(workspaces, 'coleam00', 'never-run', 'source'), { recursive: true });
 
-  expect((await defaultRoots(workspaces)).sort()).toEqual([
+  // Not re-sorted here: the sort is the function's job, so readdir order cannot leak out.
+  expect(await defaultRoots(workspaces)).toEqual([
     join(workspaces, '_folder', 'notes', 'artifacts'),
     join(workspaces, 'coleam00', 'Archon', 'artifacts'),
   ]);
