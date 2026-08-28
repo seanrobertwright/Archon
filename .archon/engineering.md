@@ -1,6 +1,6 @@
 # Archon engineering craft
 
-This document is what work gets checked against, not instructions for doing work. Operational rules for agents stay in `AGENTS.md`, which every agent loads and which stays short. This document is loaded selectively by evaluative agents: the review orchestrator, review lenses, and future evaluators such as the questioner and gate-designer patterns. It can afford depth because only evaluators carry it.
+This document is what work gets checked against, not instructions for doing work. Operational rules for agents stay in `AGENTS.md`, which every agent loads and which stays short. This document is Archon's own project context, not ambient context a workflow pack loads: it reaches an agent through `AGENTS.md`'s pointer to it, or because an evaluator — a reviewer, a questioner, a gate designer — was explicitly briefed on it. It can afford depth because only evaluators go looking for it.
 
 ## How this document works
 
@@ -51,7 +51,7 @@ What raises the stakes of a change, and therefore the depth of its review:
 - Provider and adapter boundaries: native config preservation, capability scoping.
 - Concurrency and shared estate: worktrees, sessions, leases.
 
-A change in these areas gets adversarial review depth: an explicit attempt to refute, input-set variation, and a stated answer to "what would make this merge wrong." A docs or prose change gets the minimum. The review orchestrator's depth signal derives from this list, and so do the pre-triage script's path weights; this section is their single source.
+A change in these areas gets adversarial review depth: an explicit attempt to refute, input-set variation, and a stated answer to "what would make this merge wrong." A docs or prose change gets the minimum. This section is the authority for Archon's own review depth. The bundled SDLC pack states a generic version of this list inside its own prompts, because a reusable pack cannot read a path only this repository has; that copy is a deliberate fork, not a synced mirror, and editing one does not change the other.
 
 ## Review posture
 
