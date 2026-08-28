@@ -1411,16 +1411,22 @@ async function runWorkflowWithOwnedSource(
   // handlers own it, and `executeWorkflow` executes it instead of creating a second
   // row.
   //
-  // The flag names a run row this process will execute AS, so it is honoured only when
-  // both halves hold. First, that this process really is a detached child: the owner
-  // marker is set by `spawnDetachedWorkflowRun` in the parent's own env and
-  // `assertDetachedRunProcessOwner` (above) has already proved this process leads its
-  // own process group. Second, that the row is one a fresh execution may claim —
-  // `pending`, and for the workflow being invoked (name checked once the workflow
-  // resolves, below). Without the status check a hand-typed or stale id would load a
-  // terminal row, and the executor would re-run its DAG and append events onto closed
-  // evidence. The sibling `--internal-detached-run-config` is sealed with the install
-  // key against the same class of misuse; this is the equivalent boundary.
+  // The flag names a run row this process will execute AS, so three things are checked.
+  // Be precise about which one carries the weight, because it is not the first.
+  //
+  // The owner marker plus `assertDetachedRunProcessOwner` (above) raise the bar, they do
+  // not prove provenance: a plain scripted process is not its own process-group leader,
+  // so cron, CI, and wrapper scripts are blocked — but a foreground command under a real
+  // pseudo-tty IS one by default, so a person setting the env var at their own terminal
+  // satisfies it. Treat it as a barrier to automated misuse, not as proof that an Archon
+  // parent launched this process.
+  //
+  // The catastrophic outcomes are closed by the other two, which hold no matter how the
+  // first is satisfied. `status === 'pending'` is what stops a stale or mistyped id from
+  // loading a TERMINAL row, whose DAG the executor would re-run, appending events onto
+  // closed evidence. The `workflow_name` match (checked once the workflow resolves,
+  // below) is what stops one launch's row being executed as another workflow. Neither is
+  // redundant with the process-group check, and removing either reopens its own outcome.
   let detachedPreCreatedRun: WorkflowRun | undefined;
   if (options.detachedRunId !== undefined) {
     if (!detachedProcessOwner) {
@@ -2710,8 +2716,9 @@ async function runWorkflowWithOwnedSource(
   //
   // Guard rails (#1123): a signal must only ever fail THE run this process is
   // driving, and only while that run is still 'running'. The run id is learned
-  // from the resumable lookup (resume path) or the workflow_started emitter
-  // event (fresh runs, see the subscription below) — never from a
+  // from the resumable lookup (resume path), the row a detached parent handed
+  // this child (#2872), or the workflow_started emitter event (fresh runs, see
+  // the subscription below) — never from a
   // conversation-wide "active run" query, which can match a run driven by
   // another process (children share parent_conversation_id). When the run has
   // already transitioned elsewhere — paused at a gate, completed, cancelled —
@@ -2720,10 +2727,7 @@ async function runWorkflowWithOwnedSource(
   // the finally below once executeWorkflow returns, so a late signal can never
   // touch a settled run (and repeated workflowRunCommand calls in one process
   // don't stack handlers).
-  let ownedRunId: string | undefined =
-    resumable?.id ??
-    detachedPreCreatedRun?.id ??
-    (detachedProcessOwner ? preparedSource?.runId : undefined);
+  let ownedRunId: string | undefined = resumable?.id ?? detachedPreCreatedRun?.id;
   let detachedRunControl: Awaited<ReturnType<typeof startDetachedRunControlServer>> | undefined;
   if (detachedProcessOwner) {
     if (ownedRunId === undefined) {

@@ -9207,25 +9207,40 @@ describe('workflowRunCommand — signal cleanup guard (#1123)', () => {
   it('lets an exact-run cancel controller own the lifecycle transition', async () => {
     const workflowsDb = require('@archon/core/db/workflows');
     process.env.ARCHON_DETACHED_RUN_OWNER = '1';
+    // A detached child learns its run from the row its launcher handed over (#2872) —
+    // the only shape the CLI produces for a fresh detached run.
+    (workflowsDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'test-run-id',
+      workflow_name: 'plan',
+      status: 'pending',
+      working_path: null,
+      metadata: {},
+    });
 
     const sigtermBefore = process.listeners('SIGTERM');
     const { executeWorkflow } = require('@archon/workflows/executor');
+    // Captured inside the run, once the signal handler has settled: the assertion is
+    // that the SIGNAL path never consulted status, which a global "never called" no
+    // longer isolates now that the startup-failure net reads it on the way out.
+    let statusReadsAtSignalTime = -1;
     (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce(async () => {
       mockDetachedStopRequested = true;
       const [handler] = addedSigtermListeners(sigtermBefore);
       expect(handler).toBeDefined();
       handler();
       await settleCleanup();
+      statusReadsAtSignalTime = (workflowsDb.getWorkflowRunStatus as ReturnType<typeof mock>).mock
+        .calls.length;
       return { success: false, workflowRunId: 'test-run-id', error: 'interrupted' };
     });
 
     setupWorkflowMocks();
-    await expect(workflowRunCommand('/test/path', 'plan', 'hello', {})).rejects.toThrow(
-      'Workflow failed'
-    );
+    await expect(
+      workflowRunCommand('/test/path', 'plan', 'hello', { detachedRunId: 'test-run-id' })
+    ).rejects.toThrow('Workflow failed');
 
     expect(mockStartDetachedRunControlServer).toHaveBeenCalledWith('test-run-id');
-    expect(workflowsDb.getWorkflowRunStatus).not.toHaveBeenCalled();
+    expect(statusReadsAtSignalTime).toBe(0);
     expect(workflowsDb.failWorkflowRun).not.toHaveBeenCalled();
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(mockDetachedControlClose).toHaveBeenCalledTimes(1);
