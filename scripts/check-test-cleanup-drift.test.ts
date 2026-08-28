@@ -55,6 +55,17 @@ test('recognizes quoted cleanup option keys', () => {
   expect(checkSource('scripts/example.test.ts', source)).toHaveLength(2);
 });
 
+test('recognizes computed string-literal cleanup option keys', () => {
+  const source = `
+    import { afterEach } from 'bun:test';
+    import { rm } from 'node:fs/promises';
+    afterEach(() => rm(root, { ['recursive']: true }));
+    rm(root, { ['maxRetries']: 1, ['retryDelay']: 1 });
+  `;
+
+  expect(checkSource('scripts/example.test.ts', source)).toHaveLength(2);
+});
+
 test('recognizes static fs promises bindings', () => {
   const source = `
     import { promises as fs } from 'node:fs';

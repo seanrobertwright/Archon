@@ -80,8 +80,10 @@ function rmCallName(call: ts.CallExpression, bindings: FsBindings): string | und
 }
 
 function propertyName(property: ts.PropertyAssignment): string | undefined {
-  return ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
-    ? property.name.text
+  const { name } = property;
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name)) return name.text;
+  return ts.isComputedPropertyName(name) && ts.isStringLiteral(name.expression)
+    ? name.expression.text
     : undefined;
 }
 
