@@ -105,24 +105,33 @@ async function collect(proc: Bun.Subprocess<'ignore', 'pipe', 'pipe'>): Promise<
 /**
  * Environment for every child, pinned to this sandbox.
  *
- * `DATABASE_URL` is REMOVED, not just overridden. A contributor running the
- * documented Postgres mode (`.env.example`) would otherwise have it inherited
- * here, which flips `getDatabaseType()` inside the child: `registryIsKnownEmpty`
- * goes false and `resolveTarget` reads a Postgres registry, while the C5 fixture
- * writes its row to this sandbox's SQLite file. The two sides would disagree and
- * both C5 tests would fail looking like a climbing regression rather than an
- * environment leak. Stripping it makes the dialect deterministic the same way
- * `ARCHON_HOME` already pins the destination — and it also keeps the fixture from
- * writing test rows into a contributor's real database, which the old subprocess
- * did. The one test that wants the Postgres branch passes it back via `extraEnv`.
+ * `DATABASE_URL` is forced EMPTY rather than deleted. A contributor running the
+ * documented Postgres mode would otherwise have it reach the child, which flips
+ * `getDatabaseType()` there: `registryIsKnownEmpty` goes false and `resolveTarget`
+ * reads a Postgres registry, while the C5 fixture writes its row to this sandbox's
+ * SQLite file. The two sides would disagree and both C5 tests would fail looking
+ * like a climbing regression rather than an environment leak.
+ *
+ * Deleting the key does NOT achieve that: a spawned Bun child re-runs automatic
+ * `.env` loading from its own cwd and fills in every key the passed environment
+ * omits, so a repo-root `.env` — exactly how Postgres mode is configured — puts it
+ * straight back. An empty string is a key that is present, which dotenv leaves
+ * alone, and `getDatabaseType()` reads it as falsy. This is the same suppression
+ * `packages/cli/src/cli.test.ts` uses for its own inherited keys.
+ *
+ * The one test that wants the Postgres branch passes a real DSN via `extraEnv`.
  */
 function childEnv(
   ctx: Sandbox,
   extraEnv: Record<string, string> = {}
 ): Record<string, string | undefined> {
-  const ambient: Record<string, string | undefined> = { ...process.env };
-  delete ambient.DATABASE_URL;
-  return { ...ambient, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent', ...extraEnv };
+  return {
+    ...process.env,
+    ARCHON_HOME: ctx.archonHome,
+    LOG_LEVEL: 'silent',
+    DATABASE_URL: '',
+    ...extraEnv,
+  };
 }
 
 /** Run with raw argv — no implicit `--cwd`, for argument-parsing cases. */
