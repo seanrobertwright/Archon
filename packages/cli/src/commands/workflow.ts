@@ -684,6 +684,39 @@ function buildFolderRegistrationFailureError(error: Error): Error {
   );
 }
 
+/**
+ * Refuse an isolated run that has no project to isolate, naming which step failed.
+ *
+ * One owner because two callers enforce the same policy at different times: the
+ * `--detach` pre-flight, which must refuse before the fork (#2872), and the isolation
+ * block, which is where a foreground run reaches it. Two copies of this decision is
+ * exactly how the detached path came to skip it.
+ *
+ * A no-op once a codebase resolved — the isolation block only reaches it with none, and
+ * the pre-flight calls it unconditionally for an isolating run.
+ */
+function assertCodebaseResolvedForIsolation(resolved: {
+  codebase: Awaited<ReturnType<typeof codebaseDb.getCodebase>>;
+  lookupError: Error | null;
+  registrationError: Error | null;
+}): void {
+  if (resolved.codebase) return;
+  if (resolved.lookupError) {
+    throw new Error(
+      'Cannot create worktree: database lookup failed.\n' +
+        `Error: ${resolved.lookupError.message}\n` +
+        'Hint: Check your database connection, or use --no-worktree to skip isolation.'
+    );
+  }
+  if (resolved.registrationError) {
+    throw buildRegistrationFailureError('create worktree', resolved.registrationError);
+  }
+  throw new Error(
+    'Cannot create worktree: not in a git repository.\n' +
+      'Run from within a git repo, or use --no-worktree to skip isolation.'
+  );
+}
+
 /** The refusal when `--resume` finds nothing to continue. */
 function buildNoResumableRunError(workflowName: string, cwd: string): Error {
   return new Error(`No resumable run found for workflow '${workflowName}' at path '${cwd}'.`);
@@ -1376,14 +1409,36 @@ async function runWorkflowWithOwnedSource(
   // The row a detached parent created before forking (#2872). Loaded up front because
   // it decides the run's identity: the capture is filed under its id, the signal
   // handlers own it, and `executeWorkflow` executes it instead of creating a second
-  // row. Missing means the parent acked a run that is not there — fail loud rather
-  // than silently starting an unrelated one.
+  // row.
+  //
+  // The flag names a run row this process will execute AS, so it is honoured only when
+  // both halves hold. First, that this process really is a detached child: the owner
+  // marker is set by `spawnDetachedWorkflowRun` in the parent's own env and
+  // `assertDetachedRunProcessOwner` (above) has already proved this process leads its
+  // own process group. Second, that the row is one a fresh execution may claim —
+  // `pending`, and for the workflow being invoked (name checked once the workflow
+  // resolves, below). Without the status check a hand-typed or stale id would load a
+  // terminal row, and the executor would re-run its DAG and append events onto closed
+  // evidence. The sibling `--internal-detached-run-config` is sealed with the install
+  // key against the same class of misuse; this is the equivalent boundary.
   let detachedPreCreatedRun: WorkflowRun | undefined;
   if (options.detachedRunId !== undefined) {
+    if (!detachedProcessOwner) {
+      throw new Error(
+        '--internal-detached-run-id is set by a detached launch for its own child. ' +
+          'Use `archon workflow run <name> --detach`.'
+      );
+    }
     detachedPreCreatedRun = (await workflowDb.getWorkflowRun(options.detachedRunId)) ?? undefined;
     if (!detachedPreCreatedRun) {
       throw new Error(
         `Detached workflow child cannot find the run '${options.detachedRunId}' its launcher created.`
+      );
+    }
+    if (detachedPreCreatedRun.status !== 'pending') {
+      throw new Error(
+        `Cannot execute run '${detachedPreCreatedRun.id}': it is ${detachedPreCreatedRun.status}, ` +
+          'not a run awaiting its first execution. Resume it with `archon workflow resume` instead.'
       );
     }
   }
@@ -1529,6 +1584,18 @@ async function runWorkflowWithOwnedSource(
     const availableWorkflows = workflows.map(w => `  - ${w.name}`).join('\n');
     throw new Error(
       `Workflow '${workflowName}' not found.\n\nAvailable workflows:\n${availableWorkflows}`
+    );
+  }
+
+  // Second half of the handed-over row's claim check (#2872): the row must belong to the
+  // workflow being invoked. Checked here rather than at load because the row carries the
+  // RESOLVED name its launcher selected, and resolution needs discovery. It catches an
+  // id crossed between two concurrent detached launches, and the narrow window where the
+  // child's re-capture resolves a different workflow than the parent did.
+  if (detachedPreCreatedRun && detachedPreCreatedRun.workflow_name !== workflow.name) {
+    throw new Error(
+      `Cannot execute run '${detachedPreCreatedRun.id}': it belongs to workflow ` +
+        `'${detachedPreCreatedRun.workflow_name}', not '${workflow.name}'.`
     );
   }
 
@@ -1876,19 +1943,25 @@ async function runWorkflowWithOwnedSource(
     // the run path performs, because the run row needs `codebase_id` and adoption
     // cannot be judged without it. Registration is idempotent, so the child's own call
     // finds what this one registered.
-    const {
-      codebase: detachCodebase,
-      registrationError: detachRegistrationError,
-      registeredFolder: detachRegisteredFolder,
-    } = await resolveRunCodebase(cwd, options);
+    const detachResolved = await resolveRunCodebase(cwd, options);
+    const detachCodebase = detachResolved.codebase;
     // Never on `--json`: stdout carries one machine-readable document and nothing else.
-    if (detachRegisteredFolder && !options.json) {
+    if (detachResolved.registeredFolder && !options.json) {
       console.log(
-        `Registered folder project "${detachRegisteredFolder.name}" (${detachRegisteredFolder.defaultCwd})`
+        `Registered folder project "${detachResolved.registeredFolder.name}" ` +
+          `(${detachResolved.registeredFolder.defaultCwd})`
       );
     }
-    if (options.folder && !detachCodebase && detachRegistrationError) {
-      throw buildFolderRegistrationFailureError(detachRegistrationError);
+    if (options.folder && !detachCodebase && detachResolved.registrationError) {
+      throw buildFolderRegistrationFailureError(detachResolved.registrationError);
+    }
+    // The refusal the plain `run <name> --detach` launch was still missing: an isolating
+    // run with no project to isolate. The isolation block enforces it in whichever
+    // process reaches it, which for a detached launch is the child — after the parent has
+    // already printed `Started` (#2872). `options.noWorktree` first, mirroring the
+    // isolation block's own branch order.
+    if (!options.noWorktree && wantsIsolation) {
+      assertCodebaseResolvedForIsolation(detachResolved);
     }
     // Never pin a worktree branch on the child for a folder project. The --folder flag
     // declares it; an already-registered folder project is read off the resolution.
@@ -2553,21 +2626,13 @@ async function runWorkflowWithOwnedSource(
   } else if (options.noWorktree) {
     getLog().info({ cwd }, 'workflow.running_without_isolation');
   } else if (wantsIsolation) {
-    // Isolation was expected (default) but codebase is unavailable — fail fast
-    if (codebaseLookupError) {
-      throw new Error(
-        'Cannot create worktree: database lookup failed.\n' +
-          `Error: ${codebaseLookupError.message}\n` +
-          'Hint: Check your database connection, or use --no-worktree to skip isolation.'
-      );
-    }
-    if (codebaseRegistrationError) {
-      throw buildRegistrationFailureError('create worktree', codebaseRegistrationError);
-    }
-    throw new Error(
-      'Cannot create worktree: not in a git repository.\n' +
-        'Run from within a git repo, or use --no-worktree to skip isolation.'
-    );
+    // Isolation was expected (default) but codebase is unavailable — fail fast. The
+    // `--detach` pre-flight enforces the same refusal before the fork.
+    assertCodebaseResolvedForIsolation({
+      codebase,
+      lookupError: codebaseLookupError,
+      registrationError: codebaseRegistrationError,
+    });
   }
 
   // The lane's checkout is final here — reuse-worktree set it in the lane block, and
@@ -3084,12 +3149,51 @@ export async function workflowRunCommand(
   options: WorkflowRunOptions = {}
 ): Promise<void> {
   const detachedRunConfig = parseDetachedRunConfig(options.detachedRunConfigPayload);
-  await withCapturedSource(owner =>
-    runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, {
-      ...options,
-      ...(detachedRunConfig ? { detachedRunConfig } : {}),
-    })
-  );
+  try {
+    await withCapturedSource(owner =>
+      runWorkflowWithOwnedSource(owner, cwd, workflowName, userMessage, {
+        ...options,
+        ...(detachedRunConfig ? { detachedRunConfig } : {}),
+      })
+    );
+  } catch (error) {
+    await recordDetachedChildStartupFailure(options.detachedRunId, error as Error);
+    throw error;
+  }
+}
+
+/**
+ * Record why a handed-over run never started (#2872).
+ *
+ * A detached child is given a row its launcher already created, and everything between
+ * that handover and the executor taking over — project resolution, the live re-check of
+ * an adoption, isolation — can throw. The launcher is long gone by then, so without this
+ * the row sits `pending` forever while the reason exists only in the child's log: the
+ * same silent failure this issue closed at launch, moved one process later.
+ *
+ * `pending` is the whole guard, and it is what keeps this from guessing at a lifecycle
+ * it does not own: the executor flips the row to `running` before any node executes, so
+ * a row still `pending` here is one no execution ever claimed. Anything else belongs to
+ * the run and is left alone — `failWorkflowRun`'s own status CAS closes the race.
+ */
+async function recordDetachedChildStartupFailure(
+  detachedRunId: string | undefined,
+  error: Error
+): Promise<void> {
+  if (detachedRunId === undefined) return;
+  try {
+    const status = await workflowDb.getWorkflowRunStatus(detachedRunId);
+    if (status !== 'pending') return;
+    await workflowDb.failWorkflowRun(
+      detachedRunId,
+      `Detached run failed to start: ${error.message}`
+    );
+  } catch (dbError) {
+    getLog().error(
+      { err: dbError as Error, workflowRunId: detachedRunId },
+      'cli.detached_startup_failure_record_failed'
+    );
+  }
 }
 
 /**
