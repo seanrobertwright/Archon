@@ -2,10 +2,35 @@
  * Source capture: what a run freezes, and what it must keep resolving after the
  * authoring checkout moves on.
  */
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, afterAll, mock } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, rm, readFile, readdir, symlink, stat } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+
+// Capture-cost control, same lever and same reason as `subrun.test.ts` (#2882):
+// every `captureWorkflowSource` call here copies and digests the repo's OWN bundled
+// scope — `.archon/workflows` plus `.archon/commands`, ~178 files — on top of the
+// handful of fixture files the test wrote. Twenty-five captures in this file is ~4,400
+// incidental file copies, and that bulk IO is what puts this suite at Bun's 5000ms
+// budget on a contended Windows runner. No test here reads bundled CONTENT: the
+// assertions count the PROJECT scope (`countScopeFiles`) and resolve fixture-written
+// commands. Pointing the two bundle getters at an owned EMPTY tree keeps the bundled
+// scope's semantics intact — an existing directory is still scanned, still copied,
+// still recorded in the manifest — while removing the file fan-out.
+// NB: point these one level DEEP (`<root>/defaults`) — captureWorkflowSource copies
+// dirname(getDefault*Path()), so the getter's PARENT must be the owned empty tree.
+const bundledDefaultsRoot = join(tmpdir(), `workflow-source-test-empty-bundled-${process.pid}`);
+await mkdir(join(bundledDefaultsRoot, 'defaults'), { recursive: true });
+afterAll(async () => {
+  await rm(bundledDefaultsRoot, { recursive: true, force: true }).catch(() => {});
+});
+const realArchonPaths = await import('@archon/paths');
+mock.module('@archon/paths', () => ({
+  ...realArchonPaths,
+  getDefaultWorkflowsPath: () => join(bundledDefaultsRoot, 'defaults'),
+  getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
+}));
+
 import {
   captureWorkflowSource,
   capturedSourceRoots,
@@ -538,6 +563,11 @@ describe('the capture is authoritative, not advisory', () => {
     // A project workflow can `include:` a global or bundled one, so leaving those live
     // would let an included workflow change shape across a resume.
     expect(capture.manifest.scopes).toContain('project');
+    // Named explicitly because this file redirects the bundle getters at an EMPTY tree to
+    // keep capture cost off the Windows budget (#2882). That lever is only safe while an
+    // empty bundled tree is still SCANNED and recorded; if it ever silently stopped being
+    // captured, every other assertion here would keep passing.
+    expect(capture.manifest.scopes).toContain('bundled');
     const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
     expect(roots.globalWorkflows.startsWith(capture.captureRoot)).toBe(true);
     expect(roots.globalCommands.startsWith(capture.captureRoot)).toBe(true);

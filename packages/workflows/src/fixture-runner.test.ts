@@ -1,5 +1,5 @@
 /** Tests for the declared-data dry-run fixture runner (#2772). */
-import { describe, it, expect, afterEach } from 'bun:test';
+import { describe, it, expect, afterEach, afterAll, mock } from 'bun:test';
 import {
   existsSync,
   mkdirSync,
@@ -10,8 +10,35 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Capture-cost control, same lever and same reason as `subrun.test.ts` (#2882): every
+// `runFixtures` call takes one source capture, and a capture copies and digests the
+// repo's OWN bundled scope — `.archon/workflows` plus `.archon/commands`, ~178 files —
+// alongside the handful of fixture files the test wrote. Thirty captures in this file
+// is ~5,300 incidental file copies, and that bulk IO is what puts this suite at Bun's
+// 5000ms budget on a contended Windows runner. No test here reads bundled CONTENT: the
+// bundled SCOPE tests drive `sourceRoots.bundledWorkflows`, which is a discovery root
+// this file already points at a temp directory. Pointing the two bundle getters at an
+// owned EMPTY tree keeps the bundled scope's semantics intact — an existing directory
+// is still scanned, still copied, still recorded in the manifest — while removing the
+// file fan-out.
+// NB: point these one level DEEP (`<root>/defaults`) — captureWorkflowSource copies
+// dirname(getDefault*Path()), so the getter's PARENT must be the owned empty tree.
+const bundledDefaultsRoot = join(tmpdir(), `fixture-runner-test-empty-bundled-${process.pid}`);
+await mkdir(join(bundledDefaultsRoot, 'defaults'), { recursive: true });
+afterAll(async () => {
+  await rm(bundledDefaultsRoot, { recursive: true, force: true }).catch(() => {});
+});
+const realArchonPaths = await import('@archon/paths');
+mock.module('@archon/paths', () => ({
+  ...realArchonPaths,
+  getDefaultWorkflowsPath: () => join(bundledDefaultsRoot, 'defaults'),
+  getDefaultCommandsPath: () => join(bundledDefaultsRoot, 'defaults'),
+}));
+
 import { execFileAsync } from '@archon/git';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
@@ -601,14 +628,18 @@ describe('runFixtures exec-code isolation (#2851)', () => {
   const git = (cwd: string, ...args: string[]): Promise<unknown> =>
     execFileAsync('git', args, { cwd });
 
-  /** Turn a plain temp project into a git repo with one committed file besides the project's own. */
+  /**
+   * Turn a plain temp project into a git repo with one committed file besides the project's own.
+   *
+   * Three git processes, not five: the identity travels as `-c` overrides on the commit
+   * itself rather than as two separate `git config` writes. Every test in this block pays
+   * this cost, and process creation is the expensive part on Windows CI (#2882).
+   */
   async function initGitWithCommittedFile(cwd: string): Promise<void> {
     await git(cwd, 'init', '-q');
-    await git(cwd, 'config', 'user.email', 't@t');
-    await git(cwd, 'config', 'user.name', 't');
     writeFileSync(join(cwd, 'tracked.txt'), COMMITTED_YAML);
     await git(cwd, 'add', '-A');
-    await git(cwd, 'commit', '-qm', 'init');
+    await git(cwd, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init');
   }
 
   it('gives clean and pre-dirtied callers the same verdict (#2851)', async () => {
