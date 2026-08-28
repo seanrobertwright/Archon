@@ -32,8 +32,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.after || github.event.pull_request.head.sha }}
+        # Assign before echoing. A failing command substituted into another command's arguments
+        # does not trip `set -e`, so `echo "run-tests=$(...)"` would report success and write an
+        # empty decision that every downstream `== 'true'` gate reads as "skip".
         run: |
-          echo "run-tests=$(bun scripts/should-run-test-suite.ts "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
+          run_tests=$(bun scripts/should-run-test-suite.ts "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")
+          echo "run-tests=$run_tests" >> "$GITHUB_OUTPUT"
 
   test:
     needs: changes
