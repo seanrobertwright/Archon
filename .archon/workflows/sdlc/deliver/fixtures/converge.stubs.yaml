@@ -18,6 +18,7 @@ review__mode: '{"continuation":false}'
 review__scope: "target recorded; head sha stubbed"
 review__code: "2 findings (Important)"
 review__seams: "0 findings"
+review__simplify: "0 findings"
 review__tests: "0 findings"
 review__errors: "0 findings"
 review__synthesize:

@@ -2,7 +2,7 @@
 
 Find one defect: **a real failure crosses the changed code and becomes indistinguishable from success** to the caller, operator, or user who must react. Not every error needs logging; recovery is correct when the contract permits it and the right owner can still observe the outcome. Read-only: never modify files, commit, or post anywhere.
 
-Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md` first. Anchor the review on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; for an engaged risk, explicitly try to refute the relevant invariant. In light mode, verify prior findings from this lens first, then examine only the delta.
+Read `$ARTIFACTS_DIR/review/scope.md` first, and the project's `architecture.md` if it has one. Anchor the review on the accepted work order's stated invariants, and scale depth to what the change can destroy: irreversible or destructive paths, lifecycle ownership, persisted contracts and schemas, credentials and auth boundaries, integration boundaries, and concurrency over shared state each get an explicit attempt to refute the invariant they rest on; a prose-only change gets the minimum. In light mode, verify prior findings from this lens first, then examine only the delta.
 
 ## A finding needs all four
 

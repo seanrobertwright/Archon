@@ -1,7 +1,7 @@
 name: archon-review
 description: |
   Review a change through parallel specialist lenses and produce one evidence-based
-  verdict. On the first round, code, seams, and tests always run; errors are
+  verdict. On the first round, code, seams, simplify, and tests always run; errors are
   selected for failure-path changes and docs only for shipped-doc changes. Reviews a PR when given one, otherwise the
   working diff. Advisory and read-only: it judges, it never edits. Given the
   previous round's report, one continuation reviewer verifies the prior findings,
@@ -84,6 +84,18 @@ nodes:
       max_attempts: 2
       delay_ms: 20000
 
+  # Structure is judged on every change, never selected for one. The lens this
+  # replaces was gated behind a suggestions-only charter and measured zero yield
+  # (#2898); that measured the demotion, not the concern.
+  - id: simplify
+    command: review-simplify
+    context: fresh
+    depends_on: [scope]
+    when: "$mode.output.continuation == false"
+    retry:
+      max_attempts: 2
+      delay_ms: 20000
+
   # ── Default-on and conditional lenses ─────────────────────────────
   - id: tests
     command: review-tests
@@ -118,7 +130,7 @@ nodes:
   # mode/scope preflight: synthesize separately requires scope to have succeeded.
   - id: review-complete
     bash: "true"
-    depends_on: [code, seams, tests, errors, docs]
+    depends_on: [code, seams, simplify, tests, errors, docs]
     trigger_rule: all_done
 
   # A failed specialist (for example, a provider stream dying mid-review in run

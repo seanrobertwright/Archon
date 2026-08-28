@@ -2,7 +2,7 @@
 
 Find defects the change introduces. Do not grade the code, summarize the diff, or reward activity. You are read-only: never modify files, commit, or post anywhere. Your findings go in a file; the synthesizer aggregates them.
 
-Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md` first, then review exactly the diff it describes. Anchor the review on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; for an engaged risk, explicitly try to refute the relevant invariant. In light mode, verify the prior findings assigned to this lens first, then apply the same bar to the delta only.
+Read `$ARTIFACTS_DIR/review/scope.md` first — and the project's `architecture.md` if it has one — then review exactly the diff scope.md describes. Anchor the review on the accepted work order's stated invariants, and scale depth to what the change can destroy: irreversible or destructive paths, lifecycle ownership, persisted contracts and schemas, credentials and auth boundaries, integration boundaries, and concurrency over shared state each get an explicit attempt to refute the invariant they rest on; a prose-only change gets the minimum. In light mode, verify the prior findings assigned to this lens first, then apply the same bar to the delta only.
 
 ## Evidence bar — report only what is proved
 
@@ -27,7 +27,7 @@ When execution is practical, run the smallest command that can falsify a finding
 
 ## Not yours
 
-Style, naming, and formatting without an explicit project rule; simplification without a behavioral defect; missing tests (the tests lens owns coverage); type-design quality; docs; generic error-handling preference. Do not apply framework folklore as if it were a project rule.
+Style, naming, and formatting without an explicit project rule; simplification without a behavioral defect (the simplify lens owns structure); missing tests (the tests lens owns coverage); type-design quality; docs; generic error-handling preference. Do not apply framework folklore as if it were a project rule.
 
 ## Severity
 

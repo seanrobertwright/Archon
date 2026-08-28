@@ -9,12 +9,12 @@ There are two modes in `$ARTIFACTS_DIR/review/scope.md`:
 
 ## Read the review state
 
-1. Read `AGENTS.md`, `.archon/engineering.md`, and `$ARTIFACTS_DIR/review/scope.md`, then inspect the exact diff it records. Verify claims against the code, never against summaries. Anchor on the accepted work order's stated invariants and the engineering sidecar's risk taxonomy; an unengaged stated risk is incomplete review, not a clean verdict.
-2. In full mode, read every current specialist report present in `$ARTIFACTS_DIR/review/` (`code.md`, `seams.md`, `tests.md`, `errors.md`, `docs.md`) in full.
+1. Read `$ARTIFACTS_DIR/review/scope.md`, and the project's `architecture.md` if it has one, then inspect the exact diff scope.md records. Verify claims against the code, never against summaries. Anchor on the accepted work order's stated invariants and on the same risk scaling the lenses use — irreversible or destructive paths, lifecycle ownership, persisted contracts and schemas, credentials and auth boundaries, integration boundaries, concurrency over shared state; a risk this change engages that no lens engaged is incomplete review, not a clean verdict.
+2. In full mode, read every current specialist report present in `$ARTIFACTS_DIR/review/` (`code.md`, `seams.md`, `simplify.md`, `tests.md`, `errors.md`, `docs.md`) in full.
 3. In continuation mode, read `$INPUTS.prior_report` in full before judging the delta. Also read `$ARTIFACTS_DIR/implementation.md` when it exists; it records what the correction claims to have changed and proved. Specialist files beside the report belong to the earlier round and are evidence only through the canonical prior report. Do not count them as freshly rerun lenses.
 4. Read every producer record under `$ARTIFACTS_DIR/discoveries/`, when that directory exists. Its absence means no producer recorded a discovery. Each file is independent evidence; never delete or replace these raw files.
 
-In full mode, `code`, `seams`, and `tests` are required; `errors` and `docs` are required only when their inputs are true. A missing or empty report for an enabled lens means that lens failed to report and blocks readiness. In continuation mode, the prior report's review-coverage section is authoritative for the concerns the accepted review covered; do not reconstruct it from current optional inputs or simulate separate reviewers.
+In full mode, `code`, `seams`, `simplify`, and `tests` are required; `errors` and `docs` are required only when their inputs are true. A missing or empty report for an enabled lens means that lens failed to report and blocks readiness. In continuation mode, the prior report's review-coverage section is authoritative for the concerns the accepted review covered; do not reconstruct it from current optional inputs or simulate separate reviewers.
 
 ## Continuation judgment
 
