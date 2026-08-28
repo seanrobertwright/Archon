@@ -711,6 +711,55 @@ describe('dryRunWorkflow', () => {
     expect(result.trace.find(entry => entry.nodeId === 'unreachable')?.state).toBe('skipped');
   });
 
+  test('tolerates a missing stub on an all_done join and completes past it (#2869)', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'join-tolerance',
+      nodes: [
+        { id: 'lens', prompt: 'lens' },
+        {
+          id: 'review-complete',
+          bash: 'true',
+          depends_on: ['lens'],
+          trigger_rule: 'all_done',
+        },
+        { id: 'synthesize', prompt: 'synthesize', depends_on: ['review-complete'] },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok', synthesize: 'done' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.missingStubs).toEqual(['review-complete']);
+    expect(result.trace.find(entry => entry.nodeId === 'review-complete')).toMatchObject({
+      state: 'stubbed',
+      reason: expect.stringContaining('all_done'),
+    });
+    expect(result.trace.find(entry => entry.nodeId === 'synthesize')?.state).toBe('stubbed');
+  });
+
+  test('still fails the run when a plain (non-all_done) node is missing its stub', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'no-tolerance',
+      nodes: [
+        { id: 'lens', prompt: 'lens' },
+        { id: 'gate', bash: 'true', depends_on: ['lens'] },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.missingStubs).toEqual(['gate']);
+  });
+
   test('executes bash only with execCode and captures failures', async () => {
     const success = makeTestWorkflow({
       name: 'bash-ok',

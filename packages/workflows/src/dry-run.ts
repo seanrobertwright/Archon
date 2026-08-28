@@ -1099,6 +1099,28 @@ async function simulateNode(
       }
       return;
     }
+    // `trigger_rule: all_done` declares this node a barrier/join that runs regardless
+    // of upstream outcome — a real run reaches it independent of dry-run fixture data,
+    // so a missing stub here is an authoring gap, not evidence the simulated run would
+    // fail (#2869). Tolerate it the way `--default-stubs` tolerates any missing stub —
+    // a generated placeholder — while still reporting the gap via `missingStubs` so the
+    // fixture stays honest about what it never verified.
+    if (node.trigger_rule === 'all_done') {
+      ctx.missingStubs.add(node.id);
+      const hydrated = completedOutput(node, generatedStubFor(node));
+      outputs.set(node.id, hydrated);
+      ctx.trace.push({
+        nodeId: node.id,
+        nodeType: nodeType(node),
+        state: 'stubbed',
+        reason: 'Missing stub tolerated by trigger_rule: all_done — using a generated placeholder',
+        resolvedText,
+        output: hydrated.output,
+        ...(iteration ? { iteration } : {}),
+        ...withResolution(node, ctx),
+      });
+      return;
+    }
     ctx.missingStubs.add(node.id);
     recordFailed(
       node,
