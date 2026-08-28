@@ -13,6 +13,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll, mock } from 'bun:test';
 import { mkdir, writeFile, rm, cp, readdir } from 'fs/promises';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { existsSync } from 'fs';
 import { join, sep } from 'path';
 import { tmpdir } from 'os';
@@ -6294,5 +6295,121 @@ nodes:
     } finally {
       forceRenameFailure = false;
     }
+  });
+});
+
+// #2910: a child's own setup guards record its terminal status too. When one of
+// those writes fails, the child has no trustworthy outcome — and the parent must
+// not be handed an ordinary "the sub-run errored" node result over a child row
+// still sitting at pending/running.
+describe("a child's terminal status write fails during setup (#2910)", () => {
+  let cwd: string;
+  const originalArchonHome = process.env.ARCHON_HOME;
+
+  async function writeWorkflow(name: string, yaml: string): Promise<void> {
+    await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
+  }
+
+  async function discover(name: string): Promise<WorkflowDefinition> {
+    const result = await discoverWorkflows(cwd, { loadDefaults: false });
+    const wf = result.workflows.find(w => w.workflow.name === name);
+    if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
+    return wf.workflow;
+  }
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `subrun-setup-write-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'workflows'), { recursive: true });
+    process.env.ARCHON_HOME = join(cwd, 'home');
+  });
+
+  afterEach(async () => {
+    await removeTempTree(cwd);
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+  });
+
+  async function writeSubRunPair(): Promise<WorkflowDefinition> {
+    await writeWorkflow(
+      'child-setup-write',
+      `
+name: child-setup-write
+description: child whose invocation-metadata write is forced to fail
+nodes:
+- id: work
+  prompt: "work"
+`
+    );
+    await writeWorkflow(
+      'parent-setup-write',
+      `
+name: parent-setup-write
+description: parent composing child-setup-write
+nodes:
+- id: sub
+  workflow: child-setup-write
+  input: the-goal
+- id: after
+  prompt: "downstream reads $sub.output"
+  depends_on: [sub]
+`
+    );
+    return discover('parent-setup-write');
+  }
+
+  /** Fail the child's invocation-metadata persist — the write its recovery covers. */
+  function breakChildMetadataWrite(store: InMemoryStore): void {
+    const realUpdate = store.updateWorkflowRun.bind(store);
+    store.updateWorkflowRun = (id, updates) => {
+      const row = store.runs.get(id);
+      if (row?.parent_run_id && updates.metadata) {
+        return Promise.reject(new Error('child metadata write failed'));
+      }
+      return realUpdate(id, updates);
+    };
+  }
+
+  it('fails the parent run rather than reporting an ordinary failed child', async () => {
+    const parent = await writeSubRunPair();
+    const store = new InMemoryStore();
+    breakChildMetadataWrite(store);
+    const realFail = store.failWorkflowRun.bind(store);
+    store.failWorkflowRun = (id, error) => {
+      const row = store.runs.get(id);
+      if (row?.parent_run_id) return Promise.reject(new Error('child recovery write failed'));
+      return realFail(id, error);
+    };
+
+    await expect(
+      executeWorkflow(makeDeps(store), makePlatform(), 'conv-plat', cwd, parent, 'goal', 'conv-db')
+    ).rejects.toThrow('Failed to persist terminal workflow status');
+
+    // The parent must not have carried on past the sub-run node.
+    const afterCompleted = store.events.some(
+      e => e.event_type === 'node_completed' && e.step_name?.includes('after')
+    );
+    expect(afterCompleted).toBe(false);
+  });
+
+  it('reports an ordinary failed child when the recovery write succeeds', async () => {
+    // The other side of the branch: the child's status IS recorded, so the parent
+    // gets a normal failed-sub-run outcome instead of a rejection.
+    const parent = await writeSubRunPair();
+    const store = new InMemoryStore();
+    breakChildMetadataWrite(store);
+
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(false);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-setup-write');
+    expect(child?.status).toBe('failed');
   });
 });

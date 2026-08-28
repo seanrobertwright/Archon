@@ -2977,6 +2977,154 @@ describe('executeWorkflow', () => {
   });
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// Terminal status writes outside the DAG (#2910)
+//
+// executeWorkflow records a run's terminal status from ten places, not just the
+// four inside executeDagWorkflow. These cover the distinct shapes: a setup guard
+// that would otherwise RETURN an ordinary failure, one that would otherwise
+// RETHROW its own error, and the two main-path writes whose interaction decides
+// whether the finally backstop fires a second, masking write.
+// ───────────────────────────────────────────────────────────────────────────
+describe('terminal status writes in executor setup', () => {
+  beforeEach(() => {
+    mockExecuteDagWorkflow.mockClear();
+    mockExecuteDagWorkflow.mockImplementation(async () => undefined);
+  });
+
+  it('rejects instead of returning an ordinary failure when a setup guard cannot record it', async () => {
+    // Invocation-metadata persistence fails, and so does the failWorkflowRun that
+    // exists to recover it. Without the marker this returned `{ success: false }` —
+    // a normal failed run, over a row still saying pending/running.
+    const store = makeStore({
+      updateWorkflowRun: mock(async () => {
+        throw new Error('metadata write failed');
+      }),
+      failWorkflowRun: mock(async () => {
+        throw new Error('recovery write failed');
+      }),
+    });
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        { preCreatedRun: makeRun({ id: 'pending-run', status: 'pending' }) }
+      )
+    ).rejects.toThrow('Failed to persist terminal workflow status');
+
+    expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('still returns an ordinary failure when the setup guard CAN record it', async () => {
+    // The other side of the branch: the recovery write succeeds, so the caller keeps
+    // getting a plain failed result rather than a rejection.
+    const store = makeStore({
+      updateWorkflowRun: mock(async () => {
+        throw new Error('metadata write failed');
+      }),
+    });
+
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1',
+      { preCreatedRun: makeRun({ id: 'pending-run', status: 'pending' }) }
+    );
+
+    expect(result.success).toBe(false);
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces a rethrown setup error with the marker when its record write fails', async () => {
+    // The run-config guard rethrows its own error after recording it. A failed record
+    // has to win: the caller must learn the status is unwritten, not just that config
+    // sealing was unavailable.
+    const store = makeStore({
+      failWorkflowRun: mock(async () => {
+        throw new Error('recovery write failed');
+      }),
+    });
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({ id: 'pending-run', status: 'pending' }),
+          // No `sealRunConfig` on the test deps, so the guard throws.
+          runConfig: { layer: {}, source: 'cli' },
+        } as unknown as Parameters<typeof executeWorkflow>[7]
+      )
+    ).rejects.toThrow('Failed to persist terminal workflow status');
+  });
+
+  it('does not let the finally backstop mask a failed catch-path write', async () => {
+    // The catch's own failWorkflowRun fails. The backstop sees a row still at
+    // 'running' and would fire a second write over the same channel — masking the
+    // real error with "exited without finalizing". The flag has to stop it.
+    mockExecuteDagWorkflow.mockRejectedValueOnce(new Error('dag boom'));
+    const failWorkflowRun = mock(async () => {
+      throw new Error('terminal failure write failed');
+    });
+    const store = makeStore({
+      failWorkflowRun,
+      getWorkflowRunStatus: mock(async () => 'running' as const),
+    });
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1'
+      )
+    ).rejects.toThrow('terminal failure write failed');
+
+    expect(failWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a failed backstop write instead of exiting cleanly', async () => {
+    // The backstop is the last thing standing between a zombie row and a clean exit.
+    // If its write fails, the process must not report a finished run.
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'running' as const),
+      failWorkflowRun: mock(async () => {
+        throw new Error('backstop write failed');
+      }),
+    });
+
+    await expect(
+      executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1'
+      )
+    ).rejects.toThrow('Failed to persist terminal workflow status');
+  });
+});
+
 describe('finally backstop', () => {
   it('calls failWorkflowRun when run is still running at finally', async () => {
     const failSpy = mock(async () => {});

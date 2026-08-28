@@ -12249,9 +12249,6 @@ export async function executeDagWorkflow(
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
       return undefined;
     });
-    await requireTerminalStatusWrite(
-      deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume)
-    );
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -12269,7 +12266,16 @@ export async function executeDagWorkflow(
     await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
       workflowId: workflowRun.id,
     });
-    // DO NOT throw — outer executor.ts catch would duplicate workflow_failed events
+    // Terminal write LAST: nothing above depends on it and all of it used to run
+    // unconditionally, so a rejection must not silence the log file, the live event,
+    // the telemetry, or the user's notification.
+    await requireTerminalStatusWrite(
+      deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume),
+      { workflowRunId: workflowRun.id, site: 'dag.no_nodes_completed_fail' }
+    );
+    // The ordinary path does NOT throw — the outer executor.ts catch would duplicate the
+    // workflow_failed event emitted above. A rejected terminal write DOES throw, and that
+    // catch recognizes the marker and rethrows without re-emitting.
     return;
   }
 
@@ -12299,9 +12305,6 @@ export async function executeDagWorkflow(
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
       return undefined;
     });
-    await requireTerminalStatusWrite(
-      deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume)
-    );
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -12319,7 +12322,16 @@ export async function executeDagWorkflow(
     await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
       workflowId: workflowRun.id,
     });
-    // DO NOT throw — outer executor.ts catch would duplicate workflow_failed events
+    // Terminal write LAST: nothing above depends on it and all of it used to run
+    // unconditionally, so a rejection must not silence the log file, the live event,
+    // the telemetry, or the user's notification.
+    await requireTerminalStatusWrite(
+      deps.store.failWorkflowRun(workflowRun.id, failMsg, scheduledResume),
+      { workflowRunId: workflowRun.id, site: 'dag.node_failure_fail' }
+    );
+    // The ordinary path does NOT throw — the outer executor.ts catch would duplicate the
+    // workflow_failed event emitted above. A rejected terminal write DOES throw, and that
+    // catch recognizes the marker and rethrows without re-emitting.
     return;
   }
 
@@ -12381,7 +12393,6 @@ export async function executeDagWorkflow(
             'dag.evidence_metadata_write_failed'
           );
         });
-      await requireTerminalStatusWrite(deps.store.failWorkflowRun(workflowRun.id, failMsg));
       // Persist the reason into the workflow-events log (contract: never throws).
       await deps.store.createWorkflowEvent({
         workflow_run_id: workflowRun.id,
@@ -12405,7 +12416,18 @@ export async function executeDagWorkflow(
       await safeSendMessage(platform, conversationId, `❌ ${failMsg}`, {
         workflowId: workflowRun.id,
       });
-      // DO NOT throw — outer executor.ts catch would duplicate workflow_failed events
+      // Terminal write LAST: nothing above depends on it and all of it used to run
+      // unconditionally, so a rejection must not silence the evidence event, the log
+      // file, the live event, or the user's notification. The metadata merge above
+      // still precedes it, so `metadata.evidence_validation` is present the moment the
+      // run reads as failed.
+      await requireTerminalStatusWrite(deps.store.failWorkflowRun(workflowRun.id, failMsg), {
+        workflowRunId: workflowRun.id,
+        site: 'dag.evidence_gate_fail',
+      });
+      // The ordinary path does NOT throw — the outer executor.ts catch would duplicate the
+      // workflow_failed event emitted above. A rejected terminal write DOES throw, and that
+      // catch recognizes the marker and rethrows without re-emitting.
       return;
     }
     getLog().info({ workflowRunId: workflowRun.id, evidencePath }, 'dag.evidence_gate_passed');
@@ -12480,28 +12502,9 @@ export async function executeDagWorkflow(
 
   const duration = Date.now() - dagStartTime;
 
-  // Update DB and emit completion
-  await requireTerminalStatusWrite(
-    deps.store.completeWorkflowRun(
-      workflowRun.id,
-      { duration_ms: duration },
-      {
-        node_counts: nodeCounts,
-        // Cost and token totals are NOT written here — `persistRunUsage` already wrote
-        // them at the run tail, before this branch was chosen (#2469). Keeping a second
-        // copy here would be two writers of the same three keys, free to drift.
-        // A sub-run persists its terminal summary so the parent can thread it as
-        // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
-        // growth to child runs only (top-level runs return the summary directly).
-        // `summary_value` is the additive logical sibling (#2637): old binaries keep
-        // reading `summary`, new parents prefer the typed value when present.
-        ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
-        ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
-          ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
-          : {}),
-      }
-    )
-  );
+  // Emit completion, then record it. The transcript, the live event, and the telemetry
+  // do not depend on the status write and used to run whether or not it succeeded, so
+  // the (now-throwing) write goes last.
   await logWorkflowComplete(logDir, workflowRun.id, {
     // `> 0` rather than `!== undefined`, mirroring persistRunUsage above: the accumulator
     // is a plain number seeded at 0, so zero is the only way it can say "no AI usage" —
@@ -12530,6 +12533,29 @@ export async function executeDagWorkflow(
     ...runUsageProps,
   });
   emitter.unregisterRun(workflowRun.id);
+
+  await requireTerminalStatusWrite(
+    deps.store.completeWorkflowRun(
+      workflowRun.id,
+      { duration_ms: duration },
+      {
+        node_counts: nodeCounts,
+        // Cost and token totals are NOT written here — `persistRunUsage` already wrote
+        // them at the run tail, before this branch was chosen (#2469). Keeping a second
+        // copy here would be two writers of the same three keys, free to drift.
+        // A sub-run persists its terminal summary so the parent can thread it as
+        // `$<node>.output` on re-entry. Gated on parent_run_id to bound metadata
+        // growth to child runs only (top-level runs return the summary directly).
+        // `summary_value` is the additive logical sibling (#2637): old binaries keep
+        // reading `summary`, new parents prefer the typed value when present.
+        ...(workflowRun.parent_run_id && terminalOutput ? { summary: terminalOutput } : {}),
+        ...(workflowRun.parent_run_id && terminalOutput && terminalStructuredOutput !== undefined
+          ? { [SUBRUN_METADATA_KEYS.summaryValue]: terminalStructuredOutput }
+          : {}),
+      }
+    ),
+    { workflowRunId: workflowRun.id, site: 'dag_db_complete_failed' }
+  );
 
   // terminalOutput (computed above, before the completion write) is the run's
   // summary for the parent conversation and the `workflow:` re-entry path.
