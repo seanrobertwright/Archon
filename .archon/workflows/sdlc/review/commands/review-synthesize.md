@@ -98,7 +98,7 @@ The report contains:
 
 ## Post to the PR
 
-When scope.md names a PR, publish the complete report to that recorded PR number as **one canonical comment** carrying the marker `<!-- archon-review-report -->` on its first line. Search existing comments on that exact PR for the marker first. If found, edit that exact comment in place (`gh api`, or `gh pr comment --edit-last` only when it is the marked one); never append a second report. Read the comment back and confirm its body matches the report, then record its URL. When the scope is a working diff, skip publication.
+When scope.md names a PR, publish the complete report to that recorded PR number as **one canonical comment** carrying the marker `<!-- archon-review-report -->` on its first line. For a run-owned PR record, use its recorded number and normalized origin repository throughout; never re-resolve a PR from the branch. Search existing comments on that exact PR for the marker first. If found, edit that exact comment in place (`gh api`, or `gh pr comment --edit-last` only when it is the marked one); never append a second report. Read the comment back and confirm its body matches the report, then record its URL. When the scope is a working diff, skip publication.
 
 ## Verify before finishing
 

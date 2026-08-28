@@ -109,6 +109,8 @@ nodes:
       # The PR node's structured read-back is the target authority. Review must
       # not rediscover an ambient branch→PR mapping.
       scope: "$pr.output.number"
+      pr_number: "$pr.output.number"
+      pr_head: "$pr.output.head"
       prior_report: "$INPUTS.prior_report"
       work_order: "$INPUTS.work"
       errors: "$resolve-scope.output.errors"
@@ -189,7 +191,9 @@ nodes:
         - id: recheck
           include: archon-review
           with:
-            scope: ""
+            scope: "$pr.output.number"
+            pr_number: "$pr.output.number"
+            pr_head: "$pr.output.head"
             prior_report: "$ARTIFACTS_DIR/review/report.md"
             work_order: "$INPUTS.work"
             # Continuation mode owns coverage and skips every specialist,
@@ -321,7 +325,12 @@ nodes:
       # fork clone targets the upstream parent instead. With --repo, gh disables
       # branch inference and REQUIRES an explicit selector — omitting it is a
       # usage error, seen red on run 925f6c43's resume.
-      ORIGIN_REPO=$(record_read git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      case "$ORIGIN_REPO" in
+        *[!A-Za-z0-9_.-]*/* | */*[!A-Za-z0-9_.-]* | */*/* | /* | */ | "")
+          fail "flip-ready: origin remote does not resolve to an owner/repo."
+          ;;
+      esac
       PR_NUMBER=$pr.output.number
       EXPECTED_BRANCH=$pr.output.head
       BRANCH=$(record_read git branch --show-current)

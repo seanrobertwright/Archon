@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'bun:test';
-import { existsSync, readFileSync, readdirSync } from 'fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   isBinaryBuild,
@@ -13,6 +23,8 @@ import {
   parsePackagedResourceReference,
 } from '../packaged-workflow';
 import { parseWorkflow } from '../loader';
+import { dryRunWorkflow } from '../dry-run';
+import { makeTestWorkflow } from '../test-utils';
 
 // Resolve the on-disk defaults directories relative to this test file so the
 // tests work regardless of cwd. From packages/workflows/src/defaults go up
@@ -304,6 +316,9 @@ describe('bundled-defaults', () => {
       expect(review?.kind).toBe('include');
       if (review?.kind !== 'include') throw new Error('review is not an include');
       expect(review.with).toMatchObject({
+        scope: '$pr.output.number',
+        pr_number: '$pr.output.number',
+        pr_head: '$pr.output.head',
         work_order: '$INPUTS.work',
         errors: '$resolve-scope.output.errors',
         docs: '$classify.output.docs',
@@ -334,7 +349,12 @@ describe('bundled-defaults', () => {
       const recheck = corrections.loop_group.nodes.find(node => node.id === 'recheck');
       expect(recheck?.kind).toBe('include');
       if (recheck?.kind !== 'include') throw new Error('recheck is not an include');
-      expect(recheck.with).toMatchObject({ work_order: '$INPUTS.work' });
+      expect(recheck.with).toMatchObject({
+        scope: '$pr.output.number',
+        pr_number: '$pr.output.number',
+        pr_head: '$pr.output.head',
+        work_order: '$INPUTS.work',
+      });
 
       const gateReady = parsed.workflow.nodes.find(node => node.id === 'gate-ready');
       expect(gateReady?.kind).toBe('exec');
@@ -352,8 +372,17 @@ describe('bundled-defaults', () => {
       if (parsed.workflow === null) throw new Error(parsed.error.error);
 
       expect(parsed.workflow.inputs?.work_order?.default).toBe('');
+      expect(parsed.workflow.inputs?.pr_number?.default).toBe('');
+      expect(parsed.workflow.inputs?.pr_head?.default).toBe('');
+      const target = parsed.workflow.nodes.find(node => node.id === 'target');
+      expect(target?.kind).toBe('exec');
+      if (target?.kind !== 'exec') throw new Error('target is not executable');
+      const reviewBundle = BUNDLED_WORKFLOWS['archon-review'];
+      expect(reviewBundle).toContain('gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO"');
+      expect(reviewBundle).toContain('current branch');
+      expect(reviewBundle).toContain('does not match recorded branch');
       const scope = parsed.workflow.nodes.find(node => node.id === 'scope');
-      expect(scope?.depends_on).toEqual(['mode']);
+      expect(scope?.depends_on).toEqual(['mode', 'target']);
       expect(scope?.kind).toBe('agent');
       if (scope?.kind !== 'agent') throw new Error('scope is not an agent');
       expect(scope.output_format).toEqual({
@@ -531,8 +560,104 @@ describe('bundled-defaults', () => {
       expect(deliver).toContain('EXPECTED_BRANCH=$pr.output.head');
       expect(deliver).toContain('gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO"');
       expect(deliver).toContain('EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"');
+      expect(deliver).not.toContain('record_read git remote get-url origin');
+      expect(deliver).toContain('origin remote does not resolve to an owner/repo');
       expect(sync).toContain('INPUTS_PR_NUMBER');
       expect(sync).toContain('INPUTS_PR_HEAD');
+    });
+
+    it('refuses branch and PR-head mismatches before flipping ready', async () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+      const flipReady = parsed.workflow.nodes.find(node => node.id === 'flip-ready');
+      if (flipReady?.kind !== 'exec') throw new Error('flip-ready is not executable');
+      const producer = makeTestWorkflow({
+        name: 'recorded-pr',
+        nodes: [
+          {
+            id: 'pr',
+            prompt: 'recorded PR',
+            output_format: {
+              type: 'object',
+              properties: {
+                number: { type: 'integer' },
+                head: { type: 'string' },
+              },
+              required: ['number', 'head'],
+            },
+          },
+        ],
+      }).nodes[0];
+      const workflow = {
+        ...parsed.workflow,
+        name: 'run-owned-ready-flip',
+        nodes: [producer!, { ...flipReady, depends_on: ['pr'] }],
+      };
+      const directory = mkdtempSync(join(tmpdir(), 'archon-ready-flip-'));
+      const bin = join(directory, 'bin');
+      const log = join(directory, 'gh.log');
+      const previousPath = process.env.PATH;
+      const previousBranch = process.env.TEST_BRANCH;
+      const previousHead = process.env.TEST_REMOTE_HEAD;
+      const previousLog = process.env.GH_LOG;
+
+      try {
+        mkdirSync(bin);
+        writeFileSync(
+          join(bin, 'git'),
+          [
+            '#!/bin/sh',
+            'case "$1 $2 $3" in',
+            '  "remote get-url origin") printf "%s\\n" "https://token@example.com/repo.git" ;;',
+            '  "branch --show-current") printf "%s\\n" "$TEST_BRANCH" ;;',
+            'esac',
+          ].join('\n')
+        );
+        writeFileSync(
+          join(bin, 'gh'),
+          [
+            '#!/bin/sh',
+            'printf "%s\\n" "$*" >> "$GH_LOG"',
+            'if [ "$1" = "pr" ] && [ "$2" = "view" ]; then',
+            '  printf "%s\\n" "$TEST_REMOTE_HEAD"',
+            'fi',
+          ].join('\n')
+        );
+        chmodSync(join(bin, 'git'), 0o755);
+        chmodSync(join(bin, 'gh'), 0o755);
+        process.env.PATH = `${bin}:${previousPath ?? ''}`;
+        process.env.GH_LOG = log;
+
+        for (const [branch, remoteHead] of [
+          ['wrong-branch', 'recorded-branch'],
+          ['recorded-branch', 'wrong-branch'],
+        ]) {
+          writeFileSync(log, '');
+          process.env.TEST_BRANCH = branch;
+          process.env.TEST_REMOTE_HEAD = remoteHead;
+          const result = await dryRunWorkflow({
+            workflow,
+            userMessage: '',
+            cwd: directory,
+            stubs: { pr: { number: 42, head: 'recorded-branch' } },
+            execCode: true,
+          });
+
+          expect(result.outcome).toBe('failed');
+          expect(result.trace.find(entry => entry.nodeId === 'flip-ready')?.state).toBe('failed');
+          expect(readFileSync(log, 'utf-8')).not.toContain('pr ready');
+        }
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        if (previousBranch === undefined) delete process.env.TEST_BRANCH;
+        else process.env.TEST_BRANCH = previousBranch;
+        if (previousHead === undefined) delete process.env.TEST_REMOTE_HEAD;
+        else process.env.TEST_REMOTE_HEAD = previousHead;
+        if (previousLog === undefined) delete process.env.GH_LOG;
+        else process.env.GH_LOG = previousLog;
+        rmSync(directory, { recursive: true, force: true });
+      }
     });
   });
 });
