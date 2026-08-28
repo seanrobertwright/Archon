@@ -760,6 +760,45 @@ describe('dryRunWorkflow', () => {
     expect(result.missingStubs).toEqual(['gate']);
   });
 
+  test('tolerates a missing stub on an all_done node nested in a loop_group body (#2869)', async () => {
+    // simulateLoopGroup (dry-run.ts) dispatches every body node through this same
+    // single-node fallback, then fails the whole group if any body node ends up
+    // 'failed' — a body join that tolerates its own missing stub must keep the group
+    // (and the run) completing, not just the top-level dryRunWorkflow outcome field.
+    const workflow = makeTestWorkflow({
+      name: 'loop-group-join-tolerance',
+      nodes: [
+        {
+          id: 'group',
+          loop_group: {
+            until_bash: 'true',
+            max_iterations: 1,
+            nodes: [
+              { id: 'lens', prompt: 'lens' },
+              {
+                id: 'review-complete',
+                bash: 'true',
+                depends_on: ['lens'],
+                trigger_rule: 'all_done',
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.trace.find(entry => entry.nodeId === 'group')?.state).toBe('completed');
+    expect(result.trace.find(entry => entry.nodeId === 'review-complete')?.state).toBe('stubbed');
+    expect(result.missingStubs).toEqual(['review-complete']);
+  });
+
   test('executes bash only with execCode and captures failures', async () => {
     const success = makeTestWorkflow({
       name: 'bash-ok',
