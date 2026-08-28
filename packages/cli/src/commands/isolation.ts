@@ -115,11 +115,26 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
 
   const provider = getIsolationProvider();
   let cleaned = 0;
+  let skipped = 0;
   let failed = 0;
 
   for (const env of staleEnvs) {
     console.log(`\nCleaning: ${env.branch_name ?? env.workflow_id}`);
     console.log(`  Path: ${env.working_path}`);
+
+    // Same lock the cleanup-service sweeps use: a non-terminal run owning the
+    // environment blocks removal, even when the conversation recency filter
+    // marks the env stale.
+    const liveRun = await isolationDb.getLiveRunOwningEnv(env.id);
+    if (liveRun) {
+      getLog().info(
+        { envId: env.id, runId: liveRun.id, runStatus: liveRun.status },
+        'skip_stale_live_run'
+      );
+      console.log(`  Status: Skipped — run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`);
+      skipped++;
+      continue;
+    }
 
     try {
       await provider.destroy(env.working_path, {
@@ -138,7 +153,9 @@ export async function isolationCleanupCommand(daysStale = 7): Promise<void> {
     }
   }
 
-  console.log(`\nCleanup complete: ${String(cleaned)} cleaned, ${String(failed)} failed`);
+  console.log(
+    `\nCleanup complete: ${String(cleaned)} cleaned, ${String(skipped)} skipped, ${String(failed)} failed`
+  );
 
   // Reap orphaned container environments (terminal / run-less, older than the
   // threshold). Paused runs' containers are deliberately skipped (awaited state).

@@ -790,6 +790,70 @@ describe('runScheduledCleanup', () => {
     expect(report.removed).toHaveLength(0);
   });
 
+  test('skips stale environments with a live owning run', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-stale-live',
+        working_path: '/workspace/repo/worktrees/issue-12',
+        branch_name: 'issue-12',
+        status: 'active',
+        created_by_platform: 'github',
+        created_at: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000), // 30 days old
+        codebase_default_cwd: '/workspace/repo',
+        codebase_id: 'codebase-1',
+        workflow_type: 'issue',
+        workflow_id: '12',
+        provider: 'worktree',
+        metadata: {},
+      },
+    ]);
+    mockWorktreeExists.mockResolvedValueOnce(true);
+    // isBranchMerged stays false (default from beforeEach)
+    // getLastCommitDate stays null (default from beforeEach), so staleness
+    // falls back to the 30-day creation age.
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live-stale-1', status: 'running' });
+
+    const report = await runScheduledCleanup();
+
+    expect(report.skipped).toContainEqual({
+      id: 'env-stale-live',
+      reason: 'stale but run run-live is running',
+    });
+    expect(report.removed).toHaveLength(0);
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+  });
+
+  test('skips path-missing environments owned by a live run', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-missing-live',
+        working_path: '/workspace/repo/worktrees/issue-13',
+        branch_name: 'issue-13',
+        status: 'active',
+        created_by_platform: 'github',
+        created_at: new Date(),
+        codebase_default_cwd: '/workspace/repo',
+        codebase_id: 'codebase-1',
+        workflow_type: 'issue',
+        workflow_id: '13',
+        provider: 'worktree',
+        metadata: {},
+      },
+    ]);
+    // worktreeExists stays false (default from beforeEach): path missing
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-missing-live', status: 'paused' });
+
+    const report = await runScheduledCleanup();
+
+    expect(report.skipped).toContainEqual({
+      id: 'env-missing-live',
+      reason: 'path missing but run run-miss is paused',
+    });
+    expect(report.removed).toHaveLength(0);
+    expect(mockDestroy).not.toHaveBeenCalled();
+    expect(mockUpdateStatus).not.toHaveBeenCalled();
+  });
+
   test('skips telegram environments', async () => {
     mockListAllActiveWithCodebase.mockResolvedValueOnce([
       {
@@ -1905,5 +1969,30 @@ describe('cleanupStaleWorktrees', () => {
       branchName: 'dirty-stale-branch',
       reason: 'has uncommitted changes',
     });
+  });
+
+  test('skips stale worktrees owned by a live run', async () => {
+    mockListByCodebaseWithAge.mockResolvedValueOnce([
+      {
+        id: 'env-live-stale',
+        branch_name: 'live-stale-branch',
+        working_path: '/workspace/repo/worktrees/live-stale-branch',
+        created_by_platform: 'slack',
+        days_since_activity: 30,
+        status: 'active',
+      },
+    ]);
+
+    // hasUncommittedChanges returns false (default from beforeEach)
+    mockGetLiveRunOwningEnv.mockResolvedValueOnce({ id: 'run-live-stale', status: 'paused' });
+
+    const result = await cleanupStaleWorktrees('codebase-1', '/workspace/repo');
+
+    expect(result.removed).toHaveLength(0);
+    expect(result.skipped).toContainEqual({
+      branchName: 'live-stale-branch',
+      reason: 'run run-live is paused',
+    });
+    expect(mockGetById).not.toHaveBeenCalled();
   });
 });

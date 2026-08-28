@@ -488,6 +488,20 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
         // Check if path still exists
         const pathExists = await worktreeExists(toWorktreePath(env.working_path));
         if (!pathExists) {
+          // Even with the directory gone, marking the env destroyed invalidates
+          // the live run's resume handle — same lock as the merged/stale branches.
+          const liveRun = await isolationEnvDb.getLiveRunOwningEnv(env.id);
+          if (liveRun) {
+            report.skipped.push({
+              id: env.id,
+              reason: `path missing but run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`,
+            });
+            getLog().info(
+              { envId: env.id, runId: liveRun.id, runStatus: liveRun.status },
+              'skip_path_missing_live_run'
+            );
+            continue;
+          }
           // Path doesn't exist - call removeEnvironment to clean up branch and mark as destroyed
           const removeResult = await removeEnvironment(env.id, { force: false });
           if (removeResult.skippedReason) {

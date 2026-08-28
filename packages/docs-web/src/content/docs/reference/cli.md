@@ -689,6 +689,11 @@ The `gh` CLI is optional — if absent, only git signals are used.
 By default, branches with a **CLOSED** PR are skipped. Pass `--include-closed` to clean
 those up as well. Branches with an **OPEN** PR are always skipped.
 
+Environments owned by a non-terminal workflow run are never removed by either mode,
+regardless of age or merge state — the same live-run lock the scheduled sweep applies.
+Stale environments with quiet conversations still pass the activity filter; the
+live-run lock is what keeps them on disk until the run reaches a terminal status.
+
 ### `validate workflows [name]`
 
 Validate workflow YAML definitions and their referenced resources (command files, MCP configs, skill directories).
