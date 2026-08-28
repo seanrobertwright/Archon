@@ -183,6 +183,14 @@ describe('bundled-defaults', () => {
       expect(content).toContain('PR_NUMBER=$(cat $ARTIFACTS_DIR/.pr-number');
     });
 
+    it('classify-review-scope declares only its structured output fields', () => {
+      const content =
+        BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::classify-review-scope'];
+      expect(content).toContain('- `errors`, `docs` — booleans');
+      expect(content).toContain('- `reasons` — `{errors, docs}`');
+      expect(content).not.toContain('`tests`, `errors`, `comments`, `types`, `docs`');
+    });
+
     it('archon-create-pr should write .pr-number to artifacts', () => {
       const content = BUNDLED_COMMANDS['archon-create-pr'];
       expect(content).toContain('echo "$PR_NUMBER" > "$ARTIFACTS_DIR/.pr-number"');
@@ -304,6 +312,16 @@ describe('bundled-defaults', () => {
       expect(parsed.workflow.inputs?.work_order?.default).toBe('');
       const scope = parsed.workflow.nodes.find(node => node.id === 'scope');
       expect(scope?.depends_on).toEqual(['mode']);
+      expect(scope?.kind).toBe('agent');
+      if (scope?.kind !== 'agent') throw new Error('scope is not an agent');
+      expect(scope.output_format).toEqual({
+        type: 'object',
+        properties: { docs: { type: 'boolean' } },
+        required: ['docs'],
+      });
+      expect(parsed.workflow.inputs?.docs?.default).toBe('auto');
+      const docs = parsed.workflow.nodes.find(node => node.id === 'docs');
+      expect(docs?.when).toContain("$INPUTS.docs == 'auto' && $scope.output.docs == true");
 
       const specialists = ['code', 'seams', 'tests', 'errors', 'docs'];
       const reviewComplete = parsed.workflow.nodes.find(node => node.id === 'review-complete');

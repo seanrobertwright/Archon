@@ -17,7 +17,8 @@ classify:
     docs: "stub: changed shipped docs need impact review"
 resolve-scope: '{"errors":"false"}'
 review__mode: '{"continuation":false}'
-review__scope: "target recorded; head sha stubbed"
+review__scope:
+  docs: false
 review__code: "0 findings"
 review__seams: "0 findings"
 review__tests: "0 findings"
@@ -37,3 +38,4 @@ ci-probe: '{"state":"concluded","detail":"no checks configured on this repositor
 flip-ready: "https://github.com/example/repo/pull/2"
 fixture:
   expect: completed
+  reached: [review__docs]

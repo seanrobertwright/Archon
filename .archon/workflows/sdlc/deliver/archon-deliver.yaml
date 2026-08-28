@@ -68,8 +68,9 @@ nodes:
   # Review scope is decided from the actual PR, not declared blind at launch:
   # the diff is information that does not exist until the PR does. classify
   # judges whether errors and docs warrant their conditional lenses; resolve-scope
-  # then merges the operator's declared error override over that judgment, and
-  # its structured output is what every lens gate reads. Round 1 decides once,
+  # then merges the operator's declared error override over that judgment. Its
+  # output feeds the errors gate, while the classifier feeds the docs gate. Round
+  # 1 decides once,
   # and correction reviews preserve those concerns while one continuation
   # reviewer judges the prior report and correction delta.
   - id: classify

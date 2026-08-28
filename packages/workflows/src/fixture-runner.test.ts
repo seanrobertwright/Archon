@@ -139,6 +139,7 @@ describe('parseFixtureFile', () => {
       'x.stubs.yaml'
     );
     expect(parsed.declaration.expect).toBe('completed');
+    expect(parsed.declaration.reached).toBeUndefined();
     expect(parsed.execCode).toBe(false);
     expect(parsed.stubs).toEqual({ 'node-a': 'stub' });
   });
@@ -178,6 +179,23 @@ describe('runFixtures', () => {
     expect(report.passed).toBe(1);
     expect(report.failed).toBe(0);
     expect(report.results[0].outcome).toBe('completed');
+  });
+
+  it('requires declared nodes to complete or be stubbed', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    bash: echo yes\n' +
+        '  - id: node-b\n    prompt: later\n    depends_on: [node-a]\n    when: "$node-a.output == \'no\'"\n',
+      body: ['fixture:', '  reached: [node-b]', 'node-a: "yes"', 'node-b: "must run"'].join('\n'),
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.failed).toBe(1);
+    expect(report.results[0].failureReason).toBe('required nodes did not complete: node-b');
   });
 
   it('passes an expected failure that fails on exactly the declared node', async () => {

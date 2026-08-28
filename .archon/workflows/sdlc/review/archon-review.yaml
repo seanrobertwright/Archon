@@ -40,8 +40,10 @@ inputs:
     default: false
     description: Enable the silent-failure lens on a full review.
   docs:
-    default: false
-    description: Enable the docs-impact lens when the diff changes shipped documentation.
+    default: "auto"
+    description: >-
+      Docs-impact lens — auto selects shipped-documentation changes from the
+      reviewed diff; true or false overrides that selection.
 
 returns: synthesize
 outcome_field: ready
@@ -57,6 +59,11 @@ nodes:
     command: review-scope
     context: fresh
     depends_on: [mode]
+    output_format:
+      type: object
+      properties:
+        docs: { type: boolean }
+      required: [docs]
 
   # ── Default-on lenses ─────────────────────────────────────────────
   - id: code
@@ -100,7 +107,7 @@ nodes:
     command: review-docs
     context: fresh
     depends_on: [scope]
-    when: "$mode.output.continuation == false && $INPUTS.docs == 'true'"
+    when: "$mode.output.continuation == false && $INPUTS.docs == 'true' || $mode.output.continuation == false && $INPUTS.docs == 'auto' && $scope.output.docs == true"
     retry:
       max_attempts: 2
       delay_ms: 20000

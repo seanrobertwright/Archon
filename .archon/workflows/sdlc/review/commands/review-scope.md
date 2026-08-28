@@ -31,6 +31,12 @@ $ARGUMENTS
 - When `work_order` is empty and the target is a PR, use the PR body's problem/outcome and explicit scope or non-goals as the standalone review contract. Do not infer a broader promise from the changed files.
 - When neither supplies an explicit boundary, state that the review is using the requested scope and repository contracts without inventing a non-goal.
 
+## Select docs review
+
+Set `docs` true when the reviewed diff changes shipped documentation. Otherwise
+set it false. This selection applies only when the workflow's `docs` input is
+`auto`; an explicit input overrides it.
+
 ## Light mode (a prior report exists)
 
 When a prior-report path is supplied, require that it exists and read it in full. A missing supplied report is a broken continuation contract: fail with the path named instead of silently starting a full review. Extract its **reviewed-head cursor** (the SHA it records). For a PR target, this round's diff is **only the delta**: `git diff <cursor>..HEAD`. For a working-diff target, include that delta plus any uncommitted changes. The prior report remains the sole owner of earlier findings and review coverage; do not copy or rebuild them in scope.md.
@@ -48,4 +54,4 @@ Write `$ARTIFACTS_DIR/review/scope.md` containing:
 
 ## Verify before finishing
 
-Confirm `$ARTIFACTS_DIR/review/scope.md` exists, names the accepted contract and head SHA, and that the diff commands in it actually produce output in this checkout. Reply only: `review scope: $ARTIFACTS_DIR/review/scope.md`.
+Confirm `$ARTIFACTS_DIR/review/scope.md` exists, names the accepted contract and head SHA, and that the diff commands in it actually produce output in this checkout. Return `docs` as the boolean selected above.
