@@ -27,7 +27,9 @@ import {
   workflowWaitContextSchema,
   scheduledWorkflowResumeSchema,
   workflowWaitStepName,
+  runAttention,
 } from './schemas';
+import type { RunAttentionInput, SuspendReason, WorkflowRunStatus } from './schemas';
 import type {
   DagNode,
   AgentNode,
@@ -1841,5 +1843,194 @@ describe('readIdentityUnresolved (#2304)', () => {
       readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: null })
     ).toBeUndefined();
     expect(readIdentityUnresolved({ [RUN_METADATA_KEYS.identityUnresolved]: {} })).toBeUndefined();
+  });
+});
+
+describe('runAttention', () => {
+  const pausedOn = (approval: unknown, overrides: Partial<RunAttentionInput> = {}) =>
+    ({
+      id: 'run-1',
+      status: 'paused',
+      metadata: { approval },
+      completed_at: null,
+      ...overrides,
+    }) satisfies RunAttentionInput;
+
+  const gate = (over: Record<string, unknown> = {}) => ({
+    nodeId: 'review',
+    message: 'Approve the plan.',
+    ...over,
+  });
+
+  describe('still progressing under its own power', () => {
+    test.each(['pending', 'running'] as const)('returns null for a %s run', status => {
+      expect(runAttention({ id: 'run-1', status, metadata: {} })).toBeNull();
+    });
+
+    test('returns null for a resolved gate awaiting auto-resume', () => {
+      expect(runAttention(pausedOn(gate({ resolved: 'approved' })))).toBeNull();
+      expect(runAttention(pausedOn(gate({ resolved: 'rejected' })))).toBeNull();
+    });
+
+    test('returns null for a `wait:` pause — the clock owns it, not a person', () => {
+      const run = {
+        id: 'run-1',
+        status: 'paused' as const,
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'hold',
+            kind: 'time',
+            waitingSince: '2026-08-28T10:00:00.000Z',
+            resumeAt: '2026-08-28T11:00:00.000Z',
+          },
+        },
+      };
+      expect(runAttention(run)).toBeNull();
+    });
+
+    test('a resolved child_workflow gate is still nobody’s decision', () => {
+      // Order matters: resolution is checked before the child redirect, so a gate
+      // already resolved never re-addresses a human at the child.
+      expect(
+        runAttention(
+          pausedOn(gate({ type: 'child_workflow', childRunId: 'kid', resolved: 'approved' }))
+        )
+      ).toBeNull();
+    });
+  });
+
+  describe('terminal', () => {
+    test.each(['completed', 'failed', 'cancelled'] as const)('reports %s with its time', status => {
+      const at = new Date('2026-08-28T12:00:00.000Z');
+      expect(runAttention({ id: 'run-1', status, metadata: {}, completed_at: at })).toEqual({
+        kind: 'terminal',
+        runId: 'run-1',
+        status,
+        at,
+      });
+    });
+
+    test('carries a null time when the row has none', () => {
+      const attention = runAttention({ id: 'run-1', status: 'failed', metadata: {} });
+      expect(attention).toEqual({ kind: 'terminal', runId: 'run-1', status: 'failed', at: null });
+    });
+
+    test('a terminal status wins over leftover gate metadata', () => {
+      const attention = runAttention({
+        id: 'run-1',
+        status: 'cancelled',
+        metadata: { approval: gate() },
+      });
+      expect(attention?.kind).toBe('terminal');
+    });
+  });
+
+  describe('awaiting a human', () => {
+    // Every recognized reason EXCEPT child_workflow, plus the legacy undefined.
+    const humanReasons: (SuspendReason | undefined)[] = [
+      'approval',
+      'interactive_loop',
+      'writeback',
+      undefined,
+    ];
+
+    test.each(humanReasons)('addresses the decision at this run for type %s', type => {
+      const approval = type === undefined ? gate() : gate({ type });
+      expect(runAttention(pausedOn(approval))).toEqual({
+        kind: 'awaiting_human',
+        runId: 'run-1',
+        decideOn: { runId: 'run-1', nodeId: 'review' },
+        message: 'Approve the plan.',
+      });
+    });
+  });
+
+  describe('blocked on a child', () => {
+    test('reports the block and never claims a human is needed', () => {
+      // The parent row cannot tell "child on a gate" from "child still running",
+      // so asserting awaiting_human here would wake a host for normal progress.
+      const attention = runAttention(
+        pausedOn(gate({ type: 'child_workflow', nodeId: 'sub', childRunId: 'kid' }))
+      );
+      expect(attention).toEqual({
+        kind: 'blocked_on_child',
+        runId: 'run-1',
+        childRunId: 'kid',
+        nodeId: 'sub',
+      });
+    });
+
+    test('a block pointer with nothing to follow is unreadable, not a redirect', () => {
+      for (const childRunId of [undefined, '']) {
+        const attention = runAttention(
+          pausedOn(gate({ type: 'child_workflow', nodeId: 'sub', childRunId }))
+        );
+        expect(attention).toMatchObject({ kind: 'unreadable', reason: 'child_pointer_missing' });
+      }
+    });
+  });
+
+  describe('unreadable', () => {
+    test.each([undefined, null, {}, { nodeId: 'x' }, 'garbage', 42])(
+      'malformed gate metadata (%p) still needs a human',
+      approval => {
+        const attention = runAttention(pausedOn(approval));
+        expect(attention).toMatchObject({
+          kind: 'unreadable',
+          runId: 'run-1',
+          reason: 'malformed_gate',
+        });
+      }
+    );
+
+    test('an empty node id is no address at all', () => {
+      expect(runAttention(pausedOn(gate({ nodeId: '' })))).toMatchObject({
+        kind: 'unreadable',
+        reason: 'malformed_gate',
+      });
+    });
+
+    test('a gate type this build cannot resolve is unreadable', () => {
+      const attention = runAttention(pausedOn(gate({ type: 'from_the_future' })));
+      expect(attention).toMatchObject({
+        kind: 'unreadable',
+        reason: 'unrecognized_gate_type',
+      });
+      expect((attention as { detail: string }).detail).toContain('from_the_future');
+    });
+
+    test('a malformed gate is read before its type, so reject keeps tolerating it', () => {
+      // assertRejectable tolerates unreadable gate metadata but must refuse an
+      // unrecognized type. Ordering these the other way would flip that.
+      expect(runAttention(pausedOn({ type: 'from_the_future' }))).toMatchObject({
+        reason: 'malformed_gate',
+      });
+    });
+  });
+
+  test('a gate wins over a stale wait key, and neither is ever both', () => {
+    // The write helpers strip each other's key (writeApprovalMetadata /
+    // replaceWaitMetadata), so this pins the exclusivity rather than trusting it.
+    const attention = runAttention({
+      id: 'run-1',
+      status: 'paused',
+      metadata: {
+        approval: gate(),
+        wait: {
+          owner: 'node',
+          nodeId: 'hold',
+          kind: 'time',
+          waitingSince: '2026-08-28T10:00:00.000Z',
+          resumeAt: '2026-08-28T11:00:00.000Z',
+        },
+      },
+    });
+    expect(attention?.kind).toBe('awaiting_human');
+  });
+
+  test('an absent metadata bag on a paused run is unreadable, not silence', () => {
+    const attention = runAttention({ id: 'run-1', status: 'paused' as WorkflowRunStatus });
+    expect(attention).toMatchObject({ kind: 'unreadable', reason: 'malformed_gate' });
   });
 });

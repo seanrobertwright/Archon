@@ -2223,6 +2223,50 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
     expect(mockResolveApprovalGate).not.toHaveBeenCalled();
   });
 
+  // One derivation (`runAttention`) now answers the precondition for all three
+  // gate routes, so a corrupt block pointer and a gate type this build cannot
+  // resolve reach the console as 400s with the reason, not an opaque 500.
+  test('returns 400 explaining a block pointer with no child id, never naming <unknown>', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'parent-blocked-2',
+      metadata: {
+        approval: { type: 'child_workflow', nodeId: 'sub', message: 'Blocked on sub-run' },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/parent-blocked-2/approve', {
+      method: 'POST',
+      body: JSON.stringify({}),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toContain('the child run id is missing');
+    expect(body.error).not.toContain('<unknown>');
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('returns 400 for a gate type this build cannot resolve', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_PAUSED_RUN,
+      id: 'run-future-gate',
+      metadata: {
+        approval: { type: 'from_the_future', nodeId: 'gate', message: 'Decide' },
+      },
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-future-gate/approve', {
+      method: 'POST',
+      body: JSON.stringify({}),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error?: string };
+    expect(body.error).toContain("unrecognized gate type 'from_the_future'");
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
   test('returns 400 when the gate is already resolved (double-approve guard)', async () => {
     // Post-#2075 an approved run stays 'paused' with approval.resolved set —
     // the status check alone no longer blocks a second approve.

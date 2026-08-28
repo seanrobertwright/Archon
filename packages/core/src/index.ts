@@ -139,6 +139,12 @@ export {
 
 export { generateAndSetTitle } from './services/title-generator';
 
+export {
+  waitForRunAttention,
+  DEFAULT_ATTENTION_POLL_INTERVAL_MS,
+} from './services/run-attention-watch';
+export type { RunWaitResult, RunAttentionWaitOptions } from './services/run-attention-watch';
+
 // =============================================================================
 // State
 // =============================================================================

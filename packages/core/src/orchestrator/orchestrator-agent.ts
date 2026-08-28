@@ -95,7 +95,6 @@ import { reportUnpushedWorkInSource } from './post-message-reminder';
 import * as messageDb from '../db/messages';
 import * as workflowDb from '../db/workflows';
 import { getCodebaseEnvVars } from '../db/env-vars';
-import { isContainerRun } from '@archon/workflows/schemas/workflow-run';
 import {
   buildAiProfile,
   isLiteralSpec,
@@ -2280,11 +2279,7 @@ export async function handleMessage(
     const pausedGateRun = await workflowDb.getPausedWorkflowRun(conversation.id);
     const pausedGateContext = pausedGateRun
       ? formatPausedGateSection({
-          runId: pausedGateRun.id,
-          workflowName: pausedGateRun.workflow_name,
-          approval: pausedGateRun.metadata.approval,
-          // Chat cannot rewire a container, so it cannot continue such a run.
-          containerRun: isContainerRun(pausedGateRun),
+          run: pausedGateRun,
           // Both resolution routes — the `manage_run` tool and the CLI-pointer
           // section — are gated on a scoped project; without one the section
           // must not instruct the agent to use verbs it does not have.

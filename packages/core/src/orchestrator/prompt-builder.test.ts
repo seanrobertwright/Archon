@@ -193,11 +193,21 @@ describe('buildRunManagementSection', () => {
 });
 
 describe('formatPausedGateSection', () => {
-  const openGate = {
-    runId: 'run-abc',
-    workflowName: 'prd',
-    approval: { type: 'approval', nodeId: 'review', message: 'Approve the plan above.' },
-  };
+  /** A paused run carrying `approval`, in the shape formatPausedGateSection reads. */
+  const pausedRun = (approval: unknown, metadata: Record<string, unknown> = {}) => ({
+    run: {
+      id: 'run-abc',
+      workflow_name: 'prd',
+      status: 'paused' as const,
+      metadata: { approval, ...metadata },
+    },
+  });
+
+  const openGate = pausedRun({
+    type: 'approval',
+    nodeId: 'review',
+    message: 'Approve the plan above.',
+  });
 
   test('states the gate facts the agent needs to act on', () => {
     const section = formatPausedGateSection(openGate);
@@ -249,24 +259,22 @@ describe('formatPausedGateSection', () => {
   });
 
   test('quotes a multi-line gate message as a single block', () => {
-    const section = formatPausedGateSection({
-      ...openGate,
-      approval: { type: 'approval', nodeId: 'review', message: 'Line one\nLine two' },
-    });
+    const section = formatPausedGateSection(
+      pausedRun({ type: 'approval', nodeId: 'review', message: 'Line one\nLine two' })
+    );
 
     expect(section).toContain('> Line one\n> Line two');
   });
 
   test('names the loop iteration on an interactive-loop gate', () => {
-    const section = formatPausedGateSection({
-      ...openGate,
-      approval: {
+    const section = formatPausedGateSection(
+      pausedRun({
         type: 'interactive_loop',
         nodeId: 'refine',
         iteration: 3,
         message: 'Review the output',
-      },
-    });
+      })
+    );
 
     expect(section).toContain('Loop iteration: 3');
   });
@@ -275,18 +283,26 @@ describe('formatPausedGateSection', () => {
     // Resolved gates are waiting on the machine, not on a human — offering them
     // to the agent invites a second decision the operations reject.
     expect(
-      formatPausedGateSection({
-        ...openGate,
-        approval: { ...openGate.approval, resolved: 'approved' },
-      })
+      formatPausedGateSection(
+        pausedRun({
+          type: 'approval',
+          nodeId: 'review',
+          message: 'Approve the plan above.',
+          resolved: 'approved',
+        })
+      )
     ).toBe('');
   });
 
   test('points at the child run when the pause belongs to a sub-run', () => {
-    const section = formatPausedGateSection({
-      ...openGate,
-      approval: { type: 'child_workflow', nodeId: 'child', message: 'blocked', childRunId: 'kid' },
-    });
+    const section = formatPausedGateSection(
+      pausedRun({
+        type: 'child_workflow',
+        nodeId: 'child',
+        message: 'blocked',
+        childRunId: 'kid',
+      })
+    );
 
     expect(section).toContain('kid');
     expect(section).toContain('no gate you can resolve');
@@ -295,7 +311,9 @@ describe('formatPausedGateSection', () => {
   test('does not promise continuation for a container run', () => {
     // executeWorkflow refuses a resume it cannot rewire, so "the run continues"
     // is false here — the agent must send the user to the CLI instead.
-    const section = formatPausedGateSection({ ...openGate, containerRun: true });
+    const section = formatPausedGateSection(
+      pausedRun(openGate.run.metadata.approval, { isolation: 'container' })
+    );
 
     expect(section).not.toContain('no separate resume step');
     expect(section).toContain('isolation container');
@@ -317,10 +335,43 @@ describe('formatPausedGateSection', () => {
 
   test('falls back to the explicit commands when the approval context is unusable', () => {
     for (const approval of [undefined, null, {}, { nodeId: 'x' }, 'garbage']) {
-      const section = formatPausedGateSection({ ...openGate, approval });
+      const section = formatPausedGateSection(pausedRun(approval));
       expect(section).toContain('missing or malformed');
       expect(section).toContain('/workflow approve run-abc');
       expect(section).toContain('/workflow reject run-abc');
     }
+  });
+
+  test('does not advertise a gate this build cannot resolve as approvable', () => {
+    // A future/corrupt suspend reason reaches the projection as `unreadable`, so the
+    // agent is sent to the explicit commands instead of being told to decide a gate
+    // approveWorkflow would refuse.
+    const section = formatPausedGateSection(
+      pausedRun({ type: 'from_the_future', nodeId: 'review', message: 'Approve the plan above.' })
+    );
+
+    expect(section).toContain('missing or malformed');
+    expect(section).not.toContain('resolve the gate as APPROVED');
+  });
+
+  test('says nothing for a `wait:` pause — the clock owns it, not a person', () => {
+    const section = formatPausedGateSection({
+      run: {
+        id: 'run-abc',
+        workflow_name: 'prd',
+        status: 'paused',
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'hold',
+            kind: 'time',
+            waitingSince: '2026-08-28T10:00:00.000Z',
+            resumeAt: '2026-08-28T11:00:00.000Z',
+          },
+        },
+      },
+    });
+
+    expect(section).toBe('');
   });
 });

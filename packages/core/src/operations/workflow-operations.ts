@@ -10,12 +10,13 @@ import {
   isApprovalContext,
   isGateResolved,
   isRunBlockedOnChild,
-  isRecognizedSuspendReason,
+  runAttention,
 } from '@archon/workflows/schemas/workflow-run';
 import type {
   WorkflowRun,
   ApprovalContext,
   LoopGateRunMetadata,
+  RunAttention,
 } from '@archon/workflows/schemas/workflow-run';
 import * as workflowDb from '../db/workflows';
 import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
@@ -237,6 +238,31 @@ function resolvedNodeCompletedStepName(approval: ApprovalContext): string {
     : approval.nodeId;
 }
 
+/**
+ * The message for a gate `runAttention` could not read. Shared by approve and
+ * reject so a corrupt row explains itself the same way at both entry points.
+ * `malformed_gate` never reaches here from reject — that case stays rejectable.
+ */
+function unreadableGateMessage(
+  run: WorkflowRun,
+  attention: Extract<RunAttention, { kind: 'unreadable' }>,
+  approval: ApprovalContext | undefined
+): string {
+  switch (attention.reason) {
+    case 'malformed_gate':
+      return 'Workflow run is paused but missing approval context.';
+    case 'unrecognized_gate_type':
+      // Shares this conclusion with approveWorkflow/rejectWorkflow's own exhaustive
+      // switches (#2489) so a --detach precheck success can never diverge from what
+      // resolution actually does — see isRecognizedSuspendReason's doc comment.
+      return `Run ${run.id} has an unrecognized gate type '${String(approval?.type)}'. This Archon build cannot resolve it.`;
+    default:
+      // A block pointer with nothing to follow, or a chain the reader gave up on.
+      // Never a redirect naming '<unknown>' — that is a command nobody can run.
+      return `Run ${run.id} cannot be resolved: ${attention.detail}.`;
+  }
+}
+
 export function assertApprovable(run: WorkflowRun): ApprovalContext {
   if (run.status !== 'paused') {
     throw new Error(
@@ -247,53 +273,61 @@ export function assertApprovable(run: WorkflowRun): ApprovalContext {
   const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
     ? rawApproval
     : undefined;
-  if (!approval?.nodeId) {
-    throw new Error('Workflow run is paused but missing approval context.');
+  // `runAttention` owns the decision — is a human needed, and on which run. This
+  // function still reads the gate CONTEXT afterwards, because its callers need the
+  // decisions, session, and iteration the attention value deliberately omits.
+  const attention = runAttention(run);
+  switch (attention?.kind) {
+    case 'awaiting_human':
+      // Reported only for a well-formed, unresolved gate, so the context read above
+      // is present; the check keeps that provable to the compiler.
+      if (!approval) throw new Error('Workflow run is paused but missing approval context.');
+      return approval;
+    case 'blocked_on_child':
+      // A parent blocked on a `workflow:` sub-run has no approvable gate of its
+      // own — the pause resolves automatically when the child run completes.
+      // Falling through to the generic branch would stamp a node_completed for the
+      // parent's workflow node with empty output (the child's real output is then
+      // discarded on resume) and orphan the still-paused child. Redirect the
+      // operator to the child run, where the actual gate lives.
+      throw new Error(
+        `Run ${run.id} is paused waiting on sub-run ${attention.childRunId} ` +
+          `('workflow:' node '${attention.nodeId}'). Approve or reject the child run instead` +
+          `: /workflow approve ${attention.childRunId}`
+      );
+    case 'unreadable':
+      throw new Error(unreadableGateMessage(run, attention, approval));
+    case 'terminal':
+      // Unreachable: the status guard above already returned for every terminal status.
+      throw new Error(
+        `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
+      );
+    case undefined:
+      // Nothing needs a person. Either the gate is already resolved and the run is
+      // only awaiting auto-resume, or it is parked on a durable `wait:` with no gate.
+      //
+      // The resolved read is a fast-path friendly error for the common (sequential)
+      // case: the run stays 'paused' after a resolution, so the status check alone no
+      // longer blocks a second approve. It can still race a concurrent approve — the
+      // resolveApprovalGate CAS is the real arbiter; a second approve that slips past
+      // this read loses the atomic UPDATE and throws the same way.
+      throw new Error(
+        approval && isGateResolved(approval)
+          ? `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
+          : 'Workflow run is paused but missing approval context.'
+      );
   }
-  if (!isRecognizedSuspendReason(approval.type)) {
-    // Shares this check with rejectWorkflow's precondition gate and with
-    // approveWorkflow's own exhaustive switch (#2489) so a --detach precheck
-    // success can never diverge from what resolution actually does — see
-    // isRecognizedSuspendReason's doc comment.
-    throw new Error(
-      `Run ${run.id} has an unrecognized gate type '${String(approval.type)}'. This Archon build cannot resolve it.`
-    );
-  }
-  if (approval.type === 'child_workflow') {
-    // A parent blocked on a `workflow:` sub-run has no approvable gate of its
-    // own — the pause resolves automatically when the child run completes.
-    // Falling through to the generic branch would stamp a node_completed for the
-    // parent's workflow node with empty output (the child's real output is then
-    // discarded on resume) and orphan the still-paused child. Redirect the
-    // operator to the child run, where the actual gate lives.
-    throw new Error(
-      `Run ${run.id} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
-        `('workflow:' node '${approval.nodeId}'). Approve or reject the child run instead` +
-        (approval.childRunId ? `: /workflow approve ${approval.childRunId}` : '.')
-    );
-  }
-  if (isGateResolved(approval)) {
-    // Fast-path friendly error for the common (sequential) case. The run stays
-    // 'paused' after a resolution, so the status check alone no longer blocks a
-    // second approve. This in-memory read can still race a concurrent approve —
-    // the resolveApprovalGate CAS is the real arbiter; a second approve that
-    // slips past this read loses the atomic UPDATE and throws the same way.
-    throw new Error(
-      `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
-    );
-  }
-  return approval;
 }
 
 /**
- * The FOUR preconditions `rejectWorkflow` enforces. Deliberately NOT the same
- * gate as `assertApprovable`: reject has no `nodeId` requirement — it falls back
- * to `approval?.nodeId ?? 'unknown'` when writing its audit event, so a run whose
- * approval metadata fails `isApprovalContext` (missing/malformed `nodeId`/`message`)
- * is still legitimately rejectable. A well-formed context with an unrecognized
- * `type` is NOT one of those cases — it throws via the suspend-reason check below,
- * same as approve. Merging the two gates would either break reject or over-permit
- * approve.
+ * The preconditions `rejectWorkflow` enforces. Reads the same `runAttention`
+ * decision as `assertApprovable` but acts on one variant differently, and that
+ * difference is real: reject has no `nodeId` requirement — it falls back to
+ * `approval?.nodeId ?? 'unknown'` when writing its audit event, so a run whose gate
+ * metadata is unreadable (`malformed_gate`) is still legitimately rejectable. A
+ * well-formed context with an unrecognized `type` is NOT one of those cases — it
+ * throws, same as approve. Merging the two gates would either break reject or
+ * over-permit approve.
  */
 export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined {
   if (run.status !== 'paused') {
@@ -305,29 +339,36 @@ export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined 
   const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
     ? rawApproval
     : undefined;
-  if (!isRecognizedSuspendReason(approval?.type)) {
-    // Shares this check with assertApprovable and with rejectWorkflow's own
-    // exhaustive switch (#2489) — see isRecognizedSuspendReason's doc comment.
-    throw new Error(
-      `Run ${run.id} has an unrecognized gate type '${String(approval?.type)}'. This Archon build cannot resolve it.`
-    );
-  }
-  if (approval?.type === 'child_workflow') {
-    // Same redirect as assertApprovable: the parent's pause is not a rejectable
-    // gate — cancelling the parent here would silently orphan the still-paused
-    // child run. Reject the child (its own gate) or abandon the parent (which
-    // cascade-cancels the subtree) instead.
-    throw new Error(
-      `Run ${run.id} is paused waiting on sub-run ${approval.childRunId ?? '<unknown>'} ` +
-        `('workflow:' node '${approval.nodeId}'). Reject the child run instead` +
-        (approval.childRunId ? `: /workflow reject ${approval.childRunId}` : '.') +
-        ' To discard the whole tree, abandon this run.'
-    );
-  }
-  if (approval && isGateResolved(approval)) {
-    throw new Error(
-      `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
-    );
+  const attention = runAttention(run);
+  switch (attention?.kind) {
+    case 'blocked_on_child':
+      // Same redirect as assertApprovable: the parent's pause is not a rejectable
+      // gate — cancelling the parent here would silently orphan the still-paused
+      // child run. Reject the child (its own gate) or abandon the parent (which
+      // cascade-cancels the subtree) instead.
+      throw new Error(
+        `Run ${run.id} is paused waiting on sub-run ${attention.childRunId} ` +
+          `('workflow:' node '${attention.nodeId}'). Reject the child run instead` +
+          `: /workflow reject ${attention.childRunId}` +
+          ' To discard the whole tree, abandon this run.'
+      );
+    case 'unreadable':
+      // The one deliberate divergence from approve: unreadable gate METADATA is
+      // still rejectable (see this function's doc comment). An unrecognized gate
+      // TYPE is not, and neither is a block pointer with nothing to follow.
+      if (attention.reason === 'malformed_gate') break;
+      throw new Error(unreadableGateMessage(run, attention, approval));
+    case undefined:
+      if (approval && isGateResolved(approval)) {
+        throw new Error(
+          `Workflow run ${run.id} was already ${String(approval.resolved)} and is awaiting resume.`
+        );
+      }
+      break;
+    case 'awaiting_human':
+    case 'terminal':
+      // 'terminal' is unreachable: the status guard above already returned for it.
+      break;
   }
   return approval;
 }

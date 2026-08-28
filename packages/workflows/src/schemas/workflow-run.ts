@@ -119,12 +119,24 @@ export function isScheduledWorkflowResume(value: unknown): value is ScheduledWor
   return scheduledWorkflowResumeSchema.safeParse(value).success;
 }
 
+/**
+ * The narrow tuple behind `TERMINAL_WORKFLOW_STATUSES`. It exists only so
+ * `RunTerminalStatus` can be derived from the same list the runtime checks
+ * against — the exported constant keeps its widened element type because
+ * callers pass an arbitrary `WorkflowRunStatus` to `.includes()`.
+ */
+const TERMINAL_STATUS_TUPLE = ['completed', 'failed', 'cancelled'] as const;
+
 /** Statuses that indicate a run has finished and cannot transition further. */
-export const TERMINAL_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
-  'completed',
-  'failed',
-  'cancelled',
-] as const;
+export const TERMINAL_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = TERMINAL_STATUS_TUPLE;
+
+/** A finished run's status — the narrow half of `TERMINAL_WORKFLOW_STATUSES`. */
+export type RunTerminalStatus = (typeof TERMINAL_STATUS_TUPLE)[number];
+
+/** Narrowing membership test for `TERMINAL_WORKFLOW_STATUSES`. */
+export function isTerminalRunStatus(status: WorkflowRunStatus): status is RunTerminalStatus {
+  return TERMINAL_STATUS_TUPLE.some(terminal => terminal === status);
+}
 
 /** Statuses that allow a user to resume execution. */
 export const RESUMABLE_WORKFLOW_STATUSES: readonly WorkflowRunStatus[] = [
@@ -706,6 +718,154 @@ export function isApprovalContext(val: unknown): val is ApprovalContext {
     typeof (val as Record<string, unknown>).nodeId === 'string' &&
     typeof (val as Record<string, unknown>).message === 'string'
   );
+}
+
+// ---------------------------------------------------------------------------
+// RunAttention — "what does this run need from outside, if anything"
+// ---------------------------------------------------------------------------
+
+/** Where a human decision must be made — this run, or the child blocking it. */
+export interface GateAddress {
+  /** The run the decision is recorded against. NOT always the run that was asked about. */
+  runId: string;
+  /** The gate node inside that run. */
+  nodeId: string;
+}
+
+/**
+ * Why a run cannot be described. An enum rather than prose alone because the
+ * reasons are not interchangeable to a reader: `assertRejectable` still rejects a
+ * run whose gate metadata is unreadable, but must refuse one whose gate type this
+ * build does not know — and no caller should tell those apart by matching strings.
+ *
+ * `malformed_gate`, `unrecognized_gate_type`, and `child_pointer_missing` come from
+ * `runAttention` itself. `child_run_missing` and `child_chain_too_deep` can only be
+ * produced by a reader that follows a `blocked_on_child` pointer into the database
+ * (`waitForRunAttention`, @archon/core); the projection is pure and never does.
+ */
+export type RunAttentionUnreadableReason =
+  | 'malformed_gate'
+  | 'unrecognized_gate_type'
+  | 'child_pointer_missing'
+  | 'child_run_missing'
+  | 'child_chain_too_deep';
+
+/**
+ * A run has reached a state it will not leave without someone acting.
+ *
+ * `runAttention` returns null while the run is still progressing under its own
+ * power, which includes a resolved gate awaiting auto-resume and a `wait:` node
+ * whose timer or event has not fired.
+ *
+ * `blocked_on_child` is deliberately NOT an answer to "does a human need to act".
+ * A parent pauses blocked on a child whether that child is sitting on its own gate
+ * or merely still running (`pauseParentOnChild` is reached from two sites in
+ * dag-executor.ts, the second on a child that is `paused`, `running`, OR `pending`),
+ * and the parent row cannot tell those apart. Claiming `awaiting_human` here would
+ * wake a host for normal progress; returning null would strand one when the child
+ * really is on a gate. So the projection reports what it knows — this run is blocked
+ * on that child — and a reader with database access resolves the chain.
+ */
+export type RunAttention =
+  | { kind: 'terminal'; runId: string; status: RunTerminalStatus; at: Date | null }
+  | { kind: 'awaiting_human'; runId: string; decideOn: GateAddress; message: string }
+  | { kind: 'blocked_on_child'; runId: string; childRunId: string; nodeId: string }
+  | { kind: 'unreadable'; runId: string; reason: RunAttentionUnreadableReason; detail: string };
+
+/** The run shape `runAttention` reads. Structural so a caller can pass a partial row. */
+export interface RunAttentionInput {
+  id: string;
+  status: WorkflowRunStatus;
+  metadata?: Record<string, unknown>;
+  completed_at?: Date | null;
+}
+
+function unreadableAttention(
+  runId: string,
+  reason: RunAttentionUnreadableReason,
+  detail: string
+): RunAttention {
+  return { kind: 'unreadable', runId, reason, detail };
+}
+
+/**
+ * The single derivation of "what does this run need from outside, if anything".
+ *
+ * Pure: no database, no clock, no I/O. The run ROW is the authority — attention is
+ * never derived from the event log, because terminal transitions exist that write no
+ * terminal event (`resolveAndCancelApprovalGate` cancels a run while inserting only
+ * `approval_received`), and two gate pauses write an unreliable event or none at all.
+ *
+ * Consumed by `assertApprovable`/`assertRejectable`, the server approve/reject/respond
+ * routes, the orchestrator's paused-gate prompt section, and `waitForRunAttention`.
+ * Before this existed each of those re-derived the same four steps independently, in
+ * three different orders, and the load-bearing "act on the child, not this run"
+ * conclusion survived only inside an error string.
+ */
+export function runAttention(run: RunAttentionInput): RunAttention | null {
+  if (isTerminalRunStatus(run.status)) {
+    return { kind: 'terminal', runId: run.id, status: run.status, at: run.completed_at ?? null };
+  }
+  if (run.status !== 'paused') return null;
+
+  const raw = run.metadata?.approval;
+  if (raw === undefined) {
+    // No gate recorded. A durable `wait:` owns its own resumption — the clock or the
+    // awaited event, not a person. Anything else is a run parked with nothing that
+    // describes why, which only a human can unstick.
+    return isWorkflowWaitContext(run.metadata?.wait)
+      ? null
+      : unreadableAttention(
+          run.id,
+          'malformed_gate',
+          'paused with no approval gate and no durable wait recorded'
+        );
+  }
+  if (!isApprovalContext(raw) || raw.nodeId === '') {
+    // A gate WAS recorded but cannot be read, or names no node. An `awaiting_human`
+    // with an empty address would be a lie, so this stays unreadable.
+    return unreadableAttention(
+      run.id,
+      'malformed_gate',
+      'paused with an approval gate this build cannot read'
+    );
+  }
+  if (!isRecognizedSuspendReason(raw.type)) {
+    return unreadableAttention(
+      run.id,
+      'unrecognized_gate_type',
+      `unrecognized gate type '${String(raw.type)}'`
+    );
+  }
+  // Resolved: the machine is next, not a human (see `isGateResolved`).
+  if (isGateResolved(raw)) return null;
+
+  if (raw.type === 'child_workflow') {
+    if (raw.childRunId === undefined || raw.childRunId === '') {
+      // A block pointer with nothing to follow is a corrupt row, not a state to
+      // wait on — never a redirect naming '<unknown>'.
+      return unreadableAttention(
+        run.id,
+        'child_pointer_missing',
+        `blocked on a sub-run at node '${raw.nodeId}' but the child run id is missing`
+      );
+    }
+    return {
+      kind: 'blocked_on_child',
+      runId: run.id,
+      childRunId: raw.childRunId,
+      nodeId: raw.nodeId,
+    };
+  }
+
+  // Every remaining recognized reason — `approval`, `interactive_loop`, `writeback`,
+  // and `undefined` for legacy plain gates — is a person's decision.
+  return {
+    kind: 'awaiting_human',
+    runId: run.id,
+    decideOn: { runId: run.id, nodeId: raw.nodeId },
+    message: raw.message,
+  };
 }
 
 /**
