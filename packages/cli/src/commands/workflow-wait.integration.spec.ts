@@ -104,6 +104,19 @@ function expectWaitExit(
 }
 
 interface PendingWait {
+  /**
+   * Resolve once the wait has said, on stderr, that it is watching the run.
+   *
+   * This is the ordering a caller cannot otherwise establish. `waitForRunAttention`
+   * is durable, so a waiter that attaches after a transition reports exactly the same
+   * payload as one that was watching when it happened — which means a test can only
+   * claim the wake half of the contract if it knows the watch had begun. Sleeping
+   * first only made that likely; this makes it true or fails loudly.
+   *
+   * Rejects with everything the process wrote when it exits without announcing,
+   * rather than leaving the caller to time out on a promise that will never settle.
+   */
+  attached(): Promise<{ observedStatus: string }>;
   settled(): Promise<{ exitCode: number; payload: Record<string, unknown> }>;
 }
 
@@ -127,12 +140,66 @@ function startWait(fixture: Fixture, runId: string, timeoutSeconds: number): Pen
       stderr: 'pipe',
     }
   );
+
+  let announce: ((progress: { observedStatus: string }) => void) | undefined;
+  let abandon: ((error: Error) => void) | undefined;
+  const attached = new Promise<{ observedStatus: string }>((resolve, reject) => {
+    announce = resolve;
+    abandon = reject;
+  });
+  // A test that never asks about the attachment must not turn a legitimately
+  // unannounced exit into an unhandled rejection.
+  attached.catch(() => undefined);
+
+  // One drain owns stderr: it hands the progress line over as it arrives and keeps
+  // the whole text for `settled()`'s diagnostics. Two readers of the same stream
+  // would leave which one saw what up to scheduling.
+  const stderrText = (async (): Promise<string> => {
+    const decoder = new TextDecoder();
+    let text = '';
+    let scanned = 0;
+    const scan = (): void => {
+      for (
+        let newline = text.indexOf('\n', scanned);
+        announce && newline !== -1;
+        newline = text.indexOf('\n', scanned)
+      ) {
+        const line = text.slice(scanned, newline).trim();
+        scanned = newline + 1;
+        // Scan lines rather than assume the first one: `--json` silences logging, so
+        // the progress envelope is normally alone here, but a diagnostic on stderr
+        // must not be mistaken for it.
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const progress = parsed as { result?: unknown; observedStatus?: unknown };
+        if (progress.result === 'waiting' && typeof progress.observedStatus === 'string') {
+          announce({ observedStatus: progress.observedStatus });
+          announce = undefined;
+        }
+      }
+    };
+    for await (const chunk of child.stderr) {
+      text += decoder.decode(chunk, { stream: true });
+      scan();
+    }
+    text += decoder.decode();
+    scan();
+    // Only when nothing was announced — `announce` is cleared the moment it fires.
+    if (announce) abandon?.(new Error(`wait exited without announcing that it attached: ${text}`));
+    return text;
+  })();
+
   return {
+    attached: (): Promise<{ observedStatus: string }> => attached,
     async settled(): Promise<{ exitCode: number; payload: Record<string, unknown> }> {
       const [exitCode, stdout, stderr] = await Promise.all([
         child.exited,
         new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
+        stderrText,
       ]);
       // `--json` silences logging, so stdout is exactly one (pretty-printed) document.
       let payload: Record<string, unknown>;
@@ -202,8 +269,25 @@ function readRunId(archonHome: string, workflowName: string): string | undefined
   }
 }
 
+/** The status of one run, read straight from the database file. */
+function readRunStatus(archonHome: string, runId: string): string | undefined {
+  const databasePath = join(archonHome, 'archon.db');
+  if (!existsSync(databasePath)) return undefined;
+  const database = new Database(databasePath, { readonly: true });
+  try {
+    return database
+      .query<{ status: string }, [string]>(
+        `SELECT status FROM remote_agent_workflow_runs
+         WHERE id = ?`
+      )
+      .get(runId)?.status;
+  } finally {
+    database.close();
+  }
+}
+
 /**
- * Poll `read` until it produces a value.
+ * Poll `read` until it produces a value, naming `what` if it never does.
  *
  * The catch is load bearing, not defensive: an owner process creates `archon.db`
  * BEFORE it applies the schema, so a reader that opens the file inside that window
@@ -212,7 +296,7 @@ function readRunId(archonHome: string, workflowName: string): string | undefined
  * (#2306). `workflow-terminal-event.integration.spec.ts` catches for exactly this
  * reason; a bare loop here would surface a startup race as a test failure.
  */
-async function waitFor<T>(read: () => T | undefined, timeoutMs = 30_000): Promise<T> {
+async function waitFor<T>(what: string, read: () => T | undefined, timeoutMs = 30_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
   while (Date.now() < deadline) {
@@ -225,7 +309,7 @@ async function waitFor<T>(read: () => T | undefined, timeoutMs = 30_000): Promis
     await Bun.sleep(50);
   }
   const detail = lastError instanceof Error ? `: ${lastError.message}` : '';
-  throw new Error(`Timed out waiting for the run row${detail}`);
+  throw new Error(`Timed out waiting for ${what}${detail}`);
 }
 
 describe('archon workflow wait against a detached run', () => {
@@ -292,7 +376,9 @@ describe('archon workflow wait against a detached run', () => {
 
     // Discovering the id is test setup, not the contract under test — the launcher
     // above has no `--detach --json` ack to carry one.
-    const runId = await waitFor(() => readRunId(fixture.archonHome, 'wait-gated'));
+    const runId = await waitFor('the gated run row', () =>
+      readRunId(fixture.archonHome, 'wait-gated')
+    );
     activeRunIds.add(runId);
 
     // Attached while the warm-up node is still running, so the gate is a WAKE.
@@ -334,10 +420,23 @@ describe('archon workflow wait against a detached run', () => {
     });
     const { runId } = await launchDetached(fixture, 'wait-slow');
 
+    // `cancel` stops LIVE work: it refuses a run that is still 'pending' outright, and
+    // the tree it terminates has to exist. The forked owner starts its control endpoint
+    // before it executes anything, so the row reaching 'running' is one observation
+    // that covers both. Guessing 1.5s here instead is what failed on Windows — as
+    // "Cannot actively cancel run with status 'pending'" and as a taskkill walking a
+    // tree that was still spawning (#2982).
+    await waitFor('the detached owner to start running', () =>
+      readRunStatus(fixture.archonHome, runId) === 'running' ? true : undefined
+    );
+
     const waiter = startWait(fixture, runId, 90);
-    // Let the waiter attach before the run is stopped, so what ends this wait is the
-    // wake and not a durable read of an already-cancelled row.
-    await Bun.sleep(1500);
+    // The wait announces itself once it has read the row and found nothing to report,
+    // so cancelling after this line is a WAKE and not a durable read of an
+    // already-cancelled row. The status it announces is the proof it attached to a run
+    // that was still live.
+    expect(await waiter.attached()).toEqual({ observedStatus: 'running' });
+
     const cancelled = await runCli(fixture, ['workflow', 'cancel', runId]);
     if (cancelled.exitCode !== 0) {
       throw new Error(`cancel failed: ${cancelled.stderr || cancelled.stdout}`);
