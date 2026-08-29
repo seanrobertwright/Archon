@@ -957,10 +957,10 @@ describe('validateWorkflowResources — tool-name validation', () => {
 });
 
 // =============================================================================
-// validateWorkflowResources — bash double-quote lint
+// validateWorkflowResources — bash quoted-output lint
 // =============================================================================
 
-describe('validateWorkflowResources — bash double-quote lint', () => {
+describe('validateWorkflowResources — bash quoted-output lint', () => {
   test('no warning when bash uses correct unquoted idiom', async () => {
     const workflow = makeWorkflow('test', [
       {
@@ -988,7 +988,7 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
     expect(warnings).toHaveLength(1);
     expect(warnings[0].nodeId).toBe('check');
-    expect(warnings[0].message).toContain('double-quoting');
+    expect(warnings[0].message).toContain('wrapping');
     expect(warnings[0].hint).toContain('var=$node.output.field');
   });
 
@@ -1020,7 +1020,7 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     expect(warnings).toHaveLength(0);
   });
 
-  test('no warning when $nodeId.output is inside single quotes', async () => {
+  test('warning when bash body has single-quoted $nodeId.output.field', async () => {
     const workflow = makeWorkflow('test', [
       {
         id: 'check',
@@ -1031,7 +1031,8 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
     const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
-    expect(warnings).toHaveLength(0);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain('wrapping');
   });
 
   test('no false positive: a prior double-quoted string before an unquoted ref on the same line', async () => {
@@ -1043,6 +1044,20 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
         kind: 'exec',
         runtime: 'sh',
         script: 'echo "Build complete."; result=$build.output.score',
+      } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
+    expect(warnings).toHaveLength(0);
+  });
+
+  test('no false positive: a prior single-quoted string before an unquoted ref on the same line', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'check',
+        kind: 'exec',
+        runtime: 'sh',
+        script: "echo 'Build complete.'; result=$build.output.score",
       } as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
@@ -1067,7 +1082,7 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     const issues = await validateWorkflowResources(workflow, tmpDir);
     const warnings = issues.filter(i => i.level === 'warning' && i.field === 'loop.until_bash');
     expect(warnings).toHaveLength(1);
-    expect(warnings[0].message).toContain('double-quoting');
+    expect(warnings[0].message).toContain('wrapping');
   });
 
   test('warns on double-quoted output refs in top-level and nested loop_groups', async () => {
@@ -1098,7 +1113,7 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     );
     expect(warnings).toHaveLength(2);
     expect(warnings.map(warning => warning.nodeId)).toEqual(['outer', 'inner']);
-    expect(warnings.every(warning => warning.message.includes('double-quoting'))).toBe(true);
+    expect(warnings.every(warning => warning.message.includes('wrapping'))).toBe(true);
   });
 
   test('does not warn on an unquoted output ref in loop_group until_bash', async () => {
