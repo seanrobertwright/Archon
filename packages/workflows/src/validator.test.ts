@@ -1006,7 +1006,11 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
     expect(warnings).toHaveLength(1);
   });
 
-  test('script nodes are exempt from the double-quote lint', async () => {
+  test('script nodes are exempt from the quoted-output lint', async () => {
+    // A `bun` script is not shell source, so quoting a ref there is correct TypeScript.
+    // Asserted across every field, not just `bash`: the lint selects fields by the
+    // template walker's `shell` surface, and dropping that filter would report the
+    // `script` slot (and prompts, and conditions) under their own field names.
     const workflow = makeWorkflow('test', [
       {
         id: 'check',
@@ -1016,8 +1020,7 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
       } as unknown as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
-    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
-    expect(warnings).toHaveLength(0);
+    expect(issues.filter(i => i.message.includes('wrapping'))).toHaveLength(0);
   });
 
   test('warning when bash body has single-quoted $nodeId.output.field', async () => {
@@ -1037,7 +1040,9 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
 
   test('warns on single-quoted output refs in loop and loop_group until_bash', async () => {
     // until_bash substitutes through the same pre-quoting path, so the single-quoted
-    // form is as wrong there as in a bash body.
+    // form is as wrong there as in a bash body. The loop_group case uses the
+    // $LOOP_PREV grammar, which the lint has to look for separately — a plain
+    // $id.output pattern does not match it.
     const workflow = makeWorkflow('test', [
       {
         id: 'loop-single',
@@ -1052,7 +1057,7 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
         id: 'group-single',
         kind: 'loop_group',
         loop_group: {
-          until_bash: "status='$probe.output.status'",
+          until_bash: "status='$LOOP_PREV.probe.output.status'",
           max_iterations: 2,
           nodes: [{ id: 'probe', kind: 'exec', runtime: 'sh', script: 'echo pending' }],
         },
@@ -1066,11 +1071,13 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
     ]);
   });
 
-  test('no false positive: an apostrophe in a # comment or a quoted heredoc delimiter', async () => {
-    // Both bodies are reduced from shipped workflows (archon-deliver's flip-ready,
-    // t1-fix-issue's open-pr). A lone apostrophe in prose, or the `'` of a quoted
-    // heredoc delimiter, must not open a string region that swallows a later,
-    // correctly-unquoted ref.
+  test('no false positive: prose apostrophes and heredoc bodies elsewhere in the script', async () => {
+    // Both bodies are reduced from shipped workflows that a whole-body quote scanner
+    // reported (archon-deliver's flip-ready, t1-fix-issue's open-pr). In `commented`
+    // the apostrophe of "gh's" opens nothing because it is mid-word; in `heredoc` the
+    // `--body "$(cat <<...` double quote stays open to the end of its own line, and
+    // only line-locality stops it from reaching the refs on the lines below. Every
+    // ref in both bodies is correctly unquoted.
     const workflow = makeWorkflow('test', [
       {
         id: 'commented',
@@ -1083,7 +1090,26 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
         id: 'heredoc',
         kind: 'exec',
         runtime: 'sh',
-        script: "cat <<'ARCHON_EOF' > body.md\nreport text\nARCHON_EOF\nPR_URL=$pr.output.url",
+        script:
+          'gh pr create --title "fix" --body "$(cat <<\'ARCHON_EOF\'\n## Assessment\n$assess.output.reason\nARCHON_EOF\n)"',
+      } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
+    expect(warnings).toHaveLength(0);
+  });
+
+  test("no false positive: an unbalanced apostrophe earlier on the ref's own line", async () => {
+    // Line-locality alone does not cover this: the apostrophe is on the SAME line as
+    // the ref and never closes, so only the operand-boundary rule (a quote must open
+    // at line start, after `=`, or after whitespace) keeps `$build.output.score` —
+    // which is correctly unquoted — from being reported.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'check',
+        kind: 'exec',
+        runtime: 'sh',
+        script: "echo don't; result=$build.output.score",
       } as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
@@ -1164,11 +1190,14 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
       } as unknown as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
-    const warnings = issues.filter(
-      i => i.level === 'warning' && i.field === 'loop_group.until_bash'
-    );
-    expect(warnings).toHaveLength(2);
-    expect(warnings.map(warning => warning.nodeId)).toEqual(['outer', 'inner']);
+    const warnings = issues.filter(i => i.level === 'warning');
+    // Every warning is listed, not just the ones on the expected field: a body node is
+    // reached once through the validator's own flattening, so the lint must not also
+    // walk into loop_group bodies and report `inner` a second time under a nested path.
+    expect(warnings.map(warning => [warning.nodeId, warning.field])).toEqual([
+      ['outer', 'loop_group.until_bash'],
+      ['inner', 'loop_group.until_bash'],
+    ]);
     expect(warnings.every(warning => warning.message.includes('wrapping'))).toBe(true);
   });
 

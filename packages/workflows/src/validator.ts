@@ -47,7 +47,9 @@ import {
   isWorkflowNode,
 } from './schemas';
 import { parseWorkflow } from './loader';
+import { LOOP_PREV_OUTPUT_REF_SOURCE, OUTPUT_REF_SOURCE } from './output-ref';
 import { resolveWorkflowName } from './router';
+import { visitNodeTemplateSlots } from './template-walker';
 import type { WorkflowDefinition, DagNode, IncludeDirective, WorkflowSource } from './schemas';
 import type { ScriptRuntime } from './script-discovery';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -878,42 +880,66 @@ export async function validateWorkflowResources(
     //   wrong="$n.output.field" → wrong="'ok'" (quote characters become part of the value)
     //   right=$n.output.field   → right='ok' → bash assigns: ok
     //
-    // Both quote characters open a region bash treats as a string, so both forms
-    // are matched. The two alternatives are kept separate (rather than one class)
-    // because the closing quote must be the SAME character as the opening one.
+    // The template walker owns which fields are shell source and where the refs in
+    // them are: `surface: 'shell'` is the same tag dag-executor.ts reads to decide a
+    // slot gets the pre-quoted substitution, so a future shell slot inherits this lint
+    // instead of silently escaping it (#2996). Nothing here re-discovers either fact.
     //
-    // The `(?:^|[=\s])` prefix requires the opening quote to be an operand (line
-    // start, after `=`, or after whitespace) so a *closing* quote of an unrelated
-    // earlier string doesn't cause a false positive (e.g. `echo "hi"; x=$a.output`).
-    // That anchor is why this stays a regex instead of a quote-state scanner: a
-    // scanner has to know which quotes are real, and bash bodies are full of
-    // apostrophes that are not — prose in `#` comments (`the issue's claims`) and
-    // quoted heredoc delimiters (`<<'EOF'`). Those desync a scanner and make it
-    // report correct, unquoted code. Anchoring gives that up in exchange: a quoted
-    // ref reached from a non-operand position (`<<<"$n.output"`) is not reported.
-    // `[^"\n]` / `[^'\n]` exclude newlines — a quote spanning lines is pathological,
-    // and allowing it is the other half of the comment/heredoc desync.
-    const quotedOutputRef =
-      /(?:^|[=\s])(?:"[^"\n]*|'[^'\n]*)\$(?:[a-zA-Z_][a-zA-Z0-9_-]*\.output|LOOP_PREV\.[a-zA-Z_][a-zA-Z0-9_-]*\.output)/m;
-    const warnQuotedOutputRef = (body: string, field: string): void => {
-      if (quotedOutputRef.test(body)) {
+    // Given a ref position, the only question left is whether bash sees it inside a
+    // string, and that is decided on the ref's OWN line: replay the quote state from
+    // the line start up to the ref. Two rules, each load-bearing against a real body:
+    //
+    //   Line-local — a quote that is still open at end of line does not reach the
+    //   lines below. `gh pr create --body "$(cat <<'EOF'` leaves a `"` open for the
+    //   rest of the heredoc, and the refs inside it are correctly unquoted.
+    //
+    //   Operand boundary — the opening quote must sit at line start, after `=`, or
+    //   after whitespace. Without it a mid-word apostrophe opens a phantom string
+    //   (`echo don't; x=$a.output`), and so does the *closing* quote of an earlier
+    //   string (`echo "hi"; x=$a.output`). Both are correct code.
+    //
+    // The boundary rule costs one true positive: a quoted ref reached from a
+    // non-operand position, as in `x=prefix"$n.output"` or `<<<"$n.output"`.
+    const opensAtOperandBoundary = (character: string | undefined): boolean =>
+      character === undefined || character === '=' || /\s/.test(character);
+    const isQuotedAt = (body: string, refIndex: number): boolean => {
+      let quote: string | undefined;
+      let openedAtBoundary = false;
+      for (let index = body.lastIndexOf('\n', refIndex - 1) + 1; index < refIndex; index += 1) {
+        const character = body[index];
+        if (quote === undefined) {
+          if (character === '"' || character === "'") {
+            quote = character;
+            openedAtBoundary = opensAtOperandBoundary(body[index - 1]);
+          }
+        } else if (character === quote) {
+          quote = undefined;
+        }
+      }
+      return quote !== undefined && openedAtBoundary;
+    };
+    visitNodeTemplateSlots(
+      node,
+      slot => {
+        if (slot.surface !== 'shell') return;
+        // Built per slot: a `g`-flagged instance carries mutable lastIndex.
+        const refFinder = new RegExp(`${LOOP_PREV_OUTPUT_REF_SOURCE}|${OUTPUT_REF_SOURCE}`, 'g');
+        const quoted = Array.from(slot.value.matchAll(refFinder)).some(match =>
+          isQuotedAt(slot.value, match.index)
+        );
+        if (!quoted) return;
         issues.push({
           level: 'warning',
           nodeId: node.id,
-          field,
+          field: slot.path,
           message:
             '`"$nodeId.output"` / `\'$nodeId.output\'` / `"$LOOP_PREV.nodeId.output"` / `\'$LOOP_PREV.nodeId.output\'` — wrapping a substitution that is already shell-quoted by Archon produces the wrong value',
           hint: 'Use `var=$node.output.field` or `var=$LOOP_PREV.node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so wrapping is harmless for those, but the rule is uniform.)',
         });
-      }
-    };
-    if (isExecNode(node) && node.runtime === 'sh') warnQuotedOutputRef(node.script, 'bash');
-    if (isLoopNode(node) && node.loop.until_bash) {
-      warnQuotedOutputRef(node.loop.until_bash, 'loop.until_bash');
-    }
-    if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-      warnQuotedOutputRef(node.loop_group.until_bash, 'loop_group.until_bash');
-    }
+      },
+      // Body nodes of a loop_group are already in `allNodes`; recursing would double-report.
+      { recursive: false }
+    );
   }
 
   return issues;
