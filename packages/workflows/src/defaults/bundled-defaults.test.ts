@@ -465,9 +465,9 @@ describe('bundled-defaults', () => {
           join(bin, 'git'),
           [
             '#!/bin/sh',
-            'case "$1 $2 $3" in',
+            'case "$*" in',
             '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
-            '  "branch --show-current ") printf "%s\\n" "recorded-branch" ;;',
+            '  "branch --show-current") printf "%s\\n" "recorded-branch" ;;',
             'esac',
           ].join('\n')
         );
@@ -511,6 +511,47 @@ describe('bundled-defaults', () => {
         else process.env.PATH = previousPath;
         if (previousLog === undefined) delete process.env.GH_LOG;
         else process.env.GH_LOG = previousLog;
+        await removeTempTree(directory);
+      }
+    });
+
+    it('refuses a half-supplied run-owned PR record, and skips without one', async () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-review'], 'archon-review.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+      const target = parsed.workflow.nodes.find(node => node.id === 'target');
+      if (target?.kind !== 'exec') throw new Error('target is not executable');
+      const workflow = { ...parsed.workflow, name: 'partial-review-target', nodes: [target] };
+      const directory = mkdtempSync(join(tmpdir(), 'archon-review-partial-'));
+
+      try {
+        // Both halves declared but only one supplied: the node must SAY so. Under
+        // `set -u` an input the engine never exported would abort with a shell
+        // error instead — the failure class that stalled this workflow (R5).
+        for (const inputs of [{ pr_number: '42' }, { pr_head: 'recorded-branch' }]) {
+          const result = await dryRunWorkflow({
+            workflow,
+            userMessage: '',
+            cwd: directory,
+            inputs,
+            execCode: true,
+          });
+          expect(result.outcome).toBe('failed');
+          expect(result.trace[0]?.reason).toContain(
+            'delivery-owned review requires both pr_number and pr_head'
+          );
+        }
+
+        // Neither supplied: standalone review, the preflight does not apply.
+        const standalone = await dryRunWorkflow({
+          workflow,
+          userMessage: '',
+          cwd: directory,
+          inputs: {},
+          execCode: true,
+        });
+        expect(standalone.outcome).toBe('completed');
+        expect(standalone.trace[0]?.state).toBe('skipped');
+      } finally {
         await removeTempTree(directory);
       }
     });
