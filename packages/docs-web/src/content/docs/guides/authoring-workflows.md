@@ -520,8 +520,8 @@ than you asked. Declare the shape you are branching on instead:
 Unaffected: `bash:` and `script:` producers keep whole-output comparison
 (`when: "$check.output == 'true'"`) because their stdout is author-controlled and exact by
 construction, and so do `approval:` captures (a human typed them) and `workflow:` sub-run
-results (the callee owns that contract). A field access (`$analyze.output.status`) is
-always allowed.
+results (the callee owns that contract). A scalar field access (`$analyze.output.status`) is
+allowed.
 
 **A `loop:` opts out the same way a `prompt:` node does** — declare `output_format` on it
 and the loop's output becomes the validated JSON document, so `$loop.output.field` is

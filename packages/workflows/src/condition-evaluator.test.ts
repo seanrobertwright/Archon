@@ -107,6 +107,29 @@ describe('evaluateCondition', () => {
       "Condition reference '$setup.output.config' resolved to an object"
     );
   });
+
+  it('rejects structured fields from the previous loop iteration', () => {
+    mockLogFn.mockClear();
+    const priorOutputs = new Map([
+      ['work', makeOutput(JSON.stringify({ route: { ready: true } }))],
+    ]);
+
+    expect(() =>
+      evaluateCondition("$LOOP_PREV.work.output.route == 'true'", new Map(), undefined, {
+        loopPrevOutputs: priorOutputs,
+      })
+    ).toThrow("Condition reference '$work.output.route' resolved to an object");
+    expect(mockLogFn).toHaveBeenCalledWith(
+      {
+        nodeId: 'work',
+        field: 'route',
+        actualType: 'object',
+        exprSnippet: "$LOOP_PREV.work.output.route == 'true'",
+      },
+      'dag.condition_field_not_primitive'
+    );
+  });
+
   it('dot notation: throws on a field ref when schemaless output is not JSON (no-silent-drop)', () => {
     const outputs = new Map([['classify', makeOutput('not-json')]]);
     // A `.field` ref on a schemaless node whose output is not a JSON object is a
