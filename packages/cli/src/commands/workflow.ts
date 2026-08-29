@@ -1853,9 +1853,15 @@ async function runWorkflowWithOwnedSource(
       await writeStdout(`${formatDryRunTrace(result)}\n`);
     }
     if (result.outcome === 'failed') {
+      // Same filter `checkFixture` applies: a stub an `all_done` join tolerated
+      // never blocked anything, so naming it as a cause of this failure points
+      // the reader at the wrong node (#2869).
+      const blockingMissingStubs = result.missingStubs.filter(
+        nodeId => !result.toleratedMissingStubs.includes(nodeId)
+      );
       throw new Error(
-        result.missingStubs.length > 0
-          ? `Dry-run failed; missing stubs: ${result.missingStubs.join(', ')}`
+        blockingMissingStubs.length > 0
+          ? `Dry-run failed; missing stubs: ${blockingMissingStubs.join(', ')}`
           : 'Dry-run failed. See the trace for details.'
       );
     }

@@ -1104,11 +1104,14 @@ async function simulateNode(
     // stays honest about what it never verified.
     const tolerated = stub === undefined && node.trigger_rule === 'all_done';
     if (stub !== undefined || tolerated) {
-      if (tolerated) {
-        ctx.missingStubs.add(node.id);
-        ctx.toleratedMissingStubs.add(node.id);
-      }
+      if (tolerated) ctx.missingStubs.add(node.id);
+      // The tolerance claim waits for the placeholder to exist. `generatedStubFor`
+      // throws on an `output_format` it cannot satisfy, and the catch around this
+      // whole body then fails the node — so a node added to `toleratedMissingStubs`
+      // any earlier would report a gap that never blocked it while that gap is
+      // exactly what blocked it, and `checkFixture` would filter the blocker away.
       const hydrated = completedOutput(node, stub ?? generatedStubFor(node));
+      if (tolerated) ctx.toleratedMissingStubs.add(node.id);
       outputs.set(node.id, hydrated);
       ctx.trace.push({
         nodeId: node.id,

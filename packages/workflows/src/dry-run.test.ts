@@ -1827,3 +1827,41 @@ describe('resolveWorkflowModelScope — the origin names the value that won', ()
     expect(scope.providerOrigin).toBe('default assistant');
   });
 });
+
+describe('all_done tolerance vs a placeholder that cannot be generated (#2869)', () => {
+  test('does not call a gap tolerated when generating its placeholder is what failed', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'ungeneratable-join',
+      nodes: [
+        { id: 'a', prompt: 'a' },
+        {
+          id: 'join',
+          prompt: 'join',
+          depends_on: ['a'],
+          trigger_rule: 'all_done',
+          // `$async` schemas have no placeholder, so generatedStubFor throws and the
+          // node genuinely fails. Reporting it as tolerated would hide that: the
+          // fixture gate filters tolerated ids out of its blocking set.
+          output_format: {
+            $async: true,
+            type: 'object',
+            properties: { x: { type: 'string' } },
+            required: ['x'],
+          },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { a: 'stub' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.trace.find(entry => entry.nodeId === 'join')?.state).toBe('failed');
+    expect(result.missingStubs).toEqual(['join']);
+    expect(result.toleratedMissingStubs).toEqual([]);
+  });
+});
