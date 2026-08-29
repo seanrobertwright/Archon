@@ -11,12 +11,18 @@ thing you may edit.
 
 The target is the run-owned PR, never the current branch's ambient PR mapping:
 
-- `INPUTS_PR_NUMBER` is its recorded number.
-- `INPUTS_PR_HEAD` is its recorded head branch.
+Read that record from `$ARTIFACTS_DIR/pr-action.md`, which the PR node wrote
+when it created the PR: it names the PR number and the head branch it pushed. A
+missing or unreadable record is a hard failure — do not fall back to resolving a
+PR from the current branch.
+
+(A sibling node's typed output cannot reach this file directly: a composed
+command may only read `$INPUTS.<name>` and workflow variables, and the recorded
+PR is produced mid-run rather than supplied by the caller.)
 
 Derive the origin repository, read that exact PR by number, and fail unless its
-head and the checked-out branch both equal `INPUTS_PR_HEAD`. Use the recorded
-number as the selector for every `gh` read or edit.
+head and the checked-out branch both equal the recorded head branch. Use the
+recorded number as the selector for every `gh` read or edit.
 
 1. Read the current PR body and the full final diff
    (`gh pr diff <number> --repo <owner/repo>`).

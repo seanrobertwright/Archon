@@ -681,8 +681,23 @@ describe('bundled-defaults', () => {
       expect(deliver).toContain('EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"');
       expect(deliver).not.toContain('record_read git remote get-url origin');
       expect(deliver).toContain('origin remote does not resolve to an owner/repo');
-      expect(sync).toContain('INPUTS_PR_NUMBER');
-      expect(sync).toContain('INPUTS_PR_HEAD');
+      // A composed prompt node reaches none of the other channels: the
+      // INPUTS_<UPPER_SNAKE> env form is bash/script only, a node-local `with:`
+      // map is exec-node only, and the loader rejects a cross-namespace
+      // `$pr.output` ref in a command file. The durable artifact is the one
+      // channel that survives composition, so both ends must name it (#2909 R1).
+      const prCommand = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:pr::pr'];
+      expect(prCommand).toContain('$ARTIFACTS_DIR/pr-action.md');
+      expect(sync).toContain('$ARTIFACTS_DIR/pr-action.md');
+      expect(sync).not.toContain('INPUTS_PR_NUMBER');
+      // The `review`/`recheck` includes keep their `with:` bindings — archon-review
+      // declares those inputs, so that channel is real. The prompt node must not
+      // carry one, because nothing would ever deliver it.
+      const deliverParsed = parseWorkflow(deliver, 'archon-deliver.yaml');
+      if (deliverParsed.workflow === null) throw new Error(deliverParsed.error.error);
+      const syncNode = deliverParsed.workflow.nodes.find(node => node.id === 'sync-pr-body');
+      expect(syncNode?.kind).toBe('agent');
+      expect((syncNode as { with?: unknown }).with).toBeUndefined();
     });
 
     // Windows cannot execute the extensionless `#!/bin/sh` fakes this test puts on

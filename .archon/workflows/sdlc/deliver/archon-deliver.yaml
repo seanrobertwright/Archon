@@ -238,9 +238,6 @@ nodes:
   - id: sync-pr-body
     command: sync-pr-body
     model: medium
-    with:
-      pr_number: "$pr.output.number"
-      pr_head: "$pr.output.head"
     depends_on: [gate-ready]
     when: "$review.output.ready == 'false'"
 
@@ -319,11 +316,6 @@ nodes:
         # warning must not become the branch name or the returned PR URL.
         "$@" 2>>"$EVIDENCE" | tee -a "$EVIDENCE"
       }
-      # A probe whose non-zero exit is information, not an error. Everything
-      # else here fails the node under `set -e`; this one must not.
-      record_probe() {
-        record_read "$@" || true
-      }
       fail() {
         printf '%s\n' "$1" | tee -a "$EVIDENCE" >&2
         exit 1
@@ -359,7 +351,8 @@ nodes:
       # non-zero and says "no checks reported" for exactly that case, so this
       # read is the one that tolerates failure — reporting the checks it found
       # is what refuses the flip, never the exit code.
-      NOT_GREEN=$(record_probe gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"')
+      # `|| true` here and nowhere else: every other read must fail the node.
+      NOT_GREEN=$(record_read gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' || true)
       if [ -n "$NOT_GREEN" ]; then
         fail "flip-ready: refusing to flip with non-green checks: $NOT_GREEN"
       fi

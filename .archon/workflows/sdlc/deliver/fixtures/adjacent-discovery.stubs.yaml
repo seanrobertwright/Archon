@@ -15,6 +15,7 @@ classify:
     errors: "stub"
     docs: "stub"
 resolve-scope: '{"errors":"false"}'
+review__target: "PR #5 on fixture-branch"
 review__mode: '{"continuation":false}'
 review__scope: "accepted contract recorded"
 review__code: "0 findings; 1 adjacent discovery recorded"

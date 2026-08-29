@@ -27,6 +27,7 @@ deliver__impl__implement:
   done: true
   green: true
   summary: "stub: fix built per the investigation, checks green"
+deliver__review__target: "PR #2 on fixture-branch"
 deliver__review__mode: '{"continuation":false}'
 deliver__review__scope: "target recorded; head sha stubbed"
 deliver__review__code: "0 findings"
