@@ -53,7 +53,12 @@ import {
   isComposeFanOutNode,
   INPUT_NAME_SOURCE,
 } from './schemas';
-import { canonicalValueText, parseWholeInputsRef, type JsonValue } from './output-ref';
+import {
+  canonicalValueText,
+  LOOP_PREV_OUTPUT_REF_SOURCE,
+  parseWholeInputsRef,
+  type JsonValue,
+} from './output-ref';
 import { createLogger } from '@archon/paths';
 import { validateDagStructure, validateWorkflowOutcomeDeclaration } from './loader';
 import { resolveDeclaredInputs } from './workflow-inputs';
@@ -189,7 +194,7 @@ const OUTPUT_REF_PATTERN = /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output/g;
  * When a reusable block is inlined into a loop_group body, its authored sibling ids must
  * follow the same namespace rewrite as current-iteration `$id.output` refs.
  */
-const LOOP_PREV_OUTPUT_REF_PATTERN = /\$LOOP_PREV\.([a-zA-Z_][a-zA-Z0-9_-]*)\.output/g;
+const LOOP_PREV_OUTPUT_REF_PATTERN = new RegExp(LOOP_PREV_OUTPUT_REF_SOURCE, 'g');
 
 /**
  * `when:`-only ref pattern. The condition grammar (condition-evaluator.ts) additionally
