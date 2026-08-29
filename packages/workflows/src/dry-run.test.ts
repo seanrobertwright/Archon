@@ -711,6 +711,94 @@ describe('dryRunWorkflow', () => {
     expect(result.trace.find(entry => entry.nodeId === 'unreachable')?.state).toBe('skipped');
   });
 
+  test('tolerates a missing stub on an all_done join and completes past it (#2869)', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'join-tolerance',
+      nodes: [
+        { id: 'lens', prompt: 'lens' },
+        {
+          id: 'review-complete',
+          bash: 'true',
+          depends_on: ['lens'],
+          trigger_rule: 'all_done',
+        },
+        { id: 'synthesize', prompt: 'synthesize', depends_on: ['review-complete'] },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok', synthesize: 'done' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.missingStubs).toEqual(['review-complete']);
+    expect(result.trace.find(entry => entry.nodeId === 'review-complete')).toMatchObject({
+      state: 'stubbed',
+      reason: expect.stringContaining('all_done'),
+    });
+    expect(result.trace.find(entry => entry.nodeId === 'synthesize')?.state).toBe('stubbed');
+  });
+
+  test('still fails the run when a plain (non-all_done) node is missing its stub', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'no-tolerance',
+      nodes: [
+        { id: 'lens', prompt: 'lens' },
+        { id: 'gate', bash: 'true', depends_on: ['lens'] },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.missingStubs).toEqual(['gate']);
+  });
+
+  test('tolerates a missing stub on an all_done node nested in a loop_group body (#2869)', async () => {
+    // simulateLoopGroup (dry-run.ts) dispatches every body node through this same
+    // single-node fallback, then fails the whole group if any body node ends up
+    // 'failed' — a body join that tolerates its own missing stub must keep the group
+    // (and the run) completing, not just the top-level dryRunWorkflow outcome field.
+    const workflow = makeTestWorkflow({
+      name: 'loop-group-join-tolerance',
+      nodes: [
+        {
+          id: 'group',
+          loop_group: {
+            until_bash: 'true',
+            max_iterations: 1,
+            nodes: [
+              { id: 'lens', prompt: 'lens' },
+              {
+                id: 'review-complete',
+                bash: 'true',
+                depends_on: ['lens'],
+                trigger_rule: 'all_done',
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.trace.find(entry => entry.nodeId === 'group')?.state).toBe('completed');
+    expect(result.trace.find(entry => entry.nodeId === 'review-complete')?.state).toBe('stubbed');
+    expect(result.missingStubs).toEqual(['review-complete']);
+  });
+
   test('executes bash only with execCode and captures failures', async () => {
     const success = makeTestWorkflow({
       name: 'bash-ok',
@@ -1737,5 +1825,43 @@ describe('resolveWorkflowModelScope — the origin names the value that won', ()
     const scope = resolveWorkflowModelScope({}, 'claude', assistantModels, profile);
     expect(scope.provider).toBe('claude');
     expect(scope.providerOrigin).toBe('default assistant');
+  });
+});
+
+describe('all_done tolerance vs a placeholder that cannot be generated (#2869)', () => {
+  test('does not call a gap tolerated when generating its placeholder is what failed', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'ungeneratable-join',
+      nodes: [
+        { id: 'a', prompt: 'a' },
+        {
+          id: 'join',
+          prompt: 'join',
+          depends_on: ['a'],
+          trigger_rule: 'all_done',
+          // `$async` schemas have no placeholder, so generatedStubFor throws and the
+          // node genuinely fails. Reporting it as tolerated would hide that: the
+          // fixture gate filters tolerated ids out of its blocking set.
+          output_format: {
+            $async: true,
+            type: 'object',
+            properties: { x: { type: 'string' } },
+            required: ['x'],
+          },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { a: 'stub' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.trace.find(entry => entry.nodeId === 'join')?.state).toBe('failed');
+    expect(result.missingStubs).toEqual(['join']);
+    expect(result.toleratedMissingStubs).toEqual([]);
   });
 });

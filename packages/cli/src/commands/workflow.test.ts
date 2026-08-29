@@ -321,6 +321,7 @@ mock.module('@archon/workflows/dry-run', () => ({
         },
       ],
       missingStubs: [],
+      toleratedMissingStubs: [],
       unusedStubs: [],
       summary: 'stubbed output',
     })
@@ -793,6 +794,7 @@ describe('workflowRunCommand — dry-run', () => {
       outcome: 'completed',
       trace: [],
       missingStubs: [],
+      toleratedMissingStubs: [],
       unusedStubs: [],
       summary: 'done',
     });
@@ -1047,6 +1049,7 @@ describe('workflowRunCommand — dry-run', () => {
       outcome: 'failed',
       trace: [],
       missingStubs: ['node'],
+      toleratedMissingStubs: [],
       unusedStubs: [],
     });
 
@@ -1054,6 +1057,46 @@ describe('workflowRunCommand — dry-run', () => {
       workflowRunCommand('/test/path', 'plan', '', { dryRun: true, json: true })
     ).rejects.toThrow('missing stubs: node');
     expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({ outcome: 'failed' });
+  });
+
+  it('names only blocking missing stubs, never one an all_done join tolerated', async () => {
+    const dryRun = await import('@archon/workflows/dry-run');
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflow: 'plan',
+      outcome: 'failed',
+      trace: [],
+      missingStubs: ['join', 'node'],
+      toleratedMissingStubs: ['join'],
+      unusedStubs: [],
+    });
+
+    // The join never blocked anything, so pointing the reader at it alongside the
+    // real cause sends them to the wrong node (#2869). One call, one mocked result:
+    // asserting the absence in a second call would read the default mock instead.
+    const error = await workflowRunCommand('/test/path', 'plan', '', {
+      dryRun: true,
+      json: true,
+    }).then(
+      () => undefined,
+      (thrown: unknown) => thrown as Error
+    );
+    expect(error?.message).toBe('Dry-run failed; missing stubs: node');
+  });
+
+  it('falls back to the generic message when every missing stub was tolerated', async () => {
+    const dryRun = await import('@archon/workflows/dry-run');
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflow: 'plan',
+      outcome: 'failed',
+      trace: [],
+      missingStubs: ['join'],
+      toleratedMissingStubs: ['join'],
+      unusedStubs: [],
+    });
+
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', { dryRun: true, json: true })
+    ).rejects.toThrow('See the trace for details');
   });
 });
 
@@ -9689,6 +9732,7 @@ describe('workflowTestCommand', () => {
           outcome: 'completed',
           pass: true,
           missingStubs: [],
+          toleratedMissingStubs: [],
           unusedStubs: ['spare'],
         },
       ],
@@ -9738,6 +9782,7 @@ describe('workflowTestCommand', () => {
           pass: false,
           failureReason: 'expected completed, dry-run reported failed',
           missingStubs: [],
+          toleratedMissingStubs: [],
           unusedStubs: [],
         },
       ],

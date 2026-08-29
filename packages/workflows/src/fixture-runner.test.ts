@@ -324,6 +324,57 @@ describe('runFixtures', () => {
     expect(report.results[0].missingStubs).toEqual(['node-b']);
   });
 
+  // The exact `workflow test` regression this fix closes (#2807): before it, a new
+  // `all_done` join with no stub failed `dryRunWorkflow`'s own outcome AND this
+  // independent gate. `dryRunWorkflow`'s outcome is now `completed`, but that alone is
+  // not the fix — this fixture must also stop treating the tolerated node as blocking.
+  it('passes a completing fixture whose only missing stub is tolerated by an all_done join (#2869)', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    prompt: hi\n' +
+        '  - id: node-b\n    prompt: there\n    depends_on: [node-a]\n' +
+        '    trigger_rule: all_done\n',
+      body: 'node-a: "stub"\n',
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.passed).toBe(1);
+    expect(report.results[0].outcome).toBe('completed');
+    expect(report.results[0].missingStubs).toEqual(['node-b']);
+    // The gap is reported as tolerated, not merely as missing: a reader of a
+    // PASSING fixture can otherwise not tell the two apart.
+    expect(report.results[0].toleratedMissingStubs).toEqual(['node-b']);
+    expect(formatFixtureReport(report)).toContain(
+      'note: unstubbed all_done join(s) tolerated — node-b'
+    );
+  });
+
+  it('does not mark an ordinary missing stub as tolerated (#2869)', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    prompt: hi\n' +
+        '  - id: node-b\n    prompt: there\n    depends_on: [node-a]\n',
+      body: 'node-a: "stub"\n',
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    // Without the join, the unstubbed node fails the dry run itself, so the
+    // fixture never reaches the stub gate — and nothing is tolerated.
+    expect(report.failed).toBe(1);
+    expect(report.results[0].outcome).toBe('failed');
+    expect(report.results[0].missingStubs).toEqual(['node-b']);
+    expect(report.results[0].toleratedMissingStubs).toEqual([]);
+    expect(formatFixtureReport(report)).not.toContain('tolerated');
+  });
+
   it('warns on unused stubs without failing', async () => {
     const { cwd } = writeTempProject({
       body: ['node-a: "stub"', 'unused-node: "never reached"'].join('\n'),
