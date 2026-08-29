@@ -807,7 +807,12 @@ export class SqliteAdapter implements IDatabase {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
-      -- Per-node provider session IDs persisted across workflow re-runs
+      -- Per-node provider session IDs persisted across workflow re-runs.
+      -- scope_key carries no FK, so a conversation delete does not reach these
+      -- rows: soft delete plus a never-reused UUID leaves harmless orphans, and a
+      -- future hard-delete must delete by scope_key itself (the mirror of the
+      -- workflow_runs cascade caveat above). Mirrors the COMMENT ON TABLE in
+      -- migrations/000_combined.sql.
       CREATE TABLE IF NOT EXISTS remote_agent_workflow_node_sessions (
         workflow_name TEXT NOT NULL,
         node_id TEXT NOT NULL,
