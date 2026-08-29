@@ -1,6 +1,12 @@
 # Sparse dry-run fixture: the current-truth check proves the work item is already
 # implementation-ready, so planning and investigation stay skipped. Run with
-# --default-stubs.
+# --default-stubs --exec-code.
+#
+# `outcome` is deliberately unstubbed: the real script runs and must report pull
+# request 4 from the delivered record alone. The exec workspace is a DETACHED
+# worktree, so there is no current branch for an ambient pull request lookup to
+# resolve — a pass here is proof the report is built from the record and nothing
+# the checkout happens to be sitting on.
 triage__triage:
   route: deliver
   summary: "stub: current code confirms a complete work order"
@@ -17,7 +23,6 @@ deliver__review-action: '{"ready":true,"action":"none"}'
 deliver__validate__validate:
   green: true
   summary: "stub: project gate green"
-outcome: "https://github.com/example/repo/pull/4"
 ci-probe: '{"state":"concluded","detail":"all checks green"}'
 deliver__classify:
   errors: false
@@ -28,15 +33,16 @@ deliver__classify:
 deliver__resolve-scope: '{"errors":"false"}'
 fixture:
   expect: completed
+exec-code: true
 triage__assert-intact: '{"intact":"true"}'
 deliver__gate-ready: '{"gate":"ready"}'
 deliver__impl__record-start: '{"start":"recorded"}'
 deliver__gate-validated: '{"gate":"green"}'
 deliver__impl__assert-changed: "2 files changed"
 deliver__gate-green: '{"gate":"green"}'
-deliver__flip-ready: "https://github.com/example/repo/pull/1"
-deliver__outcome: "https://github.com/example/repo/pull/1"
-deliver__pr__pr: { number: 1, url: "https://github.com/example/repo/pull/1", head: "fixture-branch", base: "dev", is_draft: true }
+deliver__flip-ready: "https://github.com/example/repo/pull/4"
+deliver__outcome: "https://github.com/example/repo/pull/4"
+deliver__pr__pr: { number: 4, url: "https://github.com/example/repo/pull/4", head: "fixture-branch", base: "dev", is_draft: true }
 deliver__review__mode: '{"continuation":false}'
 deliver__review__scope: "PR diff in scope; head sha stubbed"
 deliver__review__code: "0 findings"
