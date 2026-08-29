@@ -799,6 +799,97 @@ describe('dryRunWorkflow', () => {
     expect(result.missingStubs).toEqual(['review-complete']);
   });
 
+  test('tolerates a missing stub on a bare all_done loop node, on every channel (#2966)', async () => {
+    // A `loop:` node never reaches the single-node stub gate — simulateLoop owns its
+    // own stub lookup — so the #2869 tolerance has to be applied there too. One node
+    // per completion channel, because each reaches completion by a different route:
+    // `until` and `until_field` are satisfied by the placeholder generatedStubFor
+    // builds for them, while `until_bash` is unevaluable and rides the existing
+    // "assume complete" rule. A tolerated loop always ends on iteration 1.
+    const workflow = makeTestWorkflow({
+      name: 'loop-join-tolerance',
+      nodes: [
+        { id: 'lens', prompt: 'lens' },
+        {
+          id: 'signal',
+          loop: { prompt: 'refine $LOOP_PREV_OUTPUT', until: 'DONE', max_iterations: 3 },
+          depends_on: ['lens'],
+          trigger_rule: 'all_done',
+        },
+        {
+          id: 'field',
+          loop: { prompt: 'refine', until_field: 'done', max_iterations: 3 },
+          output_format: {
+            type: 'object',
+            properties: { done: { type: 'boolean' } },
+            required: ['done'],
+          },
+          depends_on: ['signal'],
+          trigger_rule: 'all_done',
+        },
+        {
+          id: 'checked',
+          loop: { prompt: 'refine', until_bash: 'bun run test', max_iterations: 3 },
+          depends_on: ['field'],
+          trigger_rule: 'all_done',
+        },
+        { id: 'synthesize', prompt: 'synthesize', depends_on: ['checked'] },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok', synthesize: 'done' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.missingStubs).toEqual(['checked', 'field', 'signal']);
+    expect(result.toleratedMissingStubs).toEqual(['checked', 'field', 'signal']);
+    for (const nodeId of ['signal', 'field', 'checked']) {
+      const entry = result.trace.find(traced => traced.nodeId === nodeId);
+      expect(entry?.state).toBe('stubbed');
+      expect(entry?.reason).toContain('all_done');
+      // The reason still names the channel that ended the loop, so a reader can tell a
+      // placeholder that satisfied one from a loop the simulator only assumed complete.
+      expect(entry?.reason).toContain('after 1 iteration(s)');
+    }
+    expect(result.trace.find(entry => entry.nodeId === 'signal')?.reason).toContain(
+      'completion signal'
+    );
+    expect(result.trace.find(entry => entry.nodeId === 'field')?.reason).toContain(
+      "'done' is true"
+    );
+    expect(result.trace.find(entry => entry.nodeId === 'checked')?.reason).toContain(
+      'assumed complete'
+    );
+    expect(result.trace.find(entry => entry.nodeId === 'synthesize')?.state).toBe('stubbed');
+  });
+
+  test('still fails the run when a plain (non-all_done) loop node is missing its stub', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'loop-no-tolerance',
+      nodes: [
+        { id: 'lens', prompt: 'lens' },
+        {
+          id: 'refine',
+          loop: { prompt: 'refine', until: 'DONE', max_iterations: 3 },
+          depends_on: ['lens'],
+        },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { lens: 'ok' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.missingStubs).toEqual(['refine']);
+    expect(result.toleratedMissingStubs).toEqual([]);
+  });
+
   test('executes bash only with execCode and captures failures', async () => {
     const success = makeTestWorkflow({
       name: 'bash-ok',
@@ -1862,6 +1953,48 @@ describe('all_done tolerance vs a placeholder that cannot be generated (#2869)',
     expect(result.outcome).toBe('failed');
     expect(result.trace.find(entry => entry.nodeId === 'join')?.state).toBe('failed');
     expect(result.missingStubs).toEqual(['join']);
+    expect(result.toleratedMissingStubs).toEqual([]);
+  });
+
+  test('does not call a loop gap tolerated when the placeholder ends no iteration (#2966)', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'unendable-loop-join',
+      nodes: [
+        { id: 'a', prompt: 'a' },
+        {
+          id: 'refine',
+          // An `output_format` with only a prose `until:` is the one loop shape whose
+          // generated placeholder cannot end the loop: the placeholder is the schema's
+          // JSON, which does not carry the sentinel, and there is no `until_field` to
+          // set or `until_bash` to assume. Such a node would burn max_iterations and
+          // fail, so tolerating it would hand `checkFixture` a filter over the real
+          // blocker.
+          loop: { prompt: 'refine', until: 'DONE', max_iterations: 3 },
+          output_format: {
+            type: 'object',
+            properties: { x: { type: 'string' } },
+            required: ['x'],
+          },
+          depends_on: ['a'],
+          trigger_rule: 'all_done',
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { a: 'stub' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    const failure = result.trace.find(entry => entry.nodeId === 'refine');
+    expect(failure?.state).toBe('failed');
+    expect(failure?.reason).toContain(
+      "cannot tolerate it: a generated placeholder would run to max_iterations without completion signal 'DONE'"
+    );
+    expect(result.missingStubs).toEqual(['refine']);
     expect(result.toleratedMissingStubs).toEqual([]);
   });
 });
