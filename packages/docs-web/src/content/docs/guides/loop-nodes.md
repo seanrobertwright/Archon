@@ -695,7 +695,9 @@ for structured output):
 nodes:
   - id: fix-loop
     loop_group:
-      until: TESTS_PASS
+      # The terminal node's own verdict ends the loop; nothing here emits a
+      # prose sentinel, so `until:` would run to max_iterations on a green run.
+      until_bash: test $test.output = "green"
       max_iterations: 5
       nodes:
         - id: implement
