@@ -1,6 +1,6 @@
 # Dry-run fixture: a correction whose red came from the machine, not the code,
 # keeps its round instead of throwing it away (--exec-code, so both real gate
-# scripts decide). This is run f113a1fd's shape (#2939): parallel runs held the
+# scripts decide). parallel runs held the
 # same database, one spec failed for it, and the delivery was correct.
 #
 # The initial gate takes the ordinary green route; the correction gate takes the

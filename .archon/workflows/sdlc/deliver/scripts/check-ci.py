@@ -2,7 +2,7 @@
 
 Archon-owned facts only (gh state, never the project's toolchain). This is the
 single-shot probe inside the `await-checks` loop_group: the engine's durable
-`wait:` node owns the time between probes (#2744), so this script never sleeps
+`wait:` node owns the time between probes, so this script never sleeps
 through CI — it reads the state, declares it, and exits.
 
 States, on stdout as JSON so `when:`/`until_bash` can branch without prose:

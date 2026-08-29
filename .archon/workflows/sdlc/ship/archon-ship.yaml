@@ -91,7 +91,7 @@ nodes:
 
   # One return for every legitimate terminal result. Negative advisory verdicts
   # complete with the report that explains them; delivery is still accepted
-  # only when the deliver branch actually ran (bound with if_skipped, #2637)
+  # only when the deliver branch actually ran (bound with if_skipped)
   # and GitHub confirms the PR state — see scripts/outcome.py.
   - id: outcome
     script: outcome
@@ -104,7 +104,7 @@ nodes:
       delivered: { from: "$deliver.output", if_skipped: null }
       # A passed spend gate with no delivered output means delivery STARTED and
       # died mid-flight — a different fact from an advisory stop, and the report
-      # must not claim the advisory refused (seen wrong on run a1da7249, #2402).
+      # must not claim the advisory refused.
       gate_passed_direct: { from: "$gate-direct.output", if_skipped: null }
       gate_passed_rooted: { from: "$gate-rooted.output", if_skipped: null }
       gate_passed_planned: { from: "$gate-planned.output", if_skipped: null }

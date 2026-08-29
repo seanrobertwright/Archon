@@ -51,12 +51,12 @@ nodes:
           type: boolean
         green:
           type: boolean
-        # Why the checks are red, when they are (#2939). A green turn has no red to
+        # Why the checks are red, when they are. A green turn has no red to
         # explain, and the empty string is how it says so: OpenAI strict mode rejects
         # any schema whose `required` omits a declared property, so optionality has to
-        # live inside the type rather than in what `required` leaves out (#1843 —
-        # every archon-deliver run on a Codex config died at the first turn when this
-        # was optional by omission). '' is the value gate-green.py already treats as
+        # live inside the type rather than in what `required` leaves out: every
+        # archon-deliver run on a Codex config died at the first turn while this
+        # was optional by omission. '' is the value gate-green.py already treats as
         # no cause declared, so the gate that spends on this verdict is unchanged.
         red_cause:
           type: string
@@ -68,7 +68,7 @@ nodes:
   # Decline is not success: an AI node that declines its task still exits 0. This
   # deterministic guard proves work actually happened before anything downstream
   # spends money or goes public — see scripts/assert-changed.py. The loop's green
-  # verdict arrives as a bound input (#2637): no artifact bridge.
+  # verdict arrives as a bound input: no artifact bridge.
   - id: assert-changed
     script: assert-changed
     runtime: uv

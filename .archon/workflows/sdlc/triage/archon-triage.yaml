@@ -25,7 +25,7 @@ nodes:
   - id: triage
     command: triage
     # Triage is advisory: the engine fails this node with the touched paths
-    # named if it modifies the working tree (#2771). Replaced the
+    # named if it modifies the working tree. Replaced the
     # record-state/assert-intact snapshot pair the pack carried before the
     # engine could enforce this itself.
     mutates_checkout: false

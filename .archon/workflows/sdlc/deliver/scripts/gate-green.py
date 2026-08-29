@@ -7,7 +7,7 @@ the loop completes on `done`, blocked declines included, so no spend and no publ
 step happens until this reads the verdict itself.
 
 Red is not one thing, though, and treating it as one killed two correct deliveries
-(#2939). A change that breaks a check must never reach a pull request. A check that
+A change that breaks a check must never reach a pull request. A check that
 was already red at the run's starting commit, or that failed because a parallel
 process held the database this run needed, is not evidence about the change at all —
 and reality gets checked again downstream regardless: flip-ready refuses to make the

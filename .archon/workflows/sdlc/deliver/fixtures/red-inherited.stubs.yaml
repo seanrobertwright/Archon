@@ -1,6 +1,6 @@
 # Dry-run fixture: red the change cannot have caused passes BOTH green gates, and
 # the run rides to the durable CI wait (--exec-code, so both real gate scripts
-# decide). This is run 49f0d462's shape (#2939).
+# decide).
 #
 # An inherited base break survives the whole tail: implement meets it, and so does
 # the project gate after review, because nobody fixed the base meanwhile. Neither
