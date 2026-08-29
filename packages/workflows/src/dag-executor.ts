@@ -130,6 +130,7 @@ import {
   logNodeSkip,
   logNodeError,
   logAssistant,
+  logExecOutput,
   logTool,
   logWorkflowComplete,
   logWorkflowError,
@@ -156,6 +157,7 @@ import {
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
+  retainStreamTail,
   safeSendMessage,
   type SendMessageContext,
 } from './executor-shared';
@@ -3447,6 +3449,13 @@ type RawSubprocessRejection = Error & {
   stderr?: string;
   cmd?: string;
   spawnargs?: string[];
+  /**
+   * Numeric exit code, or a symbol (`'ENOENT'`, `'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'`).
+   * `null` on a timeout kill — Node reports that one through `signal` instead.
+   */
+  code?: number | string | null;
+  /** Set (with `code: null`) when the child was killed, which for `execFile` is a timeout. */
+  signal?: string | null;
 };
 
 const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
@@ -3516,6 +3525,30 @@ function redactSubprocessError(
   return e;
 }
 
+/**
+ * Who a retained subprocess-output row belongs to (#2967).
+ *
+ * Required on every `runSubprocess` call, so a new deterministic-exec call site cannot
+ * silently opt out of retention — the type carries the invariant instead of a comment.
+ */
+interface SubprocessRetention {
+  logDir: string;
+  workflowRunId: string;
+  /**
+   * Transcript step id. Loop probes use `<node>-iteration-<i>`, matching the loop's own
+   * transcript rows.
+   *
+   * A node body uses the bare `node.id`, NOT the namespaced `stepName` the persisted
+   * events carry. That is a deliberate trade: it keeps this row correlated with the
+   * `node_start`/`node_complete` rows beside it, which have always used the bare id, at
+   * the cost of collapsing fan-out instances and loop_group body iterations of one node
+   * onto the same `step` — those are then told apart by row order.
+   */
+  nodeId: string;
+  /** `<bash>` / `<script>` / `<until_bash>`, matching the transcript's other rows. */
+  label: string;
+}
+
 async function runSubprocess(
   execContext: ExecutionContext,
   cmd: string,
@@ -3526,33 +3559,64 @@ async function runSubprocess(
     env: NodeJS.ProcessEnv;
     protectedEnvKeys?: readonly string[];
     protectedCredentialValues?: readonly string[];
+    retention: SubprocessRetention;
   }
 ): Promise<{ stdout: string; stderr: string }> {
   const subprocessEnv =
     execContext.kind === 'container' ? options.env : { ...process.env, ...options.env };
+  // Both outcomes redact against the same values, so the credential set is resolved
+  // once here rather than separately per path — a success path that redacted less than
+  // the failure path would be the security hole, not a style difference.
+  const credentialValues = collectSubprocessCredentialValues(
+    subprocessEnv,
+    options.protectedEnvKeys,
+    options.protectedCredentialValues
+  );
+  const { logDir, workflowRunId, nodeId, label } = options.retention;
+  // Container env is delivered in argv, while either execution mode can echo a
+  // credential in output. Sanitize at the shared boundaries below so every downstream
+  // reader — the rejection's consumers and the retained evidence alike — sees the same
+  // safe text.
   try {
-    if (execContext.kind === 'container') {
-      const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
-        cwd: options.cwd,
-        env: options.env,
-      });
-      // Container env is delivered in argv, while either execution mode can echo a
-      // credential in output. Sanitize at the shared throw boundary so every
-      // downstream reader receives the same safe rejection.
-      return await execFileAsync('docker', dockerArgs, { timeout: options.timeout });
-    }
-    return await execFileAsync(cmd, args, {
-      cwd: options.cwd,
-      timeout: options.timeout,
-      env: subprocessEnv,
+    const result =
+      execContext.kind === 'container'
+        ? await execFileAsync(
+            'docker',
+            buildSubprocessDockerArgs(execContext, cmd, args, {
+              cwd: options.cwd,
+              env: options.env,
+            }),
+            { timeout: options.timeout }
+          )
+        : await execFileAsync(cmd, args, {
+            cwd: options.cwd,
+            timeout: options.timeout,
+            env: subprocessEnv,
+          });
+
+    // Retention is the EVIDENCE copy, taken from a redacted-then-capped copy of the
+    // streams. `result` itself is returned untouched: the caller's `stdout` is the
+    // node's value channel and keeps its full-fidelity semantics (#2726).
+    await logExecOutput(logDir, workflowRunId, nodeId, label, {
+      stdoutTail: retainStreamTail(redactCredentialValues(result.stdout, credentialValues)),
+      stderrTail: retainStreamTail(redactCredentialValues(result.stderr, credentialValues)),
+      exitCode: 0,
     });
+    return result;
   } catch (err) {
-    const credentialValues = collectSubprocessCredentialValues(
-      subprocessEnv,
-      options.protectedEnvKeys,
-      options.protectedCredentialValues
-    );
-    throw redactSubprocessError(err as RawSubprocessRejection, credentialValues);
+    const rejection = redactSubprocessError(err as RawSubprocessRejection, credentialValues);
+    // `redactSubprocessError` already scrubbed these fields in place, so retention reads
+    // the same safe values every other failure consumer sees.
+    await logExecOutput(logDir, workflowRunId, nodeId, label, {
+      stdoutTail: retainStreamTail(rejection.stdout),
+      stderrTail: retainStreamTail(rejection.stderr),
+      // A timeout kill reports `code: null` and names the signal instead. An
+      // `until_bash` probe has no sibling `node_error` row to say so, and a probe that
+      // was killed is exactly the case a reader needs distinguished from one that
+      // simply answered "not yet".
+      exitCode: rejection.code ?? rejection.signal ?? 'unknown',
+    });
+    throw rejection;
   }
 }
 
@@ -3790,6 +3854,12 @@ async function executeBashNode(
       env: subprocessEnv,
       protectedEnvKeys,
       protectedCredentialValues,
+      retention: {
+        logDir,
+        workflowRunId: workflowRun.id,
+        nodeId: node.id,
+        label: '<bash>',
+      },
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -4181,6 +4251,12 @@ async function executeScriptNode(
       env: subprocessEnv,
       protectedEnvKeys,
       protectedCredentialValues,
+      retention: {
+        logDir,
+        workflowRunId: workflowRun.id,
+        nodeId: node.id,
+        label: '<script>',
+      },
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -4768,6 +4844,12 @@ async function executeLoopGroupNode(
             timeout: SUBPROCESS_DEFAULT_TIMEOUT,
             protectedEnvKeys: config.protectedEnvKeys,
             protectedCredentialValues: config.protectedCredentialValues,
+            retention: {
+              logDir,
+              workflowRunId: workflowRun.id,
+              nodeId: `${node.id}-iteration-${String(resumedIteration)}`,
+              label: '<until_bash>',
+            },
             env: {
               ...(config.envVars ?? {}),
               USER_MESSAGE: workflowRun.user_message,
@@ -5239,6 +5321,12 @@ async function executeLoopGroupNode(
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
           protectedEnvKeys: config.protectedEnvKeys,
           protectedCredentialValues: config.protectedCredentialValues,
+          retention: {
+            logDir,
+            workflowRunId: workflowRun.id,
+            nodeId: `${node.id}-iteration-${String(i)}`,
+            label: '<until_bash>',
+          },
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env spreads FIRST so the reserved
@@ -6796,6 +6884,12 @@ async function executeLoopNode(
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
           protectedEnvKeys: config.protectedEnvKeys,
           protectedCredentialValues: config.protectedCredentialValues,
+          retention: {
+            logDir,
+            workflowRunId: workflowRun.id,
+            nodeId: `${node.id}-iteration-${String(i)}`,
+            label: '<until_bash>',
+          },
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env (managed per-project vars +

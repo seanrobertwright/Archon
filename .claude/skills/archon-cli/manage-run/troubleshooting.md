@@ -18,9 +18,10 @@ Each line is a structured event. The discriminator is the `type` field. Values (
 | `node_start` / `node_complete` / `node_error` / `node_skipped` | Node lifecycle |
 | `assistant` | AI assistant message — has `content` field with the full AI output |
 | `tool` | SDK tool invocation — has `tool_name` and `tool_input` |
+| `exec_output` | What a `bash`/`script` node or `until_bash` probe printed — `stdout_tail`, `stderr_tail`, `exit_code` |
 | `validation` | Historical compatibility only; current runs do not emit this type |
 
-> **Loop iterations and per-attempt retry events are NOT in the JSONL file.** They go through the workflow event emitter (WebSocket / `workflow_events` DB table) under `loop_iteration_started` / `loop_iteration_completed` etc. To see them, query the DB or the Web UI dashboard — not the JSONL log.
+> **Loop iteration lifecycle events are NOT in the JSONL file.** `loop_iteration_started` / `loop_iteration_completed` go through the workflow event emitter (WebSocket / `workflow_events` DB table) — query the DB or the Web UI dashboard for those. Per-iteration rows that DO reach the JSONL are keyed `<node-id>-iteration-<n>`: a loop's `node_complete` row, and the `exec_output` row for each `until_bash` probe.
 
 Find the run ID from `archon workflow runs --status failed` (or `archon workflow runs` for the most recent run of any status; `workflow status` only shows active runs). Then:
 
@@ -30,6 +31,9 @@ jq -sr 'map(select(.type == "assistant") | .content) | last // empty' <log-file>
 
 # All error events (node failures + workflow-level failures)
 jq 'select(.type == "node_error" or .type == "workflow_error")' <log-file>
+
+# What a specific node actually printed (evidence for "did this really do X?")
+jq 'select(.type == "exec_output" and .step == "<node-id>")' <log-file>
 
 # Full event stream
 cat <log-file> | jq .

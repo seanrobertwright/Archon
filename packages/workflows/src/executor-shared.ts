@@ -200,6 +200,27 @@ function streamTail(text: string, max: number): string | undefined {
 }
 
 /**
+ * The retained evidence copy of ONE subprocess stream (#2967): a tail on the same
+ * budget the failure diagnostic spends, marked in place when the head was dropped so
+ * a reader can tell truncation from absence. `undefined` for an empty stream.
+ *
+ * The budget applies per stream here, while `formatSubprocessFailure` splits it
+ * across both — that one produces a single diagnostic string, whereas retention keeps
+ * stdout and stderr apart (merging them is the bug the workflow-side substitute this
+ * replaces had to fix), so a chatty stdout must not evict stderr evidence.
+ *
+ * Callers pass ALREADY-REDACTED text. This caps; it does not sanitize.
+ */
+export function retainStreamTail(text: string | undefined): string | undefined {
+  const trimmed = (text ?? '').trim();
+  if (trimmed.length === 0) return undefined;
+  if (trimmed.length <= SUBPROCESS_ERROR_MAX_CHARS) return trimmed;
+  return `…[truncated to last ${String(SUBPROCESS_ERROR_MAX_CHARS)} chars]\n${trimmed.slice(
+    -SUBPROCESS_ERROR_MAX_CHARS
+  )}`;
+}
+
+/**
  * Raw ExecFileException shape from Node's `child_process.execFile`. For inline
  * scripts via `bash -c <body>` / `bun -e <body>` the entire script body is
  * embedded in `err.message`, `err.cmd`, and the first line of `err.stack` —

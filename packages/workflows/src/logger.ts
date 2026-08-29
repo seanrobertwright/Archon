@@ -33,7 +33,8 @@ export interface WorkflowEvent {
     | 'node_start'
     | 'node_complete'
     | 'node_skipped'
-    | 'node_error';
+    | 'node_error'
+    | 'exec_output';
   workflow_id: string;
   workflow_name?: string;
   step?: string;
@@ -46,6 +47,16 @@ export interface WorkflowEvent {
   check?: string;
   result?: 'pass' | 'fail' | 'warn' | 'unknown';
   error?: string;
+  /** `exec_output` only — see {@link logExecOutput}. Absent means the stream was empty. */
+  stdout_tail?: string;
+  /** `exec_output` only — see {@link logExecOutput}. Absent means the stream was empty. */
+  stderr_tail?: string;
+  /**
+   * `exec_output` only. `0` on success. On failure: the process exit code, or a symbol
+   * when there is none — `'ENOENT'`, `'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'`, the signal
+   * name for a timeout kill, or `'unknown'`.
+   */
+  exit_code?: number | string;
   ts: string;
 }
 
@@ -260,5 +271,50 @@ export async function logNodeError(
     // Spread whole: the caller already omitted every unreported axis, and a guard here
     // would have to re-decide that per field — which is how `0` becomes absent.
     ...usage,
+  });
+}
+
+/** What one deterministic subprocess printed, already redacted and capped. */
+export interface RetainedExecOutput {
+  stdoutTail?: string;
+  stderrTail?: string;
+  exitCode: number | string;
+}
+
+/**
+ * Retain what a deterministic subprocess printed, in the run's own transcript (#2967).
+ *
+ * The reader is a human auditing the run — "what did this node actually do?" — which is
+ * why the evidence lives here and not under `$ARTIFACTS_DIR`, where a workflow would
+ * start depending on it as a contract surface.
+ *
+ * Three properties this row must keep:
+ *
+ * - **Streams stay separate.** Merging stderr into stdout is how a `git` warning becomes
+ *   the branch name a node returns; that bug is the reason this capability exists.
+ * - **Both tails arrive redacted and capped.** `runSubprocess` owns both, because it owns
+ *   the credential material. An artifact written once and read many times has to be safe
+ *   at rest.
+ * - **A row is written even when nothing was printed.** Absence of a row would be
+ *   ambiguous between "printed nothing" and "not retained"; an absent tail FIELD means
+ *   exactly "that stream was empty".
+ *
+ * This is the evidence copy, never the value channel — `$node.output` keeps its own
+ * full-fidelity semantics and is unaffected by the cap applied here.
+ */
+export async function logExecOutput(
+  logDir: string,
+  workflowRunId: string,
+  nodeId: string,
+  commandName: string,
+  output: RetainedExecOutput
+): Promise<void> {
+  await logWorkflowEvent(logDir, workflowRunId, {
+    type: 'exec_output',
+    step: nodeId,
+    content: commandName,
+    exit_code: output.exitCode,
+    ...(output.stdoutTail !== undefined ? { stdout_tail: output.stdoutTail } : {}),
+    ...(output.stderrTail !== undefined ? { stderr_tail: output.stderrTail } : {}),
   });
 }
