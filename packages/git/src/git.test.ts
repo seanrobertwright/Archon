@@ -1555,6 +1555,16 @@ branch refs/heads/feature/auth
       expect(result).toBe(false);
     });
 
+    test('throws expected errors when the caller needs proof of the comparison', async () => {
+      execSpy.mockRejectedValue(new Error('fatal: unknown revision origin/main'));
+
+      await expect(
+        git.isPatchEquivalent(repo('/workspace/repo'), branch('feature'), 'origin/main', {
+          throwOnExpectedError: true,
+        })
+      ).rejects.toThrow('Failed to check if feature is patch-equivalent to origin/main');
+    });
+
     test('throws on unexpected errors', async () => {
       mockLogger.error.mockClear();
       execSpy.mockRejectedValue(new Error('fatal: permission denied'));
@@ -1562,7 +1572,7 @@ branch refs/heads/feature/auth
         git.isPatchEquivalent(repo('/workspace/repo'), branch('feature'), branch('main'))
       ).rejects.toThrow('Failed to check if feature is patch-equivalent to main');
       expect(mockLogger.error).toHaveBeenCalledWith(
-        expect.objectContaining({ branchName: 'feature', baseBranch: 'main' }),
+        expect.objectContaining({ branchName: 'feature', baseRef: 'main' }),
         'branch.patch_equivalent_check_failed'
       );
     });

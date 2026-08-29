@@ -11,7 +11,9 @@ import {
   execFileAsync,
   hasUncommittedChanges,
   toWorktreePath,
+  getDefaultBranch,
   getUniqueCommitCount,
+  isPatchEquivalent,
 } from '@archon/git';
 import { getIsolationProvider } from '@archon/isolation';
 import {
@@ -310,49 +312,26 @@ export async function isolationCompleteCommand(
       }
 
       // Check 4: commits that would become unreachable after branch deletion.
-      // `uniqueCommitCount` is hoisted so check 5 can reuse it: a branch that
-      // has never been pushed is provably safe to delete iff every commit on it
-      // is already reachable from a surviving ref (i.e. uniqueCommitCount === 0).
-      // Leaving it undefined on the failure path keeps check 4's fail-closed
-      // behaviour (see below) and prevents check 5 from treating "unverified"
-      // as "verified zero".
       let remote = 'origin';
       let uniqueCommitCount: number | undefined;
+      let repoConfig: Awaited<ReturnType<typeof loadRepoConfig>> | undefined;
       try {
-        const repoConfig = await loadRepoConfig(env.codebase_default_cwd);
+        repoConfig = await loadRepoConfig(env.codebase_default_cwd);
         remote = repoConfig.worktree?.remote?.trim() || remote;
         uniqueCommitCount = await getUniqueCommitCount(
           toRepoPath(env.codebase_default_cwd),
           toBranchName(branch),
           remote
         );
-        if (uniqueCommitCount > 0) {
-          blockers.push(`${String(uniqueCommitCount)} commit(s) unique to this branch`);
-        }
       } catch (error) {
         const err = error as Error;
         getLog().warn({ err, branch }, 'isolation.complete_unique_commit_check_failed');
-        // Fail CLOSED. This check exists to stop a branch being deleted while it
-        // holds commits reachable from nowhere else; treating an unanswerable
-        // check as "no unique commits" would let exactly the loss it guards
-        // against proceed on any git failure — permissions, a corrupt ref, a
-        // timeout. An unnecessary blocker costs the operator one --force; a
-        // wrong skip costs them the commits.
-        // `uniqueCommitCount` is left undefined here so check 5 cannot mistake
-        // "unverified" for "verified zero" — the blocker pushed in this branch
-        // is what covers the unverifiable case.
         blockers.push(
           `could not determine unique commits (${err.message}) — refusing to delete unverified`
         );
       }
 
-      // Check 5: unpushed commits (not yet on remote).
-      // A branch that was never pushed carries zero commits we can lose — every
-      // commit on it is already reachable from a surviving ref — so the
-      // "never pushed" blocker is gated on check 4 having confirmed there ARE
-      // unique commits. If check
-      // 4 failed (uniqueCommitCount undefined), the gate is false and this
-      // check is suppressed; check 4's own blocker still covers the case.
+      // Check 5: unpushed commits and remote-deleted branches.
       try {
         const unpushedResult = await execFileAsync(
           'git',
@@ -363,18 +342,57 @@ export async function isolationCompleteCommand(
         if (unpushedLines.length > 0) {
           blockers.push(`${unpushedLines.length} commit(s) not pushed to remote`);
         }
+        if (uniqueCommitCount !== undefined && uniqueCommitCount > 0) {
+          blockers.push(`${String(uniqueCommitCount)} commit(s) unique to this branch`);
+        }
       } catch (error) {
         const err = error as Error;
-        // origin/<branch> doesn't exist means branch was never pushed. Only
-        // flag it as a blocker when check 4 confirmed the branch has unique
-        // commits; otherwise the branch is provably safe to delete even
-        // though it's unpushed (e.g. a branch that was created and merged
-        // locally, byte-identical to base, and never pushed upstream).
+        // git gives the same "unknown revision" for a ref GitHub deleted after a
+        // squash merge and for one that was never pushed. The safety decision is the
+        // same either way — is the content on the base? — but the operator's message
+        // must not assert a deletion that may never have happened.
         if (err.message.includes('unknown revision') || err.message.includes('bad revision')) {
           if (uniqueCommitCount !== undefined && uniqueCommitCount > 0) {
-            blockers.push('branch has never been pushed to remote');
+            try {
+              const configuredBase = repoConfig?.worktree?.baseBranch?.trim();
+              const baseBranch = configuredBase
+                ? toBranchName(configuredBase)
+                : await getDefaultBranch(toRepoPath(env.codebase_default_cwd), remote);
+              const remoteBaseRef = `${remote}/${baseBranch}`;
+              if (
+                await isPatchEquivalent(
+                  toRepoPath(env.codebase_default_cwd),
+                  toBranchName(branch),
+                  remoteBaseRef,
+                  { throwOnExpectedError: true }
+                )
+              ) {
+                console.log(
+                  `  Note: no ${remote}/${branch} on the remote; content is already on ` +
+                    `${remoteBaseRef} (squash-merged, or merged locally and never pushed).`
+                );
+              } else {
+                blockers.push(
+                  `no ${remote}/${branch} on the remote (deleted or never pushed) ` +
+                    `and content not found on ${remoteBaseRef}`
+                );
+              }
+            } catch (patchCheckError) {
+              const patchCheckErr = patchCheckError as Error;
+              getLog().warn(
+                { err: patchCheckErr, branch },
+                'isolation.complete_remote_deleted_branch_check_failed'
+              );
+              blockers.push(
+                `could not verify whether ${branch}'s content is already on the base branch ` +
+                  `(${patchCheckErr.message})`
+              );
+            }
           }
         } else {
+          if (uniqueCommitCount !== undefined && uniqueCommitCount > 0) {
+            blockers.push(`${String(uniqueCommitCount)} commit(s) unique to this branch`);
+          }
           getLog().warn({ err, branch }, 'isolation.complete_unpushed_check_failed');
         }
       }
