@@ -54,9 +54,10 @@ def delivered_pr_url(delivered: str) -> tuple[str, str]:
     if not isinstance(record, dict):
         return "", f"is a JSON {type(record).__name__}, not the pull request object"
     url = record.get("url")
-    if not isinstance(url, str) or not url.strip():
+    stripped = url.strip() if isinstance(url, str) else ""
+    if not stripped:
         return "", "carries no 'url' string"
-    return url.strip(), ""
+    return stripped, ""
 
 
 DISCOVERY_RELAY = (
