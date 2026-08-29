@@ -171,15 +171,12 @@ nodes:
               Accepted work order:
               $INPUTS.work
 
-              When the correction is green, push its commits to the existing PR
-              branch. Before pushing, read PR #$pr.output.number from the origin
-              repository and fail unless its head is exactly
-              $pr.output.head and the current branch is that same name. Push that
-              recorded branch explicitly; do not let git select an upstream or
-              gh resolve a PR from ambient state. Do not change the PR's draft state or edit the
-              canonical review comment; the following review owns that public
-              verdict. Record the exact push target and a read-back of the remote
-              ref in implementation.md; never record credentials.
+              When the correction is green, push its commits to the branch this
+              run is on. Push it explicitly by name; do not let git select an
+              upstream. Do not change the PR's draft state or edit the canonical
+              review comment; the following review owns that public verdict.
+              Record the exact push target and a read-back of the remote ref in
+              implementation.md; never record credentials.
 
         # The same gate, same script: a correction can hit inherited or environment
         # red exactly as the first implementation can (run 49f0d462, #2939), and a
@@ -337,19 +334,11 @@ nodes:
           fail "flip-ready: origin remote does not resolve to an owner/repo."
           ;;
       esac
+      # The recorded number is the selector. Which branch is checked out is not
+      # re-derived here: the run owns its worktree and the PR was created in it,
+      # so this node cannot be the place that discovers otherwise. See the pack
+      # README on guards.
       PR_NUMBER=$pr.output.number
-      EXPECTED_BRANCH=$pr.output.head
-      BRANCH=$(record_read git branch --show-current)
-      if [ -z "$BRANCH" ]; then
-        fail "flip-ready: detached HEAD — cannot resolve the PR branch."
-      fi
-      if [ "$BRANCH" != "$EXPECTED_BRANCH" ]; then
-        fail "flip-ready: current branch '$BRANCH' does not match run-owned PR #$PR_NUMBER branch '$EXPECTED_BRANCH'."
-      fi
-      ACTUAL_BRANCH=$(record_read gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json headRefName --jq .headRefName)
-      if [ "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]; then
-        fail "flip-ready: PR #$PR_NUMBER head '$ACTUAL_BRANCH' does not match recorded branch '$EXPECTED_BRANCH'."
-      fi
       # Public-surface preflight (#2794): the flip is the one irreversible
       # step, so it re-verifies CI itself instead of trusting the loop above —
       # any pending or non-green check refuses the flip loudly. An empty result

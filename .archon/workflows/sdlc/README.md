@@ -34,20 +34,21 @@ a preflight node before review, the ready flip, and prose inside the correction
 prompt for an agent to honour. Three copies, two languages, one of them dependent
 on a model's diligence.
 
-None of it was load-bearing. The engine gives a run its worktree, and the PR is
-created in that worktree, so the invariant holds by construction. Nothing had ever
-gone wrong — the alarm that prompted the work (#2905) was investigated and closed
-invalid. And the copies did not even cover the steps that would have suffered most
-from a drifted checkout: `impl` writes code to that checkout without checking, and
-`validate` runs the project's tests against it without checking.
+None of it was load-bearing. The engine gives a run its worktree, and the pull
+request is created in that worktree, so the invariant holds by construction.
+Nothing had ever gone wrong — the alarm that prompted the work was investigated
+and closed invalid. And the copies did not even cover the steps that would have
+suffered most from a drifted checkout: `impl` writes code to that checkout without
+checking, and `validate` runs the project's tests against it without checking.
 
-The preflight cost 31 lines and a stub in 17 fixtures, for a node no fixture could
-ever run. It was removed rather than shared.
+The preflight alone cost 31 lines and a stub in 17 fixtures, for a node no fixture
+could ever run. All three copies are gone.
 
-Two copies remain — the ready flip's own check and the correction prompt's — and
-are tracked in #2968 rather than removed in the same change, because one of them
-guards the single irreversible action in the pack and deserves its own decision.
-New guards are held to the rule above regardless.
+What survived in the ready flip is the part that passes the rule: it refuses an
+origin remote that does not normalize to `owner/repo`, because its own `gh` calls
+would otherwise go somewhere unintended; it refuses to flip while any check is
+non-green; and it reads the draft state back afterwards, because a successful
+exit is not proof the state changed.
 
 The rule is not "never defend against what has not happened" — the two Keep cases
 above have not happened either, and both are worth their few lines. The question is

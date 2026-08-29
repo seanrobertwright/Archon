@@ -557,7 +557,10 @@ describe('bundled-defaults', () => {
       expect(pr).toContain('required: [number, url, head, base, is_draft]');
       expect(deliver).toContain('scope: "$pr.output.number"');
       expect(deliver).toContain('PR_NUMBER=$pr.output.number');
-      expect(deliver).toContain('EXPECTED_BRANCH=$pr.output.head');
+      // The flip selects by recorded number and does not re-derive the branch:
+      // the run owns its worktree, so this node cannot be where that is discovered.
+      expect(deliver).not.toContain('EXPECTED_BRANCH=');
+      expect(deliver).not.toContain('git branch --show-current');
       expect(deliver).toContain('gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO"');
       expect(deliver).toContain('EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"');
       expect(deliver).not.toContain('record_read git remote get-url origin');
@@ -591,7 +594,7 @@ describe('bundled-defaults', () => {
     // PATH, so the harness — not the workflow — is what fails there. The node body
     // under test is POSIX shell either way, and ubuntu proves it.
     it.skipIf(process.platform === 'win32')(
-      'refuses branch and PR-head mismatches before flipping ready',
+      'refuses an origin that does not resolve to an owner/repo before flipping ready',
       async () => {
         const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
         if (parsed.workflow === null) throw new Error(parsed.error.error);
@@ -655,22 +658,11 @@ describe('bundled-defaults', () => {
           process.env.PATH = `${bin}:${previousPath ?? ''}`;
           process.env.GH_LOG = log;
 
-          // Each case must be refused for its OWN reason. Asserting only `failed`
-          // would pass on any earlier guard — the token-bearing origin below trips
-          // the owner/repo check before the branch checks are ever reached.
+          // The guard that remains protects this node's own `gh` calls: a remote
+          // that does not normalize to `owner/repo` would point them somewhere
+          // unintended, and the raw URL can carry a token. Assert the reason, not
+          // just `failed`, so it stays anchored to that check.
           const cases = [
-            {
-              origin: 'git@github.com:owner/repo.git',
-              branch: 'wrong-branch',
-              remoteHead: 'recorded-branch',
-              reason: "current branch 'wrong-branch' does not match run-owned PR #42",
-            },
-            {
-              origin: 'git@github.com:owner/repo.git',
-              branch: 'recorded-branch',
-              remoteHead: 'wrong-branch',
-              reason: "PR #42 head 'wrong-branch' does not match recorded branch",
-            },
             {
               origin: 'https://token@example.com/repo.git',
               branch: 'recorded-branch',
