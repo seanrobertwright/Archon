@@ -1429,6 +1429,44 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     expect(composedBindings(sync)).toEqual({ pr_number: '$ship__deliver__pr.output.number' });
   });
 
+  test('rejects a caller ref forwarded into a binding that skips depends_on', () => {
+    const block = wf('refblk', [{ id: 'sync', command: 'ref-cmd', with: { v: '$INPUTS.src' } }]);
+    block.inputs = { src: { required: true } };
+    // `other` is a real parent node, but nothing makes it run before the block.
+    const parent = wf('parent', [
+      { id: 'other', bash: 'echo x' },
+      { id: 'inc', include: 'refblk', with: { src: '$other.output' } },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['ref-cmd', 'Use $INPUTS.v.']])
+    );
+    // The block was proven hermetic before the caller's value was inserted, so the scan
+    // over the FLATTENED graph is the only one that can see this ref. Without it the
+    // binding reaches the executor and fails the node mid-run instead of at load.
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "add 'other' to 'inc__sync'.depends_on"
+    );
+  });
+
+  test('accepts the same forwarded ref when the include declares the dependency', () => {
+    const block = wf('refblk-ok', [{ id: 'sync', command: 'ref-ok', with: { v: '$INPUTS.src' } }]);
+    block.inputs = { src: { required: true } };
+    const parent = wf('parent', [
+      { id: 'other', bash: 'echo x' },
+      { id: 'inc', include: 'refblk-ok', depends_on: ['other'], with: { src: '$other.output' } },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['ref-ok', 'Use $INPUTS.v.']])
+    );
+    expect(errors).toHaveLength(0);
+    expect(composedBindings(nodeById(workflows.get('parent')!, 'inc__sync'))).toEqual({
+      v: '$other.output',
+    });
+  });
+
   test('materializes loop.command and binds its declared include input', () => {
     const block = wf('loopblk', [
       { id: 'repeat', loop: { command: 'loop-cmd', until: 'DONE', max_iterations: 1 } },

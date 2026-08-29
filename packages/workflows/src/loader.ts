@@ -68,6 +68,7 @@ import { workflowNodeHooksSchema } from './schemas/hooks';
 import { parseLoopPrevWhenAtom, parseWhenAtom, whenAtoms, WHEN_INPUTS_SCOPE } from './when-atom';
 import { declaredFieldsFromSchema, OUTPUT_REF_SOURCE, parseWholeOutputRef } from './output-ref';
 import { isBindingDirective } from './schemas/dag-node';
+import { readComposedBindings } from './compiled-command';
 import { visitNodeTemplateSlots } from './template-walker';
 import { z } from '@hono/zod-openapi';
 
@@ -1083,6 +1084,12 @@ export function validateDagStructure(
   // runs, so binding resolution needs no new scheduling. Only same-scope producers are
   // enforced — a loop_group body node may read the enclosing scope, whose outputs are
   // settled before the group starts (existing body-ref semantics).
+  //
+  // A composed command node is scanned through the payload its bindings moved to when
+  // expansion compiled its body (#2964). This run over the FLATTENED graph is the only
+  // one that can see a caller ref forwarded into a binding through `with:` — the child
+  // was proven before that value was inserted, so a ref naming a parent node outside the
+  // block's dependencies would otherwise reach the executor and fail the node mid-run.
   for (const node of nodes) {
     // Same capture-before-narrowing as the scan above: the include guard below would
     // otherwise filter a compose_fan_out node out of the binding check entirely.
@@ -1090,8 +1097,10 @@ export function validateDagStructure(
     if (isIncludeDirective(node)) continue;
     const nodeWith = isExecNode(node)
       ? node.with
-      : isAgentNode(node) && node.source.kind === 'command'
-        ? node.source.with
+      : isAgentNode(node)
+        ? node.source.kind === 'command'
+          ? node.source.with
+          : readComposedBindings(node)
         : composeFanOut
           ? composeFanOut.with
           : undefined;
