@@ -1035,6 +1035,42 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
     expect(warnings[0].message).toContain('wrapping');
   });
 
+  test('warns on single-quoted output refs after a shell-word prefix and across lines', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'bash-prefix',
+        kind: 'exec',
+        runtime: 'sh',
+        script: "status=prefix'$emit.output.status'",
+      } as DagNode,
+      {
+        id: 'loop-multiline',
+        prompt: 'produce output',
+        kind: 'loop',
+        loop: {
+          until: 'DONE',
+          until_bash: "status='\n$emit.output.status\n'",
+        },
+      } as unknown as DagNode,
+      {
+        id: 'group-prefix',
+        kind: 'loop_group',
+        loop_group: {
+          until_bash: "status=prefix'$probe.output.status'",
+          max_iterations: 2,
+          nodes: [{ id: 'probe', kind: 'exec', runtime: 'sh', script: 'echo pending' }],
+        },
+      } as unknown as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning');
+    expect(warnings.map(warning => [warning.nodeId, warning.field])).toEqual([
+      ['bash-prefix', 'bash'],
+      ['loop-multiline', 'loop.until_bash'],
+      ['group-prefix', 'loop_group.until_bash'],
+    ]);
+  });
+
   test('no false positive: a prior double-quoted string before an unquoted ref on the same line', async () => {
     // The closing `"` of "Build complete." must NOT seed a match that slides across
     // the `;` to the correctly-unquoted $build.output.score.

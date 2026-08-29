@@ -878,15 +878,36 @@ export async function validateWorkflowResources(
     //   wrong="$n.output.field" → wrong="'ok'" (quote characters become part of the value)
     //   right=$n.output.field   → right='ok' → bash assigns: ok
     //
-    // The `(?:^|[=\s])` prefix requires the opening quote to be an operand (line
-    // start, after `=`, or after whitespace) so a *closing* quote of an unrelated
-    // earlier string doesn't cause a false positive (e.g. `echo "hi"; x=$a.output`).
-    // Quote-specific character classes exclude newlines and the opening quote style,
-    // so a quote spanning lines or a closing quote from an earlier string cannot seed a match.
-    const quotedOutputRef =
-      /(?:^|[=\s])(?:"[^"\n]*|'[^'\n]*)\$(?:[a-zA-Z_][a-zA-Z0-9_-]*\.output|LOOP_PREV\.[a-zA-Z_][a-zA-Z0-9_-]*\.output)/m;
+    const outputRef =
+      /\$(?:[a-zA-Z_][a-zA-Z0-9_-]*\.output|LOOP_PREV\.[a-zA-Z_][a-zA-Z0-9_-]*\.output)/;
+    const quotedOutputRef = (body: string): boolean => {
+      let quote: '"' | "'" | undefined;
+      let quoteStart = 0;
+
+      for (let index = 0; index < body.length; index += 1) {
+        const character = body[index];
+        if (!quote) {
+          if (character === '\\') {
+            index += 1;
+          } else if (character === '"' || character === "'") {
+            quote = character;
+            quoteStart = index + 1;
+          }
+          continue;
+        }
+
+        if (quote === '"' && character === '\\') {
+          index += 1;
+        } else if (character === quote) {
+          if (outputRef.test(body.slice(quoteStart, index))) return true;
+          quote = undefined;
+        }
+      }
+
+      return quote !== undefined && outputRef.test(body.slice(quoteStart));
+    };
     const warnQuotedOutputRef = (body: string, field: string): void => {
-      if (quotedOutputRef.test(body)) {
+      if (quotedOutputRef(body)) {
         issues.push({
           level: 'warning',
           nodeId: node.id,
