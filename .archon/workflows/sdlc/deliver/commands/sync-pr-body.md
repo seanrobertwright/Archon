@@ -11,14 +11,8 @@ thing you may edit.
 
 The target is the run-owned PR, never the current branch's ambient PR mapping:
 
-Read that record from `$ARTIFACTS_DIR/pr-action.md`, which the PR node wrote
-when it created the PR: it names the PR number and the head branch it pushed. A
-missing or unreadable record is a hard failure — do not fall back to resolving a
-PR from the current branch.
-
-(A sibling node's typed output cannot reach this file directly: a composed
-command may only read `$INPUTS.<name>` and workflow variables, and the recorded
-PR is produced mid-run rather than supplied by the caller.)
+- Its recorded number is **$INPUTS.pr_number**.
+- Its recorded head branch is **$INPUTS.pr_head**.
 
 Derive the origin repository, read that exact PR by number, and fail unless its
 head and the checked-out branch both equal the recorded head branch. Use the

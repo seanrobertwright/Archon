@@ -681,23 +681,29 @@ describe('bundled-defaults', () => {
       expect(deliver).toContain('EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"');
       expect(deliver).not.toContain('record_read git remote get-url origin');
       expect(deliver).toContain('origin remote does not resolve to an owner/repo');
-      // A composed prompt node reaches none of the other channels: the
-      // INPUTS_<UPPER_SNAKE> env form is bash/script only, a node-local `with:`
-      // map is exec-node only, and the loader rejects a cross-namespace
-      // `$pr.output` ref in a command file. The durable artifact is the one
-      // channel that survives composition, so both ends must name it (#2909 R1).
-      const prCommand = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:pr::pr'];
-      expect(prCommand).toContain('$ARTIFACTS_DIR/pr-action.md');
-      expect(sync).toContain('$ARTIFACTS_DIR/pr-action.md');
+      // A command node reads its node-local `with:` map through `$INPUTS.<name>`,
+      // never the INPUTS_<UPPER_SNAKE> env form — that one is built only for
+      // bash/script nodes, and naming it here left the agent reading the literal
+      // token with no PR number in it (#2909 R1).
+      expect(sync).toContain('$INPUTS.pr_number');
+      expect(sync).toContain('$INPUTS.pr_head');
       expect(sync).not.toContain('INPUTS_PR_NUMBER');
-      // The `review`/`recheck` includes keep their `with:` bindings — archon-review
-      // declares those inputs, so that channel is real. The prompt node must not
-      // carry one, because nothing would ever deliver it.
       const deliverParsed = parseWorkflow(deliver, 'archon-deliver.yaml');
       if (deliverParsed.workflow === null) throw new Error(deliverParsed.error.error);
       const syncNode = deliverParsed.workflow.nodes.find(node => node.id === 'sync-pr-body');
       expect(syncNode?.kind).toBe('agent');
-      expect((syncNode as { with?: unknown }).with).toBeUndefined();
+      if (syncNode?.kind !== 'agent') throw new Error('sync-pr-body is not an agent node');
+      // A command node carries its bindings on `source`, not the node root.
+      expect(syncNode.source).toMatchObject({
+        kind: 'command',
+        with: { pr_number: '$pr.output.number', pr_head: '$pr.output.head' },
+      });
+      // Composition validates a command's `$INPUTS.<name>` against the ENCLOSING
+      // workflow's declared inputs and does not see the node-local binding, so
+      // archon-ship/stabilize/upkeep fail to load unless these names are declared
+      // too. The binding still supplies the real values and wins over any caller.
+      expect(deliverParsed.workflow.inputs?.pr_number?.default).toBe('');
+      expect(deliverParsed.workflow.inputs?.pr_head?.default).toBe('');
     });
 
     // Windows cannot execute the extensionless `#!/bin/sh` fakes this test puts on

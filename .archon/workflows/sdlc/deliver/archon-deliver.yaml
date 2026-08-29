@@ -34,6 +34,14 @@ inputs:
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
+  # Declared so composition can see the names `sync-pr-body` reads; the node's
+  # own `with:` supplies the real values mid-run and wins over any caller value.
+  pr_number:
+    default: ""
+    description: Internal — the run-owned PR number, bound from the pr node.
+  pr_head:
+    default: ""
+    description: Internal — the run-owned PR head branch, bound from the pr node.
 
 returns: pr
 
@@ -238,6 +246,9 @@ nodes:
   - id: sync-pr-body
     command: sync-pr-body
     model: medium
+    with:
+      pr_number: "$pr.output.number"
+      pr_head: "$pr.output.head"
     depends_on: [gate-ready]
     when: "$review.output.ready == 'false'"
 
