@@ -107,6 +107,34 @@ describe('waitForRunAttention', () => {
     expect(mockGetWorkflowRun).toHaveBeenCalledTimes(1);
   });
 
+  test('announces the attachment once, with the status the opening read saw', async () => {
+    // The one moment a caller cannot infer for itself. A transition after it reached
+    // the caller as a wake; the same transition before it would have been an ordinary
+    // read of a row that had already settled. Several re-reads happen inside this
+    // deadline, and none of them is a second attachment.
+    putRun('r1', { status: 'running' });
+    const attached: string[] = [];
+
+    const result = await waitForRunAttention('r1', {
+      pollIntervalMs: 5,
+      deadlineMs: 40,
+      onAttached: status => attached.push(status),
+    });
+
+    expect(result).toMatchObject({ kind: 'deadline', observedStatus: 'running' });
+    expect(attached).toEqual(['running']);
+  });
+
+  test('says nothing about attaching when the first read already has an answer', async () => {
+    // Nothing was ever waited for, so there is no watch to announce.
+    const attached: string[] = [];
+    putRun('r1', { status: 'completed', completed_at: new Date('2026-08-28T11:00:00.000Z') });
+
+    await wait('r1', { onAttached: (status: string) => attached.push(status) });
+
+    expect(attached).toEqual([]);
+  });
+
   test.each(['completed', 'failed', 'cancelled'] as const)(
     'wakes on a %s written after the wait began',
     async status => {

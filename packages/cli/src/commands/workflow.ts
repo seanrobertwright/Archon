@@ -3591,6 +3591,37 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
 }
 
 /**
+ * Say once, on stderr, that the wait is now watching the run.
+ *
+ * Until this line the command is completely silent, and neither a human nor a host
+ * can tell an attached wait from one still resolving the id — or from one that died
+ * on the way. It also fixes the instant the watch began: a transition after this line
+ * reached the caller as a wake, where the same transition before it would have been
+ * an ordinary read of an already-settled row.
+ *
+ * stderr, not stdout, because `--json` promises exactly one document on stdout. The
+ * shape follows the same split as the answer itself: the JSON envelope for a machine,
+ * one plain sentence for a person.
+ */
+function announceWaitAttached(
+  watchedRunId: string,
+  observedStatus: WorkflowRunStatus,
+  json?: boolean
+): void {
+  console.error(
+    json
+      ? JSON.stringify({
+          ok: true,
+          action: 'wait',
+          runId: watchedRunId,
+          result: 'waiting',
+          observedStatus,
+        })
+      : `Waiting on run ${watchedRunId} — currently ${observedStatus}.`
+  );
+}
+
+/**
  * Block until a run finishes or parks on a gate awaiting a response, then say which.
  *
  * The point of the verb: a host that launched a run with `--detach` waits on one
@@ -3616,6 +3647,9 @@ export async function workflowWaitCommand(
       // No timeout by default: a wait that ends on its own clock would answer a
       // question only the run can answer.
       ...(timeoutSeconds === undefined ? {} : { deadlineMs: timeoutSeconds * 1000 }),
+      onAttached: observedStatus => {
+        announceWaitAttached(resolvedId, observedStatus, json);
+      },
     });
   } catch (error) {
     const err = error as Error;

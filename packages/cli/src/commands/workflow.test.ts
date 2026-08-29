@@ -122,7 +122,8 @@ mock.module(
 // workflow-wait.integration.spec.ts. Here the command's OWN responsibilities are
 // under test: prefix resolution, both output modes, and the exit code per outcome.
 const mockWaitForRunAttention = mock(
-  (): Promise<unknown> => Promise.resolve({ kind: 'not_found', runId: 'unset' })
+  (_runId: string, _opts?: { onAttached?: (observedStatus: string) => void }): Promise<unknown> =>
+    Promise.resolve({ kind: 'not_found', runId: 'unset' })
 );
 mock.module('@archon/core/services/run-attention-watch', () => ({
   waitForRunAttention: mockWaitForRunAttention,
@@ -10163,7 +10164,48 @@ describe('workflowWaitCommand', () => {
       result: 'deadline',
       observedStatus: 'running',
     });
-    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, { deadlineMs: 5000 });
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {
+      deadlineMs: 5000,
+      onAttached: expect.any(Function),
+    });
+  });
+
+  it('announces the attachment on stderr, leaving stdout one --json document', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    mockWaitForRunAttention.mockImplementationOnce((_runId, opts) => {
+      opts?.onAttached?.('running');
+      return Promise.resolve(terminal('cancelled'));
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo');
+
+    expect(code).toBe(0);
+    // stderr is the whole point: a progress line on stdout would break the --json
+    // contract that a consumer gets exactly one document.
+    expect(stdoutSpy.mock.calls).toHaveLength(1);
+    expect(JSON.parse(String(errorSpy.mock.calls[0]?.[0]))).toEqual({
+      ok: true,
+      action: 'wait',
+      runId: FULL_ID,
+      result: 'waiting',
+      observedStatus: 'running',
+    });
+    errorSpy.mockRestore();
+  });
+
+  it('names the run and the status it attached on in human mode', async () => {
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    mockWaitForRunAttention.mockImplementationOnce((_runId, opts) => {
+      opts?.onAttached?.('paused');
+      return Promise.resolve(terminal('completed'));
+    });
+
+    await workflowWaitCommand(FULL_ID, undefined, '/repo');
+
+    expect(String(errorSpy.mock.calls[0]?.[0])).toBe(
+      `Waiting on run ${FULL_ID} — currently paused.`
+    );
+    errorSpy.mockRestore();
   });
 
   it('waits indefinitely when no timeout is given', async () => {
@@ -10171,7 +10213,9 @@ describe('workflowWaitCommand', () => {
 
     await workflowWaitCommand(FULL_ID, undefined, '/repo');
 
-    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {});
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {
+      onAttached: expect.any(Function),
+    });
   });
 
   it('exits 1 with an {ok:false} line for an unknown run', async () => {
@@ -10231,7 +10275,9 @@ describe('workflowWaitCommand', () => {
     const code = await workflowWaitCommand('0b1ee8da', undefined, '/repo');
 
     expect(code).toBe(0);
-    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {});
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {
+      onAttached: expect.any(Function),
+    });
   });
 
   it('never throws in --json mode when the wait itself fails', async () => {
