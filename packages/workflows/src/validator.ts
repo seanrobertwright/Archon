@@ -878,42 +878,31 @@ export async function validateWorkflowResources(
     //   wrong="$n.output.field" → wrong="'ok'" (quote characters become part of the value)
     //   right=$n.output.field   → right='ok' → bash assigns: ok
     //
-    const outputRef =
-      /\$(?:[a-zA-Z_][a-zA-Z0-9_-]*\.output|LOOP_PREV\.[a-zA-Z_][a-zA-Z0-9_-]*\.output)/;
-    const quotedOutputRef = (body: string): boolean => {
-      let quote: '"' | "'" | undefined;
-      let quoteStart = 0;
-
-      for (let index = 0; index < body.length; index += 1) {
-        const character = body[index];
-        if (!quote) {
-          if (character === '\\') {
-            index += 1;
-          } else if (character === '"' || character === "'") {
-            quote = character;
-            quoteStart = index + 1;
-          }
-          continue;
-        }
-
-        if (quote === '"' && character === '\\') {
-          index += 1;
-        } else if (character === quote) {
-          if (outputRef.test(body.slice(quoteStart, index))) return true;
-          quote = undefined;
-        }
-      }
-
-      return quote !== undefined && outputRef.test(body.slice(quoteStart));
-    };
+    // Both quote characters open a region bash treats as a string, so both forms
+    // are matched. The two alternatives are kept separate (rather than one class)
+    // because the closing quote must be the SAME character as the opening one.
+    //
+    // The `(?:^|[=\s])` prefix requires the opening quote to be an operand (line
+    // start, after `=`, or after whitespace) so a *closing* quote of an unrelated
+    // earlier string doesn't cause a false positive (e.g. `echo "hi"; x=$a.output`).
+    // That anchor is why this stays a regex instead of a quote-state scanner: a
+    // scanner has to know which quotes are real, and bash bodies are full of
+    // apostrophes that are not — prose in `#` comments (`the issue's claims`) and
+    // quoted heredoc delimiters (`<<'EOF'`). Those desync a scanner and make it
+    // report correct, unquoted code. Anchoring gives that up in exchange: a quoted
+    // ref reached from a non-operand position (`<<<"$n.output"`) is not reported.
+    // `[^"\n]` / `[^'\n]` exclude newlines — a quote spanning lines is pathological,
+    // and allowing it is the other half of the comment/heredoc desync.
+    const quotedOutputRef =
+      /(?:^|[=\s])(?:"[^"\n]*|'[^'\n]*)\$(?:[a-zA-Z_][a-zA-Z0-9_-]*\.output|LOOP_PREV\.[a-zA-Z_][a-zA-Z0-9_-]*\.output)/m;
     const warnQuotedOutputRef = (body: string, field: string): void => {
-      if (quotedOutputRef(body)) {
+      if (quotedOutputRef.test(body)) {
         issues.push({
           level: 'warning',
           nodeId: node.id,
           field,
           message:
-            '`"$nodeId.output"` / `\'$nodeId.output\'` / `"$LOOP_PREV.nodeId.output"` — wrapping a substitution that is already shell-quoted by Archon produces the wrong value',
+            '`"$nodeId.output"` / `\'$nodeId.output\'` / `"$LOOP_PREV.nodeId.output"` / `\'$LOOP_PREV.nodeId.output\'` — wrapping a substitution that is already shell-quoted by Archon produces the wrong value',
           hint: 'Use `var=$node.output.field` or `var=$LOOP_PREV.node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so wrapping is harmless for those, but the rule is uniform.)',
         });
       }

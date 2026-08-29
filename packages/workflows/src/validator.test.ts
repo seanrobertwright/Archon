@@ -1035,28 +1035,24 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
     expect(warnings[0].message).toContain('wrapping');
   });
 
-  test('warns on single-quoted output refs after a shell-word prefix and across lines', async () => {
+  test('warns on single-quoted output refs in loop and loop_group until_bash', async () => {
+    // until_bash substitutes through the same pre-quoting path, so the single-quoted
+    // form is as wrong there as in a bash body.
     const workflow = makeWorkflow('test', [
       {
-        id: 'bash-prefix',
-        kind: 'exec',
-        runtime: 'sh',
-        script: "status=prefix'$emit.output.status'",
-      } as DagNode,
-      {
-        id: 'loop-multiline',
+        id: 'loop-single',
         prompt: 'produce output',
         kind: 'loop',
         loop: {
           until: 'DONE',
-          until_bash: "status='\n$emit.output.status\n'",
+          until_bash: "status='$emit.output.status'",
         },
       } as unknown as DagNode,
       {
-        id: 'group-prefix',
+        id: 'group-single',
         kind: 'loop_group',
         loop_group: {
-          until_bash: "status=prefix'$probe.output.status'",
+          until_bash: "status='$probe.output.status'",
           max_iterations: 2,
           nodes: [{ id: 'probe', kind: 'exec', runtime: 'sh', script: 'echo pending' }],
         },
@@ -1065,10 +1061,34 @@ describe('validateWorkflowResources — bash quoted-output lint', () => {
     const issues = await validateWorkflowResources(workflow, tmpDir);
     const warnings = issues.filter(i => i.level === 'warning');
     expect(warnings.map(warning => [warning.nodeId, warning.field])).toEqual([
-      ['bash-prefix', 'bash'],
-      ['loop-multiline', 'loop.until_bash'],
-      ['group-prefix', 'loop_group.until_bash'],
+      ['loop-single', 'loop.until_bash'],
+      ['group-single', 'loop_group.until_bash'],
     ]);
+  });
+
+  test('no false positive: an apostrophe in a # comment or a quoted heredoc delimiter', async () => {
+    // Both bodies are reduced from shipped workflows (archon-deliver's flip-ready,
+    // t1-fix-issue's open-pr). A lone apostrophe in prose, or the `'` of a quoted
+    // heredoc delimiter, must not open a string region that swallows a later,
+    // correctly-unquoted ref.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'commented',
+        kind: 'exec',
+        runtime: 'sh',
+        script:
+          '# --repo pins to origin: gh\'s default resolution targets the parent.\nPR_NUMBER=$pr.output.number\necho "$PR_NUMBER"',
+      } as DagNode,
+      {
+        id: 'heredoc',
+        kind: 'exec',
+        runtime: 'sh',
+        script: "cat <<'ARCHON_EOF' > body.md\nreport text\nARCHON_EOF\nPR_URL=$pr.output.url",
+      } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
+    expect(warnings).toHaveLength(0);
   });
 
   test('no false positive: a prior double-quoted string before an unquoted ref on the same line', async () => {
