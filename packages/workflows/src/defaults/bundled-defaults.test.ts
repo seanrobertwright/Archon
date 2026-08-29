@@ -563,7 +563,17 @@ describe('bundled-defaults', () => {
       expect(deliver).not.toContain('git branch --show-current');
       expect(deliver).toContain('gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO"');
       expect(deliver).toContain('EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"');
-      expect(deliver).not.toContain('record_read git remote get-url origin');
+      // The raw origin URL can carry a credential (https://<token>@host/...), so
+      // it must never reach the evidence log. It is read outside the recording
+      // helpers, and only the normalized owner/repo is ever passed to a logged
+      // command or interpolated into a failure message.
+      const flipBody = deliver.slice(deliver.indexOf('- id: flip-ready'));
+      expect(flipBody).not.toMatch(/record(_read)? git remote/);
+      for (const line of flipBody.split('\n')) {
+        if (/^\s*record(_read)? /.test(line) || /\$\(record(_read)? /.test(line)) {
+          expect(line).not.toContain('git remote');
+        }
+      }
       expect(deliver).toContain('origin remote does not resolve to an owner/repo');
       // A command node reads its node-local `with:` map through `$INPUTS.<name>`,
       // never the INPUTS_<UPPER_SNAKE> env form — that one is built only for

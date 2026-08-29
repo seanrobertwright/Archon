@@ -27,6 +27,16 @@ A node the dry run cannot execute — a composed `bash:` node, for instance, whi
 never receives its caller's `with:` values — can only ever be stubbed, so no
 fixture can show the guard working or catch it breaking.
 
+## Evidence never carries credentials
+
+A guard that records what it did is only useful if the record is safe to keep. Read
+anything that can contain a secret outside whatever writes the evidence, and log the
+normalized form instead. A remote URL is the common one — `https://<token>@host/repo`
+is a perfectly ordinary origin — so the ready flip derives `owner/repo` from it
+outside its recording helpers and logs only that. The same applies to failure
+messages: they are evidence too, and interpolating the raw value into one leaks it
+just as effectively.
+
 ### Why this rule exists
 
 The pack once verified "the checkout is on the branch my PR is on" in three places:

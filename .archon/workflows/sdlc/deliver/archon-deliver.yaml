@@ -328,6 +328,9 @@ nodes:
       # fork clone targets the upstream parent instead. With --repo, gh disables
       # branch inference and REQUIRES an explicit selector — omitting it is a
       # usage error.
+      # Read OUTSIDE the recording helpers on purpose: the raw URL can carry a
+      # credential (https://<token>@host/...). Only the normalized owner/repo
+      # below is ever logged or interpolated into a failure message.
       ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
       case "$ORIGIN_REPO" in
         *[!A-Za-z0-9_.-]*/* | */*[!A-Za-z0-9_.-]* | */*/* | /* | */ | "")
