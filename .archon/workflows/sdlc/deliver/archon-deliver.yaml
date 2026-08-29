@@ -315,7 +315,14 @@ nodes:
         printf '$' >> "$EVIDENCE"
         printf ' %q' "$@" >> "$EVIDENCE"
         printf '\n' >> "$EVIDENCE"
-        "$@" 2>&1 | tee -a "$EVIDENCE"
+        # stderr goes to the log, never into the captured value: a git or gh
+        # warning must not become the branch name or the returned PR URL.
+        "$@" 2>>"$EVIDENCE" | tee -a "$EVIDENCE"
+      }
+      # A probe whose non-zero exit is information, not an error. Everything
+      # else here fails the node under `set -e`; this one must not.
+      record_probe() {
+        record_read "$@" || true
       }
       fail() {
         printf '%s\n' "$1" | tee -a "$EVIDENCE" >&2
@@ -348,8 +355,11 @@ nodes:
       # step, so it re-verifies CI itself instead of trusting the loop above —
       # any pending or non-green check refuses the flip loudly. An empty result
       # (no CI configured, or gated checks that never started) proceeds,
-      # matching the probe's permission-agnostic skip.
-      NOT_GREEN=$(record_read gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"')
+      # matching the probe's permission-agnostic skip. `gh pr checks` exits
+      # non-zero and says "no checks reported" for exactly that case, so this
+      # read is the one that tolerates failure — reporting the checks it found
+      # is what refuses the flip, never the exit code.
+      NOT_GREEN=$(record_probe gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"')
       if [ -n "$NOT_GREEN" ]; then
         fail "flip-ready: refusing to flip with non-green checks: $NOT_GREEN"
       fi

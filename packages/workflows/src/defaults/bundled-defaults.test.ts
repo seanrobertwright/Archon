@@ -6,7 +6,6 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
-  rmSync,
   writeFileSync,
 } from 'fs';
 import { tmpdir } from 'os';
@@ -666,6 +665,7 @@ describe('bundled-defaults', () => {
       const bin = join(directory, 'bin');
       const log = join(directory, 'gh.log');
       const previousPath = process.env.PATH;
+      const previousOrigin = process.env.TEST_ORIGIN;
       const previousBranch = process.env.TEST_BRANCH;
       const previousHead = process.env.TEST_REMOTE_HEAD;
       const previousLog = process.env.GH_LOG;
@@ -676,8 +676,8 @@ describe('bundled-defaults', () => {
           join(bin, 'git'),
           [
             '#!/bin/sh',
-            'case "$1 $2 $3" in',
-            '  "remote get-url origin") printf "%s\\n" "https://token@example.com/repo.git" ;;',
+            'case "$*" in',
+            '  "remote get-url origin") printf "%s\\n" "$TEST_ORIGIN" ;;',
             '  "branch --show-current") printf "%s\\n" "$TEST_BRANCH" ;;',
             'esac',
           ].join('\n')
@@ -697,11 +697,32 @@ describe('bundled-defaults', () => {
         process.env.PATH = `${bin}:${previousPath ?? ''}`;
         process.env.GH_LOG = log;
 
-        for (const [branch, remoteHead] of [
-          ['wrong-branch', 'recorded-branch'],
-          ['recorded-branch', 'wrong-branch'],
-        ]) {
+        // Each case must be refused for its OWN reason. Asserting only `failed`
+        // would pass on any earlier guard — the token-bearing origin below trips
+        // the owner/repo check before the branch checks are ever reached.
+        const cases = [
+          {
+            origin: 'git@github.com:owner/repo.git',
+            branch: 'wrong-branch',
+            remoteHead: 'recorded-branch',
+            reason: "current branch 'wrong-branch' does not match run-owned PR #42",
+          },
+          {
+            origin: 'git@github.com:owner/repo.git',
+            branch: 'recorded-branch',
+            remoteHead: 'wrong-branch',
+            reason: "PR #42 head 'wrong-branch' does not match recorded branch",
+          },
+          {
+            origin: 'https://token@example.com/repo.git',
+            branch: 'recorded-branch',
+            remoteHead: 'recorded-branch',
+            reason: 'origin remote does not resolve to an owner/repo',
+          },
+        ];
+        for (const { origin, branch, remoteHead, reason } of cases) {
           writeFileSync(log, '');
+          process.env.TEST_ORIGIN = origin;
           process.env.TEST_BRANCH = branch;
           process.env.TEST_REMOTE_HEAD = remoteHead;
           const result = await dryRunWorkflow({
@@ -713,19 +734,116 @@ describe('bundled-defaults', () => {
           });
 
           expect(result.outcome).toBe('failed');
-          expect(result.trace.find(entry => entry.nodeId === 'flip-ready')?.state).toBe('failed');
+          const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
+          expect(flip?.state).toBe('failed');
+          expect(flip?.reason).toContain(reason);
           expect(readFileSync(log, 'utf-8')).not.toContain('pr ready');
         }
       } finally {
         if (previousPath === undefined) delete process.env.PATH;
         else process.env.PATH = previousPath;
+        if (previousOrigin === undefined) delete process.env.TEST_ORIGIN;
+        else process.env.TEST_ORIGIN = previousOrigin;
         if (previousBranch === undefined) delete process.env.TEST_BRANCH;
         else process.env.TEST_BRANCH = previousBranch;
         if (previousHead === undefined) delete process.env.TEST_REMOTE_HEAD;
         else process.env.TEST_REMOTE_HEAD = previousHead;
         if (previousLog === undefined) delete process.env.GH_LOG;
         else process.env.GH_LOG = previousLog;
-        rmSync(directory, { recursive: true, force: true });
+        await removeTempTree(directory);
+      }
+    });
+
+    it('flips ready when the PR reports no checks at all', async () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+      const flipReady = parsed.workflow.nodes.find(node => node.id === 'flip-ready');
+      if (flipReady?.kind !== 'exec') throw new Error('flip-ready is not executable');
+      const producer = makeTestWorkflow({
+        name: 'recorded-pr',
+        nodes: [
+          {
+            id: 'pr',
+            prompt: 'recorded PR',
+            output_format: {
+              type: 'object',
+              properties: {
+                number: { type: 'integer' },
+                head: { type: 'string' },
+              },
+              required: ['number', 'head'],
+            },
+          },
+        ],
+      }).nodes[0];
+      const workflow = {
+        ...parsed.workflow,
+        name: 'no-checks-ready-flip',
+        nodes: [producer!, { ...flipReady, depends_on: ['pr'] }],
+      };
+      const directory = mkdtempSync(join(tmpdir(), 'archon-no-checks-'));
+      const bin = join(directory, 'bin');
+      const log = join(directory, 'gh.log');
+      const previousPath = process.env.PATH;
+      const previousLog = process.env.GH_LOG;
+
+      try {
+        mkdirSync(bin);
+        writeFileSync(
+          join(bin, 'git'),
+          [
+            '#!/bin/sh',
+            'case "$*" in',
+            '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
+            '  "branch --show-current") printf "%s\\n" "recorded-branch" ;;',
+            'esac',
+          ].join('\n')
+        );
+        // `gh pr checks` exits 1 and explains itself on stderr when a PR carries
+        // no checks — a repository with no CI, or checks a fork PR never starts.
+        writeFileSync(
+          join(bin, 'gh'),
+          [
+            '#!/bin/sh',
+            'printf "%s\\n" "$*" >> "$GH_LOG"',
+            'case "$*" in',
+            '  "pr checks"*)',
+            '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
+            '    exit 1',
+            '    ;;',
+            '  "pr ready"*) : ;;',
+            '  *headRefName*) printf "%s\\n" "recorded-branch" ;;',
+            '  *isDraft*) printf "%s\\n" "false" ;;',
+            '  *"--json url"*) printf "%s\\n" "https://example.com/repo/pull/42" ;;',
+            'esac',
+          ].join('\n')
+        );
+        chmodSync(join(bin, 'git'), 0o755);
+        chmodSync(join(bin, 'gh'), 0o755);
+        process.env.PATH = `${bin}:${previousPath ?? ''}`;
+        process.env.GH_LOG = log;
+
+        const result = await dryRunWorkflow({
+          workflow,
+          userMessage: '',
+          cwd: directory,
+          stubs: { pr: { number: 42, head: 'recorded-branch' } },
+          execCode: true,
+        });
+
+        expect(result.outcome).toBe('completed');
+        const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
+        expect(flip?.state).toBe('completed');
+        // The node's stdout is the verified URL and nothing else: the probe's
+        // stderr must reach the evidence log, never the typed public-action output.
+        expect(flip?.output?.trim()).toBe('https://example.com/repo/pull/42');
+        expect(readFileSync(log, 'utf-8')).toContain('pr ready 42 --repo owner/repo');
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        if (previousLog === undefined) delete process.env.GH_LOG;
+        else process.env.GH_LOG = previousLog;
+        await removeTempTree(directory);
       }
     });
   });
