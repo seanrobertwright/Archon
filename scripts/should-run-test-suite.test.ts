@@ -140,4 +140,25 @@ describe('test-suite change decision', () => {
     );
     expect(changesJob).toContain('echo "run-tests=$run_tests" >> "$GITHUB_OUTPUT"');
   });
+
+  test('the workflow fixture bar runs for every pull request', () => {
+    const workflow = readFileSync(
+      resolve(import.meta.dir, '../.github/workflows/test.yml'),
+      'utf8'
+    ).replaceAll('\r\n', '\n');
+    const fixtureJob = workflow.slice(
+      workflow.indexOf('  workflow-fixtures:'),
+      workflow.indexOf('  test:')
+    );
+
+    expect(fixtureJob).toContain("if: github.event_name == 'pull_request'");
+    expect(fixtureJob).toContain('runs-on: ubuntu-latest');
+    expect(fixtureJob).not.toContain('needs:');
+    expect(fixtureJob).not.toContain('changes');
+    expect(fixtureJob).toContain('uses: actions/checkout@v4');
+    expect(fixtureJob).toContain('uses: oven-sh/setup-bun@v2');
+    expect(fixtureJob).toContain('bun-version: 1.3.11');
+    expect(fixtureJob).toContain('run: bun install --frozen-lockfile');
+    expect(fixtureJob).toContain('run: bun run cli workflow test --json');
+  });
 });
