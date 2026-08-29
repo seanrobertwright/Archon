@@ -67,11 +67,16 @@ nodes:
 
   # Decline is not success: an AI node that declines its task still exits 0. This
   # deterministic guard proves work actually happened before anything downstream
-  # spends money or goes public — see scripts/assert-changed.py. The loop's green
-  # verdict arrives as a bound input: no artifact bridge.
+  # spends money or goes public — see scripts/assert-changed.py. The whole verdict
+  # arrives as bound inputs, no artifact bridge: green, the declared cause of any
+  # red, and the summary carrying the evidence for it. The guard needs all three,
+  # because an iteration whose remaining red is inherited or environmental can
+  # honestly have nothing left to change.
   - id: assert-changed
     script: assert-changed
     runtime: uv
     depends_on: [implement]
     with:
       green: "$implement.output.green"
+      red_cause: "$implement.output.red_cause"
+      summary: "$implement.output.summary"
