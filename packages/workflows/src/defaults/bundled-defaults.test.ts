@@ -605,200 +605,192 @@ describe('bundled-defaults', () => {
       expect(deliverParsed.workflow.inputs?.pr_head).toBeUndefined();
     });
 
-    // Windows cannot execute the extensionless `#!/bin/sh` fakes this test puts on
-    // PATH, so the harness — not the workflow — is what fails there. The node body
-    // under test is POSIX shell either way, and ubuntu proves it.
+    /**
+     * Execute the bundled `flip-ready` node against fake `git`/`gh` binaries on PATH,
+     * with the recorded PR supplied by a stubbed producer the way `archon-pr` supplies
+     * it in a real delivery. Returns the run and everything the fake `gh` was asked to
+     * do, so each scenario asserts on outcomes rather than repeating this setup.
+     *
+     * Windows cannot execute the extensionless `#!/bin/sh` fakes, so callers skip there:
+     * the harness, not the workflow, is what fails. The node body is POSIX shell either
+     * way, and ubuntu proves it.
+     */
+    const runFlipReady = async (scenario: {
+      name: string;
+      git: string[];
+      /** Omitted leaves no fake `gh` on PATH — for a refusal that must land before one. */
+      gh?: string[];
+      env?: Record<string, string>;
+    }): Promise<{ result: Awaited<ReturnType<typeof dryRunWorkflow>>; ghLog: string }> => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+      const flipReady = parsed.workflow.nodes.find(node => node.id === 'flip-ready');
+      if (flipReady?.kind !== 'exec') throw new Error('flip-ready is not executable');
+      const producer = makeTestWorkflow({
+        name: 'recorded-pr',
+        nodes: [
+          {
+            id: 'pr',
+            prompt: 'recorded PR',
+            output_format: {
+              type: 'object',
+              properties: { number: { type: 'integer' }, head: { type: 'string' } },
+              required: ['number', 'head'],
+            },
+          },
+        ],
+      }).nodes[0];
+      const workflow = {
+        ...parsed.workflow,
+        name: scenario.name,
+        nodes: [producer!, { ...flipReady, depends_on: ['pr'] }],
+      };
+      const directory = mkdtempSync(join(tmpdir(), 'archon-flip-ready-'));
+      const bin = join(directory, 'bin');
+      const log = join(directory, 'gh.log');
+      const overrides: Record<string, string> = {
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        GH_LOG: log,
+        ...scenario.env,
+      };
+      const previous = Object.fromEntries(
+        Object.keys(overrides).map(key => [key, process.env[key]])
+      );
+
+      try {
+        mkdirSync(bin);
+        for (const [command, body] of [
+          ['git', scenario.git],
+          ['gh', scenario.gh],
+        ] as const) {
+          if (body === undefined) continue;
+          writeFileSync(join(bin, command), body.join('\n'));
+          chmodSync(join(bin, command), 0o755);
+        }
+        writeFileSync(log, '');
+        Object.assign(process.env, overrides);
+
+        const result = await dryRunWorkflow({
+          workflow,
+          userMessage: '',
+          cwd: directory,
+          stubs: { pr: { number: 42, head: 'recorded-branch' } },
+          execCode: true,
+        });
+        return { result, ghLog: readFileSync(log, 'utf-8') };
+      } finally {
+        for (const [key, value] of Object.entries(previous)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        await removeTempTree(directory);
+      }
+    };
+
     it.skipIf(process.platform === 'win32')(
       'refuses an origin that does not resolve to an owner/repo before flipping ready',
       async () => {
-        const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
-        if (parsed.workflow === null) throw new Error(parsed.error.error);
-        const flipReady = parsed.workflow.nodes.find(node => node.id === 'flip-ready');
-        if (flipReady?.kind !== 'exec') throw new Error('flip-ready is not executable');
-        const producer = makeTestWorkflow({
-          name: 'recorded-pr',
-          nodes: [
-            {
-              id: 'pr',
-              prompt: 'recorded PR',
-              output_format: {
-                type: 'object',
-                properties: {
-                  number: { type: 'integer' },
-                  head: { type: 'string' },
-                },
-                required: ['number', 'head'],
-              },
-            },
-          ],
-        }).nodes[0];
-        const workflow = {
-          ...parsed.workflow,
+        // The guard that remains protects this node's own `gh` calls: a remote
+        // that does not normalize to `owner/repo` would point them somewhere
+        // unintended, and the raw URL can carry a token. Assert the reason, not
+        // just `failed`, so it stays anchored to that check.
+        const { result, ghLog } = await runFlipReady({
           name: 'run-owned-ready-flip',
-          nodes: [producer!, { ...flipReady, depends_on: ['pr'] }],
-        };
-        const directory = mkdtempSync(join(tmpdir(), 'archon-ready-flip-'));
-        const bin = join(directory, 'bin');
-        const log = join(directory, 'gh.log');
-        const previousPath = process.env.PATH;
-        const previousOrigin = process.env.TEST_ORIGIN;
-        const previousLog = process.env.GH_LOG;
-
-        try {
-          mkdirSync(bin);
-          writeFileSync(
-            join(bin, 'git'),
-            [
-              '#!/bin/sh',
-              'case "$*" in',
-              '  "remote get-url origin") printf "%s\\n" "$TEST_ORIGIN" ;;',
-              'esac',
-            ].join('\n')
-          );
+          git: [
+            '#!/bin/sh',
+            'case "$*" in',
+            '  "remote get-url origin") printf "%s\\n" "$TEST_ORIGIN" ;;',
+            'esac',
+          ],
           // No fake `gh`: the node refuses at the origin check before reaching one.
-          // If that ever stops being true, the missing binary makes it obvious.
-          chmodSync(join(bin, 'git'), 0o755);
-          process.env.PATH = `${bin}:${previousPath ?? ''}`;
-          process.env.GH_LOG = log;
+          env: { TEST_ORIGIN: 'https://token@example.com/repo.git' },
+        });
 
-          // The guard that remains protects this node's own `gh` calls: a remote
-          // that does not normalize to `owner/repo` would point them somewhere
-          // unintended, and the raw URL can carry a token. Assert the reason, not
-          // just `failed`, so it stays anchored to that check.
-          const cases = [
-            {
-              origin: 'https://token@example.com/repo.git',
-              reason: 'origin remote does not resolve to an owner/repo',
-            },
-          ];
-          for (const { origin, reason } of cases) {
-            writeFileSync(log, '');
-            process.env.TEST_ORIGIN = origin;
-            const result = await dryRunWorkflow({
-              workflow,
-              userMessage: '',
-              cwd: directory,
-              stubs: { pr: { number: 42, head: 'recorded-branch' } },
-              execCode: true,
-            });
-
-            expect(result.outcome).toBe('failed');
-            const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
-            expect(flip?.state).toBe('failed');
-            expect(flip?.reason).toContain(reason);
-            expect(readFileSync(log, 'utf-8')).not.toContain('pr ready');
-          }
-        } finally {
-          if (previousPath === undefined) delete process.env.PATH;
-          else process.env.PATH = previousPath;
-          if (previousOrigin === undefined) delete process.env.TEST_ORIGIN;
-          else process.env.TEST_ORIGIN = previousOrigin;
-          if (previousLog === undefined) delete process.env.GH_LOG;
-          else process.env.GH_LOG = previousLog;
-          await removeTempTree(directory);
-        }
+        expect(result.outcome).toBe('failed');
+        const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
+        expect(flip?.state).toBe('failed');
+        expect(flip?.reason).toContain('origin remote does not resolve to an owner/repo');
+        expect(ghLog).not.toContain('pr ready');
       }
     );
 
-    // Windows cannot execute the extensionless `#!/bin/sh` fakes this test puts on
-    // PATH, so the harness — not the workflow — is what fails there. The node body
-    // under test is POSIX shell either way, and ubuntu proves it.
     it.skipIf(process.platform === 'win32')(
       'flips ready when the PR reports no checks at all',
       async () => {
-        const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
-        if (parsed.workflow === null) throw new Error(parsed.error.error);
-        const flipReady = parsed.workflow.nodes.find(node => node.id === 'flip-ready');
-        if (flipReady?.kind !== 'exec') throw new Error('flip-ready is not executable');
-        const producer = makeTestWorkflow({
-          name: 'recorded-pr',
-          nodes: [
-            {
-              id: 'pr',
-              prompt: 'recorded PR',
-              output_format: {
-                type: 'object',
-                properties: {
-                  number: { type: 'integer' },
-                  head: { type: 'string' },
-                },
-                required: ['number', 'head'],
-              },
-            },
-          ],
-        }).nodes[0];
-        const workflow = {
-          ...parsed.workflow,
+        const { result, ghLog } = await runFlipReady({
           name: 'no-checks-ready-flip',
-          nodes: [producer!, { ...flipReady, depends_on: ['pr'] }],
-        };
-        const directory = mkdtempSync(join(tmpdir(), 'archon-no-checks-'));
-        const bin = join(directory, 'bin');
-        const log = join(directory, 'gh.log');
-        const previousPath = process.env.PATH;
-        const previousLog = process.env.GH_LOG;
-
-        try {
-          mkdirSync(bin);
-          writeFileSync(
-            join(bin, 'git'),
-            [
-              '#!/bin/sh',
-              'case "$*" in',
-              '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
-              '  "branch --show-current") printf "%s\\n" "recorded-branch" ;;',
-              'esac',
-            ].join('\n')
-          );
+          git: [
+            '#!/bin/sh',
+            'case "$*" in',
+            '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
+            'esac',
+          ],
           // `gh pr checks` exits 1 and explains itself on stderr when a PR carries
           // no checks — a repository with no CI, or checks a fork PR never starts.
-          writeFileSync(
-            join(bin, 'gh'),
-            [
-              '#!/bin/sh',
-              'printf "%s\\n" "$*" >> "$GH_LOG"',
-              'case "$*" in',
-              '  "pr checks"*)',
-              '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
-              '    exit 1',
-              '    ;;',
-              // On stdout deliberately: which stream gh confirms the flip on is gh's
-              // choice, so the node redirects that write itself rather than trusting it.
-              '  "pr ready"*) printf "%s\\n" "marked as ready for review" ;;',
-              '  *headRefName*) printf "%s\\n" "recorded-branch" ;;',
-              '  *isDraft*) printf "%s\\n" "false" ;;',
-              '  *"--json url"*) printf "%s\\n" "https://example.com/repo/pull/42" ;;',
-              'esac',
-            ].join('\n')
-          );
-          chmodSync(join(bin, 'git'), 0o755);
-          chmodSync(join(bin, 'gh'), 0o755);
-          process.env.PATH = `${bin}:${previousPath ?? ''}`;
-          process.env.GH_LOG = log;
+          gh: [
+            '#!/bin/sh',
+            'printf "%s\\n" "$*" >> "$GH_LOG"',
+            'case "$*" in',
+            '  "pr checks"*)',
+            '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
+            '    exit 1',
+            '    ;;',
+            // On stdout deliberately: which stream gh confirms the flip on is gh's
+            // choice, so the node redirects that write itself rather than trusting it.
+            '  "pr ready"*) printf "%s\\n" "marked as ready for review" ;;',
+            '  *isDraft*) printf "%s\\n" "false" ;;',
+            '  *"--json url"*) printf "%s\\n" "https://example.com/repo/pull/42" ;;',
+            'esac',
+          ],
+        });
 
-          const result = await dryRunWorkflow({
-            workflow,
-            userMessage: '',
-            cwd: directory,
-            stubs: { pr: { number: 42, head: 'recorded-branch' } },
-            execCode: true,
-          });
+        expect(result.outcome).toBe('completed');
+        const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
+        expect(flip?.state).toBe('completed');
+        // The node's stdout is the verified URL and nothing else — `outcome` reads it
+        // whole. The checks probe's stderr and the flip's own confirmation are retained
+        // by the engine as stderr, never merged into that value.
+        expect(flip?.output?.trim()).toBe('https://example.com/repo/pull/42');
+        expect(ghLog).toContain('pr ready 42 --repo owner/repo');
+      }
+    );
 
-          expect(result.outcome).toBe('completed');
-          const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
-          expect(flip?.state).toBe('completed');
-          // The node's stdout is the verified URL and nothing else — `outcome` reads
-          // it whole. The checks probe's stderr and the flip's own confirmation are
-          // retained by the engine as stderr, never merged into that value.
-          expect(flip?.output?.trim()).toBe('https://example.com/repo/pull/42');
-          expect(readFileSync(log, 'utf-8')).toContain('pr ready 42 --repo owner/repo');
-        } finally {
-          if (previousPath === undefined) delete process.env.PATH;
-          else process.env.PATH = previousPath;
-          if (previousLog === undefined) delete process.env.GH_LOG;
-          else process.env.GH_LOG = previousLog;
-          await removeTempTree(directory);
-        }
+    it.skipIf(process.platform === 'win32')(
+      'refuses a non-green check and names the recovery instead of flipping',
+      async () => {
+        const { result, ghLog } = await runFlipReady({
+          name: 'red-checks-ready-flip',
+          git: [
+            '#!/bin/sh',
+            'case "$*" in',
+            '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
+            'esac',
+          ],
+          // Already jq-filtered, the way the node's own `--jq` leaves it: one failing
+          // check, exit 1 the way gh reports red.
+          gh: [
+            '#!/bin/sh',
+            'printf "%s\\n" "$*" >> "$GH_LOG"',
+            'case "$*" in',
+            '  "pr checks"*)',
+            '    printf "%s\\n" "test (windows-latest) (fail)"',
+            '    exit 1',
+            '    ;;',
+            'esac',
+          ],
+        });
+
+        expect(result.outcome).toBe('failed');
+        const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
+        expect(flip?.state).toBe('failed');
+        expect(flip?.reason).toContain('test (windows-latest) (fail)');
+        // A run that dies here is recoverable in seconds, and the operator is the only
+        // one who can start it: a concluded check does not re-run itself, and nothing
+        // in this node waits for one (#2976). So the refusal says so rather than
+        // leaving it as tribal knowledge.
+        expect(flip?.reason).toContain('re-run the failing check');
+        expect(flip?.reason).toContain('resume this run');
+        expect(ghLog).not.toContain('pr ready');
       }
     );
   });

@@ -328,6 +328,7 @@ nodes:
       NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' || true)
       if [ -n "$NOT_GREEN" ]; then
         printf '%s\n' "flip-ready: refusing to flip with non-green checks: $NOT_GREEN" >&2
+        printf '%s\n' "flip-ready: if that red is transient or unrelated to this change, re-run the failing check on the pull request and resume this run — the flip reads the check state again on resume." >&2
         exit 1
       fi
       # This node's stdout is the delivered URL and nothing else, so the flip's
