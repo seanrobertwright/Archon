@@ -31813,6 +31813,103 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
     ).toBe(1);
   });
 
+  it("retains the resumed until_bash probe under the resumed iteration's own key (#2967)", async () => {
+    // The resume branch runs its own probe, separate from the per-iteration one, and
+    // it is the only exec site in a run that completes straight off a human's answer.
+    // `iteration: 2` in the gate context makes the label discriminating: the resumed
+    // iteration is 2, while a fresh one would be 3 and a hardcoded fallback would be 1.
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'should not run' };
+      yield { type: 'result', sessionId: 'unexpected-session' };
+    });
+
+    const logDir = join(testDir, 'resume-probe-logs');
+    const store = createEscalationStore('run-escalation-retention');
+    const platform = createMockPlatform();
+    const approvedDecision = { decision: 'approve', text: '' };
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['grp.work', { output: 'work output' }],
+      [
+        'grp.check',
+        { output: JSON.stringify(approvedDecision), structuredOutput: approvedDecision },
+      ],
+    ]);
+    const workflowRun = makeWorkflowRun('run-escalation-retention', {
+      metadata: {
+        approval: {
+          nodeId: 'grp',
+          message: 'Continue?',
+          type: 'approval',
+          bodyGateId: 'check',
+          iteration: 2,
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        } satisfies ApprovalContext,
+      },
+    });
+
+    const talkativeProbeWorkflow: WorkflowDefinition = {
+      ...gateTerminatedLoopGroupWorkflow(),
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'grp',
+          loop_group: {
+            until_bash:
+              'printf "resume probe ran\\n"; printf "recheck note\\n" >&2; [ $check.output.decision = "approve" ]',
+            max_iterations: 5,
+            nodes: [
+              { id: 'work', prompt: 'do work' },
+              {
+                id: 'check',
+                depends_on: ['work'],
+                approval: {
+                  message: 'Continue?',
+                  decisions: [{ id: 'approve' }, { id: 'revise' }],
+                },
+              },
+            ],
+          },
+        }),
+      ],
+    };
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      platform,
+      'conv-dag',
+      testDir,
+      ready(talkativeProbeWorkflow),
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Zero provider calls means no fresh iteration ran, so the single retained row
+    // below can only have come from the resume branch's probe — not the ordinary
+    // per-iteration site, which would have needed a body execution first.
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+
+    const probeRows = (await readTranscript(logDir, workflowRun.id)).filter(
+      row => row.type === 'exec_output'
+    );
+    expect(probeRows).toHaveLength(1);
+    expect(probeRows[0].step).toBe('grp-iteration-2');
+    expect(probeRows[0].content).toBe('<until_bash>');
+    expect(probeRows[0].stdout_tail).toBe('resume probe ran');
+    expect(probeRows[0].stderr_tail).toBe('recheck note');
+    expect(probeRows[0].exit_code).toBe(0);
+  });
+
   it('falls through without erroring when a human resolves the original pause before the rewrite lands (CAS loss)', async () => {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'work done' };
