@@ -146,11 +146,16 @@ describe('test-suite change decision', () => {
       resolve(import.meta.dir, '../.github/workflows/test.yml'),
       'utf8'
     ).replaceAll('\r\n', '\n');
+    const pullRequestTrigger = workflow.slice(
+      workflow.indexOf('  pull_request:'),
+      workflow.indexOf('\n\nconcurrency:')
+    );
     const fixtureJob = workflow.slice(
       workflow.indexOf('  workflow-fixtures:'),
       workflow.indexOf('  test:')
     );
 
+    expect(pullRequestTrigger).toBe('  pull_request:');
     expect(fixtureJob).toContain("if: github.event_name == 'pull_request'");
     expect(fixtureJob).toContain('runs-on: ubuntu-latest');
     expect(fixtureJob).not.toContain('needs:');
@@ -158,6 +163,7 @@ describe('test-suite change decision', () => {
     expect(fixtureJob).toContain('uses: actions/checkout@v4');
     expect(fixtureJob).toContain('uses: oven-sh/setup-bun@v2');
     expect(fixtureJob).toContain('bun-version: 1.3.11');
+    expect(fixtureJob).toContain('uses: astral-sh/setup-uv@v4');
     expect(fixtureJob).toContain('run: bun install --frozen-lockfile');
     expect(fixtureJob).toContain('run: bun run cli workflow test --json');
   });

@@ -5,7 +5,6 @@ on:
   push:
     branches: [main, dev]
   pull_request:
-    branches: [main, dev]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -49,6 +48,9 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.11
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
