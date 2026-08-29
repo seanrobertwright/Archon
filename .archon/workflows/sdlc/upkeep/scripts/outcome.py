@@ -1,13 +1,13 @@
 """One return for every legitimate terminal result of the upkeep chain.
 
 A no_action assessment completes with the report that explains it; a delivered
-update is accepted only when the deliver branch actually ran AND GitHub
-confirms a ready (non-draft) pull request.
+update is accepted when the deliver branch actually ran and handed back the pull
+request it opened.
 
 Bound inputs (`with:` bindings, canonical text in env):
 - INPUTS_ACTION / INPUTS_SUMMARY: the assessment's verdict.
-- INPUTS_DELIVERED: deliver's returned output, or "null" when the deliver
-  branch was skipped (no_action).
+- INPUTS_DELIVERED: deliver's returned pull request record as JSON text, or
+  "null" when the deliver branch was skipped (no_action).
 - INPUTS_GATE_PASSED: the spend gate's output, "null" when skipped. A passed
   gate with null delivered means delivery STARTED and died mid-flight — never
   claim the assessment stopped it.
@@ -15,8 +15,45 @@ Bound inputs (`with:` bindings, canonical text in env):
 
 import json
 import os
-import subprocess
 import sys
+
+
+def delivered_pr_url(delivered: str) -> tuple[str, str]:
+    """The delivered pull request URL, or why the record cannot supply one.
+
+    `archon-deliver` returns its `pr` node, so this text is that node's structured
+    read-back: the run's own record of the pull request it opened. Reading it is
+    the whole job. Asking the forge again would restate what other nodes already
+    established — a record only exists here because deliver completed, which means
+    the ready flip ran, and that flip verifies the draft state by reading it back
+    before it will finish. Worse, a second lookup has to name the pull request
+    somehow, and the only name available this late is whatever branch happens to
+    be checked out: the ambient resolution this record exists to replace.
+
+    Do not add an `is_draft` check. The record is written when the pull request is
+    created and delivery creates it as a draft, so the field is true on every
+    successful run; the flip that clears it happens afterwards and never rewrites
+    this record.
+
+    The record is validated rather than trusted, and every defect is named. This
+    is the last node of a delivery, so a report built from a record nobody could
+    read would announce a delivery while dropping the one thing its reader came
+    for.
+
+    Kept byte-identical across the three tails that compose archon-deliver. A
+    packaged script is materialized standalone, so there is no import channel to
+    share it through.
+    """
+    try:
+        record = json.loads(delivered)
+    except ValueError as err:
+        return "", f"is not valid JSON ({err})"
+    if not isinstance(record, dict):
+        return "", f"is a JSON {type(record).__name__}, not the pull request object"
+    url = record.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return "", "carries no 'url' string"
+    return url.strip(), ""
 
 
 DISCOVERY_RELAY = (
@@ -209,51 +246,12 @@ def main() -> int:
         )
         return 1
 
-    # Deliver ran: accept only what GitHub confirms (a ready, non-draft PR).
-    remote = subprocess.run(
-        ["git", "remote", "get-url", "origin"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    origin_repo = "/".join(
-        remote.removesuffix(".git").replace(":", "/").rstrip("/").split("/")[-2:]
-    )
-    # With --repo, gh disables branch inference and requires an explicit
-    # selector; pass the current branch.
-    branch = subprocess.run(
-        ["git", "branch", "--show-current"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if not branch:
+    # Deliver ran, so the record it returned is the report.
+    url, defect = delivered_pr_url(delivered)
+    if defect:
         print(
-            "outcome: detached HEAD — cannot resolve the PR branch."
-            + format_caveats(artifacts, failed=True),
-            file=sys.stderr,
-        )
-        return 1
-    proc = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "view",
-            branch,
-            "--repo",
-            origin_repo,
-            "--json",
-            "isDraft,url",
-            "--jq",
-            "select(.isDraft == false) | .url",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    url = proc.stdout.strip() if proc.returncode == 0 else ""
-    if not url:
-        print(
-            "outcome: delivery did not finish with a ready pull request."
+            f"outcome: delivery completed but its pull request record {defect}. "
+            "The deliver node's own output is the evidence."
             + format_caveats(artifacts, failed=True),
             file=sys.stderr,
         )

@@ -3,6 +3,13 @@
 # the dry-run engine auto-defaults every node it can and names the ones it
 # cannot; this file stubs exactly those plus the verdict fields that steer
 # branches. Structured stubs are YAML mappings (they hydrate structuredOutput).
+# Run with --default-stubs --exec-code.
+#
+# `outcome` is deliberately unstubbed: the real script runs and must report pull
+# request 2 from the delivered record alone. The exec workspace is a DETACHED
+# worktree, so there is no current branch for an ambient pull request lookup to
+# resolve — a pass here is proof the report is built from the record and nothing
+# the checkout happens to be sitting on.
 triage__triage:
   route: investigate
   summary: "stub: current evidence leaves the causal chain unresolved"
@@ -40,7 +47,6 @@ deliver__review__synthesize:
   findings_summary: "stub: no open findings"
 deliver__review-action: '{"ready":true,"action":"none"}'
 deliver__gate-ready: '{"ready":"true"}'
-outcome: "https://github.com/example/repo/pull/2"
 deliver__classify:
   errors: false
   docs: false
@@ -50,3 +56,4 @@ deliver__classify:
 deliver__resolve-scope: '{"errors":"false"}'
 fixture:
   expect: completed
+exec-code: true
