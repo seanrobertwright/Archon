@@ -527,7 +527,11 @@ describe('bundled-defaults', () => {
         // Both halves declared but only one supplied: the node must SAY so. Under
         // `set -u` an input the engine never exported would abort with a shell
         // error instead — the failure class that stalled this workflow (R5).
-        for (const inputs of [{ pr_number: '42' }, { pr_head: 'recorded-branch' }]) {
+        const halves: Record<string, string>[] = [
+          { pr_number: '42' },
+          { pr_head: 'recorded-branch' },
+        ];
+        for (const inputs of halves) {
           const result = await dryRunWorkflow({
             workflow,
             userMessage: '',
