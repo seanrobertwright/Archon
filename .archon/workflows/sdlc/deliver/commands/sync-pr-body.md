@@ -9,13 +9,17 @@ an accurate PR body — nothing else.
 PR's draft state, or touch the canonical review comment. The PR body is the only
 thing you may edit.
 
-The target is the current branch's open PR on the origin repository. Resolve it
-with an explicit selector — `gh` disables branch inference when `--repo` is
-used, so always pass the branch: `gh pr view "$(git branch --show-current)"
---repo <owner/repo>`.
+The target is the run-owned PR, never the current branch's ambient PR mapping:
+
+- Its recorded number is **$INPUTS.pr_number**.
+- Its recorded head branch is **$INPUTS.pr_head**.
+
+Derive the origin repository, read that exact PR by number, and fail unless its
+head and the checked-out branch both equal the recorded head branch. Use the
+recorded number as the selector for every `gh` read or edit.
 
 1. Read the current PR body and the full final diff
-   (`gh pr diff <branch> --repo <owner/repo>`).
+   (`gh pr diff <number> --repo <owner/repo>`).
 2. Check every concrete claim in the body against the final diff: named
    functions and guards, described mechanics, file lists, "unchanged" claims.
    The Problem section describes the issue and rarely drifts; the Solution and

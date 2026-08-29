@@ -13,7 +13,8 @@ impl__implement:
   summary: "stub: implemented and green"
 impl__assert-changed: "3 files changed"
 gate-green: '{"gate":"green"}'
-pr__pr: "https://github.com/example/repo/pull/1 (draft)"
+pr__pr: { number: 1, url: "https://github.com/example/repo/pull/1", head: "fixture-branch", base: "dev", is_draft: true }
+review__target: "PR #1 on fixture-branch"
 review__mode: '{"continuation":false}'
 review__scope: "target recorded; head sha stubbed"
 review__code: "2 findings (Important)"
@@ -32,6 +33,7 @@ fix__implement:
   summary: "stub: findings fixed, pushed"
 fix__assert-changed: "2 files changed"
 gate-correction-green: '{"gate":"green"}'
+recheck__target: "PR #1 on fixture-branch"
 recheck__mode: '{"continuation":true}'
 recheck__scope: "light mode; delta since cursor"
 # No recheck specialist stubs: continuation mode must skip the fan-out and let

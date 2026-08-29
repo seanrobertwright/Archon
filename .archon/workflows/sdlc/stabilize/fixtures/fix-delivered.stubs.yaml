@@ -36,7 +36,8 @@ deliver__impl__assert-changed: "2 files changed"
 deliver__gate-green: '{"gate":"green"}'
 deliver__flip-ready: "https://github.com/example/repo/pull/1"
 deliver__outcome: "https://github.com/example/repo/pull/1"
-deliver__pr__pr: "https://github.com/example/repo/pull/1 (draft)"
+deliver__pr__pr: { number: 1, url: "https://github.com/example/repo/pull/1", head: "fixture-branch", base: "dev", is_draft: true }
+deliver__review__target: "PR #1 on fixture-branch"
 deliver__review__mode: '{"continuation":false}'
 deliver__review__scope: "target recorded; head sha stubbed"
 deliver__review__code: "0 findings"

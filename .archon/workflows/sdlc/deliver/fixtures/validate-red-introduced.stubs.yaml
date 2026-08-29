@@ -11,7 +11,7 @@ impl__implement:
   green: true
   summary: "stub: implemented and green on the checks it ran"
 impl__assert-changed: "3 files changed"
-pr__pr: "https://github.com/example/repo/pull/8 (draft)"
+pr__pr: { number: 8, url: "https://github.com/example/repo/pull/8", head: "fixture-branch", base: "dev", is_draft: true }
 classify:
   errors: false
   docs: false
@@ -19,6 +19,7 @@ classify:
     errors: "stub: no failure paths"
     docs: "stub: no doc-facing changes"
 resolve-scope: '{"errors":"false"}'
+review__target: "PR #8 on fixture-branch"
 review__mode: '{"continuation":false}'
 review__scope: "target recorded; head sha stubbed"
 review__code: "0 findings"
