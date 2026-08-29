@@ -1221,6 +1221,7 @@ export async function workflowTestCommand(
       results: report.results.map(r => ({
         ...r,
         missingStubs: [...r.missingStubs],
+        toleratedMissingStubs: [...r.toleratedMissingStubs],
         unusedStubs: [...r.unusedStubs],
       })),
       passed: report.passed,

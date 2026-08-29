@@ -242,6 +242,13 @@ export interface FixtureCheckResult {
   readonly pass: boolean;
   readonly failureReason?: string;
   readonly missingStubs: readonly string[];
+  /**
+   * The subset of `missingStubs` a `trigger_rule: all_done` join tolerated (#2869).
+   * Carried through from the dry run so a reader can tell a gap that never blocked
+   * this fixture from one that would have — `missingStubs` alone cannot, and a
+   * tolerated gap appears there on a PASSING fixture.
+   */
+  readonly toleratedMissingStubs: readonly string[];
   readonly unusedStubs: readonly string[];
 }
 
@@ -485,6 +492,7 @@ async function runOneFixture(
         pass: false,
         failureReason: (error as Error).message,
         missingStubs: [],
+        toleratedMissingStubs: [],
         unusedStubs: [],
       },
     ];
@@ -500,6 +508,7 @@ async function runOneFixture(
         pass: false,
         failureReason: `no discovered workflow matches (${fixture.workflowNames.join(', ') || 'none declared alongside'})`,
         missingStubs: [],
+        toleratedMissingStubs: [],
         unusedStubs: [],
       },
     ];
@@ -590,6 +599,7 @@ async function checkFixture(
       pass: failureReason === undefined,
       ...(failureReason !== undefined ? { failureReason } : {}),
       missingStubs: result.missingStubs,
+      toleratedMissingStubs: result.toleratedMissingStubs,
       unusedStubs: result.unusedStubs,
     };
   } catch (error) {
@@ -598,6 +608,7 @@ async function checkFixture(
       pass: false,
       failureReason: (error as Error).message,
       missingStubs: [],
+      toleratedMissingStubs: [],
       unusedStubs: [],
     };
   }
@@ -613,6 +624,13 @@ export function formatFixtureReport(report: FixtureReport): string {
     if (r.failureReason) lines.push(`    ${r.failureReason}`);
     if (r.unusedStubs.length > 0) {
       lines.push(`    warning: unused stubs — ${r.unusedStubs.join(', ')}`);
+    }
+    // A tolerated gap does not fail the fixture, so without this line a passing
+    // run says nothing about the node it never verified.
+    if (r.toleratedMissingStubs.length > 0) {
+      lines.push(
+        `    note: unstubbed all_done join(s) tolerated — ${r.toleratedMissingStubs.join(', ')}`
+      );
     }
   }
   lines.push('', `${String(report.passed)} passed, ${String(report.failed)} failed`);

@@ -321,6 +321,7 @@ mock.module('@archon/workflows/dry-run', () => ({
         },
       ],
       missingStubs: [],
+      toleratedMissingStubs: [],
       unusedStubs: [],
       summary: 'stubbed output',
     })
@@ -793,6 +794,7 @@ describe('workflowRunCommand — dry-run', () => {
       outcome: 'completed',
       trace: [],
       missingStubs: [],
+      toleratedMissingStubs: [],
       unusedStubs: [],
       summary: 'done',
     });
@@ -1047,6 +1049,7 @@ describe('workflowRunCommand — dry-run', () => {
       outcome: 'failed',
       trace: [],
       missingStubs: ['node'],
+      toleratedMissingStubs: [],
       unusedStubs: [],
     });
 
@@ -9689,6 +9692,7 @@ describe('workflowTestCommand', () => {
           outcome: 'completed',
           pass: true,
           missingStubs: [],
+          toleratedMissingStubs: [],
           unusedStubs: ['spare'],
         },
       ],
@@ -9721,6 +9725,7 @@ describe('workflowTestCommand', () => {
           pass: false,
           failureReason: 'expected completed, dry-run reported failed',
           missingStubs: [],
+          toleratedMissingStubs: [],
           unusedStubs: [],
         },
       ],
