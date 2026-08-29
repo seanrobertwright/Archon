@@ -1,14 +1,15 @@
-# Dry-run fixture: delivery dies AFTER the pull request exists, and the terminal
-# report still refuses to present that pull request as delivered. The project
-# gate goes red on an introduced failure, so the flip is skipped and the bound
-# delivered value is null: outcome takes the died-mid-flight branch, never the
-# URL. This is the composed shape where a stale creation-time record could
-# otherwise masquerade as a delivery.
+# Dry-run fixture: delivery dies AFTER the pull request exists. The project
+# gate goes red on an introduced failure, the flip is skipped, and the run
+# fails with the terminal report reachable — this pins the post-creation death
+# REACHING the died-mid-flight path at all, not the report's content.
 #
 # `outcome` is stubbed for the same reason delivery-died stubs it: the real
 # script returns 1 on this branch, and a declared failure fixture asserts
-# exactly one failed node. The refusal against an unusable delivered value is
-# proved by delivered-unusable, which runs the real script.
+# exactly one failed node. Because of that stub, this fixture cannot tell a
+# stale record from a null delivered value — the proof that a creation-time
+# record never masquerades as a delivery lives in delivered-unusable (which
+# runs the real script) and in the five delivered fixtures that go red when
+# the returns choice is reverted.
 triage__triage:
   route: deliver
   summary: "stub: current code confirms a complete work order"

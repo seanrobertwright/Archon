@@ -6,7 +6,7 @@ request it opened.
 
 Bound inputs (`with:` bindings, canonical text in env):
 - INPUTS_ACTION / INPUTS_SUMMARY: the assessment's verdict.
-- INPUTS_DELIVERED: deliver's returned pull request record as JSON text, or
+- INPUTS_DELIVERED: the flip's verified pull request URL deliver returned, or
   "null" when the deliver branch was skipped (no_action).
 - INPUTS_GATE_PASSED: the spend gate's output, "null" when skipped. A passed
   gate with null delivered means delivery STARTED and died mid-flight — never

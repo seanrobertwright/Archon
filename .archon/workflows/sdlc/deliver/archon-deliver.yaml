@@ -42,6 +42,12 @@ inputs:
 # it dies. Returning the flip makes a failed flip block a composing caller's
 # terminal node, an earlier death hand it a null, and a success hand it the
 # read-back-verified URL — never a stale record presented as a delivery.
+# The deliberate cost: when the flip itself FAILS, the composing tail's
+# terminal node is blocked, so its caveat and discovery surfacing is skipped
+# along with the false delivery claim — the operator gets the flip's own
+# error, which names the recovery. Truthful failure beats a lying report;
+# surfacing caveats on every failure path is terminal-result ownership the
+# engine is growing toward, not something each tail should hand-roll.
 returns: flip-ready
 
 nodes:

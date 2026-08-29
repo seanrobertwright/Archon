@@ -6,7 +6,7 @@ it opened.
 
 Bound inputs (`with:` bindings, canonical text in env):
 - INPUTS_ROUTE / INPUTS_SUMMARY: triage's verdict.
-- INPUTS_DELIVERED: deliver's returned pull request record as JSON text, or
+- INPUTS_DELIVERED: the flip's verified pull request URL deliver returned, or
   "null" when the deliver branch was skipped (no_action, or an advisory stop
   upstream of the gates).
 - INPUTS_GATE_PASSED_{DIRECT,ROOTED,PLANNED}: the spend gates' outputs, "null"
