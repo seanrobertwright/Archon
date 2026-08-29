@@ -24,16 +24,6 @@ inputs:
     description: >-
       What to review — a PR number/URL, a branch, or empty for the working diff
       against the merge-base.
-  pr_number:
-    default: ""
-    description: >-
-      A delivery-owned PR number. When supplied with pr_head, review verifies
-      this exact PR instead of resolving a PR from the current branch.
-  pr_head:
-    default: ""
-    description: >-
-      The delivery-owned PR head branch paired with pr_number. Both values are
-      required together.
   prior_report:
     default: ""
     description: >-
@@ -59,41 +49,6 @@ returns: synthesize
 outcome_field: ready
 
 nodes:
-  # Delivery-owned review is a public action: verify both identities before an
-  # agent can write the canonical PR comment. Standalone review retains its
-  # normal scope resolution when neither record field is supplied.
-  - id: target
-    bash: |
-      set -euo pipefail
-      fail() {
-        printf 'review target: %s\n' "$1" >&2
-        exit 1
-      }
-      PR_NUMBER=$INPUTS_PR_NUMBER
-      EXPECTED_BRANCH=$INPUTS_PR_HEAD
-      if [ -z "$PR_NUMBER" ] || [ -z "$EXPECTED_BRANCH" ]; then
-        fail "delivery-owned review requires both pr_number and pr_head."
-      fi
-      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
-      case "$ORIGIN_REPO" in
-        *[!A-Za-z0-9_.-]*/* | */*[!A-Za-z0-9_.-]* | */*/* | /* | */ | "")
-          fail "origin remote does not resolve to an owner/repo."
-          ;;
-      esac
-      BRANCH=$(git branch --show-current)
-      if [ -z "$BRANCH" ]; then
-        fail "detached HEAD cannot review run-owned PR #$PR_NUMBER."
-      fi
-      if [ "$BRANCH" != "$EXPECTED_BRANCH" ]; then
-        fail "current branch '$BRANCH' does not match run-owned PR #$PR_NUMBER branch '$EXPECTED_BRANCH'."
-      fi
-      ACTUAL_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json headRefName --jq .headRefName)
-      if [ "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]; then
-        fail "PR #$PR_NUMBER head '$ACTUAL_BRANCH' does not match recorded branch '$EXPECTED_BRANCH'."
-      fi
-      printf 'PR #%s on %s\n' "$PR_NUMBER" "$EXPECTED_BRANCH"
-    when: "$INPUTS.pr_number != '' || $INPUTS.pr_head != ''"
-
   - id: mode
     script: resolve-review-mode
     runtime: uv
@@ -103,8 +58,7 @@ nodes:
   - id: scope
     command: review-scope
     context: fresh
-    depends_on: [mode, target]
-    trigger_rule: none_failed_min_one_success
+    depends_on: [mode]
     output_format:
       type: object
       properties:
@@ -131,8 +85,8 @@ nodes:
       delay_ms: 20000
 
   # Structure is judged on every change, never selected for one. The lens this
-  # replaces was gated behind a suggestions-only charter and measured zero yield
-  # (#2898); that measured the demotion, not the concern.
+  # replaces was gated behind a suggestions-only charter and measured zero yield —
+  # which measured the demotion, not the concern.
   - id: simplify
     command: review-simplify
     context: fresh
@@ -179,8 +133,8 @@ nodes:
     depends_on: [code, seams, simplify, tests, errors, docs]
     trigger_rule: all_done
 
-  # A failed specialist (for example, a provider stream dying mid-review in run
-  # ae71ab1e) must not kill the review: synthesize detects the missing
+  # A failed specialist (a provider stream dying mid-review, say) must not kill
+  # the review: synthesize detects the missing
   # report for an ENABLED lens and forces ready:false naming the gap, so
   # degradation is disclosed, never silent, and the correction loop's recheck is
   # the retry. `ready` is a real boolean — the load-bearing field a composing
@@ -196,7 +150,7 @@ nodes:
   # floor even where the configured provider can resume a named upstream session.
   #
   # v1 note: adversarial per-finding verification happens inside this node's
-  # prompt. When in-parent runtime fan-out lands (#2512), a verify stage slots in
+  # prompt. When in-parent runtime fan-out lands, a verify stage slots in
   # between the lenses and this node without changing either side's contract —
   # the findings files are the declared boundary.
   - id: synthesize

@@ -3,7 +3,7 @@
 flip-ready owns the one irreversible public action and prints the ready pull
 request's URL. This composes what the run's reader — usually an orchestrating
 agent — actually receives, which is that URL plus whatever the review recorded
-in the run's discovery sidecar (#2884).
+in the run's discovery sidecar.
 
 Bound inputs (`with:` bindings, canonical text in env):
 - INPUTS_PR_URL: flip-ready's output, the ready pull request's URL.
@@ -29,7 +29,7 @@ RAW_DISCOVERY_RELAY = (
 def format_discoveries(artifacts: str, failed: bool = False) -> str:
     """The discoveries section for a terminal report, or empty when there is nothing to report.
 
-    Presentation only (#2884): discoveries never gate readiness, so a sidecar this
+    Presentation only: discoveries never gate readiness, so a sidecar this
     cannot read must not fail a tail that has already done its irreversible work.
     A read or parse failure degrades to a one-line pointer at the file rather than
     to silence — the report's reader is exactly who needs to know it is there.
@@ -39,9 +39,9 @@ def format_discoveries(artifacts: str, failed: bool = False) -> str:
     title must not raise past the caller and fail an already-delivered run.
 
     A FAILED run with no consolidated file never reached review, so the producers' own
-    sidecars are the entire record — format_raw_discoveries owns that case (#2940). An
+    sidecars are the entire record — format_raw_discoveries owns that case. An
     EMPTY consolidated file is review's adjudication rather than a gap, so it stays
-    silent, and a completed run's report keeps #2884's shape on every branch.
+    silent, and a completed run's report keeps the same shape on every branch.
 
     Kept byte-identical across the four SDLC tails. A packaged script is
     materialized standalone, so there is no import channel to share it through.
@@ -66,7 +66,7 @@ def format_discoveries(artifacts: str, failed: bool = False) -> str:
 
 
 def format_raw_discoveries(artifacts: str) -> str:
-    """The producer sidecars of a run that died before review consolidated them (#2940).
+    """The producer sidecars of a run that died before review consolidated them.
 
     A failed run is where a discovery matters most — the run often failed BECAUSE of
     what it found — and consolidation lives on the completion path only. So this
@@ -77,7 +77,7 @@ def format_raw_discoveries(artifacts: str) -> str:
     malformed record must not raise past the last thing this run can say.
 
     Silent when there is nothing to report, like the consolidated section above:
-    #2884's contract is one section that exists only when discoveries do, and a failed
+    The contract is one section that exists only when discoveries do, and a failed
     run is not a reason to print an empty one.
 
     Kept byte-identical across the four SDLC tails.
@@ -122,7 +122,7 @@ RED_CAUSE_CAVEAT = (
 
 
 def format_red_causes(artifacts: str) -> str:
-    """The caveat for red this run's green gate deliberately let through (#2939).
+    """The caveat for red this run's green gate deliberately let through.
 
     The gate fails on red the change introduced and passes red it cannot have caused,
     which is only a safe trade while every reader of this report meets the claim. A
@@ -162,7 +162,7 @@ def format_caveats(artifacts: str, failed: bool = False) -> str:
     """Everything a terminal report owes its reader beyond the result itself.
 
     Both sections exist because their channel is otherwise write-only — a gate that
-    accepted red (#2939), and discoveries no consolidation ever reached (#2940).
+    accepted red, and discoveries no consolidation ever reached.
     Composed in one place so a new branch in main() cannot print a report that
     quietly drops one.
 

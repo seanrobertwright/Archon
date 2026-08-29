@@ -32,7 +32,7 @@ nodes:
   - id: investigate
     command: investigate
     # Advisory: the engine fails this node with the touched paths named if it
-    # modifies the working tree (#2771); replaced the record-state snapshot.
+    # modifies the working tree; replaced the record-state snapshot.
     mutates_checkout: false
     output_type: investigation-report
     output_format:

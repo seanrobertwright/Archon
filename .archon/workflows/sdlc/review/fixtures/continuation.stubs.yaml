@@ -3,7 +3,7 @@
 # stays gated off — including the docs lens the scope node would otherwise select
 # here (`docs: true`).
 #
-# That is the structural half of #2941's loop guard: when a correction delta adds
+# That is the structural half of the loop guard: when a correction delta adds
 # user-facing surface, the continuation reviewer re-evaluates a gated-off lens
 # against the delta in its own judgment, and there is no route by which an
 # already-passed lens can rerun. No lens carries a stub, so one that runs anyway

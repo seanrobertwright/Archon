@@ -16,7 +16,6 @@ classify:
     errors: "stub: no failure paths"
     docs: "stub: changed shipped docs need impact review"
 resolve-scope: '{"errors":"false"}'
-review__target: "PR #2 on fixture-branch"
 review__mode: '{"continuation":false}'
 review__scope:
   docs: false

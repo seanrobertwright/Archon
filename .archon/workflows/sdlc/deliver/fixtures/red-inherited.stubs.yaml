@@ -1,6 +1,6 @@
 # Dry-run fixture: red the change cannot have caused passes BOTH green gates, and
 # the run rides to the durable CI wait (--exec-code, so both real gate scripts
-# decide). This is run 49f0d462's shape (#2939).
+# decide).
 #
 # An inherited base break survives the whole tail: implement meets it, and so does
 # the project gate after review, because nobody fixed the base meanwhile. Neither
@@ -24,9 +24,8 @@ classify:
     errors: "stub: no failure paths"
     docs: "stub: no doc-facing changes"
 resolve-scope: '{"errors":"false"}'
-review__target: "PR #6 on fixture-branch"
 review__mode: '{"continuation":false}'
-review__scope: "target recorded; head sha stubbed"
+review__scope: "PR diff in scope; head sha stubbed"
 review__code: "0 findings"
 review__seams: "0 findings"
 review__simplify: "0 findings"

@@ -117,8 +117,6 @@ nodes:
       # The PR node's structured read-back is the target authority. Review must
       # not rediscover an ambient branch→PR mapping.
       scope: "$pr.output.number"
-      pr_number: "$pr.output.number"
-      pr_head: "$pr.output.head"
       prior_report: "$INPUTS.prior_report"
       work_order: "$INPUTS.work"
       errors: "$resolve-scope.output.errors"
@@ -173,18 +171,15 @@ nodes:
               Accepted work order:
               $INPUTS.work
 
-              When the correction is green, push its commits to the existing PR
-              branch. Before pushing, read PR #$pr.output.number from the origin
-              repository and fail unless its head is exactly
-              $pr.output.head and the current branch is that same name. Push that
-              recorded branch explicitly; do not let git select an upstream or
-              gh resolve a PR from ambient state. Do not change the PR's draft state or edit the
-              canonical review comment; the following review owns that public
-              verdict. Record the exact push target and a read-back of the remote
-              ref in implementation.md; never record credentials.
+              When the correction is green, push its commits to the branch this
+              run is on. Push it explicitly by name; do not let git select an
+              upstream. Do not change the PR's draft state or edit the canonical
+              review comment; the following review owns that public verdict.
+              Record the exact push target and a read-back of the remote ref in
+              implementation.md; never record credentials.
 
         # The same gate, same script: a correction can hit inherited or environment
-        # red exactly as the first implementation can (run 49f0d462, #2939), and a
+        # red exactly as the first implementation can, and a
         # correction refused for a red it did not cause wastes the whole round.
         - id: gate-correction-green
           script: gate-green
@@ -200,8 +195,6 @@ nodes:
           include: archon-review
           with:
             scope: "$pr.output.number"
-            pr_number: "$pr.output.number"
-            pr_head: "$pr.output.head"
             prior_report: "$ARTIFACTS_DIR/review/report.md"
             work_order: "$INPUTS.work"
             # Continuation mode owns coverage and skips every specialist,
@@ -219,7 +212,7 @@ nodes:
           depends_on: [recheck]
 
   # none_failed_min_one_success joins the mutually exclusive paths as bound
-  # values (#2637): the
+  # values: the
   # initial review's verdict directly, and the correction loop's final verdict
   # with if_skipped defaults. The loop can stop on `none` (ready) or `replan`
   # (truthful terminal refusal); the script below owns that final distinction.
@@ -276,7 +269,7 @@ nodes:
       stage: "The project gate"
 
   # CI wait, durably. The probe classifies check state once; a pending state
-  # routes into the engine's `wait:` node (#2744), which suspends the run and
+  # routes into the engine's `wait:` node, which suspends the run and
   # releases the worker slot — the server's continuation scan resumes it when
   # the clock fires, surviving restarts. This replaced a 60-minute in-process
   # polling script the moment the engine could hold the time itself. Red fails
@@ -289,7 +282,7 @@ nodes:
       max_iterations: 13
       # Completion computed EXTERNALLY (gh state), never from body-node output
       # substitution: the resumed-wait completion recheck does not evaluate
-      # until_bash against the iteration's outputs (#2794 — seen flipping a PR
+      # until_bash against the iteration's outputs (seen flipping a PR
       # with CI still running). Red counts as done here; the next iteration's
       # probe is what turns red into a loud body failure, and flip-ready's
       # preflight refuses any non-green state that slips through regardless.
@@ -331,30 +324,25 @@ nodes:
         printf '%s\n' "$1" | tee -a "$EVIDENCE" >&2
         exit 1
       }
-      # --repo pins to the origin remote (#2226): gh's default resolution in a
+      # --repo pins to the origin remote: gh's default resolution in a
       # fork clone targets the upstream parent instead. With --repo, gh disables
       # branch inference and REQUIRES an explicit selector — omitting it is a
-      # usage error, seen red on run 925f6c43's resume.
+      # usage error.
+      # Read OUTSIDE the recording helpers on purpose: the raw URL can carry a
+      # credential (https://<token>@host/...). Only the normalized owner/repo
+      # below is ever logged or interpolated into a failure message.
       ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
       case "$ORIGIN_REPO" in
         *[!A-Za-z0-9_.-]*/* | */*[!A-Za-z0-9_.-]* | */*/* | /* | */ | "")
           fail "flip-ready: origin remote does not resolve to an owner/repo."
           ;;
       esac
+      # The recorded number is the selector. Which branch is checked out is not
+      # re-derived here: the run owns its worktree and the PR was created in it,
+      # so this node cannot be the place that discovers otherwise. See the pack
+      # README on guards.
       PR_NUMBER=$pr.output.number
-      EXPECTED_BRANCH=$pr.output.head
-      BRANCH=$(record_read git branch --show-current)
-      if [ -z "$BRANCH" ]; then
-        fail "flip-ready: detached HEAD — cannot resolve the PR branch."
-      fi
-      if [ "$BRANCH" != "$EXPECTED_BRANCH" ]; then
-        fail "flip-ready: current branch '$BRANCH' does not match run-owned PR #$PR_NUMBER branch '$EXPECTED_BRANCH'."
-      fi
-      ACTUAL_BRANCH=$(record_read gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json headRefName --jq .headRefName)
-      if [ "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]; then
-        fail "flip-ready: PR #$PR_NUMBER head '$ACTUAL_BRANCH' does not match recorded branch '$EXPECTED_BRANCH'."
-      fi
-      # Public-surface preflight (#2794): the flip is the one irreversible
+      # Public-surface preflight: the flip is the one irreversible
       # step, so it re-verifies CI itself instead of trusting the loop above —
       # any pending or non-green check refuses the flip loudly. An empty result
       # (no CI configured, or gated checks that never started) proceeds,

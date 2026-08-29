@@ -1,7 +1,7 @@
 # Dry-run fixture: a correction whose red came from the machine, not the code,
 # keeps its round instead of throwing it away (--exec-code, so both real gate
-# scripts decide). This is run f113a1fd's shape (#2939): parallel runs held the
-# same database, one spec failed for it, and the delivery was correct.
+# scripts decide). Parallel runs held the same database, one spec failed for
+# it, and the delivery was correct.
 #
 # The initial gate takes the ordinary green route; the correction gate takes the
 # passed-red route. Contention is transient, so the later project gate is green
@@ -20,9 +20,8 @@ classify:
     errors: "stub: no failure paths"
     docs: "stub: no doc-facing changes"
 resolve-scope: '{"errors":"false"}'
-review__target: "PR #7 on fixture-branch"
 review__mode: '{"continuation":false}'
-review__scope: "target recorded; head sha stubbed"
+review__scope: "PR diff in scope; head sha stubbed"
 review__code: "1 Important finding"
 review__seams: "0 findings"
 review__simplify: "0 findings"
@@ -40,7 +39,6 @@ fix__implement:
 fix__assert-changed: "1 file changed"
 # gate-green and gate-correction-green are deliberately unstubbed: the real script
 # takes the green route at the first and the passed-red route at the second.
-recheck__target: "PR #7 on fixture-branch"
 recheck__mode: '{"continuation":true}'
 recheck__scope: "light mode; delta since cursor"
 recheck__synthesize:

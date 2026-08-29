@@ -30,10 +30,10 @@ nodes:
       properties:
         green:
           type: boolean
-        # Why the checks are red, when they are (#2939). Carries the empty string
+        # Why the checks are red, when they are. Carries the empty string
         # when there is no red to explain, for the same reason implement's does:
         # OpenAI strict mode rejects a schema whose `required` omits a declared
-        # property, so the absent form lives in the enum (#1843).
+        # property, so the absent form lives in the enum.
         red_cause:
           type: string
           enum: [introduced, inherited, environment, ""]
