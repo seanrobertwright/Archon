@@ -122,8 +122,10 @@ mock.module(
 // workflow-wait.integration.spec.ts. Here the command's OWN responsibilities are
 // under test: prefix resolution, both output modes, and the exit code per outcome.
 const mockWaitForRunAttention = mock(
-  (_runId: string, _opts?: { onAttached?: (observedStatus: string) => void }): Promise<unknown> =>
-    Promise.resolve({ kind: 'not_found', runId: 'unset' })
+  (
+    _runId: string,
+    _opts?: { onAttached?: (observedStatus: string) => void | Promise<void> }
+  ): Promise<unknown> => Promise.resolve({ kind: 'not_found', runId: 'unset' })
 );
 mock.module('@archon/core/services/run-attention-watch', () => ({
   waitForRunAttention: mockWaitForRunAttention,
@@ -478,6 +480,15 @@ mock.module('@archon/core/db/workflow-node-sessions', () => ({
  */
 function spyOnJsonStdout(): ReturnType<typeof spyOn> {
   return spyOn(process.stdout, 'write').mockImplementation((...args: unknown[]) => {
+    const callback = args.find(arg => typeof arg === 'function');
+    if (typeof callback === 'function') (callback as () => void)();
+    return true;
+  });
+}
+
+/** The same delivery-confirming shim for stderr, where progress lines go. */
+function spyOnStderr(): ReturnType<typeof spyOn> {
+  return spyOn(process.stderr, 'write').mockImplementation((...args: unknown[]) => {
     const callback = args.find(arg => typeof arg === 'function');
     if (typeof callback === 'function') (callback as () => void)();
     return true;
@@ -10171,10 +10182,10 @@ describe('workflowWaitCommand', () => {
   });
 
   it('announces the attachment on stderr, leaving stdout one --json document', async () => {
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-    mockWaitForRunAttention.mockImplementationOnce((_runId, opts) => {
-      opts?.onAttached?.('running');
-      return Promise.resolve(terminal('cancelled'));
+    const stderrSpy = spyOnStderr();
+    mockWaitForRunAttention.mockImplementationOnce(async (_runId, opts) => {
+      await opts?.onAttached?.('running');
+      return terminal('cancelled');
     });
 
     const code = await workflowWaitCommand(FULL_ID, true, '/repo');
@@ -10183,29 +10194,57 @@ describe('workflowWaitCommand', () => {
     // stderr is the whole point: a progress line on stdout would break the --json
     // contract that a consumer gets exactly one document.
     expect(stdoutSpy.mock.calls).toHaveLength(1);
-    expect(JSON.parse(String(errorSpy.mock.calls[0]?.[0]))).toEqual({
+    expect(JSON.parse(String(stderrSpy.mock.calls[0]?.[0]))).toEqual({
       ok: true,
       action: 'wait',
       runId: FULL_ID,
       result: 'waiting',
       observedStatus: 'running',
     });
-    errorSpy.mockRestore();
+    stderrSpy.mockRestore();
   });
 
   it('names the run and the status it attached on in human mode', async () => {
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-    mockWaitForRunAttention.mockImplementationOnce((_runId, opts) => {
-      opts?.onAttached?.('paused');
-      return Promise.resolve(terminal('completed'));
+    const stderrSpy = spyOnStderr();
+    mockWaitForRunAttention.mockImplementationOnce(async (_runId, opts) => {
+      await opts?.onAttached?.('paused');
+      return terminal('completed');
     });
 
     await workflowWaitCommand(FULL_ID, undefined, '/repo');
 
-    expect(String(errorSpy.mock.calls[0]?.[0])).toBe(
-      `Waiting on run ${FULL_ID} — currently paused.`
+    expect(String(stderrSpy.mock.calls[0]?.[0])).toBe(
+      `Waiting on run ${FULL_ID} — currently paused.\n`
     );
-    errorSpy.mockRestore();
+    stderrSpy.mockRestore();
+  });
+
+  it('fails the wait when the attachment line cannot be delivered', async () => {
+    // The line carries an ordering, so losing it silently is the one outcome that
+    // defeats it — and `console.error` to a closed pipe is exactly that no-op.
+    const stderrSpy = spyOn(process.stderr, 'write').mockImplementation((...args: unknown[]) => {
+      const callback = args.find(arg => typeof arg === 'function');
+      if (typeof callback === 'function') {
+        (callback as (error: Error) => void)(
+          Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+        );
+      }
+      return true;
+    });
+    mockWaitForRunAttention.mockImplementationOnce(async (_runId, opts) => {
+      await opts?.onAttached?.('running');
+      return terminal('completed');
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo');
+
+    expect(code).toBe(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'wait',
+      error: 'write EPIPE',
+    });
+    stderrSpy.mockRestore();
   });
 
   it('waits indefinitely when no timeout is given', async () => {

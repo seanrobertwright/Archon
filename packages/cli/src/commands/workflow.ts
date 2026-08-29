@@ -142,7 +142,7 @@ import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
 import * as userDb from '@archon/core/db/users';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
-import { writeJsonLine, writeStdout } from '../utils/stdout';
+import { writeJsonLine, writeStderr, writeStdout } from '../utils/stdout';
 import { exitWithDrain } from '../utils/exit-with-drain';
 import {
   assertDetachedRunProcessOwner,
@@ -3602,23 +3602,27 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
  * stderr, not stdout, because `--json` promises exactly one document on stdout. The
  * shape follows the same split as the answer itself: the JSON envelope for a machine,
  * one plain sentence for a person.
+ *
+ * Through `writeStderr` rather than `console.error`/`console.warn`, and awaited: this
+ * line exists to tell a host when the watch began, and `console.error` to a pipe whose
+ * reader has gone is a silent no-op under Bun. A line that can vanish without a trace
+ * cannot carry an ordering.
  */
 function announceWaitAttached(
   watchedRunId: string,
   observedStatus: WorkflowRunStatus,
   json?: boolean
-): void {
-  console.error(
-    json
-      ? JSON.stringify({
-          ok: true,
-          action: 'wait',
-          runId: watchedRunId,
-          result: 'waiting',
-          observedStatus,
-        })
-      : `Waiting on run ${watchedRunId} — currently ${observedStatus}.`
-  );
+): Promise<void> {
+  const line = json
+    ? JSON.stringify({
+        ok: true,
+        action: 'wait',
+        runId: watchedRunId,
+        result: 'waiting',
+        observedStatus,
+      })
+    : `Waiting on run ${watchedRunId} — currently ${observedStatus}.`;
+  return writeStderr(`${line}\n`);
 }
 
 /**
@@ -3647,9 +3651,7 @@ export async function workflowWaitCommand(
       // No timeout by default: a wait that ends on its own clock would answer a
       // question only the run can answer.
       ...(timeoutSeconds === undefined ? {} : { deadlineMs: timeoutSeconds * 1000 }),
-      onAttached: observedStatus => {
-        announceWaitAttached(resolvedId, observedStatus, json);
-      },
+      onAttached: observedStatus => announceWaitAttached(resolvedId, observedStatus, json),
     });
   } catch (error) {
     const err = error as Error;

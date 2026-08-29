@@ -499,7 +499,7 @@ its own clock would be answering a question only the run can answer. `--timeout
 | --- | --- |
 | `0` | The run said something — it finished (`completed`, `failed`, or `cancelled`) or it is waiting for a response. The status is data on stdout. |
 | `3` | The timeout passed with the run still live. The `--json` payload carries `observedStatus`. |
-| `1` | The wait itself failed — unknown run id, database unreachable. |
+| `1` | The wait itself failed — unknown run id, database unreachable, or output that could not be delivered. |
 
 A `failed` or `cancelled` run is still exit `0`: mapping run state onto the process
 exit code would make a legitimately cancelled run look like a broken command.

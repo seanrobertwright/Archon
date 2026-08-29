@@ -77,8 +77,11 @@ export interface RunAttentionWaitOptions {
    * This is the moment the wait becomes live, and it is the only moment a caller
    * cannot infer: a run that goes terminal after it produces a WAKE, while the same
    * transition before it would have been an ordinary durable read of a settled row.
+   *
+   * Awaited, so a host that has to deliver this somewhere can report a failed
+   * delivery instead of dropping it. A rejection ends the wait.
    */
-  onAttached?: (observedStatus: WorkflowRunStatus) => void;
+  onAttached?: (observedStatus: WorkflowRunStatus) => void | Promise<void>;
 }
 
 /** What woke a re-read. Logged at debug so a slow wake is diagnosable. */
@@ -246,7 +249,7 @@ export async function waitForRunAttention(
       }
       if (!attached) {
         attached = true;
-        opts.onAttached?.(run.status);
+        await opts.onAttached?.(run.status);
       }
       wakeSource = await nextWake();
     }

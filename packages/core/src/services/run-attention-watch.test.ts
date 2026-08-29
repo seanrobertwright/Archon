@@ -118,7 +118,9 @@ describe('waitForRunAttention', () => {
     const result = await waitForRunAttention('r1', {
       pollIntervalMs: 5,
       deadlineMs: 40,
-      onAttached: status => attached.push(status),
+      onAttached: status => {
+        attached.push(status);
+      },
     });
 
     expect(result).toMatchObject({ kind: 'deadline', observedStatus: 'running' });
@@ -130,7 +132,11 @@ describe('waitForRunAttention', () => {
     const attached: string[] = [];
     putRun('r1', { status: 'completed', completed_at: new Date('2026-08-28T11:00:00.000Z') });
 
-    await wait('r1', { onAttached: (status: string) => attached.push(status) });
+    await wait('r1', {
+      onAttached: (status: string) => {
+        attached.push(status);
+      },
+    });
 
     expect(attached).toEqual([]);
   });
