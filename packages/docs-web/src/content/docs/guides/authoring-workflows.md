@@ -461,6 +461,15 @@ when: "$INPUTS.mode == 'fast'"              # branch on a caller's `with:` value
 when: "$INPUTS.mode == 'fast' && $check.output.ok == 'true'"
 ```
 
+**Previous loop iteration** — only in a `loop_group` body:
+```yaml
+when: "$LOOP_PREV.run-tests.output.verdict == 'red'"
+```
+
+`$LOOP_PREV.<nodeId>.output[.field]` reads that body node's typed output from the
+previous iteration; it is a condition reference, not text substitution. On iteration 1,
+there is no prior output, so it resolves to `''` and the non-empty equality above is false.
+
 - `$nodeId.output` references the full output string of a completed node
 - `$nodeId.output.field` accesses a JSON field (for `output_format` nodes)
 - `$INPUTS.<name>` references a declared input supplied by a caller's `with:` (or a direct

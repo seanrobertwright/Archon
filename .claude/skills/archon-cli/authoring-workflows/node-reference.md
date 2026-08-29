@@ -121,8 +121,8 @@ Completion channels — declare at least one, pick by tier:
 - `until_field: <bool>` — completion is the model's judgment, via `output_format`
 - `until: TOKEN` — prose sentinel; interactive gates a human reads ONLY (deprecated elsewhere)
 
-Also: `fresh_context: true` (each iteration starts clean), `$LOOP_PREV_OUTPUT`
-and `$LOOP_PREV.<nodeId>.output` inside body prompts for previous-iteration state.
+Also: `fresh_context: true` (each iteration starts clean) and `$LOOP_PREV_OUTPUT`
+for previous-iteration state.
 A failed iteration fails the loop at `max_iterations` — bound exhaustion fails
 truthfully rather than blessing a bad last attempt.
 
@@ -145,8 +145,9 @@ truthfully rather than blessing a bad last attempt.
 ```
 
 Body is sealed (no external `depends_on`); outer outputs reach bodies via
-`$nodeId.output`; previous iteration via `$LOOP_PREV.<body-id>.output`. A failed
-body node fails the group immediately.
+`$nodeId.output`. In a `loop_group` body, `$LOOP_PREV.<body-id>.output` reads the
+previous iteration: prompts text-substitute it, while `when:` conditions resolve it
+as a typed condition reference. A failed body node fails the group immediately.
 
 ### approval — human gate
 
