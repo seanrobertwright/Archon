@@ -3365,8 +3365,19 @@ export interface NodeSummary {
 }
 
 /**
+ * Bounded preview of a node's persisted output, shared by the two events that
+ * report a success so both render the same cap.
+ */
+function outputPreviewOf(rawOutput: unknown): string | undefined {
+  if (typeof rawOutput !== 'string') return undefined;
+  return rawOutput.slice(0, 200) + (rawOutput.length > 200 ? '...' : '');
+}
+
+/**
  * Derive per-node summaries from a run's workflow events.
- * Processes node_started / node_completed / node_failed / node_skipped* events.
+ * Processes node_started / node_completed / node_failed / node_skipped /
+ * node_skipped_prior_success events — the last two mean opposite things and are
+ * handled separately.
  */
 export function buildNodeSummaries(events: WorkflowEventRow[]): NodeSummary[] {
   const startTimes = new Map<string, number>();
@@ -3387,17 +3398,12 @@ export function buildNodeSummaries(events: WorkflowEventRow[]): NodeSummary[] {
       case 'node_completed': {
         const started = startTimes.get(nodeId);
         const endTime = new Date(event.created_at).getTime();
-        const rawOutput = event.data.node_output;
-        const output = typeof rawOutput === 'string' ? rawOutput : undefined;
         summaries.set(nodeId, {
           nodeId,
           state: 'completed',
           startedAt: summaries.get(nodeId)?.startedAt,
           durationMs: started !== undefined ? endTime - started : undefined,
-          outputPreview:
-            output !== undefined
-              ? output.slice(0, 200) + (output.length > 200 ? '...' : '')
-              : undefined,
+          outputPreview: outputPreviewOf(event.data.node_output),
         });
         break;
       }
@@ -3413,9 +3419,26 @@ export function buildNodeSummaries(events: WorkflowEventRow[]): NodeSummary[] {
         });
         break;
       }
-      case 'node_skipped':
-      case 'node_skipped_prior_success': {
+      case 'node_skipped': {
         summaries.set(nodeId, { nodeId, state: 'skipped' });
+        break;
+      }
+      case 'node_skipped_prior_success': {
+        // The opposite of node_skipped: the node ran and succeeded on an earlier
+        // pass, and this resume declined to re-run it. The engine re-emits one per
+        // resume pass — including its own durable-wait continuation — so folding
+        // these into `skipped` reported completed work as never run, and the last
+        // write erased the original duration and output (#2973). The earlier
+        // node_completed summary is the truth about the run, so never overwrite it.
+        if (summaries.has(nodeId)) break;
+        // No summary means the original node_completed is not in this log. The
+        // replay still carries the prior output, so report the success it
+        // describes; there is no start time to derive a duration from.
+        summaries.set(nodeId, {
+          nodeId,
+          state: 'completed',
+          outputPreview: outputPreviewOf(event.data.node_output),
+        });
         break;
       }
     }
