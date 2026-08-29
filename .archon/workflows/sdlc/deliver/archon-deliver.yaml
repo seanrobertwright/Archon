@@ -35,7 +35,14 @@ inputs:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
 
-returns: pr
+# The returns node is what a composed dependency on this workflow resolves to,
+# and what a caller's binding of this workflow's output reads. Both must mean
+# "the delivery finished": the flip is the delivery's proof, where the pr
+# node's record exists from the moment of creation even when everything after
+# it dies. Returning the flip makes a failed flip block a composing caller's
+# terminal node, an earlier death hand it a null, and a success hand it the
+# read-back-verified URL — never a stale record presented as a delivery.
+returns: flip-ready
 
 nodes:
   - id: impl
