@@ -21620,11 +21620,11 @@ describe('executeDagWorkflow -- loop_group node', () => {
     }
   });
 
-  it('fails the loop_group when max_iterations is exceeded without the until signal', async () => {
+  it('exhausts loop_group iterations after a negated final until signal', async () => {
     let callCount = 0;
     mockSendQueryDag.mockImplementation(async function* () {
       callCount++;
-      yield { type: 'assistant', content: `iteration ${callCount} work, still going` };
+      yield { type: 'assistant', content: 'The task is not DONE' };
       yield { type: 'result', sessionId: `lg-sess-${callCount}` };
     });
 
@@ -21638,13 +21638,13 @@ describe('executeDagWorkflow -- loop_group node', () => {
         kind: 'loop_group',
         loop_group: {
           until: 'DONE',
-          max_iterations: 3,
+          max_iterations: 2,
           fresh_context: false,
           nodes: [
             {
               id: 'work',
               kind: 'agent',
-              source: { kind: 'inline', prompt: 'do work, never emit DONE' },
+              source: { kind: 'inline', prompt: 'do work until it is done' },
               depends_on: [],
             },
           ],
@@ -21670,9 +21670,11 @@ describe('executeDagWorkflow -- loop_group node', () => {
       minimalConfig
     );
 
-    // Exhausted max_iterations (3) with no signal → run failed, no terminal output.
-    expect(callCount).toBe(3);
+    // The negated prose does not complete the group, so it exhausts max_iterations.
+    expect(callCount).toBe(2);
     expect(result).toBeUndefined();
+    expect(mockDeps.store.failWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockDeps.store.completeWorkflowRun).not.toHaveBeenCalled();
   });
 
   it('INSTANCE 1: multi-node body (implement→test→review) completes on iteration 2', async () => {
