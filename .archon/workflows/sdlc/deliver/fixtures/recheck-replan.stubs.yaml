@@ -15,7 +15,6 @@ classify:
     errors: "stub"
     docs: "stub"
 resolve-scope: '{"errors":"false"}'
-review__target: "PR #6 on fixture-branch"
 review__mode: '{"continuation":false}'
 review__scope: "accepted contract recorded"
 review__code: "1 Important in-scope finding"
@@ -33,7 +32,6 @@ fix__implement:
   summary: "stub: correction exposed a scope conflict"
 fix__assert-changed: "1 file changed"
 gate-correction-green: '{"gate":"green"}'
-recheck__target: "PR #6 on fixture-branch"
 recheck__mode: '{"continuation":true}'
 recheck__scope: "light review with original accepted contract"
 recheck__synthesize:

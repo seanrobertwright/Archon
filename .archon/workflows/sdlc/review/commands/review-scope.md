@@ -8,11 +8,6 @@ Establish exactly what this review round examines, and write it down for the rev
 
 $INPUTS.scope
 
-**Run-owned PR record** (both fields are empty for a standalone review):
-
-- Number: $INPUTS.pr_number
-- Head branch: $INPUTS.pr_head
-
 **Previous round's report** (path; empty means this is the first round, full review):
 
 $INPUTS.prior_report
@@ -27,7 +22,7 @@ $ARGUMENTS
 
 ## Resolve the target
 
-- When either run-owned PR field is non-empty, both must be present. The preceding `target` preflight has already rejected a mismatched checkout or GitHub head. Review exactly that recorded PR number: derive the normalized `owner/repo` from `origin` without writing its raw URL into an artifact, and use `gh ... --repo <owner/repo>` with the recorded number for every GitHub read. Do not resolve a PR from the current branch, and do not accept a different requested scope. The target is that PR's diff, exactly.
+- When the requested scope is a bare PR number, delivery recorded it — review exactly that PR. Derive the normalized `owner/repo` from `origin` without writing its raw URL into an artifact, and use `gh ... --repo <owner/repo>` with that number for every GitHub read. Do not resolve a PR from the current branch, and do not accept a different target. The review object is that PR's diff, exactly.
 - A PR number, URL, or branch → resolve it with `gh pr view` (title, body, base, head, state, files) and `gh pr diff`. Make sure the PR's head is what the local checkout reflects; note the head SHA. **In PR mode the review object is the PR's diff, exactly — uncommitted or untracked local state is out of scope and must not appear in the scope file.**
 - Empty scope → first check whether the current branch has an open PR (`gh pr view`); if it does, that PR is the target (PR mode, as above). Otherwise the working diff: uncommitted changes plus commits ahead of the merge-base with the default/base branch (`git merge-base`, `git diff`, `git log`). Note the current HEAD SHA.
 

@@ -9,7 +9,6 @@ impl__implement:
 impl__assert-changed: "3 files changed"
 gate-green: '{"gate":"green"}'
 pr__pr: { number: 2, url: "https://github.com/example/repo/pull/2", head: "fixture-branch", base: "dev", is_draft: true }
-review__target: "PR #2 on fixture-branch"
 review__mode: '{"continuation":false}'
 review__scope: "target recorded; head sha stubbed"
 review__code: "0 findings"

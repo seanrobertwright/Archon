@@ -317,12 +317,14 @@ describe('bundled-defaults', () => {
       if (review?.kind !== 'include') throw new Error('review is not an include');
       expect(review.with).toMatchObject({
         scope: '$pr.output.number',
-        pr_number: '$pr.output.number',
-        pr_head: '$pr.output.head',
         work_order: '$INPUTS.work',
         errors: '$resolve-scope.output.errors',
         docs: '$classify.output.docs',
       });
+      // One typed value carries the target — not the same number bound twice
+      // beside a head branch nothing downstream reads (#2968).
+      expect(review.with).not.toHaveProperty('pr_number');
+      expect(review.with).not.toHaveProperty('pr_head');
     });
 
     it('archon-deliver validates review action before correction and carries the work order into recheck', () => {
@@ -351,10 +353,10 @@ describe('bundled-defaults', () => {
       if (recheck?.kind !== 'include') throw new Error('recheck is not an include');
       expect(recheck.with).toMatchObject({
         scope: '$pr.output.number',
-        pr_number: '$pr.output.number',
-        pr_head: '$pr.output.head',
         work_order: '$INPUTS.work',
       });
+      expect(recheck.with).not.toHaveProperty('pr_number');
+      expect(recheck.with).not.toHaveProperty('pr_head');
 
       const gateReady = parsed.workflow.nodes.find(node => node.id === 'gate-ready');
       expect(gateReady?.kind).toBe('exec');
@@ -372,17 +374,15 @@ describe('bundled-defaults', () => {
       if (parsed.workflow === null) throw new Error(parsed.error.error);
 
       expect(parsed.workflow.inputs?.work_order?.default).toBe('');
-      expect(parsed.workflow.inputs?.pr_number?.default).toBe('');
-      expect(parsed.workflow.inputs?.pr_head?.default).toBe('');
-      const target = parsed.workflow.nodes.find(node => node.id === 'target');
-      expect(target?.kind).toBe('exec');
-      if (target?.kind !== 'exec') throw new Error('target is not executable');
-      const reviewBundle = BUNDLED_WORKFLOWS['archon-review'];
-      expect(reviewBundle).toContain('gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO"');
-      expect(reviewBundle).toContain('current branch');
-      expect(reviewBundle).toContain('does not match recorded branch');
+      // The run-owned PR reaches review as ONE typed value, `scope`. The
+      // `target` preflight and its paired pr_number/pr_head inputs re-asserted
+      // an invariant the engine already establishes — the run owns its worktree
+      // and the PR was created in it — so they were cut (#2968).
+      expect(parsed.workflow.nodes.find(node => node.id === 'target')).toBeUndefined();
+      expect(parsed.workflow.inputs?.pr_number).toBeUndefined();
+      expect(parsed.workflow.inputs?.pr_head).toBeUndefined();
       const scope = parsed.workflow.nodes.find(node => node.id === 'scope');
-      expect(scope?.depends_on).toEqual(['mode', 'target']);
+      expect(scope?.depends_on).toEqual(['mode']);
       expect(scope?.kind).toBe('agent');
       if (scope?.kind !== 'agent') throw new Error('scope is not an agent');
       expect(scope.output_format).toEqual({
@@ -444,125 +444,6 @@ describe('bundled-defaults', () => {
         expect(commands[`__archon_pack__bundled:sdlc:review::review-${lens}`]).toContain(
           `sources: [${lens}]`
         );
-      }
-    });
-
-    // Windows cannot execute the extensionless `#!/bin/sh` fakes this test puts on
-    // PATH, so the harness — not the workflow — is what fails there. The node body
-    // under test is POSIX shell either way, and ubuntu proves it.
-    it.skipIf(process.platform === 'win32')(
-      'runs the delivery-owned review preflight with its declared inputs',
-      async () => {
-        const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-review'], 'archon-review.yaml');
-        if (parsed.workflow === null) throw new Error(parsed.error.error);
-        const target = parsed.workflow.nodes.find(node => node.id === 'target');
-        if (target?.kind !== 'exec') throw new Error('target is not executable');
-
-        const directory = mkdtempSync(join(tmpdir(), 'archon-review-target-'));
-        const bin = join(directory, 'bin');
-        const log = join(directory, 'gh.log');
-        const previousPath = process.env.PATH;
-        const previousLog = process.env.GH_LOG;
-
-        try {
-          mkdirSync(bin);
-          writeFileSync(
-            join(bin, 'git'),
-            [
-              '#!/bin/sh',
-              'case "$*" in',
-              '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
-              '  "branch --show-current") printf "%s\\n" "recorded-branch" ;;',
-              'esac',
-            ].join('\n')
-          );
-          writeFileSync(
-            join(bin, 'gh'),
-            [
-              '#!/bin/sh',
-              'printf "%s\\n" "$*" >> "$GH_LOG"',
-              'printf "%s\\n" "recorded-branch"',
-            ].join('\n')
-          );
-          chmodSync(join(bin, 'git'), 0o755);
-          chmodSync(join(bin, 'gh'), 0o755);
-          process.env.PATH = `${bin}:${previousPath ?? ''}`;
-          process.env.GH_LOG = log;
-
-          const workflow = {
-            ...parsed.workflow,
-            name: 'run-owned-review-target',
-            nodes: [{ ...target, when: undefined }],
-          };
-          const result = await dryRunWorkflow({
-            workflow,
-            userMessage: '',
-            cwd: directory,
-            inputs: { pr_number: '42', pr_head: 'recorded-branch' },
-            execCode: true,
-          });
-
-          expect(result.outcome).toBe('completed');
-          expect(result.trace[0]).toMatchObject({
-            nodeId: 'target',
-            state: 'completed',
-            output: 'PR #42 on recorded-branch',
-          });
-          expect(readFileSync(log, 'utf-8')).toContain(
-            'pr view 42 --repo owner/repo --json headRefName --jq .headRefName'
-          );
-        } finally {
-          if (previousPath === undefined) delete process.env.PATH;
-          else process.env.PATH = previousPath;
-          if (previousLog === undefined) delete process.env.GH_LOG;
-          else process.env.GH_LOG = previousLog;
-          await removeTempTree(directory);
-        }
-      }
-    );
-
-    it('refuses a half-supplied run-owned PR record, and skips without one', async () => {
-      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-review'], 'archon-review.yaml');
-      if (parsed.workflow === null) throw new Error(parsed.error.error);
-      const target = parsed.workflow.nodes.find(node => node.id === 'target');
-      if (target?.kind !== 'exec') throw new Error('target is not executable');
-      const workflow = { ...parsed.workflow, name: 'partial-review-target', nodes: [target] };
-      const directory = mkdtempSync(join(tmpdir(), 'archon-review-partial-'));
-
-      try {
-        // Both halves declared but only one supplied: the node must SAY so. Under
-        // `set -u` an input the engine never exported would abort with a shell
-        // error instead — the failure class that stalled this workflow (R5).
-        const halves: Record<string, string>[] = [
-          { pr_number: '42' },
-          { pr_head: 'recorded-branch' },
-        ];
-        for (const inputs of halves) {
-          const result = await dryRunWorkflow({
-            workflow,
-            userMessage: '',
-            cwd: directory,
-            inputs,
-            execCode: true,
-          });
-          expect(result.outcome).toBe('failed');
-          expect(result.trace[0]?.reason).toContain(
-            'delivery-owned review requires both pr_number and pr_head'
-          );
-        }
-
-        // Neither supplied: standalone review, the preflight does not apply.
-        const standalone = await dryRunWorkflow({
-          workflow,
-          userMessage: '',
-          cwd: directory,
-          inputs: {},
-          execCode: true,
-        });
-        expect(standalone.outcome).toBe('completed');
-        expect(standalone.trace[0]?.state).toBe('skipped');
-      } finally {
-        await removeTempTree(directory);
       }
     });
 
