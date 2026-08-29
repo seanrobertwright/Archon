@@ -28,6 +28,7 @@ import {
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
+  retainStreamTail,
   classifyError,
   isQuotaExhaustionError,
   extractQuotaResetAt,
@@ -1189,5 +1190,29 @@ describe('describeUnmetCompletion', () => {
     const described = describeUnmetCompletion({});
     expect(described).toBe('without a completion channel');
     expect(described).not.toContain('undefined');
+  });
+});
+
+describe('retainStreamTail', () => {
+  it('returns a stream at the exact budget whole and unmarked', () => {
+    // The boundary an off-by-one would move: 2000 characters is retained in full, so a
+    // reader never sees a truncation marker on output that was not truncated.
+    const exact = 'y'.repeat(2000);
+    expect(retainStreamTail(exact)).toBe(exact);
+  });
+
+  it('keeps the tail and marks the dropped head one character over budget', () => {
+    const overBudget = `HEAD${'y'.repeat(2000)}`;
+    const retained = retainStreamTail(overBudget);
+    expect(retained).toBe(`…[truncated to last 2000 chars]\n${'y'.repeat(2000)}`);
+    expect(retained).not.toContain('HEAD');
+  });
+
+  it('reports an empty or whitespace-only stream as absent, not as an empty string', () => {
+    // `undefined` is what makes an absent tail field mean "this stream was empty"
+    // rather than "retention did not happen".
+    expect(retainStreamTail('')).toBeUndefined();
+    expect(retainStreamTail('   \n  ')).toBeUndefined();
+    expect(retainStreamTail(undefined)).toBeUndefined();
   });
 });

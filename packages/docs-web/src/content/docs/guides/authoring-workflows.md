@@ -1103,6 +1103,36 @@ This works on **every** node type (`bash`/`script` produce typed outputs too, ju
 
 Successful bash stdout is retained by default on the completed run as a bounded audit preview in `node_completed.data.node_output`. Output over 32 KiB (32,768 UTF-8 bytes) ends with a truncation marker, and the event also includes `node_output_truncated: true` plus `node_output_original_bytes`. Because stdout is persisted, never print secrets or credentials from bash nodes. This preview is separate from `output_type`: declaring `output_type` opts into a best-effort file sidecar that may contain the full output and is not required for ordinary bash audit retention.
 
+### Retained subprocess evidence
+
+Separately from the value channel above, the engine retains **what each subprocess printed** in
+the run's own transcript (`~/.archon/workspaces/<project>/logs/<run-id>.jsonl`), as one
+`exec_output` row per subprocess:
+
+| Field | Meaning |
+| --- | --- |
+| `step` | The node id. An `until_bash` probe uses `<node>-iteration-<n>`. |
+| `content` | `<bash>`, `<script>`, or `<until_bash>`. |
+| `exit_code` | `0` on success. On failure, the process exit code — or a symbol when there is none: `ENOENT`, `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`, or the signal name (`SIGTERM`) for a timeout kill. |
+| `stdout_tail` / `stderr_tail` | Last 2000 characters of each stream. Absent means that stream was empty. |
+
+This covers every `bash:` and `script:` node and both loop variants' `until_bash` probes, on
+success and failure alike — including a probe's *tolerated* non-zero exit, which is otherwise
+unrecorded. Workflows do not need to build their own logging to answer "what did this node
+actually do?".
+
+Three properties worth knowing:
+
+- **Streams stay separate.** `stderr` is never merged into `stdout`, so a `git` or `gh` warning
+  cannot be mistaken for the value a node returned.
+- **It is capped; `$nodeId.output` is not.** A tail over 2000 characters is marked in place with
+  `…[truncated to last 2000 chars]`. The cap applies only to this evidence copy — a node's output
+  still reaches its consumers whole.
+- **Credentials are removed on write.** Values the engine put in the subprocess environment
+  (keys ending in `TOKEN`/`KEY`/`SECRET`/`PASSWORD`, `DATABASE_URL`, and credentials Archon
+  injected) are replaced with `[REDACTED]` before the row is written. This protects the
+  transcript, not the `node_output` preview above — the "never print secrets" rule still stands.
+
 ---
 
 ## Cross-Run State with `$STATE_DIR`
