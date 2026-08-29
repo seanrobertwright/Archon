@@ -6,7 +6,8 @@ full gate runs post-review. A node that produced a verdict is not a node that pa
 the loop completes on `done`, blocked declines included, so no spend and no public
 step happens until this reads the verdict itself.
 
-Red is not one thing, though, and treating it as one killed two correct deliveries
+Red is not one thing, though, and treating it as one killed two correct deliveries.
+
 A change that breaks a check must never reach a pull request. A check that
 was already red at the run's starting commit, or that failed because a parallel
 process held the database this run needed, is not evidence about the change at all —

@@ -85,8 +85,8 @@ nodes:
       delay_ms: 20000
 
   # Structure is judged on every change, never selected for one. The lens this
-  # replaces was gated behind a suggestions-only charter and measured zero yield
-  #; that measured the demotion, not the concern.
+  # replaces was gated behind a suggestions-only charter and measured zero yield —
+  # which measured the demotion, not the concern.
   - id: simplify
     command: review-simplify
     context: fresh
@@ -133,8 +133,8 @@ nodes:
     depends_on: [code, seams, simplify, tests, errors, docs]
     trigger_rule: all_done
 
-  # A failed specialist (for example, a provider stream dying mid-review in run
-  # ae71ab1e) must not kill the review: synthesize detects the missing
+  # A failed specialist (a provider stream dying mid-review, say) must not kill
+  # the review: synthesize detects the missing
   # report for an ENABLED lens and forces ready:false naming the gap, so
   # degradation is disclosed, never silent, and the correction loop's recheck is
   # the retry. `ready` is a real boolean — the load-bearing field a composing

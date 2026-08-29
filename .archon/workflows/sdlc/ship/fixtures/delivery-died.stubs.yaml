@@ -2,8 +2,8 @@
 # still runs. That reachability is what lets a failed run say anything at all —
 # ship's outcome depends on the deliver block's sinks, which are SKIPPED (never
 # failed) when a gate inside deliver refuses, so `none_failed_min_one_success`
-# still admits it. The shape is one where whose implement
-# node had already written a discovery sidecar the report never surfaced.
+# still admits it. The shape is one where the implement node had already
+# written a discovery sidecar the report never surfaced.
 #
 # `outcome` is stubbed on purpose: the real script returns 1 on this branch, and
 # a declared failure fixture asserts EXACTLY one failed node. Its rendering of the

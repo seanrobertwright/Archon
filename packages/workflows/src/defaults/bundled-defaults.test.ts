@@ -568,7 +568,6 @@ describe('bundled-defaults', () => {
       // helpers, and only the normalized owner/repo is ever passed to a logged
       // command or interpolated into a failure message.
       const flipBody = deliver.slice(deliver.indexOf('- id: flip-ready'));
-      expect(flipBody).not.toMatch(/record(_read)? git remote/);
       for (const line of flipBody.split('\n')) {
         if (/^\s*record(_read)? /.test(line) || /\$\(record(_read)? /.test(line)) {
           expect(line).not.toContain('git remote');
@@ -637,8 +636,6 @@ describe('bundled-defaults', () => {
         const log = join(directory, 'gh.log');
         const previousPath = process.env.PATH;
         const previousOrigin = process.env.TEST_ORIGIN;
-        const previousBranch = process.env.TEST_BRANCH;
-        const previousHead = process.env.TEST_REMOTE_HEAD;
         const previousLog = process.env.GH_LOG;
 
         try {
@@ -649,22 +646,12 @@ describe('bundled-defaults', () => {
               '#!/bin/sh',
               'case "$*" in',
               '  "remote get-url origin") printf "%s\\n" "$TEST_ORIGIN" ;;',
-              '  "branch --show-current") printf "%s\\n" "$TEST_BRANCH" ;;',
               'esac',
             ].join('\n')
           );
-          writeFileSync(
-            join(bin, 'gh'),
-            [
-              '#!/bin/sh',
-              'printf "%s\\n" "$*" >> "$GH_LOG"',
-              'if [ "$1" = "pr" ] && [ "$2" = "view" ]; then',
-              '  printf "%s\\n" "$TEST_REMOTE_HEAD"',
-              'fi',
-            ].join('\n')
-          );
+          // No fake `gh`: the node refuses at the origin check before reaching one.
+          // If that ever stops being true, the missing binary makes it obvious.
           chmodSync(join(bin, 'git'), 0o755);
-          chmodSync(join(bin, 'gh'), 0o755);
           process.env.PATH = `${bin}:${previousPath ?? ''}`;
           process.env.GH_LOG = log;
 
@@ -675,16 +662,12 @@ describe('bundled-defaults', () => {
           const cases = [
             {
               origin: 'https://token@example.com/repo.git',
-              branch: 'recorded-branch',
-              remoteHead: 'recorded-branch',
               reason: 'origin remote does not resolve to an owner/repo',
             },
           ];
-          for (const { origin, branch, remoteHead, reason } of cases) {
+          for (const { origin, reason } of cases) {
             writeFileSync(log, '');
             process.env.TEST_ORIGIN = origin;
-            process.env.TEST_BRANCH = branch;
-            process.env.TEST_REMOTE_HEAD = remoteHead;
             const result = await dryRunWorkflow({
               workflow,
               userMessage: '',
@@ -704,10 +687,6 @@ describe('bundled-defaults', () => {
           else process.env.PATH = previousPath;
           if (previousOrigin === undefined) delete process.env.TEST_ORIGIN;
           else process.env.TEST_ORIGIN = previousOrigin;
-          if (previousBranch === undefined) delete process.env.TEST_BRANCH;
-          else process.env.TEST_BRANCH = previousBranch;
-          if (previousHead === undefined) delete process.env.TEST_REMOTE_HEAD;
-          else process.env.TEST_REMOTE_HEAD = previousHead;
           if (previousLog === undefined) delete process.env.GH_LOG;
           else process.env.GH_LOG = previousLog;
           await removeTempTree(directory);
