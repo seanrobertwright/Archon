@@ -155,7 +155,7 @@ describe('test-suite change decision', () => {
       workflow.indexOf('  test:')
     );
 
-    expect(pullRequestTrigger).toBe('  pull_request:');
+    expect(pullRequestTrigger).toBe('  pull_request:\n    branches: [main, dev]');
     expect(fixtureJob).toContain("if: github.event_name == 'pull_request'");
     expect(fixtureJob).toContain('runs-on: ubuntu-latest');
     expect(fixtureJob).not.toContain('needs:');
