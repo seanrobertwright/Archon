@@ -104,6 +104,13 @@ jobs:
         if: runner.os != 'Windows'
         run: bun run test:install
 
+      # No Windows Defender exclusion step here on purpose. It was the named
+      # remaining suspect behind the downloadWebDist stalls (#2924), so one was
+      # added and run on windows-latest — and its own readback disproved the
+      # hypothesis: the runner image already excludes `C:\` and `D:\` at the
+      # drive root, recursively, so nothing under either was being scanned to
+      # begin with. `Add-MpPreference` also cost 5s per run to change nothing.
+      # Evidence: https://github.com/coleam00/Archon/pull/2943
       - name: Run tests
         run: bun run test
 
