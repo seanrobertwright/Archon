@@ -68,3 +68,13 @@ surface: interpolating the raw value into one leaks it just as effectively.
 That retention is also why a node does not need its own log. The ready flip once
 wrote one by hand — every command it ran, echoed into an artifact — which is what
 the transcript now holds for free.
+
+## A node's streams are the operator's channel
+
+Retention is not the only reader. Anything a node writes to stderr is sent to the
+operator as the run happens, even when the node succeeds — and that copy is not
+redacted. So a node speaks for itself: capture what the commands inside it print,
+and let only your own authored messages reach the streams. Re-emit a command's
+output when it failed and its words are the diagnostic; drop it when it is just a
+tool narrating itself. Capture a value's stderr separately rather than merging it,
+too — a `gh` update notice merged into a read becomes the value.

@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { removeTempTree } from '@archon/paths/test-utils';
+import { execFileAsync } from '@archon/git';
 import {
   isBinaryBuild,
   BUNDLED_COMMANDS,
@@ -576,7 +577,7 @@ describe('bundled-defaults', () => {
       expect(flipBody).not.toContain('$ARTIFACTS_DIR/flip-ready.log');
       const remoteReads = flipBody.split('\n').filter(line => line.includes('git remote'));
       expect(remoteReads).toHaveLength(1);
-      expect(remoteReads[0]).toContain('ORIGIN_REPO=$(git remote get-url origin | sed');
+      expect(remoteReads[0]).toContain('ORIGIN_REPO=$(git remote get-url origin 2>/dev/null | sed');
       expect(deliver).toContain('origin remote does not resolve to an owner/repo');
       // A command node reads its node-local `with:` map through `$INPUTS.<name>`,
       // never the INPUTS_<UPPER_SNAKE> env form — that one is built only for
@@ -606,14 +607,28 @@ describe('bundled-defaults', () => {
     });
 
     /**
-     * Execute the bundled `flip-ready` node against fake `git`/`gh` binaries on PATH,
-     * with the recorded PR supplied by a stubbed producer the way `archon-pr` supplies
-     * it in a real delivery. Returns the run and everything the fake `gh` was asked to
-     * do, so each scenario asserts on outcomes rather than repeating this setup.
+     * Write the fake `git`/`gh` the flip-ready scenarios put on PATH. An omitted
+     * command is left absent on purpose — a refusal that must land before reaching it.
      *
-     * Windows cannot execute the extensionless `#!/bin/sh` fakes, so callers skip there:
-     * the harness, not the workflow, is what fails. The node body is POSIX shell either
-     * way, and ubuntu proves it.
+     * Windows cannot execute these extensionless `#!/bin/sh` fakes, so every caller
+     * skips there: the harness, not the workflow, is what fails. The node body is POSIX
+     * shell either way, and ubuntu proves it.
+     */
+    const writeFakeBins = (bin: string, fakes: { git?: string[]; gh?: string[] }): void => {
+      mkdirSync(bin, { recursive: true });
+      for (const command of ['git', 'gh'] as const) {
+        const body = fakes[command];
+        if (body === undefined) continue;
+        writeFileSync(join(bin, command), body.join('\n'));
+        chmodSync(join(bin, command), 0o755);
+      }
+    };
+
+    /**
+     * Execute the bundled `flip-ready` node against those fakes, with the recorded PR
+     * supplied by a stubbed producer the way `archon-pr` supplies it in a real delivery.
+     * Returns the run and everything the fake `gh` was asked to do, so each scenario
+     * asserts on outcomes rather than repeating this setup.
      */
     const runFlipReady = async (scenario: {
       name: string;
@@ -658,15 +673,7 @@ describe('bundled-defaults', () => {
       );
 
       try {
-        mkdirSync(bin);
-        for (const [command, body] of [
-          ['git', scenario.git],
-          ['gh', scenario.gh],
-        ] as const) {
-          if (body === undefined) continue;
-          writeFileSync(join(bin, command), body.join('\n'));
-          chmodSync(join(bin, command), 0o755);
-        }
+        writeFakeBins(bin, scenario);
         writeFileSync(log, '');
         Object.assign(process.env, overrides);
 
@@ -791,6 +798,71 @@ describe('bundled-defaults', () => {
         expect(flip?.reason).toContain('re-run the failing check');
         expect(flip?.reason).toContain('resume this run');
         expect(ghLog).not.toContain('pr ready');
+      }
+    );
+
+    // The dry-run simulator keeps a successful node's stderr, so this scenario runs the
+    // node body as a process and reads the streams the executor would. That is the
+    // boundary the claim lives at: `executeBashNode` broadcasts ANY non-empty stderr
+    // from a SUCCEEDING node straight to the operator's chat, unredacted — redaction
+    // covers the retained transcript copy only (dag-executor.ts). So on the success
+    // path the node's stderr must be empty, and gh is chatty on stderr by habit: it
+    // explains a missing check surface there, and appends an update notice to whatever
+    // else it prints.
+    it.skipIf(process.platform === 'win32')(
+      'lets no gh output reach the node streams on the no-CI success flip',
+      async () => {
+        const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+        if (parsed.workflow === null) throw new Error(parsed.error.error);
+        const flipReady = parsed.workflow.nodes.find(node => node.id === 'flip-ready');
+        // A `bash:` node parses to the `sh` runtime, and the executor runs it through
+        // `resolveBashPath()` — the same interpreter this test invokes.
+        if (flipReady?.kind !== 'exec' || flipReady.runtime !== 'sh') {
+          throw new Error('flip-ready is not a bash node');
+        }
+        // The engine substitutes the producer ref before running the body; the dry-run
+        // scenarios above prove that wiring, so this one supplies the resolved number.
+        const script = flipReady.script.replace('$pr.output.number', '42');
+        const directory = mkdtempSync(join(tmpdir(), 'archon-flip-streams-'));
+        const bin = join(directory, 'bin');
+
+        try {
+          writeFakeBins(bin, {
+            git: [
+              '#!/bin/sh',
+              'case "$*" in',
+              '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
+              'esac',
+            ],
+            gh: [
+              '#!/bin/sh',
+              'case "$*" in',
+              '  "pr checks"*)',
+              '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
+              '    exit 1',
+              '    ;;',
+              '  "pr ready"*) printf "%s\\n" "marked as ready for review" ;;',
+              '  *isDraft*) printf "%s\\n" "false" ;;',
+              '  *"--json url"*) printf "%s\\n" "https://example.com/repo/pull/42" ;;',
+              'esac',
+              // Appended to every call, the way gh appends its update notice: it rides
+              // along with a SUCCESSFUL read, so a value read that merged stderr would
+              // carry it into the value.
+              'printf "%s\\n" "gh: A new release of gh is available" >&2',
+            ],
+          });
+
+          const { stdout, stderr } = await execFileAsync('bash', ['-c', script], {
+            cwd: directory,
+            env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+          });
+
+          // The delivered URL, alone — no confirmation, no update notice.
+          expect(stdout).toBe('https://example.com/repo/pull/42\n');
+          expect(stderr).toBe('');
+        } finally {
+          await removeTempTree(directory);
+        }
       }
     );
   });
