@@ -499,7 +499,7 @@ its own clock would be answering a question only the run can answer. `--timeout
 | --- | --- |
 | `0` | The run said something — it finished (`completed`, `failed`, or `cancelled`) or it is waiting for a response. The status is data on stdout. |
 | `3` | The timeout passed with the run still live. The `--json` payload carries `observedStatus`. |
-| `1` | The wait itself failed — unknown run id, database unreachable. |
+| `1` | The wait itself failed — unknown run id, database unreachable, or output that could not be delivered. |
 
 A `failed` or `cancelled` run is still exit `0`: mapping run state onto the process
 exit code would make a legitimately cancelled run look like a broken command.
@@ -525,6 +525,18 @@ exit code would make a legitimately cancelled run look like a broken command.
 Two pauses deliberately do **not** wake a waiter, because neither is owed a response: a
 gate that has already been approved or rejected and is awaiting auto-resume, and a
 [`wait:` node](/guides/authoring-workflows/) whose timer or event has not fired.
+
+Once the wait is watching, it says so once on **stderr** — one plain sentence, or the
+same envelope with `"result": "waiting"` and the status it attached on under `--json`:
+
+```json
+{ "ok": true, "action": "wait", "runId": "…", "result": "waiting", "observedStatus": "running" }
+```
+
+Until that line the command is completely silent, so a host cannot tell a watch that
+has begun from one still resolving the id. It is on stderr precisely so stdout keeps
+carrying exactly one document. A run that already has something to say answers on the
+first read, and never prints it.
 
 The run id may be the short prefix printed by `workflow runs`. Once the wait returns,
 inspect the run normally with `workflow get <run-id>`.

@@ -142,7 +142,7 @@ import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
 import * as userDb from '@archon/core/db/users';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
-import { writeJsonLine, writeStdout } from '../utils/stdout';
+import { writeJsonLine, writeStderr, writeStdout } from '../utils/stdout';
 import { exitWithDrain } from '../utils/exit-with-drain';
 import {
   assertDetachedRunProcessOwner,
@@ -3591,6 +3591,41 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
 }
 
 /**
+ * Say once, on stderr, that the wait is now watching the run.
+ *
+ * Until this line the command is completely silent, and neither a human nor a host
+ * can tell an attached wait from one still resolving the id — or from one that died
+ * on the way. It also fixes the instant the watch began: a transition after this line
+ * reached the caller as a wake, where the same transition before it would have been
+ * an ordinary read of an already-settled row.
+ *
+ * stderr, not stdout, because `--json` promises exactly one document on stdout. The
+ * shape follows the same split as the answer itself: the JSON envelope for a machine,
+ * one plain sentence for a person.
+ *
+ * Through `writeStderr` rather than `console.error`/`console.warn`, and awaited: this
+ * line exists to tell a host when the watch began, and `console.error` to a pipe whose
+ * reader has gone is a silent no-op under Bun. A line that can vanish without a trace
+ * cannot carry an ordering.
+ */
+function announceWaitAttached(
+  watchedRunId: string,
+  observedStatus: WorkflowRunStatus,
+  json?: boolean
+): Promise<void> {
+  const line = json
+    ? JSON.stringify({
+        ok: true,
+        action: 'wait',
+        runId: watchedRunId,
+        result: 'waiting',
+        observedStatus,
+      })
+    : `Waiting on run ${watchedRunId} — currently ${observedStatus}.`;
+  return writeStderr(`${line}\n`);
+}
+
+/**
  * Block until a run finishes or parks on a gate awaiting a response, then say which.
  *
  * The point of the verb: a host that launched a run with `--detach` waits on one
@@ -3616,6 +3651,7 @@ export async function workflowWaitCommand(
       // No timeout by default: a wait that ends on its own clock would answer a
       // question only the run can answer.
       ...(timeoutSeconds === undefined ? {} : { deadlineMs: timeoutSeconds * 1000 }),
+      onAttached: observedStatus => announceWaitAttached(resolvedId, observedStatus, json),
     });
   } catch (error) {
     const err = error as Error;

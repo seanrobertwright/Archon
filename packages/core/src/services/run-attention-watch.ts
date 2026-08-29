@@ -69,6 +69,19 @@ export interface RunAttentionWaitOptions {
   deadlineMs?: number;
   /** Backstop re-read cadence. Defaults to `DEFAULT_ATTENTION_POLL_INTERVAL_MS`. */
   pollIntervalMs?: number;
+  /**
+   * Called once, with the status the opening read saw, when that read finds nothing
+   * to report and the wait settles in to watch. It does not fire when the run already
+   * has something to say, because then nothing was ever waited for.
+   *
+   * This is the moment the wait becomes live, and it is the only moment a caller
+   * cannot infer: a run that goes terminal after it produces a WAKE, while the same
+   * transition before it would have been an ordinary durable read of a settled row.
+   *
+   * Awaited, so a host that has to deliver this somewhere can report a failed
+   * delivery instead of dropping it. A rejection ends the wait.
+   */
+  onAttached?: (observedStatus: WorkflowRunStatus) => void | Promise<void>;
 }
 
 /** What woke a re-read. Logged at debug so a slow wake is diagnosable. */
@@ -219,6 +232,7 @@ export async function waitForRunAttention(
 
   try {
     let wakeSource: WakeSource = 'immediate';
+    let attached = false;
     for (;;) {
       const run = await workflowDb.getWorkflowRun(runId);
       if (!run) return { kind: 'not_found', runId };
@@ -232,6 +246,10 @@ export async function waitForRunAttention(
       if (signal?.aborted) return { kind: 'aborted', runId };
       if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
         return { kind: 'deadline', runId, observedStatus: run.status };
+      }
+      if (!attached) {
+        attached = true;
+        await opts.onAttached?.(run.status);
       }
       wakeSource = await nextWake();
     }
