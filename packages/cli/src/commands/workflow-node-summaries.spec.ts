@@ -73,6 +73,10 @@ describe('buildNodeSummaries', () => {
   // including its own durable-wait continuation. Folding it into `skipped` made
   // `archon workflow get` report the node that opened a PR as never having run.
   it('keeps a completed node completed across repeated resume replays', () => {
+    // The engine copies the prior output forward, so a real replay repeats the
+    // original text. These replays carry a DIFFERENT string on purpose: matching
+    // text would pass whether the projection kept the original summary or
+    // overwrote it with an equal value, and only the first is the contract.
     const summaries = buildNodeSummaries([
       event('pr-started', 'node_started', 'deliver__pr__pr', '2026-08-29T14:27:29.000Z'),
       event('pr-completed', 'node_completed', 'deliver__pr__pr', '2026-08-29T14:29:16.000Z', {
@@ -85,7 +89,7 @@ describe('buildNodeSummaries', () => {
         '2026-08-29T14:53:47.000Z',
         {
           reason: 'prior_success',
-          node_output: 'https://github.com/coleam00/Archon/pull/2971',
+          node_output: 'replay 1 output',
         }
       ),
       event(
@@ -95,7 +99,7 @@ describe('buildNodeSummaries', () => {
         '2026-08-29T15:38:50.000Z',
         {
           reason: 'prior_success',
-          node_output: 'https://github.com/coleam00/Archon/pull/2971',
+          node_output: 'replay 2 output',
         }
       ),
     ]);
