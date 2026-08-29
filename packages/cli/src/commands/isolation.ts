@@ -347,6 +347,10 @@ export async function isolationCompleteCommand(
         }
       } catch (error) {
         const err = error as Error;
+        // git gives the same "unknown revision" for a ref GitHub deleted after a
+        // squash merge and for one that was never pushed. The safety decision is the
+        // same either way — is the content on the base? — but the operator's message
+        // must not assert a deletion that may never have happened.
         if (err.message.includes('unknown revision') || err.message.includes('bad revision')) {
           if (uniqueCommitCount !== undefined && uniqueCommitCount > 0) {
             try {
@@ -364,10 +368,14 @@ export async function isolationCompleteCommand(
                 )
               ) {
                 console.log(
-                  `  Note: remote branch deleted; content is already on ${remoteBaseRef} (squash-merged).`
+                  `  Note: no ${remote}/${branch} on the remote; content is already on ` +
+                    `${remoteBaseRef} (squash-merged, or merged locally and never pushed).`
                 );
               } else {
-                blockers.push(`remote branch deleted and content not found on ${remoteBaseRef}`);
+                blockers.push(
+                  `no ${remote}/${branch} on the remote (deleted or never pushed) ` +
+                    `and content not found on ${remoteBaseRef}`
+                );
               }
             } catch (patchCheckError) {
               const patchCheckErr = patchCheckError as Error;
@@ -376,7 +384,8 @@ export async function isolationCompleteCommand(
                 'isolation.complete_remote_deleted_branch_check_failed'
               );
               blockers.push(
-                `could not verify whether remote-deleted branch was merged (${patchCheckErr.message})`
+                `could not verify whether ${branch}'s content is already on the base branch ` +
+                  `(${patchCheckErr.message})`
               );
             }
           }

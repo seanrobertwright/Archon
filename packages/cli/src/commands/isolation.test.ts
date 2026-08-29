@@ -365,7 +365,7 @@ describe('isolationCompleteCommand', () => {
       }
     );
     expect(consoleLogSpy).toHaveBeenCalledWith(
-      '  Note: remote branch deleted; content is already on origin/dev (squash-merged).'
+      '  Note: no origin/feature-branch on the remote; content is already on origin/dev (squash-merged, or merged locally and never pushed).'
     );
     expect(mockRemoveEnvironment).toHaveBeenCalled();
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 1 completed, 0 failed, 0 not found');
@@ -392,9 +392,34 @@ describe('isolationCompleteCommand', () => {
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      '    ✗ remote branch deleted and content not found on origin/dev'
+      '    ✗ no origin/feature-branch on the remote (deleted or never pushed) and content not found on origin/dev'
     );
     expect(consoleLogSpy).toHaveBeenCalledWith('\nComplete: 0 completed, 1 failed, 0 not found');
+  });
+
+  // The unique-commits blocker is pushed from two places since the refactor. This
+  // covers the second one — an unpushed probe that fails for a reason that is NOT a
+  // missing ref — so the copy on the destructive path cannot rot untested.
+  it('still blocks on unique commits when the unpushed probe fails unexpectedly', async () => {
+    mockFindActiveByBranchName.mockResolvedValueOnce(mockEnv);
+    mockGetUniqueCommitCount.mockResolvedValueOnce(2);
+    mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'gh') {
+        return Promise.resolve({ stdout: '[]', stderr: '' });
+      }
+      if (cmd === 'git' && args.includes('origin/feature-branch..feature-branch')) {
+        return Promise.reject(new Error('fatal: could not read Username for https://github.com'));
+      }
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+
+    await isolationCompleteCommand(['feature-branch'], { force: false, deleteRemote: true });
+
+    expect(mockRemoveEnvironment).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
+    expect(consoleErrorSpy).toHaveBeenCalledWith('    ✗ 2 commit(s) unique to this branch');
+    // A probe that failed for an unknown reason is not evidence of a squash merge.
+    expect(mockIsPatchEquivalent).not.toHaveBeenCalled();
   });
 
   it('blocks when the remote default branch cannot be verified', async () => {
@@ -416,7 +441,7 @@ describe('isolationCompleteCommand', () => {
     expect(mockRemoveEnvironment).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith('  Blocked: feature-branch');
     expect(consoleErrorSpy).toHaveBeenCalledWith(
-      '    ✗ could not verify whether remote-deleted branch was merged (unknown revision origin/dev)'
+      "    ✗ could not verify whether feature-branch's content is already on the base branch (unknown revision origin/dev)"
     );
   });
 
