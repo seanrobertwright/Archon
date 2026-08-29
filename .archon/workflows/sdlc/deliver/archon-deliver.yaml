@@ -144,6 +144,14 @@ nodes:
   # non-starved resume converged; 3 cut two converging runs short). A per-lane
   # bound would need runtime-parameterized composition, which the language
   # deliberately does not have — the flat bound buys the same outcome free.
+  #
+  # CI feeds the fix, without waiting: checks run on the pushed commits while
+  # review happens, so concluded results usually exist by the time a round
+  # starts. Each round reads that state once, at its boundary — after the
+  # previous recheck landed — and hands it to the fix as evidence. A failure a
+  # check can prove is cheapest to fix here, in the round that caused it, not
+  # an hour later at the terminal wait. The loop itself never waits on CI, and
+  # await-checks below remains the authority on the flip.
   - id: corrections
     depends_on: [review-action]
     when: "$review-action.output.action == 'correct'"
@@ -155,8 +163,41 @@ nodes:
       max_iterations: 5
       fresh_context: true
       nodes:
+        # Evidence provisioning, never a gate: this node cannot fail the round
+        # and never waits. A read that fails, or a repository with no checks,
+        # reports that fact and the round proceeds on the review findings
+        # alone. Three tolerated reads (`|| true`) are the design, not sloppiness
+        # — the probe's whole contract is "describe what is known, refuse
+        # nothing". gh exits non-zero when checks are failing while still
+        # printing them, so exit codes here carry no signal the output lacks.
+        - id: ci-note
+          bash: |
+            PR_NUMBER=$pr.output.number
+            ORIGIN_REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##' || true)
+            TOTAL=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json bucket --jq 'length' 2>/dev/null || true)
+            if [ -z "$TOTAL" ] || [ "$TOTAL" = "0" ]; then
+              echo "No CI evidence is available for this round (no checks reported, or the read failed). Proceed on the review findings alone."
+              exit 0
+            fi
+            HEAD_OID=$(gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json headRefOid --jq '.headRefOid[0:12]' 2>/dev/null || true)
+            FAILING=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping" and .bucket != "pending") | "- \(.name) (\(.bucket))"' 2>/dev/null || true)
+            PENDING=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json bucket --jq '[.[] | select(.bucket == "pending")] | length' 2>/dev/null || true)
+            echo "CI state for this pull request (head ${HEAD_OID:-unknown}):"
+            if [ -n "$FAILING" ]; then
+              echo "Concluded non-green checks:"
+              echo "$FAILING"
+            else
+              echo "No concluded failures."
+            fi
+            case "$PENDING" in
+              ''|0) ;;
+              *) echo "$PENDING check(s) still running — never wait on them." ;;
+            esac
+            exit 0
+
         - id: fix
           include: archon-implement
+          depends_on: [ci-note]
           with:
             work: >-
               Fix every open Critical and Important finding recorded in
@@ -167,6 +208,19 @@ nodes:
               relevant proof passes. Do not cross an explicit boundary to make
               a finding disappear; the following review must return replan if
               the requested outcome requires that expansion.
+
+              Concluded CI evidence observed before this round — evidence, not
+              a verdict, and the same red-cause discipline applies to it:
+
+              $ci-note.output
+
+              A concluded CI failure that this branch's changes introduced is
+              part of this round's work, exactly like a review finding. Red on
+              a check this branch cannot have caused is classified with
+              evidence, not chased. Never wait on running checks — but results
+              can conclude while you work, so before declaring done, re-read
+              the concluded check state for this pull request with one
+              non-blocking read, and treat anything newly red the same way.
 
               Accepted work order:
               $INPUTS.work

@@ -30,6 +30,7 @@ review__synthesize:
   ready: false
   action: correct
   findings_summary: "stub: one Important finding open"
+ci-note: "CI state for this pull request (head abc123def456): No concluded failures."
 fix__record-start: '{"start":"recorded"}'
 fix__implement:
   done: true
