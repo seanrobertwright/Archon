@@ -1668,6 +1668,59 @@ describe('dryRunWorkflow — node-local with: bindings (#2637)', () => {
     expect(gate?.state).toBe('failed');
     expect(gate?.reason).toContain("'corrections' failed");
   });
+
+  test('a composed command node resolves its own binding, not an empty caller input (#2964)', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-composed-binding-'));
+    temporaryDirectories.push(cwd);
+    mkdirSync(join(cwd, '.archon', 'commands'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'commands', 'sync-pr-body.md'), 'Update PR $INPUTS.number');
+
+    // The shape from the issue: the block opens a PR, then a command node reads the number
+    // that node produced. The caller has nothing to pass at launch — the PR does not exist
+    // yet — so the value can only come from the node's own binding.
+    const deliver = makeTestWorkflow({
+      name: 'deliver',
+      nodes: [
+        {
+          id: 'pr',
+          prompt: 'Open the PR',
+          output_format: { type: 'object', properties: { number: { type: 'number' } } },
+        },
+        {
+          id: 'sync',
+          command: 'sync-pr-body',
+          depends_on: ['pr'],
+          with: { number: '$pr.output.number' },
+        },
+      ],
+    });
+    const ship = makeTestWorkflow({
+      name: 'ship',
+      nodes: [{ id: 'deliver', include: 'deliver' }],
+    });
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['deliver', deliver],
+        ['ship', ship],
+      ]),
+      new Map([['sync-pr-body', 'Update PR $INPUTS.number']])
+    );
+    expect(errors).toHaveLength(0);
+
+    const result = await dryRunWorkflow({
+      workflow: workflows.get('ship')!,
+      userMessage: '',
+      cwd,
+      stubs: { deliver__pr: { number: 2964 }, deliver__sync: 'done' },
+    });
+
+    expect(result.outcome).toBe('completed');
+    // Composition materializes the body into an inline prompt, so this proves the moved
+    // binding still reaches resolveNodeBindings — the channel a real run uses.
+    expect(result.trace.find(t => t.nodeId === 'deliver__sync')?.resolvedText).toBe(
+      'Update PR 2964'
+    );
+  });
 });
 
 describe('dryRunWorkflow — effective provider/model per node', () => {

@@ -63,7 +63,9 @@ import { mapNodeTemplateSlots, mapNodeTemplateValueSlots } from './template-walk
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
+  attachComposedBindings,
   isIncludeCommandReadError,
+  readComposedBindings,
   readComposedMeta,
   type ComposedBlockBoundary,
   type ComposedNodeMeta,
@@ -516,8 +518,19 @@ function applyInputsMacro(
   missing: Set<string>,
   includeNode: IncludeDirective
 ): void {
-  const substitute = (text: string): string =>
+  // Names the node supplies itself. Only the compiled command body reads them: the
+  // executor merges a command node's resolved bindings OVER the run inputs into the
+  // `$INPUTS` bag it builds for the prompt, and nothing else (dag-executor.ts). So the
+  // shield is scoped to that one surface — a `when:` or `systemPrompt:` naming the same
+  // input still reads the run's bag, and a caller who never supplied it still gets the
+  // load error.
+  const boundLocally = new Set(Object.keys(readComposedBindings(node) ?? {}));
+  const substitute = (text: string, shielded?: ReadonlySet<string>): string =>
     text.replace(INPUTS_REF, (match, name: string) => {
+      // A name the node's own `with:` binds is neither the caller's to supply nor the
+      // caller's to override — it resolves at run time from the nearest source in the
+      // documented precedence order, so it is left standing for the executor (#2964).
+      if (shielded?.has(name) === true) return match;
       // `Object.hasOwn` rather than a plain `args[name]` lookup: a bare index read reaches
       // Object.prototype, so an unsupplied `$INPUTS.toString` / `$INPUTS.constructor`
       // would resolve to an inherited member and splice a native function body into the
@@ -571,7 +584,8 @@ function applyInputsMacro(
       slot.name === 'composed.inputs.*'
     )
       return slot.value;
-    return slot.surface === 'condition' ? substituteWhen(slot.value) : substitute(slot.value);
+    if (slot.surface === 'condition') return substituteWhen(slot.value);
+    return substitute(slot.value, slot.name === 'agent.prompt' ? boundLocally : undefined);
   });
   const valueMapped = mapNodeTemplateValueSlots(textMapped, slot => {
     const value = substituteValue(slot.value);
@@ -641,6 +655,8 @@ function cloneNodeForInclude<T extends DagNode | IncludeDirective>(node: T): T {
     if (meta !== undefined) {
       (target as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = structuredClone(meta);
     }
+    const bindings = readComposedBindings(source);
+    if (bindings !== undefined) attachComposedBindings(target, structuredClone(bindings));
     if (isLoopNode(source) && isLoopNode(target)) {
       const compiled = (source.loop as typeof source.loop & LoopWithCompiledCommand)[
         COMPILED_LOOP_COMMAND
@@ -980,11 +996,14 @@ function materializeBlockCommandPrompts(
   if (isAgentNode(node) && node.source.kind === 'command') {
     const compiled = compile(node.source.name);
     if (compiled.error !== undefined) throw new IncludeExpansionError(compiled.error);
-    // `with:` on a command node is already inert past this point at runtime today —
-    // `executeNodeInternal`'s binding resolution gates on the node still carrying a
-    // `command` reference (dag-executor.ts), which a materialized node no longer
-    // does — so dropping it here is behavior-preserving, not a regression.
-    return { ...node, source: { kind: 'inline', prompt: compiled.prompt } };
+    // The node's own `with:` map has no home on the inline variant, so it moves to the
+    // engine-private payload the executor resolves for a materialized node (#2964).
+    // It cannot be resolved here: a binding reads a sibling's output mid-run, which is
+    // exactly the case composition used to reject as an unpassable missing input.
+    const bindings = node.source.with;
+    const materialized: DagNode = { ...node, source: { kind: 'inline', prompt: compiled.prompt } };
+    if (bindings !== undefined) attachComposedBindings(materialized, bindings);
+    return materialized;
   }
 
   if (isLoopNode(node) && node.loop.command !== undefined) {
