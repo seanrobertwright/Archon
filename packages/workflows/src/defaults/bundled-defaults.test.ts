@@ -553,7 +553,12 @@ describe('bundled-defaults', () => {
       const deliver = BUNDLED_WORKFLOWS['archon-deliver'];
       const sync = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:deliver::sync-pr-body'];
 
-      expect(pr).toContain('output_type: pull-request');
+      // The record is the bound `output_format` fields. The `pull-request` and
+      // `public-action` sidecar labels were declared beside them and nothing in the
+      // engine or the pack ever selected an artifact by either string, so they went
+      // (#2968 item 5): the explicit binding is the channel.
+      expect(pr).not.toContain('output_type:');
+      expect(deliver).not.toContain('output_type: public-action');
       expect(pr).toContain('required: [number, url, head, base, is_draft]');
       expect(deliver).toContain('scope: "$pr.output.number"');
       expect(deliver).toContain('PR_NUMBER=$pr.output.number');
@@ -562,17 +567,16 @@ describe('bundled-defaults', () => {
       expect(deliver).not.toContain('EXPECTED_BRANCH=');
       expect(deliver).not.toContain('git branch --show-current');
       expect(deliver).toContain('gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO"');
-      expect(deliver).toContain('EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"');
-      // The raw origin URL can carry a credential (https://<token>@host/...), so
-      // it must never reach the evidence log. It is read outside the recording
-      // helpers, and only the normalized owner/repo is ever passed to a logged
-      // command or interpolated into a failure message.
+      // The engine retains what every exec node prints, so the node keeps no log of
+      // its own — and the rule that log existed under still binds: the raw origin URL
+      // can carry a credential (https://<token>@host/...), so it is read exactly once,
+      // inside the substitution that normalizes it, and only `$ORIGIN_REPO` is ever
+      // passed to a command or interpolated into a failure message.
       const flipBody = deliver.slice(deliver.indexOf('- id: flip-ready'));
-      for (const line of flipBody.split('\n')) {
-        if (/^\s*record(_read)? /.test(line) || /\$\(record(_read)? /.test(line)) {
-          expect(line).not.toContain('git remote');
-        }
-      }
+      expect(flipBody).not.toContain('$ARTIFACTS_DIR/flip-ready.log');
+      const remoteReads = flipBody.split('\n').filter(line => line.includes('git remote'));
+      expect(remoteReads).toHaveLength(1);
+      expect(remoteReads[0]).toContain('ORIGIN_REPO=$(git remote get-url origin | sed');
       expect(deliver).toContain('origin remote does not resolve to an owner/repo');
       // A command node reads its node-local `with:` map through `$INPUTS.<name>`,
       // never the INPUTS_<UPPER_SNAKE> env form — that one is built only for
@@ -591,12 +595,14 @@ describe('bundled-defaults', () => {
         kind: 'command',
         with: { pr_number: '$pr.output.number', pr_head: '$pr.output.head' },
       });
-      // Composition validates a command's `$INPUTS.<name>` against the ENCLOSING
-      // workflow's declared inputs and does not see the node-local binding, so
-      // archon-ship/stabilize/upkeep fail to load unless these names are declared
-      // too. The binding still supplies the real values and wins over any caller.
-      expect(deliverParsed.workflow.inputs?.pr_number?.default).toBe('');
-      expect(deliverParsed.workflow.inputs?.pr_head?.default).toBe('');
+      // Composition once dropped that binding while materializing the command body
+      // and then reported both names as missing caller inputs, so archon-deliver
+      // declared them with empty defaults purely to load inside ship/stabilize/upkeep
+      // (#2968 item 4). Composition keeps the binding now (#2964), so the decoys are
+      // gone — and the empty default that used to be spliced in where the real value
+      // belongs cannot come back with them.
+      expect(deliverParsed.workflow.inputs?.pr_number).toBeUndefined();
+      expect(deliverParsed.workflow.inputs?.pr_head).toBeUndefined();
     });
 
     // Windows cannot execute the extensionless `#!/bin/sh` fakes this test puts on
@@ -756,7 +762,9 @@ describe('bundled-defaults', () => {
               '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
               '    exit 1',
               '    ;;',
-              '  "pr ready"*) : ;;',
+              // On stdout deliberately: which stream gh confirms the flip on is gh's
+              // choice, so the node redirects that write itself rather than trusting it.
+              '  "pr ready"*) printf "%s\\n" "marked as ready for review" ;;',
               '  *headRefName*) printf "%s\\n" "recorded-branch" ;;',
               '  *isDraft*) printf "%s\\n" "false" ;;',
               '  *"--json url"*) printf "%s\\n" "https://example.com/repo/pull/42" ;;',
@@ -779,8 +787,9 @@ describe('bundled-defaults', () => {
           expect(result.outcome).toBe('completed');
           const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
           expect(flip?.state).toBe('completed');
-          // The node's stdout is the verified URL and nothing else: the probe's
-          // stderr must reach the evidence log, never the typed public-action output.
+          // The node's stdout is the verified URL and nothing else — `outcome` reads
+          // it whole. The checks probe's stderr and the flip's own confirmation are
+          // retained by the engine as stderr, never merged into that value.
           expect(flip?.output?.trim()).toBe('https://example.com/repo/pull/42');
           expect(readFileSync(log, 'utf-8')).toContain('pr ready 42 --repo owner/repo');
         } finally {

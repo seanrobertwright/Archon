@@ -57,10 +57,14 @@ that was already true when the node started.
 
 ## Evidence never carries credentials
 
-A guard that records what it did is only useful if the record is safe to keep. Read
-anything that can contain a secret outside whatever writes the evidence, and log the
-normalized form instead. A remote URL is the common one — `https://<token>@host/repo`
-is a perfectly ordinary origin — so the ready flip derives `owner/repo` from it
-outside its recording helpers and logs only that. The same applies to failure
-messages: they are evidence too, and interpolating the raw value into one leaks it
-just as effectively.
+The engine retains what every exec node prints, so a node's output is the record
+whether it set out to keep one or not. Never print a value that can contain a
+secret: read it where it is normalized and pass on the normalized form. A remote
+URL is the common one — `https://<token>@host/repo` is a perfectly ordinary origin
+— so the ready flip normalizes `owner/repo` inside the substitution that reads the
+remote, and only that reaches a command line. Failure messages are the same
+surface: interpolating the raw value into one leaks it just as effectively.
+
+That retention is also why a node does not need its own log. The ready flip once
+wrote one by hand — every command it ran, echoed into an artifact — which is what
+the transcript now holds for free.
