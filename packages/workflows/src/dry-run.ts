@@ -676,6 +676,11 @@ async function executeCodeNode(
     // run's `inputEnvVars` (dag-executor.ts), bindings layered over run inputs in
     // the same nearest-wins order. Composed include-block inputs for named scripts
     // remain a real-run-only channel the dry run does not deliver.
+    // That applies to EVERY composed exec node, not just named scripts: a
+    // `bash:` body inlined through `include:` sees none of the caller's `with:`
+    // values here, so one reading `$INPUTS_FOO` under `set -u` dies on an
+    // unbound variable. Such a node can only be stubbed in a fixture — its real
+    // behaviour is not reachable from `workflow test`.
     const inputEnv: Record<string, string> = {};
     for (const [name, value] of Object.entries(ctx.inputs ?? {})) {
       inputEnv[inputEnvKey(name)] = canonicalValueText(value);
