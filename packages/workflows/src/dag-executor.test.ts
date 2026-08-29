@@ -13928,6 +13928,59 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     expect(errMsg).toContain('not declared in node');
   });
 
+  it('when: object-valued field FAILS the consuming node instead of skipping it', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'when-object-field',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'exec',
+            runtime: 'sh',
+            script: `printf '%s' '{"route":{"ready":true}}'`,
+          },
+          {
+            id: 'runme',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'exit 99',
+            depends_on: ['producer'],
+            when: "$producer.output.route == 'true'",
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const runmeEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).step_name === 'runme'
+    );
+    expect(runmeEvents.map(call => (call[0] as Record<string, unknown>).event_type)).toEqual([
+      'node_failed',
+    ]);
+    const error = ((runmeEvents[0]![0] as Record<string, unknown>).data as Record<string, unknown>)
+      .error as string;
+    expect(error).toContain("Condition reference '$producer.output.route' resolved to an object");
+  });
+
   it('best-effort provider: malformed-then-fixed structured output recovers within reasks', async () => {
     // Attempt 1 returns structured output missing the required `verdict`; the reask
     // loop re-runs and attempt 2 returns valid output → node COMPLETES (not failed).

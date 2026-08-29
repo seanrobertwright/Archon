@@ -472,6 +472,7 @@ there is no prior output, so it resolves to `''` and the non-empty equality abov
 
 - `$nodeId.output` references the full output string of a completed node
 - `$nodeId.output.field` accesses a JSON field (for `output_format` nodes)
+- A field used in a scalar condition must resolve to a string, number, boolean, or null. A present object or array fails the gated node; expose a scalar decision field or inspect structured data in a script node.
 - `$INPUTS.<name>` references a declared input supplied by a caller's `with:` (or a direct
   run's `--input`). A name this run does not carry **fails the node** — it never quietly
   becomes an empty string. `INPUTS` is a reserved scope: a node cannot be given that id
