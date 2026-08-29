@@ -89,6 +89,24 @@ mock.module('../db/sessions', () => ({
   transitionSession: mockTransitionSession,
 }));
 
+// handleMessage persists the assistant reply for every non-web platform, and the
+// fixture adapter reports 'mock'. Without this stub those calls reach the real
+// lazy getDatabase() singleton on every test — and both call sites swallow the
+// resulting error (addMessage into a .catch, getRecentWorkflowResultMessages into
+// its own try/catch), so the I/O is invisible rather than red. #2982
+mock.module('../db/messages', () => ({
+  addMessage: mock(() => Promise.resolve()),
+  listMessages: mock(() => Promise.resolve([])),
+  getRecentWorkflowResultMessages: mock(() => Promise.resolve([])),
+}));
+
+// Same shape as the messages gap above: the chat path loads per-codebase env
+// vars for any conversation carrying a codebase_id, and its failure lands in a
+// `codebase_env_vars_load_failed` warn on the mocked logger. #2982
+mock.module('../db/env-vars', () => ({
+  getCodebaseEnvVars: mock(() => Promise.resolve({})),
+}));
+
 // Command handler mock
 const mockHandleCommand = mock(() =>
   Promise.resolve({ message: '', modified: false, success: true })
