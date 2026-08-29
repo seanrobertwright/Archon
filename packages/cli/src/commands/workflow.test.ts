@@ -9709,6 +9709,23 @@ describe('workflowTestCommand', () => {
     expect(payload.results[0]).toMatchObject({ fixture: 'sdlc/plan/fixtures/ready.stubs.yaml' });
   });
 
+  it('keeps the invoking directory for relative fixture path targets', async () => {
+    const fixtureRunner = await import('@archon/workflows/fixture-runner');
+    (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockResolvedValue({
+      results: [],
+      passed: 0,
+      failed: 0,
+    });
+
+    await workflowTestCommand('/test/repository', 'local-pack', {
+      targetCwd: '/test/repository/tools',
+    });
+
+    expect(fixtureRunner.runFixtures).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: '/test/repository', targetCwd: '/test/repository/tools' })
+    );
+  });
+
   it('exits 1 when a fixture fails', async () => {
     const fixtureRunner = await import('@archon/workflows/fixture-runner');
     (fixtureRunner.runFixtures as ReturnType<typeof mock>).mockResolvedValue({

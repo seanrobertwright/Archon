@@ -1143,3 +1143,46 @@ describe('workflow test --json error envelope', () => {
     expect(envelope()).toMatchObject({ ok: false });
   });
 });
+
+describe('workflow test path targets', () => {
+  it('resolves a caller-relative path while discovering workflows from the repository root', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'archon-cli-workflow-test-cwd-'));
+    const tools = join(repo, 'tools');
+    const workflowDir = join(repo, '.archon', 'workflows', 'sdlc', 'plan');
+    mkdirSync(join(workflowDir, 'fixtures'), { recursive: true });
+    mkdirSync(tools, { recursive: true });
+    spawnSync('git', ['init', '-q'], { cwd: repo, encoding: 'utf8' });
+    writeFileSync(
+      join(workflowDir, 'plan.yaml'),
+      'name: plan\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
+    );
+    writeFileSync(
+      join(workflowDir, 'fixtures', 'ready.stubs.yaml'),
+      'fixture:\n  expect: completed\nnode-a: stub output\n'
+    );
+
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'test', '../.archon/workflows/sdlc/plan', '--cwd', tools, '--json'],
+        {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ARCHON_TELEMETRY_DISABLED: '1',
+            ARCHON_HOME: join(repo, 'archon-home'),
+          },
+        }
+      );
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        passed: 1,
+        failed: 0,
+        results: [{ fixture: 'sdlc/plan/fixtures/ready.stubs.yaml' }],
+      });
+    } finally {
+      await removeTempTree(repo);
+    }
+  });
+});

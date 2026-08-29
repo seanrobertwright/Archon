@@ -26,7 +26,7 @@
  */
 import { readdir, realpath, rm, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from '@hono/zod-openapi';
 import { createLogger, getArchonTempPath } from '@archon/paths';
 import { execFileAsync } from '@archon/git';
@@ -254,6 +254,8 @@ export interface FixtureReport {
 export interface RunFixturesOptions {
   workflows: readonly WorkflowWithSource[];
   cwd: string;
+  /** Directory from which a relative fixture path target is interpreted; defaults to `cwd`. */
+  targetCwd?: string;
   /** Source scopes corresponding to `workflows`; defaults to the live project, global, and bundled scopes. */
   sourceRoots?: WorkflowSourceRoots;
   /**
@@ -272,10 +274,25 @@ export interface RunFixturesOptions {
   aiProfile?: ResolvedAiProfile;
   /**
    * Restrict to a workflow name, a pack or workflow-folder name, or a path (relative
-   * or absolute) to any fixture-containing directory — a directory above a `fixtures/`
+   * or absolute) to any fixture-containing directory. Relative paths resolve from
+   * `targetCwd`, then fall back to `cwd` when absent — a directory above a `fixtures/`
    * dir, the `fixtures/` dir itself, or an ancestor of one. Unresolved values error.
    */
   target?: string;
+}
+
+function isCallerRelativePathTarget(target: string): boolean {
+  return (
+    !isAbsolute(target) &&
+    (target === '.' ||
+      target === '..' ||
+      target.startsWith('./') ||
+      target.startsWith('../') ||
+      target.startsWith('.\\') ||
+      target.startsWith('..\\') ||
+      target.includes('/') ||
+      target.includes('\\'))
+  );
 }
 
 /**
@@ -412,7 +429,11 @@ export async function runFixtures(options: RunFixturesOptions): Promise<FixtureR
     const targetName = options.target;
     // A target resolves when it names a discovered workflow, a directory above a
     // fixtures dir (pack name or workflow folder), or a path containing fixtures.
-    const targetDir = resolve(options.cwd, targetName);
+    const targetFromInvocation = resolve(options.targetCwd ?? options.cwd, targetName);
+    const targetDir =
+      isCallerRelativePathTarget(targetName) && (await exists(targetFromInvocation))
+        ? targetFromInvocation
+        : resolve(options.cwd, targetName);
     // Discovery reports fixture paths as real paths, so canonicalize the target
     // before the containment check; a nonexistent target can never contain a
     // fixture, so keeping its resolved spelling there is safe.
