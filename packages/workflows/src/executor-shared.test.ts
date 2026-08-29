@@ -694,6 +694,24 @@ describe('detectCompletionSignal', () => {
     expect(detectCompletionSignal('Work done.\n  COMPLETE  \n', 'COMPLETE')).toBe(true);
   });
 
+  it('detects a plain signal followed by trailing blank lines and whitespace', () => {
+    expect(detectCompletionSignal('Work done.\nCOMPLETE\n\n\n', 'COMPLETE')).toBe(true);
+    expect(detectCompletionSignal('Work done.\nCOMPLETE\n   \n\t\n', 'COMPLETE')).toBe(true);
+  });
+
+  it('detects a plain signal with CRLF line endings', () => {
+    expect(detectCompletionSignal('Work done.\r\nCOMPLETE\r\n', 'COMPLETE')).toBe(true);
+  });
+
+  it('does not detect the live incident shape: a negated mention ending the output', () => {
+    expect(
+      detectCompletionSignal(
+        'the story still has open tasks — T8 is now ready, and T9 remains — so not replying ALL_TASKS_COMPLETE.',
+        'ALL_TASKS_COMPLETE'
+      )
+    ).toBe(false);
+  });
+
   it('does not detect a plain signal mentioned inline at the end of output', () => {
     expect(detectCompletionSignal('Work done. COMPLETE', 'COMPLETE')).toBe(false);
   });

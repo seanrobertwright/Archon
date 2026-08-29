@@ -869,10 +869,14 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
   if (xmlWrappedPattern.test(output)) {
     return true;
   }
-  const finalStandaloneLinePattern = new RegExp(
-    `(?:^|\\r?\\n)[ \\t]*${escapeRegExp(signal)}[ \\t]*(?:\\r?\\n)?$`
-  );
-  return finalStandaloneLinePattern.test(output);
+  // The plain form counts only as the trimmed final line, and the final line is
+  // computed with string operations rather than a pattern: a matcher that has to
+  // enumerate its own tolerated line endings gets one of them wrong (a single
+  // trailing newline was tolerated where two broke the match). Trailing blank
+  // lines and whitespace are an artifact of streaming, never a signal.
+  const lines = output.trimEnd().split('\n');
+  const finalLine = (lines[lines.length - 1] ?? '').trim();
+  return finalLine === signal;
 }
 
 /**
