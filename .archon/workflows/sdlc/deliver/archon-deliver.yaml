@@ -34,14 +34,6 @@ inputs:
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
-  # Declared so composition can see the names `sync-pr-body` reads; the node's
-  # own `with:` supplies the real values mid-run and wins over any caller value.
-  pr_number:
-    default: ""
-    description: Internal — the run-owned PR number, bound from the pr node.
-  pr_head:
-    default: ""
-    description: Internal — the run-owned PR head branch, bound from the pr node.
 
 returns: pr
 
@@ -381,37 +373,25 @@ nodes:
   - id: flip-ready
     bash: |
       set -euo pipefail
-      EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"
-      : > "$EVIDENCE"
-      record() {
-        printf '$' >> "$EVIDENCE"
-        printf ' %q' "$@" >> "$EVIDENCE"
-        printf '\n' >> "$EVIDENCE"
-        "$@" >> "$EVIDENCE" 2>&1
-      }
-      record_read() {
-        printf '$' >> "$EVIDENCE"
-        printf ' %q' "$@" >> "$EVIDENCE"
-        printf '\n' >> "$EVIDENCE"
-        # stderr goes to the log, never into the captured value: a git or gh
-        # warning must not become the branch name or the returned PR URL.
-        "$@" 2>>"$EVIDENCE" | tee -a "$EVIDENCE"
-      }
-      fail() {
-        printf '%s\n' "$1" | tee -a "$EVIDENCE" >&2
-        exit 1
-      }
       # --repo pins to the origin remote: gh's default resolution in a
       # fork clone targets the upstream parent instead. With --repo, gh disables
       # branch inference and REQUIRES an explicit selector — omitting it is a
       # usage error.
-      # Read OUTSIDE the recording helpers on purpose: the raw URL can carry a
-      # credential (https://<token>@host/...). Only the normalized owner/repo
-      # below is ever logged or interpolated into a failure message.
-      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      # Nothing below streams a command's own output. The engine broadcasts a
+      # node's stderr to the operator as it runs and retains what the node prints,
+      # so every git and gh call here is captured: this node's authored messages
+      # are the only text that reaches its streams. That also keeps the raw origin
+      # URL — which can carry a credential (https://<token>@host/...) — out of
+      # both, since it is normalized inside the substitution that reads it and
+      # only the owner/repo below ever reaches a command line or a message.
+      if ! ORIGIN_REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##'); then
+        printf '%s\n' "flip-ready: could not read the origin remote." >&2
+        exit 1
+      fi
       case "$ORIGIN_REPO" in
         *[!A-Za-z0-9_.-]*/* | */*[!A-Za-z0-9_.-]* | */*/* | /* | */ | "")
-          fail "flip-ready: origin remote does not resolve to an owner/repo."
+          printf '%s\n' "flip-ready: origin remote does not resolve to an owner/repo." >&2
+          exit 1
           ;;
       esac
       # The recorded number is the selector. Which branch is checked out is not
@@ -428,16 +408,38 @@ nodes:
       # read is the one that tolerates failure — reporting the checks it found
       # is what refuses the flip, never the exit code.
       # `|| true` here and nowhere else: every other read must fail the node.
-      NOT_GREEN=$(record_read gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' || true)
+      # Dropping gh's explanation for the tolerated case hides nothing: a gh that
+      # cannot read this PR's checks cannot flip it either, and the flip below
+      # fails loudly carrying gh's own words.
+      NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>/dev/null || true)
       if [ -n "$NOT_GREEN" ]; then
-        fail "flip-ready: refusing to flip with non-green checks: $NOT_GREEN"
+        printf '%s\n' "flip-ready: refusing to flip with non-green checks: $NOT_GREEN" >&2
+        printf '%s\n' "flip-ready: if that red is transient or unrelated to this change, re-run the failing check on the pull request and resume this run — the flip reads the check state again on resume." >&2
+        exit 1
       fi
-      record gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO"
-      draft=$(record_read gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json isDraft --jq .isDraft)
-      if [ "$draft" = "false" ]; then
-        record_read gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json url --jq .url
-      else
-        fail "flip-ready: PR still reports draft after the ready flip"
+      # The flip prints a confirmation this node has no use for, and its stdout is
+      # not a value, so both streams are captured together and re-emitted only if
+      # the flip failed — where gh's own words are the diagnostic.
+      if ! FLIP=$(gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO" 2>&1); then
+        printf '%s\n' "flip-ready: the ready flip failed: $FLIP" >&2
+        exit 1
+      fi
+      # The two reads below capture a VALUE, so their stderr is dropped rather than
+      # merged: a gh notice must never become the draft state or the delivered URL.
+      # Each failure names the read it could not complete, so neither is silent.
+      if ! draft=$(gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+        printf '%s\n' "flip-ready: PR was flipped but its draft state could not be read back." >&2
+        exit 1
+      fi
+      if [ "$draft" != "false" ]; then
+        printf '%s\n' "flip-ready: PR still reports draft after the ready flip" >&2
+        exit 1
+      fi
+      # This node's stdout is the delivered URL and nothing else; `outcome` reports
+      # the value verbatim.
+      if ! gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json url --jq .url 2>/dev/null; then
+        printf '%s\n' "flip-ready: PR was flipped but its URL could not be read back." >&2
+        exit 1
       fi
     # Waits on sync-pr-body explicitly: on a repo with no CI, await-checks
     # returns immediately and the flip could otherwise beat the resync. The
@@ -446,9 +448,6 @@ nodes:
     # correct is a reason not to go ready.
     depends_on: [await-checks, sync-pr-body]
     trigger_rule: none_failed_min_one_success
-    # The node's stdout is the verified URL; the engine writes it as a durable
-    # typed sidecar alongside the PR record and review report.
-    output_type: public-action
 
   # This tail's terminal report, like every other SDLC tail's (scripts/outcome.py).
   # flip-ready owns the one irreversible public action and stops there; composing
