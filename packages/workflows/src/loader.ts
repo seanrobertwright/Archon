@@ -483,15 +483,17 @@ function collectGateAndLoopDeprecationWarnings(
     const message =
       `Node '${id}': the prose 'loop.until' completion signal is deprecated. Declare ` +
       "'loop.until_bash' (deterministic check) or 'loop.until_field' (a declared boolean " +
-      'in output_format) instead (#2707 step 3). Continue using it for now.';
+      'in output_format) instead (#2707 step 3). While supported, emit legacy signals as ' +
+      "'<promise>SIGNAL</promise>' or a final standalone signal line.";
     warnings.push(message);
     getLog().warn({ id, warning: message }, 'node_loop_until_deprecated');
   } else if (isLoopGroupNode(node) && node.loop_group.until !== undefined) {
     const message =
       `Node '${id}': the prose 'loop_group.until' completion signal is deprecated. ` +
       "Declare 'loop_group.until_bash' instead — it can read a body node's structured " +
-      'output (e.g. \'test $body-node.output.field = "true"\') (#2707 step 3). Continue ' +
-      'using it for now.';
+      'output (e.g. \'test $body-node.output.field = "true"\') (#2707 step 3). While ' +
+      "supported, emit legacy signals as '<promise>SIGNAL</promise>' or a final standalone " +
+      'signal line.';
     warnings.push(message);
     getLog().warn({ id, warning: message }, 'node_loop_group_until_deprecated');
   }

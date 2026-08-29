@@ -9600,17 +9600,13 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(result).toContain("note=['']");
     });
 
-    it('still honours an until signal at the very end of the PROSE when output_format is set', async () => {
-      // Regression: detection originally concatenated prose + payload into one
-      // haystack. `detectCompletionSignal`'s end-of-output pattern is anchored with
-      // `$` and NO `m` flag, and an object payload always ends in `}` — so the
-      // documented inline "sentinel at the very end of output" form silently stopped
-      // firing for every loop that declared a schema. The own-line and <promise>
-      // forms survive concatenation, which is why this needs its own test.
+    it('still honours an until signal on the final prose line when output_format is set', async () => {
+      // Detection checks prose and serialized output separately. Concatenating them
+      // would hide a final standalone signal line behind the serialized payload.
       let calls = 0;
       mockSendQueryDag.mockImplementation(async function* () {
         calls++;
-        yield { type: 'assistant', content: 'All tasks are finished. ALLDONE' };
+        yield { type: 'assistant', content: 'All tasks are finished.\nALLDONE' };
         yield {
           type: 'result',
           sessionId: `s-${String(calls)}`,
@@ -9968,9 +9964,9 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       });
     });
 
-    it('does NOT detect false positive plain signal in middle of text', async () => {
+    it('does not detect a negated plain signal at the end of output', async () => {
       mockSendQueryDag.mockImplementation(async function* () {
-        yield { type: 'assistant', content: 'The task is not COMPLETE yet, more work needed.' };
+        yield { type: 'assistant', content: 'The task is not COMPLETE' };
         yield { type: 'result', sessionId: 'false-pos-sid' };
       });
 
@@ -11171,7 +11167,7 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       // threw "SDK returned success" and aborted the iteration even though
       // the AI had completed its work correctly.
       mockSendQueryDag.mockImplementation(async function* () {
-        yield { type: 'assistant', content: 'Done. DONE.' };
+        yield { type: 'assistant', content: 'Done.\nDONE' };
         yield {
           type: 'result',
           isError: true,
@@ -20812,7 +20808,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       callCount++;
       yield {
         type: 'assistant',
-        content: callCount === 1 ? 'iteration 1 still working' : 'iteration 2 DONE',
+        content: callCount === 1 ? 'iteration 1 still working' : 'iteration 2\nDONE',
       };
       yield { type: 'result', sessionId: `included-body-${callCount}` };
     });
@@ -20867,7 +20863,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
     );
 
     expect(callCount).toBe(2);
-    expect(result).toContain('iteration 2 DONE');
+    expect(result).toContain('iteration 2\nDONE');
     const bodyCompletions = store.createWorkflowEvent.mock.calls
       .map(([event]) => event)
       .filter(
@@ -20971,7 +20967,9 @@ describe('executeDagWorkflow -- loop_group node', () => {
       yield {
         type: 'assistant',
         content:
-          callCount === 1 ? 'inner result 1 INNER_DONE' : 'inner result 2 INNER_DONE OUTER_DONE',
+          callCount === 1
+            ? 'inner result 1\n<promise>INNER_DONE</promise>'
+            : 'inner result 2\n<promise>INNER_DONE</promise>\nOUTER_DONE',
       };
       yield { type: 'result', sessionId: `nested-artifact-${String(callCount)}` };
     });
@@ -22603,7 +22601,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       capturedPrompts.push(prompt ?? '');
       const n = capturedPrompts.length;
       // Call 1 emits MARK1 (no signal → inner iterates again); call 2 emits the signal.
-      yield { type: 'assistant', content: n === 1 ? 'MARK1' : 'MARK2 INNER_DONE' };
+      yield { type: 'assistant', content: n === 1 ? 'MARK1' : 'MARK2\nINNER_DONE' };
       yield { type: 'result', sessionId: `s-${n}` };
     });
 
@@ -22975,7 +22973,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
       // Distinguish the two body nodes by their prompt content.
       if (prompt.includes('node-a')) {
         aCalls++;
-        yield { type: 'assistant', content: 'a-output DONE' };
+        yield { type: 'assistant', content: 'a-output\nDONE' };
       } else {
         bCalls++;
         yield { type: 'assistant', content: 'b-output (no signal)' };

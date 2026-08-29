@@ -690,16 +690,16 @@ describe('detectCompletionSignal', () => {
     expect(detectCompletionSignal('<status>DONE</status>', 'DONE')).toBe(true);
   });
 
-  it('detects plain signal at end of output', () => {
-    expect(detectCompletionSignal('Work done. COMPLETE', 'COMPLETE')).toBe(true);
+  it('detects a plain signal as the final standalone line', () => {
+    expect(detectCompletionSignal('Work done.\n  COMPLETE  \n', 'COMPLETE')).toBe(true);
   });
 
-  it('detects plain signal on its own line', () => {
-    expect(detectCompletionSignal('Work done.\nCOMPLETE\nExtra text', 'COMPLETE')).toBe(true);
+  it('does not detect a plain signal mentioned inline at the end of output', () => {
+    expect(detectCompletionSignal('Work done. COMPLETE', 'COMPLETE')).toBe(false);
   });
 
-  it('does not detect signal embedded in prose', () => {
-    expect(detectCompletionSignal('The status is not COMPLETE yet.', 'COMPLETE')).toBe(false);
+  it('does not detect a negated plain signal at the end of output', () => {
+    expect(detectCompletionSignal('The status is not COMPLETE', 'COMPLETE')).toBe(false);
   });
 
   it('does not detect signal when wrong value is in tags', () => {
