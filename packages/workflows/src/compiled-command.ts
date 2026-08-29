@@ -1,4 +1,4 @@
-import type { TriggerRule } from './schemas';
+import type { BindingDirective, TriggerRule } from './schemas';
 import type { JsonValue } from './output-ref';
 
 /** Engine-private per-node metadata attached during load-time include expansion.
@@ -17,6 +17,38 @@ export type CompiledLoopCommand =
 
 export interface LoopWithCompiledCommand {
   [COMPILED_LOOP_COMMAND]?: CompiledLoopCommand;
+}
+
+/**
+ * The node-local `with:` map a command node carried before include expansion compiled
+ * its body into an inline prompt (#2964).
+ *
+ * Composition materializes a command node so the block's refs can be namespaced and its
+ * declared inputs bound, which leaves `with:` — a field the schema admits only on the
+ * `command` source variant, so an author cannot write it on a prompt node (#2478) —
+ * with nowhere to live on the result. Dropping it silently unbound every name the node
+ * supplied itself: the compiled body's `$INPUTS.<name>` reached the model as a literal
+ * token, or as an empty string when a decoy input had been declared to get past the
+ * missing-input check. The executor and the dry-run simulator resolve this payload for a
+ * materialized node exactly as they resolve `source.with` for an unmaterialized one, so
+ * a binding means the same thing standalone and composed.
+ */
+export const COMPOSED_BINDINGS = Symbol('archon.composed-bindings');
+
+export type ComposedBindings = Record<string, JsonValue | BindingDirective>;
+
+export interface NodeWithComposedBindings {
+  [COMPOSED_BINDINGS]?: ComposedBindings;
+}
+
+/** Read a node's surviving node-local bindings. One accessor, so the cast lives in one place. */
+export function readComposedBindings(node: object): ComposedBindings | undefined {
+  return (node as NodeWithComposedBindings)[COMPOSED_BINDINGS];
+}
+
+/** Attach the bindings a materialized command node must keep. @see COMPOSED_BINDINGS */
+export function attachComposedBindings(node: object, bindings: ComposedBindings): void {
+  (node as NodeWithComposedBindings)[COMPOSED_BINDINGS] = bindings;
 }
 
 /** @see ComposedNodeMeta */

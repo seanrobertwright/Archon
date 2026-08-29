@@ -6,6 +6,8 @@ import { COMPOSE_FAN_OUT_STEP_MARKER } from './fan-out-identity';
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
+  readComposedBindings,
+  type ComposedBindings,
   type ComposedBlockBoundary,
   type ComposedNodeMeta,
   type LoopWithCompiledCommand,
@@ -49,6 +51,11 @@ function composedOrigin(node: DagNode | undefined): string | undefined {
 
 function composedBoundaries(node: DagNode | undefined): ComposedBlockBoundary[] | undefined {
   return composedMeta(node)?.boundaries;
+}
+
+/** The node-local `with:` bindings a materialized command node kept (#2964). */
+function composedBindings(node: DagNode | undefined): ComposedBindings | undefined {
+  return node === undefined ? undefined : readComposedBindings(node);
 }
 
 function compiledLoopPrompt(node: DagNode | undefined): string | undefined {
@@ -1319,6 +1326,145 @@ describe('expandWorkflowIncludes — included command compilation', () => {
     const message = errors.find(error => error.filename === 'parent')?.error;
     expect(message).toContain("command 'my-cmd' is empty");
     expect(message).toContain('non-whitespace prompt body');
+  });
+
+  // #2964 — a command node's own `with:` map is a RUNTIME channel: the executor resolves
+  // it against sibling outputs and merges it over the run inputs into the `$INPUTS` bag.
+  // Composition used to drop it while materializing the body, then report every name it
+  // supplied as a missing caller input — advice no caller could follow, because the value
+  // does not exist until a sibling three steps earlier has run.
+  test('keeps a command node own with: binding through composition', () => {
+    const block = wf('archon-deliver', [
+      { id: 'pr', bash: 'echo open-pr' },
+      {
+        id: 'sync',
+        command: 'sync-pr-body',
+        depends_on: ['pr'],
+        with: { pr_number: '$pr.output.number' },
+      },
+    ]);
+    const parent = wf('archon-ship', [{ id: 'deliver', include: 'archon-deliver' }]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['sync-pr-body', 'Update PR $INPUTS.pr_number.']])
+    );
+    expect(errors).toHaveLength(0);
+    const sync = nodeById(workflows.get('archon-ship')!, 'deliver__sync');
+    // The token stays standing for the executor's own `$INPUTS` pass — splicing anything
+    // here would freeze a value that only exists mid-run.
+    expect(inlinePrompt(sync)).toBe('Update PR $INPUTS.pr_number.');
+    // …and the binding survives with its producer ref namespaced into the flat DAG.
+    expect(composedBindings(sync)).toEqual({ pr_number: '$deliver__pr.output.number' });
+  });
+
+  test('a command node own binding wins over a caller-supplied input of the same name', () => {
+    const block = wf('bindblk', [
+      { id: 'pr', bash: 'echo open-pr' },
+      {
+        id: 'sync',
+        command: 'sync-cmd',
+        depends_on: ['pr'],
+        with: { pr_number: '$pr.output.number' },
+      },
+    ]);
+    block.inputs = { pr_number: { default: '' } };
+    const parent = wf('parent', [
+      { id: 'inc', include: 'bindblk', with: { pr_number: 'caller value' } },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['sync-cmd', 'Update PR $INPUTS.pr_number.']])
+    );
+    expect(errors).toHaveLength(0);
+    // Nearest source wins, matching the executor's merge order. Splicing the caller value
+    // (or the empty default a block declares to get past the old check) would silently
+    // hand the agent a value the author never meant it to read.
+    expect(inlinePrompt(nodeById(workflows.get('parent')!, 'inc__sync'))).toBe(
+      'Update PR $INPUTS.pr_number.'
+    );
+  });
+
+  test('still reports a command input no binding and no caller supplies', () => {
+    const block = wf('partialblk', [
+      { id: 'pr', bash: 'echo open-pr' },
+      {
+        id: 'sync',
+        command: 'partial-cmd',
+        depends_on: ['pr'],
+        with: { pr_number: '$pr.output.number' },
+      },
+    ]);
+    const parent = wf('parent', [{ id: 'inc', include: 'partialblk' }]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['partial-cmd', 'Update PR $INPUTS.pr_number for $INPUTS.repo.']])
+    );
+    // The shield is per-name, not a blanket exemption for a node that binds anything.
+    expect(workflows.has('parent')).toBe(false);
+    const message = errors.find(error => error.filename === 'parent')?.error;
+    expect(message).toContain('$INPUTS.repo');
+    expect(message).not.toContain('$INPUTS.pr_number');
+  });
+
+  test('carries a surviving binding through two include levels', () => {
+    const inner = wf('inner', [
+      { id: 'pr', bash: 'echo open-pr' },
+      {
+        id: 'sync',
+        command: 'nested-sync',
+        depends_on: ['pr'],
+        with: { pr_number: '$pr.output.number' },
+      },
+    ]);
+    const middle = wf('middle', [{ id: 'deliver', include: 'inner' }]);
+    const outer = wf('outer', [{ id: 'ship', include: 'middle' }]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(inner, middle, outer),
+      new Map([['nested-sync', 'Update PR $INPUTS.pr_number.']])
+    );
+    expect(errors).toHaveLength(0);
+    // The payload rides a symbol, which structuredClone drops — a miss in either the
+    // clone or the walker works at one level and silently vanishes at two.
+    const sync = nodeById(workflows.get('outer')!, 'ship__deliver__sync');
+    expect(composedBindings(sync)).toEqual({ pr_number: '$ship__deliver__pr.output.number' });
+  });
+
+  test('rejects a caller ref forwarded into a binding that skips depends_on', () => {
+    const block = wf('refblk', [{ id: 'sync', command: 'ref-cmd', with: { v: '$INPUTS.src' } }]);
+    block.inputs = { src: { required: true } };
+    // `other` is a real parent node, but nothing makes it run before the block.
+    const parent = wf('parent', [
+      { id: 'other', bash: 'echo x' },
+      { id: 'inc', include: 'refblk', with: { src: '$other.output' } },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['ref-cmd', 'Use $INPUTS.v.']])
+    );
+    // The block was proven hermetic before the caller's value was inserted, so the scan
+    // over the FLATTENED graph is the only one that can see this ref. Without it the
+    // binding reaches the executor and fails the node mid-run instead of at load.
+    expect(workflows.has('parent')).toBe(false);
+    expect(errors.find(error => error.filename === 'parent')?.error).toContain(
+      "add 'other' to 'inc__sync'.depends_on"
+    );
+  });
+
+  test('accepts the same forwarded ref when the include declares the dependency', () => {
+    const block = wf('refblk-ok', [{ id: 'sync', command: 'ref-ok', with: { v: '$INPUTS.src' } }]);
+    block.inputs = { src: { required: true } };
+    const parent = wf('parent', [
+      { id: 'other', bash: 'echo x' },
+      { id: 'inc', include: 'refblk-ok', depends_on: ['other'], with: { src: '$other.output' } },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      mapOf(block, parent),
+      new Map([['ref-ok', 'Use $INPUTS.v.']])
+    );
+    expect(errors).toHaveLength(0);
+    expect(composedBindings(nodeById(workflows.get('parent')!, 'inc__sync'))).toEqual({
+      v: '$other.output',
+    });
   });
 
   test('materializes loop.command and binds its declared include input', () => {

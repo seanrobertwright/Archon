@@ -15,7 +15,11 @@ import {
   type ShellInputContext,
 } from './dag-executor';
 import { evaluateCondition } from './condition-evaluator';
-import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
+import {
+  COMPILED_LOOP_COMMAND,
+  readComposedBindings,
+  type LoopWithCompiledCommand,
+} from './compiled-command';
 import { declaredFieldsFromSchema, canonicalValueText, type JsonValue } from './output-ref';
 import { discoverScriptsForCwd } from './script-discovery';
 import {
@@ -1043,7 +1047,6 @@ async function simulateNode(
       return;
     }
 
-    const isCommandSourced = isAgentNode(node) && node.source.kind === 'command';
     const sourceText = isAgentNode(node)
       ? node.source.kind === 'command'
         ? await loadDryRunCommand(ctx, node.source.name)
@@ -1056,17 +1059,21 @@ async function simulateNode(
     // on (unknown producer, skipped without if_skipped) fails the simulated node
     // with the executor's own error, via the catch below. Command bindings merge
     // over run inputs into the `$INPUTS` bag; script bindings ride the exec env.
+    // A composed command node carries its map in the engine-private payload, having
+    // been materialized into an inline prompt at expansion (#2964).
     const nodeWith = isExecNode(node)
       ? node.with
-      : isCommandSourced && isAgentNode(node) && node.source.kind === 'command'
-        ? node.source.with
+      : isAgentNode(node)
+        ? node.source.kind === 'command'
+          ? node.source.with
+          : readComposedBindings(node)
         : undefined;
     const nodeBindings =
       nodeWith !== undefined
         ? resolveNodeBindings(node.id, nodeWith, bindingShellContext(ctx, outputs), ctx.inputs)
         : undefined;
     const commandInputs =
-      isCommandSourced && nodeBindings !== undefined
+      isAgentNode(node) && nodeBindings !== undefined
         ? { ...(ctx.inputs ?? {}), ...nodeBindings }
         : undefined;
     const resolvedText =

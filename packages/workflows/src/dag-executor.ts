@@ -118,6 +118,7 @@ import { buildTruncationMarker } from './utils/output-truncation';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import {
   COMPILED_LOOP_COMMAND,
+  readComposedBindings,
   readComposedMeta,
   type LoopWithCompiledCommand,
   type IncludeCommandContent,
@@ -2090,7 +2091,10 @@ async function executeNodeInternal(
   // Command file name when this agent node is command-sourced, undefined for an
   // inline prompt — replaces the old `node.command` field access throughout.
   const commandName = node.source.kind === 'command' ? node.source.name : undefined;
-  const nodeWith = node.source.kind === 'command' ? node.source.with : undefined;
+  // Include expansion compiles a command body into an inline prompt and moves the node's
+  // `with:` map to the engine-private payload, so a composed node binds exactly as the
+  // same node does standalone (#2964).
+  const nodeWith = node.source.kind === 'command' ? node.source.with : readComposedBindings(node);
   // Persisted step_name is namespaced ('<groupId>.' prefix) for loop_group bodies;
   // '' for the top-level DAG → identical to node.id. The in-process emitter payloads
   // below stay raw (node.id) — live SSE/CLI consumers key off those. See #2090.
