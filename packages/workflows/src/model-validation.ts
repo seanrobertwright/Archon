@@ -544,6 +544,19 @@ export function readRunModelBindingsMetadata(
  * to surface a non-blocking "tier fell back" nudge use this; everything
  * else keeps the simpler {@link resolveModelSpec}.
  */
+/**
+ * A tier resolved to nothing — no configured preset, no built-in default. This
+ * is authored configuration guidance, not a runtime fault: consumers that
+ * format errors for users (core's classifyAndFormatError) deliver instances
+ * verbatim so the CLI command, console panel, and docs pointers survive.
+ */
+export class TierResolutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TierResolutionError';
+  }
+}
+
 export function resolveTierWithFallback(
   profile: ResolvedAiProfile,
   tier: TierName
@@ -552,7 +565,7 @@ export function resolveTierWithFallback(
     const preset = profile.aliases[candidate];
     if (preset) return { preset, matchedTier: candidate };
   }
-  throw new Error(
+  throw new TierResolutionError(
     `Tier '${tier}' has no configured preset and no built-in default for provider '${profile.defaultProvider}'. ` +
       'Built-in tier defaults exist only for claude and codex; every other provider must configure its own. ' +
       "Set tiers with 'archon ai tier set <tier> <provider> <model>', the console AI Settings -> Model Tiers panel, " +
