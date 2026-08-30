@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-30
+
+**This patch release contains a breaking change.** Built-in model tiers now ship for `claude` and `codex` only. If your install runs `pi`, `copilot`, or `opencode` and you have never configured `tiers:`, bundled workflows will refuse to load until you set them — read the Breaking section before upgrading. Everyone else gets a smaller review bill and four fixes.
+
+### Breaking
+
+- **Built-in model tiers ship for `claude` and `codex` only, at the provider's default reasoning effort.** Tier defaults previously existed for five providers, and the entries for providers Archon does not actively curate pinned third-party model IDs that rot invisibly — a `pi` or `opencode` install silently resolved `small`/`medium`/`large` to models nobody chose. Those entries are gone.
+
+  **What breaks:** an install whose provider is `pi`, `copilot`, or `opencode` and which has no configured tiers now fails at workflow load with an error naming every fix surface. Nothing is silently downgraded and no run starts, so no provider is called and no money is spent — but the workflow does not run.
+
+  **The fix, once:** `archon ai tier set <small|medium|large> <provider> <model>` for each tier, or set them in console AI Settings, or add a `tiers:` block to `config.yaml`. See the configuration reference for the full shape.
+
+  **Codex tiers also changed.** They now resolve to `gpt-5.6-luna` (small), `gpt-5.6-terra` (medium), and `gpt-5.6-sol` (large), replacing the old `gpt-5.5` plus `minimal`/`medium`/`high` effort ladder. That ladder was removed rather than ported: a configured tier replaces the built-in wholesale, so the effort settings only ever survived on installs that never touched a tier. Effort is now an explicit per-tier choice — add `effort` to a tier if codex `large` reasons less than you want.
+
+  `archon setup` now shows what the three tiers resolve to on claude and codex and asks you to confirm, and warns when the selected provider ships no built-ins. Accepting the defaults writes nothing, so future default bumps still reach existing installs on upgrade. Installs with configured tiers are unaffected. (#3007)
+
+### Changed
+
+- The bundled `sdlc` review workflow runs its agent nodes on the `medium` tier instead of `large`. Review is the pack's widest fan-out, so it is where tier spend concentrates. Installs that want deeper review reasoning rebind `medium` or give it an `effort`, rather than the pack hardcoding the top tier. (#3005)
+
+- The seams review lens reports a hand-synced pair — two declarations kept in agreement by nothing but a comment — as an Important finding the moment it exists, instead of waiting for the copies to drift apart. It also traces a discriminant dispatch back to the table that defines it. (#3003)
+
+### Fixed
+
+- The tier-resolution error reached chat users as a generic "Try /reset" because the error formatter length-gated messages over 100 characters. The guidance now survives to the user verbatim. (#3007)
+
+- `archon ai tier unset` claimed the tier would fall back to a built-in default even for providers that ship none. It now names the actual fallback, or says none exists and how to set one. (#3007)
+
+- The console Model Tiers panel hinted "built-in default" for unset rows on providers without built-ins. (#3007)
+
+- SQLite vintage fixtures were stale after the v0.10.0 tag, failing the `schema-upgrade` check on every dev-based pull request. (#3008)
+
 ## [0.10.0] - 2026-08-30
 
 This is the largest release since Archon became a workflow engine, and it changes three things you will notice on day one.
