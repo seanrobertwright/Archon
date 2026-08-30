@@ -413,7 +413,7 @@ describe('bundled-defaults', () => {
         required: expect.arrayContaining(['action']),
       });
 
-      expect(parsed.workflow.model).toBe('large');
+      expect(parsed.workflow.model).toBe('medium');
       expect(parsed.workflow.inputs?.tests).toBeUndefined();
       expect(parsed.workflow.inputs?.comments).toBeUndefined();
       expect(parsed.workflow.inputs?.types).toBeUndefined();
