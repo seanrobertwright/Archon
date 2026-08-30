@@ -12,6 +12,7 @@
 import { describe, test, expect } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { resolveBashPath } from '@archon/git';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import {
   mkdtempSync,
   mkdirSync,
@@ -21,7 +22,6 @@ import {
   existsSync,
   lstatSync,
   readlinkSync,
-  rmSync,
   chmodSync,
 } from 'fs';
 import { tmpdir } from 'os';
@@ -84,9 +84,14 @@ function runScript(
   return { records, stdout, stderr, code };
 }
 
+// Cleanup used to be a trailing `rmSync` in each test body; the tracker reaps every root
+// even when a test fails first, and retries against a bash/tar child that has exited but
+// not yet released its handles (#2306).
+const trackTempRoot = trackTempRoots();
+
 /** Fresh {upper, dest} pair under a temp root; `data` is the overlay upperdir. */
 function makeDirs(): { root: string; upper: string; dest: string; ws: string } {
-  const root = mkdtempSync(join(tmpdir(), 'overlay-sec-'));
+  const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'overlay-sec-')));
   const upper = join(root, 'upper', 'data');
   const dest = join(root, 'dest');
   mkdirSync(upper, { recursive: true });
@@ -96,7 +101,7 @@ function makeDirs(): { root: string; upper: string; dest: string; ws: string } {
 
 describe('apply script — C1 whiteout-name traversal', () => {
   test('`.wh.` (empty decoded name) does NOT wipe the parent dir', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, 'subdir'), { recursive: true });
     writeFileSync(join(upper, 'subdir', '.wh.'), ''); // malicious: decodes to empty name
     mkdirSync(join(dest, 'subdir'), { recursive: true });
@@ -105,11 +110,10 @@ describe('apply script — C1 whiteout-name traversal', () => {
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
     expect(existsSync(join(dest, 'subdir', 'keepme.txt'))).toBe(true); // NOT wiped
     expect(records.some(r => r.tag === 'S' && r.fields[1] === 'unsafe-whiteout-name')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test('`.wh...` (decoded name `..`) does NOT rm the parent-of-parent', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     writeFileSync(join(upper, '.wh...'), ''); // decodes to '..'
     const canary = join(dest, 'canary.txt');
     writeFileSync(canary, 'alive');
@@ -118,11 +122,10 @@ describe('apply script — C1 whiteout-name traversal', () => {
     expect(existsSync(canary)).toBe(true);
     expect(existsSync(dest)).toBe(true);
     expect(records.some(r => r.tag === 'S' && r.fields[1] === 'unsafe-whiteout-name')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test('a legit `.wh.<name>` whiteout deletes exactly that file', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     writeFileSync(join(upper, '.wh.gone.txt'), '');
     writeFileSync(join(dest, 'gone.txt'), 'bye');
     writeFileSync(join(dest, 'stay.txt'), 'keep');
@@ -131,7 +134,6 @@ describe('apply script — C1 whiteout-name traversal', () => {
     expect(existsSync(join(dest, 'gone.txt'))).toBe(false);
     expect(existsSync(join(dest, 'stay.txt'))).toBe(true);
     expect(records.some(r => r.tag === 'D' && r.fields[0] === 'gone.txt')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 });
 
@@ -147,7 +149,7 @@ describe('apply script — C1 whiteout-name traversal', () => {
 // whose filenames cannot portably exist on win32 carry a skipIf, individually.
 describe('apply script — rel/base/dir splitting', () => {
   test('a legit whiteout inside a subdirectory deletes exactly that nested file', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, 'sub'), { recursive: true });
     writeFileSync(join(upper, 'sub', '.wh.gone.txt'), '');
     mkdirSync(join(dest, 'sub'), { recursive: true });
@@ -163,7 +165,6 @@ describe('apply script — rel/base/dir splitting', () => {
     // target to top-level 'gone.txt' and delete the wrong file entirely.
     expect(existsSync(join(dest, 'gone.txt'))).toBe(true);
     expect(records.some(r => r.tag === 'D' && r.fields[0] === 'sub/gone.txt')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // The expansions are not merely cheaper than the forks they replaced — they are
@@ -174,7 +175,7 @@ describe('apply script — rel/base/dir splitting', () => {
     // `evil` and delete a different, innocent file — while `safe_parent` also
     // confined the wrong path. Skipped on win32 only because a trailing-newline
     // filename is not portably creatable there.
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     writeFileSync(join(upper, '.wh.evil\n'), '');
     writeFileSync(join(dest, 'evil\n'), 'the real target');
     writeFileSync(join(dest, 'evil'), 'innocent bystander');
@@ -184,7 +185,6 @@ describe('apply script — rel/base/dir splitting', () => {
     expect(existsSync(join(dest, 'evil\n'))).toBe(false);
     expect(existsSync(join(dest, 'evil'))).toBe(true);
     expect(records.some(r => r.tag === 'D' && r.fields[0] === 'evil\n')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test('a whiteout under a `-`-prefixed directory still decodes instead of being copied', () => {
@@ -193,7 +193,7 @@ describe('apply script — rel/base/dir splitting', () => {
     // empty, the `.wh.*` arm never matched, and the marker was applied as an
     // ordinary FILE — planting a `.wh.foo` file in the live root instead of
     // deleting `foo`.
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, '-d'), { recursive: true });
     writeFileSync(join(upper, '-d', '.wh.foo'), '');
     mkdirSync(join(dest, '-d'), { recursive: true });
@@ -205,7 +205,6 @@ describe('apply script — rel/base/dir splitting', () => {
     // The marker itself must never land in the destination.
     expect(existsSync(join(dest, '-d', '.wh.foo'))).toBe(false);
     expect(records.some(r => r.tag === 'D' && r.fields[0] === '-d/foo')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test('`.wh..wh.x` decodes to `.wh.x` — one prefix stripped, not four characters', () => {
@@ -214,7 +213,7 @@ describe('apply script — rel/base/dir splitting', () => {
     // the wrong entry. Note plain `##` is NOT the hazard: with a literal pattern
     // `${base##.wh.}` is byte-identical to `${base#.wh.}` — only adding the `*`
     // makes it greedy.
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     writeFileSync(join(upper, '.wh..wh.x'), '');
     writeFileSync(join(dest, '.wh.x'), 'the real target');
     writeFileSync(join(dest, 'x'), 'must survive');
@@ -224,7 +223,6 @@ describe('apply script — rel/base/dir splitting', () => {
     expect(existsSync(join(dest, '.wh.x'))).toBe(false);
     expect(existsSync(join(dest, 'x'))).toBe(true);
     expect(records.some(r => r.tag === 'D' && r.fields[0] === '.wh.x')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 });
 
@@ -236,7 +234,7 @@ describe('apply script — guards pinned on the apply copy', () => {
   // R9: commit 3 tested the TAB guard only through the SUMMARY script, so deleting the
   // apply-side guard outright passed everything. Apply is the copy that writes.
   test.skipIf(isWin)('a TAB-bearing entry is refused by the APPLY script, not applied', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     writeFileSync(join(upper, 'a\tb'), 'payload');
 
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
@@ -245,7 +243,6 @@ describe('apply script — guards pinned on the apply copy', () => {
     // Nothing was written under either the real or the mangled name.
     expect(existsSync(join(dest, 'a\tb'))).toBe(false);
     expect(existsSync(join(dest, 'a?b'))).toBe(false);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // The apply-side mirror of the summary's TAB-target guard. Deleting that guard left
@@ -258,7 +255,7 @@ describe('apply script — guards pinned on the apply copy', () => {
   //   apply   → K x, symlink lands in the live root
   // i.e. the summary lies to the approver about what apply will do.
   test.skipIf(isWin)('a TAB in a symlink target is refused by the APPLY script too', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     symlinkSync('foo\tbar', join(upper, 'x'));
 
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
@@ -273,7 +270,6 @@ describe('apply script — guards pinned on the apply copy', () => {
       landed = false;
     }
     expect(landed).toBe(false);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // R4: the newline fix had two halves and only the whiteout half was pinned. The
@@ -296,7 +292,6 @@ describe('apply script — guards pinned on the apply copy', () => {
       expect(existsSync(join(outside, 'f.txt'))).toBe(false);
       // And it was refused rather than reported applied.
       expect(records.some(r => r.tag === 'W' && r.fields[0] === 'd\n/f.txt')).toBe(false);
-      rmSync(root, { recursive: true, force: true });
     }
   );
 
@@ -317,14 +312,13 @@ describe('apply script — guards pinned on the apply copy', () => {
       // Replaced as a real file, and the symlink's old target left untouched.
       expect(lstatSync(join(dest, 'f.txt')).isSymbolicLink()).toBe(false);
       expect(readFileSync(join(root, 'elsewhere.txt'), 'utf8')).toBe('old');
-      rmSync(root, { recursive: true, force: true });
     }
   );
 });
 
 describe('apply script — C2 special files + setuid', () => {
   test('setuid/setgid/sticky bits are stripped from applied files', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     const src = join(upper, 'tool');
     writeFileSync(src, '#!/bin/sh\n');
     chmodSync(src, 0o6755); // setuid + setgid + rwxr-xr-x
@@ -336,56 +330,50 @@ describe('apply script — C2 special files + setuid', () => {
     expect(mode & 0o4000).toBe(0); // no setuid
     expect(mode & 0o2000).toBe(0); // no setgid
     expect(mode & 0o1000).toBe(0); // no sticky
-    rmSync(root, { recursive: true, force: true });
   });
 
   test.skipIf(!hasMkfifo)('a fifo (special file) is skipped, never reproduced on the host', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     execFileSync('mkfifo', [join(upper, 'pipe')]);
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
     expect(existsSync(join(dest, 'pipe'))).toBe(false);
     expect(records.some(r => r.tag === 'S' && r.fields[0] === 'pipe')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 });
 
 describe('apply script — M1/M4 symlinks', () => {
   test.skipIf(isWin)('a symlink whose target escapes the project root is REFUSED', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     symlinkSync('/etc/passwd', join(upper, 'leak')); // absolute, outside ws
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
     expect(existsSync(join(dest, 'leak'))).toBe(false);
     expect(records.some(r => r.tag === 'S' && r.fields[1] === 'escaping-symlink')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test.skipIf(isWin)('a relative `..` symlink target is refused', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     symlinkSync('../../../../etc/hosts', join(upper, 'up'));
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
     expect(existsSync(join(dest, 'up'))).toBe(false);
     expect(records.some(r => r.tag === 'S' && r.fields[1] === 'escaping-symlink')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test.skipIf(isWin)('an in-project relative symlink is reproduced as a symlink', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     writeFileSync(join(upper, 'real.txt'), 'x');
     symlinkSync('real.txt', join(upper, 'link'));
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
     expect(lstatSync(join(dest, 'link')).isSymbolicLink()).toBe(true);
     expect(readlinkSync(join(dest, 'link'))).toBe('real.txt');
     expect(records.some(r => r.tag === 'K' && r.fields[0] === 'link')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test.skipIf(isWin)('M4: a symlink-to-dir is applied as a SYMLINK, not a real directory', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, 'realdir'), { recursive: true });
     symlinkSync('realdir', join(upper, 'dirlink'));
     runScript(buildApplyScript(), upper, dest, ws);
     expect(lstatSync(join(dest, 'dirlink')).isSymbolicLink()).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 });
 
@@ -401,13 +389,12 @@ describe('apply script — dest-symlink traversal confinement', () => {
     const { records } = runScript(buildApplyScript(), upper, dest, ws);
     expect(existsSync(join(outside, 'pwned.txt'))).toBe(false); // did NOT traverse
     expect(records.some(r => r.tag === 'S' && r.fields[1] === 'escaping-file')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 });
 
 describe('summary script — faithful representation (M1)', () => {
   test.skipIf(isWin)('symlinks are shown with target + escape flag; specials flagged', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     writeFileSync(join(upper, 'added.txt'), 'x');
     symlinkSync('/etc/shadow', join(upper, 'exfil')); // escaping
     symlinkSync('added.txt', join(upper, 'ok-link')); // in-project
@@ -423,7 +410,6 @@ describe('summary script — faithful representation (M1)', () => {
     expect(okLink?.fields[2]).toBe('0'); // in-project
     expect(records.some(r => r.tag === 'A' && r.fields[0] === 'added.txt')).toBe(true);
     expect(records.some(r => r.tag === 'M' && r.fields[0] === 'mod.txt')).toBe(true);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // The summary script carries its OWN copy of the rel/base/dir splitting, and
@@ -438,7 +424,7 @@ describe('summary script — faithful representation (M1)', () => {
   // reaching the gate looking safe. Apply still refused it, so the exposure was
   // misinformed consent rather than over-apply, which is why it survived unnoticed.
   test.skipIf(isWin)('a TAB in a filename cannot forge the fields of a later record', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     symlinkSync('/etc/shadow', join(upper, 'a\tb'));
 
     const { records } = runScript(buildSummaryScript(), upper, dest, ws);
@@ -448,7 +434,6 @@ describe('summary script — faithful representation (M1)', () => {
     // (Asserting merely that no `L … '0'` record exists passed before the guard too,
     // because the forged flag was a path rather than '0'.)
     expect(records).toEqual([{ tag: 'S', fields: ['a?b', 'unsafe-record-name'] }]);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // C1's mirror on the consent surface. The apply script's valid_name refusal is
@@ -458,7 +443,7 @@ describe('summary script — faithful representation (M1)', () => {
   // about to be deleted. A human asked to approve a deletion that will not happen is
   // being misinformed just as surely as one shown a deletion that will.
   test('the summary refuses an unsafe whiteout name rather than reporting a deletion', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, 'subdir'), { recursive: true });
     writeFileSync(join(upper, 'subdir', '.wh.'), ''); // decodes to the empty name
     mkdirSync(join(dest, 'subdir'), { recursive: true });
@@ -469,7 +454,6 @@ describe('summary script — faithful representation (M1)', () => {
     expect(records.some(r => r.tag === 'S' && r.fields[1] === 'unsafe-whiteout-name')).toBe(true);
     // Nothing may be presented as a pending deletion — least of all the parent dir.
     expect(records.some(r => r.tag === 'D')).toBe(false);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // R6, second half: a TAB in the symlink TARGET forges the fields after it, so the
@@ -478,20 +462,19 @@ describe('summary script — faithful representation (M1)', () => {
   // — the gate renders "-> src/utils.ts", no warning, while the real target escapes.
   // The name-only guard did not catch this; both variable-width fields need checking.
   test.skipIf(isWin)('a TAB in a symlink TARGET cannot forge the escape flag', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     symlinkSync('src/utils.ts\t../../../../etc/shadow', join(upper, 'utils-link.ts'));
 
     const { records } = runScript(buildSummaryScript(), upper, dest, ws);
 
     expect(records).toEqual([{ tag: 'S', fields: ['utils-link.ts', 'unsafe-record-target'] }]);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // R8: the previous summary fixture pinned only `dir`. These pin the `base`/`whname`
   // decodes on the consent surface too — reverting the summary copy's split to forks,
   // or making its whiteout decode greedy, passed the whole suite before this.
   test('the summary decodes a nested whiteout name, not just its directory', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, 'sub'), { recursive: true });
     writeFileSync(join(upper, 'sub', '.wh..wh.x'), '');
     mkdirSync(join(dest, 'sub'), { recursive: true });
@@ -503,7 +486,6 @@ describe('summary script — faithful representation (M1)', () => {
     // component would report nothing at all.
     expect(records.some(r => r.tag === 'D' && r.fields[0] === 'sub/.wh.x')).toBe(true);
     expect(records.some(r => r.tag === 'D' && r.fields[0] === 'sub/x')).toBe(false);
-    rmSync(root, { recursive: true, force: true });
   });
 
   // Reverting the summary copy's rel/base to forks passed even the test above,
@@ -512,7 +494,7 @@ describe('summary script — faithful representation (M1)', () => {
   // option and fails, so `base` comes back empty, the whiteout arm never matches, and
   // the summary shows the approver an ADDED marker file instead of a deletion.
   test('the summary decodes a whiteout under a `-`-prefixed directory', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, '-d'), { recursive: true });
     writeFileSync(join(upper, '-d', '.wh.foo'), '');
     mkdirSync(join(dest, '-d'), { recursive: true });
@@ -523,11 +505,10 @@ describe('summary script — faithful representation (M1)', () => {
     expect(records.some(r => r.tag === 'D' && r.fields[0] === '-d/foo')).toBe(true);
     // A failed decode surfaces the marker itself as an addition — the wrong story.
     expect(records.some(r => r.tag === 'A' && r.fields[0] === '-d/.wh.foo')).toBe(false);
-    rmSync(root, { recursive: true, force: true });
   });
 
   test('a nested whiteout is reported at its full path, not its stem', () => {
-    const { root, upper, dest, ws } = makeDirs();
+    const { upper, dest, ws } = makeDirs();
     mkdirSync(join(upper, 'sub'), { recursive: true });
     writeFileSync(join(upper, 'sub', '.wh.gone.txt'), '');
     mkdirSync(join(dest, 'sub'), { recursive: true });
@@ -539,6 +520,5 @@ describe('summary script — faithful representation (M1)', () => {
     // An empty `dir` would report the top-level name and invite the approver to
     // sign off on deleting a different file.
     expect(records.some(r => r.tag === 'D' && r.fields[0] === 'gone.txt')).toBe(false);
-    rmSync(root, { recursive: true, force: true });
   });
 });

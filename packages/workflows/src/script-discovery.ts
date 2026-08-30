@@ -9,15 +9,10 @@
  */
 import { access, mkdir, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { createHash, randomUUID } from 'crypto';
-import { dirname, join, basename, extname } from 'path';
-import {
-  createLogger,
-  getArchonHome,
-  getDefaultWorkflowsPath,
-  getHomeScriptsPath,
-  getHomeWorkflowsPath,
-} from '@archon/paths';
+import { join, basename, extname } from 'path';
+import { createLogger, getArchonHome } from '@archon/paths';
 import { BUNDLED_SCRIPTS, isBinaryBuild } from './defaults/bundled-defaults';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import {
   formatPackagedResourceReference,
   getPackagedResourceDirectory,
@@ -253,14 +248,21 @@ async function materializeBundledScripts(): Promise<Map<string, ScriptDefinition
   return scripts;
 }
 
-async function discoverBundledPackagedScripts(): Promise<Map<string, ScriptDefinition>> {
-  return isBinaryBuild()
+async function discoverBundledPackagedScripts(
+  roots: WorkflowSourceRoots
+): Promise<Map<string, ScriptDefinition>> {
+  // A captured run reads the bundled scripts IT froze — the capture materialized a
+  // binary's embedded ones to files, so the filesystem path serves both builds.
+  return isBinaryBuild() && roots.kind === 'live'
     ? await materializeBundledScripts()
-    : await discoverPackagedScripts(dirname(getDefaultWorkflowsPath()), 'bundled');
+    : await discoverPackagedScripts(roots.bundledWorkflows, 'bundled');
 }
 
 /**
  * Discover scripts across all scopes for a given repo cwd.
+ *
+ * `sourceRoots` overrides where EVERY scope is read from — a run passes the roots of its
+ * frozen capture so a statically included global or bundled script cannot change under it.
  *
  * Shared bare-name scripts use repo-over-home precedence. Packaged scripts
  * are owner-qualified and merge without participating in that override rule.
@@ -270,15 +272,23 @@ async function discoverBundledPackagedScripts(): Promise<Map<string, ScriptDefin
  * Within a single shared scope, duplicate basenames across extensions still
  * throw (matches `discoverScripts` behavior).
  */
-export async function discoverScriptsForCwd(cwd: string): Promise<Map<string, ScriptDefinition>> {
-  const bundledPackagedScripts = await discoverBundledPackagedScripts();
-  const homeScripts = await discoverScripts(getHomeScriptsPath());
-  const homePackagedScripts = await discoverPackagedScripts(getHomeWorkflowsPath(), 'global');
-  const repoScripts = await discoverScripts(join(cwd, '.archon', 'scripts'));
-  const repoPackagedScripts = await discoverPackagedScripts(
-    join(cwd, '.archon', 'workflows'),
-    'project'
-  );
+export async function discoverScriptsForCwd(
+  cwd: string,
+  sourceRoots?: WorkflowSourceRoots
+): Promise<Map<string, ScriptDefinition>> {
+  // Scripts are executable SOURCE, so they resolve under the roots the workflow was read
+  // from, not the workspace it acts on. Omitting `sourceRoots` reads live off `cwd`,
+  // which is both the in-place case and the pre-capture behavior.
+  const roots = sourceRoots ?? liveSourceRoots(cwd);
+  const bundledPackagedScripts = await discoverBundledPackagedScripts(roots);
+  const homeScripts = await discoverScripts(roots.globalScripts);
+  const homePackagedScripts = await discoverPackagedScripts(roots.globalWorkflows, 'global');
+  const repoScripts = roots.project
+    ? await discoverScripts(join(roots.project, '.archon', 'scripts'))
+    : new Map<string, ScriptDefinition>();
+  const repoPackagedScripts = roots.project
+    ? await discoverPackagedScripts(join(roots.project, '.archon', 'workflows'), 'project')
+    : new Map<string, ScriptDefinition>();
 
   // Internal packaged keys include their scope, so included workflows retain
   // exact ownership. Legacy shared scripts keep repo-over-home precedence.

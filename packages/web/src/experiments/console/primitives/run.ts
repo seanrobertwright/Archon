@@ -40,8 +40,26 @@ export interface Run {
    * `completionSignaled` is true when an interactive-loop gate paused on an
    * iteration that emitted its completion signal (#2074) — a bare approve
    * finalizes the node (no re-run); a comment runs another iteration.
+   * `decisions`/`decisionsAuthored` (#2707 step 2) are the gate's declared
+   * decision vocabulary, snapshotted at pause time — always populated
+   * (default `approve`/`reject` pair when the author wrote none explicitly);
+   * `decisionsAuthored` is the signal that the author declared a vocabulary
+   * beyond the default pair.
    */
-  approval?: { nodeId: string; message: string; completionSignaled: boolean } | null;
+  approval?: {
+    nodeId: string;
+    message: string;
+    completionSignaled: boolean;
+    decisions: { id: string; label?: string }[];
+    decisionsAuthored: boolean;
+  } | null;
+  /** Active durable wait cursor. Mutually exclusive with approval metadata. */
+  wait?: {
+    nodeId: string;
+    kind: 'time' | 'event';
+    resumeAt: string;
+    event?: string;
+  } | null;
   /**
    * Set when a paused run's gate was already approved/rejected and the run is
    * only awaiting auto-resume (server: metadata.approval.resolved). The
@@ -148,6 +166,19 @@ export function toRun(raw: RawWorkflowRun): Run {
   const resolvedRaw = isApprovalShape ? (approval as { resolved?: unknown }).resolved : undefined;
   const gateResolved =
     resolvedRaw === 'approved' || resolvedRaw === 'rejected' ? resolvedRaw : null;
+  const decisionsField = isApprovalShape
+    ? (approval as { decisions?: unknown }).decisions
+    : undefined;
+  const rawDecisions = Array.isArray(decisionsField) ? decisionsField : [];
+  const decisions = rawDecisions
+    .filter(
+      (d): d is { id: string; label?: string } =>
+        d !== null && typeof d === 'object' && typeof (d as { id?: unknown }).id === 'string'
+    )
+    .map(d => ({
+      id: d.id,
+      ...(typeof d.label === 'string' ? { label: d.label } : {}),
+    }));
   const parsedApproval =
     isApprovalShape && gateResolved === null
       ? {
@@ -158,8 +189,31 @@ export function toRun(raw: RawWorkflowRun): Run {
               : '',
           completionSignaled:
             (approval as { completionSignaled?: unknown }).completionSignaled === true,
+          decisions: decisions.length > 0 ? decisions : [{ id: 'approve' }, { id: 'reject' }],
+          decisionsAuthored:
+            (approval as { decisionsAuthored?: unknown }).decisionsAuthored === true,
         }
       : null;
+  const wait = raw.metadata?.wait;
+  const isWaitShape =
+    wait !== null &&
+    typeof wait === 'object' &&
+    wait !== undefined &&
+    'nodeId' in wait &&
+    typeof wait.nodeId === 'string' &&
+    'resumeAt' in wait &&
+    typeof (wait as { resumeAt: unknown }).resumeAt === 'string' &&
+    'kind' in wait &&
+    ((wait as { kind: unknown }).kind === 'time' || (wait as { kind: unknown }).kind === 'event');
+  const waitRecord = isWaitShape ? (wait as Record<string, unknown>) : undefined;
+  const parsedWait = isWaitShape
+    ? {
+        nodeId: (wait as { nodeId: string }).nodeId,
+        kind: (wait as { kind: 'time' | 'event' }).kind,
+        resumeAt: (wait as { resumeAt: string }).resumeAt,
+        ...(typeof waitRecord?.event === 'string' ? { event: waitRecord.event } : {}),
+      }
+    : null;
 
   return {
     id: raw.id,
@@ -179,6 +233,7 @@ export function toRun(raw: RawWorkflowRun): Run {
     currentNode: raw.current_step_name ?? null,
     lastTool: null,
     approval: parsedApproval,
+    wait: parsedWait,
     gateResolved,
     parentRunId: raw.parent_run_id ?? null,
   };

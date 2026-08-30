@@ -32,14 +32,35 @@
  * A larger budget would answer the question by silencing it.
  * If it does recur, find the specific colliding bound the way #2473 did; do not
  * reach for the timeout.
+ *
+ * It did recur, for the two C5 cases only (#2575). Coverage instrumentation was
+ * measured on windows-latest and ruled out. What was left was accidental cost:
+ * their fixture spawned a SECOND cold `bun` process purely to write one registry
+ * row, which is now an in-process write. The budget still has not moved.
+ *
+ * It recurred a third time (#2882, both C5 cases in one windows-latest run at
+ * 6266/5016 ms, carrying Bun's body-timeout message rather than its hook-timeout
+ * one). This time the body was phase-attributed and nothing accidental was left
+ * to remove: spawning the migration script is 88% of it (61-68 ms of a 69-74 ms
+ * body locally), and that subprocess IS the contract. The registry fixture is
+ * the remaining 8-11%; building it once and copying the file per test measured
+ * 2-3 ms cheaper and would have to either share one database across the two
+ * cases — the cross-test coupling the paragraph above exists to prevent — or
+ * rewrite the row anyway, because `default_cwd` is the per-test sandbox path.
+ * The other 17 tests in this file sit at the same one-spawn floor (58-65 ms), so
+ * the C5 pair are not special; they are ~15% above a floor that a contended
+ * Windows runner puts at the budget line. That is a runner-capacity question,
+ * not a cost this file can spend less of. Still do not reach for the timeout.
  */
 import { describe, test, expect } from 'bun:test';
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'fs/promises';
+import { removeTempTree } from '@archon/paths/test-utils';
+import { getLogLevel, setLogLevel } from '@archon/paths';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 
 const SCRIPT = resolve(import.meta.dir, 'migrate-state-dir.ts');
-const REPO_ROOT = resolve(import.meta.dir, '..');
 
 /** Per-test paths. Immutable, and never shared between tests. */
 interface Sandbox {
@@ -53,12 +74,11 @@ interface Sandbox {
 /**
  * Create a sandbox, run `body`, and always tear down.
  *
- * `maxRetries` covers the Windows case where a just-exited child still holds a
- * handle inside the sandbox: node's `rm` retries on EBUSY, EMFILE, ENFILE,
- * ENOTEMPTY and EPERM, which covers what this hits. On PR #2513 an unretried `rm`
- * threw `EBUSY … archon-migrate-dhOLl3` from teardown and failed the check. A leaked
- * temp directory is not a test failure, so a final failure warns instead of
- * throwing — but it does warn, so a genuine leak stays visible.
+ * Teardown has to survive the Windows case where a just-exited child still holds a
+ * handle inside the sandbox: on PR #2513 an unretried `rm` threw
+ * `EBUSY … archon-migrate-dhOLl3` and failed the check. `removeTempTree` owns that
+ * retry — and owns it explicitly, because passing `maxRetries` to `rm` does nothing
+ * under Bun (#2306). This docblock used to claim that option was the fix.
  */
 async function withSandbox(body: (ctx: Sandbox) => Promise<void>): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'archon-migrate-'));
@@ -77,11 +97,7 @@ async function withSandbox(body: (ctx: Sandbox) => Promise<void>): Promise<void>
   try {
     await body(ctx);
   } finally {
-    try {
-      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    } catch (error) {
-      console.warn(`sandbox cleanup failed for ${root}: ${(error as Error).message}`);
-    }
+    await removeTempTree(root);
   }
 }
 
@@ -100,11 +116,43 @@ async function collect(proc: Bun.Subprocess<'ignore', 'pipe', 'pipe'>): Promise<
   return { exitCode, stdout, stderr };
 }
 
+/**
+ * Environment for every child, pinned to this sandbox.
+ *
+ * `DATABASE_URL` is forced EMPTY rather than deleted. A contributor running the
+ * documented Postgres mode would otherwise have it reach the child, which flips
+ * `getDatabaseType()` there: `registryIsKnownEmpty` goes false and `resolveTarget`
+ * reads a Postgres registry, while the C5 fixture writes its row to this sandbox's
+ * SQLite file. The two sides would disagree and both C5 tests would fail looking
+ * like a climbing regression rather than an environment leak.
+ *
+ * Deleting the key does NOT achieve that: a spawned Bun child re-runs automatic
+ * `.env` loading from its own cwd and fills in every key the passed environment
+ * omits, so a repo-root `.env` — exactly how Postgres mode is configured — puts it
+ * straight back. An empty string is a key that is present, which dotenv leaves
+ * alone, and `getDatabaseType()` reads it as falsy. This is the same suppression
+ * `packages/cli/src/cli.test.ts` uses for its own inherited keys.
+ *
+ * The one test that wants the Postgres branch passes a real DSN via `extraEnv`.
+ */
+function childEnv(
+  ctx: Sandbox,
+  extraEnv: Record<string, string> = {}
+): Record<string, string | undefined> {
+  return {
+    ...process.env,
+    ARCHON_HOME: ctx.archonHome,
+    LOG_LEVEL: 'silent',
+    DATABASE_URL: '',
+    ...extraEnv,
+  };
+}
+
 /** Run with raw argv — no implicit `--cwd`, for argument-parsing cases. */
 async function runRaw(ctx: Sandbox, ...args: string[]): Promise<RunResult> {
   return collect(
     Bun.spawn(['bun', 'run', SCRIPT, ...args], {
-      env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent' },
+      env: childEnv(ctx),
       cwd: ctx.repo,
       stdout: 'pipe',
       stderr: 'pipe',
@@ -130,7 +178,7 @@ async function runWithEnv(
 ): Promise<RunResult> {
   return collect(
     Bun.spawn(['bun', 'run', SCRIPT, '--cwd', cwd, ...args], {
-      env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent', ...extraEnv },
+      env: childEnv(ctx, extraEnv),
       stdout: 'pipe',
       stderr: 'pipe',
     })
@@ -422,10 +470,19 @@ describe('migrate-state-dir', () => {
      * silently disable project resolution: here a database exists, so the lookup
      * must still run and still climb.
      *
-     * Registered in a SUBPROCESS: @archon/core's DB connection is a module-level
-     * singleton, so registering in-process would cache a handle to the first
-     * test's temp ARCHON_HOME and fail with SQLITE_IOERR_VNODE once that
-     * directory is torn down.
+     * The row goes in through the SAME adapter the script's lookup opens, so the
+     * fixture cannot drift from the real schema — but through a dedicated instance
+     * rather than `@archon/core/db/codebases`, whose `pool` resolves the
+     * module-level connection singleton from `ARCHON_HOME`. That singleton would
+     * pin the first test's temp home and then fail with SQLITE_IOERR_VNODE once
+     * the directory is torn down; an instance takes an explicit path and is closed
+     * before the sandbox goes away. `name` and `default_cwd` are the only columns
+     * the destination resolution reads (`resolveRepoProjectIdentity`).
+     *
+     * This used to be a cold `bun -e` subprocess importing @archon/core's whole
+     * module graph to write that one row — the accidental half of these tests'
+     * Windows cost (#2575). The subprocess below it runs the migration script
+     * itself and is the contract under test, so it stays a real process.
      */
     async function withProjectSandbox(body: (ctx: ProjectSandbox) => Promise<void>): Promise<void> {
       return withSandbox(async base => {
@@ -436,24 +493,22 @@ describe('migrate-state-dir', () => {
         };
         await mkdir(ctx.subdir, { recursive: true });
 
-        const src = [
-          "const db = await import('@archon/core/db/codebases');",
-          'await db.createCodebase({',
-          `  name: ${JSON.stringify(PROJECT_NAME)},`,
-          `  repository_url: ${JSON.stringify(`https://github.com/${PROJECT_NAME}`)},`,
-          `  default_cwd: ${JSON.stringify(ctx.repo)},`,
-          "  default_branch: 'main',",
-          '});',
-        ].join('\n');
-        const proc = Bun.spawn(['bun', '-e', src], {
-          cwd: REPO_ROOT,
-          env: { ...process.env, ARCHON_HOME: ctx.archonHome, LOG_LEVEL: 'silent' },
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const { exitCode, stderr } = await collect(proc);
-        if (exitCode !== 0) {
-          throw new Error(`registerProject failed (${String(exitCode)}): ${stderr}`);
+        // Opening the adapter announces its schema init at info, which every
+        // subprocess here already suppresses with LOG_LEVEL=silent. Scoped rather
+        // than set once at module load: `setLogLevel` mutates the process-wide
+        // root logger, and `bun test ./scripts/` runs all five files in one
+        // process, so an unrestored level would silently follow the others.
+        const priorLogLevel = getLogLevel();
+        setLogLevel('silent');
+        const registry = new SqliteAdapter(join(ctx.archonHome, 'archon.db'));
+        try {
+          await registry.query(
+            'INSERT INTO remote_agent_codebases (name, default_cwd) VALUES ($1, $2)',
+            [PROJECT_NAME, ctx.repo]
+          );
+        } finally {
+          await registry.close();
+          setLogLevel(priorLogLevel);
         }
 
         await body(ctx);

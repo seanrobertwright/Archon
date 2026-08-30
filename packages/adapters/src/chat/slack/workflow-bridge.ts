@@ -471,20 +471,22 @@ export class SlackWorkflowBridge {
         if (decision === 'approved') {
           const result = await workflowOperations.approveWorkflow(runId);
           // Interactive-loop approves are outcome-ambiguous from here: a gate that
-          // paused on a completion signal finalizes on resume (no re-run, #2074);
+          // paused after a completion condition was met finalizes on resume (no re-run, #2074);
           // otherwise the loop runs another iteration. Hedge like manage_run does —
           // this bridge approves with no comment, so both outcomes are reachable.
           outcomeNote =
             result.type === 'interactive_loop'
-              ? 'recorded — finalizes if the gate paused on a completion signal, otherwise the loop runs another iteration on resume'
+              ? 'recorded — finalizes if the gate paused after a completion condition was met, otherwise the loop runs another iteration on resume'
               : 'workflow resumed';
         } else {
-          const result = await workflowOperations.rejectWorkflow(runId);
+          const result = await workflowOperations.rejectWorkflow(runId, 'Rejected');
           outcomeNote = result.cancelled
             ? result.maxAttemptsReached
               ? 'cancelled — max reject attempts reached'
               : 'cancelled'
-            : 'recorded — workflow will retry with feedback';
+            : result.newMode
+              ? 'recorded — the run continues'
+              : 'recorded — workflow will retry with feedback';
         }
       } catch (error) {
         const err = error as Error;

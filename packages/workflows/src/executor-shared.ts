@@ -6,25 +6,17 @@
  * utilities. Single source of truth; no logic changes from either copy.
  */
 import { readFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import type { LoadCommandResult } from './schemas';
-import { INPUT_NAME_SOURCE } from './schemas/dag-node';
-import { similarNodeIds } from './output-ref';
+import { substituteInputRefs, type JsonValue } from './output-ref';
 import { getPackagedResourceDirectory, parsePackagedResourceReference } from './packaged-workflow';
-
-/**
- * Runtime `$INPUTS.<name>` reference — the sub-run twin of the include-expander's
- * load-time INPUTS_REF, built from the same identifier grammar so a name that
- * validates as a `with:` key can never fail to match here. Resolved only for
- * `workflow:` sub-runs (child runs get `metadata.inputs`), and only into non-shell
- * surfaces (shell nodes get `INPUTS_<UPPER_SNAKE>` env vars instead — see #2470).
- */
-const INPUTS_RUNTIME_REF = new RegExp(String.raw`\$INPUTS\.(${INPUT_NAME_SOURCE})`, 'g');
 
 /** Lazy-initialized logger */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -38,11 +30,14 @@ function getLog(): ReturnType<typeof createLogger> {
 /** Result of error classification */
 export type ErrorType = 'TRANSIENT' | 'FATAL' | 'UNKNOWN';
 
-/**
- * Fatal error patterns - errors that won't resolve with retry: authentication/
- * authorization failures and provider quota/limit-window exhaustion (a retry
- * inside the same limit window is guaranteed to fail — see #2177).
- */
+const QUOTA_EXHAUSTION_PATTERNS = [
+  'session limit',
+  'usage limit reached',
+  'credit exhaustion',
+  'credit balance',
+] as const;
+
+/** Fatal errors: authentication/authorization failures plus quota exhaustion. */
 export const FATAL_PATTERNS = [
   'unauthorized',
   'forbidden',
@@ -51,14 +46,26 @@ export const FATAL_PATTERNS = [
   'permission denied',
   '401',
   '403',
-  'credit balance',
-  'session limit', // Claude subscription 5h window — covers every detectCreditExhaustion session variant
-  'usage limit reached', // Claude CLI quota string, e.g. "Claude AI usage limit reached|<ts>"
-  'credit exhaustion', // synthesized "Credit exhaustion detected — resume when credits reset"
+  ...QUOTA_EXHAUSTION_PATTERNS,
 ];
 
 /** Ambiguous fatal patterns that yield to concrete transient evidence. */
 const FALLBACK_FATAL_PATTERNS = ['auth error'];
+
+/**
+ * Rate/concurrency pressure (429, provider overload) — a subset of TRANSIENT that
+ * sheds load on a minutes-scale window, so it earns its own patient backoff policy
+ * (see {@link getRetryDelayMs}) instead of the generic short exponential one (#2706).
+ * Defined first so {@link TRANSIENT_PATTERNS} derives from it: a pattern can never
+ * widen the rate-limit budget while classifyError treats it as non-transient.
+ */
+export const RATE_LIMIT_PATTERNS = [
+  '429',
+  'rate limit',
+  'too many requests',
+  'overloaded', // Anthropic/Minimax overload message text
+  'at capacity', // Codex/OpenAI model-level saturation
+] as const;
 
 /** Transient error patterns - temporary issues that may resolve with retry */
 export const TRANSIENT_PATTERNS = [
@@ -66,15 +73,12 @@ export const TRANSIENT_PATTERNS = [
   'econnrefused',
   'econnreset',
   'etimedout',
-  'rate limit',
-  'too many requests',
-  '429',
+  ...RATE_LIMIT_PATTERNS,
   '503',
   '502',
   '529', // Anthropic HTTP 529 = service overloaded
-  'overloaded', // Anthropic/Minimax overload message text
-  'at capacity', // Codex/OpenAI model-level saturation
   'network error',
+  'stream closed without yielding content', // empty provider stream (#2706): silent rejection or interruption, not a node defect
   'socket hang up',
   'exited with code',
   'claude code crash',
@@ -109,6 +113,61 @@ export function classifyError(error: Error): ErrorType {
   return 'UNKNOWN';
 }
 
+/** Retry budget for rate-limited failures, replacing the node's own maxRetries when one is seen. */
+export const RATE_LIMIT_MAX_RETRIES = 5;
+
+/** Flat delay center for rate-limit retries; jitter widens it to ±50% in {@link getRetryDelayMs}. */
+export const RATE_LIMIT_RETRY_DELAY_MS = 45_000;
+
+export function isRateLimitError(error: string): boolean {
+  const message = error.toLowerCase();
+  return RATE_LIMIT_PATTERNS.some(pattern => message.includes(pattern));
+}
+
+/**
+ * Delay before retry attempt N for a failed attempt with this error message.
+ *
+ * Rate-limit failures back off FLAT at ~45s ±50% jitter: providers shedding load
+ * recover on a minutes-scale window with no retry-after signal (#2706), so exponential
+ * from 3s either exhausts before the window opens or over-waits once it does; flat +
+ * jitter spreads concurrent nodes apart without thundering-herd re-synchronization.
+ * Everything else keeps the caller's base × 2^attempt exponential shape.
+ */
+export function getRetryDelayMs(
+  errorMessage: string,
+  attempt: number,
+  baseDelayMs: number
+): number {
+  if (isRateLimitError(errorMessage)) {
+    return Math.round(RATE_LIMIT_RETRY_DELAY_MS * (0.5 + Math.random()));
+  }
+  return baseDelayMs * Math.pow(2, attempt);
+}
+
+export function isQuotaExhaustionError(error: string): boolean {
+  const message = error.toLowerCase();
+  return QUOTA_EXHAUSTION_PATTERNS.some(pattern => message.includes(pattern));
+}
+
+/** Parse only provider reset forms that carry an unambiguous instant/duration. */
+export function extractQuotaResetAt(error: string, now = new Date()): Date | null {
+  const epoch = /usage limit reached\|(\d{10,13})/i.exec(error)?.[1];
+  if (epoch !== undefined) {
+    const raw = Number(epoch);
+    const millis = epoch.length === 10 ? raw * 1000 : raw;
+    const parsed = new Date(millis);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  const relative = /resets\s+in\s+(\d+(?:\.\d+)?)\s*(m(?:in(?:ute)?s?)?|h(?:ours?)?)/i.exec(error);
+  if (relative?.[1] !== undefined && relative[2] !== undefined) {
+    const amount = Number(relative[1]);
+    const multiplier = relative[2].toLowerCase().startsWith('h') ? 60 * 60 * 1000 : 60 * 1000;
+    const parsed = new Date(now.getTime() + amount * multiplier);
+    return Number.isFinite(parsed.getTime()) ? parsed : null;
+  }
+  return null;
+}
+
 /**
  * Map the retry-oriented {@link ErrorType} to the telemetry wire enum. The
  * telemetry event carries ONLY this fixed-enum class — never error text.
@@ -132,8 +191,34 @@ export function toTelemetryErrorClass(errorType: ErrorType): archonPaths.Workflo
 
 // ─── Subprocess Failure Formatting ───────────────────────────────────────────
 
-/** Max characters of stderr/message we keep in user-facing and logged fields. */
+/** Max characters of combined stdout+stderr we keep in user-facing and logged fields. */
 const SUBPROCESS_ERROR_MAX_CHARS = 2000;
+
+function streamTail(text: string, max: number): string | undefined {
+  if (text.length === 0) return undefined;
+  return text.length > max ? text.slice(-max) : text;
+}
+
+/**
+ * The retained evidence copy of ONE subprocess stream (#2967): a tail on the same
+ * budget the failure diagnostic spends, marked in place when the head was dropped so
+ * a reader can tell truncation from absence. `undefined` for an empty stream.
+ *
+ * The budget applies per stream here, while `formatSubprocessFailure` splits it
+ * across both — that one produces a single diagnostic string, whereas retention keeps
+ * stdout and stderr apart (merging them is the bug the workflow-side substitute this
+ * replaces had to fix), so a chatty stdout must not evict stderr evidence.
+ *
+ * Callers pass ALREADY-REDACTED text. This caps; it does not sanitize.
+ */
+export function retainStreamTail(text: string | undefined): string | undefined {
+  const trimmed = (text ?? '').trim();
+  if (trimmed.length === 0) return undefined;
+  if (trimmed.length <= SUBPROCESS_ERROR_MAX_CHARS) return trimmed;
+  return `…[truncated to last ${String(SUBPROCESS_ERROR_MAX_CHARS)} chars]\n${trimmed.slice(
+    -SUBPROCESS_ERROR_MAX_CHARS
+  )}`;
+}
 
 /**
  * Raw ExecFileException shape from Node's `child_process.execFile`. For inline
@@ -156,7 +241,9 @@ interface RawSubprocessError {
  * Produce a concise, diagnostic-first summary of a failed subprocess.
  *
  * User-visible output strips Node's `"Command failed: <cmd>"` prefix (which for
- * inline scripts contains the full script body) and prefers stderr when present.
+ * inline scripts contains the full script body) and includes a jointly capped
+ * tail of stderr and stdout — stderr keeps budget priority, stdout gets the
+ * remainder, so scripts that report failure context on stdout stay visible.
  * Log fields expose a controlled, tail-truncated subset — never the full `err`
  * object, to prevent Pino's default error serializer from emitting three copies
  * of the script body (`err.message`, `err.stack`, `err.cmd`).
@@ -166,6 +253,7 @@ export function formatSubprocessFailure(
   label: string
 ): { userMessage: string; logFields: Record<string, unknown> } {
   const stderr = (err.stderr ?? '').trim();
+  const stdout = (err.stdout ?? '').trim();
   const rawMessage = (err.message ?? '').trim();
 
   // The first line of Node's ExecFileException.message is `Command failed: <cmd>`,
@@ -176,9 +264,26 @@ export function formatSubprocessFailure(
     ? rawMessage.split('\n').slice(1).join('\n').trim()
     : rawMessage;
 
+  // Well-behaved scripts print failure context to stdout, so both streams share
+  // the cap. stderr keeps budget priority; the leftover goes to stdout, and each
+  // stream is labelled only when both are present. The budget accounts for the
+  // label overhead so the joined diagnostic never truncates away a label.
+  const STDERR_LABEL = '[stderr]\n';
+  const STDOUT_LABEL = '\n[stdout]\n';
+  const bothPresent = stderr.length > 0 && stdout.length > 0;
+  const labelsOverhead = bothPresent ? STDERR_LABEL.length + STDOUT_LABEL.length : 0;
+  const halfCap = Math.floor(SUBPROCESS_ERROR_MAX_CHARS / 2);
+  const stderrTail = streamTail(stderr, bothPresent ? halfCap : SUBPROCESS_ERROR_MAX_CHARS);
+  const stdoutTail = streamTail(
+    stdout,
+    SUBPROCESS_ERROR_MAX_CHARS - labelsOverhead - (stderrTail?.length ?? 0)
+  );
+
   let diagnostic: string;
-  if (stderr) {
-    diagnostic = stderr;
+  if (stderrTail && stdoutTail) {
+    diagnostic = `${STDERR_LABEL}${stderrTail}${STDOUT_LABEL}${stdoutTail}`;
+  } else if (stderrTail || stdoutTail) {
+    diagnostic = (stderrTail ?? '') + (stdoutTail ?? '');
   } else if (bodyAfterPrefix) {
     diagnostic = bodyAfterPrefix;
   } else if (hasCommandFailedPrefix) {
@@ -195,15 +300,13 @@ export function formatSubprocessFailure(
 
   const exitSuffix = err.code != null ? ` [exit ${String(err.code)}]` : '';
 
-  const stderrTail =
-    stderr.length > SUBPROCESS_ERROR_MAX_CHARS ? stderr.slice(-SUBPROCESS_ERROR_MAX_CHARS) : stderr;
-
   return {
     userMessage: `${label} failed${exitSuffix}: ${truncated}`,
     logFields: {
       exitCode: err.code ?? undefined,
       killed: err.killed === true,
-      stderrTail: stderrTail.length > 0 ? stderrTail : undefined,
+      stderrTail,
+      stdoutTail,
     },
   };
 }
@@ -265,18 +368,29 @@ export function detectCreditExhaustion(text: string): string | null {
 /**
  * Load command prompt from file.
  *
+ * Two directories are in play and they are not interchangeable. `cwd` is the workspace
+ * the run acts on: it owns config, and it is where a `commands.folder` setting is read
+ * from. `sourceRoots` is where the command TEXT lives — the authoring checkout, or a
+ * run's frozen capture of it. They describe the same place for an ordinary in-place run
+ * and differ whenever a workflow authored in one checkout executes against another.
+ * Passing `cwd` for both is what made a workflow's own commands invisible inside its
+ * isolated worktree.
+ *
  * @param deps - Workflow dependencies (for config loading)
- * @param cwd - Working directory (repo root)
+ * @param cwd - Target workspace; owns config only
  * @param commandName - Name of the command (without .md extension)
  * @param configuredFolder - Optional additional folder from config to search
+ * @param sourceRoots - Roots to resolve command files under; defaults to reading `cwd` live
  * @returns On success: `{ success: true, content }`. On failure: `{ success: false, reason, message }`.
  */
 export async function loadCommandPrompt(
   deps: Pick<WorkflowDeps, 'loadConfig'>,
   cwd: string,
   commandName: string,
-  configuredFolder?: string
+  configuredFolder?: string,
+  sourceRoots?: WorkflowSourceRoots
 ): Promise<LoadCommandResult> {
+  const roots = sourceRoots ?? liveSourceRoots(cwd);
   // Validate command name first
   if (!isValidCommandName(commandName)) {
     getLog().error({ commandName }, 'invalid_command_name');
@@ -287,34 +401,40 @@ export async function loadCommandPrompt(
     };
   }
 
-  // Load config to check opt-out
-  let config;
-  try {
-    config = await deps.loadConfig(cwd);
-  } catch (error) {
-    const err = error as Error;
-    getLog().warn(
-      {
-        err,
-        cwd,
-        note: 'Default commands will be loaded. Check your .archon/config.yaml if this is unexpected.',
-      },
-      'config_load_failed_using_defaults'
-    );
-    config = { defaults: { loadDefaultCommands: true } };
+  // Opt-out comes from the SOURCE when there is one — a capture carries the settings that
+  // were in force when it was taken, so a resume cannot let the target's `defaults:`
+  // decide whether the bundled scope counts. Falls back to reading `cwd` live.
+  let loadDefaultCommands = sourceRoots?.config.load_default_commands;
+  if (loadDefaultCommands === undefined) {
+    try {
+      loadDefaultCommands = (await deps.loadConfig(cwd)).defaults?.loadDefaultCommands ?? true;
+    } catch (error) {
+      const err = error as Error;
+      getLog().warn(
+        {
+          err,
+          cwd,
+          note: 'Default commands will be loaded. Check your .archon/config.yaml if this is unexpected.',
+        },
+        'config_load_failed_using_defaults'
+      );
+      loadDefaultCommands = true;
+    }
   }
 
   const packaged = parsePackagedResourceReference(commandName);
   if (packaged !== null) {
     if (packaged.owner.source === 'bundled') {
-      if (config.defaults?.loadDefaultCommands === false) {
+      if (!loadDefaultCommands) {
         return {
           success: false,
           reason: 'not_found',
           message: `Packaged command not found: ${packaged.name}.md`,
         };
       }
-      if (isBinaryBuild()) {
+      // A captured run reads the bundled bytes IT froze, even in a binary: the capture
+      // materialized the constants to files, and those are what its digest covers.
+      if (isBinaryBuild() && roots.kind === 'live') {
         const content = BUNDLED_COMMANDS[commandName];
         if (content === undefined) {
           return {
@@ -336,11 +456,18 @@ export async function loadCommandPrompt(
 
     let workflowsRoot: string;
     if (packaged.owner.source === 'project') {
-      workflowsRoot = join(cwd, '.archon', 'workflows');
+      if (roots.project === null) {
+        return {
+          success: false,
+          reason: 'not_found',
+          message: `Packaged command not found (no project source): ${packaged.name}.md`,
+        };
+      }
+      workflowsRoot = join(roots.project, '.archon', 'workflows');
     } else if (packaged.owner.source === 'global') {
-      workflowsRoot = archonPaths.getHomeWorkflowsPath();
+      workflowsRoot = roots.globalWorkflows;
     } else {
-      workflowsRoot = dirname(archonPaths.getDefaultWorkflowsPath());
+      workflowsRoot = roots.bundledWorkflows;
     }
     const filePath = join(
       getPackagedResourceDirectory(workflowsRoot, packaged.owner, 'commands'),
@@ -384,10 +511,16 @@ export async function loadCommandPrompt(
   // Each scope is walked 1 subfolder deep so `triage/review.md` resolves as
   // `review` — matching the workflows/scripts convention. Resolution
   // precedence: repo > home (~/.archon/commands/) > bundled/app defaults.
-  const searchPaths = archonPaths.getCommandFolderSearchPaths(configuredFolder);
+  // The SOURCE's command folder, when a capture supplied one. `configuredFolder` is the
+  // target's, which is the right answer only for an in-place run — for a captured run it
+  // would search folders the frozen source never used.
+  const searchPaths = archonPaths.getCommandFolderSearchPaths(
+    sourceRoots?.config.command_folder ?? configuredFolder
+  );
+  const projectRoot = roots.project;
   const resolvedSearchPaths: string[] = [
-    ...searchPaths.map(folder => join(cwd, folder)),
-    archonPaths.getHomeCommandsPath(),
+    ...(projectRoot !== null ? searchPaths.map(folder => join(projectRoot, folder)) : []),
+    roots.globalCommands,
   ];
 
   for (const dir of resolvedSearchPaths) {
@@ -431,9 +564,9 @@ export async function loadCommandPrompt(
   }
 
   // If not found in repo/home and app defaults enabled, search app defaults
-  const loadDefaultCommands = config.defaults?.loadDefaultCommands ?? true;
   if (loadDefaultCommands) {
-    if (isBinaryBuild()) {
+    // A captured run reads the bundled command bytes IT froze; see the note above.
+    if (isBinaryBuild() && roots.kind === 'live') {
       // Binary: check bundled commands
       const bundledContent = BUNDLED_COMMANDS[commandName];
       if (bundledContent) {
@@ -442,8 +575,9 @@ export async function loadCommandPrompt(
       }
       getLog().debug({ commandName }, 'command_bundled_not_found');
     } else {
-      // Bun: load from filesystem (walk 1 level deep so `defaults/archon-*.md` resolves)
-      const appDefaultsPath = archonPaths.getDefaultCommandsPath();
+      // Bun (or any captured run): load from the bundled-commands root, walking 1 level
+      // deep so `defaults/archon-*.md` resolves.
+      const appDefaultsPath = roots.bundledCommands;
       const entries = await archonPaths.findMarkdownFilesRecursive(appDefaultsPath, '', {
         maxDepth: 1,
       });
@@ -489,6 +623,28 @@ export async function loadCommandPrompt(
 
 // ─── Variable Substitution ───────────────────────────────────────────────────
 
+/**
+ * Scope holding the current run's adopted artifact directory (#2747), entered by
+ * the executor around DAG execution. A scoped context rather than another
+ * positional parameter because the value is RUN-level (like `artifactsDir`) but
+ * is consumed at every substitution site several layers down; a child sub-run's
+ * `executeWorkflow` re-enters with its own (absent) scope, correctly shadowing
+ * the parent's adoption.
+ */
+const adoptedRunDirContext = new AsyncLocalStorage<string>();
+
+export function runWithAdoptedRunDir<T>(
+  adoptedRunDir: string | undefined,
+  fn: () => Promise<T>
+): Promise<T> {
+  if (adoptedRunDir === undefined) return fn();
+  return adoptedRunDirContext.run(adoptedRunDir, fn);
+}
+
+function currentAdoptedRunDir(): string | undefined {
+  return adoptedRunDirContext.getStore();
+}
+
 /** Pattern string for context variables - used to create fresh regex instances */
 export const CONTEXT_VAR_PATTERN_STR =
   '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';
@@ -503,6 +659,9 @@ export const CONTEXT_VAR_PATTERN_STR =
  * - $STATE_DIR - External per-PROJECT cross-run state directory (shared by every
  *   workflow in the project; pre-created by the executor). Throws if referenced
  *   without a resolved value.
+ * - $ADOPTED_RUN_DIR (#2747) - The adopted run's artifact directory, resolved
+ *   through its persisted `output_root`. Read-only by contract; throws if
+ *   referenced without an adoption active.
  * - $BASE_BRANCH - The base branch (from config or auto-detected)
  * - $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT - GitHub issue/PR context (if available)
  * - $DOCS_DIR - Documentation directory path (configured or default 'docs/')
@@ -530,7 +689,13 @@ export function substituteWorkflowVariables(
   loopUserInput?: string,
   rejectionReason?: string,
   loopPrevOutput?: string,
-  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, string> }
+  options?: {
+    shellSafe?: boolean;
+    stateDir?: string;
+    inputs?: Record<string, JsonValue>;
+    /** Adopted run's artifact directory (#2747). Undefined = no adoption active. */
+    adoptedRunDir?: string;
+  }
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
   if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
@@ -552,6 +717,18 @@ export function substituteWorkflowVariables(
     );
   }
 
+  // $ADOPTED_RUN_DIR (#2747) resolves only under an explicit adoption. A run
+  // that references it without one throws — mirroring $BASE_BRANCH/$STATE_DIR —
+  // because a literal or empty substitution would silently point work at
+  // nothing instead of telling the author the run was never started with --adopt.
+  if (!options?.adoptedRunDir && !currentAdoptedRunDir() && prompt.includes('$ADOPTED_RUN_DIR')) {
+    throw new Error(
+      '$ADOPTED_RUN_DIR is referenced but this run did not adopt a prior run. ' +
+        'Start it with `workflow run <name> --adopt <run-id>` (or adopt_run_id on the API) ' +
+        "to read an earlier run's artifacts by reference."
+    );
+  }
+
   // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
   const resolvedDocsDir = docsDir || 'docs/';
 
@@ -564,6 +741,7 @@ export function substituteWorkflowVariables(
     // Engine-controlled like $ARTIFACTS_DIR — substituted even under shellSafe,
     // or `bash:`/`script:` bodies would never see it.
     .replace(/\$STATE_DIR/g, options?.stateDir ?? '')
+    .replace(/\$ADOPTED_RUN_DIR/g, options?.adoptedRunDir ?? currentAdoptedRunDir() ?? '')
     .replace(/\$BASE_BRANCH/g, baseBranch)
     .replace(/\$DOCS_DIR/g, resolvedDocsDir);
 
@@ -581,19 +759,7 @@ export function substituteWorkflowVariables(
     // source (#2115). Bash/script bodies read INPUTS_<UPPER_SNAKE> env vars instead.
     // An unknown name THROWS (mirrors $node.output.field strictness) rather than
     // substituting '' — a typo'd input silently emptying is worse than a load-visible error.
-    const inputs = options?.inputs;
-    result = result.replace(INPUTS_RUNTIME_REF, (_match, name: string) => {
-      if (inputs && Object.hasOwn(inputs, name)) return inputs[name];
-      const known = inputs ? Object.keys(inputs) : [];
-      const hint = similarNodeIds(name, known);
-      const suffix =
-        hint.length > 0
-          ? ` Did you mean ${hint.map(h => `$INPUTS.${h}`).join(', ')}?`
-          : known.length > 0
-            ? ` Available inputs: ${known.map(k => `$INPUTS.${k}`).join(', ')}.`
-            : ' This run has no declared inputs.';
-      throw new Error(`Unknown input '$INPUTS.${name}'.${suffix}`);
-    });
+    result = substituteInputRefs(result, options?.inputs);
   }
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
@@ -645,7 +811,7 @@ export function buildPromptWithContext(
   docsDir: string,
   issueContext: string | undefined,
   logLabel: string,
-  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, string> }
+  options?: { shellSafe?: boolean; stateDir?: string; inputs?: Record<string, JsonValue> }
 ): string {
   const { prompt, contextSubstituted } = substituteWorkflowVariables(
     template,
@@ -710,6 +876,32 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
   const endPattern = new RegExp(`${escapeRegExp(signal)}[\\s.,;:!?]*$`);
   const ownLinePattern = new RegExp(`^\\s*${escapeRegExp(signal)}\\s*$`, 'm');
   return endPattern.test(output) || ownLinePattern.test(output);
+}
+
+/**
+ * Name the completion channels a loop declared, for the max-iterations failure
+ * message (#2563).
+ *
+ * `loop.until` became optional once `until_bash` alone could end a loop, so a
+ * message hard-coding `without completion signal '<until>'` prints `undefined`
+ * for a deterministic-only loop and names a channel the author never declared.
+ * Both loop variants read this so they can never describe the same loop
+ * differently — the divergence between them is exactly what #2563 asked to fix.
+ *
+ * The schema guarantees at least one channel, so the empty case is unreachable;
+ * it is handled rather than asserted because this is only an error message.
+ */
+export function describeUnmetCompletion(control: {
+  until?: string;
+  until_bash?: string;
+  until_field?: string;
+}): string {
+  const channels: string[] = [];
+  if (control.until) channels.push(`completion signal '${control.until}'`);
+  if (control.until_bash) channels.push("a passing 'until_bash' check");
+  if (control.until_field) channels.push(`'${control.until_field}' ever being true`);
+  if (channels.length === 0) return 'without a completion channel';
+  return `without ${channels.join(' or ')}`;
 }
 
 /**

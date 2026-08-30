@@ -14,6 +14,38 @@ import {
   dashboardRunsResultSchema,
   identityPlatformSchema,
 } from './index';
+import type { DashboardWorkflowRun } from './index';
+
+const validDashboardWorkflowRun = {
+  id: 'run-1',
+  workflow_name: 'deploy',
+  conversation_id: 'conv-1',
+  parent_conversation_id: null,
+  codebase_id: null,
+  status: 'running',
+  outcome: null,
+  user_message: 'deploy please',
+  metadata: {},
+  started_at: new Date(),
+  completed_at: null,
+  last_activity_at: new Date(),
+  working_path: null,
+  user_id: null,
+  parent_run_id: null,
+  output_root: null,
+  adopted_from_run_id: null,
+  // dashboard extensions
+  codebase_name: 'my-repo',
+  platform_type: 'web',
+  worker_platform_id: null,
+  parent_platform_id: null,
+  current_step_name: null,
+  total_steps: null,
+  current_step_status: null,
+  agents_completed: null,
+  agents_failed: null,
+  agents_total: null,
+} satisfies DashboardWorkflowRun;
 
 describe('core schemas', () => {
   // -----------------------------------------------------------------------
@@ -107,6 +139,7 @@ describe('core schemas', () => {
       default_cwd: '/home/user/projects/my-project',
       default_branch: 'main',
       ai_assistant_type: 'claude',
+      kind: 'repo',
       commands: { plan: { path: '/cmds/plan.md', description: 'Plan' } },
       created_at: new Date(),
       updated_at: new Date(),
@@ -219,62 +252,40 @@ describe('core schemas', () => {
   // dashboardWorkflowRunSchema
   // -----------------------------------------------------------------------
   test('dashboardWorkflowRunSchema preserves all base workflowRun fields', () => {
-    const result = dashboardWorkflowRunSchema.safeParse({
-      id: 'run-1',
-      workflow_name: 'deploy',
-      conversation_id: 'conv-1',
-      parent_conversation_id: null,
-      codebase_id: null,
-      status: 'running',
-      user_message: 'deploy please',
-      metadata: {},
-      started_at: new Date(),
-      completed_at: null,
-      last_activity_at: new Date(),
-      working_path: null,
-      user_id: null,
-      // dashboard extensions
-      codebase_name: 'my-repo',
-      platform_type: 'web',
-      worker_platform_id: null,
-      parent_platform_id: null,
-      current_step_name: null,
-      total_steps: null,
-      current_step_status: null,
-      agents_completed: null,
-      agents_failed: null,
-      agents_total: null,
-    });
+    const result = dashboardWorkflowRunSchema.safeParse(validDashboardWorkflowRun);
     expect(result.success).toBe(true);
   });
 
   test('dashboardWorkflowRunSchema rejects invalid status', () => {
     const result = dashboardWorkflowRunSchema.safeParse({
-      id: 'run-1',
-      workflow_name: 'deploy',
-      conversation_id: 'conv-1',
-      parent_conversation_id: null,
-      codebase_id: null,
+      ...validDashboardWorkflowRun,
       status: 'invalid_status',
-      user_message: 'deploy please',
-      metadata: {},
-      started_at: new Date(),
-      completed_at: null,
-      last_activity_at: new Date(),
-      working_path: null,
-      user_id: null,
-      codebase_name: 'my-repo',
-      platform_type: 'web',
-      worker_platform_id: null,
-      parent_platform_id: null,
-      current_step_name: null,
-      total_steps: null,
-      current_step_status: null,
-      agents_completed: null,
-      agents_failed: null,
-      agents_total: null,
     });
     expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => issue.path)).toEqual([['status']]);
+    }
+  });
+
+  test('dashboardWorkflowRunSchema preserves nullable authored outcomes and rejects unknown values', () => {
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'succeeded',
+      }).success
+    ).toBe(true);
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'failed',
+      }).success
+    ).toBe(true);
+    expect(
+      dashboardWorkflowRunSchema.safeParse({
+        ...validDashboardWorkflowRun,
+        outcome: 'unknown',
+      }).success
+    ).toBe(false);
   });
 
   // -----------------------------------------------------------------------

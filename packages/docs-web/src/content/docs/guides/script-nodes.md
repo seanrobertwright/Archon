@@ -75,9 +75,16 @@ The file `.archon/scripts/fetch-github-pages.ts` is loaded and executed with
 4. **Capture.** `stdout` (with the trailing newline stripped) becomes
    `$nodeId.output`. On a successful run, `stderr` is logged as a warning and
    posted to the conversation but does **not** fail the node. A non-zero exit
-   code fails the node; on failure, `stderr` is the diagnostic surfaced in the
-   error message (`Script node 'X' failed [exit N]: <stderr>`) — the script
-   body is never echoed back to users.
+   code fails the node; on failure, tails of both streams are surfaced in the
+   error message (`Script node 'X' failed [exit N]: [stderr] ... [stdout] ...`),
+   sharing a ~2 KB diagnostic budget — stderr keeps priority, stdout gets the
+   remainder, and a label prefixes each stream only when both are populated.
+   With stderr empty, the stdout tail becomes the diagnostic. The script body
+   is never echoed back to users.
+5. **Retain.** Regardless of outcome, capped and credential-redacted tails of
+   both streams are written to the run transcript as an `exec_output` row — see
+   [Retained subprocess evidence](/guides/authoring-workflows#retained-subprocess-evidence).
+   That retention is evidence only; it never caps `$nodeId.output`.
 
 ## YAML Schema
 
@@ -88,7 +95,8 @@ The file `.archon/scripts/fetch-github-pages.ts` is loaded and executed with
   deps: ["httpx", "pydantic>=2"]               # optional, uv-only (see below)
   timeout: 60000                               # optional ms, default 120000
   depends_on: [upstream]                       # optional
-  when: "$upstream.output != ''"               # optional
+  when: "$upstream.output != '[]'"             # optional (upstream is a bash/script node;
+                                               #  an AI producer needs output_format + a field)
   trigger_rule: all_success                    # optional (default)
   retry:                                       # optional; same shape as bash/AI nodes
     max_attempts: 3

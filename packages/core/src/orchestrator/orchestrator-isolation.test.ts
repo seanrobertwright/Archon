@@ -6,7 +6,14 @@ import type { IsolationEnvironmentRow } from '@archon/isolation';
 // Type-only imports are erased at runtime, so these do not load './orchestrator'
 // (or the workflow engine) before the mock.module() calls below take effect.
 import type { WorkflowRoutingContext } from './orchestrator';
+import type { PreparedWorkflowSource } from '@archon/workflows/executor';
+import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import {
+  makeTestComposedWorkflow,
+  makeTestWorkflow,
+  withObservableCapturedSource,
+} from '@archon/workflows/test-utils';
 
 // ─── Mock setup (BEFORE importing module under test) ─────────────────────────
 
@@ -91,9 +98,10 @@ mock.module('@archon/providers', () => ({
 }));
 
 const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
+const mockFailWorkflowRun = mock((): Promise<void> => Promise.resolve());
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mockCreateWorkflowRun },
+    store: { createWorkflowRun: mockCreateWorkflowRun, failWorkflowRun: mockFailWorkflowRun },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),
@@ -104,8 +112,11 @@ mock.module('../config/config-loader', () => ({
   loadRepoConfig: mock(() => Promise.resolve(null)),
 }));
 
-mock.module('../utils/worktree-sync', () => ({
-  syncArchonToWorktree: mock(() => Promise.resolve(false)),
+const mockResolveWorkflowSourceRoot = mock(
+  (): Promise<string | undefined> => Promise.resolve(undefined)
+);
+mock.module('../utils/workflow-source-root', () => ({
+  resolveWorkflowSourceRoot: mockResolveWorkflowSourceRoot,
 }));
 
 mock.module('../services/cleanup-service', () => ({
@@ -152,12 +163,72 @@ mock.module('@archon/workflows/workflow-discovery', () => ({
 }));
 // Resolves to a paused result so dispatchBackgroundWorkflow's fire-and-forget
 // tail is a no-op (no result card is surfaced to the parent conversation).
-const mockExecuteWorkflow = mock(() => Promise.resolve({ paused: true }));
+// Mirrors the real executor's adopt site (#2690): setup awaits happen before rename,
+// then `capturedSourceOwner.adopt()` is called. One regression test holds that await
+// open to prove the background dispatch does not reclaim before adoption.
+let deferExecuteWorkflowAdoption = false;
+let releaseExecuteWorkflowAdoption: (() => void) | undefined;
+const mockExecuteWorkflow = mock(async (...args: unknown[]) => {
+  const opts = args[7] as
+    | {
+        preparedSource?: unknown;
+        capturedSourceOwner?: { adopt: () => void };
+      }
+    | undefined;
+  if (deferExecuteWorkflowAdoption) {
+    await new Promise<void>(resolve => {
+      releaseExecuteWorkflowAdoption = resolve;
+    });
+  }
+  if (opts?.preparedSource) opts.capturedSourceOwner?.adopt();
+  return { paused: true };
+});
+const mockPrepareWorkflowSource = mock(
+  (): Promise<PreparedWorkflowSource> =>
+    Promise.resolve({
+      runId: 'prepared-run-id',
+      captureRoot: '/capture',
+      origin: '/origin',
+      manifest: {
+        version: 1,
+        engine_version: 'test',
+        origin: '/origin',
+        captured_at: '2026-08-21T00:00:00.000Z',
+        digest: 'test-digest',
+        file_count: 0,
+        byte_count: 0,
+        scopes: [],
+      },
+      roots: {
+        project: '/capture/project',
+        globalWorkflows: '/capture/global/workflows',
+        globalCommands: '/capture/global/commands',
+        globalScripts: '/capture/global/scripts',
+        bundledWorkflows: '/capture/bundled',
+      },
+    })
+);
+/** Ownership calls the dispatch path makes on its capture, in order. */
+const capturedSourceOwnerCalls: string[] = [];
+
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mockExecuteWorkflow,
+  // Source capture runs before dispatch and does real filesystem work; stub it so these
+  // tests stay about routing. `mock.module` MERGES, so an export omitted here keeps its
+  // REAL implementation — which is exactly how a stub silently starts doing disk I/O.
+  prepareWorkflowSource: mockPrepareWorkflowSource,
+  recordSelectedWorkflow: mock(() => Promise.resolve()),
+  disposeWorkflowSource: mock(() => Promise.resolve()),
+  resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
+  withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
+    withObservableCapturedSource(capturedSourceOwnerCalls, body)
+  ),
 }));
 mock.module('@archon/workflows/router', () => ({
   findWorkflow: mock(() => undefined),
+  // Statically imported by the background dispatch path; a named import must link even
+  // when the test never exercises it.
+  resolveWorkflowName: mock(() => undefined),
 }));
 mock.module('@archon/workflows/utils/tool-formatter', () => ({
   formatToolCall: mock(() => ''),
@@ -330,7 +401,7 @@ describe('dispatchBackgroundWorkflow', () => {
     } as WorkflowDefinition;
   }
 
-  function makeRoutingCtx(): WorkflowRoutingContext {
+  function makeRoutingCtx(overrides?: Partial<WorkflowRoutingContext>): WorkflowRoutingContext {
     return {
       platform,
       conversationId: 'parent-conv',
@@ -339,6 +410,7 @@ describe('dispatchBackgroundWorkflow', () => {
       conversationDbId: 'parent-db-id',
       codebaseId: 'cb-1',
       availableWorkflows: [],
+      ...overrides,
     };
   }
 
@@ -349,14 +421,92 @@ describe('dispatchBackgroundWorkflow', () => {
 
   beforeEach(() => {
     platform = new MockPlatformAdapter();
+    deferExecuteWorkflowAdoption = false;
+    releaseExecuteWorkflowAdoption?.();
+    releaseExecuteWorkflowAdoption = undefined;
+    capturedSourceOwnerCalls.length = 0;
     mockResolve.mockClear();
     mockUpdateConversation.mockClear();
     mockCreateWorkflowRun.mockClear();
+    mockFailWorkflowRun.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockPrepareWorkflowSource.mockClear();
+    mockResolveWorkflowSourceRoot.mockClear();
+    mockResolveWorkflowSourceRoot.mockResolvedValue(undefined);
     mockLogger.info.mockClear();
     mockGetOrCreateConversation.mockResolvedValue(
       makeConversation({ id: 'worker-conv-1', platform_conversation_id: 'web-worker-1' })
     );
     mockGetCodebase.mockResolvedValue(makeCodebase());
+  });
+
+  test('refuses a composed approval gate before creating anything (#1764)', async () => {
+    // Enforced HERE rather than at the callers, because there are two entrypoints that
+    // background a run — the console's default dispatch and the `manage_run` tool's
+    // startWorkflow, which reaches every platform with native tools. A rule enforced per
+    // caller fails open the moment a third appears.
+    const block = makeTestWorkflow({
+      name: 'gate-blk',
+      nodes: [{ id: 'gate', approval: { message: 'Approve?' } }],
+    });
+    const parent = makeTestComposedWorkflow(
+      [block, makeTestWorkflow({ name: 'bg-parent', nodes: [{ id: 'inc', include: 'gate-blk' }] })],
+      'bg-parent'
+    );
+
+    await expect(dispatchBackgroundWorkflow(makeRoutingCtx(), parent)).rejects.toThrow(
+      /composes 'gate-blk'.*approval gate/s
+    );
+
+    // Refused before any side effect — no worker conversation, no run row.
+    expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  test('a workflow with only its OWN approval gate still dispatches', async () => {
+    // The rule is about a gate written in another file, not about gates.
+    const own = makeTestWorkflow({
+      name: 'own-gate',
+      nodes: [{ id: 'gate', approval: { message: 'Approve?' } }],
+      worktree: { enabled: false },
+    });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), makeTestComposedWorkflow([own], 'own-gate'));
+    expect(mockGetOrCreateConversation).toHaveBeenCalled();
+    await flushBackgroundExecution();
+  });
+
+  // #2910: a rejected terminal write means the row still says 'running' and the run's
+  // real outcome is unknown. Both sides of the branch are asserted — an ordinary
+  // rejection keeps its compensating write and its "failed" card; a terminal-write
+  // rejection gets neither, because a second write over the channel that just failed
+  // would either fail again or bury the real error.
+  test('marks the run failed and says so when execution rejects with an ordinary error', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    mockExecuteWorkflow.mockRejectedValueOnce(new Error('exec boom'));
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+    await flushBackgroundExecution();
+
+    expect(mockFailWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockFailWorkflowRun.mock.calls[0]?.[0]).toBe('run-1');
+    const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+    expect(sent.some(m => m.includes('failed: exec boom'))).toBe(true);
+  });
+
+  test('does not compensate or claim failure when the terminal write rejects', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    mockExecuteWorkflow.mockRejectedValueOnce(
+      new TerminalStatusWriteError(new Error('db is gone'))
+    );
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+    await flushBackgroundExecution();
+
+    expect(mockFailWorkflowRun).not.toHaveBeenCalled();
+    const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+    expect(sent.some(m => m.includes('final status could not be saved'))).toBe(true);
+    expect(sent.some(m => m.includes('failed: Failed to persist'))).toBe(false);
   });
 
   test('worktree.enabled: false skips isolation and runs in the parent cwd', async () => {
@@ -381,6 +531,123 @@ describe('dispatchBackgroundWorkflow', () => {
     await flushBackgroundExecution();
   });
 
+  test('transfers capture ownership before returning while executor adoption is deferred', async () => {
+    // Production awaits setup before its rename/adopt site. Hold that boundary open: the
+    // dispatch must return without either ownership scope reclaiming the staged source.
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    deferExecuteWorkflowAdoption = true;
+
+    try {
+      await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+
+      // Outer dispatch owner holds, detached owner synchronously takes over, then the
+      // outer owner adopts. The detached owner remains live across the unresolved await.
+      expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'hold:/capture', 'adopt']);
+
+      releaseExecuteWorkflowAdoption?.();
+      await flushBackgroundExecution();
+      expect(capturedSourceOwnerCalls).toEqual([
+        'hold:/capture',
+        'hold:/capture',
+        'adopt',
+        'adopt',
+      ]);
+    } finally {
+      deferExecuteWorkflowAdoption = false;
+      releaseExecuteWorkflowAdoption?.();
+      releaseExecuteWorkflowAdoption = undefined;
+    }
+  });
+
+  test('keeps holding the capture when the dispatch gives up after taking it', async () => {
+    // No run exists to own the bytes, so the wrapper must reclaim them — one leaked tree
+    // per failed dispatch otherwise, on the console's default path.
+    const { recordSelectedWorkflow } = await import('@archon/workflows/executor');
+    (recordSelectedWorkflow as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('capture manifest is read-only')
+    );
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+
+    expect(capturedSourceOwnerCalls).toEqual(['hold:/capture', 'reclaim:/capture']);
+    expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  // This path PRE-CREATES the run row (so the console can fetch it immediately), which
+  // means the executor's own `if (!workflowRun)` stamp never fires here — the values
+  // have to be written onto the row below. It is also the console's default path for
+  // non-interactive workflows, so losing the stamp would silently start every
+  // console-supplied run with its inputs missing rather than failing (#2554).
+  test('stamps caller-supplied declared inputs onto the pre-created run row', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx({ inputs: { diff: 'D1' } }), workflow);
+
+    expect(mockCreateWorkflowRun).toHaveBeenCalledTimes(1);
+    const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0] as unknown as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(runRow.metadata?.inputs).toEqual({ diff: 'D1' });
+
+    await flushBackgroundExecution();
+  });
+
+  test('writes no inputs key on the pre-created row when none are supplied', async () => {
+    // Bare-run parity with the executor-level row: a run that supplied nothing must
+    // look exactly as it did before #2554.
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+
+    const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0] as unknown as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(runRow.metadata).not.toHaveProperty('inputs');
+
+    await flushBackgroundExecution();
+  });
+
+  test('passes sparse model bindings to the executor for a pre-created background run', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+
+    await dispatchBackgroundWorkflow(
+      makeRoutingCtx({ modelOverrides: { tiers: { large: 'openai/gpt-5.6' } } }),
+      workflow
+    );
+    await flushBackgroundExecution();
+
+    const opts = mockExecuteWorkflow.mock.calls[0]?.[7] as { modelOverrideLayer?: unknown };
+    expect(opts.modelOverrideLayer).toEqual({
+      kind: 'raw',
+      overrides: { tiers: { large: 'openai/gpt-5.6' } },
+    });
+  });
+
+  test('passes validated run config to the executor for a pre-created background run', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    const runConfig = {
+      source: { kind: 'http' as const, label: 'inline' },
+      layer: { docsPath: 'handbook' },
+    };
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx({ runConfig }), workflow);
+    await flushBackgroundExecution();
+
+    const opts = mockExecuteWorkflow.mock.calls[0]?.[7] as { runConfig?: unknown };
+    expect(opts.runConfig).toEqual(runConfig);
+  });
+
+  test('terminalizes a pre-created row when executor setup rejects the run config', async () => {
+    const workflow = makeWorkflow({ worktree: { enabled: false } });
+    mockExecuteWorkflow.mockRejectedValueOnce(new Error('invalid run config provider'));
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
+    await flushBackgroundExecution();
+
+    expect(mockFailWorkflowRun).toHaveBeenCalledWith('run-1', 'invalid run config provider');
+  });
+
   test('default policy still resolves isolation for the worker', async () => {
     const workflow = makeWorkflow();
     mockResolve.mockResolvedValueOnce({
@@ -403,6 +670,52 @@ describe('dispatchBackgroundWorkflow', () => {
       expect.anything(),
       'workflow.worktree_disabled_by_policy'
     );
+
+    await flushBackgroundExecution();
+  });
+
+  test('missing-worktree adoption materializes the exact branch for a background run', async () => {
+    mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
+    const workflow = makeWorkflow();
+    mockResolve.mockResolvedValueOnce({
+      status: 'resolved',
+      env: makeEnvRow({
+        working_path: '/worktrees/feature-adopted',
+        branch_name: 'feature/adopted',
+      }),
+      cwd: '/worktrees/feature-adopted',
+      method: { type: 'created' },
+    });
+
+    await dispatchBackgroundWorkflow(
+      makeRoutingCtx({
+        adoptionLane: {
+          kind: 'checkout-branch',
+          taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+        },
+      }),
+      workflow
+    );
+
+    const resolveRequest = mockResolve.mock.calls[0]?.[0] as {
+      hints?: {
+        workflowType?: string;
+        taskBranch?: { kind: string; branch?: string };
+      };
+    };
+    expect(resolveRequest.hints).toMatchObject({
+      workflowType: 'task',
+      taskBranch: { kind: 'existing', branch: 'feature/adopted' },
+    });
+    const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0] as unknown as {
+      working_path: string;
+    };
+    expect(runRow.working_path).toBe('/worktrees/feature-adopted');
+    const captureArgs = mockPrepareWorkflowSource.mock.calls.at(-1) as unknown[];
+    expect((captureArgs[1] as { sourceRoot: string }).sourceRoot).toBe(
+      '/worktrees/feature-adopted'
+    );
+    expect(mockResolveWorkflowSourceRoot).not.toHaveBeenCalledWith('/worktrees/feature-adopted');
 
     await flushBackgroundExecution();
   });

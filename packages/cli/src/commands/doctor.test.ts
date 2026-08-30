@@ -10,8 +10,10 @@
 import { describe, it, expect, spyOn, afterEach, beforeEach } from 'bun:test';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mkdirSync, rmSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'fs';
 import * as git from '@archon/git';
+import { canonicalizeProjectPath } from '@archon/paths';
+import { removeTempTree } from '@archon/paths/test-utils';
 import {
   checkClaudeBinary,
   checkCodexBinary,
@@ -649,6 +651,34 @@ describe('checkFolderProject', () => {
     const result = await checkFolderProject('/tmp/x', async () => deps);
     expect(result.status).toBe('skip');
     expect(result.message).toContain('database unavailable');
+  });
+
+  // #2927: doctor has to ask the database the same question the CLI gate asks,
+  // or it reports "not a registered folder project" for a directory every other
+  // command resolves fine. It looked the raw cwd up, so any directory reached
+  // through a link — or through a Windows 8.3 short path — missed.
+  it('looks up the shared canonicalizer output, not the raw cwd', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'archon-doctor-canon-'));
+    const target = join(root, 'platform');
+    const link = join(root, 'platform-link');
+    mkdirSync(target);
+    // 'junction' is ignored on POSIX and needs no elevated privileges on Windows.
+    symlinkSync(target, link, 'junction');
+    const lookedUp: string[] = [];
+    try {
+      const deps = makeDeps({
+        findCodebaseByDefaultCwd: async (cwd: string) => {
+          lookedUp.push(cwd);
+          return null;
+        },
+      });
+
+      await checkFolderProject(link, async () => deps);
+
+      expect(lookedUp).toEqual([await canonicalizeProjectPath(target)]);
+    } finally {
+      await removeTempTree(root);
+    }
   });
 });
 

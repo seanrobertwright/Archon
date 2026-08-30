@@ -20,8 +20,9 @@
  */
 
 import { randomUUID } from 'crypto';
+import { isAbsolute, sep } from 'path';
 import type { BranchName } from '@archon/git';
-import { createLogger } from '@archon/paths';
+import { createLogger, isInsideArchonHome } from '@archon/paths';
 import type { WriteBackFinalizeResult, WriteBackApplySummary } from '@archon/providers/types';
 import type {
   BackendPrepareRequest,
@@ -86,7 +87,44 @@ interface ContainerEnvMetadata {
   workspacePath: string;
   /** Overlay mode that actually mounted (`fuse` = unprivileged; `native` = CAP_SYS_ADMIN). */
   overlayMode: OverlayMode;
+  /**
+   * Host path of the run's frozen workflow source, bind-mounted read-only at the SAME
+   * absolute path inside the container.
+   *
+   * Persisted because `resumeEnv` may have to recreate a container over the surviving
+   * volume, and a recreated container without this mount would resolve nothing: every
+   * named script would be missing at a path the run's own metadata says is fine.
+   */
+  sourceMount?: string;
   [key: string]: unknown;
+}
+
+/**
+ * Reject a source mount that is not Archon's to mount.
+ *
+ * The path is engine-internal — never YAML, never `archon.config` — so this guards
+ * against a bug or a hand-edited row, not a hostile author. It still matters: mounting an
+ * arbitrary host path into a container that runs agent code, or shadowing the project
+ * root the overlay depends on, are both far worse than failing the run.
+ */
+function assertMountableSource(sourceMount: string, workspacePath: string): void {
+  if (!isAbsolute(sourceMount)) {
+    throw new Error(`Container source mount must be an absolute path, got '${sourceMount}'.`);
+  }
+  if (!isInsideArchonHome(sourceMount)) {
+    throw new Error(
+      `Container source mount '${sourceMount}' is outside ARCHON_HOME. Only Archon-owned ` +
+        'run source may be mounted into a container.'
+    );
+  }
+  const workspace = workspacePath.endsWith(sep) ? workspacePath : workspacePath + sep;
+  const mount = sourceMount.endsWith(sep) ? sourceMount : sourceMount + sep;
+  if (mount.startsWith(workspace) || workspace.startsWith(mount)) {
+    throw new Error(
+      `Container source mount '${sourceMount}' overlaps the workspace root ` +
+        `'${workspacePath}'. Mounting it would shadow the overlay.`
+    );
+  }
 }
 
 export class ContainerBackend implements IIsolationBackend {
@@ -114,6 +152,9 @@ export class ContainerBackend implements IIsolationBackend {
   async prepare(req: BackendPrepareRequest): Promise<PreparedEnv> {
     const hostRoot = req.codebase.defaultCwd;
     const { image } = this.config;
+    const sourceMount = req.sourceMount;
+    // Before any docker work: a rejected mount must not leave a volume or container.
+    if (sourceMount !== undefined) assertMountableSource(sourceMount, hostRoot);
 
     await dockerPreflight(image, this.docker);
 
@@ -153,7 +194,8 @@ export class ContainerBackend implements IIsolationBackend {
         containerName,
         volume,
         hostRoot,
-        req.codebase.id
+        req.codebase.id,
+        sourceMount
       ));
     } catch (startErr) {
       // The container(s) are already removed inside startContainerWithOverlay;
@@ -177,6 +219,7 @@ export class ContainerBackend implements IIsolationBackend {
       resourceId,
       overlayMode,
       workspacePath: hostRoot,
+      ...(sourceMount !== undefined ? { sourceMount } : {}),
     };
     let row;
     try {
@@ -342,11 +385,15 @@ export class ContainerBackend implements IIsolationBackend {
           'an aggressive prune likely removed it; paused runs are never auto-pruned.)'
       );
     }
+    // Re-apply the source mount. A recreated container without it would resolve no
+    // named script, at a path the run's own metadata reports as intact.
+    if (meta.sourceMount !== undefined) assertMountableSource(meta.sourceMount, workspacePath);
     const { containerId, mode } = await this.startContainerWithOverlay(
       containerName,
       volume,
       workspacePath,
-      codebaseId
+      codebaseId,
+      meta.sourceMount
     );
     log.info({ envId, containerName, volume }, 'isolation.container_resume_recreated');
     return this.preparedEnvFor(containerId, workspacePath, envId, mode);
@@ -505,7 +552,8 @@ export class ContainerBackend implements IIsolationBackend {
     containerName: string,
     volume: string,
     hostRoot: string,
-    codebaseId: string
+    codebaseId: string,
+    sourceMount?: string
   ): Promise<{ containerId: string; mode: OverlayMode }> {
     const failures: string[] = [];
     for (const mode of OVERLAY_MODES) {
@@ -516,7 +564,8 @@ export class ContainerBackend implements IIsolationBackend {
           volume,
           hostRoot,
           codebaseId,
-          mode
+          mode,
+          sourceMount
         );
       } catch (runErr) {
         // `docker run` itself refused (e.g. `--device /dev/fuse` on a host with no
@@ -562,7 +611,8 @@ export class ContainerBackend implements IIsolationBackend {
     volume: string,
     hostRoot: string,
     codebaseId: string,
-    mode: OverlayMode
+    mode: OverlayMode,
+    sourceMount?: string
   ): Promise<string> {
     // Least-privilege per mode: fuse gets ONLY the device; native gets the caps.
     const privilegeArgs =
@@ -596,6 +646,11 @@ export class ContainerBackend implements IIsolationBackend {
       `${hostRoot}:/mnt/lower:ro`,
       '-v',
       `${volume}:/mnt/upper`,
+      // The run's frozen workflow source, at the SAME absolute path it has on the host.
+      // Identical paths are what let the engine hold one source-roots value that means
+      // the same thing whether a node executes here or on the host. Read-only: the run
+      // reads its own commands and scripts, it never writes them.
+      ...(sourceMount ? ['-v', `${sourceMount}:${sourceMount}:ro`] : []),
       '-e',
       `ARCHON_WORKSPACE_PATH=${hostRoot}`,
       '-e',

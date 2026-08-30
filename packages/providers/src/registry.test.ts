@@ -15,7 +15,7 @@ import { registerPiProvider } from './community/pi/registration';
 import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
 import { UnknownProviderError } from './errors';
-import type { ProviderRegistration, IAgentProvider, ProviderCapabilities } from './types';
+import type { ProviderRegistration, IAgentProvider } from './types';
 
 /** Minimal mock provider for testing registration. */
 function makeMockProvider(id: string): IAgentProvider {
@@ -37,6 +37,7 @@ function makeMockProvider(id: string): IAgentProvider {
       sandbox: false,
       nativeTools: false,
       containerExec: false,
+      settingSources: false,
     }),
     async *sendQuery() {
       yield { type: 'result' as const };
@@ -56,6 +57,7 @@ function makeMockRegistration(
     builtIn: false,
     credentials: { kind: 'static', specs: [] },
     ...overrides,
+    parseRunConfig: overrides?.parseRunConfig ?? (raw => raw),
   };
 }
 
@@ -126,6 +128,7 @@ describe('registry', () => {
   describe('getProviderCapabilities', () => {
     test('returns Claude capabilities without instantiation', () => {
       const caps = getProviderCapabilities('claude');
+      expect(caps.sessionFork).toBe(true);
       expect(caps.mcp).toBe(true);
       expect(caps.hooks).toBe(true);
       expect(caps.envInjection).toBe(true);
@@ -133,6 +136,7 @@ describe('registry', () => {
 
     test('returns Codex capabilities without instantiation', () => {
       const caps = getProviderCapabilities('codex');
+      expect(caps.sessionFork).toBe(false);
       expect(caps.mcp).toBe(true);
       expect(caps.hooks).toBe(false);
       expect(caps.envInjection).toBe(true);
@@ -176,6 +180,20 @@ describe('registry', () => {
     test('throws on duplicate registration', () => {
       expect(() => registerProvider(makeMockRegistration('claude'))).toThrow(
         "Provider 'claude' is already registered"
+      );
+    });
+
+    test('rejects session fork support without session resume support', () => {
+      const entry = makeMockRegistration('invalid-fork', {
+        capabilities: {
+          ...makeMockProvider('invalid-fork').getCapabilities(),
+          sessionFork: true,
+          sessionResume: false,
+        },
+      });
+
+      expect(() => registerProvider(entry)).toThrow(
+        "Provider 'invalid-fork' cannot advertise sessionFork without sessionResume"
       );
     });
   });
@@ -299,6 +317,7 @@ describe('registry', () => {
       expect(caps.toolRestrictions).toBe(true);
       expect(caps.skills).toBe(true);
       expect(caps.sessionResume).toBe(true);
+      expect(caps.sessionFork).toBe(true);
       expect(caps.envInjection).toBe(true);
       // Best-effort structured output via prompt engineering + post-parse —
       // not SDK-enforced like Claude/Codex, but wired up and tested.

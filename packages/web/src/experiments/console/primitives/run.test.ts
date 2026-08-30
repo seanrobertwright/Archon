@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { toRun, normalizeOrigin, runMessageConversationId } from './run';
+import { runStatusLabel } from '../lib/run-status';
 
 type Raw = Parameters<typeof toRun>[0];
 
@@ -186,7 +187,13 @@ describe('toRun — approval parsing', () => {
         metadata: { approval: { nodeId: 'gate', message: 'Approve?' } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: 'Approve?', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
   });
 
   test('surfaces completionSignaled on a signal-bearing interactive-loop gate (#2074)', () => {
@@ -218,7 +225,13 @@ describe('toRun — approval parsing', () => {
         metadata: { approval: { nodeId: 'gate' } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: '', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: '',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
   });
 
   test('approval is null when absent or malformed (no string nodeId)', () => {
@@ -273,7 +286,13 @@ describe('toRun — resolved gate (approved/rejected awaiting resume)', () => {
         metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: null } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: 'Approve?', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
     expect(r.gateResolved).toBeNull();
   });
 
@@ -286,7 +305,42 @@ describe('toRun — resolved gate (approved/rejected awaiting resume)', () => {
         metadata: { approval: { nodeId: 'gate', message: 'Approve?', resolved: 'weird' } },
       })
     );
-    expect(r.approval).toEqual({ nodeId: 'gate', message: 'Approve?', completionSignaled: false });
+    expect(r.approval).toEqual({
+      nodeId: 'gate',
+      message: 'Approve?',
+      completionSignaled: false,
+      decisions: [{ id: 'approve' }, { id: 'reject' }],
+      decisionsAuthored: false,
+    });
     expect(r.gateResolved).toBeNull();
+  });
+});
+
+describe('toRun — durable wait', () => {
+  test('parses the active wait and labels it without implying human approval', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'await-checks',
+        status: 'paused',
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'checks',
+            kind: 'event',
+            event: 'checks.complete',
+            resumeAt: '2026-08-25T10:00:00.000Z',
+          },
+        },
+      })
+    );
+
+    expect(r.wait).toEqual({
+      nodeId: 'checks',
+      kind: 'event',
+      event: 'checks.complete',
+      resumeAt: '2026-08-25T10:00:00.000Z',
+    });
+    expect(runStatusLabel(r)).toBe('Waiting for event');
   });
 });

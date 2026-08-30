@@ -2,13 +2,15 @@
  * Standalone repository clone/register logic.
  * Extracted from command-handler.ts for reuse by REST endpoints.
  */
-import { access, rm, stat, realpath } from 'fs/promises';
+import { access, rm, stat } from 'fs/promises';
 import { join, basename, resolve } from 'path';
 import * as codebaseDb from '../db/codebases';
 import { sanitizeError } from '../utils/credential-sanitizer';
 import { execFileAsync } from '@archon/git';
+import { findCodebaseForCheckoutPath } from '../services/codebase-checkout-resolver';
 import {
   expandTilde,
+  canonicalizeProjectPath,
   getCommandFolderSearchPaths,
   ensureProjectStructure,
   ensureFolderProjectStructure,
@@ -411,8 +413,9 @@ export async function registerRepository(localPath: string): Promise<RegisterRes
     throw new Error(`Path is not a git repository: ${localPath} (${(error as Error).message})`);
   }
 
-  // Check if already registered by path
-  const existing = await codebaseDb.findCodebaseByDefaultCwd(localPath);
+  // Git's physical common directory proves linked-checkout ownership without
+  // conflating separate clones, remotes, names, or branches (#1192).
+  const existing = await findCodebaseForCheckoutPath(localPath);
   if (existing) {
     return {
       codebaseId: existing.id,
@@ -475,7 +478,7 @@ export async function registerRepository(localPath: string): Promise<RegisterRes
 }
 
 /**
- * Build an accurate path-validation error from a `realpath`/`stat` failure —
+ * Build an accurate path-validation error from a `stat` failure —
  * `ENOENT` really is "does not exist", but `EACCES`/`ENOTDIR`/`ELOOP` are not,
  * and mislabeling them "Path does not exist" sends the user chasing a typo
  * instead of a permissions/symlink problem. The raw errno message is preserved.
@@ -501,23 +504,17 @@ function pathValidationError(path: string, error: Error): Error {
  * artifact/log storage lives under `~/.archon/workspaces/_folder/<slug>/`.
  */
 export async function registerFolder(localPath: string, name?: string): Promise<RegisterResult> {
-  const expandedPath = resolve(expandTilde(localPath));
+  // `canonicalizeProjectPath` is the one canonicalizer for `default_cwd`; the CLI
+  // gate, `archon doctor` and `/register-project` all resolve through it, so a
+  // symlinked root (macOS `/tmp` → `/private/tmp`) or a Windows 8.3 short path
+  // registers under exactly the string those lookups will ask for (#2927). Repo
+  // projects are immune because git canonicalizes the repo root on both sides.
+  const resolvedPath = await canonicalizeProjectPath(localPath);
 
-  // Canonicalize symlinks (realpath) so the stored `default_cwd` matches what the
-  // lookups resolve to: `archon doctor` uses `process.cwd()` (which resolves
-  // symlinks — e.g. macOS `/tmp` → `/private/tmp`) and the CLI gate realpaths its
-  // cwd too. Without this a symlinked root registers under one path but is looked
-  // up under another, causing a lookup miss and a duplicate row on re-register.
-  // Repo projects are immune because git canonicalizes the repo root on both
-  // sides. realpath also validates existence (throws ENOENT for a missing path).
-  let resolvedPath: string;
-  try {
-    resolvedPath = await realpath(expandedPath);
-  } catch (error) {
-    throw pathValidationError(expandedPath, error as Error);
-  }
-
-  // realpath succeeds for a symlink-to-file too — require a directory (no git check).
+  // The stat below is the existence gate: canonicalization is fail-safe and
+  // returns the unresolved path, so a missing/unreadable path surfaces here with
+  // its real errno rather than being registered. It also rejects a symlink to a
+  // file, which realpath resolves happily (no git check on this path).
   let isDirectory = false;
   try {
     isDirectory = (await stat(resolvedPath)).isDirectory();

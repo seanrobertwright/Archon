@@ -109,7 +109,8 @@ archon workflow run my-workflow "auth refresh-tokens"
 | `nodes` | Yes | array | DAG nodes (see Node Options below) |
 | `provider` | No | string | Registered provider identifier (e.g. `claude`, `codex`). Default: `claude` |
 | `model` | No | string | Model for all nodes (`sonnet`, `opus`, `haiku`, or full model ID) |
-| `modelReasoningEffort` | No | string | Codex only, no per-node form: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
+| `effort` | No | string | Reasoning depth on any provider that has one; also a node field: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` \| `ultra` |
+| `modelReasoningEffort` | No | string | **Deprecated** — translated into `effort` at load (dropped if `effort` is also declared), with a warning: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` \| `ultra` |
 | `webSearchMode` | No | string | Codex only, no per-node form. Gates Codex's built-in search tool, not network access: `disabled` \| `cached` \| `live` |
 
 ### Node Options (DAG)
@@ -127,14 +128,14 @@ All nodes share these base fields:
 | `loop_group` | One of | object | Multi-node sub-DAG repeated per iteration (see Loop Group Options below) |
 | `approval` | One of | object | Pause for human review; see [Approval Nodes](/guides/approval-nodes/) |
 | `cancel` | One of | string | Reason string; terminates the run with `cancelled` status (not `failed`). Usually gated with `when:` |
-| `include` | One of | string | Name of another workflow whose nodes are inlined at discovery as a namespaced sub-DAG; see [Reusing a Shared Sub-DAG](/guides/authoring-workflows/#reusing-a-shared-sub-dag-with-include) |
-| `workflow` | One of | string | Name of another workflow run at execution time as a separate governed CHILD run (own run record, gates, artifacts, cost); see [Composing a Governed Sub-Run](/guides/authoring-workflows/#composing-a-governed-sub-run-with-workflow) |
+| `include` | One of | string | Name of another workflow whose nodes are inlined at discovery as a namespaced sub-DAG; see [Composing Another Workflow](/guides/authoring-workflows/#composing-another-workflow-with-include) |
+| `workflow` | One of | string | Name of another workflow run at execution time as a separate governed CHILD run (own run record, gates, artifacts, cost); see [Launching a Separate Governed Run](/guides/authoring-workflows/#launching-a-separate-governed-run-with-workflow) |
 | `depends_on` | No | string[] | Node IDs that must complete before this node runs |
 | `when` | No | string | Condition expression; node is skipped if false |
 | `trigger_rule` | No | string | Join semantics when multiple upstreams exist (see Trigger Rules) |
 | `provider` | No | string | Per-node provider override (any registered provider) |
 | `model` | No | string | Per-node model override |
-| `context` | No | `fresh` \| `shared` | Session context — `fresh` starts a new conversation, `shared` inherits from prior node |
+| `context` | No | `fresh` \| `shared` \| `{ resume: node-id }` | Session context — `fresh` starts a new conversation; scalar `shared` inherits the ambient prior session in a sequential layer; named [`resume`](/guides/authoring-workflows/#addressable-session-ancestry) forks one exact upstream session and is required for parallel ancestry |
 | `output_format` | No | JSON Schema | Enforce structured JSON output from this node |
 | `allowed_tools` | No | string[] | Restrict available tools to this list (Claude only) |
 | `denied_tools` | No | string[] | Remove specific tools from this node's context (Claude only) |
@@ -192,10 +193,11 @@ Defined under `loop:` inside a node:
 |-------|----------|------|-------------|
 | `prompt` | One of `prompt`/`command` | string | Inline AI instructions executed each iteration |
 | `command` | One of `prompt`/`command` | string | Package-local or shared command whose body is the iteration prompt — exactly one of `prompt` or `command` |
-| `until` | Yes | string | Completion signal string — loop ends when AI output contains this |
+| `until` | One channel required | string | Completion signal string — loop ends when AI output contains this. Omit it for a deterministic or structured loop: with no signal declared, nothing matches prose |
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | Start a new session each iteration (default: false) |
-| `until_bash` | No | string | Shell script run after each iteration; exit 0 signals completion |
+| `until_bash` | One channel required | string | Shell script run after each iteration; exit 0 signals completion. Skipped once a cheaper channel already fired |
+| `until_field` | One channel required | string | **`loop:` only.** Names a boolean in the node's `output_format`; the loop ends when its validated value is `true` |
 | `interactive` | No | boolean | Pause at a human gate after each iteration for input via `/workflow approve` |
 | `gate_message` | No | string | Message shown at the interactive gate (required when `interactive: true`) |
 | `signal_completes` | No | boolean | Interactive loops only: a detected completion signal completes the node immediately (even on iteration 1) instead of gating (default: false) |
@@ -217,11 +219,11 @@ per iteration (see [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-
 
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
-| `nodes` | Yes | node[] | Sub-DAG body re-run in full each iteration. Any node type, including nested `loop_group`. `depends_on` is body-scoped; body ids must not shadow outer ids |
-| `until` | Yes | string | Completion signal — checked in the body's terminal-node output |
+| `nodes` | Yes | node[] | Sub-DAG body re-run in full each iteration. Executable nodes, `include:`, and nested `loop_group` are supported; runtime `workflow:` sub-runs are not. `depends_on` is body-scoped; body ids must not shadow outer ids |
+| `until` | One channel required | string | Completion signal — checked in the body's terminal-node output. Omit it for a deterministic group |
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | `true` starts fresh body AI sessions each iteration (default: false — sessions continue) |
-| `until_bash` | No | string | Shell script run after each iteration; exit 0 signals completion |
+| `until_bash` | One channel required | string | Shell script run after each iteration; exit 0 signals completion. Skipped once a cheaper channel already fired |
 | `interactive` | No | boolean | Pause at a human gate after each non-completing iteration |
 | `gate_message` | No | string | Message shown at the interactive gate |
 | `signal_completes` | No | boolean | Interactive loops only: a detected completion signal completes the group immediately (even on iteration 1) instead of gating (default: false) |

@@ -13,7 +13,9 @@
  * │   ├── artifacts/runs/{workflow-id}/  # Workflow artifacts (NEVER in git)
  * │   ├── logs/{workflow-id}.jsonl       # Workflow execution logs
  * │   └── state/                         # $STATE_DIR — cross-run state, shared per project
+ * ├── temp/                              # Ephemeral scratch (per-simulation dry-run dirs)
  * ├── worktrees/                         # Legacy global worktrees (for repos not in workspaces/)
+ * ├── install.json                       # Last compiled CLI invoked
  * └── config.yaml                        # Global config
  *
  * `resolveProjectStorageKey` + `getProjectStoragePaths` are the single source of
@@ -22,7 +24,7 @@
  * For Docker: /.archon/
  */
 
-import { join, dirname, normalize, basename, sep } from 'path';
+import { join, dirname, normalize, basename, resolve, sep } from 'path';
 import { homedir } from 'os';
 import { access, mkdir, symlink, lstat, readdir, readlink, realpath, rm, stat } from 'fs/promises';
 import { readFileSync } from 'fs';
@@ -47,13 +49,50 @@ export function expandTilde(path: string): string {
 }
 
 /**
+ * Canonicalize a directory path into the single form stored in and looked up
+ * from `remote_agent_codebases.default_cwd`.
+ *
+ * Every writer and every reader of that column MUST resolve through this one
+ * function. The column is matched by exact string equality (and by a
+ * separator-anchored prefix), so two call sites using two different
+ * canonicalizers silently stop finding each other's rows. That is issue #2927:
+ * on Windows `fs/promises.realpath` expands an 8.3 short component
+ * (`C:\Users\RUNNER~1\…` → `C:\Users\runneradmin\…`) while `fs.realpathSync`
+ * does not, so a folder project registered by the CLI became invisible to every
+ * later command run in that same directory.
+ *
+ * `fs/promises.realpath` is the chosen implementation for two reasons. It is the
+ * only variant whose Windows short-name behaviour has actually been observed
+ * here (`fs.realpathSync.native` is believed equivalent but is unverified on
+ * Windows, so nothing depends on it). And expansion is what makes this a
+ * canonicalization at all: the long name is the one name a directory has, so
+ * the non-expanding variant would leave two spellings of one directory able to
+ * register two rows.
+ *
+ * Fail-safe: a path that cannot be resolved (missing, unreadable parent, race)
+ * canonicalizes to its own absolute form rather than throwing, so a lookup still
+ * gets an answer to reject. Nothing is swallowed — callers that require the path
+ * to exist detect it immediately afterwards (`registerFolder` stats the result;
+ * a reader misses the lookup and reports an unregistered directory).
+ */
+export async function canonicalizeProjectPath(path: string): Promise<string> {
+  const absolute = resolve(expandTilde(path));
+  try {
+    return await realpath(absolute);
+  } catch (err) {
+    getLog().debug({ err, path: absolute }, 'paths.canonicalize_project_path_failed');
+    return absolute;
+  }
+}
+
+/**
  * Detect if running in Docker container
  */
-export function isDocker(): boolean {
+export function isDocker(env: NodeJS.ProcessEnv = process.env): boolean {
   return (
-    process.env.WORKSPACE_PATH === '/workspace' ||
-    (process.env.HOME === '/root' && Boolean(process.env.WORKSPACE_PATH)) ||
-    process.env.ARCHON_DOCKER === 'true'
+    env.WORKSPACE_PATH === '/workspace' ||
+    (env.HOME === '/root' && Boolean(env.WORKSPACE_PATH)) ||
+    env.ARCHON_DOCKER === 'true'
   );
 }
 
@@ -103,12 +142,12 @@ export function getWSLDistroName(): string | undefined {
  * - Docker: /.archon
  * - Local: ~/.archon (or ARCHON_HOME env var)
  */
-export function getArchonHome(): string {
-  if (isDocker()) {
+export function getArchonHome(env: NodeJS.ProcessEnv = process.env): string {
+  if (isDocker(env)) {
     return '/.archon';
   }
 
-  const envHome = process.env.ARCHON_HOME;
+  const envHome = env.ARCHON_HOME;
   if (envHome) {
     if (envHome === 'undefined') {
       throw new Error(
@@ -150,10 +189,24 @@ export function getArchonWorktreesPath(): string {
 }
 
 /**
+ * Get the ephemeral scratch area (~/.archon/temp/).
+ * Contents are per-process throwaway — each consumer creates a uniquely named
+ * subdirectory and removes it when done (currently: dry-run simulations).
+ */
+export function getArchonTempPath(): string {
+  return join(getArchonHome(), 'temp');
+}
+
+/**
  * Get the global config file path
  */
 export function getArchonConfigPath(): string {
   return join(getArchonHome(), 'config.yaml');
+}
+
+/** Path to the compiled CLI discovery manifest (`<ARCHON_HOME>/install.json`). */
+export function getInstallManifestPath(): string {
+  return join(getArchonHome(), 'install.json');
 }
 
 /** Path where the auto-provisioned encryption key is stored (~/.archon/credential-key). */

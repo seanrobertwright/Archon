@@ -1,8 +1,8 @@
 import { mock, describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 // spyOn (NOT mock.module) for config-loader: this file shares a `bun test`
-// invocation with the real config-loader.test.ts and worktree-sync.test.ts —
-// a mock.module here would poison them (pattern: worktree-sync.test.ts).
+// invocation with the real config-loader.test.ts, and `mock.module` is
+// process-global and irreversible — mocking the loader here would poison it.
 import * as configLoader from '../config/config-loader';
 
 const mockQuery = mock(() => Promise.resolve(createQueryResult([])));

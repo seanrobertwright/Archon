@@ -88,6 +88,8 @@ function buildDemoRuns(scope: Scope, projectName: string | null): Run[] {
         message:
           'Answer the foundation questions above. Your answers will guide the research phase.',
         completionSignaled: false,
+        decisions: [{ id: 'approve' }, { id: 'reject' }],
+        decisionsAuthored: false,
       },
     },
     {
@@ -103,6 +105,8 @@ function buildDemoRuns(scope: Scope, projectName: string | null): Run[] {
         nodeId: 'review/approve',
         message: 'Approve changes before opening PR?',
         completionSignaled: false,
+        decisions: [{ id: 'approve' }, { id: 'reject' }],
+        decisionsAuthored: false,
       },
     },
     {

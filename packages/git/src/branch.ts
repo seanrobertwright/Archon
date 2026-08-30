@@ -272,20 +272,21 @@ export async function isBranchMerged(
  * Returns true if every reported commit is patch-equivalent (or if there are no
  * commits to compare). Returns false if any commit is unmerged.
  *
- * Returns false for expected errors (branch/repo not found).
+ * Returns false for expected errors (branch/repo not found), unless callers
+ * need those errors surfaced to distinguish an unmerged branch from an
+ * unverifiable comparison.
  * Throws for unexpected errors (permission denied, corruption).
  */
 export async function isPatchEquivalent(
   repoPath: RepoPath,
   branchName: BranchName,
-  baseBranch: BranchName
+  baseRef: string,
+  options: { throwOnExpectedError?: boolean } = {}
 ): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['-C', repoPath, 'cherry', baseBranch, branchName],
-      { timeout: 15000 }
-    );
+    const { stdout } = await execFileAsync('git', ['-C', repoPath, 'cherry', baseRef, branchName], {
+      timeout: 15000,
+    });
     const lines = stdout.split('\n').filter(line => line.trim());
     if (lines.length === 0) return true;
     return lines.every(line => line.startsWith('-'));
@@ -300,14 +301,14 @@ export async function isPatchEquivalent(
       errorText.includes('no such file') ||
       err.code === 'ENOENT';
 
-    if (isExpectedError) return false;
+    if (isExpectedError && !options.throwOnExpectedError) return false;
 
     getLog().error(
-      { err: error, repoPath, branchName, baseBranch },
+      { err: error, repoPath, branchName, baseRef },
       'branch.patch_equivalent_check_failed'
     );
     throw new Error(
-      `Failed to check if ${branchName} is patch-equivalent to ${baseBranch}: ${err.message}`
+      `Failed to check if ${branchName} is patch-equivalent to ${baseRef}: ${err.message}`
     );
   }
 }
@@ -376,6 +377,60 @@ export async function getCurrentBranch(
     // Unexpected (permission denied, timeout): same safe default; log for debugging.
     getLog().debug({ workingPath, err: error as Error }, 'get_current_branch_failed');
     return null;
+  }
+}
+
+/**
+ * Read the checked-out branch for an ownership decision.
+ *
+ * Unlike `getCurrentBranch`, this returns `null` only for Git's explicit
+ * detached-HEAD result. Infrastructure and repository errors remain errors so
+ * callers never mistake an unreadable checkout for a different branch.
+ */
+export async function getCurrentBranchStrict(
+  workingPath: RepoPath | WorktreePath
+): Promise<BranchName | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', workingPath, 'symbolic-ref', '--quiet', '--short', 'HEAD'],
+      { timeout: 10000 }
+    );
+    const branch = stdout.trim();
+    if (!branch) {
+      throw new Error(`Git returned no branch for checkout ${workingPath}`);
+    }
+    return toBranchName(branch);
+  } catch (error) {
+    const err = error as Error & { code?: number | string };
+    if (err.code === 1 || err.code === '1') return null;
+    throw new Error(`Failed to inspect the current branch at ${workingPath}: ${err.message}`, {
+      cause: error,
+    });
+  }
+}
+
+/** Verify an exact local branch ref without treating Git failures as absence. */
+export async function localBranchExists(
+  repoPath: RepoPath,
+  branchName: BranchName
+): Promise<boolean> {
+  try {
+    await execFileAsync(
+      'git',
+      ['-C', repoPath, 'show-ref', '--verify', '--quiet', `refs/heads/${branchName}`],
+      { timeout: 10000 }
+    );
+    return true;
+  } catch (error) {
+    const err = error as Error & { code?: number | string };
+    if (err.code === 1 || err.code === '1') return false;
+    throw new Error(
+      `Failed to verify local branch '${branchName}' at ${repoPath}: ${err.message}`,
+      {
+        cause: error,
+      }
+    );
   }
 }
 

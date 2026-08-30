@@ -12,12 +12,34 @@ import {
   KNOWN_DAG_NODE_KEYS,
 } from './dag-node';
 import type { NestedKeySpec } from './dag-node';
+import { jsonValueSchema } from '../output-ref';
 
 // ---------------------------------------------------------------------------
 // Shared enum schemas
 // ---------------------------------------------------------------------------
 
-export const modelReasoningEffortSchema = z.enum(['minimal', 'low', 'medium', 'high', 'xhigh']);
+/**
+ * DEPRECATED (#2556). The Codex-only spelling of reasoning depth.
+ *
+ * This is an ACCEPTED-INPUT alias only: the loader translates
+ * `modelReasoningEffort:` into `effort:` and never emits it, so a
+ * `WorkflowDefinition` produced by `parseWorkflow` never carries the field.
+ * It stays on the schema so `KNOWN_WORKFLOW_KEYS` still recognises it — dropping
+ * it would turn an author's deprecated-but-valid line into an "unknown key"
+ * warning and silently discard the value instead of honouring it.
+ *
+ * The last provider-specific effort vocabulary left inside @archon/workflows;
+ * it goes away with the field. `effortLevelSchema` in ./dag-node is the live one.
+ */
+export const modelReasoningEffortSchema = z.enum([
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+]);
 
 export type ModelReasoningEffort = z.infer<typeof modelReasoningEffortSchema>;
 
@@ -131,11 +153,30 @@ export type WorkflowEvidencePolicy = z.infer<typeof workflowEvidencePolicySchema
  */
 export const workflowInputSpecSchema = z.object({
   required: z.boolean().optional(),
-  default: z.string().optional(),
+  // Any JSON-compatible value (#2637): a boolean/number/array default keeps its
+  // logical type through the input contract instead of arriving as text.
+  default: jsonValueSchema.optional(),
   description: z.string().optional(),
 });
 
 export type WorkflowInputSpec = z.infer<typeof workflowInputSpecSchema>;
+
+/**
+ * Deprecation marker (#2781). A bundle declares this on a workflow that is being
+ * replaced and kept only for a deprecation window; every run-start surface then
+ * composes its standard notice around `message`.
+ *
+ * Declare-and-done: a future deprecation of any bundled workflow (or a replaced
+ * pack revision) needs no engine change — set the field, get the notice. Pure
+ * declarative coordination, so it stays admissible under the Workflow Language
+ * Constitution (code computes, YAML coordinates).
+ */
+export const workflowDeprecationSchema = z.object({
+  /** Per-item sentence carried inside the standard run-start deprecation notice. */
+  message: z.string().min(1),
+});
+
+export type WorkflowDeprecation = z.infer<typeof workflowDeprecationSchema>;
 
 // ---------------------------------------------------------------------------
 // WorkflowBase — common fields shared by all workflow types
@@ -148,6 +189,26 @@ export const workflowBaseSchema = z.object({
   model: z.string().optional(),
   modelReasoningEffort: modelReasoningEffortSchema.optional(),
   webSearchMode: webSearchModeSchema.optional(),
+  /**
+   * The workflow's CLASS declaration (#2707 step 2): `true` means this
+   * workflow's tree may pause. Every background-dispatch entry point
+   * independently refuses to background an `interactive: true` workflow —
+   * CLI `--detach`, the `manage_run` native tool, and web's default
+   * background dispatch — so a pause always has a foreground driver watching
+   * for it. Absent/`false` means the workflow is unattended-class; it is
+   * also the class a `fan_out:` target must resolve to.
+   *
+   * See `validateWorkflowClassPlacement`'s doc comment in `loader.ts` for the
+   * precise load-time enforcement scope — it is narrower than "no pause node
+   * anywhere": a NATIVE gate/interactive-loop authored directly in this
+   * workflow's own DAG without `interactive: true` is inferred as
+   * `interactive: true` with a one-time WARN during a grace period (#2736/
+   * #2738), not a load error. A gate that arrives via `include:` composition
+   * is deliberately NOT covered here (`assertComposedGateDriveable` remains
+   * the invocation-time check for that case — the same reusable block can be
+   * legitimately composed by different parents, so load time cannot always
+   * tell which workflow will own a given run).
+   */
   interactive: z.boolean().optional(),
   effort: effortLevelSchema.optional(),
   thinking: thinkingConfigSchema.optional(),
@@ -195,6 +256,21 @@ export const workflowBaseSchema = z.object({
    * including a non-sink node.
    */
   returns: z.string().min(1).optional(),
+  /**
+   * Required boolean property on the declared `returns:` node that records the
+   * workflow author's verdict independently from the run lifecycle (#2618).
+   * The loader validates the selected node's `output_format` contract; the
+   * engine maps exact true/false values to succeeded/failed without inference.
+   */
+  outcome_field: z.string().trim().min(1).optional(),
+  /**
+   * Marks the workflow deprecated (#2781): run-start surfaces announce removal
+   * in an upcoming release with a switch/copy escape hatch, while it keeps
+   * running normally. Metadata-only — never blocks or alters execution.
+   * Bundled defaults carry it during a deprecation window; nothing may ship it
+   * on the exempt `archon-assist` default.
+   */
+  deprecated: workflowDeprecationSchema.optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
@@ -211,7 +287,13 @@ export const workflowDefinitionSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
 });
 
-/** Workflow definition with fully typed nodes (DagNode[]) derived from the schema. */
+/**
+ * Workflow definition with fully typed nodes derived from the schema. `nodes`'
+ * element type is `DagNode | IncludeDirective` (not `DagNode[]` alone) because
+ * `dagNodeSchema` still parses `include:` entries at this pre-expansion stage
+ * (#2486) — `expandWorkflowIncludes` consumes every `IncludeDirective` before
+ * the executor ever sees a `WorkflowDefinition`.
+ */
 export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { prompt?: never };
 
 // ---------------------------------------------------------------------------
@@ -264,9 +346,10 @@ export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = ne
     'evidence_policy',
     { kind: 'object', keys: new Set(Object.keys(workflowEvidencePolicySchema.shape)) },
   ],
+  ['deprecated', { kind: 'object', keys: new Set(Object.keys(workflowDeprecationSchema.shape)) }],
   // First `record` entry in this map: `inputs` is a record of input-name → spec,
   // so unknown keys under an individual spec (e.g. `inputs.diff.typo`) warn.
-  // `returns` is a plain string and needs no nested registration.
+  // `returns` and `outcome_field` are plain strings and need no nested registration.
   [
     'inputs',
     {
@@ -319,12 +402,30 @@ export type WorkflowExecutionResult =
  */
 export type WorkflowSource = 'bundled' | 'global' | 'project';
 
+/**
+ * The workflow-level configuration an author WROTE, captured before composition
+ * collapsed it onto the workflow's own nodes and removed the workflow-level layer
+ * (#1764). This is not a second representation of a live value — the collapsed
+ * definition no longer holds these fields at all.
+ *
+ * Read it for display and for labelling a run; never for execution. Execution reads
+ * `WorkflowWithSource.workflow`, whose nodes each carry their own resolved values.
+ * Deliberately narrow: the fields a person is shown, not the whole travelling set.
+ */
+export interface DeclaredWorkflowConfig {
+  readonly provider?: string;
+  readonly model?: string;
+  readonly effort?: string;
+}
+
 /** A workflow definition paired with its discovery source. */
 export interface WorkflowWithSource {
   readonly workflow: WorkflowDefinition;
   readonly source: WorkflowSource;
   /** Warnings from YAML parsing (e.g. unknown keys) — never hard-fails. */
   readonly parseWarnings?: readonly string[];
+  /** What the author declared at workflow level, for display. @see DeclaredWorkflowConfig */
+  readonly declared?: DeclaredWorkflowConfig;
 }
 
 /**

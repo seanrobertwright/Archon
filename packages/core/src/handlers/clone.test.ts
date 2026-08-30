@@ -11,6 +11,11 @@ import { describe, test, expect, mock, beforeEach, afterAll, afterEach, spyOn } 
 import { resolve } from 'path';
 import * as fsPromises from 'fs/promises';
 import * as gitUtils from '@archon/git';
+import type { Codebase } from '../types';
+import {
+  findCodebaseForCheckoutPath,
+  type CodebaseCheckoutResolverDeps,
+} from '../services/codebase-checkout-resolver';
 import { createMockLogger } from '../test/mocks/logger';
 
 // ── DB mocks ────────────────────────────────────────────────────────────────
@@ -30,8 +35,10 @@ const mockGetCodebaseCommands = mock(() => Promise.resolve({}));
 const mockUpdateCodebaseCommands = mock(() => Promise.resolve());
 const mockFindCodebaseByRepoUrl = mock(() => Promise.resolve(null));
 const mockFindCodebaseByDefaultCwd = mock(() => Promise.resolve(null));
+const mockListCodebases = mock(() => Promise.resolve([]));
 const mockFindCodebaseByName = mock(() => Promise.resolve(null));
 const mockUpdateCodebase = mock(() => Promise.resolve());
+const mockCreateProjectSourceSymlink = mock((): Promise<void> => Promise.resolve());
 
 mock.module('../db/codebases', () => ({
   createCodebase: mockCreateCodebase,
@@ -39,6 +46,7 @@ mock.module('../db/codebases', () => ({
   updateCodebaseCommands: mockUpdateCodebaseCommands,
   findCodebaseByRepoUrl: mockFindCodebaseByRepoUrl,
   findCodebaseByDefaultCwd: mockFindCodebaseByDefaultCwd,
+  listCodebases: mockListCodebases,
   findCodebaseByName: mockFindCodebaseByName,
   updateCodebase: mockUpdateCodebase,
 }));
@@ -49,12 +57,23 @@ const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   expandTilde: mock((p: string) => p.replace(/^~/, '/home/test')),
+  // Mirrors the real canonicalizer's contract (resolve, then realpath, falling
+  // back to the resolved path) and reads `fsPromises.realpath` at call time so
+  // the symlink test's spy still drives it.
+  canonicalizeProjectPath: mock(async (p: string) => {
+    const absolute = resolve(p.replace(/^~/, '/home/test'));
+    try {
+      return await fsPromises.realpath(absolute);
+    } catch {
+      return absolute;
+    }
+  }),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
   ensureProjectStructure: mock(() => Promise.resolve()),
   getProjectSourcePath: mock(
     (owner: string, repo: string) => `/home/test/.archon/workspaces/${owner}/${repo}/source`
   ),
-  createProjectSourceSymlink: mock(() => Promise.resolve()),
+  createProjectSourceSymlink: mockCreateProjectSourceSymlink,
   parseOwnerRepo: mock((name: string) => {
     const parts = name.split('/');
     return parts.length === 2 ? { owner: parts[0], repo: parts[1] } : null;
@@ -94,6 +113,7 @@ let spyFsRm: ReturnType<typeof spyOn>;
 let spyFsStat: ReturnType<typeof spyOn>;
 let spyFsRealpath: ReturnType<typeof spyOn>;
 let spyExecFileAsync: ReturnType<typeof spyOn>;
+let spyGetCanonicalRepoPath: ReturnType<typeof spyOn>;
 
 function setupSpies(): void {
   // Default: .git does NOT exist (no pre-existing clone)
@@ -113,6 +133,10 @@ function setupSpies(): void {
     stdout: '',
     stderr: '',
   });
+  spyGetCanonicalRepoPath = spyOn(gitUtils, 'getCanonicalRepoPath').mockImplementation(
+    (path: string): ReturnType<typeof gitUtils.getCanonicalRepoPath> =>
+      Promise.resolve(gitUtils.toRepoPath(path))
+  );
 }
 
 function restoreSpies(): void {
@@ -121,6 +145,7 @@ function restoreSpies(): void {
   spyFsRealpath?.mockRestore();
   spyFsStat?.mockRestore();
   spyExecFileAsync?.mockRestore();
+  spyGetCanonicalRepoPath?.mockRestore();
 }
 
 function clearMocks(): void {
@@ -133,6 +158,7 @@ function clearMocks(): void {
   mockFindCodebaseByDefaultCwd.mockReset();
   mockFindCodebaseByName.mockReset();
   mockUpdateCodebase.mockReset();
+  mockCreateProjectSourceSymlink.mockClear();
   mockFindMarkdownFilesRecursive.mockReset();
   mockLoadConfig.mockReset();
   mockLoadConfig.mockResolvedValue({ assistant: 'claude' });
@@ -175,12 +201,97 @@ function makeCodebase(
     default_cwd: '/home/test/.archon/workspaces/owner/repo/source',
     default_branch: null,
     ai_assistant_type: 'claude',
+    kind: 'repo',
     commands: {},
     created_at: new Date(),
     updated_at: new Date(),
     ...overrides,
   };
 }
+
+function makeResolverDeps(
+  overrides: Partial<CodebaseCheckoutResolverDeps> = {}
+): CodebaseCheckoutResolverDeps {
+  return {
+    findCodebaseByDefaultCwd: async () => null,
+    listCodebases: async () => [],
+    getCanonicalRepoPath: async path => path,
+    getGitCheckoutIdentity: async path => ({
+      gitDir: `${path}/.git`,
+      commonGitDir: `${path}/.git`,
+      linkedWorktree: false,
+    }),
+    ...overrides,
+  };
+}
+
+describe('findCodebaseForCheckoutPath', () => {
+  const cwd = '/workspace/external-linked';
+  const commonGitDir = '/metadata/repository';
+
+  function externalLinkedError(): gitUtils.CanonicalRepoPathUnavailableError {
+    return new gitUtils.CanonicalRepoPathUnavailableError(cwd, commonGitDir);
+  }
+
+  test('matches an external linked worktree to its uniquely registered Git repository', async () => {
+    const registered = makeCodebase({ default_cwd: '/workspace/primary' }) as Codebase;
+    const separateClone = makeCodebase({
+      id: 'separate-clone',
+      default_cwd: '/workspace/separate-clone',
+    }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [registered, separateClone],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : `${path}/.git`,
+        commonGitDir:
+          path === separateClone.default_cwd ? '/metadata/separate-clone' : commonGitDir,
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).resolves.toBe(registered);
+  });
+
+  test('does not conflate a separate clone with the registered repository', async () => {
+    const registered = makeCodebase({ default_cwd: '/workspace/primary' }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [registered],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : '/other/clone/.git',
+        commonGitDir: path === cwd ? commonGitDir : '/other/clone/.git',
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).resolves.toBeNull();
+  });
+
+  test('rejects ambiguous registrations sharing one external Git directory', async () => {
+    const first = makeCodebase({ id: 'first', default_cwd: '/workspace/first' }) as Codebase;
+    const second = makeCodebase({ id: 'second', default_cwd: '/workspace/second' }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [first, second],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : commonGitDir,
+        commonGitDir,
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).rejects.toThrow(
+      'matches multiple registered codebases'
+    );
+  });
+});
 
 // ────────────────────────────────────────────────────────────────────────────
 describe('cloneRepository', () => {
@@ -955,6 +1066,33 @@ describe('registerRepository', () => {
     expect(mockCreateCodebase.mock.calls.length).toBe(0);
   });
 
+  test('reuses the registered primary checkout for a linked worktree', async () => {
+    spyExecFileAsync.mockResolvedValue({ stdout: '.git', stderr: '' });
+    spyGetCanonicalRepoPath.mockResolvedValueOnce(
+      gitUtils.toRepoPath('/home/user/primary-checkout')
+    );
+    const existingCodebase = makeCodebase({
+      id: 'primary-codebase-id',
+      default_cwd: '/home/user/primary-checkout',
+    });
+    mockFindCodebaseByDefaultCwd
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(existingCodebase);
+
+    const result = await registerRepository('/home/user/sibling-worktree');
+
+    expect(mockFindCodebaseByDefaultCwd).toHaveBeenNthCalledWith(1, '/home/user/sibling-worktree');
+    expect(mockFindCodebaseByDefaultCwd).toHaveBeenNthCalledWith(2, '/home/user/primary-checkout');
+    expect(result).toMatchObject({
+      alreadyExisted: true,
+      codebaseId: 'primary-codebase-id',
+      defaultCwd: '/home/user/primary-checkout',
+    });
+    expect(mockCreateProjectSourceSymlink).not.toHaveBeenCalled();
+    expect(mockCreateCodebase).not.toHaveBeenCalled();
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
+  });
+
   // ── Validation ─────────────────────────────────────────────────────────
   test('throws when path is not a git repository', async () => {
     spyExecFileAsync.mockRejectedValueOnce(new Error('not a git repository'));
@@ -1148,8 +1286,12 @@ describe('registerFolder', () => {
 
   // ── Validation ─────────────────────────────────────────────────────────
   test('throws when the path does not exist', async () => {
-    // realpath is the first existence gate (runs before stat).
-    spyFsRealpath.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    // Canonicalization is fail-safe (it returns the unresolved path), so `stat`
+    // is the existence gate. Both reject here the way the real fs does for a
+    // missing path, so the registration is refused rather than stored.
+    const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    spyFsRealpath.mockRejectedValueOnce(enoent);
+    spyFsStat.mockRejectedValueOnce(enoent);
 
     await expect(registerFolder('/tmp/does-not-exist')).rejects.toThrow('Path does not exist');
     expect(mockCreateCodebase.mock.calls.length).toBe(0);

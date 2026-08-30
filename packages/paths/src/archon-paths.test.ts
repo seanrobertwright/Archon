@@ -3,6 +3,7 @@ import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { mkdir, rm, writeFile, lstat, readlink, symlink as fsSymlink } from 'fs/promises';
+import { removeTempTree } from './test-utils';
 
 const isWindows = process.platform === 'win32';
 
@@ -11,10 +12,12 @@ import {
   isWSL,
   getWSLDistroName,
   getArchonHome,
+  getArchonTempPath,
   getArchonWorkspacesPath,
   ensureArchonWorkspacesPath,
   getArchonWorktreesPath,
   getArchonConfigPath,
+  getInstallManifestPath,
   getCredentialKeyPath,
   getHomeWorkflowsPath,
   getHomeCommandsPath,
@@ -23,6 +26,7 @@ import {
   getCommandFolderSearchPaths,
   getWorkflowFolderSearchPaths,
   expandTilde,
+  canonicalizeProjectPath,
   getAppArchonBasePath,
   getDefaultCommandsPath,
   getDefaultWorkflowsPath,
@@ -97,6 +101,50 @@ describe('archon-paths', () => {
 
     test('returns path unchanged if no tilde', () => {
       expect(expandTilde('/absolute/path')).toBe('/absolute/path');
+    });
+  });
+
+  // The one canonicalizer for `remote_agent_codebases.default_cwd` (#2927).
+  describe('canonicalizeProjectPath', () => {
+    let canonRoot: string;
+
+    beforeEach(async () => {
+      canonRoot = join(tmpdir(), `archon-canon-${String(Date.now())}-${String(Math.random())}`);
+      await mkdir(canonRoot, { recursive: true });
+    });
+
+    afterEach(async () => {
+      await removeTempTree(canonRoot);
+    });
+
+    test('collapses two spellings of one directory to a single string', async () => {
+      // This is the whole job: exact-string lookups only find a row when the
+      // path the reader holds and the path the writer held canonicalize alike.
+      // `'junction'` is ignored on POSIX and is the Windows link type that
+      // needs no elevated privileges.
+      const target = join(canonRoot, 'project');
+      const link = join(canonRoot, 'project-link');
+      await mkdir(target);
+      await fsSymlink(target, link, 'junction');
+
+      expect(await canonicalizeProjectPath(link)).toBe(await canonicalizeProjectPath(target));
+    });
+
+    test('is idempotent', async () => {
+      const once = await canonicalizeProjectPath(canonRoot);
+      expect(await canonicalizeProjectPath(once)).toBe(once);
+    });
+
+    test('expands ~ and makes the result absolute', async () => {
+      expect(await canonicalizeProjectPath('~')).toBe(await canonicalizeProjectPath(homedir()));
+    });
+
+    test('falls back to the absolute path instead of throwing when it cannot resolve', async () => {
+      // Callers rely on always getting a string back: a reader needs a value to
+      // miss its lookup with, and `registerFolder` reports the real errno from
+      // its own `stat` rather than from here.
+      const missing = join(canonRoot, 'no-such-dir');
+      expect(await canonicalizeProjectPath(missing)).toBe(missing);
     });
   });
 
@@ -236,6 +284,36 @@ describe('archon-paths', () => {
       delete process.env.ARCHON_DOCKER;
       process.env.ARCHON_HOME = '/custom/archon';
       expect(getArchonWorktreesPath()).toBe(join('/custom/archon', 'worktrees'));
+    });
+  });
+
+  describe('getInstallManifestPath', () => {
+    test('returns install.json under the default ARCHON_HOME', () => {
+      delete process.env.WORKSPACE_PATH;
+      delete process.env.ARCHON_HOME;
+      delete process.env.ARCHON_DOCKER;
+      expect(getInstallManifestPath()).toBe(join(homedir(), '.archon', 'install.json'));
+    });
+
+    test('respects ARCHON_HOME', () => {
+      delete process.env.WORKSPACE_PATH;
+      delete process.env.ARCHON_DOCKER;
+      process.env.ARCHON_HOME = '/custom/archon';
+      expect(getInstallManifestPath()).toBe(join('/custom/archon', 'install.json'));
+    });
+  });
+
+  describe('getArchonTempPath', () => {
+    test('returns ~/.archon/temp by default', () => {
+      delete process.env.ARCHON_HOME;
+      delete process.env.ARCHON_DOCKER;
+      expect(getArchonTempPath()).toBe(join(homedir(), '.archon', 'temp'));
+    });
+
+    test('uses ARCHON_HOME when set', () => {
+      delete process.env.ARCHON_DOCKER;
+      process.env.ARCHON_HOME = '/custom/archon';
+      expect(getArchonTempPath()).toBe(join('/custom/archon', 'temp'));
     });
   });
 

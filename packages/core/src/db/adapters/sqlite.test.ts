@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from 'bun:test';
 import { SqliteAdapter } from './sqlite';
 import { getSchemaSQL } from '../bundled-schema';
 import { APP_VERSION, readSchemaVersion } from '../schema-version';
-import { Database } from 'bun:sqlite';
+import { Database, type Statement } from 'bun:sqlite';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 
@@ -103,6 +103,30 @@ describe('SqliteAdapter upgrade path', () => {
 
       expect(objects).toContain('idx_workflow_events_run_order');
       expect(objects).toContain('remote_agent_workflow_events_assign_order');
+    } finally {
+      await seed.close();
+    }
+  });
+
+  test('adds the authored outcome column idempotently to an existing workflow-runs table', async () => {
+    const name = `archon-test-sqlite-outcome-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const uri = `file:${name}?mode=memory&cache=shared`;
+    const seed = new SqliteAdapter(uri);
+    try {
+      const raw = new Database(uri);
+      try {
+        raw.run('ALTER TABLE remote_agent_workflow_runs DROP COLUMN outcome');
+      } finally {
+        raw.close();
+      }
+      expect(columnsOf(uri, 'remote_agent_workflow_runs')).not.toContain('outcome');
+
+      const upgraded = new SqliteAdapter(uri);
+      await upgraded.close();
+      const reopened = new SqliteAdapter(uri);
+      await reopened.close();
+
+      expect(columnsOf(uri, 'remote_agent_workflow_runs')).toContain('outcome');
     } finally {
       await seed.close();
     }
@@ -767,6 +791,71 @@ describe('SqliteAdapter', () => {
       expect(raw_pragma(currentDbPath, 'remote_agent_workflow_runs')).toContain('output_root');
       expect(getSchemaSQL()).toContain('output_root');
     });
+
+    test('authored outcome is nullable and constrained identically in both schema sources', async () => {
+      db = createTestDb();
+      await insertCodebase(db, 'cb-outcome');
+      await db.query(
+        `INSERT INTO remote_agent_conversations
+           (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['conv-outcome', 'web', 'thread-outcome', 'cb-outcome']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_workflow_runs
+           (id, conversation_id, workflow_name, user_message, outcome)
+         VALUES ($1, $2, $3, $4, $5)`,
+        ['run-outcome', 'conv-outcome', 'verify', 'test', 'succeeded']
+      );
+      const rows = await db.query<{ outcome: string | null }>(
+        'SELECT outcome FROM remote_agent_workflow_runs WHERE id = $1',
+        ['run-outcome']
+      );
+      expect(rows.rows[0]?.outcome).toBe('succeeded');
+      await expect(
+        db.query(
+          `INSERT INTO remote_agent_workflow_runs
+             (id, conversation_id, workflow_name, user_message, outcome)
+           VALUES ($1, $2, $3, $4, $5)`,
+          ['run-bad-outcome', 'conv-outcome', 'verify', 'test', 'unknown']
+        )
+      ).rejects.toThrow();
+      expect(getSchemaSQL()).toContain("CHECK (outcome IN ('succeeded', 'failed'))");
+    });
+
+    test('run-scoped session handles cascade with their workflow run in both schema shapes', async (): Promise<void> => {
+      db = createTestDb();
+      await insertCodebase(db, 'cb-session-cascade');
+      await db.query(
+        `INSERT INTO remote_agent_conversations
+           (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['conv-session-cascade', 'web', 'thread-session-cascade', 'cb-session-cascade']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_workflow_runs
+           (id, conversation_id, workflow_name, user_message)
+         VALUES ($1, $2, $3, $4)`,
+        ['run-session-cascade', 'conv-session-cascade', 'lineage', 'test']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_workflow_run_node_sessions
+           (workflow_run_id, node_id, provider, provider_session_id)
+         VALUES ($1, $2, $3, $4)`,
+        ['run-session-cascade', 'scope', 'claude', 'session-secret']
+      );
+
+      await db.query('DELETE FROM remote_agent_workflow_runs WHERE id = $1', [
+        'run-session-cascade',
+      ]);
+      const rows = await db.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_workflow_run_node_sessions'
+      );
+      expect(Number(rows.rows[0]?.count)).toBe(0);
+      expect(getSchemaSQL()).toMatch(
+        /remote_agent_workflow_run_node_sessions[\s\S]*workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs\(id\) ON DELETE CASCADE/
+      );
+    });
   });
 
   /**
@@ -988,3 +1077,72 @@ function raw_query(dbPath: string, sql: string): unknown[] {
     raw.close();
   }
 }
+
+describe('SqliteAdapter native-resource finalization (#2875)', () => {
+  let adapter: SqliteAdapter | undefined;
+
+  afterEach(async () => {
+    if (adapter) {
+      await adapter.close();
+      adapter = undefined;
+    }
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        unlinkSync(currentDbPath + suffix);
+      } catch {
+        /* may not exist */
+      }
+    }
+  });
+
+  test('finalizes every statement it prepares by the time close() resolves', async () => {
+    const originalPrepare = Database.prototype.prepare;
+    let prepared = 0;
+    let finalized = 0;
+    Database.prototype.prepare = function (
+      this: Database,
+      ...args: Parameters<typeof originalPrepare>
+    ) {
+      const stmt = originalPrepare.apply(this, args) as Statement & {
+        finalize: () => unknown;
+      };
+      prepared++;
+      const nativeFinalize = stmt.finalize.bind(stmt);
+      stmt.finalize = () => {
+        finalized++;
+        return nativeFinalize();
+      };
+      return stmt;
+    };
+
+    try {
+      adapter = createTestDb();
+      await insertCodebase(adapter, 'cb-finalize');
+      await adapter.query('SELECT id FROM remote_agent_codebases WHERE id = $1', ['cb-finalize']);
+
+      // A statement that prepares cleanly but fails on execution (primary key
+      // violation) must still be finalized (this is the finally-branch of the fix).
+      await expect(insertCodebase(adapter, 'cb-finalize')).rejects.toThrow();
+
+      await adapter.close();
+      adapter = undefined;
+
+      expect(prepared).toBeGreaterThan(0);
+      expect(finalized).toBe(prepared);
+    } finally {
+      Database.prototype.prepare = originalPrepare;
+    }
+  });
+
+  test('close() leaves the database file immediately deletable', async () => {
+    adapter = createTestDb();
+    await insertCodebase(adapter, 'cb-delete');
+    await adapter.query('SELECT id FROM remote_agent_codebases WHERE id = $1', ['cb-delete']);
+    await adapter.close();
+    adapter = undefined;
+
+    // Passes trivially where POSIX unlink tolerates open handles, but on
+    // windows-latest this fails with EBUSY while any statement is unfinalized.
+    unlinkSync(currentDbPath);
+  });
+});

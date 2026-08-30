@@ -233,14 +233,40 @@ describe('CopilotProvider.sendQuery', () => {
     expect(opts.reasoningEffort).toBe('high');
   });
 
-  test('workflow `effort: max` maps to SDK `xhigh`', async () => {
+  test.each(['max', 'ultra'] as const)(
+    'workflow `effort: %s` maps to SDK `xhigh`',
+    async effort => {
+      const session = makeFakeSession();
+      nextCreateSessionResult = session;
+
+      const p = new CopilotProvider();
+      const gen = p.sendQuery('hi', '/w', undefined, {
+        model: 'gpt-5',
+        nodeConfig: { effort },
+      });
+      const first = gen.next();
+      await new Promise(resolve => setTimeout(resolve, 5));
+      session.resolveSend(undefined);
+      await first;
+      await collect(gen);
+
+      const opts = createSessionSpy.mock.calls[0]![0] as { reasoningEffort?: string };
+      expect(opts.reasoningEffort).toBe('xhigh');
+    }
+  );
+
+  // #2556: `minimal` is a rung on Archon's shared ladder that Copilot's SDK
+  // lacks, so it clamps to the SDK's shallowest — the same treatment `max`
+  // already gets at the top end. Only a value that is not a rung at all is
+  // dropped.
+  test('effort: minimal clamps to the SDK shallowest rung', async () => {
     const session = makeFakeSession();
     nextCreateSessionResult = session;
 
     const p = new CopilotProvider();
     const gen = p.sendQuery('hi', '/w', undefined, {
       model: 'gpt-5',
-      nodeConfig: { effort: 'max' },
+      nodeConfig: { effort: 'minimal' },
     });
     const first = gen.next();
     await new Promise(resolve => setTimeout(resolve, 5));
@@ -249,7 +275,7 @@ describe('CopilotProvider.sendQuery', () => {
     await collect(gen);
 
     const opts = createSessionSpy.mock.calls[0]![0] as { reasoningEffort?: string };
-    expect(opts.reasoningEffort).toBe('xhigh');
+    expect(opts.reasoningEffort).toBe('low');
   });
 
   test('invalid effort value is dropped (not passed to SDK)', async () => {
@@ -259,7 +285,7 @@ describe('CopilotProvider.sendQuery', () => {
     const p = new CopilotProvider();
     const gen = p.sendQuery('hi', '/w', undefined, {
       model: 'gpt-5',
-      nodeConfig: { effort: 'minimal' }, // Copilot doesn't support
+      nodeConfig: { effort: 'extreme' }, // not a rung on the ladder
     });
     const first = gen.next();
     await new Promise(resolve => setTimeout(resolve, 5));

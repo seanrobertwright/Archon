@@ -291,6 +291,64 @@ curl -X POST http://localhost:3090/api/workflows/archon-assist/run \
   -F "files=@screenshot.png"
 ```
 
+**Supplying declared inputs.** A workflow that declares [`inputs:`](/guides/authoring-workflows/#running-a-workflow-that-declares-inputs) takes their values through an optional `inputs` map — a flat object of string values. Omit a name to take its declared `default:`.
+
+```bash
+# JSON: inputs is a nested object
+curl -X POST http://localhost:3090/api/workflows/review-block/run \
+  -H "Content-Type: application/json" \
+  -d '{"message": "review it", "conversationId": "conv-123",
+       "inputs": {"diff": "...", "style": "terse"}}'
+
+# multipart: form fields are strings, so the same map travels JSON-encoded
+curl -X POST http://localhost:3090/api/workflows/review-block/run \
+  -F "conversationId=conv-123" \
+  -F "message=review it" \
+  -F 'inputs={"diff":"...","style":"terse"}' \
+  -F "files=@context.md"
+```
+
+Values are validated against the workflow's declaration before any worktree, clone, or AI cost: a missing **required** input and an **undeclared** name are both refused up front, through the same contract a composing `with:` map goes through. `400` if `inputs` is not an object of strings (or, on multipart, not valid JSON). An empty object is the same as omitting the field.
+
+**Rebinding models for one run.** Optional `tiers` and `aliases` maps change only the named tier or existing `@alias` for this invocation. Every other binding keeps its normal user → repo → global → built-in value.
+
+```bash
+# JSON: only `large` changes
+curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
+  -H "Content-Type: application/json" \
+  -d '{"message":"fix #2481","conversationId":"conv-123",
+       "tiers":{"large":"openai/gpt-5.6"},
+       "aliases":{"@reviewer":"codex/gpt-5.6-sol"}}'
+
+# multipart: each map is one JSON-encoded form field
+curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
+  -F "conversationId=conv-123" \
+  -F "message=fix #2481" \
+  -F 'tiers={"large":"openai/gpt-5.6"}'
+```
+
+Tier keys are `small`, `medium`, and `large`; alias keys start with `@`. A model spec can name an Archon agent/model, a Pi vendor/model, an unqualified model under the binding's current provider, or another tier/alias preset. Literal model pins in the workflow remain unchanged. To replace all default tiers, author all three mappings explicitly. The run's `metadata.model_bindings` records the effective non-secret bindings for attribution and the sparse resolved overrides for reuse on resume.
+
+**Loading inline config for one run.** Optional `config` content uses the same sparse runtime keys as a CLI run config file. JSON sends it as an object; multipart sends the object JSON-encoded in one form field. Explicit `tiers` and `aliases` fields are the final model layer and replace only matching names from `config`.
+
+```bash
+# JSON content
+curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
+  -H "Content-Type: application/json" \
+  -d '{"message":"fix #2482","conversationId":"conv-123",
+       "config":{"tiers":{"large":{"provider":"pi","model":"minimax/MiniMax-M3"}},
+                 "env":{"BENCH_MODE":"1"}},
+       "tiers":{"large":"openai/gpt-5.6"}}'
+
+# multipart content
+curl -X POST http://localhost:3090/api/workflows/issue-to-pr/run \
+  -F "conversationId=conv-123" \
+  -F "message=fix #2482" \
+  -F 'config={"docs":{"path":"handbook"},"workflows":{"quotaMaxAttempts":3}}'
+```
+
+Supported inline keys are `assistant` or `defaultAssistant`, `assistants`, `tiers`, `aliases`, `workflows`, `docs.path`, and `env`. Unknown or ineffective keys fail with `400` and name the key. `configPath` is always rejected: HTTP callers cannot ask the server to read a filesystem path. Run metadata stores sealed replay content plus redacted source/key attribution, and resume uses the original layer without accepting replacement content.
+
 #### List Run Artifacts
 
 ```bash

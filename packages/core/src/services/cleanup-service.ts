@@ -10,7 +10,6 @@ import * as codebaseDb from '../db/codebases';
 import * as workflowDb from '../db/workflows';
 import { getIsolationProvider, getPrState, ContainerBackend } from '@archon/isolation';
 import type { WorktreeStatusBreakdown, PrState, ContainerBackendConfig } from '@archon/isolation';
-import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import {
   hasUncommittedChanges,
   worktreeExists,
@@ -154,11 +153,12 @@ export async function listContainerEnvironments(): Promise<readonly ContainerEnv
 
 /**
  * Reap orphaned container isolation environments: remove the container + upper
- * volume of TERMINAL (completed/failed/cancelled) or run-less container envs older
- * than `daysStale`. A PAUSED run's container is NEVER touched — a paused container
- * is awaited state, not garbage (No-Autonomous-Lifecycle-Mutation Across Process
- * Boundaries); it is surfaced by `isolation list` with its age instead. All pruning
- * is label-scoped (via the tracking row), never a bare `docker prune`.
+ * volume of finished-and-unresumable (completed/cancelled) or run-less container
+ * envs older than `daysStale`. A container a run can still claim — running, pending,
+ * paused, or failed-but-resumable — is NEVER touched: it is awaited state, not
+ * garbage (No-Autonomous-Lifecycle-Mutation Across Process Boundaries), and is
+ * surfaced by `isolation list` with its age instead. All pruning is label-scoped
+ * (via the tracking row), never a bare `docker prune`.
  */
 export async function cleanupContainerEnvironments(
   daysStale = STALE_THRESHOLD_DAYS
@@ -174,11 +174,15 @@ export async function cleanupContainerEnvironments(
 
   for (const row of rows) {
     // FAIL CLOSED on an ambiguous lookup (H3): a DB error is NOT "no run" — treating
-    // it as an orphan would destroy an active/paused run's container on a transient
-    // blip (violating No-Autonomous-Lifecycle-Mutation). Report + skip, never destroy.
-    let run: Awaited<ReturnType<typeof workflowDb.getRunByIsolationEnvId>> | null;
+    // it as an orphan would destroy a claimable run's container on a transient blip
+    // (violating No-Autonomous-Lifecycle-Mutation). Report + skip, never destroy.
+    //
+    // Same lock the worktree sweeps use. getRunByIsolationEnvId, which this replaced,
+    // took the newest run row BEFORE filtering status, so a newer terminal run could
+    // shadow an older claimable one and the container would be reaped underneath it.
+    let liveRun: Awaited<ReturnType<typeof isolationEnvDb.getLiveRunOwningEnv>>;
     try {
-      run = await workflowDb.getRunByIsolationEnvId(row.id);
+      liveRun = await isolationEnvDb.getLiveRunOwningEnv(row.id);
     } catch (err) {
       report.errors.push({
         id: row.id,
@@ -187,12 +191,10 @@ export async function cleanupContainerEnvironments(
       getLog().warn({ err, envId: row.id }, 'container_env_reap_lookup_failed');
       continue;
     }
-    // Never reap an awaited (paused) or still-active (running/pending) run's
-    // container — only terminal runs, or orphans with no run at all.
-    if (run && !TERMINAL_WORKFLOW_STATUSES.includes(run.status)) {
+    if (liveRun) {
       report.skipped.push({
         id: row.id,
-        reason: `run ${run.id.slice(0, 8)} is ${run.status}`,
+        reason: `run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`,
       });
       continue;
     }
@@ -206,7 +208,8 @@ export async function cleanupContainerEnvironments(
     try {
       await backend.destroy(row.id);
       report.removed.push(row.id);
-      getLog().info({ envId: row.id, runId: run?.id ?? null }, 'container_env_reaped');
+      // No runId: the reap only happens when no run can still claim this env.
+      getLog().info({ envId: row.id }, 'container_env_reaped');
     } catch (err) {
       report.errors.push({ id: row.id, error: (err as Error).message });
       getLog().warn({ err, envId: row.id }, 'container_env_reap_failed');
@@ -217,7 +220,8 @@ export async function cleanupContainerEnvironments(
 
 /**
  * Called when a platform conversation is closed (e.g., GitHub issue/PR closed)
- * Cleans up the associated isolation environment if no other conversations use it
+ * Cleans up the associated isolation environment unless a workflow run can still
+ * claim it. Conversation references are data, not locks (#2868).
  */
 export async function onConversationClosed(
   platformType: string,
@@ -264,21 +268,34 @@ export async function onConversationClosed(
     return;
   }
 
-  // Clear this conversation's reference (best-effort - conversation may be deleted)
+  // Live work is the only lock — the same rule the merged cleanup sweep follows.
+  // Historical conversations referencing this env are data, not locks. This must
+  // read before the null-out below: a top-level run attaches to its env ONLY
+  // through this conversation's reference, so clearing first would erase the
+  // pin and let the env be removed under a running or paused run.
+  const liveRun = await isolationEnvDb.getLiveRunOwningEnv(envId);
+  if (liveRun) {
+    getLog().info({ envId, runId: liveRun.id, runStatus: liveRun.status }, 'env_has_live_run');
+    return;
+  }
+
+  // Clear this conversation's reference (best-effort - conversation may be deleted).
+  // `cwd` is cleared alongside it when it names the environment being torn down:
+  // leaving it set would strand the conversation on a directory that is about to
+  // be deleted, and a chat turn uses `cwd` verbatim (the orchestrator refuses the
+  // turn outright once the path is gone). Null means "no override" — the
+  // conversation falls back to codebase.default_cwd, the same end state
+  // /setproject produces. A cwd pointing somewhere else is left untouched.
+  const cwdBelongsToEnv = conversation.cwd === env.working_path;
   await conversationDb
-    .updateConversation(conversation.id, { isolation_env_id: null })
+    .updateConversation(conversation.id, {
+      isolation_env_id: null,
+      ...(cwdBelongsToEnv ? { cwd: null } : {}),
+    })
     .catch(err => {
       if (!(err instanceof ConversationNotFoundError)) throw err;
     });
 
-  // Check if other conversations still use this environment
-  const otherConversations = await isolationEnvDb.getConversationsUsingEnv(envId);
-  if (otherConversations.length > 0) {
-    getLog().info({ envId, conversationCount: otherConversations.length }, 'env_still_in_use');
-    return;
-  }
-
-  // No other users - attempt removal
   await removeEnvironment(envId, {
     force: false,
     deleteRemoteBranch: options?.merged,
@@ -425,11 +442,11 @@ export async function cleanupToMakeRoom(
 /**
  * Returns the reason the environment cannot be removed, or null if it is safe to remove.
  * Checks uncommitted changes first (avoids a DB query when changes are present),
- * then active conversation references.
+ * then live work: a workflow run that can still claim the environment.
  */
 type RemovalBlocker =
   | { reason: 'uncommitted_changes'; display: string }
-  | { reason: 'in_use'; display: string; conversationCount: number };
+  | { reason: 'live_run'; display: string; runId: string; runStatus: string };
 
 async function getRemovalBlocker(env: {
   id: string;
@@ -437,13 +454,19 @@ async function getRemovalBlocker(env: {
 }): Promise<RemovalBlocker | null> {
   const hasChanges = await hasUncommittedChanges(toWorktreePath(env.working_path));
   if (hasChanges) return { reason: 'uncommitted_changes', display: 'has uncommitted changes' };
-  const conversations = await isolationEnvDb.getConversationsUsingEnv(env.id);
-  if (conversations.length > 0)
+  // Live work is the only lock: a run that can still claim the env blocks removal —
+  // running, pending, paused, or failed-but-resumable. Historical conversation
+  // references are data, not locks (same rule the merged cleanup sweep follows) —
+  // see getLiveRunOwningEnv.
+  const liveRun = await isolationEnvDb.getLiveRunOwningEnv(env.id);
+  if (liveRun) {
     return {
-      reason: 'in_use',
-      display: `still used by ${String(conversations.length)} conversation(s)`,
-      conversationCount: conversations.length,
+      reason: 'live_run',
+      display: `run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`,
+      runId: liveRun.id,
+      runStatus: liveRun.status,
     };
+  }
   return null;
 }
 
@@ -469,6 +492,20 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
         // Check if path still exists
         const pathExists = await worktreeExists(toWorktreePath(env.working_path));
         if (!pathExists) {
+          // Even with the directory gone, marking the env destroyed invalidates
+          // the live run's resume handle — same lock as the merged/stale branches.
+          const liveRun = await isolationEnvDb.getLiveRunOwningEnv(env.id);
+          if (liveRun) {
+            report.skipped.push({
+              id: env.id,
+              reason: `path missing but run ${liveRun.id.slice(0, 8)} is ${liveRun.status}`,
+            });
+            getLog().info(
+              { envId: env.id, runId: liveRun.id, runStatus: liveRun.status },
+              'skip_path_missing_live_run'
+            );
+            continue;
+          }
           // Path doesn't exist - call removeEnvironment to clean up branch and mark as destroyed
           const removeResult = await removeEnvironment(env.id, { force: false });
           if (removeResult.skippedReason) {
@@ -492,10 +529,10 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
           const blocker = await getRemovalBlocker(env);
           if (blocker) {
             report.skipped.push({ id: env.id, reason: `merged but ${blocker.display}` });
-            if (blocker.reason === 'in_use') {
+            if (blocker.reason === 'live_run') {
               getLog().info(
-                { envId: env.id, conversationCount: blocker.conversationCount },
-                'skip_merged_still_in_use'
+                { envId: env.id, runId: blocker.runId, runStatus: blocker.runStatus },
+                'skip_merged_live_run'
               );
             } else {
               getLog().warn({ envId: env.id }, 'skip_merged_uncommitted_changes');
@@ -527,10 +564,10 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
           const blocker = await getRemovalBlocker(env);
           if (blocker) {
             report.skipped.push({ id: env.id, reason: `stale but ${blocker.display}` });
-            if (blocker.reason === 'in_use') {
+            if (blocker.reason === 'live_run') {
               getLog().info(
-                { envId: env.id, conversationCount: blocker.conversationCount },
-                'skip_stale_still_in_use'
+                { envId: env.id, runId: blocker.runId, runStatus: blocker.runStatus },
+                'skip_stale_live_run'
               );
             } else {
               getLog().warn({ envId: env.id }, 'skip_stale_uncommitted_changes');
@@ -679,7 +716,7 @@ export async function getWorktreeStatusBreakdown(
 
 /**
  * Clean up stale worktrees for a codebase
- * Respects uncommitted changes and conversation references
+ * Respects uncommitted changes and live workflow runs
  */
 export async function cleanupStaleWorktrees(
   codebaseId: string,
@@ -695,7 +732,7 @@ export async function cleanupStaleWorktrees(
     // Check if stale
     if (env.days_since_activity < STALE_THRESHOLD_DAYS) continue;
 
-    // Check for uncommitted changes or active conversation references
+    // Check for uncommitted changes or a live owning run
     const blocker = await getRemovalBlocker(env);
     if (blocker) {
       result.skipped.push({ branchName: env.branch_name, reason: blocker.display });
@@ -754,7 +791,7 @@ async function isSafeToRemove(
 
 /**
  * Clean up merged worktrees for a codebase
- * Respects uncommitted changes and conversation references
+ * Respects uncommitted changes and live workflow runs
  */
 export async function cleanupMergedWorktrees(
   codebaseId: string,
@@ -808,7 +845,7 @@ export async function cleanupMergedWorktrees(
       continue;
     }
 
-    // Check for uncommitted changes or active conversation references
+    // Check for uncommitted changes or a live owning run
     const blocker = await getRemovalBlocker(env);
     if (blocker) {
       result.skipped.push({ branchName: env.branch_name, reason: blocker.display });

@@ -13,11 +13,14 @@ import {
 import type {
   IAgentProvider,
   SendQueryOptions,
+  NodeConfig,
   MessageChunk,
   TokenUsage,
   ProviderCapabilities,
+  CodexProviderDefaults,
 } from '../types';
-import { parseCodexConfig } from './config';
+import { clampEffort } from '../shared/effort';
+import { CODEX_EFFORTS, parseCodexConfig } from './config';
 import { CODEX_CAPABILITIES } from './capabilities';
 import { resolveCodexBinaryPath } from './binary-resolver';
 import { createLogger } from '@archon/paths';
@@ -74,12 +77,43 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 }
 
 /**
+ * Resolve Codex's `modelReasoningEffort` from Archon's inputs.
+ *
+ * Precedence: `nodeConfig.effort` > `assistants.codex.modelReasoningEffort`
+ * from config.yaml — mirroring Copilot's `resolveCopilotReasoning`, so a workflow's
+ * declared depth beats the install default on both providers alike.
+ *
+ * Codex accepts every rung on Archon's ladder. A value that is not on the
+ * ladder at all falls back to the config default rather than being invented;
+ * the workflow loader rejects such values at parse time, so this only guards
+ * programmatic callers.
+ */
+function resolveModelReasoningEffort(
+  nodeConfig: NodeConfig | undefined,
+  configured: CodexProviderDefaults['modelReasoningEffort']
+): CodexProviderDefaults['modelReasoningEffort'] {
+  const declared = nodeConfig?.effort;
+  if (declared === undefined) return configured;
+
+  const clamped = clampEffort(declared, CODEX_EFFORTS);
+  if (clamped === undefined) {
+    getLog().warn({ effort: declared }, 'codex.effort_unrecognized');
+    return configured;
+  }
+  if (clamped !== declared) {
+    getLog().debug({ declared, applied: clamped }, 'codex.effort_clamped');
+  }
+  return clamped;
+}
+
+/**
  * Build thread options for Codex SDK
  */
 function buildThreadOptions(
   cwd: string,
   model?: string,
-  assistantConfig?: Record<string, unknown>
+  assistantConfig?: Record<string, unknown>,
+  nodeConfig?: NodeConfig
 ): ThreadOptions {
   const config = parseCodexConfig(assistantConfig ?? {});
   return {
@@ -89,7 +123,7 @@ function buildThreadOptions(
     networkAccessEnabled: true,
     approvalPolicy: 'never',
     model: model ?? config.model,
-    modelReasoningEffort: config.modelReasoningEffort,
+    modelReasoningEffort: resolveModelReasoningEffort(nodeConfig, config.modelReasoningEffort),
     webSearchMode: config.webSearchMode,
     additionalDirectories: config.additionalDirectories,
   };
@@ -270,18 +304,27 @@ function buildModelAccessMessage(model?: string): string {
 
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
-const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', '429', 'overloaded'];
-const AUTH_PATTERNS = [
-  'credit balance',
-  'unauthorized',
-  'authentication',
-  'invalid token',
-  '401',
-  '403',
-];
+// Deliberately excludes a bare '429': that digit can appear in unrelated text
+// (a port, a byte count, a millisecond duration) on this classifier's sole
+// call site (the retry loop's catch, `:1141`) — same "bare digits aren't
+// enough signal" reasoning as AUTH_PATTERNS below (#2509 R11). A false
+// 'rate_limit' classification wastes a subprocess retry/backoff cycle before
+// the correct terminal message is shown, but (unlike a false 'auth' hit)
+// does not deny the retry outright.
+const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', 'overloaded'];
+// Deliberately excludes bare '401'/'403': those digits can appear in
+// unrelated text (a port, a byte offset, a millisecond duration) on this
+// classifier's sole call site (the retry loop's catch, `:1141`), which covers
+// every error thrown mid-turn — the most common failure surface in this
+// file. A false 'auth' classification here both misroutes the user-facing
+// message (`error-formatter.ts` trusts `Codex auth error:` unconditionally)
+// and forces `shouldRetry: false` below, denying a transient failure its
+// retry (#2509 R7).
+const AUTH_PATTERNS = ['credit balance', 'unauthorized', 'authentication', 'invalid token'];
 const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'codex exec'];
 
-function classifyCodexError(
+/** Exported for direct unit testing — see provider.test.ts (#2509 R7). */
+export function classifyCodexError(
   errorMessage: string
 ): 'rate_limit' | 'auth' | 'crash' | 'model_access' | 'unknown' {
   if (isModelAccessError(errorMessage)) return 'model_access';
@@ -300,6 +343,8 @@ function extractUsageFromCodexEvent(event: TurnCompletedEvent): TokenUsage {
   return {
     input: event.usage.input_tokens,
     output: event.usage.output_tokens,
+    cacheRead: event.usage.cached_input_tokens,
+    cacheWrite: event.usage.cache_write_input_tokens,
   };
 }
 
@@ -917,7 +962,12 @@ export class CodexProvider implements IAgentProvider {
       requestOptions?.env,
       initialConfigOverrides
     );
-    const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    const threadOptions = buildThreadOptions(
+      cwd,
+      requestOptions?.model,
+      assistantConfig,
+      requestOptions?.nodeConfig
+    );
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');

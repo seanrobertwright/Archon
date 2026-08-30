@@ -1,0 +1,462 @@
+name: archon-deliver
+description: |
+  The delivery tail, end to end and autonomous: implement the work, gate on
+  green, open a draft PR, review it, correct and close the findings, validate,
+  wait for checks to clear, then flip the PR ready for review. No in-run
+  approval gate — the human gate is PR review and merge on GitHub, outside
+  the run.
+
+  Use when: decided work should become a reviewed, ready-to-merge PR —
+  "deliver this plan", "take this to a PR", "build and ship this".
+  NOT for: deciding what to build, or merging (always human).
+
+# Review establishes the first verdict. When blockers remain, a bounded static
+# body repeats fix → light review, so every correction is independently checked
+# and a clean review stops immediately. Exhausting the bound fails truthfully
+# with the PR still draft and the canonical report carrying the open findings.
+
+requires: [github]
+
+inputs:
+  work:
+    default: ""
+    description: >-
+      What to deliver — a plan path, findings, or a description. Empty means
+      the run's trigger message is the work.
+  prior_report:
+    default: ""
+    description: >-
+      Cross-run review continuity: the previous delivery run's review report
+      path. Round 1 then verifies prior findings (rejections included) instead
+      of relitigating them from scratch. Empty on a first delivery.
+  # Error review can be forced on or off. Code, seams, simplify, and tests always run;
+  # docs runs only when the classifier finds shipped documentation in the diff.
+  errors:
+    default: "auto"
+    description: Silent-failure lens — auto, true, or false.
+
+returns: pr
+
+nodes:
+  - id: impl
+    include: archon-implement
+    with:
+      work: "$INPUTS.work"
+
+  # R3's gate: run success never certifies green — this does, deterministically,
+  # before anything public happens. Strict field access: a missing field fails
+  # the node rather than passing the gate. It fails on red the change introduced
+  # and passes red the change cannot have caused, recording that caveat for every
+  # downstream reader — see scripts/gate-green.py for why that trade is safe.
+  - id: gate-green
+    script: gate-green
+    runtime: uv
+    depends_on: [impl]
+    with:
+      green: "$impl.output.green"
+      red_cause: "$impl.output.red_cause"
+      summary: "$impl.output.summary"
+      stage: "The implementation"
+
+  - id: pr
+    include: archon-pr
+    with:
+      draft: "true"
+    depends_on: [gate-green]
+
+  # Initial review: full on a first delivery, light continuation when
+  # the caller passes the previous run's report (adjudications carry across
+  # runs instead of being relitigated).
+  # Review scope is decided from the actual PR, not declared blind at launch:
+  # the diff is information that does not exist until the PR does. classify
+  # judges whether errors and docs warrant their conditional lenses; resolve-scope
+  # then merges the operator's declared error override over that judgment. Its
+  # output feeds the errors gate, while the classifier feeds the docs gate. Round
+  # 1 decides once,
+  # and correction reviews preserve those concerns while one continuation
+  # reviewer judges the prior report and correction delta.
+  - id: classify
+    command: classify-review-scope
+    depends_on: [pr]
+    mutates_checkout: false
+    output_type: review-scope
+    output_format:
+      type: object
+      properties:
+        errors: { type: boolean }
+        docs: { type: boolean }
+        reasons:
+          type: object
+          properties:
+            errors: { type: string }
+            docs: { type: string }
+          required: [errors, docs]
+      required: [errors, docs, reasons]
+
+  # Deterministic merge at the boundary: a declared 'true'/'false' beats the
+  # classifier; 'auto' adopts its judgment. Output values are the strings the
+  # lens gates compare against.
+  - id: resolve-scope
+    script: resolve-review-scope
+    runtime: uv
+    with:
+      c_errors: "$classify.output.errors"
+    depends_on: [classify]
+
+  - id: review
+    include: archon-review
+    with:
+      # The PR node's structured read-back is the target authority. Review must
+      # not rediscover an ambient branch→PR mapping.
+      scope: "$pr.output.number"
+      prior_report: "$INPUTS.prior_report"
+      work_order: "$INPUTS.work"
+      errors: "$resolve-scope.output.errors"
+      docs: "$classify.output.docs"
+    depends_on: [resolve-scope]
+
+  # Validate the authored verdict before it controls a costly branch. `ready`
+  # remains the review outcome; `action` says what delivery may do about it.
+  - id: review-action
+    script: validate-review-action
+    runtime: uv
+    with:
+      ready: "$review.output.ready"
+      action: "$review.output.action"
+    depends_on: [review]
+
+  # A ready initial review skips this block. Otherwise each iteration corrects
+  # the current canonical findings, proves the correction is green, then runs a
+  # fresh continuation review over the report and delta, never an unreviewed
+  # final fix. The bound
+  # is a runaway backstop, not a pacing device: until_bash ends the loop the
+  # moment a recheck certifies ready, so a healthy fix-class run still exits in
+  # one or two rounds. Five rounds is calibrated to the feature-class evidence
+  # (2026-08-25: every executor-heavy delivery needed 4-6 rounds and every
+  # non-starved resume converged; 3 cut two converging runs short). A per-lane
+  # bound would need runtime-parameterized composition, which the language
+  # deliberately does not have — the flat bound buys the same outcome free.
+  #
+  # CI feeds the fix, without waiting: checks run on the pushed commits while
+  # review happens, so concluded results usually exist by the time a round
+  # starts. Each round reads that state once, at its boundary — after the
+  # previous recheck landed — and hands it to the fix as evidence. A failure a
+  # check can prove is cheapest to fix here, in the round that caused it, not
+  # an hour later at the terminal wait. The loop itself never waits on CI, and
+  # await-checks below remains the authority on the flip.
+  - id: corrections
+    depends_on: [review-action]
+    when: "$review-action.output.action == 'correct'"
+    loop_group:
+      # `none` converged and `replan` must stop correction. gate-ready below
+      # accepts only `none`; a replan outcome leaves the PR draft and fails with
+      # the canonical report intact instead of spending another correction.
+      until_bash: test $recheck-action.output.action != "correct"
+      max_iterations: 5
+      fresh_context: true
+      nodes:
+        # Evidence provisioning, never a gate: this node cannot fail the round
+        # and never waits. A read that fails, times out, or finds no checks
+        # reports that fact and the round proceeds on the review findings
+        # alone. One read, one captured document — deriving failures and counts
+        # from separate reads could present a half-failed read as clean CI. The
+        # read is bounded by its own watchdog, well under the engine's
+        # subprocess timeout: an engine-killed node here would skip the fix and
+        # cascade the round into a loud failure, which is exactly backwards for
+        # optional evidence. The exit code is read together with the captured
+        # output, never alone — this gh form can encode check state in its exit
+        # code and can exit zero on failing checks, so non-zero with output is
+        # data, and only killed-or-empty means the read itself failed.
+        - id: ci-note
+          timeout: 90000
+          bash: |
+            PR_NUMBER=$pr.output.number
+            ORIGIN_REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##' || true)
+            TMP=$(mktemp)
+            gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket \
+              --jq '.[] | if .bucket == "pending" then "PENDING" elif .bucket == "pass" or .bucket == "skipping" then "GREEN" else "RED \(.name) (\(.bucket))" end' \
+              > "$TMP" 2>/dev/null &
+            GH_PID=$!
+            ( sleep 45; kill "$GH_PID" 2>/dev/null && : > "$TMP.killed" ) &
+            WATCHDOG=$!
+            wait "$GH_PID"
+            RC=$?
+            kill "$WATCHDOG" 2>/dev/null
+            wait "$WATCHDOG" 2>/dev/null || true
+            LINES=$(cat "$TMP" 2>/dev/null || true)
+            KILLED=""
+            [ -f "$TMP.killed" ] && KILLED=1
+            rm -f "$TMP" "$TMP.killed"
+            if [ -n "$KILLED" ] || { [ "$RC" -ne 0 ] && [ -z "$LINES" ]; }; then
+              echo "No CI evidence is available for this round (the check read failed or timed out). Proceed on the review findings alone."
+              exit 0
+            fi
+            if [ -z "$LINES" ]; then
+              echo "No CI evidence is available for this round (no checks reported). Proceed on the review findings alone."
+              exit 0
+            fi
+            FAILING=$(printf '%s\n' "$LINES" | sed -n 's/^RED /- /p')
+            PENDING=$(printf '%s\n' "$LINES" | grep -c '^PENDING') || true
+            echo "CI state for this pull request, read at the start of this round; it describes the currently pushed head:"
+            if [ -n "$FAILING" ]; then
+              echo "Concluded non-green checks:"
+              printf '%s\n' "$FAILING"
+            else
+              echo "No concluded failures."
+            fi
+            case "$PENDING" in
+              ''|0) ;;
+              *) echo "$PENDING check(s) still running — never wait on them." ;;
+            esac
+            exit 0
+
+        - id: fix
+          include: archon-implement
+          depends_on: [ci-note]
+          with:
+            work: >-
+              Fix every open Critical and Important finding recorded in
+              $ARTIFACTS_DIR/review/report.md, within the accepted work order
+              below. Read both in full before editing. When a causal finding
+              records a finite affected-member inventory, the finding is not
+              fixed until every affected member is handled and the smallest
+              relevant proof passes. Do not cross an explicit boundary to make
+              a finding disappear; the following review must return replan if
+              the requested outcome requires that expansion.
+
+              Concluded CI evidence observed before this round — evidence, not
+              a verdict, and the same red-cause discipline applies to it:
+
+              $ci-note.output
+
+              A concluded CI failure that this branch's changes introduced is
+              part of this round's work, exactly like a review finding. Red on
+              a check this branch cannot have caused is classified with
+              evidence, not chased. Never wait on running checks — but results
+              can conclude while you work, so before declaring done, re-read
+              the concluded check state for this pull request with one
+              non-blocking read, and treat anything newly red the same way.
+
+              Accepted work order:
+              $INPUTS.work
+
+              When the correction is green, push its commits to the branch this
+              run is on. Push it explicitly by name; do not let git select an
+              upstream. Do not change the PR's draft state or edit the canonical
+              review comment; the following review owns that public verdict.
+              Record the exact push target and a read-back of the remote ref in
+              implementation.md; never record credentials.
+
+        # The same gate, same script: a correction can hit inherited or environment
+        # red exactly as the first implementation can, and a
+        # correction refused for a red it did not cause wastes the whole round.
+        - id: gate-correction-green
+          script: gate-green
+          runtime: uv
+          depends_on: [fix]
+          with:
+            green: "$fix.output.green"
+            red_cause: "$fix.output.red_cause"
+            summary: "$fix.output.summary"
+            stage: "The correction"
+
+        - id: recheck
+          include: archon-review
+          with:
+            scope: "$pr.output.number"
+            prior_report: "$ARTIFACTS_DIR/review/report.md"
+            work_order: "$INPUTS.work"
+            # Continuation mode owns coverage and skips every specialist,
+            # regardless of these conditional-lens bindings.
+            errors: "$resolve-scope.output.errors"
+            docs: "$classify.output.docs"
+          depends_on: [gate-correction-green]
+
+        - id: recheck-action
+          script: validate-review-action
+          runtime: uv
+          with:
+            ready: "$recheck.output.ready"
+            action: "$recheck.output.action"
+          depends_on: [recheck]
+
+  # none_failed_min_one_success joins the mutually exclusive paths as bound
+  # values: the
+  # initial review's verdict directly, and the correction loop's final verdict
+  # with if_skipped defaults. The loop can stop on `none` (ready) or `replan`
+  # (truthful terminal refusal); the script below owns that final distinction.
+  # A failed loop (bound exhausted) or failed review prevents this node from
+  # running, so lifecycle success alone never certifies readiness. if_skipped
+  # covers only skipped/pending producers, never failed ones.
+  - id: gate-ready
+    script: gate-ready
+    runtime: uv
+    depends_on: [review-action, corrections]
+    trigger_rule: none_failed_min_one_success
+    with:
+      review_ready: { from: "$review-action.output.ready", if_skipped: false }
+      review_action: { from: "$review-action.output.action", if_skipped: null }
+      correction_ready: { from: "$corrections.output.ready", if_skipped: false }
+      correction_action: { from: "$corrections.output.action", if_skipped: null }
+
+  # Correction rounds change the diff after `pr` wrote the description, so
+  # concrete claims in the body can be falsified by the very fixes the review
+  # demanded. One resync, once readiness is certified — never per iteration
+  # (that would be repeated public writes describing diffs the next iteration
+  # falsifies). Skipped when the initial review was already ready: the diff
+  # never changed after the body was written.
+  - id: sync-pr-body
+    command: sync-pr-body
+    model: medium
+    with:
+      pr_number: "$pr.output.number"
+      pr_head: "$pr.output.head"
+    depends_on: [gate-ready]
+    when: "$review.output.ready == 'false'"
+
+  # Final local gate, ALWAYS run: the project's own checks via the validate
+  # package. Uniform on every path — and when CI is maintainer-gated (fork
+  # PRs), this is the only validation before the flip.
+  - id: validate
+    include: archon-validate
+    depends_on: [gate-ready]
+
+  # The third gate on the same script, for the same reason: a local gate that
+  # refuses every red refuses red the change did not cause, and the base break
+  # this branch inherited is exactly the red that survives to here. Introduced red
+  # still stops the run. Inherited or environment red proceeds to await-checks,
+  # where the pull request's own CI decides — an inherited break is red there too
+  # and holds at the durable wait, which is the honest place to hold it.
+  - id: gate-validated
+    script: gate-green
+    runtime: uv
+    depends_on: [validate]
+    with:
+      green: "$validate.output.green"
+      red_cause: "$validate.output.red_cause"
+      summary: "$validate.output.summary"
+      stage: "The project gate"
+
+  # CI wait, durably. The probe classifies check state once; a pending state
+  # routes into the engine's `wait:` node, which suspends the run and
+  # releases the worker slot — the server's continuation scan resumes it when
+  # the clock fires, surviving restarts. This replaced a 60-minute in-process
+  # polling script the moment the engine could hold the time itself. Red fails
+  # the body (and so the group) immediately; a concluded probe skips the pause
+  # and `until_bash` ends the loop with zero wasted wait. 13 iterations bound
+  # the watch at ~60 minutes of CI time, the same ceiling the poller had —
+  # exhausting it fails the run rather than flipping a PR whose CI never ended.
+  - id: await-checks
+    loop_group:
+      max_iterations: 13
+      # Completion computed EXTERNALLY (gh state), never from body-node output
+      # substitution: the resumed-wait completion recheck does not evaluate
+      # until_bash against the iteration's outputs (seen flipping a PR
+      # with CI still running). Red counts as done here; the next iteration's
+      # probe is what turns red into a loud body failure, and flip-ready's
+      # preflight refuses any non-green state that slips through regardless.
+      until_bash: '! gh pr checks --json bucket --jq ".[].bucket" 2>/dev/null | grep -q "^pending$"'
+      nodes:
+        - id: ci-probe
+          script: check-ci
+          runtime: uv
+          # The probe's only in-process wait is the single 60 s registration
+          # grace; headroom over the 120 s script default keeps that honest.
+          timeout: 180000
+        - id: ci-pause
+          wait:
+            duration_ms: 300000
+          when: $ci-probe.output.state == 'pending'
+          depends_on: [ci-probe]
+    depends_on: [gate-validated]
+
+  - id: flip-ready
+    bash: |
+      set -euo pipefail
+      # --repo pins to the origin remote: gh's default resolution in a
+      # fork clone targets the upstream parent instead. With --repo, gh disables
+      # branch inference and REQUIRES an explicit selector — omitting it is a
+      # usage error.
+      # Nothing below streams a command's own output. The engine broadcasts a
+      # node's stderr to the operator as it runs and retains what the node prints,
+      # so every git and gh call here is captured: this node's authored messages
+      # are the only text that reaches its streams. That also keeps the raw origin
+      # URL — which can carry a credential (https://<token>@host/...) — out of
+      # both, since it is normalized inside the substitution that reads it and
+      # only the owner/repo below ever reaches a command line or a message.
+      if ! ORIGIN_REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##'); then
+        printf '%s\n' "flip-ready: could not read the origin remote." >&2
+        exit 1
+      fi
+      case "$ORIGIN_REPO" in
+        *[!A-Za-z0-9_.-]*/* | */*[!A-Za-z0-9_.-]* | */*/* | /* | */ | "")
+          printf '%s\n' "flip-ready: origin remote does not resolve to an owner/repo." >&2
+          exit 1
+          ;;
+      esac
+      # The recorded number is the selector. Which branch is checked out is not
+      # re-derived here: the run owns its worktree and the PR was created in it,
+      # so this node cannot be the place that discovers otherwise. See the pack
+      # README on guards.
+      PR_NUMBER=$pr.output.number
+      # Public-surface preflight: the flip is the one irreversible
+      # step, so it re-verifies CI itself instead of trusting the loop above —
+      # any pending or non-green check refuses the flip loudly. An empty result
+      # (no CI configured, or gated checks that never started) proceeds,
+      # matching the probe's permission-agnostic skip. `gh pr checks` exits
+      # non-zero and says "no checks reported" for exactly that case, so this
+      # read is the one that tolerates failure — reporting the checks it found
+      # is what refuses the flip, never the exit code.
+      # `|| true` here and nowhere else: every other read must fail the node.
+      # Dropping gh's explanation for the tolerated case hides nothing: a gh that
+      # cannot read this PR's checks cannot flip it either, and the flip below
+      # fails loudly carrying gh's own words.
+      NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>/dev/null || true)
+      if [ -n "$NOT_GREEN" ]; then
+        printf '%s\n' "flip-ready: refusing to flip with non-green checks: $NOT_GREEN" >&2
+        printf '%s\n' "flip-ready: if that red is transient or unrelated to this change, re-run the failing check on the pull request and resume this run — the flip reads the check state again on resume." >&2
+        exit 1
+      fi
+      # The flip prints a confirmation this node has no use for, and its stdout is
+      # not a value, so both streams are captured together and re-emitted only if
+      # the flip failed — where gh's own words are the diagnostic.
+      if ! FLIP=$(gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO" 2>&1); then
+        printf '%s\n' "flip-ready: the ready flip failed: $FLIP" >&2
+        exit 1
+      fi
+      # The two reads below capture a VALUE, so their stderr is dropped rather than
+      # merged: a gh notice must never become the draft state or the delivered URL.
+      # Each failure names the read it could not complete, so neither is silent.
+      if ! draft=$(gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+        printf '%s\n' "flip-ready: PR was flipped but its draft state could not be read back." >&2
+        exit 1
+      fi
+      if [ "$draft" != "false" ]; then
+        printf '%s\n' "flip-ready: PR still reports draft after the ready flip" >&2
+        exit 1
+      fi
+      # This node's stdout is the delivered URL and nothing else; `outcome` reports
+      # the value verbatim.
+      if ! gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json url --jq .url 2>/dev/null; then
+        printf '%s\n' "flip-ready: PR was flipped but its URL could not be read back." >&2
+        exit 1
+      fi
+    # Waits on sync-pr-body explicitly: on a repo with no CI, await-checks
+    # returns immediately and the flip could otherwise beat the resync. The
+    # trigger rule lets a SKIPPED resync (initial review was ready) pass while
+    # a FAILED resync still blocks the flip — a public surface we could not
+    # correct is a reason not to go ready.
+    depends_on: [await-checks, sync-pr-body]
+    trigger_rule: none_failed_min_one_success
+
+  # This tail's terminal report, like every other SDLC tail's (scripts/outcome.py).
+  # flip-ready owns the one irreversible public action and stops there; composing
+  # the text its reader receives is separate work, and a named script keeps it out
+  # of a bash body that would otherwise need a python interpreter Windows hosts do
+  # not reliably have.
+  - id: outcome
+    script: outcome
+    runtime: uv
+    with:
+      pr_url: "$flip-ready.output"
+    depends_on: [flip-ready]

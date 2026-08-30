@@ -306,7 +306,7 @@ describe('PATCH /api/auth/me/ai-prefs/tiers', () => {
       method: 'PATCH',
       headers: JSON_HEADERS,
       body: JSON.stringify({
-        tiers: { large: { provider: 'claude', model: 'opus', effort: 'ultra' } },
+        tiers: { large: { provider: 'claude', model: 'opus', effort: 'extreme' } },
       }),
     });
     expect(res.status).toBe(400);

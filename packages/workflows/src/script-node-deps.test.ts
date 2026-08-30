@@ -46,7 +46,7 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after all mock.module calls) ---
 import { executeDagWorkflow } from './dag-executor';
-import type { ScriptNode, WorkflowRun } from './schemas';
+import type { ExecNode, WorkflowRun } from './schemas';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 
@@ -62,17 +62,23 @@ function createMockStore(): IWorkflowStore {
         parent_conversation_id: null,
         codebase_id: null,
         status: 'running' as const,
+        outcome: null,
         user_message: 'mock message',
         metadata: {},
         started_at: new Date(),
         completed_at: null,
         last_activity_at: null,
         working_path: null,
+        user_id: null,
+        parent_run_id: null,
+        output_root: null,
+        adopted_from_run_id: null,
       })
     ),
     getWorkflowRun: mock(() => Promise.resolve(null)),
+    findChildRuns: mock(() => Promise.resolve([])),
+    getRunAncestry: mock(() => Promise.resolve([])),
     getActiveWorkflowRunByPath: mock(() => Promise.resolve(null)),
-    failOrphanedRuns: mock(() => Promise.resolve({ count: 0 })),
     findResumableRun: mock(() => Promise.resolve(null)),
     resumeWorkflowRun: mock(() =>
       Promise.resolve({
@@ -82,41 +88,83 @@ function createMockStore(): IWorkflowStore {
         parent_conversation_id: null,
         codebase_id: null,
         status: 'running' as const,
+        outcome: null,
         user_message: 'mock message',
         metadata: {},
         started_at: new Date(),
         completed_at: null,
         last_activity_at: null,
         working_path: null,
+        user_id: null,
+        parent_run_id: null,
+        output_root: null,
+        adopted_from_run_id: null,
       })
     ),
+    recoverCancelledFanOutRun: mock(() => Promise.reject(new Error('unused in this test'))),
     updateWorkflowRun: mock(() => Promise.resolve()),
     updateWorkflowActivity: mock(() => Promise.resolve()),
     getWorkflowRunStatus: mock(() => Promise.resolve('running' as const)),
     completeWorkflowRun: mock(() => Promise.resolve()),
     failWorkflowRun: mock(() => Promise.resolve()),
     pauseWorkflowRun: mock(() => Promise.resolve()),
-    cancelWorkflowRun: mock(() => Promise.resolve()),
+    pauseWorkflowRunForWait: mock(() => Promise.resolve()),
+    clearWorkflowWaitContext: mock(() => Promise.resolve({ cleared: true })),
+    rewriteApprovalContext: mock(() => Promise.resolve({ resolved: true })),
+    claimWriteback: mock(() => Promise.resolve({ claimed: true })),
+    releaseWritebackClaim: mock(() => Promise.resolve()),
+    cancelWorkflowRun: mock(() => Promise.resolve({ cancelled: false })),
+    cancelFanOutRun: mock(() => Promise.resolve({ cancelled: false })),
     createWorkflowEvent: mock(() => Promise.resolve()),
+    persistWorkflowEvent: mock(() => Promise.resolve()),
+    persistWorkflowEventIfRunning: mock(() => Promise.resolve({ persisted: true })),
     getDagResumeSnapshot: mock(() =>
       Promise.resolve({
-        completedNodeOutputs: new Map<string, string>(),
+        completedNodeOutputs: new Map<string, { output: string }>(),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set<string>(),
         tokens: { input: 0, output: 0 },
+        costUsd: 0,
       })
     ),
     getCodebase: mock(() => Promise.resolve(null)),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
+    getWorkflowNodeSession: mock(() => Promise.resolve(null)),
+    listWorkflowRunNodeSessions: mock(() => Promise.resolve([])),
+    upsertWorkflowRunNodeSession: mock(() => Promise.resolve()),
+    upsertWorkflowNodeSession: mock(() => Promise.resolve()),
+    deleteWorkflowNodeSessions: mock(() => Promise.resolve({ deleted: 0 })),
   };
 }
 
-const mockSendQuery = mock(function* () {
-  yield { type: 'assistant', content: 'AI response' };
-  yield { type: 'result', sessionId: 'session-id' };
-});
+const mockSendQuery = mock<ReturnType<WorkflowDeps['getAgentProvider']>['sendQuery']>(
+  async function* (_prompt, _cwd, _resumeSessionId, _options) {
+    yield { type: 'assistant', content: 'AI response' };
+    yield { type: 'result', sessionId: 'session-id' };
+  }
+);
 
-const mockGetAgentProvider = mock(() => ({
+const mockGetAgentProvider = mock<WorkflowDeps['getAgentProvider']>(_provider => ({
   sendQuery: mockSendQuery,
   getType: () => 'claude',
+  getCapabilities: () => ({
+    sessionResume: true,
+    mcp: true,
+    hooks: true,
+    skills: true,
+    agents: true,
+    toolRestrictions: true,
+    structuredOutput: 'enforced' as const,
+    envInjection: true,
+    costControl: true,
+    effortControl: true,
+    thinkingControl: true,
+    fallbackModel: true,
+    sandbox: true,
+    settingSources: true,
+    nativeTools: true,
+    containerExec: true,
+  }),
 }));
 
 function createMockDeps(): WorkflowDeps {
@@ -151,12 +199,17 @@ function makeWorkflowRun(id: string): WorkflowRun {
     parent_conversation_id: null,
     codebase_id: null,
     status: 'running',
+    outcome: null,
     user_message: 'test',
     metadata: {},
     started_at: new Date(),
     completed_at: null,
     last_activity_at: null,
     working_path: null,
+    user_id: null,
+    parent_run_id: null,
+    output_root: null,
+    adopted_from_run_id: null,
   };
 }
 
@@ -190,8 +243,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('uv inline with deps uses uv run --with flags', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'fetch-data',
+      kind: 'exec',
       script: 'import httpx; print(httpx.get("https://example.com").status_code)',
       runtime: 'uv',
       deps: ['httpx', 'beautifulsoup4'],
@@ -231,8 +285,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('uv inline without deps uses uv run python -c', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'simple-py',
+      kind: 'exec',
       script: 'print("hello")',
       runtime: 'uv',
     };
@@ -263,8 +318,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('uv inline with empty deps array uses uv run python -c (no extra flags)', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'empty-deps-py',
+      kind: 'exec',
       script: 'print("no deps")',
       runtime: 'uv',
       deps: [],
@@ -296,8 +352,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('bun inline with deps uses bun --no-env-file -e (no extra dep flags — bun auto-installs)', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'bun-with-deps',
+      kind: 'exec',
       script: 'import { z } from "zod"; console.log(z.string().parse("hello"))',
       runtime: 'bun',
       deps: ['zod', 'node-fetch'],
@@ -332,8 +389,9 @@ describe('script node deps field — command construction', () => {
   });
 
   it('bun inline without deps uses bun --no-env-file -e', async () => {
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'bun-no-deps',
+      kind: 'exec',
       script: 'console.log("hello")',
       runtime: 'bun',
     };
@@ -370,8 +428,9 @@ describe('script node deps field — command construction', () => {
     const { writeFile } = await import('fs/promises');
     await writeFile(join(scriptsDir, 'analyze.py'), 'import httpx\nprint("ok")');
 
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'run-analyze',
+      kind: 'exec',
       script: 'analyze',
       runtime: 'uv',
       deps: ['httpx'],
@@ -417,8 +476,9 @@ describe('script node deps field — command construction', () => {
     const { writeFile } = await import('fs/promises');
     await writeFile(join(scriptsDir, 'simple.py'), 'print("simple")');
 
-    const node: ScriptNode = {
+    const node: ExecNode = {
       id: 'run-simple',
+      kind: 'exec',
       script: 'simple',
       runtime: 'uv',
     };
