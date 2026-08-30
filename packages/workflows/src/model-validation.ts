@@ -553,7 +553,10 @@ export function resolveTierWithFallback(
     if (preset) return { preset, matchedTier: candidate };
   }
   throw new Error(
-    `Tier '${tier}' has no configured preset and no built-in default for provider '${profile.defaultProvider}'. Configure 'tiers.small/medium/large' in .archon/config.yaml.`
+    `Tier '${tier}' has no configured preset and no built-in default for provider '${profile.defaultProvider}'. ` +
+      'Built-in tier defaults exist only for claude and codex; every other provider must configure its own. ' +
+      "Set tiers with 'archon ai tier set <tier> <provider> <model>', the console AI Settings -> Model Tiers panel, " +
+      "or 'tiers.small/medium/large' in .archon/config.yaml. Docs: https://archon.diy/getting-started/ai-assistants/#per-user-credentials-and-ai-settings"
   );
 }
 
