@@ -9546,7 +9546,14 @@ describe('maybePrintTierNotice', () => {
     stderrSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
     (readTierNoticeState as ReturnType<typeof mock>).mockReturnValue(null);
     (markTierNoticeShown as ReturnType<typeof mock>).mockClear();
-    (loadConfig as ReturnType<typeof mock>).mockResolvedValue({ defaults: {}, tiers: {} });
+    // assistant: 'claude' — a provider WITH built-in tier defaults, so the
+    // notice has something truthful to announce (the no-built-ins case is
+    // covered by its own test below).
+    (loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      tiers: {},
+      assistant: 'claude',
+    });
     (getUserAiPrefs as ReturnType<typeof mock>).mockResolvedValue({});
   });
 
@@ -9603,6 +9610,21 @@ describe('maybePrintTierNotice', () => {
     const written = stderrSpy.mock.calls[0][0] as string;
     expect(written).toContain('model tiers');
     expect(markTierNoticeShown).toHaveBeenCalledWith('0.0.0-test');
+  });
+
+  it('prints nothing for a provider with no built-in tier defaults (and keeps the notice unshown)', async () => {
+    (loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      tiers: {},
+      assistant: 'pi',
+    });
+    const workflow = makeTierWorkflow('large');
+    await maybePrintTierNotice(workflow, '/cwd', undefined, false);
+    // No built-ins exist, so claiming "using built-in defaults" would be false —
+    // the run's tier-resolution error owns the guidance. Not marked shown, so a
+    // later provider switch still gets its one-time notice.
+    expect(stderrSpy).not.toHaveBeenCalled();
+    expect(markTierNoticeShown).not.toHaveBeenCalled();
   });
 
   it('returns silently when loadConfig throws', async () => {
