@@ -175,6 +175,26 @@ export function buildApprovalResolutionBlocks(input: {
   };
 }
 
+export function buildClosedApprovalBlocks(input: {
+  runId: string;
+  terminalStatus: RunTerminalStatus;
+  originalMessage: string;
+}): { blocks: KnownBlock[]; fallbackText: string } {
+  const blocks: KnownBlock[] = [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${TERMINAL_HEADER[input.terminalStatus]} — approval closed for run \`${shortRunId(input.runId)}\`\n\n${input.originalMessage}`,
+      },
+    },
+  ];
+  return {
+    blocks,
+    fallbackText: `Approval closed for ${input.terminalStatus} run ${shortRunId(input.runId)}`,
+  };
+}
+
 /**
  * Block Kit status message shown for the duration of a workflow run, edited
  * in place as nodes start and complete. Includes a Cancel button while the

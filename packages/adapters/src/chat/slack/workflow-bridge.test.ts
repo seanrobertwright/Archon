@@ -164,6 +164,31 @@ async function dispatchEvent(event: WorkflowEmitterEvent): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, 0));
 }
 
+function makeTerminalEvent(status: 'completed' | 'failed' | 'cancelled'): WorkflowEmitterEvent {
+  if (status === 'completed') {
+    return {
+      type: 'workflow_completed',
+      runId: 'r1',
+      workflowName: 'assist',
+      duration: 1234,
+    };
+  }
+  if (status === 'failed') {
+    return {
+      type: 'workflow_failed',
+      runId: 'r1',
+      workflowName: 'assist',
+      error: 'later node failed',
+    };
+  }
+  return {
+    type: 'workflow_cancelled',
+    runId: 'r1',
+    nodeId: 'review',
+    reason: 'cancelled by operator',
+  };
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 describe('SlackWorkflowBridge', () => {
@@ -324,28 +349,7 @@ describe('SlackWorkflowBridge', () => {
         message: 'Approve the change?',
       });
 
-      const terminalEvent: WorkflowEmitterEvent =
-        terminal === 'completed'
-          ? {
-              type: 'workflow_completed',
-              runId: 'r1',
-              workflowName: 'assist',
-              duration: 1234,
-            }
-          : terminal === 'failed'
-            ? {
-                type: 'workflow_failed',
-                runId: 'r1',
-                workflowName: 'assist',
-                error: 'later node failed',
-              }
-            : {
-                type: 'workflow_cancelled',
-                runId: 'r1',
-                nodeId: 'review',
-                reason: 'cancelled by operator',
-              };
-      await dispatchEvent(terminalEvent);
+      await dispatchEvent(makeTerminalEvent(terminal));
 
       resolveApprovalLookup({ metadata: {}, outcome: 'succeeded' });
       await new Promise(resolve => setTimeout(resolve, 0));
@@ -355,6 +359,61 @@ describe('SlackWorkflowBridge', () => {
       const header = updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined;
       expect(header?.text?.text).toContain(`*Execution status:* \`${terminal}\``);
       expect(header?.text?.text).not.toContain('paused');
+    }
+  );
+
+  test.each(['completed', 'failed', 'cancelled'] as const)(
+    'closes an approval posted after the run becomes %s',
+    async terminal => {
+      const { adapter, fakeApp, posted, updated, triggerMap, dispatchAction } = makeFakeAdapter();
+      triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });
+      mockGetConversationId.mockReturnValue('C1:111.0');
+
+      new SlackWorkflowBridge(adapter as never).attach();
+      await dispatchEvent({
+        type: 'workflow_started',
+        runId: 'r1',
+        workflowName: 'assist',
+        conversationId: 'conv-db-uuid',
+      });
+
+      let resolveApprovalPost!: (result: { ts: string }) => void;
+      const approvalPost = new Promise<{ ts: string }>(resolve => {
+        resolveApprovalPost = resolve;
+      });
+      fakeApp.client.chat.postMessage.mockImplementationOnce(async args => {
+        posted.push(args);
+        return approvalPost;
+      });
+
+      await dispatchEvent({
+        type: 'approval_pending',
+        runId: 'r1',
+        nodeId: 'review',
+        message: 'Approve the change?',
+      });
+
+      await dispatchEvent(makeTerminalEvent(terminal));
+
+      resolveApprovalPost({ ts: '2.000' });
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      const closedApproval = updated.find(message => message.ts === '2.000');
+      expect(closedApproval).toBeDefined();
+      expect(closedApproval?.text).toContain(terminal);
+      expect(
+        closedApproval?.blocks?.some(block => (block as { type?: string }).type === 'actions')
+      ).toBe(false);
+
+      const actionBody = {
+        user: { id: 'U123' },
+        channel: { id: 'C1' },
+        message: { ts: '2.000' },
+      };
+      await dispatchAction('approve:r1:review', actionBody);
+      await dispatchAction('reject:r1:review', actionBody);
+      expect(mockApproveWorkflow).not.toHaveBeenCalled();
+      expect(mockRejectWorkflow).not.toHaveBeenCalled();
     }
   );
 

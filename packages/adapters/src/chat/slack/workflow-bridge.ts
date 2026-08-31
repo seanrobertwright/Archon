@@ -24,6 +24,7 @@ import {
   REACTION_SUCCESS,
   buildApprovalBlocks,
   buildApprovalResolutionBlocks,
+  buildClosedApprovalBlocks,
   buildStatusBlocks,
   type NodeSnapshot,
   type NodeState,
@@ -40,10 +41,10 @@ function getLog(): ReturnType<typeof createLogger> {
 
 interface ApprovalMessage {
   channel: string;
-  ts: string;
   /** Original message text we showed alongside the buttons; reused in the resolution edit. */
   message: string;
   nodeId: string;
+  postResult: Promise<string | undefined>;
 }
 
 interface RunState {
@@ -251,26 +252,33 @@ export class SlackWorkflowBridge {
       nodeId: event.nodeId,
       message: event.message,
     });
-    try {
-      const result = await this.adapter.getApp().client.chat.postMessage({
+    const postResult = this.adapter
+      .getApp()
+      .client.chat.postMessage({
         channel: state.channel,
         thread_ts: state.threadTs,
         text: fallbackText,
         blocks,
+      })
+      .then(result => result.ts ?? undefined)
+      .catch(error => {
+        getLog().warn(
+          { err: error as Error, runId: event.runId, nodeId: event.nodeId },
+          'slack.bridge_approval_post_failed'
+        );
+        return undefined;
       });
-      if (result.ts) {
-        state.approvals.set(event.nodeId, {
-          channel: state.channel,
-          ts: result.ts,
-          message: event.message,
-          nodeId: event.nodeId,
-        });
-      }
-    } catch (error) {
-      getLog().warn(
-        { err: error as Error, runId: event.runId, nodeId: event.nodeId },
-        'slack.bridge_approval_post_failed'
-      );
+    const approval: ApprovalMessage = {
+      channel: state.channel,
+      message: event.message,
+      nodeId: event.nodeId,
+      postResult,
+    };
+    state.approvals.set(event.nodeId, approval);
+
+    const ts = await postResult;
+    if (!ts && state.approvals.get(event.nodeId) === approval) {
+      state.approvals.delete(event.nodeId);
     }
   }
 
@@ -288,6 +296,7 @@ export class SlackWorkflowBridge {
         state.pendingEdit = undefined;
       }
     }
+    const closingApprovals = state ? this.closeApprovals(state, terminal) : undefined;
     const trigger = this.adapter.getTriggeringMessage(conversationId);
     const { authoredOutcome, totalCostUsd } = await this.readRunPresentation(runId);
 
@@ -315,10 +324,40 @@ export class SlackWorkflowBridge {
         failureReason: terminal === 'completed' ? undefined : reason,
       });
     }
+    await closingApprovals;
 
     // Triggering message is no longer needed for this conversation once the
     // run has terminated. (Reactions stay — we only clear the map entry.)
     this.adapter.clearTriggeringMessage(conversationId);
+  }
+
+  private async closeApprovals(state: RunState, terminalStatus: RunTerminalStatus): Promise<void> {
+    const approvals = [...state.approvals.values()];
+    state.approvals.clear();
+    await Promise.all(
+      approvals.map(async approval => {
+        const ts = await approval.postResult;
+        if (!ts) return;
+        const { blocks, fallbackText } = buildClosedApprovalBlocks({
+          runId: state.runId,
+          terminalStatus,
+          originalMessage: approval.message,
+        });
+        try {
+          await this.adapter.getApp().client.chat.update({
+            channel: approval.channel,
+            ts,
+            text: fallbackText,
+            blocks,
+          });
+        } catch (error) {
+          getLog().warn(
+            { err: error as Error, runId: state.runId, nodeId: approval.nodeId, ts },
+            'slack.bridge_approval_close_failed'
+          );
+        }
+      })
+    );
   }
 
   private async readRunPresentation(runId: string): Promise<{
@@ -488,6 +527,7 @@ export class SlackWorkflowBridge {
     const parsed = parseActionId(action.action_id ?? '', decision);
     if (!parsed) return;
     const { runId, nodeId } = parsed;
+    if (!this.runs.get(runId)?.approvals.has(nodeId)) return;
 
     // Top-level try/catch: applyResolutionEdit must also be guarded because the
     // block builder or chat.update can throw. Bolt has no app.error registered,
