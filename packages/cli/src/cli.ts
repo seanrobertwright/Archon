@@ -47,6 +47,7 @@ import {
   rejectConfigOnContinue,
   rejectConfigOutsideRun,
   rejectModelOnContinue,
+  isContinueSubcommand,
   RESUME_RUN_CONFIG_CONFLICT,
 } from './dispatch-guards';
 import { resolveCliExitCode } from './utils/workflow-exit-code';
@@ -100,17 +101,6 @@ async function loadRoute<T>(
   const route = await loader();
   if (options.database) databaseRouteLoaded = true;
   return route;
-}
-
-let workflowCommandsPromise: Promise<typeof import('./commands/workflow')> | undefined;
-async function loadWorkflowCommands(
-  providers = false
-): Promise<typeof import('./commands/workflow')> {
-  if (providers) await registerProviders();
-  workflowCommandsPromise ??= import('./commands/workflow');
-  const commands = await workflowCommandsPromise;
-  databaseRouteLoaded = true;
-  return commands;
 }
 
 /** True when `path` exists and is a directory (used to validate `--workflow-source`). */
@@ -466,7 +456,7 @@ async function main(): Promise<number> {
     if (command === 'workflow' && subcommand === 'search') {
       const query = positionals[2];
       try {
-        const { workflowSearchCommand } = await loadWorkflowCommands();
+        const { workflowSearchCommand } = await loadRoute(() => import('./commands/workflow'));
         await workflowSearchCommand(query, jsonFlag);
       } catch (error) {
         const err = error as Error;
@@ -487,7 +477,7 @@ async function main(): Promise<number> {
       try {
         const [git, { workflowTestCommand }] = await Promise.all([
           import('@archon/git'),
-          loadWorkflowCommands(),
+          loadRoute(() => import('./commands/workflow')),
         ]);
         // Resolve to the repo root like the git gate below does, so project
         // workflow discovery reads the repository, not a subdirectory of it.
@@ -669,7 +659,17 @@ async function main(): Promise<number> {
           workflowEventEmitCommand,
           workflowInstallCommand,
           isValidEventType,
-        } = await loadWorkflowCommands(subcommand === 'run');
+        } = await loadRoute(() => import('./commands/workflow'), {
+          // `resume`, `approve`, `reject`, and `respond` all reach `workflowRunCommand`,
+          // so they need the registry for the same reason `run` does. They need it more,
+          // in fact: a continuation resolves its workflow from the run's captured source,
+          // and passing that capture's `source_config` into discovery is what skips
+          // `loadConfig()` — the call that self-registers providers for every other
+          // route. Without this, the loader rejects any `provider:`-scoped workflow and
+          // the run is reported as missing from its own capture.
+          providers: subcommand === 'run' || isContinueSubcommand(subcommand),
+          database: true,
+        });
         switch (subcommand) {
           case 'list':
             await workflowListCommand(effectiveCwd, jsonFlag);
