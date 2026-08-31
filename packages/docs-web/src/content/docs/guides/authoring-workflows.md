@@ -1490,9 +1490,10 @@ nodes:
 An included workflow's outcome declaration never becomes the composer's outcome, and a
 `workflow:` child owns its outcome on its own run row; neither propagates implicitly to a parent.
 The REST run list, detail, by-worker, and dashboard JSON expose nullable `outcome` beside `status`.
-Coherent presentation across CLI, web, console, and adapters is tracked in
-[#2651](https://github.com/coleam00/Archon/issues/2651); dry-run terminology and compatibility are
-tracked separately in [#2650](https://github.com/coleam00/Archon/issues/2650).
+CLI, console, chat, and adapter result surfaces show a non-null authored outcome separately from
+execution status. When `outcome` is null, they retain the normal status-only presentation. Dry-run
+terminology and compatibility are tracked separately in
+[#2650](https://github.com/coleam00/Archon/issues/2650).
 
 ### Binding time: includes resolve at load, runs at runtime
 
