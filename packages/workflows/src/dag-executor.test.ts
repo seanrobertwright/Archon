@@ -15669,6 +15669,11 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     expect(cancelRow?.error).toBe('Cancelled by user');
     expect(cancelRow?.cost_usd).toBe(0.02);
     expect(cancelRow?.tokens).toEqual({ input: 30, output: 3 });
+
+    const failedEvent = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .find(event => event.event_type === 'node_failed' && event.step_name === 'only');
+    expect(typeof failedEvent?.data?.duration_ms).toBe('number');
   });
 
   it('a cancel that surfaces as a thrown error still leaves a transcript row', async () => {
