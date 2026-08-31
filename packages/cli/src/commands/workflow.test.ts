@@ -122,7 +122,10 @@ mock.module(
 // workflow-wait.integration.spec.ts. Here the command's OWN responsibilities are
 // under test: prefix resolution, both output modes, and the exit code per outcome.
 const mockWaitForRunAttention = mock(
-  (): Promise<unknown> => Promise.resolve({ kind: 'not_found', runId: 'unset' })
+  (
+    _runId: string,
+    _opts?: { onAttached?: (observedStatus: string) => void | Promise<void> }
+  ): Promise<unknown> => Promise.resolve({ kind: 'not_found', runId: 'unset' })
 );
 mock.module('@archon/core/services/run-attention-watch', () => ({
   waitForRunAttention: mockWaitForRunAttention,
@@ -477,6 +480,15 @@ mock.module('@archon/core/db/workflow-node-sessions', () => ({
  */
 function spyOnJsonStdout(): ReturnType<typeof spyOn> {
   return spyOn(process.stdout, 'write').mockImplementation((...args: unknown[]) => {
+    const callback = args.find(arg => typeof arg === 'function');
+    if (typeof callback === 'function') (callback as () => void)();
+    return true;
+  });
+}
+
+/** The same delivery-confirming shim for stderr, where progress lines go. */
+function spyOnStderr(): ReturnType<typeof spyOn> {
+  return spyOn(process.stderr, 'write').mockImplementation((...args: unknown[]) => {
     const callback = args.find(arg => typeof arg === 'function');
     if (typeof callback === 'function') (callback as () => void)();
     return true;
@@ -3961,47 +3973,6 @@ const EXPECTED_VERBOSE_NODES = JSON.parse(
   JSON.stringify(buildNodeSummaries(VERBOSE_EVENTS_FIXTURE))
 ) as Array<Record<string, unknown>>;
 
-describe('buildNodeSummaries', () => {
-  it('resets a retried node to its current running attempt', () => {
-    const summaries = buildNodeSummaries([
-      {
-        id: 'retry-start-1',
-        workflow_run_id: 'run-retry',
-        event_type: 'node_started',
-        step_index: 0,
-        step_name: 'build',
-        data: {},
-        created_at: '2026-08-03T10:00:00.000Z',
-        event_order: 1,
-      },
-      {
-        id: 'retry-failed',
-        workflow_run_id: 'run-retry',
-        event_type: 'node_failed',
-        step_index: 0,
-        step_name: 'build',
-        data: { error: 'temporary failure' },
-        created_at: '2026-08-03T10:00:01.000Z',
-        event_order: 2,
-      },
-      {
-        id: 'retry-start-2',
-        workflow_run_id: 'run-retry',
-        event_type: 'node_started',
-        step_index: 0,
-        step_name: 'build',
-        data: {},
-        created_at: '2026-08-03T10:00:02.000Z',
-        event_order: 3,
-      },
-    ]);
-
-    expect(summaries).toEqual([
-      { nodeId: 'build', state: 'running', startedAt: '2026-08-03T10:00:02.000Z' },
-    ]);
-  });
-});
-
 describe('workflowStatusCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
   let stdoutSpy: ReturnType<typeof spyOn>;
@@ -4214,6 +4185,9 @@ describe('workflowStatusCommand', () => {
       durationMs: 5_000,
       error: 'Unknown error',
     });
+    // A prior-success replay reports the success it describes, with no start
+    // time to derive a duration from (#2973).
+    expect(middle?.state).toBe('completed');
     expect(middle?.startedAt).toBeUndefined();
     expect(middle?.durationMs).toBeUndefined();
     expect(beta).toMatchObject({
@@ -5519,9 +5493,11 @@ describe('workflowRunCommand — detach', () => {
     expect(consoleSpy).toHaveBeenCalledWith("Started 'assist' in the background.");
   });
 
-  it('passes adoption to the detached child without generating a conflicting branch', async () => {
+  it('resolves an adopted run prefix before passing it to the detached child', async () => {
+    const adoptedRunId = '0b1ee8da-1111-2222-3333-444455556666';
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
     const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
     const { resolveWorkflowAdoption } = await import('@archon/core/operations/workflow-adoption');
     const paths = await import('@archon/paths');
     (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
@@ -5533,15 +5509,18 @@ describe('workflowRunCommand — detach', () => {
     });
     // The parent resolves the declared adoption before forking (#2872), so this test
     // now has to give it a project and a resolvable lane to pass through.
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (codebaseDb.findCodebaseByPathPrefix as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'cb-1',
-      name: 'test/repo',
+      name: 'test/folder',
       default_cwd: '/test/path',
-      default_branch: 'main',
-      kind: 'repo',
+      kind: 'folder',
     });
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: adoptedRunId },
+    ]);
     (resolveWorkflowAdoption as ReturnType<typeof mock>).mockResolvedValueOnce({
-      adoptedRun: { id: 'run-old', status: 'completed', working_path: '/test/worktree' },
+      adoptedRun: { id: adoptedRunId, status: 'completed', working_path: '/test/worktree' },
       lane: { kind: 'reuse-worktree', workingPath: '/test/worktree' },
     });
 
@@ -5552,9 +5531,9 @@ describe('workflowRunCommand — detach', () => {
 
     let spawnCmd: string[] = [];
     try {
-      const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', {
+      const commandPromise = workflowRunCommand('/test/path/subdir', 'assist', 'hello', {
         detach: true,
-        adoptRunId: 'run-old',
+        adoptRunId: '0b1ee8da',
       });
       await finishStartupWindow(commandPromise, spawnSpy);
       spawnCmd = (
@@ -5567,7 +5546,12 @@ describe('workflowRunCommand — detach', () => {
 
     const adoptIndex = spawnCmd.indexOf('--adopt');
     expect(adoptIndex).toBeGreaterThan(-1);
-    expect(spawnCmd[adoptIndex + 1]).toBe('run-old');
+    expect(spawnCmd[adoptIndex + 1]).toBe(adoptedRunId);
+    expect(workflowDb.findWorkflowRunsByIdPrefix).toHaveBeenCalledWith('0b1ee8da', 'cb-1');
+    expect(resolveWorkflowAdoption).toHaveBeenCalledWith(expect.objectContaining({ adoptedRunId }));
+    expect(mockCreateWorkflowRun).toHaveBeenCalledWith(
+      expect.objectContaining({ adopted_from_run_id: adoptedRunId })
+    );
     expect(spawnCmd).not.toContain('--branch');
   });
 
@@ -9562,7 +9546,14 @@ describe('maybePrintTierNotice', () => {
     stderrSpy = spyOn(process.stderr, 'write').mockImplementation(() => true);
     (readTierNoticeState as ReturnType<typeof mock>).mockReturnValue(null);
     (markTierNoticeShown as ReturnType<typeof mock>).mockClear();
-    (loadConfig as ReturnType<typeof mock>).mockResolvedValue({ defaults: {}, tiers: {} });
+    // assistant: 'claude' — a provider WITH built-in tier defaults, so the
+    // notice has something truthful to announce (the no-built-ins case is
+    // covered by its own test below).
+    (loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      tiers: {},
+      assistant: 'claude',
+    });
     (getUserAiPrefs as ReturnType<typeof mock>).mockResolvedValue({});
   });
 
@@ -9619,6 +9610,21 @@ describe('maybePrintTierNotice', () => {
     const written = stderrSpy.mock.calls[0][0] as string;
     expect(written).toContain('model tiers');
     expect(markTierNoticeShown).toHaveBeenCalledWith('0.0.0-test');
+  });
+
+  it('prints nothing for a provider with no built-in tier defaults (and keeps the notice unshown)', async () => {
+    (loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      tiers: {},
+      assistant: 'pi',
+    });
+    const workflow = makeTierWorkflow('large');
+    await maybePrintTierNotice(workflow, '/cwd', undefined, false);
+    // No built-ins exist, so claiming "using built-in defaults" would be false —
+    // the run's tier-resolution error owns the guidance. Not marked shown, so a
+    // later provider switch still gets its one-time notice.
+    expect(stderrSpy).not.toHaveBeenCalled();
+    expect(markTierNoticeShown).not.toHaveBeenCalled();
   });
 
   it('returns silently when loadConfig throws', async () => {
@@ -10009,7 +10015,7 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
     const prepareMock = require('@archon/workflows/executor').prepareWorkflowSource as ReturnType<
       typeof mock
     >;
-    discoverMock.mockClear();
+    discoverMock.mockReset();
     prepareMock.mockClear();
     // First discovery runs against the invoking checkout; the second must run against
     // the adopted lane's worktree and resolve the branch's vintage of the workflow.
@@ -10047,6 +10053,77 @@ describe('workflowRunCommand — adopt lane source recapture (#2660/#2747)', () 
       lane,
     });
   }
+
+  it('adopts a normal run from a unique short run id prefix', async () => {
+    const adoptedRunId = '0b1ee8da-1111-2222-3333-444455556666';
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const adoption = await import('@archon/core/operations/workflow-adoption');
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockClear();
+    setupAdoptMocks();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockReset();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (codebaseDb.findCodebaseByPathPrefix as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-adopt',
+      name: 'test-folder',
+      default_cwd: '/test/path',
+      kind: 'folder',
+    });
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: adoptedRunId },
+    ]);
+
+    await workflowRunCommand('/test/path/subdir', 'assist', 'hello', { adoptRunId: '0b1ee8da' });
+
+    expect(workflowDb.findWorkflowRunsByIdPrefix).toHaveBeenCalledWith('0b1ee8da', 'cb-adopt');
+    expect(adoption.resolveWorkflowAdoption).toHaveBeenCalledWith(
+      expect.objectContaining({ adoptedRunId })
+    );
+  });
+
+  it('rejects an ambiguous adopted run prefix with its candidates', async () => {
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const adoption = await import('@archon/core/operations/workflow-adoption');
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockClear();
+    setupAdoptMocks();
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-adopt',
+      name: 'test-repo',
+      default_cwd: '/test/path',
+      kind: 'repo',
+    });
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockResolvedValueOnce([
+      { id: '0b1ee8da-1111-2222-3333-444455556666' },
+      { id: '0b1ee8da-9999-8888-7777-666655554444' },
+    ]);
+
+    await expect(
+      workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: '0b1ee8da' })
+    ).rejects.toThrow(
+      '0b1ee8da-1111-2222-3333-444455556666\n  0b1ee8da-9999-8888-7777-666655554444'
+    );
+    expect(adoption.resolveWorkflowAdoption).not.toHaveBeenCalled();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockReset();
+  });
+
+  it('passes a full adopted run id through unchanged', async () => {
+    const adoptedRunId = '0b1ee8da-1111-2222-3333-444455556666';
+    const workflowDb = await import('@archon/core/db/workflows');
+    const adoption = await import('@archon/core/operations/workflow-adoption');
+    (workflowDb.findWorkflowRunsByIdPrefix as ReturnType<typeof mock>).mockClear();
+    (adoption.resolveWorkflowAdoption as ReturnType<typeof mock>).mockClear();
+    setupAdoptMocks();
+
+    await workflowRunCommand('/test/path', 'assist', 'hello', { adoptRunId: adoptedRunId });
+
+    expect(workflowDb.findWorkflowRunsByIdPrefix).not.toHaveBeenCalled();
+    expect(adoption.resolveWorkflowAdoption).toHaveBeenCalledWith(
+      expect.objectContaining({ adoptedRunId })
+    );
+  });
 
   it('re-freezes workflow source from the inherited worktree on the reuse-worktree lane', async () => {
     setupAdoptMocks();
@@ -10201,7 +10278,76 @@ describe('workflowWaitCommand', () => {
       result: 'deadline',
       observedStatus: 'running',
     });
-    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, { deadlineMs: 5000 });
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {
+      deadlineMs: 5000,
+      onAttached: expect.any(Function),
+    });
+  });
+
+  it('announces the attachment on stderr, leaving stdout one --json document', async () => {
+    const stderrSpy = spyOnStderr();
+    mockWaitForRunAttention.mockImplementationOnce(async (_runId, opts) => {
+      await opts?.onAttached?.('running');
+      return terminal('cancelled');
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo');
+
+    expect(code).toBe(0);
+    // stderr is the whole point: a progress line on stdout would break the --json
+    // contract that a consumer gets exactly one document.
+    expect(stdoutSpy.mock.calls).toHaveLength(1);
+    expect(JSON.parse(String(stderrSpy.mock.calls[0]?.[0]))).toEqual({
+      ok: true,
+      action: 'wait',
+      runId: FULL_ID,
+      result: 'waiting',
+      observedStatus: 'running',
+    });
+    stderrSpy.mockRestore();
+  });
+
+  it('names the run and the status it attached on in human mode', async () => {
+    const stderrSpy = spyOnStderr();
+    mockWaitForRunAttention.mockImplementationOnce(async (_runId, opts) => {
+      await opts?.onAttached?.('paused');
+      return terminal('completed');
+    });
+
+    await workflowWaitCommand(FULL_ID, undefined, '/repo');
+
+    expect(String(stderrSpy.mock.calls[0]?.[0])).toBe(
+      `Waiting on run ${FULL_ID} — currently paused.\n`
+    );
+    stderrSpy.mockRestore();
+  });
+
+  it('fails the wait when the attachment line cannot be delivered', async () => {
+    // The line carries an ordering, so losing it silently is the one outcome that
+    // defeats it — and `console.error` to a closed pipe is exactly that no-op.
+    const stderrSpy = spyOn(process.stderr, 'write').mockImplementation((...args: unknown[]) => {
+      const callback = args.find(arg => typeof arg === 'function');
+      if (typeof callback === 'function') {
+        (callback as (error: Error) => void)(
+          Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+        );
+      }
+      return true;
+    });
+    mockWaitForRunAttention.mockImplementationOnce(async (_runId, opts) => {
+      await opts?.onAttached?.('running');
+      return terminal('completed');
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, true, '/repo');
+
+    expect(code).toBe(1);
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      ok: false,
+      action: 'wait',
+      error: 'write EPIPE',
+    });
+    stderrSpy.mockRestore();
   });
 
   it('waits indefinitely when no timeout is given', async () => {
@@ -10209,7 +10355,9 @@ describe('workflowWaitCommand', () => {
 
     await workflowWaitCommand(FULL_ID, undefined, '/repo');
 
-    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {});
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {
+      onAttached: expect.any(Function),
+    });
   });
 
   it('exits 1 with an {ok:false} line for an unknown run', async () => {
@@ -10269,7 +10417,9 @@ describe('workflowWaitCommand', () => {
     const code = await workflowWaitCommand('0b1ee8da', undefined, '/repo');
 
     expect(code).toBe(0);
-    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {});
+    expect(mockWaitForRunAttention).toHaveBeenCalledWith(FULL_ID, {
+      onAttached: expect.any(Function),
+    });
   });
 
   it('never throws in --json mode when the wait itself fails', async () => {

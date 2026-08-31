@@ -403,7 +403,7 @@ export async function validateWorkflowResources(
       level: 'error',
       field: 'model',
       message: (error as Error).message,
-      hint: 'Fix tiers/aliases in .archon/config.yaml, or use literal provider model strings.',
+      hint: 'Fix tiers/aliases in .archon/config.yaml, with `archon ai tier set`, or in the console AI Settings panel — or use literal provider model strings.',
     });
   }
 
@@ -417,7 +417,7 @@ export async function validateWorkflowResources(
         ...(nodeId !== undefined ? { nodeId } : {}),
         field: 'model',
         message: (error as Error).message,
-        hint: 'Fix tiers/aliases in .archon/config.yaml, or use a literal provider model string.',
+        hint: 'Fix tiers/aliases in .archon/config.yaml, with `archon ai tier set`, or in the console AI Settings panel — or use a literal provider model string.',
       });
     }
   };

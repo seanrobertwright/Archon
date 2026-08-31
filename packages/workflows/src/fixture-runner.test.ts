@@ -375,6 +375,31 @@ describe('runFixtures', () => {
     expect(formatFixtureReport(report)).not.toContain('tolerated');
   });
 
+  // `loop:` is the node shape #2869 left behind: it resolves its own stub inside
+  // simulateLoop and never reaches the single-node gate the tolerance was added to.
+  // The fixture gate has no loop branch, so this proves the end-to-end path a user
+  // hits — `workflow test` on an unstubbed all_done loop — rather than a second
+  // filter (#2966).
+  it('passes a fixture whose only missing stub is an all_done loop node (#2966)', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nnodes:\n' +
+        '  - id: node-a\n    prompt: hi\n' +
+        '  - id: node-b\n    depends_on: [node-a]\n    trigger_rule: all_done\n' +
+        '    loop:\n      prompt: refine\n      until_bash: "true"\n      max_iterations: 3\n',
+      body: 'node-a: "stub"\n',
+    });
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.passed).toBe(1);
+    expect(report.results[0].outcome).toBe('completed');
+    expect(report.results[0].missingStubs).toEqual(['node-b']);
+    expect(report.results[0].toleratedMissingStubs).toEqual(['node-b']);
+  });
+
   it('warns on unused stubs without failing', async () => {
     const { cwd } = writeTempProject({
       body: ['node-a: "stub"', 'unused-node: "never reached"'].join('\n'),

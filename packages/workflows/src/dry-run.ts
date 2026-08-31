@@ -15,7 +15,11 @@ import {
   type ShellInputContext,
 } from './dag-executor';
 import { evaluateCondition } from './condition-evaluator';
-import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
+import {
+  COMPILED_LOOP_COMMAND,
+  readComposedBindings,
+  type LoopWithCompiledCommand,
+} from './compiled-command';
 import { declaredFieldsFromSchema, canonicalValueText, type JsonValue } from './output-ref';
 import { discoverScriptsForCwd } from './script-discovery';
 import {
@@ -714,6 +718,14 @@ async function executeCodeNode(
   }
 }
 
+/**
+ * Trace reason for a missing stub that `trigger_rule: all_done` tolerated (#2869).
+ * Shared by the single-node gate and by `simulateLoop`, which resolves its own stub
+ * and so never reaches that gate (#2966).
+ */
+const TOLERATED_STUB_REASON =
+  'Missing stub tolerated by trigger_rule: all_done — using a generated placeholder';
+
 function stubFor(node: DagNode, ctx: DryRunContext): DryRunStubValue | undefined {
   if (Object.hasOwn(ctx.stubs, node.id)) {
     ctx.consumedStubs.add(node.id);
@@ -839,14 +851,52 @@ async function simulateLoop(
     const stub = stubFor(node, ctx);
     if (stub === undefined) {
       ctx.missingStubs.add(node.id);
-      recordFailed(
-        node,
-        outputs,
-        ctx,
-        `Missing reachable stub for node '${node.id}'`,
+      if (node.trigger_rule !== 'all_done') {
+        recordFailed(
+          node,
+          outputs,
+          ctx,
+          `Missing reachable stub for node '${node.id}'`,
+          resolvedText,
+          iteration
+        );
+        return;
+      }
+      // Same tolerance the single-node gate applies (#2869), extended to the loop
+      // shape that never reaches it (#2966). One placeholder covers every iteration —
+      // `stubFor` is constant for this node — so the question of "which iteration's
+      // stub" collapses: `generatedStubFor` builds a loop placeholder that satisfies
+      // the node's own completion channel, so a tolerated loop always ends on
+      // iteration 1, and never runs a second one.
+      const placeholder = completedOutput(node, generatedStubFor(node));
+      const toleratedCompletion = loopIterationCompletes(node.loop, placeholder);
+      if (toleratedCompletion.kind === 'incomplete') {
+        // The tolerance claim waits for a placeholder that actually carries the node,
+        // exactly as the join gate waits for one that can be generated at all. A
+        // placeholder that ends no iteration would burn `max_iterations` and fail —
+        // calling that tolerated would let `checkFixture` filter away the real blocker.
+        recordFailed(
+          node,
+          outputs,
+          ctx,
+          `Missing reachable stub for node '${node.id}' — trigger_rule: all_done cannot tolerate it: a generated placeholder would run to max_iterations ${describeUnmetCompletion(node.loop)}`,
+          resolvedText,
+          iteration
+        );
+        return;
+      }
+      ctx.toleratedMissingStubs.add(node.id);
+      outputs.set(node.id, placeholder);
+      ctx.trace.push({
+        nodeId: node.id,
+        nodeType: 'loop',
+        state: 'stubbed',
+        reason: `${TOLERATED_STUB_REASON}; ${completionReason(toleratedCompletion, node.loop, current)}`,
         resolvedText,
-        iteration
-      );
+        output: placeholder.output,
+        ...(iteration ? { iteration } : {}),
+        ...withResolution(node, ctx),
+      });
       return;
     }
     const hydrated = completedOutput(node, stub);
@@ -1043,7 +1093,6 @@ async function simulateNode(
       return;
     }
 
-    const isCommandSourced = isAgentNode(node) && node.source.kind === 'command';
     const sourceText = isAgentNode(node)
       ? node.source.kind === 'command'
         ? await loadDryRunCommand(ctx, node.source.name)
@@ -1056,17 +1105,21 @@ async function simulateNode(
     // on (unknown producer, skipped without if_skipped) fails the simulated node
     // with the executor's own error, via the catch below. Command bindings merge
     // over run inputs into the `$INPUTS` bag; script bindings ride the exec env.
+    // A composed command node carries its map in the engine-private payload, having
+    // been materialized into an inline prompt at expansion (#2964).
     const nodeWith = isExecNode(node)
       ? node.with
-      : isCommandSourced && isAgentNode(node) && node.source.kind === 'command'
-        ? node.source.with
+      : isAgentNode(node)
+        ? node.source.kind === 'command'
+          ? node.source.with
+          : readComposedBindings(node)
         : undefined;
     const nodeBindings =
       nodeWith !== undefined
         ? resolveNodeBindings(node.id, nodeWith, bindingShellContext(ctx, outputs), ctx.inputs)
         : undefined;
     const commandInputs =
-      isCommandSourced && nodeBindings !== undefined
+      isAgentNode(node) && nodeBindings !== undefined
         ? { ...(ctx.inputs ?? {}), ...nodeBindings }
         : undefined;
     const resolvedText =
@@ -1122,12 +1175,7 @@ async function simulateNode(
         nodeId: node.id,
         nodeType: nodeType(node),
         state: 'stubbed',
-        ...(tolerated
-          ? {
-              reason:
-                'Missing stub tolerated by trigger_rule: all_done — using a generated placeholder',
-            }
-          : {}),
+        ...(tolerated ? { reason: TOLERATED_STUB_REASON } : {}),
         resolvedText,
         output: hydrated.output,
         ...(iteration ? { iteration } : {}),

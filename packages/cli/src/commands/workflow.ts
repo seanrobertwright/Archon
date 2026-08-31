@@ -142,7 +142,7 @@ import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
 import * as userDb from '@archon/core/db/users';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
-import { writeJsonLine, writeStdout } from '../utils/stdout';
+import { writeJsonLine, writeStderr, writeStdout } from '../utils/stdout';
 import { exitWithDrain } from '../utils/exit-with-drain';
 import {
   assertDetachedRunProcessOwner,
@@ -1003,14 +1003,23 @@ export async function maybePrintTierNotice(
     return;
   }
 
+  const tierLines: string[] = [];
+  for (const t of TIER_NAMES) {
+    const preset = aliases[t];
+    if (preset) tierLines.push(`     ${t.padEnd(7)} → ${preset.provider}/${preset.model}`);
+  }
+  // Only claude and codex ship built-in tier defaults. With none for this
+  // provider there is nothing truthful to announce — the run's tier
+  // resolution fails loudly with the full configuration guidance, and this
+  // notice must not claim defaults are in play. Not marked shown: once the
+  // operator configures tiers for a provider WITH built-ins, the one-time
+  // notice should still fire.
+  if (tierLines.length === 0) return;
   const lines: string[] = [
     "ℹ️  This workflow uses model tiers (small/medium/large). You haven't configured them —",
     `   using built-in defaults for '${effectiveAssistant}':`,
+    ...tierLines,
   ];
-  for (const t of TIER_NAMES) {
-    const preset = aliases[t];
-    if (preset) lines.push(`     ${t.padEnd(7)} → ${preset.provider}/${preset.model}`);
-  }
   // Plan-dependent 1M note for the large→opus row (the CLI can't detect the plan).
   const largePreset = aliases.large;
   if (largePreset?.provider === 'claude' && largePreset.model === 'opus') {
@@ -2095,6 +2104,7 @@ async function runWorkflowWithOwnedSource(
     // pure resolution with no filesystem or database mutation, so running it as a
     // pre-flight costs nothing and the child still re-resolves it against the live
     // checkout when it starts (its lane binds a worktree this process never touches).
+    let adoptedRunId: string | undefined;
     if (options.adoptRunId !== undefined || options.supersedesRunId !== undefined) {
       if (!detachCodebase) {
         throw new Error(
@@ -2102,8 +2112,9 @@ async function runWorkflowWithOwnedSource(
         );
       }
       if (options.adoptRunId !== undefined) {
+        adoptedRunId = await resolveRunIdArg(options.adoptRunId, cwd, false, detachCodebase.id);
         await resolveWorkflowAdoption({
-          adoptedRunId: options.adoptRunId,
+          adoptedRunId,
           codebaseId: detachCodebase.id,
           codebasePath: detachCodebase.default_cwd,
           codebaseKind: detachCodebase.kind,
@@ -2145,8 +2156,8 @@ async function runWorkflowWithOwnedSource(
       }
       const detachedUserId = await resolveCliUserRecordId();
       const continuationDeclaration =
-        options.adoptRunId !== undefined
-          ? { mode: 'adopt' as const, runId: options.adoptRunId }
+        adoptedRunId !== undefined
+          ? { mode: 'adopt' as const, runId: adoptedRunId }
           : options.supersedesRunId !== undefined
             ? { mode: 'supersede' as const, runId: options.supersedesRunId }
             : undefined;
@@ -2201,7 +2212,7 @@ async function runWorkflowWithOwnedSource(
     }
     // Between-run continuation (#2747) — the child re-resolves the adoption
     // against the live filesystem/database, so pass the declaration through.
-    if (options.adoptRunId !== undefined) extraArgs.push('--adopt', options.adoptRunId);
+    if (adoptedRunId !== undefined) extraArgs.push('--adopt', adoptedRunId);
     if (options.supersedesRunId !== undefined)
       extraArgs.push('--supersedes', options.supersedesRunId);
     // Re-pin the source as an ABSOLUTE path (parseArgs is last-wins, same as --cwd).
@@ -2354,7 +2365,7 @@ async function runWorkflowWithOwnedSource(
     // one of the two ids is present.
     if (options.adoptRunId !== undefined) {
       continuationMode = 'adopt';
-      adoptedFromRunId = options.adoptRunId;
+      adoptedFromRunId = await resolveRunIdArg(options.adoptRunId, cwd, false, codebase.id);
     } else if (options.supersedesRunId !== undefined) {
       continuationMode = 'supersede';
       adoptedFromRunId = options.supersedesRunId;
@@ -3365,8 +3376,19 @@ export interface NodeSummary {
 }
 
 /**
+ * Bounded preview of a node's persisted output, shared by the two events that
+ * report a success so both render the same cap.
+ */
+function outputPreviewOf(rawOutput: unknown): string | undefined {
+  if (typeof rawOutput !== 'string') return undefined;
+  return rawOutput.slice(0, 200) + (rawOutput.length > 200 ? '...' : '');
+}
+
+/**
  * Derive per-node summaries from a run's workflow events.
- * Processes node_started / node_completed / node_failed / node_skipped* events.
+ * Processes node_started / node_completed / node_failed / node_skipped /
+ * node_skipped_prior_success events — the last two mean opposite things and are
+ * handled separately.
  */
 export function buildNodeSummaries(events: WorkflowEventRow[]): NodeSummary[] {
   const startTimes = new Map<string, number>();
@@ -3387,17 +3409,12 @@ export function buildNodeSummaries(events: WorkflowEventRow[]): NodeSummary[] {
       case 'node_completed': {
         const started = startTimes.get(nodeId);
         const endTime = new Date(event.created_at).getTime();
-        const rawOutput = event.data.node_output;
-        const output = typeof rawOutput === 'string' ? rawOutput : undefined;
         summaries.set(nodeId, {
           nodeId,
           state: 'completed',
           startedAt: summaries.get(nodeId)?.startedAt,
           durationMs: started !== undefined ? endTime - started : undefined,
-          outputPreview:
-            output !== undefined
-              ? output.slice(0, 200) + (output.length > 200 ? '...' : '')
-              : undefined,
+          outputPreview: outputPreviewOf(event.data.node_output),
         });
         break;
       }
@@ -3413,9 +3430,26 @@ export function buildNodeSummaries(events: WorkflowEventRow[]): NodeSummary[] {
         });
         break;
       }
-      case 'node_skipped':
-      case 'node_skipped_prior_success': {
+      case 'node_skipped': {
         summaries.set(nodeId, { nodeId, state: 'skipped' });
+        break;
+      }
+      case 'node_skipped_prior_success': {
+        // The opposite of node_skipped: the node ran and succeeded on an earlier
+        // pass, and this resume declined to re-run it. The engine re-emits one per
+        // resume pass — including its own durable-wait continuation — so folding
+        // these into `skipped` reported completed work as never run, and the last
+        // write erased the original duration and output (#2973). The earlier
+        // node_completed summary is the truth about the run, so never overwrite it.
+        if (summaries.has(nodeId)) break;
+        // No summary means the original node_completed is not in this log. The
+        // replay still carries the prior output, so report the success it
+        // describes; there is no start time to derive a duration from.
+        summaries.set(nodeId, {
+          nodeId,
+          state: 'completed',
+          outputPreview: outputPreviewOf(event.data.node_output),
+        });
         break;
       }
     }
@@ -3568,6 +3602,41 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
 }
 
 /**
+ * Say once, on stderr, that the wait is now watching the run.
+ *
+ * Until this line the command is completely silent, and neither a human nor a host
+ * can tell an attached wait from one still resolving the id — or from one that died
+ * on the way. It also fixes the instant the watch began: a transition after this line
+ * reached the caller as a wake, where the same transition before it would have been
+ * an ordinary read of an already-settled row.
+ *
+ * stderr, not stdout, because `--json` promises exactly one document on stdout. The
+ * shape follows the same split as the answer itself: the JSON envelope for a machine,
+ * one plain sentence for a person.
+ *
+ * Through `writeStderr` rather than `console.error`/`console.warn`, and awaited: this
+ * line exists to tell a host when the watch began, and `console.error` to a pipe whose
+ * reader has gone is a silent no-op under Bun. A line that can vanish without a trace
+ * cannot carry an ordering.
+ */
+function announceWaitAttached(
+  watchedRunId: string,
+  observedStatus: WorkflowRunStatus,
+  json?: boolean
+): Promise<void> {
+  const line = json
+    ? JSON.stringify({
+        ok: true,
+        action: 'wait',
+        runId: watchedRunId,
+        result: 'waiting',
+        observedStatus,
+      })
+    : `Waiting on run ${watchedRunId} — currently ${observedStatus}.`;
+  return writeStderr(`${line}\n`);
+}
+
+/**
  * Block until a run finishes or parks on a gate awaiting a response, then say which.
  *
  * The point of the verb: a host that launched a run with `--detach` waits on one
@@ -3593,6 +3662,7 @@ export async function workflowWaitCommand(
       // No timeout by default: a wait that ends on its own clock would answer a
       // question only the run can answer.
       ...(timeoutSeconds === undefined ? {} : { deadlineMs: timeoutSeconds * 1000 }),
+      onAttached: observedStatus => announceWaitAttached(resolvedId, observedStatus, json),
     });
   } catch (error) {
     const err = error as Error;
@@ -4041,7 +4111,8 @@ const FULL_RUN_ID_RE =
  * codebase, a unique match resolves, and an ambiguous prefix errors.
  *
  * Full UUIDs skip resolution entirely — exact lookup is global, so full ids
- * keep working from any directory. Project lookup preserves an exact checkout
+ * keep working from any directory. A caller that already resolved a project can
+ * provide its id; otherwise project lookup preserves an exact checkout
  * registration, then falls back to a linked worktree's canonical checkout. By
  * default, an omitted or unregistered cwd and an unmatched prefix pass through
  * unchanged so the downstream exact lookup keeps its existing error surface.
@@ -4050,23 +4121,25 @@ const FULL_RUN_ID_RE =
 async function resolveRunIdArg(
   runId: string,
   cwd?: string,
-  requirePrefixMatch = false
+  requirePrefixMatch = false,
+  codebaseId?: string
 ): Promise<string> {
   if (FULL_RUN_ID_RE.test(runId)) return runId;
-  if (cwd === undefined) {
+  if (cwd === undefined && codebaseId === undefined) {
     if (requirePrefixMatch) {
       throw new Error(`Cannot resolve run id prefix '${runId}' without a project directory.`);
     }
     return runId;
   }
-  const codebase = await findCodebaseForCheckoutPath(cwd);
-  if (!codebase) {
+  const resolvedCodebaseId =
+    codebaseId ?? (cwd === undefined ? undefined : (await findCodebaseForCheckoutPath(cwd))?.id);
+  if (!resolvedCodebaseId) {
     if (requirePrefixMatch) {
       throw new Error(`Cannot resolve run id prefix '${runId}' outside a registered project.`);
     }
     return runId;
   }
-  const matches = await workflowDb.findWorkflowRunsByIdPrefix(runId, codebase.id);
+  const matches = await workflowDb.findWorkflowRunsByIdPrefix(runId, resolvedCodebaseId);
   if (matches.length > 1) {
     const candidates = matches.map(match => `  ${match.id}`).join('\n');
     throw new Error(

@@ -81,6 +81,10 @@ The file `.archon/scripts/fetch-github-pages.ts` is loaded and executed with
    remainder, and a label prefixes each stream only when both are populated.
    With stderr empty, the stdout tail becomes the diagnostic. The script body
    is never echoed back to users.
+5. **Retain.** Regardless of outcome, capped and credential-redacted tails of
+   both streams are written to the run transcript as an `exec_output` row — see
+   [Retained subprocess evidence](/guides/authoring-workflows#retained-subprocess-evidence).
+   That retention is evidence only; it never caps `$nodeId.output`.
 
 ## YAML Schema
 

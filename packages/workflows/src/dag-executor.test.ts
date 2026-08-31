@@ -27545,6 +27545,386 @@ describe('subprocess credential redaction', () => {
       }
     }
   });
+
+  it('removes a credential a SUCCESSFUL subprocess echoed, before it reaches the retained evidence', async () => {
+    // The failure path has been redacting since #2431. Retention (#2967) writes on the
+    // success path too, and a node that echoes a token while exiting 0 is the ordinary
+    // case (`set -x`, a remote URL, a debug print) — so the evidence copy has to be
+    // scrubbed with the SAME credential set, not a weaker one.
+    const suffixNamedSecret = 'success-path-openai-secret';
+    const explicitlyProtectedSecret = 'success-path-file-delivered-secret';
+    const logDir = join(testDir, 'success-redaction-logs');
+    const workflowRun = makeWorkflowRun('success-redaction-run', {
+      workflow_name: 'success-redaction',
+      conversation_id: 'conv-success-redaction',
+    });
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      workflowRun.conversation_id,
+      testDir,
+      {
+        name: workflowRun.workflow_name,
+        nodes: [
+          {
+            id: 'leaky',
+            kind: 'exec',
+            runtime: 'sh',
+            // Real subprocess, both streams, exit 0.
+            script: 'printf "%s\\n" "$OPENAI_API_KEY"; printf "%s\\n" "$SIDECAR_AUTH" >&2',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'success-redaction-artifacts'),
+      join(testDir, 'success-redaction-state'),
+      logDir,
+      'main',
+      'docs/',
+      {
+        ...minimalConfig,
+        envVars: {
+          OPENAI_API_KEY: suffixNamedSecret,
+          SIDECAR_AUTH: explicitlyProtectedSecret,
+          BASE_BRANCH: 'main',
+        },
+        protectedCredentialValues: [explicitlyProtectedSecret],
+      }
+    );
+
+    const transcriptText = await readFile(join(logDir, `${workflowRun.id}.jsonl`), 'utf-8');
+    expect(transcriptText).not.toContain(suffixNamedSecret);
+    expect(transcriptText).not.toContain(explicitlyProtectedSecret);
+
+    // Not vacuous: the node really ran, really printed both secrets, and the retained
+    // row really exists — the values were replaced, not merely absent.
+    const row = (await readTranscript(logDir, workflowRun.id)).find(
+      candidate => candidate.type === 'exec_output' && candidate.step === 'leaky'
+    );
+    expect(row?.stdout_tail).toBe('[REDACTED]');
+    expect(row?.stderr_tail).toBe('[REDACTED]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Engine-retained exec output (#2967)
+// ---------------------------------------------------------------------------
+
+describe('retained exec output', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-retained-exec-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await removeTempTree(testDir);
+  });
+
+  /** Run one workflow against a fresh log dir and return its parsed transcript. */
+  const runAndReadTranscript = async (
+    runId: string,
+    nodes: DagNode[]
+  ): Promise<{
+    logDir: string;
+    rows: Array<Record<string, unknown>>;
+    store: MockWorkflowStore;
+  }> => {
+    const logDir = join(testDir, `${runId}-logs`);
+    const store = createMockStore();
+    const workflowRun = makeWorkflowRun(runId);
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-retained',
+      testDir,
+      { name: runId, nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, `${runId}-artifacts`),
+      join(testDir, `${runId}-state`),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    return { logDir, rows: await readTranscript(logDir, workflowRun.id), store };
+  };
+
+  it('retains stdout and stderr as SEPARATE fields on a successful exec node', async () => {
+    const { rows } = await runAndReadTranscript('retain-success', [
+      {
+        id: 'work',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'printf "did the thing\\n"; printf "a warning\\n" >&2',
+      },
+    ]);
+
+    const row = rows.find(
+      candidate => candidate.type === 'exec_output' && candidate.step === 'work'
+    );
+    expect(row).toBeDefined();
+    expect(row?.content).toBe('<bash>');
+    expect(row?.exit_code).toBe(0);
+    // Separate, not merged: merging stderr into stdout is how a `git` warning becomes
+    // the value a node returns — the bug #2967 exists to stop every node re-earning.
+    expect(row?.stdout_tail).toBe('did the thing');
+    expect(row?.stderr_tail).toBe('a warning');
+  });
+
+  it('retains the same evidence when the node FAILS, with its exit code', async () => {
+    const { rows } = await runAndReadTranscript('retain-failure', [
+      {
+        id: 'work',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'printf "got this far\\n"; printf "then broke\\n" >&2; exit 3',
+      },
+    ]);
+
+    const row = rows.find(
+      candidate => candidate.type === 'exec_output' && candidate.step === 'work'
+    );
+    expect(row?.exit_code).toBe(3);
+    expect(row?.stdout_tail).toBe('got this far');
+    expect(row?.stderr_tail).toBe('then broke');
+    // Symmetry is the point: the same row shape on both outcomes, next to the
+    // lifecycle row that says which outcome it was.
+    expect(
+      rows.some(candidate => candidate.type === 'node_error' && candidate.step === 'work')
+    ).toBe(true);
+  });
+
+  it('writes a row for a silent node, so an absent tail means "printed nothing"', async () => {
+    const { rows } = await runAndReadTranscript('retain-silent', [
+      { id: 'quiet', kind: 'exec', runtime: 'sh', script: 'true' },
+    ]);
+
+    const row = rows.find(
+      candidate => candidate.type === 'exec_output' && candidate.step === 'quiet'
+    );
+    expect(row).toBeDefined();
+    expect(row?.exit_code).toBe(0);
+    expect(row?.stdout_tail).toBeUndefined();
+    expect(row?.stderr_tail).toBeUndefined();
+  });
+
+  it('caps each retained stream while the $node.output value channel stays complete', async () => {
+    // The binding invariant: retention caps the EVIDENCE copy only. A node's output is
+    // its contract with its consumers, and it must still arrive whole — well past both
+    // the 2000-char retention budget and the 32KB persistence preview.
+    const paddingBytes = 40_000;
+    const { rows, store } = await runAndReadTranscript('retain-cap', [
+      {
+        id: 'producer',
+        kind: 'exec',
+        runtime: 'sh',
+        script: `printf 'HEAD'; printf '%${String(paddingBytes)}s' '' | tr ' ' x; printf 'TAIL'`,
+      },
+      {
+        id: 'consumer',
+        kind: 'exec',
+        runtime: 'sh',
+        script: 'value=$producer.output; printf "%s" "${#value}"',
+        depends_on: ['producer'],
+      },
+    ]);
+
+    const producerRow = rows.find(
+      candidate => candidate.type === 'exec_output' && candidate.step === 'producer'
+    );
+    const stdoutTail = producerRow?.stdout_tail as string;
+    // Tail-preserving and marked, so a reader can tell truncation from absence.
+    expect(stdoutTail.startsWith('…[truncated to last 2000 chars]\n')).toBe(true);
+    expect(stdoutTail.endsWith('TAIL')).toBe(true);
+    expect(stdoutTail).not.toContain('HEAD');
+    expect(stdoutTail.split('\n')[1].length).toBe(2000);
+
+    // The value channel is untouched: the downstream consumer measured the WHOLE
+    // 40,008-character output, not the 2000-char evidence tail nor a 32KB preview.
+    const consumerEvent = (
+      store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
+    ).mock.calls.find(
+      ([event]) => event.event_type === 'node_completed' && event.step_name === 'consumer'
+    );
+    expect((consumerEvent?.[0].data as { node_output: string }).node_output).toBe(
+      String(paddingBytes + 8)
+    );
+  });
+
+  it('retains an until_bash probe per iteration it runs in', async () => {
+    // The probe is exactly the case the hand-rolled substitute could not cover: a
+    // non-zero exit is TOLERATED ("not done yet"), so nothing else in the run records
+    // why the loop kept going.
+    const logDir = join(testDir, 'until-bash-logs');
+    const counterPath = join(testDir, 'iterations');
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'working' };
+      yield { type: 'result', sessionId: 's-1' };
+    });
+    const workflowRun = makeWorkflowRun('retain-until-bash');
+
+    await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-retained-probe',
+      testDir,
+      {
+        name: 'retain-until-bash',
+        nodes: [
+          {
+            id: 'poll',
+            kind: 'loop',
+            loop: {
+              fresh_context: false,
+              prompt: 'Keep working.',
+              max_iterations: 2,
+              // Iteration 1 prints and exits 1 (keep looping); iteration 2 exits 0.
+              until_bash: `printf 'x' >> ${JSON.stringify(counterPath)}; printf 'checked\\n'; printf 'not ready\\n' >&2; test "$(wc -c < ${JSON.stringify(counterPath)} | tr -d ' ')" -ge 2`,
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'until-bash-artifacts'),
+      join(testDir, 'until-bash-state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const rows = await readTranscript(logDir, workflowRun.id);
+    const probeRows = rows.filter(candidate => candidate.type === 'exec_output');
+    expect(probeRows.map(row => row.step)).toEqual(['poll-iteration-1', 'poll-iteration-2']);
+    for (const row of probeRows) {
+      expect(row.content).toBe('<until_bash>');
+      expect(row.stdout_tail).toBe('checked');
+      expect(row.stderr_tail).toBe('not ready');
+    }
+    // The tolerated non-zero exit is retained as such, not flattened into the success
+    // shape — that difference IS the answer to "why did the loop run again?".
+    expect(probeRows[0].exit_code).toBe(1);
+    expect(probeRows[1].exit_code).toBe(0);
+  });
+
+  it("labels a script node's retained evidence as <script>, not <bash>", async () => {
+    // Same seat, different node executor. The label is what tells a reader which
+    // executor produced the row, so a copy-paste of the wrong constant is the failure
+    // this catches.
+    const { rows } = await runAndReadTranscript('retain-script', [
+      {
+        id: 'measure',
+        kind: 'exec',
+        runtime: 'bun',
+        script: 'console.log("from bun"); console.error("bun warning");',
+      },
+    ]);
+
+    const row = rows.find(
+      candidate => candidate.type === 'exec_output' && candidate.step === 'measure'
+    );
+    expect(row?.content).toBe('<script>');
+    expect(row?.exit_code).toBe(0);
+    expect(row?.stdout_tail).toBe('from bun');
+    expect(row?.stderr_tail).toBe('bun warning');
+  });
+
+  it("retains a loop_group's until_bash probe under the group's own iteration key", async () => {
+    // loop_group resolves its own probe at a different call site than `loop:`, with its
+    // own iteration variable — a site that writes no per-iteration transcript row of any
+    // other kind, so this row is the only per-iteration evidence the group produces.
+    const logDir = join(testDir, 'group-probe-logs');
+    const counterPath = join(testDir, 'group-iterations');
+    const workflowRun = makeWorkflowRun('retain-group-probe');
+
+    await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-group-probe',
+      testDir,
+      {
+        name: 'retain-group-probe',
+        nodes: [
+          {
+            id: 'group',
+            kind: 'loop_group',
+            loop_group: {
+              max_iterations: 2,
+              fresh_context: false,
+              until_bash: `printf 'x' >> ${JSON.stringify(counterPath)}; printf 'probe spoke\\n'; test "$(wc -c < ${JSON.stringify(counterPath)} | tr -d ' ')" -ge 2`,
+              nodes: [
+                { id: 'body', kind: 'exec', runtime: 'sh', script: 'printf body', depends_on: [] },
+              ],
+            },
+            depends_on: [],
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'group-probe-artifacts'),
+      join(testDir, 'group-probe-state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const rows = await readTranscript(logDir, workflowRun.id);
+    const probeRows = rows.filter(
+      candidate => candidate.type === 'exec_output' && candidate.content === '<until_bash>'
+    );
+    expect(probeRows.map(row => row.step)).toEqual(['group-iteration-1', 'group-iteration-2']);
+    expect(probeRows.map(row => row.exit_code)).toEqual([1, 0]);
+    for (const row of probeRows) expect(row.stdout_tail).toBe('probe spoke');
+
+    // The group's body node is retained too, under its own bare id.
+    expect(
+      rows.filter(candidate => candidate.type === 'exec_output' && candidate.step === 'body')
+    ).toHaveLength(2);
+  });
+
+  it('names the signal when a timed-out subprocess reports no exit code', async () => {
+    // Node reports a timeout kill as `code: null` with the signal set. Falling back
+    // straight to 'unknown' would erase the most operationally interesting failure —
+    // and an `until_bash` probe has no sibling node_error row to say it timed out.
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async () => {
+      throw Object.assign(new Error('Command failed: bash -c sleep 999'), {
+        code: null,
+        signal: 'SIGTERM',
+        killed: true,
+        stdout: 'started work',
+        stderr: '',
+      });
+    });
+
+    try {
+      const { rows } = await runAndReadTranscript('retain-timeout', [
+        { id: 'slow', kind: 'exec', runtime: 'sh', script: 'sleep 999' },
+      ]);
+      const row = rows.find(
+        candidate => candidate.type === 'exec_output' && candidate.step === 'slow'
+      );
+      expect(row?.exit_code).toBe('SIGTERM');
+      expect(row?.stdout_tail).toBe('started work');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -31431,6 +31811,103 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
     expect(
       (store.completeWorkflowRun as Mock<IWorkflowStore['completeWorkflowRun']>).mock.calls.length
     ).toBe(1);
+  });
+
+  it("retains the resumed until_bash probe under the resumed iteration's own key (#2967)", async () => {
+    // The resume branch runs its own probe, separate from the per-iteration one, and
+    // it is the only exec site in a run that completes straight off a human's answer.
+    // `iteration: 2` in the gate context makes the label discriminating: the resumed
+    // iteration is 2, while a fresh one would be 3 and a hardcoded fallback would be 1.
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'should not run' };
+      yield { type: 'result', sessionId: 'unexpected-session' };
+    });
+
+    const logDir = join(testDir, 'resume-probe-logs');
+    const store = createEscalationStore('run-escalation-retention');
+    const platform = createMockPlatform();
+    const approvedDecision = { decision: 'approve', text: '' };
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['grp.work', { output: 'work output' }],
+      [
+        'grp.check',
+        { output: JSON.stringify(approvedDecision), structuredOutput: approvedDecision },
+      ],
+    ]);
+    const workflowRun = makeWorkflowRun('run-escalation-retention', {
+      metadata: {
+        approval: {
+          nodeId: 'grp',
+          message: 'Continue?',
+          type: 'approval',
+          bodyGateId: 'check',
+          iteration: 2,
+          decisions: [{ id: 'approve' }, { id: 'revise' }],
+          decisionsAuthored: true,
+        } satisfies ApprovalContext,
+      },
+    });
+
+    const talkativeProbeWorkflow: WorkflowDefinition = {
+      ...gateTerminatedLoopGroupWorkflow(),
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'grp',
+          loop_group: {
+            until_bash:
+              'printf "resume probe ran\\n"; printf "recheck note\\n" >&2; [ $check.output.decision = "approve" ]',
+            max_iterations: 5,
+            nodes: [
+              { id: 'work', prompt: 'do work' },
+              {
+                id: 'check',
+                depends_on: ['work'],
+                approval: {
+                  message: 'Continue?',
+                  decisions: [{ id: 'approve' }, { id: 'revise' }],
+                },
+              },
+            ],
+          },
+        }),
+      ],
+    };
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      platform,
+      'conv-dag',
+      testDir,
+      ready(talkativeProbeWorkflow),
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      logDir,
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      priorCompletedNodes
+    );
+
+    // Zero provider calls means no fresh iteration ran, so the single retained row
+    // below can only have come from the resume branch's probe — not the ordinary
+    // per-iteration site, which would have needed a body execution first.
+    expect(mockSendQueryDag.mock.calls.length).toBe(0);
+
+    const probeRows = (await readTranscript(logDir, workflowRun.id)).filter(
+      row => row.type === 'exec_output'
+    );
+    expect(probeRows).toHaveLength(1);
+    expect(probeRows[0].step).toBe('grp-iteration-2');
+    expect(probeRows[0].content).toBe('<until_bash>');
+    expect(probeRows[0].stdout_tail).toBe('resume probe ran');
+    expect(probeRows[0].stderr_tail).toBe('recheck note');
+    expect(probeRows[0].exit_code).toBe(0);
   });
 
   it('falls through without erroring when a human resolves the original pause before the rewrite lands (CAS loss)', async () => {

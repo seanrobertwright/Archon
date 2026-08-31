@@ -138,7 +138,7 @@ archon ai default <provider> [<model>] [--scope user|install]   # set the defaul
 
 Credential ids are **vendor-keyed** (`anthropic`, `openai`, `github-copilot`, plus the Pi backends like `openrouter`); legacy `claude`/`codex`/`copilot` are accepted and normalized with a printed notice. `ai login` supports subscription login for **`anthropic`**, **`openai`** (ChatGPT/Codex), and **`github-copilot`**. The `openai` login is an Archon-owned PKCE flow ([#1924](https://github.com/coleam00/Archon/issues/1924)): authorize in the browser, then paste the authorization code or the full `localhost:1455` redirect URL back at the prompt — nothing needs to listen on that port. The API key is never read from argv (it would leak into shell history): pipe it (`echo "$KEY" | archon ai key set openrouter`) or type it at the masked prompt.
 
-`ai tier`, `ai alias`, and `ai default` edit the same `tiers:` / `aliases:` / `defaultAssistant` config you can hand-write in `~/.archon/config.yaml` (see [Configuration](/reference/configuration/)) or edit from the console **AI Settings** page. An unknown provider exits non-zero; `tier unset` removes the override so the tier falls back to its built-in preset. The full per-user setup walkthrough is in [Per-user credentials and AI Settings](/getting-started/ai-assistants/#per-user-credentials-and-ai-settings).
+`ai tier`, `ai alias`, and `ai default` edit the same `tiers:` / `aliases:` / `defaultAssistant` config you can hand-write in `~/.archon/config.yaml` (see [Configuration](/reference/configuration/)) or edit from the console **AI Settings** page. An unknown provider exits non-zero; `tier unset` removes the override so the tier falls back to its built-in preset — claude and codex only; for any other default provider the tier is left unset and must be reconfigured before use. The full per-user setup walkthrough is in [Per-user credentials and AI Settings](/getting-started/ai-assistants/#per-user-credentials-and-ai-settings).
 
 **`ai default <provider> [<model>]` (default chat model).** The optional `<model>` sets the default **chat** model alongside the assistant. At `--scope install` it writes `assistants.<provider>.model` in `~/.archon/config.yaml` (omitting the model leaves that field untouched). At `--scope user` the provider and model are written **atomically** to your prefs row — `archon ai default pi --scope user` clears any previous model pin, since a pin is only meaningful for the provider it was set with. Your chat model applies to direct chat only; workflow nodes keep resolving the `large` tier. The model may also be an `@alias` or tier keyword.
 
@@ -245,7 +245,7 @@ Note that a real `run` emits a JSON payload **only** under `--detach`. Without i
 | `--dry-run` | Simulate deterministic DAG control flow in memory. Creates no run, worktree, session, event, artifact, or provider request. |
 | `--stubs <path>` | YAML mapping of node ids to scalar or structured outputs for `--dry-run`. Relative paths resolve from `--cwd`. |
 | `--stubs-init <path>` | Write a complete stub scaffold for the expanded workflow and exit. Refuses to overwrite an existing file. Relative paths resolve from `--cwd`. |
-| `--default-stubs` | Fill reachable nodes omitted from `--stubs` with schema-valid placeholders. Explicit stubs still win; without this flag, a missing reachable stub remains an error unless the node is a `trigger_rule: all_done` join. |
+| `--default-stubs` | Fill reachable nodes omitted from `--stubs` with schema-valid placeholders. Explicit stubs still win; without this flag, a missing reachable stub remains an error unless the node declares `trigger_rule: all_done`. |
 | `--exec-code` | During `--dry-run`, execute trusted `bash:`/`script:` nodes locally instead of requiring stubs. Default is no code execution. |
 | `--pause-at-gates` | During `--dry-run`, stop at the first approval gate instead of auto-approving it. |
 
@@ -322,7 +322,7 @@ archon workflow run deliver --cwd /path/to/repo \
 
 The scaffold is derived from the already-expanded workflow, so included top-level nodes use their flattened ids (for example, `review__classify`) — while `loop_group` BODY nodes keep their bare ids even inside an included block (the group node gets the `<includeId>__` prefix; its body does not). Prefer `--stubs-init` over hand-writing keys: the scaffold is the authoritative source for both spellings. Structured `output_format` values are emitted as YAML objects with native booleans, numbers, arrays, and nested required properties. Loop completion fields are generated as `true`. If Archon cannot prove that a generated value satisfies its JSON Schema, scaffold generation fails before creating the file.
 
-The stub file must contain one YAML mapping. Each value is either a string or an object. Object stubs are preserved as structured output, so downstream `$classify.output.severity` references behave like live structured producers. Strict coverage remains the default: a reachable AI, bash, or script node without a stub fails the simulation and appears in `missingStubs`. The one exception is a `trigger_rule: all_done` join — it runs whatever its upstream did, so a real run reaches it regardless of stub data. It gets a generated placeholder and is listed in both `missingStubs` and `toleratedMissingStubs`, and the absent stub alone never fails the simulation or a `workflow test` fixture. It is only listed in `toleratedMissingStubs` once that placeholder exists: a node whose `output_format` cannot produce one still fails, and stays out of the tolerated list. Add `--default-stubs` to fill only omitted reachable nodes with the same schema-aware placeholders used by scaffold generation; explicit values always take precedence. A reachable `bash:` or `script:` node that arrived through `include:` must always be stubbed: the simulation does not deliver the caller's `with:` values to it, so a body that reads its inputs fails rather than running. Supplied stubs for unknown or unreachable nodes appear in `unusedStubs`, while generated placeholders do not. Whole-output references retain their normal lenient behavior, while invalid strict `$node.output.field` references fail the consuming node exactly as they do in a real run. See [Node Output References](/reference/variables/#node-output-references).
+The stub file must contain one YAML mapping. Each value is either a string or an object. Object stubs are preserved as structured output, so downstream `$classify.output.severity` references behave like live structured producers. Strict coverage remains the default: a reachable AI, bash, or script node without a stub fails the simulation and appears in `missingStubs`. The one exception is a `trigger_rule: all_done` join — it runs whatever its upstream did, so a real run reaches it regardless of stub data. It gets a generated placeholder and is listed in both `missingStubs` and `toleratedMissingStubs`, and the absent stub alone never fails the simulation or a `workflow test` fixture. It is only listed in `toleratedMissingStubs` once that placeholder exists: a node whose `output_format` cannot produce one still fails, and stays out of the tolerated list. A `loop:` node carrying the same trigger rule is tolerated on the same terms, with one addition — the placeholder must also end the loop, which it does by satisfying the node's own completion channel, so a tolerated loop always completes on its first iteration. The one loop shape it cannot end is an `output_format` whose only completion channel is a prose `until:`, because the generated JSON never carries the sentinel; that node still fails and stays out of the tolerated list. Add `--default-stubs` to fill only omitted reachable nodes with the same schema-aware placeholders used by scaffold generation; explicit values always take precedence. A reachable `bash:` or `script:` node that arrived through `include:` must always be stubbed: the simulation does not deliver the caller's `with:` values to it, so a body that reads its inputs fails rather than running. Supplied stubs for unknown or unreachable nodes appear in `unusedStubs`, while generated placeholders do not. Whole-output references retain their normal lenient behavior, while invalid strict `$node.output.field` references fail the consuming node exactly as they do in a real run. See [Node Output References](/reference/variables/#node-output-references).
 
 A workflow's declared `inputs:` resolve exactly as in a real run: omitted inputs take their declared `default:`, `--input name=value` binds a value (visible in the trace's resolved text), and a missing **required** input or an **undeclared** name fails at the invocation gate with the same errors a real run gives — before any trace output. With `--exec-code`, bash and script nodes also receive the run-level inputs as the same `INPUTS_<UPPER_SNAKE>` environment variables a real run delivers (a composed block's own inputs for named scripts are a real-run-only channel).
 
@@ -499,7 +499,7 @@ its own clock would be answering a question only the run can answer. `--timeout
 | --- | --- |
 | `0` | The run said something — it finished (`completed`, `failed`, or `cancelled`) or it is waiting for a response. The status is data on stdout. |
 | `3` | The timeout passed with the run still live. The `--json` payload carries `observedStatus`. |
-| `1` | The wait itself failed — unknown run id, database unreachable. |
+| `1` | The wait itself failed — unknown run id, database unreachable, or output that could not be delivered. |
 
 A `failed` or `cancelled` run is still exit `0`: mapping run state onto the process
 exit code would make a legitimately cancelled run look like a broken command.
@@ -525,6 +525,18 @@ exit code would make a legitimately cancelled run look like a broken command.
 Two pauses deliberately do **not** wake a waiter, because neither is owed a response: a
 gate that has already been approved or rejected and is awaiting auto-resume, and a
 [`wait:` node](/guides/authoring-workflows/) whose timer or event has not fired.
+
+Once the wait is watching, it says so once on **stderr** — one plain sentence, or the
+same envelope with `"result": "waiting"` and the status it attached on under `--json`:
+
+```json
+{ "ok": true, "action": "wait", "runId": "…", "result": "waiting", "observedStatus": "running" }
+```
+
+Until that line the command is completely silent, so a host cannot tell a watch that
+has begun from one still resolving the id. It is on stderr precisely so stdout keeps
+carrying exactly one document. A run that already has something to say answers on the
+first read, and never prints it.
 
 The run id may be the short prefix printed by `workflow runs`. Once the wait returns,
 inspect the run normally with `workflow get <run-id>`.

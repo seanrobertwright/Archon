@@ -16,7 +16,9 @@ import {
 import {
   COMPOSED_NODE,
   COMPILED_LOOP_COMMAND,
+  attachComposedBindings,
   type LoopWithCompiledCommand,
+  readComposedBindings,
   readComposedMeta,
   type NodeWithComposedMeta,
 } from './compiled-command';
@@ -205,6 +207,12 @@ function walk(
     if (node.source.kind === 'inline') {
       const source = node.source;
       slot('agent.prompt', 'prompt', source.prompt, value => (source.prompt = value));
+      // A materialized command node keeps its bindings in the engine-private payload
+      // (#2964); they are the same template surface as an unmaterialized `with:` map, so
+      // an enclosing include namespaces their refs and forwards its own inputs into them.
+      const composedBindings = readComposedBindings(node);
+      if (composedBindings !== undefined)
+        walkBindings(composedBindings, (name, value) => (composedBindings[name] = value));
     } else {
       walkBindings(node.source.with, (name, value) => {
         if (node.source.kind === 'command' && node.source.with !== undefined)
@@ -367,6 +375,8 @@ function preserveInternalMetadata(source: DagNode, target: DagNode): void {
   const meta = readComposedMeta(source);
   if (meta !== undefined)
     (target as DagNode & NodeWithComposedMeta)[COMPOSED_NODE] = structuredClone(meta);
+  const bindings = readComposedBindings(source);
+  if (bindings !== undefined) attachComposedBindings(target, structuredClone(bindings));
   if (isLoopNode(source) && isLoopNode(target)) {
     const compiled = (source.loop as typeof source.loop & LoopWithCompiledCommand)[
       COMPILED_LOOP_COMMAND

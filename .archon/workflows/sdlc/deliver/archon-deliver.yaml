@@ -34,14 +34,6 @@ inputs:
   errors:
     default: "auto"
     description: Silent-failure lens — auto, true, or false.
-  # Declared so composition can see the names `sync-pr-body` reads; the node's
-  # own `with:` supplies the real values mid-run and wins over any caller value.
-  pr_number:
-    default: ""
-    description: Internal — the run-owned PR number, bound from the pr node.
-  pr_head:
-    default: ""
-    description: Internal — the run-owned PR head branch, bound from the pr node.
 
 returns: pr
 
@@ -144,6 +136,14 @@ nodes:
   # non-starved resume converged; 3 cut two converging runs short). A per-lane
   # bound would need runtime-parameterized composition, which the language
   # deliberately does not have — the flat bound buys the same outcome free.
+  #
+  # CI feeds the fix, without waiting: checks run on the pushed commits while
+  # review happens, so concluded results usually exist by the time a round
+  # starts. Each round reads that state once, at its boundary — after the
+  # previous recheck landed — and hands it to the fix as evidence. A failure a
+  # check can prove is cheapest to fix here, in the round that caused it, not
+  # an hour later at the terminal wait. The loop itself never waits on CI, and
+  # await-checks below remains the authority on the flip.
   - id: corrections
     depends_on: [review-action]
     when: "$review-action.output.action == 'correct'"
@@ -155,8 +155,64 @@ nodes:
       max_iterations: 5
       fresh_context: true
       nodes:
+        # Evidence provisioning, never a gate: this node cannot fail the round
+        # and never waits. A read that fails, times out, or finds no checks
+        # reports that fact and the round proceeds on the review findings
+        # alone. One read, one captured document — deriving failures and counts
+        # from separate reads could present a half-failed read as clean CI. The
+        # read is bounded by its own watchdog, well under the engine's
+        # subprocess timeout: an engine-killed node here would skip the fix and
+        # cascade the round into a loud failure, which is exactly backwards for
+        # optional evidence. The exit code is read together with the captured
+        # output, never alone — this gh form can encode check state in its exit
+        # code and can exit zero on failing checks, so non-zero with output is
+        # data, and only killed-or-empty means the read itself failed.
+        - id: ci-note
+          timeout: 90000
+          bash: |
+            PR_NUMBER=$pr.output.number
+            ORIGIN_REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##' || true)
+            TMP=$(mktemp)
+            gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket \
+              --jq '.[] | if .bucket == "pending" then "PENDING" elif .bucket == "pass" or .bucket == "skipping" then "GREEN" else "RED \(.name) (\(.bucket))" end' \
+              > "$TMP" 2>/dev/null &
+            GH_PID=$!
+            ( sleep 45; kill "$GH_PID" 2>/dev/null && : > "$TMP.killed" ) &
+            WATCHDOG=$!
+            wait "$GH_PID"
+            RC=$?
+            kill "$WATCHDOG" 2>/dev/null
+            wait "$WATCHDOG" 2>/dev/null || true
+            LINES=$(cat "$TMP" 2>/dev/null || true)
+            KILLED=""
+            [ -f "$TMP.killed" ] && KILLED=1
+            rm -f "$TMP" "$TMP.killed"
+            if [ -n "$KILLED" ] || { [ "$RC" -ne 0 ] && [ -z "$LINES" ]; }; then
+              echo "No CI evidence is available for this round (the check read failed or timed out). Proceed on the review findings alone."
+              exit 0
+            fi
+            if [ -z "$LINES" ]; then
+              echo "No CI evidence is available for this round (no checks reported). Proceed on the review findings alone."
+              exit 0
+            fi
+            FAILING=$(printf '%s\n' "$LINES" | sed -n 's/^RED /- /p')
+            PENDING=$(printf '%s\n' "$LINES" | grep -c '^PENDING') || true
+            echo "CI state for this pull request, read at the start of this round; it describes the currently pushed head:"
+            if [ -n "$FAILING" ]; then
+              echo "Concluded non-green checks:"
+              printf '%s\n' "$FAILING"
+            else
+              echo "No concluded failures."
+            fi
+            case "$PENDING" in
+              ''|0) ;;
+              *) echo "$PENDING check(s) still running — never wait on them." ;;
+            esac
+            exit 0
+
         - id: fix
           include: archon-implement
+          depends_on: [ci-note]
           with:
             work: >-
               Fix every open Critical and Important finding recorded in
@@ -167,6 +223,19 @@ nodes:
               relevant proof passes. Do not cross an explicit boundary to make
               a finding disappear; the following review must return replan if
               the requested outcome requires that expansion.
+
+              Concluded CI evidence observed before this round — evidence, not
+              a verdict, and the same red-cause discipline applies to it:
+
+              $ci-note.output
+
+              A concluded CI failure that this branch's changes introduced is
+              part of this round's work, exactly like a review finding. Red on
+              a check this branch cannot have caused is classified with
+              evidence, not chased. Never wait on running checks — but results
+              can conclude while you work, so before declaring done, re-read
+              the concluded check state for this pull request with one
+              non-blocking read, and treat anything newly red the same way.
 
               Accepted work order:
               $INPUTS.work
@@ -304,37 +373,25 @@ nodes:
   - id: flip-ready
     bash: |
       set -euo pipefail
-      EVIDENCE="$ARTIFACTS_DIR/flip-ready.log"
-      : > "$EVIDENCE"
-      record() {
-        printf '$' >> "$EVIDENCE"
-        printf ' %q' "$@" >> "$EVIDENCE"
-        printf '\n' >> "$EVIDENCE"
-        "$@" >> "$EVIDENCE" 2>&1
-      }
-      record_read() {
-        printf '$' >> "$EVIDENCE"
-        printf ' %q' "$@" >> "$EVIDENCE"
-        printf '\n' >> "$EVIDENCE"
-        # stderr goes to the log, never into the captured value: a git or gh
-        # warning must not become the branch name or the returned PR URL.
-        "$@" 2>>"$EVIDENCE" | tee -a "$EVIDENCE"
-      }
-      fail() {
-        printf '%s\n' "$1" | tee -a "$EVIDENCE" >&2
-        exit 1
-      }
       # --repo pins to the origin remote: gh's default resolution in a
       # fork clone targets the upstream parent instead. With --repo, gh disables
       # branch inference and REQUIRES an explicit selector — omitting it is a
       # usage error.
-      # Read OUTSIDE the recording helpers on purpose: the raw URL can carry a
-      # credential (https://<token>@host/...). Only the normalized owner/repo
-      # below is ever logged or interpolated into a failure message.
-      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      # Nothing below streams a command's own output. The engine broadcasts a
+      # node's stderr to the operator as it runs and retains what the node prints,
+      # so every git and gh call here is captured: this node's authored messages
+      # are the only text that reaches its streams. That also keeps the raw origin
+      # URL — which can carry a credential (https://<token>@host/...) — out of
+      # both, since it is normalized inside the substitution that reads it and
+      # only the owner/repo below ever reaches a command line or a message.
+      if ! ORIGIN_REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##'); then
+        printf '%s\n' "flip-ready: could not read the origin remote." >&2
+        exit 1
+      fi
       case "$ORIGIN_REPO" in
         *[!A-Za-z0-9_.-]*/* | */*[!A-Za-z0-9_.-]* | */*/* | /* | */ | "")
-          fail "flip-ready: origin remote does not resolve to an owner/repo."
+          printf '%s\n' "flip-ready: origin remote does not resolve to an owner/repo." >&2
+          exit 1
           ;;
       esac
       # The recorded number is the selector. Which branch is checked out is not
@@ -351,16 +408,38 @@ nodes:
       # read is the one that tolerates failure — reporting the checks it found
       # is what refuses the flip, never the exit code.
       # `|| true` here and nowhere else: every other read must fail the node.
-      NOT_GREEN=$(record_read gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' || true)
+      # Dropping gh's explanation for the tolerated case hides nothing: a gh that
+      # cannot read this PR's checks cannot flip it either, and the flip below
+      # fails loudly carrying gh's own words.
+      NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>/dev/null || true)
       if [ -n "$NOT_GREEN" ]; then
-        fail "flip-ready: refusing to flip with non-green checks: $NOT_GREEN"
+        printf '%s\n' "flip-ready: refusing to flip with non-green checks: $NOT_GREEN" >&2
+        printf '%s\n' "flip-ready: if that red is transient or unrelated to this change, re-run the failing check on the pull request and resume this run — the flip reads the check state again on resume." >&2
+        exit 1
       fi
-      record gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO"
-      draft=$(record_read gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json isDraft --jq .isDraft)
-      if [ "$draft" = "false" ]; then
-        record_read gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json url --jq .url
-      else
-        fail "flip-ready: PR still reports draft after the ready flip"
+      # The flip prints a confirmation this node has no use for, and its stdout is
+      # not a value, so both streams are captured together and re-emitted only if
+      # the flip failed — where gh's own words are the diagnostic.
+      if ! FLIP=$(gh pr ready "$PR_NUMBER" --repo "$ORIGIN_REPO" 2>&1); then
+        printf '%s\n' "flip-ready: the ready flip failed: $FLIP" >&2
+        exit 1
+      fi
+      # The two reads below capture a VALUE, so their stderr is dropped rather than
+      # merged: a gh notice must never become the draft state or the delivered URL.
+      # Each failure names the read it could not complete, so neither is silent.
+      if ! draft=$(gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+        printf '%s\n' "flip-ready: PR was flipped but its draft state could not be read back." >&2
+        exit 1
+      fi
+      if [ "$draft" != "false" ]; then
+        printf '%s\n' "flip-ready: PR still reports draft after the ready flip" >&2
+        exit 1
+      fi
+      # This node's stdout is the delivered URL and nothing else; `outcome` reports
+      # the value verbatim.
+      if ! gh pr view "$PR_NUMBER" --repo "$ORIGIN_REPO" --json url --jq .url 2>/dev/null; then
+        printf '%s\n' "flip-ready: PR was flipped but its URL could not be read back." >&2
+        exit 1
       fi
     # Waits on sync-pr-body explicitly: on a repo with no CI, await-checks
     # returns immediately and the flip could otherwise beat the resync. The
@@ -369,9 +448,6 @@ nodes:
     # correct is a reason not to go ready.
     depends_on: [await-checks, sync-pr-body]
     trigger_rule: none_failed_min_one_success
-    # The node's stdout is the verified URL; the engine writes it as a durable
-    # typed sidecar alongside the PR record and review report.
-    output_type: public-action
 
   # This tail's terminal report, like every other SDLC tail's (scripts/outcome.py).
   # flip-ready owns the one irreversible public action and stops there; composing

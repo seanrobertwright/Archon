@@ -16,7 +16,7 @@ description: |
   NOT for: fixing findings (implement), running the project's checks (validate),
   or writing code.
 
-model: large
+model: medium
 
 inputs:
   scope:
