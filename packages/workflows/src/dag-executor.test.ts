@@ -12509,10 +12509,10 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     expect(failed?.error).toContain("chunk type 'thinking'");
   });
 
-  it('loop timeout diagnostics distinguish tool progress from assistant output', async () => {
+  it('loop timeout diagnostics retain the latest reset and distinguish tool progress from assistant output', async () => {
     const runCase = async (
       runId: string,
-      chunk: MessageChunk
+      chunks: MessageChunk[]
     ): Promise<{ transcript: Array<Record<string, unknown>>; error: string }> => {
       mockSendQueryDag.mockImplementationOnce(async function* (
         _prompt: string,
@@ -12520,7 +12520,7 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
         _resumeSessionId?: string,
         options?: { abortSignal?: AbortSignal }
       ) {
-        yield chunk;
+        for (const chunk of chunks) yield chunk;
         await new Promise<void>(resolve => {
           if (options?.abortSignal?.aborted) resolve();
           else options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
@@ -12563,19 +12563,24 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
       return { transcript, error: String(failed?.error) };
     };
 
-    const tool = await runCase('loop-tool-timeout', {
-      type: 'tool',
-      toolName: 'Bash',
-      toolInput: { command: 'private tool input' },
-    });
-    const assistant = await runCase('loop-assistant-timeout', {
-      type: 'assistant',
-      content: 'user-visible output',
-    });
+    const tool = await runCase('loop-tool-timeout', [
+      { type: 'thinking', content: 'private reasoning' },
+      {
+        type: 'tool',
+        toolName: 'Bash',
+        toolInput: { command: 'private tool input' },
+      },
+    ]);
+    const assistant = await runCase('loop-assistant-timeout', [
+      {
+        type: 'assistant',
+        content: 'user-visible output',
+      },
+    ]);
 
     const toolReset = tool.transcript.filter(event => event.type === 'watchdog_reset');
     const assistantReset = assistant.transcript.filter(event => event.type === 'watchdog_reset');
-    expect(toolReset.map(event => event.chunk_type)).toEqual(['tool']);
+    expect(toolReset.map(event => event.chunk_type)).toEqual(['thinking', 'tool']);
     expect(assistantReset.map(event => event.chunk_type)).toEqual(['assistant']);
     expect(toolReset.every(event => !('content' in event) && !('tool_input' in event))).toBe(true);
     expect(assistantReset.every(event => !('content' in event))).toBe(true);
