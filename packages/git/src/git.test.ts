@@ -2487,6 +2487,49 @@ branch refs/heads/feature/auth
       expect(fetchCalls).toBeGreaterThan(2);
     });
 
+    test('throws after exhausting retry budget on persistent lock-race error', async () => {
+      // When every fetch attempt fails with the lock-race error, the function
+      // must throw after 4 total attempts (1 initial + 3 retries), not hang or
+      // retry indefinitely.
+      const raceError = new Error(
+        "error: cannot lock ref 'refs/remotes/origin/dev': is at de581e24 but expected 8eaa8d42\n" +
+          '! 8eaa8d420..de581e24b dev -> origin/dev (unable to update local ref)'
+      );
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch')) {
+          fetchCalls++;
+          throw raceError;
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(git.syncWorkspace(repo('/workspace/repo'), branch('dev'))).rejects.toThrow(
+        'Sync fetch from origin/dev failed'
+      );
+
+      expect(fetchCalls).toBe(4); // 1 initial + 3 retries
+    });
+
+    test('does not retry non-race fetch errors', async () => {
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch')) {
+          fetchCalls++;
+          throw new Error("fatal: 'origin' does not appear to be a git repository");
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(git.syncWorkspace(repo('/workspace/repo'), branch('main'))).rejects.toThrow(
+        'Sync fetch from origin/main failed'
+      );
+
+      expect(fetchCalls).toBe(1);
+    });
+
     test('names the custom remote in the configured-branch-missing error', async () => {
       execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
         if (args.includes('fetch')) {
