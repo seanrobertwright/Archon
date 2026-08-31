@@ -193,6 +193,28 @@ describe('buildStatusBlocks', () => {
     expect(ctx.elements[0]?.text).toContain('total cost: $0.1230');
   });
 
+  test('terminal snapshot labels execution and contradictory authored outcome separately', () => {
+    const { blocks, fallbackText } = buildStatusBlocks(
+      snapshot({
+        terminal: 'completed',
+        authoredOutcome: 'failed',
+      }),
+      startedAt + 1000
+    );
+    const header = (blocks[0] as { text: { text: string } }).text.text;
+    expect(header).toContain('*Execution status:* `completed`');
+    expect(header).toContain('*Authored outcome:* `failed`');
+    expect(fallbackText).toContain('authored outcome: failed');
+  });
+
+  test('terminal snapshot keeps the existing presentation when outcome is null', () => {
+    const withoutOutcome = buildStatusBlocks(snapshot({ terminal: 'completed' }), startedAt + 1000);
+    expect(withoutOutcome.fallbackText).toBe(':white_check_mark: Workflow completed (assist)');
+    expect((withoutOutcome.blocks[0] as { text: { text: string } }).text.text).not.toContain(
+      'Authored outcome'
+    );
+  });
+
   test('terminal failed snapshot shows reason', () => {
     const { blocks } = buildStatusBlocks(
       snapshot({

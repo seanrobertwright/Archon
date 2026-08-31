@@ -6,6 +6,7 @@
  */
 import type { types } from '@slack/bolt';
 import type { TokenUsage } from '@archon/providers/types';
+import type { WorkflowRunOutcome } from '@archon/workflows/schemas/workflow-run';
 
 type KnownBlock = types.KnownBlock;
 
@@ -30,6 +31,8 @@ export interface RunSnapshot {
   nodes: NodeSnapshot[];
   /** Set only after a terminal event arrives. */
   terminal?: RunTerminalState;
+  /** Persisted workflow-authored verdict, independent from terminal execution state. */
+  authoredOutcome?: Exclude<WorkflowRunOutcome, null>;
   /** Final cost in USD; only set once persisted on workflow_runs.metadata.total_cost_usd. */
   totalCostUsd?: number;
   /** Optional failure reason for failed/cancelled runs. */
@@ -185,11 +188,14 @@ export function buildStatusBlocks(
     ? TERMINAL_HEADER[snapshot.terminal]
     : ':arrows_counterclockwise: Workflow running';
 
+  const authoredOutcome = snapshot.authoredOutcome
+    ? `\n*Execution status:* \`${snapshot.terminal}\` · *Authored outcome:* \`${snapshot.authoredOutcome}\``
+    : '';
   const headerSection: KnownBlock = {
     type: 'section',
     text: {
       type: 'mrkdwn',
-      text: `${header}\n*Workflow:* \`${snapshot.workflowName}\` · *Run:* \`${shortRunId(snapshot.runId)}\` · *Elapsed:* ${elapsed}`,
+      text: `${header}${authoredOutcome}\n*Workflow:* \`${snapshot.workflowName}\` · *Run:* \`${shortRunId(snapshot.runId)}\` · *Elapsed:* ${elapsed}`,
     },
   };
 
@@ -246,7 +252,7 @@ export function buildStatusBlocks(
   return {
     blocks,
     fallbackText: snapshot.terminal
-      ? `${TERMINAL_HEADER[snapshot.terminal]} (${snapshot.workflowName})`
+      ? `${TERMINAL_HEADER[snapshot.terminal]} (${snapshot.workflowName})${snapshot.authoredOutcome ? ` · authored outcome: ${snapshot.authoredOutcome}` : ''}`
       : `Workflow ${snapshot.workflowName} running`,
   };
 }

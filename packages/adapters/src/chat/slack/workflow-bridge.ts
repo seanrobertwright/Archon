@@ -278,13 +278,31 @@ export class SlackWorkflowBridge {
     const state = this.runs.get(runId);
     const trigger = this.adapter.getTriggeringMessage(conversationId);
 
+    let totalCostUsd: number | undefined;
+    let authoredOutcome: RunSnapshot['authoredOutcome'];
+    try {
+      const run = await workflowDb.getWorkflowRun(runId);
+      const raw = run?.metadata?.total_cost_usd;
+      if (typeof raw === 'number' && Number.isFinite(raw)) totalCostUsd = raw;
+      authoredOutcome = run?.outcome ?? undefined;
+    } catch (error) {
+      getLog().warn({ err: error as Error, runId }, 'slack.bridge_run_lookup_failed');
+    }
+
     // Replace running reaction with the terminal one.
     if (trigger) {
       await this.removeReactionSafe(trigger, REACTION_RUNNING);
-      await this.addReactionSafe(
-        trigger,
-        terminal === 'completed' ? REACTION_SUCCESS : REACTION_FAILURE
-      );
+      const executionReaction = terminal === 'completed' ? REACTION_SUCCESS : REACTION_FAILURE;
+      await this.addReactionSafe(trigger, executionReaction);
+      const outcomeReaction =
+        authoredOutcome === 'succeeded'
+          ? REACTION_SUCCESS
+          : authoredOutcome === 'failed'
+            ? REACTION_FAILURE
+            : undefined;
+      if (outcomeReaction !== undefined && outcomeReaction !== executionReaction) {
+        await this.addReactionSafe(trigger, outcomeReaction);
+      }
     }
 
     if (state) {
@@ -294,18 +312,9 @@ export class SlackWorkflowBridge {
         state.pendingEdit = undefined;
       }
 
-      // Pull final cost from the workflow run record (best-effort).
-      let totalCostUsd: number | undefined;
-      try {
-        const run = await workflowDb.getWorkflowRun(runId);
-        const raw = run?.metadata?.total_cost_usd;
-        if (typeof raw === 'number' && Number.isFinite(raw)) totalCostUsd = raw;
-      } catch (error) {
-        getLog().debug({ err: error as Error, runId }, 'slack.bridge_cost_lookup_failed');
-      }
-
       await this.updateStatusMessage(state, {
         terminal,
+        authoredOutcome,
         totalCostUsd,
         failureReason: terminal === 'completed' ? undefined : reason,
       });
@@ -357,7 +366,9 @@ export class SlackWorkflowBridge {
 
   private async updateStatusMessage(
     state: RunState,
-    overlay: Partial<Pick<RunSnapshot, 'terminal' | 'totalCostUsd' | 'failureReason'>> = {}
+    overlay: Partial<
+      Pick<RunSnapshot, 'terminal' | 'authoredOutcome' | 'totalCostUsd' | 'failureReason'>
+    > = {}
   ): Promise<void> {
     if (!state.statusMessageTs) return;
     const snapshot: RunSnapshot = { ...this.snapshot(state), ...overlay };
