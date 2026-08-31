@@ -292,7 +292,7 @@ export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { pr
 
 /** Static execution plan attached after include expansion and graph validation. */
 export interface GraphPlan {
-  readonly nodes: DagNode[];
+  readonly nodes: readonly DagNode[];
   readonly layers: readonly (readonly DagNode[])[];
   readonly sinks: readonly string[];
 }
@@ -305,7 +305,7 @@ declare class ResolvedWorkflowIdentity {
 /** Include-free workflow accepted by execution and simulation boundaries. */
 export type ResolvedWorkflow = Omit<WorkflowDefinition, 'nodes'> &
   ResolvedWorkflowIdentity & {
-    readonly nodes: DagNode[];
+    readonly nodes: readonly DagNode[];
     readonly plan: GraphPlan;
   };
 

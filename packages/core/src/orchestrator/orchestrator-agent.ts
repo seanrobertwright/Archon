@@ -532,7 +532,7 @@ function resolveCodebaseName(name: string, codebases: readonly Codebase[]): Code
 export function parseOrchestratorCommands(
   response: string,
   codebases: readonly Codebase[],
-  workflows: readonly WorkflowDefinition[]
+  workflows: readonly Pick<WorkflowDefinition, 'name'>[]
 ): OrchestratorCommands {
   const result: OrchestratorCommands = {
     workflowInvocation: null,

@@ -106,6 +106,10 @@ export interface ComposedSuspensionPath {
   reason: string;
 }
 
+type SuspensionWorkflow = Pick<WorkflowDefinition, 'name' | 'interactive'> & {
+  readonly nodes: readonly (DagNode | IncludeDirective)[];
+};
+
 /**
  * Find every path in a static include/workflow closure that can pause an instance.
  * Composed fan-out currently owns one parent cursor, not one cursor per item, so both
@@ -113,14 +117,14 @@ export interface ComposedSuspensionPath {
  * Durable interactive instances are tracked separately in #2810.
  */
 export function collectComposedSuspensionPaths(
-  root: WorkflowDefinition,
-  definitions: readonly WorkflowDefinition[]
+  root: SuspensionWorkflow,
+  definitions: readonly SuspensionWorkflow[]
 ): ComposedSuspensionPath[] {
   const byName = new Map(definitions.map(definition => [definition.name, definition]));
   const visited = new Set<string>();
   const found: ComposedSuspensionPath[] = [];
 
-  const visitDefinition = (definition: WorkflowDefinition): void => {
+  const visitDefinition = (definition: SuspensionWorkflow): void => {
     if (visited.has(definition.name)) return;
     visited.add(definition.name);
     if (definition.interactive === true) {
@@ -130,7 +134,7 @@ export function collectComposedSuspensionPaths(
   };
 
   const visitTarget = (name: string, ownerId: string, kind: 'include' | 'workflow'): void => {
-    let target: WorkflowDefinition | undefined;
+    let target: SuspensionWorkflow | undefined;
     try {
       target = kind === 'workflow' ? resolveWorkflowName(name, definitions) : byName.get(name);
     } catch (_err) {
@@ -630,7 +634,7 @@ export interface ExpandedInclude {
  */
 function resolveIncludeInputs(
   includeNode: IncludeDirective,
-  child: WorkflowDefinition
+  child: Pick<WorkflowDefinition, 'name' | 'inputs'>
 ): Record<string, JsonValue> {
   try {
     return resolveDeclaredInputs(
@@ -947,7 +951,7 @@ function warnDroppedWorkflowLevelFields(
 function materializeBlockCommandPrompts(
   node: DagNode,
   includeNode: IncludeDirective,
-  child: WorkflowDefinition,
+  child: Pick<WorkflowDefinition, 'name'>,
   commandContents: ReadonlyMap<string, IncludeCommandContent>,
   currentIds: ReadonlySet<string>,
   enclosingIds: ReadonlySet<string>,

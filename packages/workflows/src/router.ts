@@ -203,7 +203,7 @@ export function parseWorkflowInvocation(
 /**
  * Find a workflow by name
  */
-export function findWorkflow<T extends WorkflowDefinition>(
+export function findWorkflow<T extends Pick<WorkflowDefinition, 'name'>>(
   name: string,
   workflows: readonly T[]
 ): T | undefined {
@@ -220,7 +220,7 @@ export function findWorkflow<T extends WorkflowDefinition>(
  * Returns the matched workflow, or undefined if no match found.
  * Throws an Error if multiple workflows match at the same tier (ambiguous).
  */
-export function resolveWorkflowName<T extends WorkflowDefinition>(
+export function resolveWorkflowName<T extends Pick<WorkflowDefinition, 'name'>>(
   name: string,
   workflows: readonly T[]
 ): T | undefined {

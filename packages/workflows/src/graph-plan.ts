@@ -16,7 +16,7 @@ function requireResolvedNodes(nodes: readonly (DagNode | IncludeDirective)[]): D
   return resolved;
 }
 
-function planResolvedNodes(nodes: DagNode[]): GraphPlan {
+function planResolvedNodes(nodes: readonly DagNode[]): GraphPlan {
   const inDegree = new Map<string, number>();
   const dependents = new Map<string, string[]>();
 

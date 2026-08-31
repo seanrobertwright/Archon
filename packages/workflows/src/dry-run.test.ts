@@ -15,22 +15,29 @@ import { resolveWorkflow } from './graph-plan';
 import { buildAiProfile } from './model-validation';
 import { resolveWorkflowModelScope } from './node-model-resolution';
 import { expandWorkflowIncludes } from './include-expander';
-import type { WorkflowDefinition } from './schemas';
+import type { ResolvedWorkflow, WorkflowDefinition } from './schemas';
 
-function createDryRunStubScaffold(workflow: WorkflowDefinition) {
-  return createResolvedDryRunStubScaffold(resolveWorkflow(workflow));
+function asResolvedWorkflow(workflow: WorkflowDefinition | ResolvedWorkflow): ResolvedWorkflow {
+  return 'plan' in workflow ? workflow : resolveWorkflow(workflow);
 }
 
-function writeDryRunStubScaffold(workflow: WorkflowDefinition, path: string) {
-  return writeResolvedDryRunStubScaffold(resolveWorkflow(workflow), path);
+function createDryRunStubScaffold(workflow: WorkflowDefinition | ResolvedWorkflow) {
+  return createResolvedDryRunStubScaffold(asResolvedWorkflow(workflow));
+}
+
+function writeDryRunStubScaffold(workflow: WorkflowDefinition | ResolvedWorkflow, path: string) {
+  return writeResolvedDryRunStubScaffold(asResolvedWorkflow(workflow), path);
 }
 
 type TestDryRunOptions = Omit<Parameters<typeof dryRunResolvedWorkflow>[0], 'workflow'> & {
-  workflow: WorkflowDefinition;
+  workflow: WorkflowDefinition | ResolvedWorkflow;
 };
 
 function dryRunWorkflow(options: TestDryRunOptions) {
-  return dryRunResolvedWorkflow({ ...options, workflow: resolveWorkflow(options.workflow) });
+  return dryRunResolvedWorkflow({
+    ...options,
+    workflow: asResolvedWorkflow(options.workflow),
+  });
 }
 
 const temporaryDirectories: string[] = [];
@@ -49,7 +56,7 @@ function temporaryFile(content: string): string {
   return path;
 }
 
-function composedReviewWorkflow(gateNodes: unknown[], includeWhen?: string): WorkflowDefinition {
+function composedReviewWorkflow(gateNodes: unknown[], includeWhen?: string): ResolvedWorkflow {
   const block = makeTestWorkflow({
     name: 'review-block',
     nodes: [

@@ -384,8 +384,9 @@ const minimalConfig: WorkflowConfig = {
  * `deps`, `cwd`, `workflow`, and `workflowRun` carry each test's own fixtures, so every call
  * supplies them; the run directories derive from `cwd` the way every call site built them.
  */
-type TestWorkflowDefinition = Omit<WorkflowDefinition, 'description'> & {
+type TestWorkflowDefinition = Omit<WorkflowDefinition, 'description' | 'nodes'> & {
   description?: string;
+  nodes: readonly (DagNode | IncludeDirective)[];
 };
 
 type DagOptionsOverrides = Omit<Partial<ExecuteDagWorkflowOptions>, 'workflow'> &
@@ -394,7 +395,11 @@ type DagOptionsOverrides = Omit<Partial<ExecuteDagWorkflowOptions>, 'workflow'> 
   };
 
 function resolveTestWorkflow(workflow: TestWorkflowDefinition): ResolvedWorkflow {
-  return resolveWorkflow({ ...workflow, description: workflow.description ?? workflow.name });
+  return resolveWorkflow({
+    ...workflow,
+    description: workflow.description ?? workflow.name,
+    nodes: [...workflow.nodes],
+  });
 }
 
 /**
@@ -490,8 +495,8 @@ describe('executeDagWorkflow options type contract', () => {
 
 // --- Helpers ---
 
-function ready(wf: WorkflowDefinition): ResolvedWorkflow {
-  return resolveWorkflow(wf);
+function ready(wf: TestWorkflowDefinition): ResolvedWorkflow {
+  return resolveTestWorkflow(wf);
 }
 
 function node(id: string, depends_on?: string[], opts?: Partial<AgentNode>): AgentNode {
@@ -695,6 +700,15 @@ describe('planGraph', () => {
     ]);
     expect(workflow.plan.sinks).toEqual(['left', 'right']);
     expect(workflow.nodes).toBe(workflow.plan.nodes);
+
+    if (false) {
+      // @ts-expect-error Resolved workflow nodes are immutable after planning.
+      workflow.nodes.push(node('late'));
+      // @ts-expect-error The plan exposes the same immutable node set.
+      workflow.plan.nodes.splice(0, 1);
+      // @ts-expect-error Planned layers cannot be mutated after construction.
+      workflow.plan.layers[0]?.push(node('late'));
+    }
   });
 
   it('does not let a typed caller pair a plan with another node set', () => {
@@ -26512,7 +26526,7 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
     runName: string,
     options: { expand?: boolean; profileProvider?: string; tiers?: RawTiersConfig } = {}
   ): Promise<Map<string, EffectiveConfig>> {
-    let workflow: WorkflowDefinition;
+    let workflow: TestWorkflowDefinition;
     if (options.expand === false) {
       workflow = defs.find(d => d.name === runName)!;
     } else {
@@ -28637,7 +28651,7 @@ function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
 function includedProbeWaitTerminatedLoopGroupWorkflow(
   markerPath: string,
   quoteOutputRef = false
-): WorkflowDefinition {
+): ResolvedWorkflow {
   const stateRef = quoteOutputRef ? '"$ci-probe.output.state"' : '$ci-probe.output.state';
   const block = workflowDefinitionSchema.parse({
     name: 'probe-wait-block',

@@ -84,6 +84,7 @@ import {
   assertWorkflowRequirementsMet,
   resolveTopLevelInputs,
 } from '@archon/workflows/utils/workflow-requirements';
+import type { RequirementBearingWorkflow } from '@archon/workflows/utils/workflow-requirements';
 import { parseInputAssignments } from '@archon/workflows/workflow-inputs';
 import { formatDeprecationNotice } from '@archon/workflows/deprecation';
 import {
@@ -808,7 +809,9 @@ function assertWorkflowNotWorktreePinnedForFolder(
  * GitHub App + TOKEN_ENCRYPTION_KEY are both configured — identical semantics
  * to the orchestrator gate.
  */
-async function assertCliWorkflowRequirementsMet(workflow: WorkflowDefinition): Promise<void> {
+async function assertCliWorkflowRequirementsMet(
+  workflow: RequirementBearingWorkflow
+): Promise<void> {
   if (!isPerUserGitHubEnabled() || !workflow.requires?.length) return;
 
   // Resolve the acting CLI user (ARCHON_USER_ID, else $USER/$USERNAME) → Archon
@@ -869,7 +872,9 @@ function resolveTitleAssistantType(
  * `archon ai tier list`.
  */
 export async function maybePrintTierNotice(
-  workflow: WorkflowDefinition,
+  workflow: Pick<WorkflowDefinition, 'model'> & {
+    readonly nodes: readonly WorkflowDefinition['nodes'][number][];
+  },
   cwd: string,
   cliUserId: string | undefined,
   quiet: boolean | undefined
@@ -1070,7 +1075,9 @@ export function emitParseWarnings(
  * a user driving runs programmatically still has to learn the default they
  * picked is scheduled for removal.
  */
-export function emitDeprecationNotice(workflow: WorkflowDefinition): void {
+export function emitDeprecationNotice(
+  workflow: Pick<WorkflowDefinition, 'name' | 'deprecated'>
+): void {
   const notice = formatDeprecationNotice(workflow);
   if (notice) console.warn(notice);
 }

@@ -175,7 +175,9 @@ function nodeIdForMessages(raw: unknown, index: number): string {
  * on the final flat workflow, where every selected node is executable.
  */
 export function validateWorkflowOutcomeDeclaration(
-  workflow: Pick<WorkflowDefinition, 'returns' | 'outcome_field' | 'nodes'>
+  workflow: Pick<WorkflowDefinition, 'returns' | 'outcome_field'> & {
+    readonly nodes: readonly (DagNode | IncludeDirective)[];
+  }
 ): string | null {
   const field = workflow.outcome_field;
   if (field === undefined) return null;
@@ -781,7 +783,7 @@ const GATE_ON_A_SHELL_NODE =
  * the free-form-AI check needs that producer's type and `output_format`.
  */
 export function validateDagStructure(
-  nodes: (DagNode | IncludeDirective)[],
+  nodes: readonly (DagNode | IncludeDirective)[],
   enclosingNodes?: ReadonlyMap<string, DagNode | IncludeDirective>
 ): string | null {
   // Check ID uniqueness
