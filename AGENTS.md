@@ -31,6 +31,7 @@ This file is the canonical project guidance for coding agents. Keep it short, du
 
 - Apply KISS and YAGNI. Do not add configuration, interfaces, lifecycle states, compatibility paths, or guards without a current requirement or concrete failure mode.
 - Before adding machinery, look for dead, redundant, or superseded machinery on the same path that can disappear.
+- Fix drift on the path you touch rather than preserving it for a cleaner diff. Two sites that should agree and do not are a defect, not a diff-size decision.
 - Duplicate small local logic when it keeps ownership clear. Extract only after a pattern has repeated and stabilized.
 - Prefer explicit control flow and narrow typed interfaces over meta-programming, shared mutable state, or hidden coupling.
 - Keep policy, transport, persistence, and execution concerns separate.
