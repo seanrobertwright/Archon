@@ -45,7 +45,7 @@ mock.module('@archon/paths', () => ({
 }));
 
 // --- Imports (after all mock.module calls) ---
-import { executeDagWorkflow } from './dag-executor';
+import { executeDagWorkflow, type ExecuteDagWorkflowOptions } from './dag-executor';
 import type { ExecNode, WorkflowRun } from './schemas';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
@@ -219,6 +219,36 @@ const minimalConfig: WorkflowConfig = {
   commands: {},
   defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
 };
+
+/**
+ * `deps`, `cwd`, `workflow`, and `workflowRun` carry each test's own fixtures, so every call
+ * supplies them; the run directories derive from `cwd` the way every call site built them.
+ */
+type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
+  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflow' | 'workflowRun'>;
+
+/**
+ * Options for a direct `executeDagWorkflow` call, built from only what a test varies. The
+ * defaults are the exact values these tests used to spell out at every call site. They are
+ * this file's own fixtures — `dag-executor.test.ts` has a builder of the same shape over its
+ * own mocks, and the two do not have to agree.
+ */
+function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
+  const { cwd } = overrides;
+  return {
+    platform: createMockPlatform(),
+    conversationId: 'conv-deps',
+    workflowProvider: 'claude',
+    workflowModel: undefined,
+    artifactsDir: join(cwd, 'artifacts'),
+    stateDir: join(cwd, 'state'),
+    logDir: join(cwd, 'logs'),
+    baseBranch: 'main',
+    docsDir: 'docs/',
+    config: minimalConfig,
+    ...overrides,
+  };
+}
 
 describe('script node deps field — command construction', () => {
   let testDir: string;

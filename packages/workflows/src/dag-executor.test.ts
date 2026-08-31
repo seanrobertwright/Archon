@@ -378,6 +378,39 @@ const minimalConfig: WorkflowConfig = {
   defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
 };
 
+/**
+ * `deps`, `cwd`, `workflow`, and `workflowRun` carry each test's own fixtures, so every call
+ * supplies them; the run directories derive from `cwd` the way every call site built them.
+ */
+type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
+  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflow' | 'workflowRun'>;
+
+/**
+ * Options for a direct `executeDagWorkflow` call, built from only what a test varies. The
+ * defaults are the exact values these tests used to spell out at every call site, so a test
+ * reads as the run it configures rather than as the fields it does not care about.
+ *
+ * Supplying `workflowModel` here is a convenience for tests only. It stays a required
+ * `string | undefined` on `ExecuteDagWorkflowOptions` so a production caller cannot omit a
+ * resolved model decision (#2302); this builder is not that guard's audience.
+ */
+function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
+  const { cwd } = overrides;
+  return {
+    platform: createMockPlatform(),
+    conversationId: 'conv-dag',
+    workflowProvider: 'claude',
+    workflowModel: undefined,
+    artifactsDir: join(cwd, 'artifacts'),
+    stateDir: join(cwd, 'state'),
+    logDir: join(cwd, 'logs'),
+    baseBranch: 'main',
+    docsDir: 'docs/',
+    config: minimalConfig,
+    ...overrides,
+  };
+}
+
 describe('executeDagWorkflow options type contract', () => {
   it('requires one named object including workflowModel', () => {
     const validOptions: ExecuteDagWorkflowOptions = {
