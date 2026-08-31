@@ -7,6 +7,7 @@ import {
   makeDiscoverWorkflowsMock,
   makeLoaderMock,
   makeCommandValidationMock,
+  makeListDashboardRunsMock,
 } from '../test/workflow-mock-factories';
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,7 @@ mock.module('@archon/core/db/isolation-environments', () => ({
 }));
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
-  listDashboardRuns: mock(async () => ({ runs: [], total: 0, counts: {} })),
+  listDashboardRuns: makeListDashboardRunsMock(),
   getWorkflowRun: mock(async () => null),
   cancelWorkflowRun: mock(async () => {}),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),

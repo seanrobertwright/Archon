@@ -4,10 +4,15 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
+import type { DashboardWorkflowRun } from '@archon/core/db/workflows';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
-import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
+import {
+  makeDashboardRunsResult,
+  makeListDashboardRunsMock,
+  mockAllWorkflowModules,
+} from '../test/workflow-mock-factories';
 
 beforeAll(async (): Promise<void> => {
   const { registerBuiltinProviders, registerCommunityProviders } =
@@ -25,24 +30,11 @@ const mockCancelWorkflowRun = mock(async (_id: string) => ({ cancelled: true }))
 type ListWorkflowRunsOptions = Parameters<
   (typeof import('@archon/core/db/workflows'))['listWorkflowRuns']
 >[0];
-type ListDashboardRunsOptions = Parameters<
-  (typeof import('@archon/core/db/workflows'))['listDashboardRuns']
->[0];
 
 const mockListWorkflowRuns = mock<
   (_options?: ListWorkflowRunsOptions) => Promise<MockWorkflowRun[]>
 >(async () => []);
-const mockListDashboardRuns = mock<
-  (_options?: ListDashboardRunsOptions) => Promise<{
-    runs: MockWorkflowRun[];
-    total: number;
-    counts: Record<string, number>;
-  }>
->(async () => ({
-  runs: [],
-  total: 0,
-  counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-}));
+const mockListDashboardRuns = makeListDashboardRunsMock();
 const mockGetWorkflowRunByWorkerPlatformId = mock(
   async (_id: string) => null as null | MockWorkflowRun
 );
@@ -383,7 +375,7 @@ import { registerApiRoutes } from './api';
 const NOW = new Date().toISOString();
 const NOW_DATE = new Date(NOW);
 
-const MOCK_RUNNING_RUN: MockWorkflowRun = {
+const MOCK_RUNNING_RUN = {
   id: 'run-uuid-1',
   workflow_name: 'deploy',
   conversation_id: 'conv-uuid-1',
@@ -401,15 +393,15 @@ const MOCK_RUNNING_RUN: MockWorkflowRun = {
   parent_run_id: null,
   adopted_from_run_id: null,
   output_root: null,
-};
+} satisfies MockWorkflowRun;
 
-const MOCK_COMPLETED_RUN: MockWorkflowRun = {
+const MOCK_COMPLETED_RUN = {
   ...MOCK_RUNNING_RUN,
   id: 'run-uuid-2',
   status: 'completed',
   outcome: 'failed',
   completed_at: NOW_DATE,
-};
+} satisfies MockWorkflowRun;
 
 const MOCK_FAILED_RUN: MockWorkflowRun = {
   ...MOCK_RUNNING_RUN,
@@ -424,6 +416,22 @@ const MOCK_PENDING_RUN: MockWorkflowRun = {
   id: 'run-uuid-3',
   status: 'pending',
 };
+
+function makeDashboardWorkflowRun(run: WorkflowRun): DashboardWorkflowRun {
+  return {
+    ...run,
+    codebase_name: null,
+    platform_type: null,
+    worker_platform_id: null,
+    parent_platform_id: null,
+    current_step_name: null,
+    total_steps: null,
+    current_step_status: null,
+    agents_completed: null,
+    agents_failed: null,
+    agents_total: null,
+  };
+}
 
 const MOCK_EVENTS: MockWorkflowEvent[] = [
   {
@@ -1467,11 +1475,16 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('returns paginated runs with total and counts', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [MOCK_RUNNING_RUN, MOCK_COMPLETED_RUN],
-      total: 2,
-      counts: { all: 5, running: 1, completed: 2, failed: 1, cancelled: 1, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () =>
+      makeDashboardRunsResult({
+        runs: [
+          makeDashboardWorkflowRun(MOCK_RUNNING_RUN),
+          makeDashboardWorkflowRun(MOCK_COMPLETED_RUN),
+        ],
+        total: 2,
+        counts: { all: 5, running: 1, completed: 2, failed: 1, cancelled: 1 },
+      })
+    );
 
     const { app } = makeApp();
     const response = await app.request('/api/dashboard/runs');
@@ -1490,11 +1503,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('filters by status query param', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?status=running');
@@ -1504,11 +1513,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('accepts paused as valid status', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?status=paused');
@@ -1518,11 +1523,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('ignores invalid status values in dashboard runs', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?status=bogus');
@@ -1532,11 +1533,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('filters by codebaseId query param', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?codebaseId=cb-1');
@@ -1546,11 +1543,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('filters by search query param', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?search=deploy');
@@ -1560,11 +1553,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('supports after and before date filters', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?after=2024-01-01T00:00:00Z&before=2024-12-31T23:59:59Z');
@@ -1575,11 +1564,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('caps limit at 200', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?limit=9999');
@@ -1589,11 +1574,7 @@ describe('GET /api/dashboard/runs', () => {
   });
 
   test('supports offset for pagination', async () => {
-    mockListDashboardRuns.mockImplementationOnce(async () => ({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
-    }));
+    mockListDashboardRuns.mockImplementationOnce(async () => makeDashboardRunsResult());
 
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?offset=50');

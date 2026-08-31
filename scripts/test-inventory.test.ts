@@ -226,4 +226,12 @@ describe('compiler test inventory', () => {
       join(REPO_ROOT, 'packages', 'core', 'src', 'utils', 'conversation-lock.test.ts'),
     ]);
   }, 15_000);
+
+  test("server's normal TypeScript project includes its own, core, and adapter test files", () => {
+    return expectProgramToInclude('server', [
+      join(REPO_ROOT, 'packages', 'server', 'src', 'routes', 'api.health.test.ts'),
+      join(REPO_ROOT, 'packages', 'core', 'src', 'utils', 'conversation-lock.test.ts'),
+      join(REPO_ROOT, 'packages', 'adapters', 'src', 'forge', 'github', 'adapter.test.ts'),
+    ]);
+  }, 15_000);
 });
