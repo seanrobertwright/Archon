@@ -70,6 +70,7 @@ import { declaredFieldsFromSchema, OUTPUT_REF_SOURCE, parseWholeOutputRef } from
 import { isBindingDirective } from './schemas/dag-node';
 import { readComposedBindings } from './compiled-command';
 import { visitNodeTemplateSlots } from './template-walker';
+import { validateInlineExecInputs } from './exec-input-validation';
 import { z } from '@hono/zod-openapi';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -1978,6 +1979,18 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       ...(outcomeField !== undefined ? { outcome_field: outcomeField } : {}),
       ...(deprecated !== undefined ? { deprecated } : {}),
     };
+    const execInputValidation = validateInlineExecInputs(workflow);
+    parseWarnings.push(...execInputValidation.warnings);
+    if (execInputValidation.errors.length > 0) {
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error: execInputValidation.errors.join(' '),
+          errorType: 'validation_error',
+        },
+      };
+    }
     const outcomeDeclarationError = validateWorkflowOutcomeDeclaration(workflow);
     if (outcomeDeclarationError !== null) {
       return {

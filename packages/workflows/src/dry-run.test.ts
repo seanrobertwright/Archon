@@ -1038,6 +1038,31 @@ describe('dryRunWorkflow', () => {
     }
   });
 
+  test('exec-code receives the fixed engine-owned environment', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'engine-env',
+      nodes: [
+        {
+          id: 'code',
+          bash: `printf '%s|%s|%s|%s|%s|%s' "$WORKFLOW_ID" "$BASE_BRANCH" "$ARGUMENTS" "$LOG_DIR" "$LOOP_PREV_OUTPUT" "$REJECTION_REASON"`,
+        },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: 'hello',
+      cwd: process.cwd(),
+      execCode: true,
+    });
+
+    expect(result.outcome).toBe('completed');
+    const fields = result.trace[0]?.output?.split('|') ?? [];
+    expect(fields.slice(0, 3)).toEqual(['dry-run', 'dry-run-base', 'hello']);
+    expect(fields[3]).toContain('/dry-run-');
+    expect(fields[3]).toEndWith('/logs');
+    expect(fields.slice(4)).toEqual(['', '']);
+  });
+
   test('a dry run that executes nothing creates no temp directory', async () => {
     const home = mkdtempSync(join(tmpdir(), 'archon-dry-run-home-'));
     temporaryDirectories.push(home);
