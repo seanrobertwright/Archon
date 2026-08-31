@@ -251,22 +251,22 @@ describe('script node deps field — command construction', () => {
       deps: ['httpx', 'beautifulsoup4'],
     };
 
-    await executeDagWorkflow(
-      createMockDeps(),
-      createMockPlatform(),
-      'conv-deps',
-      testDir,
-      { name: 'deps-test', nodes: [node] },
-      makeWorkflowRun('deps-run-1'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    await executeDagWorkflow({
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'conv-deps',
+      cwd: testDir,
+      workflow: { name: 'deps-test', nodes: [node] },
+      workflowRun: makeWorkflowRun('deps-run-1'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: join(testDir, 'artifacts'),
+      stateDir: join(testDir, 'state'),
+      logDir: join(testDir, 'logs'),
+      baseBranch: 'main',
+      docsDir: 'docs/',
+      config: minimalConfig,
+    });
 
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
@@ -292,22 +292,22 @@ describe('script node deps field — command construction', () => {
       runtime: 'uv',
     };
 
-    await executeDagWorkflow(
-      createMockDeps(),
-      createMockPlatform(),
-      'conv-deps',
-      testDir,
-      { name: 'deps-test', nodes: [node] },
-      makeWorkflowRun('deps-run-2'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    await executeDagWorkflow({
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'conv-deps',
+      cwd: testDir,
+      workflow: { name: 'deps-test', nodes: [node] },
+      workflowRun: makeWorkflowRun('deps-run-2'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: join(testDir, 'artifacts'),
+      stateDir: join(testDir, 'state'),
+      logDir: join(testDir, 'logs'),
+      baseBranch: 'main',
+      docsDir: 'docs/',
+      config: minimalConfig,
+    });
 
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
@@ -326,22 +326,22 @@ describe('script node deps field — command construction', () => {
       deps: [],
     };
 
-    await executeDagWorkflow(
-      createMockDeps(),
-      createMockPlatform(),
-      'conv-deps',
-      testDir,
-      { name: 'deps-test', nodes: [node] },
-      makeWorkflowRun('deps-run-3'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    await executeDagWorkflow({
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'conv-deps',
+      cwd: testDir,
+      workflow: { name: 'deps-test', nodes: [node] },
+      workflowRun: makeWorkflowRun('deps-run-3'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: join(testDir, 'artifacts'),
+      stateDir: join(testDir, 'state'),
+      logDir: join(testDir, 'logs'),
+      baseBranch: 'main',
+      docsDir: 'docs/',
+      config: minimalConfig,
+    });
 
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
@@ -360,22 +360,22 @@ describe('script node deps field — command construction', () => {
       deps: ['zod', 'node-fetch'],
     };
 
-    await executeDagWorkflow(
-      createMockDeps(),
-      createMockPlatform(),
-      'conv-deps',
-      testDir,
-      { name: 'deps-test', nodes: [node] },
-      makeWorkflowRun('deps-run-4'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    await executeDagWorkflow({
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'conv-deps',
+      cwd: testDir,
+      workflow: { name: 'deps-test', nodes: [node] },
+      workflowRun: makeWorkflowRun('deps-run-4'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: join(testDir, 'artifacts'),
+      stateDir: join(testDir, 'state'),
+      logDir: join(testDir, 'logs'),
+      baseBranch: 'main',
+      docsDir: 'docs/',
+      config: minimalConfig,
+    });
 
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'bun');
@@ -396,22 +396,22 @@ describe('script node deps field — command construction', () => {
       runtime: 'bun',
     };
 
-    await executeDagWorkflow(
-      createMockDeps(),
-      createMockPlatform(),
-      'conv-deps',
-      testDir,
-      { name: 'deps-test', nodes: [node] },
-      makeWorkflowRun('deps-run-5'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    await executeDagWorkflow({
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'conv-deps',
+      cwd: testDir,
+      workflow: { name: 'deps-test', nodes: [node] },
+      workflowRun: makeWorkflowRun('deps-run-5'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: join(testDir, 'artifacts'),
+      stateDir: join(testDir, 'state'),
+      logDir: join(testDir, 'logs'),
+      baseBranch: 'main',
+      docsDir: 'docs/',
+      config: minimalConfig,
+    });
 
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'bun');
@@ -436,22 +436,22 @@ describe('script node deps field — command construction', () => {
       deps: ['httpx'],
     };
 
-    await executeDagWorkflow(
-      createMockDeps(),
-      createMockPlatform(),
-      'conv-deps',
-      testDir,
-      { name: 'deps-test', nodes: [node] },
-      makeWorkflowRun('deps-run-6'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    await executeDagWorkflow({
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'conv-deps',
+      cwd: testDir,
+      workflow: { name: 'deps-test', nodes: [node] },
+      workflowRun: makeWorkflowRun('deps-run-6'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: join(testDir, 'artifacts'),
+      stateDir: join(testDir, 'state'),
+      logDir: join(testDir, 'logs'),
+      baseBranch: 'main',
+      docsDir: 'docs/',
+      config: minimalConfig,
+    });
 
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
@@ -483,22 +483,22 @@ describe('script node deps field — command construction', () => {
       runtime: 'uv',
     };
 
-    await executeDagWorkflow(
-      createMockDeps(),
-      createMockPlatform(),
-      'conv-deps',
-      testDir,
-      { name: 'deps-test', nodes: [node] },
-      makeWorkflowRun('deps-run-7'),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+    await executeDagWorkflow({
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'conv-deps',
+      cwd: testDir,
+      workflow: { name: 'deps-test', nodes: [node] },
+      workflowRun: makeWorkflowRun('deps-run-7'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: join(testDir, 'artifacts'),
+      stateDir: join(testDir, 'state'),
+      logDir: join(testDir, 'logs'),
+      baseBranch: 'main',
+      docsDir: 'docs/',
+      config: minimalConfig,
+    });
 
     const calls = mockExecFileAsync.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
