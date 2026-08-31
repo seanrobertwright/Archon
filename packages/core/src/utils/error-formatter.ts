@@ -5,6 +5,7 @@
  * without leaking sensitive information
  */
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
+import { TierResolutionError } from '@archon/workflows/model-validation';
 import { WorkflowAdoptionError } from '../operations/workflow-adoption';
 
 /**
@@ -32,6 +33,14 @@ export function classifyAndFormatError(error: Error): string {
       '⚠️ The workflow ran, but its final status could not be saved, so it may still show ' +
       'as running. Check `/workflow status` before starting another run on this project.'
     );
+  }
+
+  // Tier-resolution failures are authored configuration guidance (the message
+  // names the CLI command, the console panel, and the docs URL): deliver it
+  // verbatim — the generic fallbacks below would erase it into `/reset`
+  // advice that cannot fix a missing tier config.
+  if (error instanceof TierResolutionError) {
+    return `⚠️ ${message}`;
   }
 
   // AI-provider rate-limit / usage-cap classification

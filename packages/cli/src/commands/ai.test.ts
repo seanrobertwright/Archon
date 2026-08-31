@@ -361,6 +361,17 @@ describe('aiTierUnsetCommand', () => {
     expect(await aiTierUnsetCommand('medium')).toBe(0);
     const arg = mockUpdateGlobalConfig.mock.calls[0]?.[0] as { tiers: Record<string, unknown> };
     expect(arg.tiers.medium).toBeNull();
+    // claude ships a built-in for every tier — the message may name the fallback.
+    expect(out()).toContain('built-in default');
+  });
+
+  it('no built-in for the default provider → success without claiming a fallback', async () => {
+    loadConfigResult = { assistant: 'pi', tiers: {} };
+    expect(await aiTierUnsetCommand('medium')).toBe(0);
+    const text = out();
+    expect(text).toContain("Unset tier 'medium'");
+    expect(text).not.toContain('falls back to the built-in default');
+    expect(text).toContain('archon ai tier set medium');
   });
 
   it('invalid tier → 1, no write', async () => {

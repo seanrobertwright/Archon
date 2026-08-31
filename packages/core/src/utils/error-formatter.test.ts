@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { classifyAndFormatError } from './error-formatter';
 import { WorkflowAdoptionError } from '../operations/workflow-adoption';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
+import { buildAiProfile, resolveTierWithFallback } from '@archon/workflows/model-validation';
 
 describe('classifyAndFormatError', () => {
   describe('rate limit errors', () => {
@@ -735,5 +736,25 @@ describe('classifyAndFormatError', () => {
       const result = classifyAndFormatError(new Error('database is locked'));
       expect(result).not.toContain('final status could not be saved');
     });
+  });
+});
+
+describe('TierResolutionError', () => {
+  test('delivers the real tier-resolution guidance verbatim (never the generic fallback)', () => {
+    // The actual error the chat path hits when the default provider ships no
+    // built-in tiers and none are configured — derived, not restated.
+    let thrown: Error | undefined;
+    try {
+      resolveTierWithFallback(buildAiProfile('pi'), 'large');
+    } catch (err) {
+      thrown = err as Error;
+    }
+    if (!thrown) throw new Error('expected resolveTierWithFallback to throw');
+
+    const formatted = classifyAndFormatError(thrown);
+    expect(formatted).toBe(`⚠️ ${thrown.message}`);
+    expect(formatted).toContain('archon ai tier set');
+    expect(formatted).toContain('https://archon.diy/');
+    expect(formatted).not.toContain('/reset');
   });
 });

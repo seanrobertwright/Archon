@@ -78,7 +78,7 @@ assistants:
     # Source/dev mode auto-resolves.
     # claudeBinaryPath: /absolute/path/to/claude
   codex:
-    model: gpt-5.5
+    model: gpt-5.6-terra
     modelReasoningEffort: medium
     webSearchMode: disabled
     additionalDirectories:
@@ -112,7 +112,7 @@ workflows:
 # custom workflows, direct chat (`large`), and title generation (`small`).
 tiers:
   large: { provider: claude, model: opus }
-  medium: { provider: codex, model: gpt-5.5, effort: high }
+  medium: { provider: codex, model: gpt-5.6-terra, effort: high }
   small: { provider: pi, model: minimax-m3 }
 
 # Model aliases — optional custom refs for project workflows.
@@ -174,7 +174,7 @@ assistants:
     settingSources:  # Override global settingSources for this repo
       - project
   codex:
-    model: gpt-5.5
+    model: gpt-5.6-terra
     webSearchMode: live
 
 # Commands configuration
@@ -222,15 +222,18 @@ defaults:
 
 # Model tiers and aliases override global entries with the same name (repo > global).
 # tiers:
-#   small: { provider: codex, model: gpt-5.5, effort: minimal }
+#   small: { provider: codex, model: gpt-5.6-luna }
 # aliases:
 #   '@fast': { provider: claude, model: haiku }
 
 ```
 
-Providers with built-in tier defaults (`claude`, `codex`, `pi`, `copilot`, `opencode`) work
-without a `tiers:` block. Other providers must configure any tier they use, or resolving
-`small`, `medium`, or `large` will fail with a clear configuration error.
+Only `claude` and `codex` ship built-in tier defaults (claude: `haiku`/`sonnet`/`opus`;
+codex: the current small/medium/large models) and work without a `tiers:` block, at the
+provider's default reasoning effort. Every other provider must configure each tier it
+uses — with `archon ai tier set`, the console AI Settings -> Model Tiers panel, or the
+`tiers:` block — or resolving `small`, `medium`, or `large` fails with a configuration
+error that names those surfaces.
 
 ### Claude settingSources
 

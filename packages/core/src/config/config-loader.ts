@@ -211,7 +211,7 @@ const DEFAULT_CONFIG_CONTENT = `# Archon Global Configuration
 # Model tier presets (usable as model: small / medium / large)
 # tiers:
 #   large: { provider: claude, model: opus }
-#   medium: { provider: codex, model: gpt-5.5, effort: high }
+#   medium: { provider: codex, model: gpt-5.6-terra, effort: high }
 #   small: { provider: pi, model: minimax-m3 }
 
 # Streaming mode per platform (stream or batch)
