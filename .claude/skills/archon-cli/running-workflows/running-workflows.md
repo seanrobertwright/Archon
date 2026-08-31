@@ -19,6 +19,49 @@ Map intent to workflow by reading the listed descriptions — never from memory 
 names you have seen elsewhere. If two names plausibly match, say which you picked
 and why in one line.
 
+## The input is the contract
+
+Everything the run does is measured against its input — the message, the issue body, or the
+document it reads. Archon governs how the work happens; it cannot supply what the user
+actually wanted. This is the highest-leverage moment in the whole flow, and it is before any
+money is spent.
+
+Check the input names all six. Solution steering is a seventh, optional, and last:
+
+1. **Problem to solve** — what is wrong today, concretely.
+2. **Why it is worth solving** — the cost of leaving it.
+3. **Why now** — what makes this the moment.
+4. **Desired outcome** — what is observably different afterwards.
+5. **Invariants** — what must stay true across any acceptable implementation.
+6. **Acceptance** — how completion is checked.
+
+**When something is missing, do not fix it silently and do not launch anyway.** Tell the user
+which of the six is absent, propose concrete wording, and let them decide. They own the
+contract; your job is to notice it is thin before it costs them a run.
+
+A useful shape:
+
+> Before I launch: this brief states the problem and the outcome, but not the invariants or
+> acceptance. Without acceptance the run decides for itself when it is done. Suggest adding:
+> "Acceptance: X passes, Y is covered by a test, Z is unchanged." Want me to run it with that,
+> or would you rather word it yourself?
+
+Two failure modes worth naming, because they look like diligence:
+
+- **Naming a solution before the problem is settled.** It narrows the run to the first guess
+  and hides better answers. If the user supplied one, keep it, but make sure the problem is
+  stated too — a run that only knows the proposed fix cannot tell you it was the wrong fix.
+- **Dropping steering the user actually holds.** Optional does not mean unwanted. If they have
+  said anywhere in the conversation how they want this done — reuse a primitive, avoid a
+  dependency, migrate rather than rewrite — carry it into the input as explicit steering. An
+  unstated preference cannot be honoured, and the user discovers it only in the diff.
+- **Silence about uncertainty.** An assumption stated in the brief is something the run can
+  contradict. An assumption left out is one it will quietly inherit.
+
+If the input is a GitHub issue, read the actual body before launching rather than trusting the
+title. Recommend edits to the issue itself when it is thin — the issue is the durable contract,
+and the next run against it inherits whatever you leave there.
+
 ## Invocation
 
 ```bash

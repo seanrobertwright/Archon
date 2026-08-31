@@ -133,6 +133,31 @@ The governing rule is: **YAML coordinates. Code computes. Agents judge.** Read [
 - When stopping a process, target the recorded PID or exact bound port. Never kill by a broad process-name match.
 - Keep commits and pull requests focused. Do not mix unrelated cleanup into the requested outcome.
 
+## Running Archon workflows
+
+The input is the contract. A run is only as accurate as the brief it starts from, and a
+workflow cannot recover from a premise that was never stated — it will produce a confident,
+well-formed answer to the wrong question. Treat writing the input as the work, not the
+preamble to it.
+
+Before launching a run, the input — an issue body, a message, a document, whatever the run
+reads — must state:
+
+- the problem to solve;
+- why it is worth solving;
+- why now;
+- the desired outcome;
+- the invariants that must hold;
+- what acceptance looks like.
+
+Solution steering is optional and belongs last, but omitting it is a decision: the run then
+chooses its own approach. State a constraint you actually hold — reuse this primitive, no new
+dependency, migrate rather than rewrite — because an unstated preference cannot be honoured.
+Naming an implementation *before* the problem is settled narrows the run to your first guess.
+
+Do not launch a run against an input missing any of the six. Fix the input first, and say
+what you changed — a thin brief is cheaper to correct before a run than after one.
+
 ## Tests and validation
 
 - Add tests for meaningful behavior and failure modes. Do not preserve deleted features through regression-test clutter.
