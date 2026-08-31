@@ -536,8 +536,10 @@ describe('bundled-defaults', () => {
       if (parsed.workflow === null) throw new Error(parsed.error.error);
 
       const validateNode = parsed.workflow.nodes.find(node => node.id === 'validate');
-      expect(validateNode).toBeDefined();
-      expect(validateNode!.always_run).toBe(true);
+      if (validateNode === undefined || !('always_run' in validateNode)) {
+        throw new Error('archon-validate has no executable validate node carrying always_run');
+      }
+      expect(validateNode.always_run).toBe(true);
     });
   });
 
