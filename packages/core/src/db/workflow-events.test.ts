@@ -1,6 +1,6 @@
 import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
-import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
 import { AXIS_SPECIMEN } from '../test/token-usage-axes';
 import { mergeTokenUsage } from '@archon/providers/types';
@@ -20,7 +20,7 @@ mock.module('@archon/paths', () => ({
   getDefaultWorkflowsPath: mock(() => '/app/.archon/workflows/defaults'),
 }));
 
-const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockQuery = createMockQuery();
 
 // Mock the connection module before importing the module under test
 mock.module('./connection', () => ({
@@ -53,7 +53,7 @@ describe('workflow-events', () => {
   const mockEvent: WorkflowEventRow = {
     id: 'evt-123',
     workflow_run_id: 'run-456',
-    event_type: 'step_started',
+    event_type: 'node_started',
     step_index: 0,
     step_name: 'plan',
     data: {},
@@ -66,7 +66,7 @@ describe('workflow-events', () => {
 
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
-        event_type: 'step_started',
+        event_type: 'node_started',
         step_index: 0,
         step_name: 'plan',
         data: { duration: 100 },
@@ -78,7 +78,7 @@ describe('workflow-events', () => {
         [
           expect.any(String), // generated UUID
           'run-456',
-          'step_started',
+          'node_started',
           0,
           'plan',
           JSON.stringify({ duration: 100 }),
@@ -110,7 +110,7 @@ describe('workflow-events', () => {
       // Should NOT throw — fire-and-forget logs error internally
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
-        event_type: 'step_started',
+        event_type: 'node_started',
       });
     });
   });
