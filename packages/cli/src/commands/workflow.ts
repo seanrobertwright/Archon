@@ -1003,14 +1003,23 @@ export async function maybePrintTierNotice(
     return;
   }
 
+  const tierLines: string[] = [];
+  for (const t of TIER_NAMES) {
+    const preset = aliases[t];
+    if (preset) tierLines.push(`     ${t.padEnd(7)} → ${preset.provider}/${preset.model}`);
+  }
+  // Only claude and codex ship built-in tier defaults. With none for this
+  // provider there is nothing truthful to announce — the run's tier
+  // resolution fails loudly with the full configuration guidance, and this
+  // notice must not claim defaults are in play. Not marked shown: once the
+  // operator configures tiers for a provider WITH built-ins, the one-time
+  // notice should still fire.
+  if (tierLines.length === 0) return;
   const lines: string[] = [
     "ℹ️  This workflow uses model tiers (small/medium/large). You haven't configured them —",
     `   using built-in defaults for '${effectiveAssistant}':`,
+    ...tierLines,
   ];
-  for (const t of TIER_NAMES) {
-    const preset = aliases[t];
-    if (preset) lines.push(`     ${t.padEnd(7)} → ${preset.provider}/${preset.model}`);
-  }
   // Plan-dependent 1M note for the large→opus row (the CLI can't detect the plan).
   const largePreset = aliases.large;
   if (largePreset?.provider === 'claude' && largePreset.model === 'opus') {

@@ -554,6 +554,35 @@ describe('dryRunWorkflow', () => {
     expect(result.missingStubs).toEqual([]);
   });
 
+  test('fails an object-valued condition field instead of recording a false skip', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'structured-condition',
+      nodes: [
+        { id: 'source', prompt: 'source' },
+        {
+          id: 'gated',
+          prompt: 'gated',
+          depends_on: ['source'],
+          when: "$source.output.route == 'true'",
+        },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { source: { route: { ready: true } }, gated: 'unused' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.trace.find(entry => entry.nodeId === 'gated')).toMatchObject({
+      state: 'failed',
+      reason: expect.stringContaining(
+        "Condition reference '$source.output.route' resolved to an object"
+      ),
+    });
+  });
+
   test('applies all trigger rules after failed and skipped upstream nodes', async () => {
     const workflow = makeTestWorkflow({
       name: 'triggers',
