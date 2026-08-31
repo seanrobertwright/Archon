@@ -8968,6 +8968,25 @@ describe('workflowRunCommand — progress rendering', () => {
     expect(consoleSpy).toHaveBeenCalledWith('\nWorkflow completed successfully.');
   });
 
+  it('distinguishes an unavailable outcome read from an undeclared outcome', async () => {
+    setupWorkflowMocks(true);
+    const { executeWorkflow } = require('@archon/workflows/executor');
+    const workflowDb = require('@archon/core/db/workflows');
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-1',
+    });
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('database unavailable')
+    );
+
+    await workflowRunCommand('/test/path', 'plan', 'hello', {});
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      '\nWorkflow finished.\n  Status: completed\n  Authored outcome: unavailable — failed to read persisted run'
+    );
+  });
+
   it('should subscribe to emitter when not quiet', async () => {
     setupWorkflowMocks();
 

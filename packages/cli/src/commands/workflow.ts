@@ -3189,28 +3189,36 @@ async function runWorkflowWithOwnedSource(
   }
 
   let presentedRun: WorkflowRun | null = null;
+  let outcomeReadUnavailable = false;
   if (workflow.outcome_field !== undefined && result.workflowRunId !== undefined) {
     try {
       presentedRun = await workflowDb.getWorkflowRun(result.workflowRunId);
+      outcomeReadUnavailable = presentedRun === null;
     } catch (error) {
+      outcomeReadUnavailable = true;
       getLog().warn(
         { err: error as Error, workflowRunId: result.workflowRunId },
         'cli.workflow_outcome_lookup_failed'
       );
     }
   }
-  const presentedOutcome = presentedRun?.outcome ?? null;
-  const presentBothRunFacts = (lead: string): boolean => {
-    if (presentedOutcome === null || presentedRun === null) return false;
+  const presentRunFacts = (lead: string, executionStatus: WorkflowRunStatus): boolean => {
+    if (outcomeReadUnavailable) {
+      console.log(
+        `${lead}\n  Status: ${executionStatus}\n  Authored outcome: unavailable — failed to read persisted run`
+      );
+      return true;
+    }
+    if (presentedRun?.outcome == null) return false;
     console.log(
-      `${lead}\n  Status: ${presentedRun.status}\n  Authored outcome: ${presentedOutcome}`
+      `${lead}\n  Status: ${presentedRun.status}\n  Authored outcome: ${presentedRun.outcome}`
     );
     return true;
   };
 
   // Check result and exit appropriately
   if (result.success && 'paused' in result && result.paused) {
-    if (!presentBothRunFacts('\nWorkflow paused — waiting for approval.')) {
+    if (!presentRunFacts('\nWorkflow paused — waiting for approval.', 'paused')) {
       console.log('\nWorkflow paused — waiting for approval.');
     }
   } else if (result.success) {
@@ -3230,11 +3238,11 @@ async function runWorkflowWithOwnedSource(
         );
       }
     }
-    if (!presentBothRunFacts('\nWorkflow finished.')) {
+    if (!presentRunFacts('\nWorkflow finished.', 'completed')) {
       console.log('\nWorkflow completed successfully.');
     }
   } else {
-    presentBothRunFacts('\nWorkflow finished.');
+    presentRunFacts('\nWorkflow finished.', 'failed');
     throw new WorkflowRunFailedError(result.error, detachedProcessOwner);
   }
 }

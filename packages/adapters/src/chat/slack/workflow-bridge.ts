@@ -16,6 +16,7 @@ import {
   getWorkflowEventEmitter,
   type WorkflowEmitterEvent,
 } from '@archon/workflows/event-emitter';
+import type { RunTerminalStatus } from '@archon/workflows/schemas/workflow-run';
 import { workflowOperations, workflowDb } from '@archon/core';
 import {
   REACTION_FAILURE,
@@ -27,7 +28,6 @@ import {
   type NodeSnapshot,
   type NodeState,
   type RunSnapshot,
-  type RunTerminalState,
 } from './blocks';
 import { isSlackUserAuthorized } from './auth';
 import type { SlackAdapter, SlackMessageRef } from './adapter';
@@ -241,6 +241,9 @@ export class SlackWorkflowBridge {
       getLog().warn({ runId: event.runId }, 'slack.bridge_approval_no_run');
       return;
     }
+    const { authoredOutcome } = await this.readRunPresentation(event.runId);
+    await this.updateStatusMessage(state, { status: 'paused', authoredOutcome });
+
     const { blocks, fallbackText } = buildApprovalBlocks({
       runId: event.runId,
       nodeId: event.nodeId,
@@ -271,23 +274,13 @@ export class SlackWorkflowBridge {
 
   private async onTerminal(
     runId: string,
-    terminal: RunTerminalState,
+    terminal: RunTerminalStatus,
     conversationId: string,
     reason?: string
   ): Promise<void> {
     const state = this.runs.get(runId);
     const trigger = this.adapter.getTriggeringMessage(conversationId);
-
-    let totalCostUsd: number | undefined;
-    let authoredOutcome: RunSnapshot['authoredOutcome'];
-    try {
-      const run = await workflowDb.getWorkflowRun(runId);
-      const raw = run?.metadata?.total_cost_usd;
-      if (typeof raw === 'number' && Number.isFinite(raw)) totalCostUsd = raw;
-      authoredOutcome = run?.outcome ?? undefined;
-    } catch (error) {
-      getLog().warn({ err: error as Error, runId }, 'slack.bridge_run_lookup_failed');
-    }
+    const { authoredOutcome, totalCostUsd } = await this.readRunPresentation(runId);
 
     // Replace running reaction with the terminal one.
     if (trigger) {
@@ -313,7 +306,7 @@ export class SlackWorkflowBridge {
       }
 
       await this.updateStatusMessage(state, {
-        terminal,
+        status: terminal,
         authoredOutcome,
         totalCostUsd,
         failureReason: terminal === 'completed' ? undefined : reason,
@@ -325,6 +318,27 @@ export class SlackWorkflowBridge {
     // Triggering message is no longer needed for this conversation once the
     // run has terminated. (Reactions stay — we only clear the map entry.)
     this.adapter.clearTriggeringMessage(conversationId);
+  }
+
+  private async readRunPresentation(runId: string): Promise<{
+    authoredOutcome: RunSnapshot['authoredOutcome'];
+    totalCostUsd?: number;
+  }> {
+    try {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        getLog().warn({ runId }, 'slack.bridge_run_not_found');
+        return { authoredOutcome: 'unavailable' };
+      }
+      const raw = run.metadata?.total_cost_usd;
+      return {
+        authoredOutcome: run.outcome ?? undefined,
+        totalCostUsd: typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined,
+      };
+    } catch (error) {
+      getLog().warn({ err: error as Error, runId }, 'slack.bridge_run_lookup_failed');
+      return { authoredOutcome: 'unavailable' };
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -367,7 +381,7 @@ export class SlackWorkflowBridge {
   private async updateStatusMessage(
     state: RunState,
     overlay: Partial<
-      Pick<RunSnapshot, 'terminal' | 'authoredOutcome' | 'totalCostUsd' | 'failureReason'>
+      Pick<RunSnapshot, 'status' | 'authoredOutcome' | 'totalCostUsd' | 'failureReason'>
     > = {}
   ): Promise<void> {
     if (!state.statusMessageTs) return;
@@ -393,6 +407,7 @@ export class SlackWorkflowBridge {
       runId: state.runId,
       workflowName: state.workflowName,
       startedAt: state.startedAt,
+      status: 'running',
       nodes: state.nodeOrder.map(id => state.nodes.get(id)).filter(isDefined),
     };
   }

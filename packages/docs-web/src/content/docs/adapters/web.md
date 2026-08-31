@@ -134,7 +134,6 @@ Workflows with `interactive: true` in their YAML definition run in the foregroun
 While a workflow runs, a progress card appears in the conversation showing:
 
 - Current status (running, completed, failed, paused)
-- Authored outcome (`succeeded` or `failed`) as a separate badge when the workflow has authored one
 - Which DAG node is currently executing
 - Per-node status indicators
 - Elapsed time
@@ -147,15 +146,22 @@ When a workflow reaches a terminal state (completed, failed, or cancelled), the 
 
 - **Status icon** -- Visual indicator for completed, failed, or cancelled
 - **Header** -- "Workflow complete", "Workflow failed", or "Workflow cancelled" based on execution status
-- **Authored outcome** -- A separate succeeded/failed badge when the workflow declares and authors a verdict
 - **Node count** -- How many nodes completed out of the total nodes that reached a terminal state (e.g., `3/4 nodes`)
 - **Duration** -- Total elapsed time for the run
 - **Artifacts** -- Any files or outputs produced by the workflow, with direct links
 
+These legacy conversation cards present execution status only.
+
+### Console Run Surfaces
+
+The maintained console at `/console` shows authored outcomes on active and recent run cards,
+approval cards, result cards, and run details. When a workflow authors an outcome, the console
+labels execution status and authored outcome (`succeeded` or `failed`) separately.
+
 Execution status and authored outcome can disagree. A completed run with a failed outcome finished
 execution normally but did not meet the workflow's own success condition; a paused or failed run
 with a succeeded outcome authored success before execution stopped. If no outcome was authored,
-the console shows the existing status-only card.
+the console keeps its status-only presentation.
 
 Click the arrow button in the result card header to open the full execution detail page.
 

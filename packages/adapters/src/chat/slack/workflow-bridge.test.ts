@@ -261,6 +261,34 @@ describe('SlackWorkflowBridge', () => {
     expect(actionsBlock?.elements?.[1]?.action_id).toBe('reject:r1:review');
   });
 
+  test('approval_pending updates the run status with a persisted authored outcome', async () => {
+    const { adapter, updated, triggerMap } = makeFakeAdapter();
+    triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });
+    mockGetConversationId.mockReturnValue('C1:111.0');
+    mockGetWorkflowRun.mockResolvedValue({ metadata: {}, outcome: 'succeeded' });
+
+    new SlackWorkflowBridge(adapter as never).attach();
+    await dispatchEvent({
+      type: 'workflow_started',
+      runId: 'r1',
+      workflowName: 'assist',
+      conversationId: 'conv-db-uuid',
+    });
+    await dispatchEvent({
+      type: 'approval_pending',
+      runId: 'r1',
+      nodeId: 'review',
+      message: 'Approve the change?',
+    });
+
+    const header = updated[updated.length - 1]?.blocks?.[0] as
+      | { text?: { text?: string } }
+      | undefined;
+    expect(header?.text?.text).toContain('Workflow paused');
+    expect(header?.text?.text).toContain('*Execution status:* `paused`');
+    expect(header?.text?.text).toContain('*Authored outcome:* `succeeded`');
+  });
+
   test('approve button calls approveWorkflow and edits the message', async () => {
     const { adapter, posted, updated, triggerMap, dispatchAction } = makeFakeAdapter();
     triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });
@@ -291,10 +319,9 @@ describe('SlackWorkflowBridge', () => {
 
     expect(mockApproveWorkflow).toHaveBeenCalledTimes(1);
     expect(mockApproveWorkflow).toHaveBeenCalledWith('r1');
-    expect(updated).toHaveLength(1);
-    expect(updated[0]?.channel).toBe('C1');
-    expect(updated[0]?.ts).toBe('2.000');
-    const headerText = (updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text
+    const resolution = updated.find(message => message.ts === '2.000');
+    expect(resolution?.channel).toBe('C1');
+    const headerText = (resolution?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text
       ?.text;
     expect(headerText).toContain('Approved');
     expect(headerText).toContain('<@U123>');
@@ -327,7 +354,8 @@ describe('SlackWorkflowBridge', () => {
       message: { ts: '2.000' },
     });
 
-    const headerText = (updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text
+    const resolution = updated.find(message => message.ts === '2.000');
+    const headerText = (resolution?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text
       ?.text;
     expect(headerText).toContain('completion condition was met');
     expect(headerText).not.toContain('completion signal');
@@ -364,7 +392,8 @@ describe('SlackWorkflowBridge', () => {
     // reason — the bridge must default it to 'Rejected' itself (#2740),
     // otherwise a new-mode gate's structured output.text records ''.
     expect(mockRejectWorkflow).toHaveBeenCalledWith('r1', 'Rejected');
-    const text = (updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text?.text;
+    const resolution = updated.find(message => message.ts === '2.000');
+    const text = (resolution?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text?.text;
     expect(text).toContain('Rejected');
     expect(text).toContain('will retry');
   });
@@ -396,7 +425,8 @@ describe('SlackWorkflowBridge', () => {
     });
 
     expect(mockRejectWorkflow).toHaveBeenCalledTimes(1);
-    const text = (updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text?.text;
+    const resolution = updated.find(message => message.ts === '2.000');
+    const text = (resolution?.blocks?.[0] as { text?: { text?: string } } | undefined)?.text?.text;
     expect(text).toContain('Rejected');
     expect(text).toContain('max reject attempts reached');
   });
@@ -549,6 +579,36 @@ describe('SlackWorkflowBridge', () => {
 
     expect(reactionsAdded.map(call => call.name)).toEqual(
       expect.arrayContaining(['x', 'white_check_mark'])
+    );
+  });
+
+  test('terminal run lookup failure marks the authored outcome unavailable', async () => {
+    const { adapter, updated, triggerMap } = makeFakeAdapter();
+    triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });
+    mockGetConversationId.mockReturnValue('C1:111.0');
+    mockGetWorkflowRun.mockRejectedValue(new Error('database unavailable'));
+
+    new SlackWorkflowBridge(adapter as never).attach();
+    await dispatchEvent({
+      type: 'workflow_started',
+      runId: 'r1',
+      workflowName: 'assist',
+      conversationId: 'conv-db-uuid',
+    });
+    await dispatchEvent({
+      type: 'workflow_completed',
+      runId: 'r1',
+      workflowName: 'assist',
+      duration: 1234,
+    });
+
+    const terminal = updated[updated.length - 1];
+    const header = terminal?.blocks?.[0] as { text?: { text?: string } } | undefined;
+    expect(header?.text?.text).toContain(
+      '*Authored outcome:* unavailable — failed to read persisted run'
+    );
+    expect(terminal?.text).toContain(
+      'authored outcome: unavailable — failed to read persisted run'
     );
   });
 
