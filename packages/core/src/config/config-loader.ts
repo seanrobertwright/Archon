@@ -800,7 +800,6 @@ function tierDefaultsFor(provider: string): RawTiersConfig | undefined {
           provider: preset.provider,
           model: preset.model,
           ...(preset.effort !== undefined ? { effort: preset.effort } : {}),
-          ...(preset.thinking !== undefined ? { thinking: preset.thinking } : {}),
         };
       }
     }

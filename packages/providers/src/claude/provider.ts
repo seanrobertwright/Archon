@@ -53,7 +53,7 @@ import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
 import { withResumedOutcome, resumedOutcome } from '../shared/resumed';
-import { clampEffort, type AssertNever } from '../shared/effort';
+import { clampEffort, type AssertNever } from '@archon/paths/effort';
 import {
   claudeSkillSearchRoots,
   findInstalledSkillNames,
@@ -655,9 +655,9 @@ async function applyNodeConfig(
     getLog().info({ agentIds: Object.keys(nodeConfig.agents) }, 'claude.inline_agents_registered');
   }
 
-  // effort — clamped into the SDK's own vocabulary. Claude has no `minimal` or
-  // `ultra` rung, so they become its shallowest (`low`) and deepest (`max`)
-  // values respectively.
+  // effort — clamped into the SDK's own vocabulary. Claude has no `minimal`,
+  // `ultra`, or `persistent` rung, so they become its shallowest (`low`) and
+  // deepest (`max`) values respectively.
   if (nodeConfig.effort !== undefined) {
     const effort = clampEffort(nodeConfig.effort, CLAUDE_EFFORTS);
     if (effort === undefined) {
@@ -668,11 +668,6 @@ async function applyNodeConfig(
       }
       options.effort = effort;
     }
-  }
-
-  // thinking
-  if (nodeConfig.thinking !== undefined) {
-    options.thinking = nodeConfig.thinking as Options['thinking'];
   }
 
   // sandbox

@@ -202,9 +202,5 @@ export function isWebAdapter(adapter: IPlatformAdapter): adapter is IWebPlatform
 // Re-export workflow schema types for config-types.ts compatibility
 import type { ModelReasoningEffort, WebSearchMode } from '@archon/workflows/schemas/workflow';
 export type { ModelReasoningEffort, WebSearchMode };
-import type {
-  EffortLevel,
-  ThinkingConfig,
-  SandboxSettings,
-} from '@archon/workflows/schemas/dag-node';
-export type { EffortLevel, ThinkingConfig, SandboxSettings };
+import type { EffortLevel, SandboxSettings } from '@archon/workflows/schemas/dag-node';
+export type { EffortLevel, SandboxSettings };

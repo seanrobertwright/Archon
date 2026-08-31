@@ -61,7 +61,6 @@ export const CLAUDE_CAPABILITIES: ProviderCapabilities = {
   envInjection: true,
   costControl: true,
   effortControl: true,
-  thinkingControl: true,
   fallbackModel: true,
   sandbox: true,
   settingSources: true, // per-node override of the SDK's settingSources option

@@ -313,6 +313,19 @@ describe('PATCH /api/auth/me/ai-prefs/tiers', () => {
     expect(mockSetTiers).not.toHaveBeenCalled();
   });
 
+  test('retired thinking config → 400 naming effort', async () => {
+    const res = await makeApp().request('/api/auth/me/ai-prefs/tiers', {
+      method: 'PATCH',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        tiers: { large: { provider: 'claude', model: 'opus', thinking: 'adaptive' } },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain('effort:');
+    expect(mockSetTiers).not.toHaveBeenCalled();
+  });
+
   test('401 without identity', async () => {
     const res = await makeApp().request('/api/auth/me/ai-prefs/tiers', {
       method: 'PATCH',

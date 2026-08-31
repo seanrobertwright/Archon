@@ -126,10 +126,6 @@ function applyPresetToRequestOptions(
   preset: ModelAliasPreset,
   options: SendQueryOptions
 ): void {
-  if (preset.thinking !== undefined) {
-    options.nodeConfig = { ...(options.nodeConfig ?? {}), thinking: preset.thinking };
-  }
-
   if (preset.effort === undefined) return;
 
   // One effort channel for every provider (#2556): the preset's rung goes on

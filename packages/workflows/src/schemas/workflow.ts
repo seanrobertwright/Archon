@@ -6,13 +6,13 @@ import { z } from '@hono/zod-openapi';
 import {
   dagNodeSchema,
   effortLevelSchema,
-  thinkingConfigSchema,
   sandboxSettingsSchema,
   betasSchema,
   KNOWN_DAG_NODE_KEYS,
 } from './dag-node';
 import type { NestedKeySpec } from './dag-node';
 import { jsonValueSchema } from '../output-ref';
+import { rejectRetiredThinking, type EffortLevel } from './effort';
 
 // ---------------------------------------------------------------------------
 // Shared enum schemas
@@ -28,19 +28,9 @@ import { jsonValueSchema } from '../output-ref';
  * it would turn an author's deprecated-but-valid line into an "unknown key"
  * warning and silently discard the value instead of honouring it.
  *
- * The last provider-specific effort vocabulary left inside @archon/workflows;
- * it goes away with the field. `effortLevelSchema` in ./dag-node is the live one.
+ * It derives from the shared ladder while the deprecated field remains accepted.
  */
-export const modelReasoningEffortSchema = z.enum([
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-  'ultra',
-  'persistent',
-]);
+export const modelReasoningEffortSchema = effortLevelSchema;
 
 export type ModelReasoningEffort = z.infer<typeof modelReasoningEffortSchema>;
 
@@ -212,7 +202,6 @@ export const workflowBaseSchema = z.object({
    */
   interactive: z.boolean().optional(),
   effort: effortLevelSchema.optional(),
-  thinking: thinkingConfigSchema.optional(),
   fallbackModel: z.string().min(1).optional(),
   betas: betasSchema.optional(),
   sandbox: sandboxSettingsSchema.optional(),
@@ -284,9 +273,13 @@ export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
  * Workflow definition parsed from YAML.
  * All workflows use DAG-based execution with `nodes`.
  */
-export const workflowDefinitionSchema = workflowBaseSchema.extend({
+const workflowDefinitionObjectSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
 });
+export const workflowDefinitionSchema = z.preprocess(
+  rejectRetiredThinking,
+  workflowDefinitionObjectSchema
+);
 
 /**
  * Workflow definition with fully typed nodes derived from the schema. `nodes`'
@@ -307,7 +300,7 @@ export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { pr
  * Used by parseWorkflow to warn on unknown keys (#2213).
  */
 export const KNOWN_WORKFLOW_KEYS: ReadonlySet<string> = new Set(
-  Object.keys(workflowDefinitionSchema.shape)
+  Object.keys(workflowDefinitionObjectSchema.shape)
 );
 
 /**
@@ -325,17 +318,16 @@ export const WORKFLOW_ONLY_KEYS: ReadonlySet<string> = new Set(
  * KNOWN_NODE_NESTED_KEYS — an unknown key one level down is stripped just as
  * silently as one at the top (#2213).
  *
- * `sandbox` (`.passthrough()`) and `thinking` (`z.preprocess`) are omitted for
- * the same reasons they are omitted at node level. `nodes` is handled by the
- * per-node check, not here.
+ * `sandbox` (`.passthrough()`) is omitted because it preserves unknown fields.
+ * `nodes` is handled by the per-node check, not here.
  *
- * Constructed with `keyof typeof workflowDefinitionSchema.shape` as the key type
+ * Constructed with `keyof typeof workflowDefinitionObjectSchema.shape` as the key type
  * so a typo'd registration fails to compile rather than silently disabling the
  * check; the exported type widens back to `string` for lookup (same split as
  * KNOWN_NODE_NESTED_KEYS).
  */
 export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = new Map<
-  keyof typeof workflowDefinitionSchema.shape,
+  keyof typeof workflowDefinitionObjectSchema.shape,
   NestedKeySpec
 >([
   ['worktree', { kind: 'object', keys: new Set(Object.keys(workflowWorktreePolicySchema.shape)) }],
@@ -416,7 +408,7 @@ export type WorkflowSource = 'bundled' | 'global' | 'project';
 export interface DeclaredWorkflowConfig {
   readonly provider?: string;
   readonly model?: string;
-  readonly effort?: string;
+  readonly effort?: EffortLevel;
 }
 
 /** A workflow definition paired with its discovery source. */
