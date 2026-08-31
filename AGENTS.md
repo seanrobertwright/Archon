@@ -38,10 +38,10 @@ This file is the canonical project guidance for coding agents. Keep it short, du
 
 ### Let types carry invariants
 
-- Keep TypeScript strict. Avoid `any`, broad assertions, and parallel hand-written shapes when a sound type can express the state.
-- Derive types from the owning schema. Do not maintain a schema and a second equivalent interface by hand.
+- Keep TypeScript strict. Avoid `any` and broad assertions when a sound type can express the state.
+- Two declarations that must agree to stay correct, kept in agreement by discipline rather than by a mechanism, are a present defect and not a future risk. Treat a hand-synced pair as a bug the moment it exists, and as a live one once the sides already disagree. Derive from the owner instead: an import, a derived or mapped type, a generated artifact with an owning script, or an enforced conformance test. A "keep in sync" comment is none of those; it records the defect rather than clearing it.
+- Import external SDK types rather than restating them. Where a boundary genuinely cannot share one definition, the copy owes a conformance test.
 - Use discriminated unions and constructors to make invalid states hard to represent.
-- Import external SDK types instead of recreating them locally.
 - Keep interfaces narrow. Extend an existing interface only when the new method belongs to the same responsibility.
 
 ### Fail clearly
