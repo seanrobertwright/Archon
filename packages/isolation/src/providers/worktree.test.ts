@@ -2012,12 +2012,12 @@ describe('WorktreeProvider', () => {
     test('copies configured files after worktree creation', async () => {
       const configLoader: RepoConfigLoader = async () => ({
         baseBranch: git.toBranchName('main'),
-        copyFiles: ['.env.example -> .env', '.vscode/settings.json'],
+        copyFiles: ['.env', '.vscode/settings.json'],
       });
       provider = new WorktreeProvider(configLoader);
 
       copyWorktreeFilesSpy.mockResolvedValue([
-        { source: '.env.example', destination: '.env' },
+        { source: '.env', destination: '.env' },
         { source: '.vscode/settings.json', destination: '.vscode/settings.json' },
       ]);
 
@@ -2027,7 +2027,7 @@ describe('WorktreeProvider', () => {
       expect(copyWorktreeFilesSpy).toHaveBeenCalledWith(
         '/.archon/workspaces/owner/repo',
         expect.stringContaining('issue-42'),
-        ['.env.example -> .env', '.vscode/settings.json']
+        ['.env', '.vscode/settings.json']
       );
     });
 
@@ -2092,7 +2092,7 @@ describe('WorktreeProvider', () => {
         'gitdir: /.archon/workspaces/owner/repo/.git/worktrees/archon/issue-42\n'
       );
       const configLoader: RepoConfigLoader = async () => ({
-        copyFiles: ['.env.example -> .env'],
+        copyFiles: ['.env'],
       });
       provider = new WorktreeProvider(configLoader);
 
