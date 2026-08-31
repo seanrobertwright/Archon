@@ -289,6 +289,75 @@ describe('SlackWorkflowBridge', () => {
     expect(header?.text?.text).toContain('*Authored outcome:* `succeeded`');
   });
 
+  test.each(['completed', 'failed', 'cancelled'] as const)(
+    'does not let a delayed approval lookup overwrite a %s terminal status',
+    async terminal => {
+      const { adapter, posted, updated, triggerMap } = makeFakeAdapter();
+      triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });
+      mockGetConversationId.mockReturnValue('C1:111.0');
+
+      let resolveApprovalLookup!: (run: {
+        metadata: Record<string, unknown>;
+        outcome: 'succeeded' | 'failed' | null;
+      }) => void;
+      const approvalLookup = new Promise<{
+        metadata: Record<string, unknown>;
+        outcome: 'succeeded' | 'failed' | null;
+      }>(resolve => {
+        resolveApprovalLookup = resolve;
+      });
+      mockGetWorkflowRun
+        .mockImplementationOnce(() => approvalLookup)
+        .mockResolvedValueOnce({ metadata: {}, outcome: 'succeeded' });
+
+      new SlackWorkflowBridge(adapter as never).attach();
+      await dispatchEvent({
+        type: 'workflow_started',
+        runId: 'r1',
+        workflowName: 'assist',
+        conversationId: 'conv-db-uuid',
+      });
+      await dispatchEvent({
+        type: 'approval_pending',
+        runId: 'r1',
+        nodeId: 'review',
+        message: 'Approve the change?',
+      });
+
+      const terminalEvent: WorkflowEmitterEvent =
+        terminal === 'completed'
+          ? {
+              type: 'workflow_completed',
+              runId: 'r1',
+              workflowName: 'assist',
+              duration: 1234,
+            }
+          : terminal === 'failed'
+            ? {
+                type: 'workflow_failed',
+                runId: 'r1',
+                workflowName: 'assist',
+                error: 'later node failed',
+              }
+            : {
+                type: 'workflow_cancelled',
+                runId: 'r1',
+                nodeId: 'review',
+                reason: 'cancelled by operator',
+              };
+      await dispatchEvent(terminalEvent);
+
+      resolveApprovalLookup({ metadata: {}, outcome: 'succeeded' });
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(posted).toHaveLength(1);
+      expect(updated).toHaveLength(1);
+      const header = updated[0]?.blocks?.[0] as { text?: { text?: string } } | undefined;
+      expect(header?.text?.text).toContain(`*Execution status:* \`${terminal}\``);
+      expect(header?.text?.text).not.toContain('paused');
+    }
+  );
+
   test('approve button calls approveWorkflow and edits the message', async () => {
     const { adapter, posted, updated, triggerMap, dispatchAction } = makeFakeAdapter();
     triggerMap.set('C1:111.0', { channel: 'C1', ts: '111.0' });

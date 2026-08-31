@@ -242,7 +242,9 @@ export class SlackWorkflowBridge {
       return;
     }
     const { authoredOutcome } = await this.readRunPresentation(event.runId);
+    if (this.runs.get(event.runId) !== state) return;
     await this.updateStatusMessage(state, { status: 'paused', authoredOutcome });
+    if (this.runs.get(event.runId) !== state) return;
 
     const { blocks, fallbackText } = buildApprovalBlocks({
       runId: event.runId,
@@ -279,6 +281,13 @@ export class SlackWorkflowBridge {
     reason?: string
   ): Promise<void> {
     const state = this.runs.get(runId);
+    if (state) {
+      this.runs.delete(runId);
+      if (state.pendingEdit) {
+        clearTimeout(state.pendingEdit);
+        state.pendingEdit = undefined;
+      }
+    }
     const trigger = this.adapter.getTriggeringMessage(conversationId);
     const { authoredOutcome, totalCostUsd } = await this.readRunPresentation(runId);
 
@@ -299,20 +308,12 @@ export class SlackWorkflowBridge {
     }
 
     if (state) {
-      // Cancel any pending debounce.
-      if (state.pendingEdit) {
-        clearTimeout(state.pendingEdit);
-        state.pendingEdit = undefined;
-      }
-
       await this.updateStatusMessage(state, {
         status: terminal,
         authoredOutcome,
         totalCostUsd,
         failureReason: terminal === 'completed' ? undefined : reason,
       });
-
-      this.runs.delete(runId);
     }
 
     // Triggering message is no longer needed for this conversation once the
