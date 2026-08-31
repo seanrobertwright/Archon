@@ -2157,6 +2157,65 @@ async function executeNodeInternal(
     ...(resolvedEffort !== undefined ? { effort: resolvedEffort } : {}),
   });
 
+  let nodeTokens: TokenUsage | undefined;
+  let nodeCostUsd: number | undefined;
+
+  const nodeUsageEventData = (): WorkflowUsage => ({
+    ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+    ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
+  });
+
+  const nodeKey = `${workflowRun.id}:${node.id}`;
+
+  // Every failed result after node_started passes through this finalizer so the
+  // transcript, persisted event, emitter, and throttle cleanup cannot drift.
+  const failAgentNode = async (
+    error: string,
+    extras: { output?: string; data?: Record<string, unknown> } = {}
+  ): Promise<NodeExecutionResult> => {
+    const usage = nodeUsageEventData();
+    await logNodeError(logDir, workflowRun.id, node.id, error, usage);
+
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'node_failed',
+        step_name: stepName,
+        data: {
+          error,
+          duration_ms: Date.now() - nodeStartTime,
+          ...usage,
+          ...namedSessionAuditData,
+          ...(extras.data ?? {}),
+        },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+          'workflow_event_persist_failed'
+        );
+      });
+
+    emitter.emit({
+      type: 'node_failed',
+      runId: workflowRun.id,
+      nodeId: node.id,
+      nodeName: commandName ?? node.id,
+      error,
+    });
+
+    lastNodeCancelCheck.delete(nodeKey);
+    lastNodeActivityUpdate.delete(nodeKey);
+
+    return {
+      state: 'failed',
+      output: extras.output ?? '',
+      error,
+      costUsd: nodeCostUsd,
+      ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+    };
+  };
+
   // Load prompt
   let rawPrompt: string;
   if (commandName !== undefined) {
@@ -2170,28 +2229,7 @@ async function executeNodeInternal(
     if (!promptResult.success) {
       const errMsg = promptResult.message;
       getLog().error({ nodeId: node.id, error: errMsg }, 'dag_node_command_load_failed');
-      await logNodeError(logDir, workflowRun.id, node.id, errMsg);
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: stepName,
-          data: { error: errMsg, ...namedSessionAuditData },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: commandName,
-        error: errMsg,
-      });
-      return { state: 'failed', output: '', error: errMsg };
+      return failAgentNode(errMsg);
     }
     rawPrompt = promptResult.content;
   } else {
@@ -2248,38 +2286,14 @@ async function executeNodeInternal(
   } catch (error) {
     const err = error as Error;
     getLog().error({ nodeId: node.id, error: err.message }, 'dag.node_prompt_substitution_failed');
-    await logNodeError(logDir, workflowRun.id, node.id, err.message);
-    // Emit the terminal event (mirrors the command-load failure path above).
-    // Without it the node emits node_started and then vanishes with no terminal
-    // event, so downstream all_success rules silently skip instead of the run
-    // surfacing the failure.
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'node_failed',
-        step_name: stepName,
-        data: { error: err.message, ...namedSessionAuditData },
-      })
-      .catch((persistErr: Error) => {
-        getLog().error(
-          { err: persistErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
-    emitter.emit({
-      type: 'node_failed',
-      runId: workflowRun.id,
-      nodeId: node.id,
-      nodeName: commandName ?? node.id,
-      error: err.message,
-    });
+    const result = await failAgentNode(err.message);
     await safeSendMessage(
       platform,
       conversationId,
       `Node '${node.id}' failed: ${err.message}`,
       nodeContext
     );
-    return { state: 'failed', output: '', error: err.message };
+    return result;
   }
 
   // Substitute upstream node output references
@@ -2292,20 +2306,10 @@ async function executeNodeInternal(
   let structuredOutput: unknown;
   let newSessionId: string | undefined;
   let nodeResumed: boolean | undefined;
-  let nodeTokens: TokenUsage | undefined;
-  let nodeCostUsd: number | undefined;
   let nodeStopReason: string | undefined;
   let nodeNumTurns: number | undefined;
   let nodeResolvedModel: ResolvedModel | undefined;
   const batchMessages: string[] = [];
-
-  // What this node reported, built once and passed whole rather than re-listed per sink:
-  // the DB event and the JSONL transcript row, on every outcome that can hold spend —
-  // completion, failure, and user cancellation alike (#2693). See WorkflowUsage.
-  const nodeUsageEventData = (): WorkflowUsage => ({
-    ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
-    ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
-  });
 
   // Create per-node abort controller for idle timeout cleanup
   const nodeAbortController = new AbortController();
@@ -2370,7 +2374,6 @@ async function executeNodeInternal(
       }
     )) {
       const tickNow = Date.now();
-      const nodeKey = `${workflowRun.id}:${node.id}`;
 
       // Cancel/pause check — read-only, no write contention in WAL mode (every 10s).
       //
@@ -3093,55 +3096,7 @@ async function executeNodeInternal(
         { nodeId: node.id, durationMs: duration },
         'dag_node_cancelled_during_streaming'
       );
-      // Cancellation is a terminal outcome like any other failure, and the work it
-      // interrupted was already paid for. This branch wrote no transcript row at all
-      // until #2693, so a cancelled node's spend reached the DB and nothing else.
-      await logNodeError(
-        logDir,
-        workflowRun.id,
-        node.id,
-        'Cancelled by user',
-        nodeUsageEventData()
-      );
-
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: stepName,
-          data: {
-            error: 'Cancelled by user',
-            duration_ms: duration,
-            ...nodeUsageEventData(),
-            ...namedSessionAuditData,
-          },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: commandName ?? node.id,
-        error: 'Cancelled by user',
-      });
-
-      // Clean up throttle entries
-      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
-      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-
-      return {
-        state: 'failed',
-        output: nodeOutputText,
-        error: 'Cancelled by user',
-        costUsd: nodeCostUsd,
-        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
-      };
+      return await failAgentNode('Cancelled by user', { output: nodeOutputText });
     }
 
     if (streamingMode === 'batch' && batchMessages.length > 0) {
@@ -3158,40 +3113,7 @@ async function executeNodeInternal(
     if (creditError) {
       const duration = Date.now() - nodeStartTime;
       getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
-      await logNodeError(logDir, workflowRun.id, node.id, creditError, nodeUsageEventData());
-
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: stepName,
-          data: { error: creditError, ...nodeUsageEventData(), ...namedSessionAuditData },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: commandName ?? node.id,
-        error: creditError,
-      });
-
-      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
-      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-
-      return {
-        state: 'failed',
-        output: nodeOutputText,
-        error: creditError,
-        costUsd: nodeCostUsd,
-        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
-      };
+      return await failAgentNode(creditError, { output: nodeOutputText });
     }
 
     // Fail for zero output: covers both silent non-timeout exits AND idle-timeout before first token (time-to-first-token exceeded the window).
@@ -3201,45 +3123,7 @@ async function executeNodeInternal(
         ? `Node '${node.id}' timed out with no output (idle for ${String(effectiveIdleTimeout / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
         : `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
-      await logNodeError(logDir, workflowRun.id, node.id, emptyError, nodeUsageEventData());
-
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: stepName,
-          data: {
-            error: emptyError,
-            duration_ms: duration,
-            ...nodeUsageEventData(),
-            ...namedSessionAuditData,
-          },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: commandName ?? node.id,
-        error: emptyError,
-      });
-
-      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
-      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-
-      return {
-        state: 'failed',
-        output: '',
-        error: emptyError,
-        costUsd: nodeCostUsd,
-        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
-      };
+      return await failAgentNode(emptyError);
     }
 
     if (namedResumeSourceNodeId !== undefined) {
@@ -3343,10 +3227,6 @@ async function executeNodeInternal(
   } catch (error) {
     const err = error as Error;
 
-    // Clean up throttle entries on failure
-    lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
-    lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
-
     const cancelled = nodeAbortController.signal.aborted && !nodeIdleTimedOut;
     const failureMessage = cancelled ? 'Cancelled by user' : err.message;
     if (cancelled) {
@@ -3354,44 +3234,7 @@ async function executeNodeInternal(
     } else {
       getLog().error({ err, nodeId: node.id }, 'dag_node_failed');
     }
-    // Transcript row on BOTH branches. The persisted event below is written either way,
-    // so the transcript must not disagree with it depending on how the cancel arrived.
-    // A cancel reaches this catch mainly through the engine's own structured-output
-    // gate: it runs before the streaming-cancel branch and cannot reask once the signal
-    // is aborted, so an aborted node declaring `output_format` throws here instead of
-    // returning there. A provider SDK that throws on abort also lands here. Neither is
-    // a reason for a node to be missing from the run's transcript (#2693).
-    await logNodeError(logDir, workflowRun.id, node.id, failureMessage, nodeUsageEventData());
-
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'node_failed',
-        step_name: stepName,
-        data: { error: failureMessage, ...nodeUsageEventData(), ...namedSessionAuditData },
-      })
-      .catch((err: Error) => {
-        getLog().error(
-          { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
-
-    emitter.emit({
-      type: 'node_failed',
-      runId: workflowRun.id,
-      nodeId: node.id,
-      nodeName: commandName ?? node.id,
-      error: failureMessage,
-    });
-
-    return {
-      state: 'failed',
-      output: '',
-      error: failureMessage,
-      costUsd: nodeCostUsd,
-      ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
-    };
+    return failAgentNode(failureMessage);
   }
 }
 

@@ -13611,6 +13611,7 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     const deps = createMockDeps(store);
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('credit-exhaustion-run');
+    const logDir = join(testDir, 'logs');
 
     await executeDagWorkflow(
       dagOptions({
@@ -13629,15 +13630,27 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
           ],
         },
         workflowRun,
+        logDir,
       })
     );
 
     // node_failed (not node_completed) must have been stored
-    const events = (
-      store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
-    ).mock.calls.map((c: unknown[]) => (c[0] as { event_type: string }).event_type);
+    const eventCalls = (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>)
+      .mock.calls;
+    const events = eventCalls.map((c: unknown[]) => (c[0] as { event_type: string }).event_type);
     expect(events).toContain('node_failed');
     expect(events).not.toContain('node_completed');
+    const failedEvent = eventCalls.find(
+      (c: unknown[]) => (c[0] as { event_type: string }).event_type === 'node_failed'
+    );
+    expect(
+      typeof (failedEvent?.[0] as { data?: { duration_ms?: unknown } }).data?.duration_ms
+    ).toBe('number');
+
+    const transcriptFailures = (await readTranscript(logDir, workflowRun.id)).filter(
+      row => row.type === 'node_error' && row.step === 'investigate'
+    );
+    expect(transcriptFailures).toHaveLength(1);
 
     // Overall workflow should be marked failed
     expect(store.failWorkflowRun).toHaveBeenCalled();
@@ -15589,6 +15602,9 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     );
     expect(failedEvents.length).toBe(1);
     expect((failedEvents[0][0] as { data: Record<string, unknown> }).data.cost_usd).toBe(0.02);
+    expect(typeof (failedEvents[0][0] as { data: Record<string, unknown> }).data.duration_ms).toBe(
+      'number'
+    );
 
     // And the run total is the money burned across both nodes.
     expect(runUsageWrites(store)).toEqual([
@@ -15653,6 +15669,11 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     expect(cancelRow?.error).toBe('Cancelled by user');
     expect(cancelRow?.cost_usd).toBe(0.02);
     expect(cancelRow?.tokens).toEqual({ input: 30, output: 3 });
+
+    const failedEvent = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .find(event => event.event_type === 'node_failed' && event.step_name === 'only');
+    expect(typeof failedEvent?.data?.duration_ms).toBe('number');
   });
 
   it('a cancel that surfaces as a thrown error still leaves a transcript row', async () => {
