@@ -104,7 +104,6 @@ import type {
   WorkflowSource,
   WorkflowWithSource,
 } from '@archon/workflows/schemas/workflow';
-import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import {
   workflowRunStatusSchema,
@@ -1987,10 +1986,7 @@ async function runWorkflowWithOwnedSource(
     // discoverable via `workflow status`/`runs`, not a silent hang nobody knows exists.
     if (!isContinuation) {
       assertInteractiveClassNotBackgrounded(workflow);
-      // Already-expanded — discoverWorkflowsWithConfig's output never contains an
-      // IncludeDirective (#2486); the type admits one only for the pre-expansion display
-      // shape (`WorkflowWithSource.declared`), which `workflow` here is not.
-      assertComposedGateDriveable(workflow.nodes as DagNode[]);
+      assertComposedGateDriveable(workflow.nodes);
     }
 
     const childConversationId = options.conversationId ?? generateConversationId();

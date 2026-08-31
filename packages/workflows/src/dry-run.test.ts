@@ -4,17 +4,34 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeTestComposedWorkflow, makeTestWorkflow } from './test-utils';
 import {
-  createDryRunStubScaffold,
-  dryRunWorkflow,
+  createDryRunStubScaffold as createResolvedDryRunStubScaffold,
+  dryRunWorkflow as dryRunResolvedWorkflow,
   formatDryRunTrace,
   loadDryRunStubs,
-  writeDryRunStubScaffold,
+  writeDryRunStubScaffold as writeResolvedDryRunStubScaffold,
 } from './dry-run';
 import type { DryRunResolution } from './dry-run';
+import { resolveWorkflow } from './graph-plan';
 import { buildAiProfile } from './model-validation';
 import { resolveWorkflowModelScope } from './node-model-resolution';
 import { expandWorkflowIncludes } from './include-expander';
 import type { WorkflowDefinition } from './schemas';
+
+function createDryRunStubScaffold(workflow: WorkflowDefinition) {
+  return createResolvedDryRunStubScaffold(resolveWorkflow(workflow));
+}
+
+function writeDryRunStubScaffold(workflow: WorkflowDefinition, path: string) {
+  return writeResolvedDryRunStubScaffold(resolveWorkflow(workflow), path);
+}
+
+type TestDryRunOptions = Omit<Parameters<typeof dryRunResolvedWorkflow>[0], 'workflow'> & {
+  workflow: WorkflowDefinition;
+};
+
+function dryRunWorkflow(options: TestDryRunOptions) {
+  return dryRunResolvedWorkflow({ ...options, workflow: resolveWorkflow(options.workflow) });
+}
 
 const temporaryDirectories: string[] = [];
 

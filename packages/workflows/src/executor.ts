@@ -14,7 +14,7 @@ import { getDefaultBranch, toRepoPath } from '@archon/git';
 import type {
   DagNode,
   IncludeDirective,
-  WorkflowDefinition,
+  ResolvedWorkflow,
   WorkflowRun,
   WorkflowExecutionResult,
   WorkflowSource,
@@ -905,7 +905,7 @@ export async function resolveContinuationWorkflow(
 
 /** What a continuation resolved to, plus the discovery it already paid for. */
 export interface ResolvedContinuation {
-  workflow: WorkflowDefinition;
+  workflow: ResolvedWorkflow;
   roots: WorkflowSourceRoots;
   workflows: readonly WorkflowWithSource[];
   errors: readonly WorkflowLoadError[];
@@ -1232,7 +1232,7 @@ async function runChildWorkflow(
   //    Resolution runs BEFORE the cycle check so a case-variant / suffix / substring
   //    reference to an ancestor (e.g. `workflow: SELFIE` naming its own run) is caught
   //    as a cycle by canonical name, not left to the less-informative depth cap.
-  let childWorkflow: WorkflowDefinition | undefined;
+  let childWorkflow: ResolvedWorkflow | undefined;
   try {
     // DELIBERATE AFFORDANCE — do not "fix" this by adding a load-time existence
     // check for `workflow:` targets. Discovery runs HERE, when the node executes,
@@ -1655,7 +1655,7 @@ async function maybeResumeParentRun(
     return;
   }
 
-  let parentWorkflow: WorkflowDefinition | undefined;
+  let parentWorkflow: ResolvedWorkflow | undefined;
   try {
     // Reload the parent's graph from the source IT started with. Rediscovering from
     // `parentCwd` is how a mid-run authoring edit used to change an already-running
@@ -1774,7 +1774,7 @@ export async function executeWorkflow(
   platform: IWorkflowPlatform,
   conversationId: string,
   cwd: string,
-  workflow: WorkflowDefinition,
+  workflow: ResolvedWorkflow,
   userMessage: string,
   conversationDbId: string,
   opts: ExecuteWorkflowOptions = {}
@@ -2830,10 +2830,7 @@ export async function executeWorkflow(
     // workflows report their real name, custom ones report "custom". No PII —
     // descriptions/prompts/paths are never sent. Machine context + version ride
     // along as super-properties. Opt out: ARCHON_TELEMETRY_DISABLED=1 / DO_NOT_TRACK=1.
-    // Already-expanded — the run is about to execute this workflow, so `workflow.nodes`
-    // never actually holds an `IncludeDirective` here even though the type admits one
-    // for the general pre-expansion case (#2486).
-    const telemetryNodes = workflow.nodes as DagNode[];
+    const telemetryNodes = workflow.nodes;
     captureWorkflowInvoked({
       workflowName: workflow.name,
       workflowSource: source,
@@ -3052,10 +3049,8 @@ export async function executeWorkflow(
         }
       : workflowRun;
 
-    // Execute the DAG workflow. Already-expanded (see `telemetryNodes` above) — the
-    // executor's own `DagNode[]` parameter type is correctly narrow; this boundary
-    // cast reflects that invariant, not a new one. The adopted-dir scope (#2747)
-    // encloses only the DAG: a child sub-run spawned from a node re-enters
+    // The adopted-dir scope (#2747) encloses only the DAG: a child sub-run spawned
+    // from a node re-enters
     // `executeWorkflow` and scopes its own (absent) adoption.
     const dagSummary = await runWithAdoptedRunDir(adoptedRunDir, () =>
       executeDagWorkflow({
@@ -3063,7 +3058,7 @@ export async function executeWorkflow(
         platform,
         conversationId,
         cwd,
-        workflow: { ...workflow, nodes: telemetryNodes },
+        workflow,
         workflowRun: runForDag,
         workflowProvider: resolvedProvider,
         workflowModel: resolvedModel,

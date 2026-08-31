@@ -61,10 +61,10 @@ import type {
   SandboxSettings,
   WebSearchMode,
   WorkflowSource,
-  WorkflowDefinition,
+  GraphPlan,
+  ResolvedWorkflow,
   LoopGateRunMetadata,
   ApprovalContext,
-  WorkflowEvidencePolicy,
   WorkflowRunOutcome,
   NodeArtifactLoopFrame,
   WorkflowRunNodeSession,
@@ -94,6 +94,7 @@ import {
 } from './schemas';
 import type { BindingDirective } from './schemas';
 import { mapNodeTemplateSlots } from './template-walker';
+import { planGraph, resolvedBodyNodes } from './graph-plan';
 import { FAN_OUT_CANCEL_REASONS } from './store';
 import type { DagResumeSnapshot, FanOutCancelReason, PersistedNodeOutput } from './store';
 import { formatToolCall } from './utils/tool-formatter';
@@ -2005,56 +2006,6 @@ export function checkComposedBlockBoundaries(
     }
   }
   return 'run';
-}
-
-/**
- * Build topological layers from DAG nodes using Kahn's algorithm.
- * Layer 0: nodes with no dependencies.
- * Layer N: nodes whose dependencies are all in layers 0..N-1.
- *
- * Cycle detection: if the sum of all layer sizes < nodes.length, a cycle exists.
- * (Cycle detection at load time is the primary guard; this is a runtime safety check.)
- */
-export function buildTopologicalLayers(nodes: readonly DagNode[]): DagNode[][] {
-  const inDegree = new Map<string, number>();
-  const dependents = new Map<string, string[]>();
-
-  for (const node of nodes) {
-    inDegree.set(node.id, node.depends_on?.length ?? 0);
-    for (const dep of node.depends_on ?? []) {
-      const existing = dependents.get(dep) ?? [];
-      existing.push(node.id);
-      dependents.set(dep, existing);
-    }
-  }
-
-  const layers: DagNode[][] = [];
-  let ready = [...nodes].filter(n => (inDegree.get(n.id) ?? 0) === 0);
-
-  while (ready.length > 0) {
-    layers.push(ready);
-    const nextIds: string[] = [];
-    for (const node of ready) {
-      for (const depId of dependents.get(node.id) ?? []) {
-        const newDegree = (inDegree.get(depId) ?? 0) - 1;
-        inDegree.set(depId, newDegree);
-        if (newDegree === 0) nextIds.push(depId);
-      }
-    }
-    ready = nextIds
-      .map(id => nodes.find(n => n.id === id))
-      .filter((n): n is DagNode => n !== undefined);
-  }
-
-  const totalPlaced = layers.reduce((sum, l) => sum + l.length, 0);
-  if (totalPlaced < nodes.length) {
-    // Should never happen — cycle detection runs at load time
-    throw new Error(
-      '[DagExecutor] Cycle detected at runtime — was cycle detection skipped at load?'
-    );
-  }
-
-  return layers;
 }
 
 /**
@@ -4622,6 +4573,7 @@ async function executeLoopGroupNode(
     execContext,
   } = ctx;
   const group = node.loop_group;
+  const bodyNodes = resolvedBodyNodes(group);
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
   // This group's OWN persisted step_name — namespaced by any enclosing group so nested
   // loop_groups compose (e.g. `outer.inner`); '' → node.id at the top level (#2090).
@@ -4641,8 +4593,8 @@ async function executeLoopGroupNode(
   // THIS group's immediate ids — an id in knownBodyIds but not directBodyIds belongs to a
   // nested group and its token is preserved for that inner group's own pass. Computed once
   // (body shape is static) and threaded into every applyLoopPrevToBodyNode call.
-  const knownBodyIds = collectLoopBodyNodeIds(group.nodes);
-  const directBodyIds = new Set(group.nodes.map(n => n.id));
+  const knownBodyIds = collectLoopBodyNodeIds(bodyNodes);
+  const directBodyIds = new Set(bodyNodes.map(n => n.id));
 
   // Detect loop resume (mirrors executeLoopNode). Two shapes recognized:
   //  - the ORIGINAL interactive_loop gate (group.interactive + gate_message).
@@ -4713,7 +4665,7 @@ async function executeLoopGroupNode(
   }
 
   if (isEscalatedWaitResume) {
-    const terminalNode = findLoopGroupTerminalSuspendNode(group.nodes as DagNode[]);
+    const terminalNode = findLoopGroupTerminalSuspendNode(bodyNodes);
     if (terminalNode?.kind !== 'wait') {
       throw new Error(`Loop group '${node.id}' resumed with wait state but has no terminal wait`);
     }
@@ -4748,7 +4700,7 @@ async function executeLoopGroupNode(
   // substituteLoopPrevRefs finds them exactly as it would mid-loop.
   if (isLoopResume) {
     const restoredLoopPrevOutputs = new Map<string, NodeOutput>();
-    const bodyNodesById = new Map((group.nodes as DagNode[]).map(n => [n.id, n]));
+    const bodyNodesById = new Map(bodyNodes.map(n => [n.id, n]));
     for (const id of directBodyIds) {
       const prior = outerNodeOutputs.get(bodyStepNamePrefix + id);
       if (!prior) continue;
@@ -4788,7 +4740,7 @@ async function executeLoopGroupNode(
   // iteration boundary, so the pre-gate body nodes' already-produced outputs are
   // safe to reuse as-is; only the gate's own answer needed reconstructing.
   if ((isEscalatedGateResume || isEscalatedWaitResume) && loopPrevOutputs !== undefined) {
-    const terminalNode = findLoopGroupTerminalSuspendNode(group.nodes as DagNode[]);
+    const terminalNode = findLoopGroupTerminalSuspendNode(bodyNodes);
     const terminalSink = terminalNode ? loopPrevOutputs.get(terminalNode.id) : undefined;
     if (terminalSink !== undefined) {
       const resumedIteration = resumeIteration;
@@ -5014,9 +4966,7 @@ async function executeLoopGroupNode(
     // iteration of an interactive loop.
     const prevSnapshot = loopPrevOutputs;
     const userInputForIter = isLoopResume && i === startIteration ? loopUserInput : '';
-    // The executor only ever receives already-expanded nodes (see the justification at
-    // the other `applyLoopPrevToBodyNode` call site above), so the body is include-free.
-    const iterBodyNodes = (group.nodes as DagNode[]).map(n =>
+    const iterBodyNodes = bodyNodes.map(n =>
       applyLoopPrevToBodyNode(
         n,
         prevSnapshot,
@@ -5028,7 +4978,7 @@ async function executeLoopGroupNode(
     );
     // Re-layer from the (possibly substituted) body nodes — runLayers walks ctx.layers,
     // not ctx.nodes, so the layers must reference the substituted nodes to take effect.
-    const iterBodyLayers = buildTopologicalLayers(iterBodyNodes);
+    const iterBodyLayers = planGraph(iterBodyNodes).layers;
 
     // Fresh scoped output map per iteration. Seed it read-only with the outer DAG's
     // upstream outputs so body nodes can reference outer context via $nodeId.output if
@@ -8157,8 +8107,8 @@ async function resolveFanOutChildDefinition(
   source?: WorkflowSourceRoots | string
 ): Promise<
   | {
-      definition: WorkflowDefinition;
-      definitions: WorkflowDefinition[];
+      definition: ResolvedWorkflow;
+      definitions: ResolvedWorkflow[];
       commandContents: ReadonlyMap<string, IncludeCommandContent>;
     }
   | { unresolved: string }
@@ -8932,7 +8882,7 @@ function expandComposeInstance(
   node: ComposeFanOutNode,
   identity: string,
   inputs: Record<string, JsonValue>,
-  definition: WorkflowDefinition,
+  definition: ResolvedWorkflow,
   commandContents: ReadonlyMap<string, IncludeCommandContent>
 ): { nodes: DagNode[]; primarySink: string } | { error: string } {
   const directiveId = `${node.id}__${identity}`;
@@ -9378,7 +9328,9 @@ async function executeComposeFanOutNode(
         persistScopeKey: ctx.persistScopeKey,
         workflowPersistSessions: ctx.workflowPersistSessions,
         scopeArtifactsDir: undefined,
-        layers: buildTopologicalLayers(expanded.nodes),
+        // Runtime cardinality changes only the deterministic instance prefix; the body
+        // was fully resolved and validated before any parent node ran.
+        layers: planGraph(expanded.nodes).layers,
         nodeOutputs: instanceNodeOutputs,
         priorCompletedNodes: instancePriorNodes,
         claimedWorkPausePolicy: 'finish_through_parent_pause',
@@ -9723,7 +9675,7 @@ interface RunDerived {
 interface RunLayersContext extends RunInputs, RunDerived {
   // --- per-subgraph mutable state (varies between top-level DAG and loop_group body) ---
   /** Pre-computed topological layers (caller builds once — body shape is static). runLayers walks ONLY these; there is deliberately no flat node list here. */
-  layers: DagNode[][];
+  layers: GraphPlan['layers'];
   /** Shared node-output map (caller owns; runLayers writes node results here). */
   nodeOutputs: Map<string, NodeOutput>;
   /** Prior body outputs available to a loop-group iteration's `when:` conditions. */
@@ -9946,20 +9898,6 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
       (node): (() => Promise<LayerNodeResult>) =>
         async (): Promise<LayerNodeResult> => {
           try {
-            // Include nodes are expanded away at discovery time (include-expander.ts): one
-            // must never reach the executor. This guard is FIRST in the per-node body — before
-            // resume-skip, `when:`, and trigger-rule handling — so an unexpanded include node
-            // cannot slip through by matching a prior-completed entry, a false `when:`, or a
-            // failing trigger rule. If one gets here, discovery was bypassed; fail loud rather
-            // than silently accepting an invalid runtime DAG.
-            if (isIncludeDirective(node as DagNode | IncludeDirective)) {
-              const includeNode = node as unknown as IncludeDirective;
-              throw new Error(
-                `Internal error: include node '${includeNode.id}' reached the executor unexpanded. ` +
-                  'Include nodes must be resolved by expandWorkflowIncludes() during discovery.'
-              );
-            }
-
             const checkpointSessionForProvider = (
               provider: string
             ): SessionCheckpoint | undefined => {
@@ -11516,21 +11454,7 @@ async function raiseWriteBackGate(
 
 /** Inputs accepted by {@link executeDagWorkflow}. */
 export interface ExecuteDagWorkflowOptions extends RunInputs {
-  workflow: {
-    name: string;
-    nodes: readonly DagNode[];
-    /** Workflow-level default for per-node `persist_session` (read directly here). */
-    persist_sessions?: boolean;
-    /** Raw workflow-level `model` ref — used only to derive the workflow tier
-     *  keyword for node_started attribution (resolution uses `workflowModel`). */
-    model?: string;
-    /** Terminal-success evidence gate (#2230) — read at the completion path. */
-    evidence_policy?: WorkflowEvidencePolicy;
-    /** Declared `returns:` node id (#2470) — rebinds a CHILD run's terminal output. */
-    returns?: string;
-    /** Required boolean property on `returns:` that authors the durable run outcome. */
-    outcome_field?: string;
-  } & WorkflowLevelOptions;
+  workflow: ResolvedWorkflow;
   priorCompletedNodes?: Map<string, PersistedNodeOutput>;
   /** Discovery source — telemetry only (custom-vs-default + name redaction). */
   source?: WorkflowSource;
@@ -11677,7 +11601,7 @@ export async function executeDagWorkflow(
     webSearchMode: workflow.webSearchMode,
     workflowTier,
   };
-  const layers = buildTopologicalLayers(workflow.nodes);
+  const layers = workflow.plan.layers;
   const nodeOutputs = new Map<string, NodeOutput>();
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
@@ -12323,10 +12247,8 @@ export async function executeDagWorkflow(
       terminalOutput = '';
     }
   } else {
-    const allDependencies = new Set(workflow.nodes.flatMap(n => n.depends_on ?? []));
-    const terminalSink = workflow.nodes
-      .filter(n => !allDependencies.has(n.id))
-      .map(n => nodeOutputs.get(n.id))
+    const terminalSink = workflow.plan.sinks
+      .map(nodeId => nodeOutputs.get(nodeId))
       .find(o => o?.state === 'completed' && o.output.trim().length > 0);
     terminalOutput = terminalSink?.output;
     terminalStructuredOutput =

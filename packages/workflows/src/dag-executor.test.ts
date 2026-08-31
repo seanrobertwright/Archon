@@ -74,7 +74,6 @@ registerOpencodeProvider();
 
 // --- Imports (after mocks) ---
 import {
-  buildTopologicalLayers,
   checkTriggerRule,
   substituteNodeOutputRefs,
   substituteLoopPrevRefs,
@@ -87,6 +86,7 @@ import {
   type ExecuteDagWorkflowOptions,
   type RunChildWorkflowFn,
 } from './dag-executor';
+import { planGraph, resolveWorkflow, resolvedBodyNodes } from './graph-plan';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emitter';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
@@ -95,11 +95,13 @@ import type {
   AgentNode,
   ExecNode,
   LoopGroupNode,
+  LoopGroupNodeConfig,
   IncludeDirective,
   NodeOutput,
   WorkflowRun,
   WorkflowRunNodeSession,
   WorkflowDefinition,
+  ResolvedWorkflow,
   WorkflowRunStatus,
   ApprovalContext,
   WorkflowWaitContext,
@@ -382,8 +384,18 @@ const minimalConfig: WorkflowConfig = {
  * `deps`, `cwd`, `workflow`, and `workflowRun` carry each test's own fixtures, so every call
  * supplies them; the run directories derive from `cwd` the way every call site built them.
  */
-type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
-  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflow' | 'workflowRun'>;
+type TestWorkflowDefinition = Omit<WorkflowDefinition, 'description'> & {
+  description?: string;
+};
+
+type DagOptionsOverrides = Omit<Partial<ExecuteDagWorkflowOptions>, 'workflow'> &
+  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflowRun'> & {
+    workflow: TestWorkflowDefinition;
+  };
+
+function resolveTestWorkflow(workflow: TestWorkflowDefinition): ResolvedWorkflow {
+  return resolveWorkflow({ ...workflow, description: workflow.description ?? workflow.name });
+}
 
 /**
  * Options for a direct `executeDagWorkflow` call, built from only what a test varies. The
@@ -395,7 +407,7 @@ type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
  * resolved model decision (#2302); this builder is not that guard's audience.
  */
 function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
-  const { cwd } = overrides;
+  const { cwd, workflow, ...rest } = overrides;
   return {
     platform: createMockPlatform(),
     conversationId: 'conv-dag',
@@ -407,7 +419,9 @@ function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
     baseBranch: 'main',
     docsDir: 'docs/',
     config: minimalConfig,
-    ...overrides,
+    ...rest,
+    cwd,
+    workflow: resolveTestWorkflow(workflow),
   };
 }
 
@@ -418,7 +432,7 @@ describe('executeDagWorkflow options type contract', () => {
       platform: createMockPlatform(),
       conversationId: 'type-contract',
       cwd: '/tmp/type-contract',
-      workflow: { name: 'type-contract', nodes: [] },
+      workflow: resolveTestWorkflow({ name: 'type-contract', nodes: [] }),
       workflowRun: makeWorkflowRun('type-contract'),
       workflowProvider: 'claude',
       workflowModel: undefined,
@@ -476,14 +490,8 @@ describe('executeDagWorkflow options type contract', () => {
 
 // --- Helpers ---
 
-/**
- * A parsed `WorkflowDefinition`'s `nodes` admits `IncludeDirective` for the general
- * pre-expansion case (#2486); every workflow built for these tests is a flat,
- * already-expanded fixture with no `include:` nodes, so this narrows it back to what
- * `executeDagWorkflow` actually requires.
- */
-function ready(wf: WorkflowDefinition): Omit<WorkflowDefinition, 'nodes'> & { nodes: DagNode[] } {
-  return { ...wf, nodes: wf.nodes as DagNode[] };
+function ready(wf: WorkflowDefinition): ResolvedWorkflow {
+  return resolveWorkflow(wf);
 }
 
 function node(id: string, depends_on?: string[], opts?: Partial<AgentNode>): AgentNode {
@@ -582,11 +590,11 @@ function expectLoopGateEvidence(
 }
 
 function loaderBypassingWorkflow(
-  workflow: Parameters<typeof executeDagWorkflow>[0]['workflow'] & {
+  workflow: TestWorkflowDefinition & {
     modelReasoningEffort: string;
   }
-): Parameters<typeof executeDagWorkflow>[0]['workflow'] {
-  return workflow;
+): ResolvedWorkflow & { modelReasoningEffort: string } {
+  return { ...resolveTestWorkflow(workflow), modelReasoningEffort: workflow.modelReasoningEffort };
 }
 
 // --- Tests ---
@@ -604,15 +612,15 @@ const readTranscript = async (
     .split('\n')
     .map(line => JSON.parse(line) as Record<string, unknown>);
 
-describe('buildTopologicalLayers', () => {
+describe('planGraph', () => {
   it('single node with no dependencies -> one layer', () => {
-    const layers = buildTopologicalLayers([node('a')]);
+    const layers = planGraph([node('a')]).layers;
     expect(layers).toHaveLength(1);
     expect(layers[0].map(n => n.id)).toEqual(['a']);
   });
 
   it('linear chain -> one node per layer', () => {
-    const layers = buildTopologicalLayers([node('a'), node('b', ['a']), node('c', ['b'])]);
+    const layers = planGraph([node('a'), node('b', ['a']), node('c', ['b'])]).layers;
     expect(layers).toHaveLength(3);
     expect(layers[0].map(n => n.id)).toEqual(['a']);
     expect(layers[1].map(n => n.id)).toEqual(['b']);
@@ -620,11 +628,11 @@ describe('buildTopologicalLayers', () => {
   });
 
   it('fan-out: classify -> [investigate, plan] in same layer', () => {
-    const layers = buildTopologicalLayers([
+    const layers = planGraph([
       node('classify'),
       node('investigate', ['classify']),
       node('plan', ['classify']),
-    ]);
+    ]).layers;
     expect(layers).toHaveLength(2);
     expect(layers[0].map(n => n.id)).toEqual(['classify']);
     const layer1Ids = layers[1].map(n => n.id).sort();
@@ -632,45 +640,79 @@ describe('buildTopologicalLayers', () => {
   });
 
   it('fan-in: [a, b] -> implement in its own layer', () => {
-    const layers = buildTopologicalLayers([node('a'), node('b'), node('implement', ['a', 'b'])]);
+    const layers = planGraph([node('a'), node('b'), node('implement', ['a', 'b'])]).layers;
     expect(layers).toHaveLength(2);
     expect(layers[0].map(n => n.id).sort()).toEqual(['a', 'b']);
     expect(layers[1].map(n => n.id)).toEqual(['implement']);
   });
 
   it('diamond: classify -> [investigate, plan] -> implement', () => {
-    const layers = buildTopologicalLayers([
+    const layers = planGraph([
       node('classify'),
       node('investigate', ['classify']),
       node('plan', ['classify']),
       node('implement', ['investigate', 'plan']),
-    ]);
+    ]).layers;
     expect(layers).toHaveLength(3);
     expect(layers[0].map(n => n.id)).toEqual(['classify']);
     expect(layers[1].map(n => n.id).sort()).toEqual(['investigate', 'plan']);
     expect(layers[2].map(n => n.id)).toEqual(['implement']);
   });
 
-  it('throws on cyclic graph (runtime safety check)', () => {
+  it('throws on a cyclic graph', () => {
     const cyclic = [node('a', ['b']), node('b', ['a'])];
-    expect(() => buildTopologicalLayers(cyclic)).toThrow('Cycle detected');
+    expect(() => planGraph(cyclic)).toThrow('Cycle detected');
   });
 
   it('self-referential node throws', () => {
     const selfRef = [node('a', ['a'])];
-    expect(() => buildTopologicalLayers(selfRef)).toThrow('Cycle detected');
+    expect(() => planGraph(selfRef)).toThrow('Cycle detected');
   });
 
   it('two independent chains share layers correctly', () => {
-    const layers = buildTopologicalLayers([
-      node('a'),
-      node('b', ['a']),
-      node('c'),
-      node('d', ['c']),
-    ]);
+    const layers = planGraph([node('a'), node('b', ['a']), node('c'), node('d', ['c'])]).layers;
     expect(layers).toHaveLength(2);
     expect(layers[0].map(n => n.id).sort()).toEqual(['a', 'c']);
     expect(layers[1].map(n => n.id).sort()).toEqual(['b', 'd']);
+  });
+
+  it('records every sink in definition order', () => {
+    const plan = planGraph([node('root'), node('left', ['root']), node('right', ['root'])]);
+    expect(plan.sinks).toEqual(['left', 'right']);
+  });
+
+  it('attaches the complete plan to a resolved workflow', () => {
+    const workflow = resolveTestWorkflow({
+      name: 'representative',
+      nodes: [node('root'), node('left', ['root']), node('right', ['root'])],
+    });
+
+    expect(workflow.plan.layers.map(layer => layer.map(item => item.id))).toEqual([
+      ['root'],
+      ['left', 'right'],
+    ]);
+    expect(workflow.plan.sinks).toEqual(['left', 'right']);
+  });
+
+  it('rejects an include directive that survived expansion and names it', () => {
+    const include: IncludeDirective = { id: 'block', kind: 'include', include: 'child' };
+    expect(() => planGraph([include])).toThrow("include node 'block'");
+    expect(() =>
+      resolveWorkflow({ name: 'invalid', description: 'invalid', nodes: [include] })
+    ).toThrow("include node 'block'");
+  });
+});
+
+describe('resolvedBodyNodes', () => {
+  it('rejects an include directive in a nested body and names it', () => {
+    const include: IncludeDirective = { id: 'nested', kind: 'include', include: 'child' };
+    const group: LoopGroupNodeConfig = {
+      until: 'DONE',
+      max_iterations: 1,
+      fresh_context: false,
+      nodes: [include],
+    };
+    expect(() => resolvedBodyNodes(group)).toThrow("include node 'nested'");
   });
 });
 
@@ -24703,104 +24745,6 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     expect(events.some(e => e.event_type === 'node_completed' && e.step_name === 'inc__a')).toBe(
       true
     );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// An unexpanded include node must FAIL LOUDLY, never silently skip — the
-// fail-fast guard runs before resume-skip / when / trigger-rule handling.
-// ---------------------------------------------------------------------------
-
-describe('executeDagWorkflow -- unexpanded include node fail-fast guard', () => {
-  let testDir: string;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `dag-inc-guard-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(testDir, { recursive: true });
-  });
-
-  afterEach(async () => {
-    try {
-      await rm(testDir, { recursive: true, force: true });
-    } catch {
-      // ignore cleanup errors
-    }
-  });
-
-  function events(
-    deps: WorkflowDeps
-  ): Array<{ event_type: string; step_name: string; data: unknown }> {
-    return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
-      (call: unknown[]) => call[0] as { event_type: string; step_name: string; data: unknown }
-    );
-  }
-
-  it('fails (not skips) an unexpanded include node that matches a prior-completed entry', async () => {
-    const mockDeps = createMockDeps();
-    const platform = createMockPlatform();
-    const workflowRun = makeWorkflowRun('inc-guard-resume', { workflow_name: 'inc-guard' });
-
-    // A raw include node reaching the executor with a resume entry for its own id: the
-    // guard must fire BEFORE the resume-skip check, so it fails instead of being skipped.
-    const includeNode = dagNodeSchema.parse({ id: 'inc', include: 'some-block' }) as DagNode;
-    const prior = new Map([['inc', { output: 'stale prior output' }]]);
-
-    await executeDagWorkflow(
-      dagOptions({
-        deps: mockDeps,
-        platform,
-        conversationId: 'conv-inc-guard',
-        cwd: testDir,
-        workflow: { name: 'inc-guard', nodes: [includeNode] },
-        workflowRun,
-        priorCompletedNodes: prior,
-      })
-    );
-
-    const evs = events(mockDeps);
-    const failed = evs.find(e => e.event_type === 'node_failed' && e.step_name === 'inc');
-    expect(failed).toBeDefined();
-    expect((failed!.data as { error: string }).error).toContain('reached the executor unexpanded');
-    // Crucially, it was NOT silently skipped as a prior success.
-    expect(evs.some(e => e.event_type === 'node_skipped_prior_success')).toBe(false);
-  });
-
-  it('fails (not skips) an unexpanded include node whose when: would evaluate false', async () => {
-    const mockDeps = createMockDeps();
-    const platform = createMockPlatform();
-    const workflowRun = makeWorkflowRun('inc-guard-when', { workflow_name: 'inc-guard' });
-
-    // `flag` emits NO; the include's when checks == YES (false → would normally skip). The
-    // guard must fire first and fail the node instead.
-    const nodes = [
-      dagNodeSchema.parse({ id: 'flag', bash: 'echo NO' }),
-      dagNodeSchema.parse({
-        id: 'inc',
-        include: 'some-block',
-        depends_on: ['flag'],
-        when: "$flag.output == 'YES'",
-      }),
-    ];
-
-    await executeDagWorkflow(
-      dagOptions({
-        deps: mockDeps,
-        platform,
-        conversationId: 'conv-inc-guard',
-        cwd: testDir,
-        // Deliberately includes an unexpanded include directive — the test exercises the
-        // `when:` guard firing BEFORE the executor would ever need to resolve it.
-        workflow: { name: 'inc-guard', nodes: nodes as DagNode[] },
-        workflowRun,
-      })
-    );
-
-    const evs = events(mockDeps);
-    const failed = evs.find(e => e.event_type === 'node_failed' && e.step_name === 'inc');
-    expect(failed).toBeDefined();
-    expect((failed!.data as { error: string }).error).toContain('reached the executor unexpanded');
-    // It was NOT skipped via the when: gate.
-    expect(evs.some(e => e.event_type === 'node_skipped' && e.step_name === 'inc')).toBe(false);
   });
 });
 

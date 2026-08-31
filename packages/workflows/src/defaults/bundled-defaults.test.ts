@@ -25,6 +25,7 @@ import {
 } from '../packaged-workflow';
 import { parseWorkflow } from '../loader';
 import { dryRunWorkflow } from '../dry-run';
+import { resolveWorkflow } from '../graph-plan';
 import { makeTestWorkflow } from '../test-utils';
 
 // Resolve the on-disk defaults directories relative to this test file so the
@@ -690,11 +691,11 @@ describe('bundled-defaults', () => {
           },
         ],
       }).nodes[0];
-      const workflow = {
+      const workflow = resolveWorkflow({
         ...parsed.workflow,
         name: scenario.name,
         nodes: [producer!, { ...flipReady, depends_on: ['pr'] }],
-      };
+      });
       const directory = mkdtempSync(join(tmpdir(), 'archon-flip-ready-'));
       const bin = join(directory, 'bin');
       const log = join(directory, 'gh.log');
