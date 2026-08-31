@@ -11,7 +11,7 @@ import { cliArgOptions } from './args';
 import * as git from '@archon/git';
 import { removeTempTree } from '@archon/paths/test-utils';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -1097,13 +1097,54 @@ describe('CLI git repo check', () => {
 // One helper owns the spawn env and envelope access so every case pays setup
 // once instead of repeating it; each test still drives its own invocation so
 // the subprocess stdout/exit-code contract stays covered.
+//
+// The helper owns an ARCHON_HOME because these spawns are real CLI processes:
+// the no-git folder-project gate opens the Archon registry to decide whether an
+// unregistered directory is a folder project, before it refuses the command.
+// Inheriting the ambient home aimed that at the operator's ~/.archon, so the
+// tests both mutated real state and queued behind whoever else held it. The
+// registry sets `PRAGMA busy_timeout = 5000` — the same number as Bun's
+// implicit per-test budget — so a contended open can spend the whole budget
+// waiting: holding a write lock for 3 s made this command take 3.41 s, and an
+// 8 s lock took it to the 5.54 s ceiling. A private registry removes the
+// contention, and seeding it once below keeps schema creation out of every
+// timed body (#2982).
+let jsonEnvelopeHome: string;
+
 function spawnJsonError(argv: string[], extraEnv: Record<string, string> = {}) {
   const result = spawnSync(process.execPath, [CLI_ENTRY, ...argv], {
     encoding: 'utf8',
-    env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1', ...extraEnv },
+    env: {
+      ...process.env,
+      ARCHON_TELEMETRY_DISABLED: '1',
+      ARCHON_HOME: jsonEnvelopeHome,
+      ...extraEnv,
+    },
   });
   return { status: result.status, envelope: () => JSON.parse(result.stdout ?? '') };
 }
+
+beforeAll(() => {
+  jsonEnvelopeHome = mkdtempSync(join(tmpdir(), 'archon-json-envelope-home-'));
+
+  // Build the registry once, here, so no timed body below pays for creating it.
+  // Seeding through `spawnJsonError` rather than a bespoke spawn is deliberate:
+  // it makes this also the check that the helper hands its ARCHON_HOME to the
+  // child. If that wiring is ever dropped, no registry appears in the scratch
+  // home and this throws, instead of every case below quietly falling back to
+  // the operator's registry again.
+  const seed = spawnJsonError(['workflow', 'list', '--json', '--cwd', tmpdir()]);
+  if (!existsSync(join(jsonEnvelopeHome, 'archon.db'))) {
+    throw new Error(
+      `--json envelope tests could not seed a scratch registry in ${jsonEnvelopeHome}.\n` +
+        `status=${String(seed.status)}\n${JSON.stringify(seed.envelope())}`
+    );
+  }
+});
+
+afterAll(async () => {
+  if (jsonEnvelopeHome) await removeTempTree(jsonEnvelopeHome);
+});
 
 describe('workflow search --json error envelope', () => {
   it('emits { ok: false } on stdout when the command throws under --json', () => {
@@ -1173,6 +1214,27 @@ describe('pre-dispatch gates --json error envelope', () => {
     expect(status).toBe(1);
     expect(envelope).not.toThrow();
     expect(envelope()).toMatchObject({ ok: false });
+  });
+
+  it('leaves the default home untouched when the gate opens the registry', async () => {
+    // Same command as the case above — the one route here that opens the
+    // registry — but with the child's home directory pointed at a scratch tree,
+    // so `<sentinel>/.archon` is what `getArchonHome()` would resolve to if the
+    // helper's ARCHON_HOME stopped reaching the child. It must stay absent: the
+    // registry belongs in the test-owned home, never the ambient one.
+    const sentinel = mkdtempSync(join(tmpdir(), 'archon-json-envelope-sentinel-'));
+    try {
+      const { status } = spawnJsonError(['workflow', 'list', '--json', '--cwd', tmpdir()], {
+        HOME: sentinel,
+        USERPROFILE: sentinel,
+      });
+
+      expect(status).toBe(1);
+      expect(existsSync(join(sentinel, '.archon'))).toBe(false);
+      expect(existsSync(join(jsonEnvelopeHome, 'archon.db'))).toBe(true);
+    } finally {
+      await removeTempTree(sentinel);
+    }
   });
 
   it('emits { ok: false } on stdout for an unknown command instead of usage text', () => {
