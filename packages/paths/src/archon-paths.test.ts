@@ -45,6 +45,7 @@ import {
   getScopeArtifactsPath,
   resolveProjectStorageKey,
   getProjectStoragePaths,
+  resolveRunStorageRoot,
   getRunArtifactsDirForKey,
   getRunLogPathForRoot,
   slugifyFolderName,
@@ -731,6 +732,37 @@ describe('archon-paths', () => {
         artifactsRoot: getFolderProjectArtifactsPath('ops'),
         logsDir: getFolderProjectLogsPath('ops'),
       });
+    });
+  });
+
+  describe('resolveRunStorageRoot', () => {
+    beforeEach(() => {
+      delete process.env.WORKSPACE_PATH;
+      delete process.env.ARCHON_DOCKER;
+      process.env.ARCHON_HOME = '/custom/archon';
+    });
+
+    test('keeps a trusted persisted root when the codebase was renamed', () => {
+      const root = join('/custom/archon', 'workspaces', 'acme', 'original');
+      expect(
+        resolveRunStorageRoot(
+          { output_root: root },
+          { kind: 'repo', name: 'acme/renamed', default_cwd: '/repos/renamed' }
+        )
+      ).toBe(root);
+    });
+
+    test('re-derives an out-of-tree persisted root under the current home', () => {
+      expect(
+        resolveRunStorageRoot(
+          { output_root: '/previous/archon/home/workspaces/_local/workspace' },
+          { kind: 'repo', name: 'workspace', default_cwd: '/home/u/workspace' }
+        )
+      ).toBe(join('/custom/archon', 'workspaces', '_local', 'workspace'));
+    });
+
+    test('rejects an untrusted root when no codebase can re-derive it', () => {
+      expect(resolveRunStorageRoot({ output_root: '/etc' }, null)).toBeNull();
     });
   });
 

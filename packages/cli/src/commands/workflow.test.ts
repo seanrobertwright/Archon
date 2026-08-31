@@ -31,6 +31,7 @@ import {
   getRunLogPathForRoot as getRunLogPathForRootReal,
   isInsideArchonHome as isInsideArchonHomeReal,
   resolveProjectStorageKey as resolveProjectStorageKeyReal,
+  resolveRunStorageRoot as resolveRunStorageRootReal,
 } from '@archon/paths/archon-paths';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
 import {
@@ -189,6 +190,7 @@ mock.module('@archon/paths', () => ({
   getRunLogPathForRoot: getRunLogPathForRootReal,
   isInsideArchonHome: isInsideArchonHomeReal,
   resolveProjectStorageKey: resolveProjectStorageKeyReal,
+  resolveRunStorageRoot: resolveRunStorageRootReal,
   BUNDLED_IS_BINARY: false,
   BUNDLED_VERSION: '0.0.0-test',
   readTierNoticeState: mock(() => null),
@@ -4779,6 +4781,8 @@ describe('workflowLogsCommand', () => {
     (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValue(null);
     (codebaseDb.findCodebaseByPathPrefix as ReturnType<typeof mock>).mockReset();
     (codebaseDb.findCodebaseByPathPrefix as ReturnType<typeof mock>).mockResolvedValue(null);
+    (codebaseDb.getCodebase as ReturnType<typeof mock>).mockReset();
+    (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValue(null);
   });
 
   afterEach(async () => {
@@ -4811,6 +4815,27 @@ describe('workflowLogsCommand', () => {
     expect(stdoutText()).toBe(row);
     expect(stderrText()).toBe('');
     expect(workflowDb.findWorkflowRunsByIdPrefix).toHaveBeenCalledWith('11111111', 'cb-1');
+  });
+
+  it('re-derives a relocated transcript from the run codebase', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const row = `${JSON.stringify({ type: 'workflow_start', content: 'relocated' })}\n`;
+    writeFileSync(transcriptPath, row);
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...run('completed'),
+      output_root: '/previous/archon/home/workspaces/acme/widget',
+    });
+    (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-1',
+      kind: 'repo',
+      name: 'acme/widget',
+      default_cwd: '/home/u/widget',
+    });
+
+    expect(await workflowLogsCommand(run('completed').id, false)).toBe(0);
+    expect(stdoutText()).toBe(row);
+    expect(stderrText()).toBe('');
   });
 
   it('preserves UTF-8 characters split across read chunks', async () => {
@@ -4861,6 +4886,8 @@ describe('workflowLogsCommand', () => {
       });
     (workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mockClear();
     (workflowDb.failWorkflowRun as ReturnType<typeof mock>).mockClear();
+    (workflowDb.cancelWorkflowRun as ReturnType<typeof mock>).mockClear();
+    (workflowDb.resumeWorkflowRun as ReturnType<typeof mock>).mockClear();
 
     const code = await workflowLogsCommand(run('paused').id, true);
 
@@ -4869,6 +4896,8 @@ describe('workflowLogsCommand', () => {
     expect(stderrText()).toContain(`Following transcript: ${transcriptPath}`);
     expect(workflowDb.updateWorkflowRun).not.toHaveBeenCalled();
     expect(workflowDb.failWorkflowRun).not.toHaveBeenCalled();
+    expect(workflowDb.cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(workflowDb.resumeWorkflowRun).not.toHaveBeenCalled();
   });
 
   it('fails if the transcript shrinks behind the current offset', async () => {

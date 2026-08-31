@@ -741,6 +741,22 @@ export function isInsideArchonHome(candidate: string): boolean {
 }
 
 /**
+ * Resolve the durable project root for a persisted run.
+ *
+ * A trusted persisted root preserves the run's original project identity. An
+ * out-of-tree root is stale or corrupt, so readers re-derive the project under
+ * the current ARCHON_HOME when the run still has a codebase row.
+ */
+export function resolveRunStorageRoot(
+  run: { output_root?: string | null },
+  codebase: { kind?: string | null; name: string; default_cwd: string } | null | undefined
+): string | null {
+  if (run.output_root && isInsideArchonHome(run.output_root)) return run.output_root;
+  if (!codebase?.name) return null;
+  return getProjectStoragePaths(resolveProjectStorageKey(codebase, codebase.default_cwd)).root;
+}
+
+/**
  * Compose the output roots from an already-resolved project root — the branch
  * taken when a run recorded its `output_root` at start and must NOT re-derive
  * identity (a renamed codebase would otherwise orphan its artifacts, #1192).

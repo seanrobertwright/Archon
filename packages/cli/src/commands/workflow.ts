@@ -3995,17 +3995,9 @@ interface LeaveBehind {
 }
 
 async function resolveRunTranscriptPath(run: WorkflowRun): Promise<string | null> {
-  if (run.output_root && archonPaths.isInsideArchonHome(run.output_root)) {
-    return archonPaths.getRunLogPathForRoot(run.output_root, run.id);
-  }
-  if (!run.codebase_id) return null;
-
-  const codebase = await codebaseDb.getCodebase(run.codebase_id);
-  if (!codebase) return null;
-  const storage = archonPaths.getProjectStoragePaths(
-    archonPaths.resolveProjectStorageKey(codebase, codebase.default_cwd)
-  );
-  return archonPaths.getRunLogPathForRoot(storage.root, run.id);
+  const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
+  const root = archonPaths.resolveRunStorageRoot(run, codebase);
+  return root ? archonPaths.getRunLogPathForRoot(root, run.id) : null;
 }
 
 async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
