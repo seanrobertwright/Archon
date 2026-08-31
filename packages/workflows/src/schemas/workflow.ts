@@ -39,6 +39,7 @@ export const modelReasoningEffortSchema = z.enum([
   'xhigh',
   'max',
   'ultra',
+  'persistent',
 ]);
 
 export type ModelReasoningEffort = z.infer<typeof modelReasoningEffortSchema>;

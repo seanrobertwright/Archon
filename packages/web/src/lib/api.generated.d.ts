@@ -3433,12 +3433,20 @@ export interface components {
       provider?: string;
       model?: string;
       /** @enum {string} */
-      modelReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+      modelReasoningEffort?:
+        | 'minimal'
+        | 'low'
+        | 'medium'
+        | 'high'
+        | 'xhigh'
+        | 'max'
+        | 'ultra'
+        | 'persistent';
       /** @enum {string} */
       webSearchMode?: 'disabled' | 'cached' | 'live';
       interactive?: boolean;
       /** @enum {string} */
-      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
       thinking?:
         | {
             /** @enum {string} */
@@ -3711,7 +3719,7 @@ export interface components {
         };
       };
       /** @enum {string} */
-      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
       thinking?:
         | {
             /** @enum {string} */

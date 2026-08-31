@@ -118,6 +118,7 @@ export const EFFORT_OPTIONS = [
   'xhigh',
   'max',
   'ultra',
+  'persistent',
 ] as const;
 
 export type EffortOption = (typeof EFFORT_OPTIONS)[number];
@@ -133,6 +134,7 @@ export const CODEX_CONFIG_EFFORT_OPTIONS = [
   'xhigh',
   'max',
   'ultra',
+  'persistent',
 ] as const;
 
 /**

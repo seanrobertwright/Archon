@@ -26,6 +26,9 @@ describe('clampEffort', () => {
   test('clamps down to the nearest supported rung', () => {
     // The top of Archon's ladder means "as deep as this model goes", so it
     // lands on each provider's strongest rung rather than disappearing.
+    expect(clampEffort('persistent', CLAUDE)).toBe('max');
+    expect(clampEffort('persistent', PI)).toBe('max');
+    expect(clampEffort('persistent', COPILOT)).toBe('xhigh');
     expect(clampEffort('ultra', CLAUDE)).toBe('max');
     expect(clampEffort('ultra', PI)).toBe('max');
     expect(clampEffort('ultra', COPILOT)).toBe('xhigh');
