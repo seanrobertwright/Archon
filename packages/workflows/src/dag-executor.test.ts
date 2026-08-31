@@ -84,6 +84,7 @@ import {
   containerCommandName,
   buildSubprocessDockerArgs,
   childOutcomeFromRun,
+  type ExecuteDagWorkflowOptions,
   type RunChildWorkflowFn,
 } from './dag-executor';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
@@ -376,6 +377,69 @@ const minimalConfig: WorkflowConfig = {
   commands: {},
   defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
 };
+
+describe('executeDagWorkflow options type contract', () => {
+  it('requires one named object including workflowModel', () => {
+    const validOptions: ExecuteDagWorkflowOptions = {
+      deps: createMockDeps(),
+      platform: createMockPlatform(),
+      conversationId: 'type-contract',
+      cwd: '/tmp/type-contract',
+      workflow: { name: 'type-contract', nodes: [] },
+      workflowRun: makeWorkflowRun('type-contract'),
+      workflowProvider: 'claude',
+      workflowModel: undefined,
+      artifactsDir: '/tmp/type-contract/artifacts',
+      stateDir: '/tmp/type-contract/state',
+      logDir: '/tmp/type-contract/logs',
+      baseBranch: 'main',
+      docsDir: 'docs',
+      config: minimalConfig,
+    };
+
+    const { workflowModel, ...withoutWorkflowModel } = validOptions;
+    expect(workflowModel).toBeUndefined();
+
+    // @ts-expect-error workflowModel is a required resolved-policy input, even when undefined.
+    const missingWorkflowModel: ExecuteDagWorkflowOptions = withoutWorkflowModel;
+    expect(missingWorkflowModel).not.toHaveProperty('workflowModel');
+
+    const legacyArguments = [
+      validOptions.deps,
+      validOptions.platform,
+      validOptions.conversationId,
+      validOptions.cwd,
+      validOptions.workflow,
+      validOptions.workflowRun,
+      validOptions.workflowProvider,
+      validOptions.workflowModel,
+      validOptions.artifactsDir,
+      validOptions.stateDir,
+      validOptions.logDir,
+      validOptions.baseBranch,
+      validOptions.docsDir,
+      validOptions.config,
+      validOptions.configuredCommandFolder,
+      validOptions.issueContext,
+      validOptions.priorCompletedNodes,
+      validOptions.source,
+      validOptions.aiProfile,
+      validOptions.workflowPreset,
+      validOptions.scopeArtifactsDir,
+      validOptions.execContext,
+      validOptions.containerCtx,
+      validOptions.runChildWorkflow,
+      validOptions.priorUsage,
+      validOptions.priorNodeSessions,
+      validOptions.workflowSourceRoots,
+    ] as const;
+    const legacyCall = (): Promise<string | undefined> => {
+      // @ts-expect-error executeDagWorkflow no longer accepts the positional contract.
+      return executeDagWorkflow(...legacyArguments);
+    };
+    expect(legacyCall).toBeFunction();
+  });
+});
 
 // --- Helpers ---
 
