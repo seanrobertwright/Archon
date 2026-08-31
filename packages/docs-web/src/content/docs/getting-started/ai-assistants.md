@@ -839,7 +839,7 @@ archon ai default codex --scope user
 archon ai default pi openrouter/minimax/minimax-m2 --scope user
 ```
 
-**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: your `default_model` pin (only when your default provider matches the effective provider) → the configured `large` tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when no `large` tier is configured anywhere) → the built-in tier default. Workflow nodes are unaffected — `model: large` keeps meaning the tier.
+**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: your `default_model` pin (only when your default provider matches the effective provider) → the configured `large` tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when no `large` tier is configured anywhere) → the built-in tier default (claude and codex only — other providers have none). Workflow nodes are unaffected — `model: large` keeps meaning the tier.
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
 
@@ -855,4 +855,4 @@ There is no run-wide provider or bare-model shortcut. To replace every default t
 - Once a conversation starts, the assistant type is locked for that conversation
 - `DEFAULT_AI_ASSISTANT` (optional) is used only for new conversations without codebase context
 - Workflows can override the assistant on a per-node basis with `provider` and `model` fields
-- Chat and workflow resolution use different chains. Chat uses the exact chain above, including highest-precedence per-user defaults. Workflows may declare `provider` and `model` at the workflow or node level; tier and alias references resolve from per-user preferences over repo and global config, then built-in defaults. Literal model IDs pass unchanged to the selected provider SDK.
+- Chat and workflow resolution use different chains. Chat uses the exact chain above, including highest-precedence per-user defaults. Workflows may declare `provider` and `model` at the workflow or node level; tier and alias references resolve from per-user preferences over repo and global config, then built-in defaults (claude and codex only; any other provider must configure the tiers it uses). Literal model IDs pass unchanged to the selected provider SDK.
