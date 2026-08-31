@@ -1,0 +1,53 @@
+# Exec-code fixture: validate produced green on the corrected tree, gate-validated
+# runs the real gate-green script and passes. This path is what a resume delivers
+# after the `always_run: true` opt-out: validate re-runs on resume, produces a fresh
+# verdict from the current tree, and the gate reads live evidence instead of the
+# stale red report that dead-ended the prior run.
+#
+# Without `always_run` on the validate node, a resume would skip validate and replay
+# its stale red output through this gate — the bug recorded in issue #3092.
+#
+# This fixture covers the exec-code green path through gate-validated. The red paths
+# through the same gate with exec-code are covered by the validate-red*.stubs.yaml
+# fixtures.
+impl__record-start: '{"start":"recorded"}'
+impl__implement:
+  done: true
+  green: true
+  summary: "stub: implemented and green"
+impl__assert-changed: "3 files changed"
+gate-green: '{"gate":"green"}'
+pr__pr: { number: 2, url: "https://github.com/example/repo/pull/2", head: "fixture-branch", base: "dev", is_draft: true }
+review__mode: '{"continuation":false}'
+review__scope: "PR diff in scope; head sha stubbed"
+review__code: "0 findings"
+review__seams: "0 findings"
+review__simplify: "0 findings"
+review__tests: "0 findings"
+review__review-complete: "settled"
+review__synthesize:
+  ready: true
+  action: none
+  findings_summary: "stub: clean on initial review"
+review-action: '{"ready":true,"action":"none"}'
+gate-ready: '{"ready":"true"}'
+validate__validate:
+  green: true
+  red_cause: ""
+  summary: "stub: full gate green — the tree was corrected"
+# gate-validated is deliberately unstubbed: the real gate-green script runs
+# (exec-code: true) and proves it passes on a green validate verdict.
+ci-probe: '{"state":"concluded","detail":"no checks configured on this repository — nothing to await"}'
+ci-verdict: '{"state":"concluded","detail":"no checks configured on this repository — nothing to await"}'
+flip-ready: "https://github.com/example/repo/pull/2"
+outcome: "https://github.com/example/repo/pull/2"
+classify:
+  errors: false
+  docs: false
+  reasons:
+    errors: "stub: no failure paths"
+    docs: "stub: no doc-facing changes"
+resolve-scope: '{"errors":"false"}'
+fixture:
+  expect: completed
+exec-code: true
