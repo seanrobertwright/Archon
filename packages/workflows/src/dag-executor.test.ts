@@ -61,7 +61,7 @@ import {
   getProviderCapabilities,
 } from '@archon/providers';
 import type { SendQueryOptions } from '@archon/providers';
-import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
+import { mergeTokenUsage, type MessageChunk, type TokenUsage } from '@archon/providers/types';
 clearRegistry();
 registerBuiltinProviders();
 // Pi is a community provider (best-effort structured output) — register it so the
@@ -12444,6 +12444,145 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     );
     expect(nodeCompletedEvents.length).toBe(0);
     expect(store.failWorkflowRun).toHaveBeenCalled();
+    const transcript = await readTranscript(join(testDir, 'logs'), workflowRun.id);
+    expect(transcript.filter(event => event.type === 'watchdog_reset')).toHaveLength(0);
+    expect(failedData.error).toContain('No provider chunk reset the watchdog');
+  });
+
+  it('a thinking-only stream renews the watchdog and persists a type-only timeout diagnostic', async () => {
+    const privateThinking = 'reasoning that must not be logged';
+    let yielded = 0;
+    mockSendQueryDag.mockImplementation(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: { abortSignal?: AbortSignal }
+    ) {
+      for (let i = 0; i < 3; i++) {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        if (options?.abortSignal?.aborted) return;
+        yielded++;
+        yield { type: 'thinking', content: `${privateThinking} ${String(i)}` };
+      }
+      await new Promise<void>(resolve => {
+        if (options?.abortSignal?.aborted) resolve();
+        else options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+
+    const store = createMockStore();
+    const workflowRun = makeWorkflowRun('thinking-only-timeout');
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: {
+          name: 'thinking-only-timeout',
+          nodes: [
+            {
+              id: 'review',
+              kind: 'agent',
+              source: { kind: 'command', name: 'my-cmd' },
+              idle_timeout: 70,
+              retry: { max_attempts: 0 },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    expect(yielded).toBe(3);
+    const transcript = await readTranscript(join(testDir, 'logs'), workflowRun.id);
+    const resetEvents = transcript.filter(event => event.type === 'watchdog_reset');
+    expect(resetEvents).toHaveLength(3);
+    expect(resetEvents.map(event => event.chunk_type)).toEqual([
+      'thinking',
+      'thinking',
+      'thinking',
+    ]);
+    expect(resetEvents.every(event => !('content' in event))).toBe(true);
+    expect(resetEvents.every(event => !Number.isNaN(Date.parse(String(event.ts))))).toBe(true);
+    expect(JSON.stringify(transcript)).not.toContain(privateThinking);
+
+    const failed = transcript.find(event => event.type === 'node_error' && event.step === 'review');
+    expect(failed?.error).toContain("chunk type 'thinking'");
+  });
+
+  it('loop timeout diagnostics distinguish tool progress from assistant output', async () => {
+    const runCase = async (
+      runId: string,
+      chunk: MessageChunk
+    ): Promise<{ transcript: Array<Record<string, unknown>>; error: string }> => {
+      mockSendQueryDag.mockImplementationOnce(async function* (
+        _prompt: string,
+        _cwd: string,
+        _resumeSessionId?: string,
+        options?: { abortSignal?: AbortSignal }
+      ) {
+        yield chunk;
+        await new Promise<void>(resolve => {
+          if (options?.abortSignal?.aborted) resolve();
+          else options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      });
+
+      const store = createMockStore();
+      const workflowRun = makeWorkflowRun(runId);
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          cwd: testDir,
+          workflow: {
+            name: runId,
+            nodes: [
+              {
+                id: 'implement',
+                kind: 'loop',
+                output_format: {
+                  type: 'object',
+                  properties: { done: { type: 'boolean' } },
+                  required: ['done'],
+                },
+                loop: {
+                  fresh_context: false,
+                  prompt: 'Implement the change.',
+                  max_iterations: 1,
+                  until_field: 'done',
+                },
+                idle_timeout: 50,
+              },
+            ],
+          },
+          workflowRun,
+        })
+      );
+
+      const transcript = await readTranscript(join(testDir, 'logs'), workflowRun.id);
+      const failed = transcript.find(event => event.type === 'node_error');
+      return { transcript, error: String(failed?.error) };
+    };
+
+    const tool = await runCase('loop-tool-timeout', {
+      type: 'tool',
+      toolName: 'Bash',
+      toolInput: { command: 'private tool input' },
+    });
+    const assistant = await runCase('loop-assistant-timeout', {
+      type: 'assistant',
+      content: 'user-visible output',
+    });
+
+    const toolReset = tool.transcript.filter(event => event.type === 'watchdog_reset');
+    const assistantReset = assistant.transcript.filter(event => event.type === 'watchdog_reset');
+    expect(toolReset.map(event => event.chunk_type)).toEqual(['tool']);
+    expect(assistantReset.map(event => event.chunk_type)).toEqual(['assistant']);
+    expect(toolReset.every(event => !('content' in event) && !('tool_input' in event))).toBe(true);
+    expect(assistantReset.every(event => !('content' in event))).toBe(true);
+    expect(tool.error).toContain("chunk type 'tool'");
+    expect(assistant.error).toContain("chunk type 'assistant'");
+    expect(tool.transcript.some(event => event.type === 'assistant')).toBe(false);
+    expect(assistant.transcript.some(event => event.type === 'assistant')).toBe(true);
   });
 
   it('idle-timeout with zero output fails a loop iteration instead of consuming its iteration budget', async () => {
