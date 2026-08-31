@@ -63,18 +63,23 @@ void isSlackUserAuthorized;
 
 // ─── Test doubles for the SlackAdapter ────────────────────────────────────
 
+interface SlackBlock {
+  type?: string;
+  elements?: Array<{ action_id?: string; text?: string }>;
+}
+
 interface PostedMessage {
   channel: string;
   thread_ts?: string;
   text?: string;
-  blocks?: unknown[];
+  blocks?: SlackBlock[];
 }
 
 interface UpdatedMessage {
   channel: string;
   ts: string;
   text?: string;
-  blocks?: unknown[];
+  blocks?: SlackBlock[];
 }
 
 interface ReactionCall {
@@ -248,9 +253,7 @@ describe('SlackWorkflowBridge', () => {
     const approval = posted[posted.length - 1];
     expect(approval?.thread_ts).toBe('111.0');
     expect(approval?.text).toContain('Approval needed');
-    const actionsBlock = (approval?.blocks ?? []).find(
-      (b: { type?: string }) => b?.type === 'actions'
-    ) as { elements?: Array<{ action_id?: string }> } | undefined;
+    const actionsBlock = (approval?.blocks ?? []).find(block => block.type === 'actions');
     expect(actionsBlock?.elements?.[0]?.action_id).toBe('approve:r1:review');
     expect(actionsBlock?.elements?.[1]?.action_id).toBe('reject:r1:review');
   });
@@ -476,9 +479,7 @@ describe('SlackWorkflowBridge', () => {
       name: 'white_check_mark',
     });
     expect(updated.length).toBeGreaterThan(0);
-    const ctx = (updated[updated.length - 1]?.blocks ?? []).find(
-      (b: { type?: string }) => b?.type === 'context'
-    ) as { elements?: Array<{ text?: string }> } | undefined;
+    const ctx = (updated[updated.length - 1]?.blocks ?? []).find(block => block.type === 'context');
     expect(ctx?.elements?.[0]?.text).toContain('total cost: $0.0234');
   });
 
@@ -507,9 +508,7 @@ describe('SlackWorkflowBridge', () => {
       timestamp: '111.0',
       name: 'x',
     });
-    const ctx = (updated[updated.length - 1]?.blocks ?? []).find(
-      (b: { type?: string }) => b?.type === 'context'
-    ) as { elements?: Array<{ text?: string }> } | undefined;
+    const ctx = (updated[updated.length - 1]?.blocks ?? []).find(block => block.type === 'context');
     expect(ctx?.elements?.[0]?.text).toContain('plan node crashed');
   });
 });
