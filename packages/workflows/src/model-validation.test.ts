@@ -18,6 +18,7 @@ import {
   type ModelAliasPreset,
   type ResolvedAiProfile,
 } from './model-validation';
+import builtInTierDefaults from './defaults/tier-defaults.json';
 
 // The effort helpers read `effortControl` off the provider registry, so the
 // registry has to be populated the way a real entrypoint populates it.
@@ -45,11 +46,24 @@ describe('buildAiProfile — tier defaults', () => {
     expect(profile.aliases.large?.provider).toBe('claude');
   });
 
-  test('preserves effort from tier defaults (codex)', () => {
-    const profile = buildAiProfile('codex');
-    expect(profile.aliases.small?.effort).toBe('minimal');
-    expect(profile.aliases.medium?.effort).toBe('medium');
-    expect(profile.aliases.large?.effort).toBe('high');
+  test('built-in tier defaults mirror tier-defaults.json, provider injected', () => {
+    // Derived from the owning JSON, never restated by hand: a defaults bump
+    // must not require editing this test.
+    for (const [provider, tiers] of Object.entries(builtInTierDefaults)) {
+      const profile = buildAiProfile(provider);
+      for (const tier of TIER_NAMES) {
+        // Built-in defaults are deliberately effort-free: the provider's own
+        // default reasoning applies until an install configures a tier.
+        expect(profile.aliases[tier]).toEqual({ provider, model: tiers[tier].model });
+      }
+    }
+  });
+
+  test('only claude and codex ship built-in tier defaults', () => {
+    expect(Object.keys(builtInTierDefaults).sort()).toEqual(['claude', 'codex']);
+    for (const provider of ['pi', 'opencode', 'copilot']) {
+      expect(Object.keys(buildAiProfile(provider).aliases)).toEqual([]);
+    }
   });
 
   test('unknown provider yields empty alias map (no tier defaults)', () => {

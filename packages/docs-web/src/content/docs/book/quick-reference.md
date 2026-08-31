@@ -193,7 +193,7 @@ Defined under `loop:` inside a node:
 |-------|----------|------|-------------|
 | `prompt` | One of `prompt`/`command` | string | Inline AI instructions executed each iteration |
 | `command` | One of `prompt`/`command` | string | Package-local or shared command whose body is the iteration prompt — exactly one of `prompt` or `command` |
-| `until` | One channel required | string | Completion signal string — loop ends when AI output contains this. Omit it for a deterministic or structured loop: with no signal declared, nothing matches prose |
+| `until` | One channel required | string | Deprecated prose completion signal — use `<promise>SIGNAL</promise>` or a final line containing only `SIGNAL`. Omit it for a deterministic or structured loop: with no signal declared, nothing matches prose |
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | Start a new session each iteration (default: false) |
 | `until_bash` | One channel required | string | Shell script run after each iteration; exit 0 signals completion. Skipped once a cheaper channel already fired |
@@ -207,7 +207,7 @@ Defined under `loop:` inside a node:
 ```yaml
 - id: refine
   loop:
-    prompt: "Review the current draft and improve it. Output COMPLETE when done."
+    prompt: "Review the current draft and improve it. Output <promise>COMPLETE</promise> when done."
     until: "COMPLETE"
     max_iterations: 5
 ```

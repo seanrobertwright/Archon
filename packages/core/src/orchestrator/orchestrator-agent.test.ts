@@ -5931,7 +5931,7 @@ describe('resolveChatModelRequest', () => {
       emptyConfig
     );
     expect(req.provider).toBe('codex');
-    expect(req.model).toBe('gpt-5.5'); // built-in codex large tier
+    expect(req.model).toBe(profile.aliases.large?.model); // built-in codex large tier
     expect(req.matchedTier).toBe('large');
   });
 
@@ -6060,10 +6060,24 @@ describe('resolveTitleRequest', () => {
 
     expect(req.provider).toBe('codex');
     // Built-in codex small tier — NOT the (ChatGPT-plan-unsupported) assistants default.
-    expect(req.options.model).toBe('gpt-5.5');
-    // #2556: preset effort rides the one nodeConfig channel on every provider;
-    // assistantConfig carries only what config.yaml put there.
+    expect(req.options.model).toBe(buildAiProfile('codex').aliases.small?.model);
     expect(req.options.assistantConfig).toEqual({ model: 'gpt-5.3-codex' });
+    // Built-in tiers carry no effort — the provider's default reasoning applies.
+    expect(req.options.nodeConfig).toBeUndefined();
+  });
+
+  // #2556: preset effort rides the one nodeConfig channel on every provider.
+  // Built-in tiers no longer carry effort, so the pin uses a configured tier.
+  test('a configured tier effort rides nodeConfig (#2556)', async () => {
+    mockLoadConfig.mockResolvedValueOnce({
+      assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
+      tiers: { small: { provider: 'codex', model: 'test-small-model', effort: 'minimal' } },
+      envVars: {},
+    });
+
+    const req = await resolveTitleRequest('codex');
+
+    expect(req.options.model).toBe('test-small-model');
     expect(req.options.nodeConfig).toEqual({ effort: 'minimal' });
   });
 
@@ -6072,6 +6086,11 @@ describe('resolveTitleRequest', () => {
   // tier means different depths in a workflow and in a chat turn — so the
   // rejection is pinned on both sides, not just the acceptance.
   test('drops a tier effort when the resolved provider has no reasoning control', async () => {
+    mockLoadConfig.mockResolvedValueOnce({
+      assistants: { claude: {}, codex: { model: 'gpt-5.3-codex' } },
+      tiers: { small: { provider: 'codex', model: 'test-small-model', effort: 'minimal' } },
+      envVars: {},
+    });
     const providers = await import('@archon/providers');
     const capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
     capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, effortControl: false });
@@ -6079,7 +6098,7 @@ describe('resolveTitleRequest', () => {
     try {
       const req = await resolveTitleRequest('codex');
 
-      expect(req.options.model).toBe('gpt-5.5');
+      expect(req.options.model).toBe('test-small-model');
       // The tier still selects the model; only its effort is dropped, and it is
       // not quietly written onto the other channel either.
       expect(req.options.nodeConfig?.effort).toBeUndefined();
@@ -6138,7 +6157,7 @@ describe('resolveTitleRequest', () => {
     const req = await resolveTitleRequest('codex', 'user-1');
 
     expect(req.provider).toBe('codex');
-    expect(req.options.model).toBe('gpt-5.5');
+    expect(req.options.model).toBe(buildAiProfile('codex').aliases.small?.model);
   });
 
   test('NEVER throws — config load failure falls back to the bare legacy request', async () => {
