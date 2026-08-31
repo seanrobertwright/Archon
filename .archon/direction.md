@@ -72,6 +72,9 @@ Providers and platform integrations change faster than Archon's core. Community 
 - **Existing bundled community integrations are a transition state, not the extension pattern.** They may receive focused compatibility, correctness, and security fixes. Do not add another bundled community provider or adapter, or substantially expand one, until its external plugin contract and loading path exist. Migration of existing integrations can happen incrementally after those seams are proven.
 - **Build the seams in evidence order.** The forge contract in #2963 goes first, followed by chat/platform and provider contracts. A focused seam does not need to build a generic plugin framework or marketplace before it can prove its runtime contract, but its package shape must not block the shared distribution model that follows.
 
+- **Built-in does not mean bundled.** Archon maintains the Claude, Codex, and Pi providers in this repository and does not install their SDKs by default. An install selects the providers it needs — one, several, or all — and community plugins arrive through the same selection mechanism. Maintenance ownership and distribution are separate decisions: being maintained here earns a provider correctness and parity work, not a place in every install's dependency tree.
+- **Maintained providers hold parity with each other.** A user who selects Codex should not get worse diagnostics, resolution, or configuration handling than one who selects Claude. A fix that lands on one maintained provider and not its siblings is drift on the path, not a scoping choice.
+
 Archon maintains the provider and platform integrations it explicitly designates as built-ins. Listing a community plugin is curation and discovery, not a transfer of maintenance responsibility.
 
 When citing this policy in a PR comment: `direction.md §community-plugins`.
@@ -113,6 +116,7 @@ These are direction calls we haven't made. PRs that touch these areas should sur
 
 - **License posture.** Whether Archon stays MIT or moves to a fair-code/source-available license (and adopts a CLA) for a future hosted/enterprise offering is undecided — deferred to the maintainers. PRs that assume either posture are premature.
 - **Workflow result surfaces.** The Web UI should render useful, actionable workflow outcomes and demonstrate the same capability for user-built UIs. The contract is unsettled: structured JSON and known renderers, sandboxed HTML, a view manifest, or another narrow form. Settle the trust boundary, portable schema, action authorization, and audit behavior before adding workflow-specific UI branches.
+- **Provider selection on a fresh install.** Built-ins are maintained but not bundled; what a brand-new install resolves to before the user has chosen is undecided. Options include failing loudly with a selection prompt, resolving whatever provider CLI is already on the machine, or a named default. Settle it against "core plus CLI is a complete local install" — an install that cannot run a workflow until a second download is not complete, and a silent default that spends on an unintended provider is worse.
 - **Workflow authoring.** The current visual builder remains an experiment. An agent writing YAML with a rendered DAG may be the smaller product. Decide from real authoring use; do not make legacy-UI removal depend on this choice or move Web-owned editor vocabulary into the engine meanwhile.
 
 ---
