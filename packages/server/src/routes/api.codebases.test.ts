@@ -22,7 +22,10 @@ const mockGetCodebase = mock(
       updated_at: string;
     }
 );
-const mockListCodebases = mock(async () => [] as (typeof MOCK_CODEBASE)[]);
+type MockCodebase = Omit<typeof MOCK_CODEBASE, 'repository_url'> & {
+  repository_url: string | null;
+};
+const mockListCodebases = mock(async () => [] as MockCodebase[]);
 const mockDeleteCodebase = mock(async (_id: string) => {});
 const mockCloneRepository = mock(async (_url: string) => ({
   codebaseId: 'clone-uuid-1',

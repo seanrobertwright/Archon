@@ -32,10 +32,13 @@ const mockAddMessage = mock(
     role: _role,
     content: _content,
     metadata: '{}',
+    user_id: null,
     created_at: new Date().toISOString(),
   })
 );
-const mockListMessages = mock(async (_conversationId: string, _limit?: number) => []);
+const mockListMessages = mock<(typeof import('@archon/core/db/messages'))['listMessages']>(
+  async () => []
+);
 const mockHandleMessage = mock(async () => {});
 
 mock.module('@archon/core', () => ({
@@ -179,6 +182,7 @@ const MOCK_MESSAGES = [
     role: 'user' as const,
     content: 'Hello there',
     metadata: '{}',
+    user_id: null,
     created_at: new Date().toISOString(),
   },
   {
@@ -187,6 +191,7 @@ const MOCK_MESSAGES = [
     role: 'assistant' as const,
     content: 'Hi! How can I help?',
     metadata: '{"toolCalls":[]}',
+    user_id: null,
     created_at: new Date().toISOString(),
   },
 ];
@@ -228,6 +233,7 @@ describe('POST /api/conversations/:id/message', () => {
       role: 'user' as const,
       content: 'Hello',
       metadata: '{}',
+      user_id: null,
       created_at: new Date().toISOString(),
     }));
     mockHandleMessage.mockImplementationOnce(async () => {});
@@ -253,6 +259,7 @@ describe('POST /api/conversations/:id/message', () => {
       role: 'user' as const,
       content: 'Test message',
       metadata: '{}',
+      user_id: null,
       created_at: new Date().toISOString(),
     }));
     mockHandleMessage.mockImplementationOnce(async () => {});
@@ -384,6 +391,7 @@ describe('GET /api/conversations/:id/messages', () => {
         content: 'Response',
         // Simulate PostgreSQL returning JSONB as an object
         metadata: { toolCalls: [{ name: 'bash' }] } as unknown as string,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -412,6 +420,7 @@ describe('GET /api/conversations/:id/messages', () => {
         content: 'Response',
         // Simulate unserializable metadata from PostgreSQL JSONB
         metadata: circular as unknown as string,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -502,6 +511,7 @@ describe('GET /api/conversations/:id/messages — tool output bounding', () => {
         role: 'assistant' as const,
         content: '',
         metadata: storedMetadata,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -535,6 +545,7 @@ describe('GET /api/conversations/:id/messages — tool output bounding', () => {
         role: 'assistant' as const,
         content: '',
         metadata,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);
@@ -556,6 +567,7 @@ describe('GET /api/conversations/:id/messages — tool output bounding', () => {
         role: 'assistant' as const,
         content: 'Done.',
         metadata,
+        user_id: null,
         created_at: new Date().toISOString(),
       },
     ]);

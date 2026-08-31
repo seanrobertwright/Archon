@@ -122,8 +122,8 @@ const mockStartOAuth = mock(async (_userId: string, provider: string) => ({
   url: `https://auth/${provider}`,
   expiresIn: 600,
 }));
-const mockPollOAuth = mock((_sessionId: string, _userId: string, _code?: string) => ({
-  status: 'pending' as const,
+const mockPollOAuth = mock<(typeof import('@archon/core'))['pollOAuth']>(() => ({
+  status: 'pending',
 }));
 
 mock.module('@archon/core', () => ({
@@ -287,7 +287,13 @@ describe('GET /api/auth/providers', () => {
     const body = (await res.json()) as {
       enabled: boolean;
       available: string[];
-      agents: { id: string; catalog: string; ready: boolean }[];
+      agents: {
+        id: string;
+        displayName: string;
+        catalog: string;
+        ready: boolean;
+        credentials: unknown[];
+      }[];
     };
     expect(body.enabled).toBe(false);
     expect(body.available.length).toBeGreaterThan(0);

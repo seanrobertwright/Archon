@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
@@ -21,9 +22,24 @@ beforeAll(async (): Promise<void> => {
 
 const mockGetWorkflowRun = mock(async (_id: string) => null as null | MockWorkflowRun);
 const mockCancelWorkflowRun = mock(async (_id: string) => ({ cancelled: true }));
-const mockListWorkflowRuns = mock(async () => [] as MockWorkflowRun[]);
-const mockListDashboardRuns = mock(async () => ({
-  runs: [] as MockWorkflowRun[],
+type ListWorkflowRunsOptions = Parameters<
+  (typeof import('@archon/core/db/workflows'))['listWorkflowRuns']
+>[0];
+type ListDashboardRunsOptions = Parameters<
+  (typeof import('@archon/core/db/workflows'))['listDashboardRuns']
+>[0];
+
+const mockListWorkflowRuns = mock<
+  (_options?: ListWorkflowRunsOptions) => Promise<MockWorkflowRun[]>
+>(async () => []);
+const mockListDashboardRuns = mock<
+  (_options?: ListDashboardRunsOptions) => Promise<{
+    runs: MockWorkflowRun[];
+    total: number;
+    counts: Record<string, number>;
+  }>
+>(async () => ({
+  runs: [],
   total: 0,
   counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
 }));
@@ -49,7 +65,7 @@ const mockFindConversationByPlatformId = mock(
       codebase_id: string | null;
     }
 );
-const mockHandleMessage = mock(async () => {});
+const mockHandleMessage = mock<(typeof import('@archon/core'))['handleMessage']>(async () => {});
 const mockAddMessage = mock(async () => ({
   id: 'msg-1',
   conversation_id: 'conv-1',
@@ -65,20 +81,9 @@ const mockResolveTitleRequest = mock(async () => ({
 }));
 
 // Type aliases for clarity in tests
-type MockWorkflowRun = {
-  id: string;
-  workflow_name: string;
-  conversation_id: string | null;
-  parent_conversation_id: string | null;
-  codebase_id: string | null;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
-  outcome: 'succeeded' | 'failed' | null;
-  user_message: string;
-  started_at: string;
-  completed_at: string | null;
-  metadata: Record<string, unknown>;
-  working_path: string | null;
-  last_activity_at: string | null;
+type MockWorkflowRun = Omit<WorkflowRun, 'conversation_id' | 'last_activity_at'> & {
+  conversation_id: WorkflowRun['conversation_id'] | null;
+  last_activity_at: WorkflowRun['last_activity_at'] | undefined;
 };
 
 type MockWorkflowEvent = {
@@ -353,21 +358,17 @@ mock.module('@archon/core/handlers', () => ({
   resolveRunContinuation: mockResolveRunContinuation,
 }));
 
-type MockHydrated = {
-  preCreatedRun: unknown;
-  priorCompletedNodes: Map<string, unknown>;
-  priorUsage: { costUsd: number };
-  priorNodeSessions: unknown[];
-} | null;
-const mockHydrateResumableRun = mock(
-  async (_deps: unknown, run: MockWorkflowRun): Promise<MockHydrated> => ({
-    preCreatedRun: { ...run, status: 'running' },
-    priorCompletedNodes: new Map(),
-    priorUsage: { costUsd: 0 },
-    priorNodeSessions: [],
-  })
+const mockHydrateResumableRun = mock<
+  (typeof import('@archon/workflows/executor'))['hydrateResumableRun']
+>(async (_deps, run) => ({
+  preCreatedRun: { ...run, status: 'running' },
+  priorCompletedNodes: new Map(),
+  priorUsage: { costUsd: 0 },
+  priorNodeSessions: [],
+}));
+const mockExecuteWorkflow = mock<(typeof import('@archon/workflows/executor'))['executeWorkflow']>(
+  async () => ({ success: true, workflowRunId: 'run-1' })
 );
-const mockExecuteWorkflow = mock(async () => ({}) as unknown);
 mock.module('@archon/workflows/executor', () => ({
   hydrateResumableRun: mockHydrateResumableRun,
   executeWorkflow: mockExecuteWorkflow,
@@ -380,6 +381,7 @@ import { registerApiRoutes } from './api';
 // ---------------------------------------------------------------------------
 
 const NOW = new Date().toISOString();
+const NOW_DATE = new Date(NOW);
 
 const MOCK_RUNNING_RUN: MockWorkflowRun = {
   id: 'run-uuid-1',
@@ -390,11 +392,15 @@ const MOCK_RUNNING_RUN: MockWorkflowRun = {
   status: 'running',
   outcome: null,
   user_message: 'Deploy to staging',
-  started_at: NOW,
+  started_at: NOW_DATE,
   completed_at: null,
   metadata: {},
   working_path: '/tmp/worktrees/feature',
-  last_activity_at: NOW,
+  last_activity_at: NOW_DATE,
+  user_id: null,
+  parent_run_id: null,
+  adopted_from_run_id: null,
+  output_root: null,
 };
 
 const MOCK_COMPLETED_RUN: MockWorkflowRun = {
@@ -402,7 +408,7 @@ const MOCK_COMPLETED_RUN: MockWorkflowRun = {
   id: 'run-uuid-2',
   status: 'completed',
   outcome: 'failed',
-  completed_at: NOW,
+  completed_at: NOW_DATE,
 };
 
 const MOCK_FAILED_RUN: MockWorkflowRun = {
@@ -410,7 +416,7 @@ const MOCK_FAILED_RUN: MockWorkflowRun = {
   id: 'run-uuid-4',
   status: 'failed',
   outcome: 'succeeded',
-  completed_at: NOW,
+  completed_at: NOW_DATE,
 };
 
 const MOCK_PENDING_RUN: MockWorkflowRun = {
@@ -770,7 +776,7 @@ describe('POST /api/workflows/:name/run', () => {
       body: JSON.stringify({ conversationId: 'web-test-abc', message: 'Go' }),
     });
 
-    const ctx = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    const ctx = mockHandleMessage.mock.calls[0]?.[3];
     expect(ctx).not.toHaveProperty('workflowInputs');
   });
 
@@ -811,7 +817,7 @@ describe('POST /api/workflows/:name/run', () => {
     });
     expect(response.status).toBe(200);
 
-    const ctx = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
+    const ctx = mockHandleMessage.mock.calls[0]?.[3];
     expect(ctx).not.toHaveProperty('workflowInputs');
   });
 
@@ -907,8 +913,8 @@ describe('POST /api/workflows/:name/run', () => {
     });
 
     expect(response.status).toBe(200);
-    const context = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
-    expect(context.workflowModelOverrides).toEqual({
+    const context = mockHandleMessage.mock.calls[0]?.[3];
+    expect(context?.workflowModelOverrides).toEqual({
       tiers: { large: 'openai/gpt-5.6' },
       aliases: { '@planner': 'codex/gpt-5.6-sol' },
     });
@@ -983,8 +989,8 @@ describe('POST /api/workflows/:name/run', () => {
     });
 
     expect(response.status).toBe(200);
-    const context = mockHandleMessage.mock.calls[0][3] as Record<string, unknown>;
-    expect(context.workflowRunConfig).toEqual({
+    const context = mockHandleMessage.mock.calls[0]?.[3];
+    expect(context?.workflowRunConfig).toEqual({
       source: { kind: 'http', label: 'inline' },
       layer: { docsPath: 'handbook' },
     });
@@ -1200,7 +1206,7 @@ describe('GET /api/workflows/runs', () => {
         ...MOCK_RUNNING_RUN,
         started_at: now,
         completed_at: null,
-        last_activity_at: undefined as unknown as string,
+        last_activity_at: undefined,
       },
     ]);
 
@@ -1222,9 +1228,7 @@ describe('GET /api/workflows/runs', () => {
     const { app } = makeApp();
     await app.request('/api/workflows/runs?status=running');
 
-    const [[callArgs]] = mockListWorkflowRuns.mock.calls as [
-      [{ status?: string; limit?: number }],
-    ][];
+    const [callArgs] = mockListWorkflowRuns.mock.calls[0] ?? [];
     expect(callArgs?.status).toBe('running');
   });
 
@@ -1234,9 +1238,7 @@ describe('GET /api/workflows/runs', () => {
     const { app } = makeApp();
     await app.request('/api/workflows/runs?status=invalid_status');
 
-    const [[callArgs]] = mockListWorkflowRuns.mock.calls as [
-      [{ status?: string; limit?: number }],
-    ][];
+    const [callArgs] = mockListWorkflowRuns.mock.calls[0] ?? [];
     expect(callArgs?.status).toBeUndefined();
   });
 
@@ -1246,7 +1248,7 @@ describe('GET /api/workflows/runs', () => {
     const { app } = makeApp();
     await app.request('/api/workflows/runs?conversationId=conv-123');
 
-    const [[callArgs]] = mockListWorkflowRuns.mock.calls as [[{ conversationId?: string }]][];
+    const [callArgs] = mockListWorkflowRuns.mock.calls[0] ?? [];
     expect(callArgs?.conversationId).toBe('conv-123');
   });
 
@@ -1256,7 +1258,7 @@ describe('GET /api/workflows/runs', () => {
     const { app } = makeApp();
     await app.request('/api/workflows/runs?codebaseId=cb-uuid-1');
 
-    const [[callArgs]] = mockListWorkflowRuns.mock.calls as [[{ codebaseId?: string }]][];
+    const [callArgs] = mockListWorkflowRuns.mock.calls[0] ?? [];
     expect(callArgs?.codebaseId).toBe('cb-uuid-1');
   });
 
@@ -1266,7 +1268,7 @@ describe('GET /api/workflows/runs', () => {
     const { app } = makeApp();
     await app.request('/api/workflows/runs?limit=9999');
 
-    const [[callArgs]] = mockListWorkflowRuns.mock.calls as [[{ limit?: number }]][];
+    const [callArgs] = mockListWorkflowRuns.mock.calls[0] ?? [];
     expect(callArgs?.limit).toBeLessThanOrEqual(200);
   });
 
@@ -1276,7 +1278,7 @@ describe('GET /api/workflows/runs', () => {
     const { app } = makeApp();
     await app.request('/api/workflows/runs');
 
-    const [[callArgs]] = mockListWorkflowRuns.mock.calls as [[{ limit?: number }]][];
+    const [callArgs] = mockListWorkflowRuns.mock.calls[0] ?? [];
     expect(callArgs?.limit).toBe(50);
   });
 
@@ -1311,6 +1313,7 @@ describe('GET /api/workflows/runs/:runId', () => {
     mockGetConversationById.mockImplementationOnce(async () => ({
       id: 'conv-uuid-1',
       platform_conversation_id: 'web-conv-abc',
+      platform_type: 'web',
     }));
 
     const { app } = makeApp();
@@ -1346,6 +1349,7 @@ describe('GET /api/workflows/runs/:runId', () => {
     mockGetConversationById.mockImplementationOnce(async () => ({
       id: 'conv-uuid-1',
       platform_conversation_id: 'web-conv-abc',
+      platform_type: 'web',
     }));
 
     const { app } = makeApp();
@@ -1368,6 +1372,7 @@ describe('GET /api/workflows/runs/:runId', () => {
     mockGetConversationById.mockImplementationOnce(async () => ({
       id: 'conv-uuid-1',
       platform_conversation_id: 'cli-conv-xyz',
+      platform_type: 'cli',
     }));
 
     const { app } = makeApp();
@@ -1396,11 +1401,13 @@ describe('GET /api/workflows/runs/:runId', () => {
     mockGetConversationById.mockImplementationOnce(async () => ({
       id: 'conv-uuid-1',
       platform_conversation_id: 'worker-platform-id',
+      platform_type: 'web',
     }));
     // Second call: parent conversation
     mockGetConversationById.mockImplementationOnce(async () => ({
       id: 'parent-conv-uuid',
       platform_conversation_id: 'parent-platform-id',
+      platform_type: 'web',
     }));
 
     const { app } = makeApp();
@@ -1492,7 +1499,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?status=running');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ status?: string }]][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.status).toBe('running');
   });
 
@@ -1506,7 +1513,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?status=paused');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ status?: string }]][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.status).toBe('paused');
   });
 
@@ -1520,7 +1527,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?status=bogus');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ status?: string }]][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.status).toBeUndefined();
   });
 
@@ -1534,7 +1541,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?codebaseId=cb-1');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ codebaseId?: string }]][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.codebaseId).toBe('cb-1');
   });
 
@@ -1548,7 +1555,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?search=deploy');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ search?: string }]][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.search).toBe('deploy');
   });
 
@@ -1562,9 +1569,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?after=2024-01-01T00:00:00Z&before=2024-12-31T23:59:59Z');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [
-      [{ after?: string; before?: string }],
-    ][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.after).toBe('2024-01-01T00:00:00Z');
     expect(callArgs?.before).toBe('2024-12-31T23:59:59Z');
   });
@@ -1579,7 +1584,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?limit=9999');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ limit?: number }]][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.limit).toBeLessThanOrEqual(200);
   });
 
@@ -1593,7 +1598,7 @@ describe('GET /api/dashboard/runs', () => {
     const { app } = makeApp();
     await app.request('/api/dashboard/runs?offset=50');
 
-    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ offset?: number }]][];
+    const [callArgs] = mockListDashboardRuns.mock.calls[0] ?? [];
     expect(callArgs?.offset).toBe(50);
   });
 
@@ -1690,7 +1695,7 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     expect(mockGetConversationById).not.toHaveBeenCalled();
     expect(mockHydrateResumableRun).toHaveBeenCalledTimes(1);
     expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
-    const [, , , cwd] = mockExecuteWorkflow.mock.calls[0] as [unknown, unknown, unknown, string];
+    const cwd = mockExecuteWorkflow.mock.calls[0]?.[3];
     expect(cwd).toBe('/tmp/worktrees/run-uuid-4');
   });
 
@@ -1777,11 +1782,7 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
 
     // dispatchToOrchestrator → lockManager → handleMessage
     expect(mockHandleMessage).toHaveBeenCalled();
-    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] as [
-      unknown,
-      string,
-      string,
-    ];
+    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] ?? [];
     expect(platformConvId).toBe('web-plat-abc');
     expect(dispatchedMessage).toBe('/workflow resume run-uuid-4');
   });
@@ -2049,7 +2050,7 @@ describe('POST /api/workflows/runs/:runId/abandon', () => {
     mockGetWorkflowRun.mockResolvedValueOnce({
       ...MOCK_RUNNING_RUN,
       status: 'cancelled' as const,
-      completed_at: NOW,
+      completed_at: NOW_DATE,
     });
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-uuid-1/abandon', {
@@ -2858,11 +2859,7 @@ describe('approve/reject auto-resume', () => {
 
     // dispatchToOrchestrator → lockManager → handleMessage
     expect(mockHandleMessage).toHaveBeenCalled();
-    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] as [
-      unknown,
-      string,
-      string,
-    ];
+    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] ?? [];
     expect(platformConvId).toBe('web-plat-abc');
     expect(dispatchedMessage).toBe('/workflow resume run-auto-resume-approve');
   });
@@ -2901,18 +2898,9 @@ describe('approve/reject auto-resume', () => {
     expect(mockCreateChildWorktreeResolver).toHaveBeenCalledWith(
       expect.objectContaining({ codebaseId: 'cb-uuid-1', codebaseName: 'owner/repo' })
     );
-    const [, , , , , , , opts] = mockExecuteWorkflow.mock.calls[0] as [
-      unknown,
-      unknown,
-      unknown,
-      unknown,
-      unknown,
-      unknown,
-      unknown,
-      { resolveChildIsolation?: unknown; baseBranch?: string },
-    ];
-    expect(opts.resolveChildIsolation).toBeDefined();
-    expect(opts.baseBranch).toBe('main');
+    const opts = mockExecuteWorkflow.mock.calls[0]?.[7];
+    expect(opts?.resolveChildIsolation).toBeDefined();
+    expect(opts?.baseBranch).toBe('main');
   });
 
   test('approve: skips the child-isolation resolver for a folder-project codebase', async () => {
@@ -3099,11 +3087,7 @@ describe('approve/reject auto-resume', () => {
     const body = (await response.json()) as { message: string };
     expect(body.message).toContain('Running on-reject prompt');
     expect(mockHandleMessage).toHaveBeenCalled();
-    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] as [
-      unknown,
-      string,
-      string,
-    ];
+    const [, platformConvId, dispatchedMessage] = mockHandleMessage.mock.calls[0] ?? [];
     expect(platformConvId).toBe('web-plat-xyz');
     expect(dispatchedMessage).toBe('/workflow resume run-auto-resume-reject');
   });

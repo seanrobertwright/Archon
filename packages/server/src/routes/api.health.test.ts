@@ -12,11 +12,16 @@ import {
 // Mock setup — must be before dynamic imports
 // ---------------------------------------------------------------------------
 
-const mockLoadConfig = mock(async () => ({
+type TestConfig = {
+  assistants?: { claude: { model: string } };
+  worktree?: { baseBranch: string };
+};
+
+const mockLoadConfig = mock<(_repoPath?: string) => Promise<TestConfig>>(async () => ({
   assistants: { claude: { model: 'sonnet' } },
   worktree: { baseBranch: 'main' },
 }));
-const mockGetDatabaseType = mock(() => 'sqlite' as const);
+const mockGetDatabaseType = mock<() => 'postgresql' | 'sqlite'>(() => 'sqlite');
 const mockGetSchemaVersion = mock(async () => ({
   createdAppVersion: '0.5.3' as string | null,
   appVersion: '0.6.0',
@@ -185,7 +190,7 @@ import { registerApiRoutes } from './api';
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeApp(): Hono {
+function makeApp(): OpenAPIHono {
   const app = new OpenAPIHono();
   const mockWebAdapter = {
     setConversationDbId: mock((_platformId: string, _dbId: string) => {}),
