@@ -24,7 +24,9 @@ const ACCESS_WITHOUT_ACCOUNT = fakeJwt({ sub: 'nobody' });
 const realFetch = globalThis.fetch;
 let lastRequest: { url: string; body: URLSearchParams } | undefined;
 function installFetch(
-  implementation: (input: string | URL | Request, init?: RequestInit) => Promise<Response>
+  implementation: (
+    ...args: Parameters<typeof globalThis.fetch>
+  ) => ReturnType<typeof globalThis.fetch>
 ): void {
   globalThis.fetch = Object.assign(implementation, { preconnect: realFetch.preconnect });
 }
