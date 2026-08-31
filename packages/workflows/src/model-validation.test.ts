@@ -829,7 +829,7 @@ describe('isLiteralSpec type guard', () => {
 // #2556: one vocabulary, gated by one capability flag. Before this, effort
 // "routed" only on Claude and Codex, each with its own enum, so a tier's
 // `effort` was silently dropped on Pi and Copilot — which do have the control.
-const LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent'];
 
 describe('validEffortsForProvider', () => {
   test('returns the one ladder for every provider with a reasoning control', () => {
@@ -877,7 +877,16 @@ describe('resolvePresetEffort', () => {
 
 describe('isEffortValidForProvider', () => {
   test('accepts every rung on a provider that has the control', () => {
-    for (const rung of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
+    for (const rung of [
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultra',
+      'persistent',
+    ]) {
       expect(isEffortValidForProvider('codex', rung)).toBe(true);
       expect(isEffortValidForProvider('claude', rung)).toBe(true);
     }

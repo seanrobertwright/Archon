@@ -1048,7 +1048,7 @@ async function* streamClaudeMessages(
           yield { type: 'system', content: `MCP server connection failed: ${names}` };
         }
       } else if (subtype === 'task_started' && sysMsg.task_id) {
-        // Ambient / housekeeping tasks (SDK v0.3.247 signals them directly;
+        // Ambient / housekeeping tasks (SDK v0.3.247+ signals them directly;
         // older emitters use skip_transcript) are SDK-internal — they bloat
         // the Web UI's tasks panel without telling
         // the user anything actionable. Drop them at the provider boundary;

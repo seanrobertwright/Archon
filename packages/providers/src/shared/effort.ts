@@ -15,7 +15,16 @@
  */
 
 /** Reasoning-depth rungs, weakest → strongest. Order is load-bearing: `clampEffort` walks it. */
-export const EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+export const EFFORT_LADDER = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+  'persistent',
+] as const;
 
 /**
  * Compile-time proof that a provider's rung list COVERS its SDK's vocabulary.

@@ -1187,7 +1187,7 @@ describe('CodexProvider', () => {
       );
     });
 
-    test.each(['max', 'ultra'] as const)(
+    test.each(['max', 'ultra', 'persistent'] as const)(
       'passes `effort: %s` to the SDK natively',
       async effort => {
         mockRunStreamed.mockResolvedValue({
