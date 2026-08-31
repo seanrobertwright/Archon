@@ -637,7 +637,6 @@ export function runWithAdoptedRunDir<T>(
   adoptedRunDir: string | undefined,
   fn: () => Promise<T>
 ): Promise<T> {
-  if (adoptedRunDir === undefined) return fn();
   return adoptedRunDirContext.run(adoptedRunDir, fn);
 }
 

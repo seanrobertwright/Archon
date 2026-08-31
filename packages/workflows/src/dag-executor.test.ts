@@ -16611,9 +16611,8 @@ describe('executeDagWorkflow -- script nodes', () => {
 
     expect(mockSendQueryDag.mock.calls.length).toBe(1);
     const prompt = mockSendQueryDag.mock.calls[0][0] as string;
-    // Non-adopting run: both nodes see the empty string.
-    expect(prompt).toContain('script=');
-    expect(prompt).toContain('bash=');
+    // Non-adopting run: both nodes produce the empty string.
+    expect(prompt).toContain('script= bash=');
   });
 
   it('named script not found at runtime results in failed state and platform message', async () => {
