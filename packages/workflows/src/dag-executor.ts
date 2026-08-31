@@ -6836,13 +6836,11 @@ async function executeLoopNode(
     // silently, which is the failure mode this issue exists to remove.
     //
     // TWO independent calls, never one concatenated haystack. `detectCompletionSignal`
-    // supports a sentinel "at the very end of output", and that pattern is anchored
-    // with `$` and NO `m` flag (see executor-shared.ts). Appending the payload moves
-    // the end of the string past the prose — and an object payload always ends in
-    // `}` — so concatenating silently kills the documented inline end-of-output form
-    // for every loop that declares a schema. (The own-line and `<promise>` forms
-    // survive it, which is exactly why it is easy to miss.) Checking each haystack
-    // separately preserves each one's own anchor.
+    // supports a sentinel on the final standalone line, and that pattern is anchored
+    // with `$` (see executor-shared.ts). Appending the payload moves the end of the
+    // string past the prose, so concatenating would hide a final standalone signal
+    // line for every loop that declares a schema. Checking each haystack separately
+    // preserves each one's own anchor.
     const signalDetected =
       loop.until !== undefined &&
       (detectCompletionSignal(fullOutput, loop.until) ||

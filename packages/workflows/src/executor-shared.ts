@@ -850,13 +850,13 @@ function escapeRegExp(str: string): string {
  * Supports three formats, checked in order:
  * 1. <promise>SIGNAL</promise> - Recommended; prevents false positives in prose
  * 2. <anytag>SIGNAL</anytag> - Any XML-wrapped tag; case-insensitive on tag names
- * 3. Plain SIGNAL - Backwards compatibility; only at end of output or on own line
+ * 3. Plain SIGNAL - Backwards compatibility; only as the final standalone line
  *
  * Tag matching uses a backreference (\1) so opening and closing tag names must
  * agree — `<COMPLETE>X</done>` is not treated as a completion, which avoids
  * false positives when the AI interleaves tags in prose.
  *
- * Plain signal detection is restrictive to prevent false positives like "not SIGNAL yet".
+ * Plain signal detection requires the final line to contain only the signal.
  */
 export function detectCompletionSignal(output: string, signal: string): boolean {
   // Check for XML-like tag wrapping with matching open/close names: <tag>SIGNAL</tag>.
@@ -869,13 +869,14 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
   if (xmlWrappedPattern.test(output)) {
     return true;
   }
-  // Plain signal detection - restrictive to prevent false positives like "not COMPLETE yet"
-  // Only matches if signal is:
-  // 1. At the very end of output (with optional trailing whitespace/punctuation)
-  // 2. On its own line
-  const endPattern = new RegExp(`${escapeRegExp(signal)}[\\s.,;:!?]*$`);
-  const ownLinePattern = new RegExp(`^\\s*${escapeRegExp(signal)}\\s*$`, 'm');
-  return endPattern.test(output) || ownLinePattern.test(output);
+  // The plain form counts only as the trimmed final line, and the final line is
+  // computed with string operations rather than a pattern: a matcher that has to
+  // enumerate its own tolerated line endings gets one of them wrong (a single
+  // trailing newline was tolerated where two broke the match). Trailing blank
+  // lines and whitespace are an artifact of streaming, never a signal.
+  const lines = output.trimEnd().split('\n');
+  const finalLine = (lines[lines.length - 1] ?? '').trim();
+  return finalLine === signal;
 }
 
 /**
