@@ -47,6 +47,18 @@ Agentic engineering changes too quickly for a monolith to stay right. Projects t
 
 Triage clause: cite this direction as `direction.md §standalone-core`. Do not reject incremental improvements because they do not complete the decomposition in one change; reject new coupling that makes the target materially harder.
 
+## Web UI
+
+Archon's Web UI is a reference implementation over the governed engine and SDK, not a privileged product layer. It should prove that another team can build its own UI against the same public contracts.
+
+- **The console replaces the legacy UI.** The console is the maintained path for runs, settings, configuration, and observability. The legacy UI and its duplicate components are removed rather than maintained as a second product. Temporary redirects may preserve bookmarks during cutover, but the old UI is not a compatibility surface.
+- **The Web UI demonstrates the engine as a product surface.** It consumes the same run, governance, event, artifact, and configuration contracts available to another SDK or API client. A feature that works only through Web-specific engine behavior is missing a public seam.
+- **The Web UI also demonstrates useful applications over governed workflows.** Workflows should be able to produce an actionable result surface, not only logs and generic artifacts. A review workflow may produce a review UI, a delivery workflow a merge queue, and a triage workflow a triage view. Archon's implementation should show users how to build equivalent UIs over their own workflows and outputs without depending on bundled workflow names or private Web behavior.
+- **Workflow output owns the meaning; the host owns safe presentation and action dispatch.** The output may eventually be structured data, a declared view, sandboxed HTML, or another small contract. The exact representation is undecided. Any action from a rendered result must still pass through typed engine-owned authorization and governance boundaries.
+- **Workflow authoring does not gate the console cutover.** The current visual builder is an experiment, not a committed product shape and not a reason to retain the legacy UI. A smaller path may be an agent editing workflow YAML while the UI renders the resulting DAG. Keep both approaches open until real authoring use provides evidence.
+
+Triage clause: cite this direction as `direction.md §web-ui`.
+
 ## Community plugins
 
 Providers and platform integrations change faster than Archon's core. Community implementations should therefore ship as optional plugins from contributor-owned repositories, not as new dependencies and implementations compiled into Archon.
@@ -98,6 +110,8 @@ Triage clauses — cite as `direction.md §<clause>`:
 These are direction calls we haven't made. PRs that touch these areas should surface the question for explicit decision rather than be silently accepted or rejected. The workflow may add to this list as new questions appear.
 
 - **License posture.** Whether Archon stays MIT or moves to a fair-code/source-available license (and adopts a CLA) for a future hosted/enterprise offering is undecided — deferred to the maintainers. PRs that assume either posture are premature.
+- **Workflow result surfaces.** The Web UI should render useful, actionable workflow outcomes and demonstrate the same capability for user-built UIs. The contract is unsettled: structured JSON and known renderers, sandboxed HTML, a view manifest, or another narrow form. Settle the trust boundary, portable schema, action authorization, and audit behavior before adding workflow-specific UI branches.
+- **Workflow authoring.** The current visual builder remains an experiment. An agent writing YAML with a rendered DAG may be the smaller product. Decide from real authoring use; do not make legacy-UI removal depend on this choice or move Web-owned editor vocabulary into the engine meanwhile.
 
 ---
 
