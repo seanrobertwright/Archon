@@ -122,6 +122,21 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   };
 }
 
+// A run paused on an interactive_loop gate. The node and prompt are fixed so each
+// test varies only the signalling state the tool is meant to report on.
+function makeLoopGateRun(gate: {
+  iteration: number;
+  completionSignaled: boolean;
+  signaledOutput: string | null;
+}): WorkflowRun {
+  return makeRun({
+    status: 'paused',
+    metadata: {
+      approval: { nodeId: 'refine', message: 'gate', type: 'interactive_loop', ...gate },
+    },
+  });
+}
+
 beforeEach(() => {
   for (const m of [
     mockFindByPrefix,
@@ -243,18 +258,10 @@ describe('manage_run — reads', () => {
 
   test('get surfaces the structured gate state on a paused interactive_loop run (#2074 E)', async () => {
     mockFindByPrefix.mockResolvedValue([
-      makeRun({
-        status: 'paused',
-        metadata: {
-          approval: {
-            nodeId: 'refine',
-            message: 'gate',
-            type: 'interactive_loop',
-            iteration: 3,
-            completionSignaled: true,
-            signaledOutput: 'validation PASS — all 42 checks green',
-          },
-        },
+      makeLoopGateRun({
+        iteration: 3,
+        completionSignaled: true,
+        signaledOutput: 'validation PASS — all 42 checks green',
       }),
     ]);
     const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
@@ -268,19 +275,7 @@ describe('manage_run — reads', () => {
 
   test('get shows completionSignaled: false with no finalize hint on a non-signaled gate (#2074 E)', async () => {
     mockFindByPrefix.mockResolvedValue([
-      makeRun({
-        status: 'paused',
-        metadata: {
-          approval: {
-            nodeId: 'refine',
-            message: 'gate',
-            type: 'interactive_loop',
-            iteration: 1,
-            completionSignaled: false,
-            signaledOutput: null,
-          },
-        },
-      }),
+      makeLoopGateRun({ iteration: 1, completionSignaled: false, signaledOutput: null }),
     ]);
     const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
     const out = await tool.handler({ action: 'get', runId: 'r1abcdef' });
@@ -420,19 +415,7 @@ describe('manage_run — destructive confirmation gate', () => {
 
   test('approve preview on a completed-condition gate states the finalize/iterate effect (#2074 E)', async () => {
     mockFindByPrefix.mockResolvedValue([
-      makeRun({
-        status: 'paused',
-        metadata: {
-          approval: {
-            nodeId: 'refine',
-            message: 'gate',
-            type: 'interactive_loop',
-            iteration: 1,
-            completionSignaled: true,
-            signaledOutput: 'REPORT',
-          },
-        },
-      }),
+      makeLoopGateRun({ iteration: 1, completionSignaled: true, signaledOutput: 'REPORT' }),
     ]);
     const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
     // No confirm → preview. Bare args would finalize.

@@ -2,7 +2,11 @@ import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import type { Conversation, Codebase } from '../types';
-import type { IsolationEnvironmentRow, IsolationResolver } from '@archon/isolation';
+import type {
+  IsolationEnvironmentRow,
+  IsolationResolution,
+  IsolationResolver,
+} from '@archon/isolation';
 import { toBranchName } from '@archon/git';
 // Type-only imports are erased at runtime, so these do not load './orchestrator'
 // (or the workflow engine) before the mock.module() calls below take effect.
@@ -306,6 +310,17 @@ function makeEnvRow(overrides?: Partial<IsolationEnvironmentRow>): IsolationEnvi
   };
 }
 
+type ResolvedIsolation = Extract<IsolationResolution, { status: 'resolved' }>;
+
+// The resolver always reports the environment's own working path as `cwd`.
+// Deriving it here stops a call site from setting the two to different values.
+function resolvedIsolation(
+  method: ResolvedIsolation['method'],
+  env: IsolationEnvironmentRow = makeEnvRow()
+): ResolvedIsolation {
+  return { status: 'resolved', env, cwd: env.working_path, method };
+}
+
 function makeConversation(overrides?: Partial<Conversation>): Conversation {
   return {
     id: 'conv-1',
@@ -357,12 +372,9 @@ describe('validateAndResolveIsolation', () => {
     const conversation = makeConversation();
     const codebase = makeCodebase();
 
-    mockResolve.mockResolvedValueOnce({
-      status: 'resolved',
-      env: makeEnvRow(),
-      cwd: '/worktrees/issue-42',
-      method: { type: 'linked_issue_reuse', issueNumber: 99 },
-    });
+    mockResolve.mockResolvedValueOnce(
+      resolvedIsolation({ type: 'linked_issue_reuse', issueNumber: 99 })
+    );
 
     const result = await validateAndResolveIsolation(conversation, codebase, platform, 'conv-1');
 
@@ -374,12 +386,7 @@ describe('validateAndResolveIsolation', () => {
     const conversation = makeConversation();
     const codebase = makeCodebase();
 
-    mockResolve.mockResolvedValueOnce({
-      status: 'resolved',
-      env: makeEnvRow(),
-      cwd: '/worktrees/issue-42',
-      method: { type: 'created', autoCleanedCount: 3 },
-    });
+    mockResolve.mockResolvedValueOnce(resolvedIsolation({ type: 'created', autoCleanedCount: 3 }));
 
     const result = await validateAndResolveIsolation(conversation, codebase, platform, 'conv-1');
 
@@ -394,12 +401,7 @@ describe('validateAndResolveIsolation', () => {
     const conversation = makeConversation();
     const codebase = makeCodebase({ default_branch: 'develop' });
 
-    mockResolve.mockResolvedValueOnce({
-      status: 'resolved',
-      env: makeEnvRow(),
-      cwd: '/worktrees/issue-42',
-      method: { type: 'created' },
-    });
+    mockResolve.mockResolvedValueOnce(resolvedIsolation({ type: 'created' }));
 
     await validateAndResolveIsolation(conversation, codebase, platform, 'conv-1');
 
@@ -411,12 +413,7 @@ describe('validateAndResolveIsolation', () => {
     const conversation = makeConversation();
     const codebase = makeCodebase({ default_branch: null });
 
-    mockResolve.mockResolvedValueOnce({
-      status: 'resolved',
-      env: makeEnvRow(),
-      cwd: '/worktrees/issue-42',
-      method: { type: 'created' },
-    });
+    mockResolve.mockResolvedValueOnce(resolvedIsolation({ type: 'created' }));
 
     await validateAndResolveIsolation(conversation, codebase, platform, 'conv-1');
 
@@ -677,12 +674,12 @@ describe('dispatchBackgroundWorkflow', () => {
 
   test('default policy still resolves isolation for the worker', async () => {
     const workflow = makeWorkflow();
-    mockResolve.mockResolvedValueOnce({
-      status: 'resolved',
-      env: makeEnvRow({ working_path: '/worktrees/bg-1', branch_name: 'bg-1' }),
-      cwd: '/worktrees/bg-1',
-      method: { type: 'created' },
-    });
+    mockResolve.mockResolvedValueOnce(
+      resolvedIsolation(
+        { type: 'created' },
+        makeEnvRow({ working_path: '/worktrees/bg-1', branch_name: 'bg-1' })
+      )
+    );
 
     await dispatchBackgroundWorkflow(makeRoutingCtx(), workflow);
 
@@ -702,15 +699,15 @@ describe('dispatchBackgroundWorkflow', () => {
   test('missing-worktree adoption materializes the exact branch for a background run', async () => {
     mockResolveWorkflowSourceRoot.mockResolvedValue('/canonical/repo');
     const workflow = makeWorkflow();
-    mockResolve.mockResolvedValueOnce({
-      status: 'resolved',
-      env: makeEnvRow({
-        working_path: '/worktrees/feature-adopted',
-        branch_name: 'feature/adopted',
-      }),
-      cwd: '/worktrees/feature-adopted',
-      method: { type: 'created' },
-    });
+    mockResolve.mockResolvedValueOnce(
+      resolvedIsolation(
+        { type: 'created' },
+        makeEnvRow({
+          working_path: '/worktrees/feature-adopted',
+          branch_name: 'feature/adopted',
+        })
+      )
+    );
 
     await dispatchBackgroundWorkflow(
       makeRoutingCtx({
