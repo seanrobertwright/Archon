@@ -66,14 +66,15 @@ function getLog(): ReturnType<typeof createLogger> {
  * `loop_group`'s failure paths leave real, last-completed-iteration text behind).
  * For `$node.output.field`, the no-silent-drop contract (`resolveNodeOutputField`)
  * applies: a declared-optional-absent field resolves to ''; a field not in the
- * producer's schema, a schemaless node whose output isn't JSON / lacks the key, or a
- * failed producer, THROWS an `OutputRefError` that propagates to fail the consuming
- * node (no silent skip).
+ * producer's schema, a schemaless node whose output isn't JSON / lacks the key, a
+ * failed producer, or a present object/array THROWS and propagates to fail the
+ * consuming node (no silent skip).
  */
 function resolveOutputRef(
   nodeId: string,
   field: string | undefined,
-  nodeOutputs: ReadonlyMap<string, NodeOutput>
+  nodeOutputs: ReadonlyMap<string, NodeOutput>,
+  exprSnippet: string
 ): string {
   const nodeOutput = nodeOutputs.get(nodeId);
   if (!nodeOutput) {
@@ -113,11 +114,23 @@ function resolveOutputRef(
 
   const resolution = resolveNodeOutputField(nodeOutput, nodeId, field);
   if (resolution.kind === 'empty') return '';
+  if (
+    Array.isArray(resolution.value) ||
+    (resolution.value !== null && typeof resolution.value === 'object')
+  ) {
+    const actualType = Array.isArray(resolution.value) ? 'array' : 'object';
+    getLog().error({ nodeId, field, actualType, exprSnippet }, 'dag.condition_field_not_primitive');
+    throw new Error(
+      `Condition reference '$${nodeId}.output.${field}' resolved to an ${actualType}. ` +
+        "A 'when:' field must be a string, number, boolean, or null; emit a scalar routing field " +
+        'or inspect structured data in a script node.'
+    );
+  }
   // The one deterministic value→text rule (#2637): strings raw, everything else
-  // canonical JSON text. Numbers/booleans compare as their digits/true/false; a
-  // present null on the lenient no-schema path stringifies to "null" (NOT empty),
-  // matching legacy structuredOutput-preference behavior. The helper's defensive
-  // '' covers what JSON.parse can't yield (undefined/symbol/bigint).
+  // canonical JSON text. This condition-only boundary rejects present objects and
+  // arrays above; numbers/booleans compare as their digits/true/false, and a present
+  // null on the lenient no-schema path stringifies to "null" (NOT empty). The helper's
+  // defensive '' covers what JSON.parse can't yield (undefined/symbol/bigint).
   return canonicalValueText(resolution.value);
 }
 
@@ -173,7 +186,8 @@ function resolveAtomRef(
   ref: WhenAtomRef,
   nodeOutputs: Map<string, NodeOutput>,
   inputs: Record<string, JsonValue> | undefined,
-  loopPrevOutputs: ReadonlyMap<string, NodeOutput> | undefined
+  loopPrevOutputs: ReadonlyMap<string, NodeOutput> | undefined,
+  exprSnippet: string
 ): string {
   if (ref.kind === 'input') return resolveInputRef(ref.name, inputs);
   // No prior iteration is an ordinary first-iteration condition, not an unknown-node
@@ -182,7 +196,8 @@ function resolveAtomRef(
   return resolveOutputRef(
     ref.nodeId,
     ref.field,
-    ref.kind === 'loop_prev' ? (loopPrevOutputs ?? new Map()) : nodeOutputs
+    ref.kind === 'loop_prev' ? (loopPrevOutputs ?? new Map()) : nodeOutputs,
+    exprSnippet
   );
 }
 
@@ -209,7 +224,7 @@ function evaluateAtom(
   // `$INPUTS.<name>`. Deliberately NOT caught here: under the no-silent-drop contract
   // it must propagate to fail the node, not fail-closed to a silent skip. (Pure-syntax
   // parse failures still return {parsed:false} via the parse miss above.)
-  const actual = resolveAtomRef(ref, nodeOutputs, inputs, loopPrevOutputs);
+  const actual = resolveAtomRef(ref, nodeOutputs, inputs, loopPrevOutputs, expr);
 
   let result: boolean;
   if (operator === '==' || operator === '!=') {

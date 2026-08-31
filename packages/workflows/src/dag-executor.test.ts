@@ -13924,6 +13924,59 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     expect(errMsg).toContain('not declared in node');
   });
 
+  it('when: object-valued field FAILS the consuming node instead of skipping it', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'when-object-field',
+        nodes: [
+          {
+            id: 'producer',
+            kind: 'exec',
+            runtime: 'sh',
+            script: `printf '%s' '{"route":{"ready":true}}'`,
+          },
+          {
+            id: 'runme',
+            kind: 'exec',
+            runtime: 'sh',
+            script: 'exit 99',
+            depends_on: ['producer'],
+            when: "$producer.output.route == 'true'",
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const runmeEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).step_name === 'runme'
+    );
+    expect(runmeEvents.map(call => (call[0] as Record<string, unknown>).event_type)).toEqual([
+      'node_failed',
+    ]);
+    const error = ((runmeEvents[0]![0] as Record<string, unknown>).data as Record<string, unknown>)
+      .error as string;
+    expect(error).toContain("Condition reference '$producer.output.route' resolved to an object");
+  });
+
   it('best-effort provider: malformed-then-fixed structured output recovers within reasks', async () => {
     // Attempt 1 returns structured output missing the required `verdict`; the reask
     // loop re-runs and attempt 2 returns valid output → node COMPLETES (not failed).
@@ -26547,6 +26600,28 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     return [...(workflows.get('gated-parent')!.nodes as DagNode[])];
   }
 
+  function expandedStructuredGateNodes(): DagNode[] {
+    const child = buildWf('structured-gate-block', [{ id: 'entry', bash: 'echo started' }]);
+    const parent = buildWf('structured-gate-parent', [
+      { id: 'gate', bash: `printf '%s' '{"route":{"ready":true}}'` },
+      {
+        id: 'review',
+        include: 'structured-gate-block',
+        depends_on: ['gate'],
+        when: "$gate.output.route == 'true'",
+      },
+      { id: 'consumer', bash: 'echo $review.output', depends_on: ['review'] },
+    ]);
+    const { workflows, errors } = expandWorkflowIncludes(
+      new Map([
+        ['structured-gate-block', child],
+        ['structured-gate-parent', parent],
+      ])
+    );
+    expect(errors).toHaveLength(0);
+    return [...(workflows.get('structured-gate-parent')!.nodes as DagNode[])];
+  }
+
   function expandedMultiSinkDependencyNodes(
     entryTriggerRule: 'all_success' | 'one_success'
   ): DagNode[] {
@@ -26615,9 +26690,12 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     return [...(workflows.get('mixed-entry-parent')!.nodes as DagNode[])];
   }
 
-  function eventList(deps: WorkflowDeps): Array<{ event_type: string; step_name: string }> {
+  function eventList(
+    deps: WorkflowDeps
+  ): Array<{ event_type: string; step_name: string; data?: Record<string, unknown> }> {
     return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
-      (call: unknown[]) => call[0] as { event_type: string; step_name: string }
+      (call: unknown[]) =>
+        call[0] as { event_type: string; step_name: string; data?: Record<string, unknown> }
     );
   }
 
@@ -26626,7 +26704,7 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     runId: string,
     priorCompletedNodes?: Map<string, PersistedNodeOutput>
   ): Promise<{
-    events: Array<{ event_type: string; step_name: string }>;
+    events: Array<{ event_type: string; step_name: string; data?: Record<string, unknown> }>;
     output: string | undefined;
   }> {
     const mockDeps = createMockDeps();
@@ -26827,6 +26905,27 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
     expect(skipped).toContain('down__strict');
     expect(reused).toContain('down__lenient');
     expect(reused).not.toContain('down__strict');
+  });
+
+  it('fails a cached block entry when its include gate reads a structured field', async () => {
+    const { events } = await executeExpanded(
+      expandedStructuredGateNodes(),
+      'inc-resume-structured-gate',
+      new Map([['review__entry', { output: 'prior entry' }]])
+    );
+
+    const entryEvents = events.filter(event => event.step_name === 'review__entry');
+    expect(entryEvents).toHaveLength(1);
+    expect(entryEvents[0]?.event_type).toBe('node_failed');
+    expect(entryEvents[0]?.data?.error).toContain(
+      "Condition reference '$gate.output.route' resolved to an object"
+    );
+    expect(
+      events.some(
+        event =>
+          event.step_name === 'review__entry' && event.event_type === 'node_skipped_prior_success'
+      )
+    ).toBe(false);
   });
 
   it('emits namespaced step_names and resolves $inc.output to the child terminal node', async () => {

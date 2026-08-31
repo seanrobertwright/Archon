@@ -1996,7 +1996,8 @@ export function checkComposedBlockBoundaries(
       try {
         const condition = evaluateCondition(boundary.when, nodeOutputs, inputs);
         if (!condition.parsed || !condition.result) return 'skip';
-      } catch {
+      } catch (error) {
+        if (boundary.isEntry && evaluateEntryBoundary) throw error;
         // Entry nodes own the actionable missing-ref error. Descendants only need to stay
         // inside the failed boundary, without repeating the same failure for every node.
         return 'skip';
