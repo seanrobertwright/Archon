@@ -16563,6 +16563,59 @@ describe('executeDagWorkflow -- script nodes', () => {
     expect(prompt).toContain(`bash=${runId}`);
   });
 
+  it('ADOPTED_RUN_DIR reaches script and bash subprocesses as an env var (empty on non-adopting runs)', async () => {
+    // ADOPTED_RUN_DIR (#3017) joins the deterministic-node env bag so packaged
+    // script: files can read it from process.env / os.environ. On a non-adopting
+    // run it is the empty string — a script can test for it without KeyError.
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('wf-adopted-env', {
+      workflow_name: 'adopted-env-test',
+      conversation_id: 'conv-adopted',
+      user_message: 'adopted env test',
+    });
+
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(
+      join(commandsDir, 'check-adopted.md'),
+      'script=$from-script.output bash=$from-bash.output'
+    );
+
+    const nodes: DagNode[] = [
+      {
+        id: 'from-script',
+        kind: 'exec',
+        script: 'console.log(process.env.ADOPTED_RUN_DIR)',
+        runtime: 'bun',
+      },
+      { id: 'from-bash', kind: 'exec', runtime: 'sh', script: 'printf %s "${ADOPTED_RUN_DIR}"' },
+      {
+        id: 'check',
+        kind: 'agent',
+        source: { kind: 'command', name: 'check-adopted' },
+        depends_on: ['from-script', 'from-bash'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-adopted',
+        cwd: testDir,
+        workflow: { name: 'adopted-env-test', nodes },
+        workflowRun,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const prompt = mockSendQueryDag.mock.calls[0][0] as string;
+    // Non-adopting run: both nodes see the empty string.
+    expect(prompt).toContain('script=');
+    expect(prompt).toContain('bash=');
+  });
+
   it('named script not found at runtime results in failed state and platform message', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();

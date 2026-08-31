@@ -641,7 +641,7 @@ export function runWithAdoptedRunDir<T>(
   return adoptedRunDirContext.run(adoptedRunDir, fn);
 }
 
-function currentAdoptedRunDir(): string | undefined {
+export function currentAdoptedRunDir(): string | undefined {
   return adoptedRunDirContext.getStore();
 }
 

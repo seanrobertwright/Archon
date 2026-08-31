@@ -142,6 +142,7 @@ import { collectComposedSuspensionPaths, instantiateResolvedInclude } from './in
 import { buildInstanceSnapshots, composeFanOutScopeSegment } from './fan-out-identity';
 import {
   classifyError,
+  currentAdoptedRunDir,
   getRetryDelayMs,
   isRateLimitError,
   RATE_LIMIT_MAX_RETRIES,
@@ -3680,6 +3681,7 @@ async function executeBashNode(
     ARTIFACTS_DIR: artifactsDir,
     STATE_DIR: stateDir,
     LOG_DIR: logDir,
+    ADOPTED_RUN_DIR: currentAdoptedRunDir() ?? '',
     // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
     // reads os.environ and found it missing while its siblings above were all
     // present. Deliver it the same way.
@@ -3978,6 +3980,7 @@ async function executeScriptNode(
     ARTIFACTS_DIR: artifactsDir,
     STATE_DIR: stateDir,
     LOG_DIR: logDir,
+    ADOPTED_RUN_DIR: currentAdoptedRunDir() ?? '',
     // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
     // reads os.environ and found it missing while its siblings above were all
     // present. Deliver it the same way.
