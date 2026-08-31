@@ -2440,6 +2440,53 @@ branch refs/heads/feature/auth
       ).rejects.toThrow('Sync fetch from mar/main failed');
     });
 
+    test('retries on concurrent ref-lock race and both calls succeed', async () => {
+      // Simulate two concurrent syncWorkspace calls racing on the same remote ref.
+      // The first fetch attempt for each call fails with the lock-race error;
+      // the retry loop absorbs it and both calls eventually succeed.
+      const raceError = new Error(
+        "error: cannot lock ref 'refs/remotes/origin/dev': is at de581e24 but expected 8eaa8d42\n" +
+          '! 8eaa8d420..de581e24b dev -> origin/dev (unable to update local ref)'
+      );
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch')) {
+          fetchCalls++;
+          // First two fetch attempts fail with the race error; all others succeed
+          if (fetchCalls <= 2) {
+            throw raceError;
+          }
+          return { stdout: '', stderr: '' };
+        }
+        if (args.includes('status')) return { stdout: '', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--short=8')) {
+          return { stdout: 'abc12345\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('HEAD')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        if (args.includes('rev-parse') && args.includes('origin/dev')) {
+          return { stdout: 'abc12345abcdef\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const [a, b] = await Promise.all([
+        git.syncWorkspace(repo('/workspace/repo'), branch('dev')),
+        git.syncWorkspace(repo('/workspace/repo'), branch('dev')),
+      ]);
+
+      for (const result of [a, b]) {
+        expect(result.synced).toBe(true);
+        expect(result.branch).toBe(branch('dev'));
+      }
+
+      // At least one retry happened: fetch was called more than the minimum 2
+      // (one successful call per Promise.all entry).
+      expect(fetchCalls).toBeGreaterThan(2);
+    });
+
     test('names the custom remote in the configured-branch-missing error', async () => {
       execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
         if (args.includes('fetch')) {
