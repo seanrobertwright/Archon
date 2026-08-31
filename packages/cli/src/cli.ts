@@ -47,7 +47,10 @@ import {
   rejectConfigOnContinue,
   rejectConfigOutsideRun,
   rejectModelOnContinue,
+  RESUME_RUN_CONFIG_CONFLICT,
 } from './dispatch-guards';
+import { resolveCliExitCode } from './utils/workflow-exit-code';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 installPipeSafeConsole();
 
 import { parseArgs } from 'util';
@@ -64,66 +67,6 @@ if (!process.env.CLAUDE_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
   }
 }
 
-// DATABASE_URL is no longer required - SQLite will be used as default
-
-// Bootstrap provider registry before any provider lookups
-import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
-registerBuiltinProviders();
-registerCommunityProviders();
-
-// Import commands after dotenv is loaded
-import { versionCommand } from './commands/version';
-import {
-  workflowListCommand,
-  workflowRunCommand,
-  workflowStatusCommand,
-  workflowGetCommand,
-  workflowWaitCommand,
-  workflowRunsCommand,
-  workflowResumeCommand,
-  workflowCancelCommand,
-  workflowAbandonCommand,
-  workflowApproveCommand,
-  workflowRejectCommand,
-  workflowRespondCommand,
-  workflowCleanupCommand,
-  workflowResetSessionsCommand,
-  workflowEventEmitCommand,
-  workflowSearchCommand,
-  workflowTestCommand,
-  workflowInstallCommand,
-  isValidEventType,
-  resolveCliExitCode,
-} from './commands/workflow';
-import { WORKFLOW_EVENT_TYPES } from '@archon/workflows/store';
-import {
-  isolationListCommand,
-  isolationCleanupCommand,
-  isolationCleanupMergedCommand,
-  isolationCompleteCommand,
-} from './commands/isolation';
-import { chatCommand } from './commands/chat';
-import { setupCommand } from './commands/setup';
-import { skillInstallCommand } from './commands/skill';
-import { validateWorkflowsCommand, validateCommandsCommand } from './commands/validate';
-import { serveCommand } from './commands/serve';
-import { doctorCommand } from './commands/doctor';
-import { authGithubCommand } from './commands/auth';
-import {
-  aiKeySetCommand,
-  aiListCommand,
-  aiLogoutCommand,
-  aiLoginCommand,
-  aiTierSetCommand,
-  aiTierListCommand,
-  aiTierUnsetCommand,
-  aiAliasSetCommand,
-  aiAliasListCommand,
-  aiAliasUnsetCommand,
-  aiDefaultCommand,
-} from './commands/ai';
-import { telemetryStatusCommand, telemetryResetCommand } from './commands/telemetry';
-import { closeDatabase } from '@archon/core';
 import {
   setLogLevel,
   createLogger,
@@ -136,7 +79,39 @@ import {
   refreshCompiledInstallManifest,
   canonicalizeProjectPath,
 } from '@archon/paths';
-import * as git from '@archon/git';
+
+let providersRegistered = false;
+let databaseRouteLoaded = false;
+
+async function registerProviders(): Promise<void> {
+  if (providersRegistered) return;
+  const { registerBuiltinProviders, registerCommunityProviders } =
+    await import('@archon/providers');
+  registerBuiltinProviders();
+  registerCommunityProviders();
+  providersRegistered = true;
+}
+
+async function loadRoute<T>(
+  loader: () => Promise<T>,
+  options: { providers?: boolean; database?: boolean } = {}
+): Promise<T> {
+  if (options.providers) await registerProviders();
+  const route = await loader();
+  if (options.database) databaseRouteLoaded = true;
+  return route;
+}
+
+let workflowCommandsPromise: Promise<typeof import('./commands/workflow')> | undefined;
+async function loadWorkflowCommands(
+  providers = false
+): Promise<typeof import('./commands/workflow')> {
+  if (providers) await registerProviders();
+  workflowCommandsPromise ??= import('./commands/workflow');
+  const commands = await workflowCommandsPromise;
+  databaseRouteLoaded = true;
+  return commands;
+}
 
 /** True when `path` exists and is a directory (used to validate `--workflow-source`). */
 async function isPathDirectory(path: string): Promise<boolean> {
@@ -294,7 +269,9 @@ Examples:
  * Safely close the database connection
  */
 async function closeDb(): Promise<void> {
+  if (!databaseRouteLoaded) return;
   try {
+    const { closeDatabase } = await import('@archon/core/db/connection');
     await closeDatabase();
   } catch (error) {
     const err = error as Error;
@@ -356,6 +333,7 @@ async function main(): Promise<number> {
   if (isVersionRequest(args)) {
     try {
       refreshCompiledInstallManifest(BUNDLED_IS_BINARY, process.execPath, BUNDLED_VERSION);
+      const { versionCommand } = await loadRoute(() => import('./commands/version'));
       await versionCommand();
       return 0;
     } finally {
@@ -450,8 +428,21 @@ async function main(): Promise<number> {
     'ai',
   ];
   const requiresGitRepo = !noGitCommands.includes(command ?? '');
+  let detachedRunConfig: WorkflowRunConfigInput | undefined;
 
   try {
+    const detachedRunConfigPayload = values['internal-detached-run-config'];
+    if (
+      command === 'workflow' &&
+      subcommand === 'run' &&
+      typeof detachedRunConfigPayload === 'string'
+    ) {
+      const { decodeWorkflowRunConfigHandoff } =
+        await import('@archon/core/config/run-config-handoff');
+      detachedRunConfig = decodeWorkflowRunConfigHandoff(detachedRunConfigPayload);
+      if (resumeFlag) throw new Error(RESUME_RUN_CONFIG_CONFLICT);
+    }
+
     const configOutsideRun = rejectConfigOutsideRun(command, subcommand, values.config);
     if (configOutsideRun) {
       console.error(configOutsideRun);
@@ -475,6 +466,7 @@ async function main(): Promise<number> {
     if (command === 'workflow' && subcommand === 'search') {
       const query = positionals[2];
       try {
+        const { workflowSearchCommand } = await loadWorkflowCommands();
         await workflowSearchCommand(query, jsonFlag);
       } catch (error) {
         const err = error as Error;
@@ -493,6 +485,10 @@ async function main(): Promise<number> {
     if (command === 'workflow' && subcommand === 'test') {
       const target = positionals[2];
       try {
+        const [git, { workflowTestCommand }] = await Promise.all([
+          import('@archon/git'),
+          loadWorkflowCommands(),
+        ]);
         // Resolve to the repo root like the git gate below does, so project
         // workflow discovery reads the repository, not a subdirectory of it.
         const testCwd = requiresGitRepo ? ((await git.findRepoRoot(cwd)) ?? cwd) : cwd;
@@ -516,6 +512,7 @@ async function main(): Promise<number> {
       }
 
       // Validate git repository and resolve to root
+      const git = await import('@archon/git');
       const repoRoot = await git.findRepoRoot(cwd);
       if (repoRoot) {
         // Use repo root as working directory (handles subdirectory case)
@@ -541,7 +538,9 @@ async function main(): Promise<number> {
         let folderCodebase: { default_cwd: string; kind: 'repo' | 'folder' } | null = null;
         let gateLookupError: Error | null = null;
         try {
-          const codebaseDb = await import('@archon/core/db/codebases');
+          const codebaseDb = await loadRoute(() => import('@archon/core/db/codebases'), {
+            database: true,
+          });
           folderCodebase =
             (await codebaseDb.findCodebaseByDefaultCwd(realCwd)) ??
             (await codebaseDb.findCodebaseByPathPrefix(realCwd));
@@ -590,9 +589,11 @@ async function main(): Promise<number> {
     }
 
     switch (command) {
-      case 'version':
+      case 'version': {
+        const { versionCommand } = await loadRoute(() => import('./commands/version'));
         await versionCommand();
         break;
+      }
 
       case 'help':
         printUsage();
@@ -601,6 +602,10 @@ async function main(): Promise<number> {
       case 'chat': {
         const chatMessage = positionals.slice(1).join(' ');
         if (!chatMessage) return await fail(jsonFlag, 'Usage: archon chat <message>');
+        const { chatCommand } = await loadRoute(() => import('./commands/chat'), {
+          providers: true,
+          database: true,
+        });
         await chatCommand(chatMessage);
         break;
       }
@@ -620,6 +625,7 @@ async function main(): Promise<number> {
         // reads at boot) — not <subdir>/.archon/.env.
         let repoPath = cwd;
         if (scope === 'project') {
+          const git = await import('@archon/git');
           const repoRoot = await git.findRepoRoot(cwd);
           if (!repoRoot) {
             return await fail(
@@ -632,6 +638,10 @@ async function main(): Promise<number> {
           }
           repoPath = repoRoot;
         }
+        const { setupCommand } = await loadRoute(() => import('./commands/setup'), {
+          providers: true,
+          database: true,
+        });
         await setupCommand({ spawn: spawnFlag, repoPath, scope, force: forceFlag });
         break;
       }
@@ -641,6 +651,25 @@ async function main(): Promise<number> {
         if (modelOnContinue) {
           return await fail(jsonFlag, modelOnContinue);
         }
+        const {
+          workflowListCommand,
+          workflowRunCommand,
+          workflowStatusCommand,
+          workflowGetCommand,
+          workflowWaitCommand,
+          workflowRunsCommand,
+          workflowResumeCommand,
+          workflowCancelCommand,
+          workflowAbandonCommand,
+          workflowApproveCommand,
+          workflowRejectCommand,
+          workflowRespondCommand,
+          workflowCleanupCommand,
+          workflowResetSessionsCommand,
+          workflowEventEmitCommand,
+          workflowInstallCommand,
+          isValidEventType,
+        } = await loadWorkflowCommands(subcommand === 'run');
         switch (subcommand) {
           case 'list':
             await workflowListCommand(effectiveCwd, jsonFlag);
@@ -758,9 +787,7 @@ async function main(): Promise<number> {
               modelAssignments: values.model as string[] | undefined,
               configPath:
                 typeof values.config === 'string' ? resolve(cwd, values.config) : undefined,
-              detachedRunConfigPayload: values['internal-detached-run-config'] as
-                | string
-                | undefined,
+              detachedRunConfig,
               detachedRunId: values['internal-detached-run-id'] as string | undefined,
             };
             await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
@@ -1007,6 +1034,7 @@ async function main(): Promise<number> {
               );
             }
             if (!isValidEventType(eventType)) {
+              const { WORKFLOW_EVENT_TYPES } = await import('@archon/workflows/store');
               return await fail(
                 jsonFlag,
                 `Error: unknown event type: ${eventType}\nValid types: ${WORKFLOW_EVENT_TYPES.join(', ')}`
@@ -1051,7 +1079,9 @@ async function main(): Promise<number> {
         break;
       }
 
-      case 'isolation':
+      case 'isolation': {
+        const { isolationListCommand, isolationCleanupCommand, isolationCleanupMergedCommand } =
+          await loadRoute(() => import('./commands/isolation'), { database: true });
         switch (subcommand) {
           case 'list':
             await isolationListCommand();
@@ -1078,8 +1108,12 @@ async function main(): Promise<number> {
           }
         }
         break;
+      }
 
-      case 'validate':
+      case 'validate': {
+        const { validateWorkflowsCommand, validateCommandsCommand } = await loadRoute(
+          () => import('./commands/validate')
+        );
         switch (subcommand) {
           case 'workflows': {
             const validateName = positionals[2];
@@ -1099,6 +1133,7 @@ async function main(): Promise<number> {
             return await fail(jsonFlag, `${problem}\nAvailable: workflows, commands`);
           }
         }
+      }
 
       case 'complete': {
         const branches = positionals.slice(1);
@@ -1106,6 +1141,9 @@ async function main(): Promise<number> {
           return await fail(jsonFlag, 'Usage: archon complete <branch-name> [branch2 ...]');
         }
         const forceFlag = Boolean(values.force);
+        const { isolationCompleteCommand } = await loadRoute(() => import('./commands/isolation'), {
+          database: true,
+        });
         await isolationCompleteCommand(branches, { force: forceFlag, deleteRemote: true });
         break;
       }
@@ -1113,17 +1151,27 @@ async function main(): Promise<number> {
       case 'serve': {
         const servePort = values.port !== undefined ? Number(values.port) : undefined;
         const downloadOnly = Boolean(values['download-only']);
+        const { serveCommand } = await loadRoute(() => import('./commands/serve'), {
+          database: !downloadOnly,
+        });
         return await serveCommand({ port: servePort, downloadOnly });
       }
 
       case 'doctor': {
+        const { doctorCommand } = await loadRoute(() => import('./commands/doctor'), {
+          database: true,
+        });
         return await doctorCommand(undefined, Boolean(values.full));
       }
 
       case 'auth': {
         switch (subcommand) {
-          case 'github':
+          case 'github': {
+            const { authGithubCommand } = await loadRoute(() => import('./commands/auth'), {
+              database: true,
+            });
             return await authGithubCommand();
+          }
           default: {
             const problem =
               subcommand === undefined
@@ -1135,6 +1183,22 @@ async function main(): Promise<number> {
       }
 
       case 'ai': {
+        const {
+          aiKeySetCommand,
+          aiListCommand,
+          aiLogoutCommand,
+          aiLoginCommand,
+          aiTierSetCommand,
+          aiTierListCommand,
+          aiTierUnsetCommand,
+          aiAliasSetCommand,
+          aiAliasListCommand,
+          aiAliasUnsetCommand,
+          aiDefaultCommand,
+        } = await loadRoute(() => import('./commands/ai'), {
+          providers: true,
+          database: true,
+        });
         switch (subcommand) {
           case 'key': {
             const action = positionals[2];
@@ -1215,6 +1279,9 @@ async function main(): Promise<number> {
       }
 
       case 'telemetry': {
+        const { telemetryStatusCommand, telemetryResetCommand } = await loadRoute(
+          () => import('./commands/telemetry')
+        );
         switch (subcommand) {
           case 'status':
             return telemetryStatusCommand();
@@ -1236,6 +1303,7 @@ async function main(): Promise<number> {
             // Optional positional path; otherwise install into the resolved cwd.
             const targetArg = positionals[2];
             const targetPath = targetArg ? resolve(targetArg) : cwd;
+            const { skillInstallCommand } = await loadRoute(() => import('./commands/skill'));
             return await skillInstallCommand(targetPath);
           }
 

@@ -12,6 +12,9 @@
 /** Workflow subcommands that continue an existing run. */
 const CONTINUE_SUBCOMMANDS = ['resume', 'approve', 'reject', 'respond'] as const;
 
+export const RESUME_RUN_CONFIG_CONFLICT =
+  '--resume and --config are mutually exclusive. A resumed run keeps its original run config.';
+
 /**
  * Rejects --model on subcommands that continue an existing workflow run: the
  * run keeps the model bindings it started with.

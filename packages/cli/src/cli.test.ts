@@ -4,14 +4,14 @@
  * Note: These tests focus on argument parsing logic.
  * Full integration tests would require mocking the database and commands.
  */
-import { describe, it, expect, beforeAll } from 'bun:test';
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { parseArgs } from 'util';
 import { cliArgOptions } from './args';
 import * as git from '@archon/git';
 import { removeTempTree } from '@archon/paths/test-utils';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -26,6 +26,112 @@ const CLI_ENTRY = join(import.meta.dir, 'cli.ts');
 // The enclosing git worktree — a valid repo for the git gate, with a real
 // .archon/workflows/ directory so an unknown workflow name fails deterministically.
 const repoRoot = join(import.meta.dir, '..', '..', '..');
+
+type BuildMetafile = NonNullable<Bun.BuildOutput['metafile']>;
+
+function staticallyReachableInputs(metafile: BuildMetafile, start: string): string[] {
+  const pending = [start];
+  const visited = new Set<string>();
+  const inputs = new Set<string>();
+
+  while (pending.length > 0) {
+    const outputPath = pending.pop();
+    if (outputPath === undefined || visited.has(outputPath)) continue;
+    visited.add(outputPath);
+
+    const output = metafile.outputs[outputPath];
+    if (!output) throw new Error(`Build metafile references missing output '${outputPath}'.`);
+    for (const input of Object.keys(output.inputs)) inputs.add(input);
+    for (const imported of output.imports) {
+      if (imported.kind !== 'dynamic-import') pending.push(imported.path);
+    }
+  }
+
+  return [...inputs].sort();
+}
+
+function repositoryInput(path: string): string | undefined {
+  const normalized = path.replaceAll('\\', '/');
+  const packagesIndex = normalized.indexOf('packages/');
+  return packagesIndex === -1 ? undefined : normalized.slice(packagesIndex);
+}
+
+describe('CLI startup import boundary', () => {
+  let buildDir: string;
+  let metafile: BuildMetafile;
+
+  beforeAll(async () => {
+    buildDir = mkdtempSync(join(tmpdir(), 'archon-cli-import-graph-'));
+    const metafilePath = join(buildDir, 'metafile.json');
+    const result = spawnSync(
+      process.execPath,
+      [
+        'build',
+        CLI_ENTRY,
+        '--target=bun',
+        '--format=esm',
+        '--splitting',
+        `--outdir=${buildDir}`,
+        `--metafile=${metafilePath}`,
+      ],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+      }
+    );
+    if (result.status !== 0) {
+      throw new Error(`CLI graph build failed:\n${result.stdout}\n${result.stderr}`);
+    }
+    metafile = JSON.parse(readFileSync(metafilePath, 'utf8')) as BuildMetafile;
+  });
+
+  afterAll(async () => {
+    if (buildDir) await removeTempTree(buildDir);
+  });
+
+  it('keeps help and argument failures outside command, provider, core, workflow, and Git graphs', () => {
+    const entry = Object.entries(metafile.outputs).find(([, output]) =>
+      output.entryPoint?.replaceAll('\\', '/').endsWith('packages/cli/src/cli.ts')
+    )?.[0];
+    expect(entry).toBeDefined();
+
+    const forbidden = staticallyReachableInputs(metafile, entry ?? '')
+      .map(repositoryInput)
+      .filter(
+        (input): input is string =>
+          input !== undefined &&
+          (input.startsWith('packages/cli/src/commands/') ||
+            input.startsWith('packages/core/src/') ||
+            input.startsWith('packages/git/src/') ||
+            input.startsWith('packages/providers/src/') ||
+            input.startsWith('packages/workflows/src/'))
+      );
+    expect(forbidden).toEqual([]);
+  });
+
+  it('keeps detached handoff decoding on its audited schema, crypto, and path leaves', () => {
+    const decoderChunk = Object.entries(metafile.outputs).find(([, output]) =>
+      Object.keys(output.inputs).some(input =>
+        input.replaceAll('\\', '/').endsWith('packages/core/src/config/run-config-handoff.ts')
+      )
+    )?.[0];
+    expect(decoderChunk).toBeDefined();
+
+    const internalInputs = staticallyReachableInputs(metafile, decoderChunk ?? '')
+      .map(repositoryInput)
+      .filter((input): input is string => input !== undefined);
+    expect(internalInputs).toEqual([
+      'packages/core/src/config/run-config-handoff.ts',
+      'packages/core/src/utils/token-crypto.ts',
+      'packages/paths/src/archon-paths.ts',
+      'packages/paths/src/logger.ts',
+      'packages/workflows/src/schemas/durable-wait.ts',
+      'packages/workflows/src/schemas/model-binding.ts',
+      'packages/workflows/src/schemas/run-config.ts',
+      'packages/workflows/src/schemas/thinking-config.ts',
+    ]);
+  });
+});
 
 describe('CLI help output', () => {
   // The five tests assert disjoint fragments of one static usage string, so a
