@@ -47,23 +47,20 @@ Agentic engineering changes too quickly for a monolith to stay right. Projects t
 
 Triage clause: cite this direction as `direction.md §standalone-core`. Do not reject incremental improvements because they do not complete the decomposition in one change; reject new coupling that makes the target materially harder.
 
-## Community providers
+## Community plugins
 
-Archon ships built-in providers for Claude (`@anthropic-ai/claude-agent-sdk`) and Codex (`@openai/codex-sdk`). Pi (`@earendil-works/pi-coding-agent`) is the reference community provider and sets the pattern others should follow.
+Providers and platform integrations change faster than Archon's core. Community implementations should therefore ship as optional plugins from contributor-owned repositories, not as new dependencies and implementations compiled into Archon.
 
-**Acceptance criteria** for new community providers:
+- **One distribution model, separate runtime contracts.** Independently packaged plugins share one manifest, marketplace, and CLI install/update/remove mechanism. Each plugin kind keeps the runtime contract its responsibility needs: provider plugins own agent sessions, streaming, native configuration, and capability enforcement; chat/platform plugins own inbound authentication, identity, transport, and lifecycle; forge plugins own normalized forge operations. Do not force these different boundaries through one generic runtime interface.
+- **The engine owns each contract.** A conforming plugin attaches without provider- or platform-specific branches in engine control flow. If an integration requires those branches or a new static import in an Archon registry, its contract is missing or not ready.
+- **The contributor owns the implementation.** Community plugin source, releases, SDK dependencies, and upstream-breakage maintenance stay in the contributor's repository. Archon may list and promote the plugin without taking ownership of its code or dependencies.
+- **Marketplace entries are installable trust records.** A listing identifies an immutable release or source revision, Archon compatibility, plugin kind, declared capabilities and permissions, and its maintainer. Installation makes the third-party-code boundary explicit. A broken or abandoned listing can be deprecated or removed without an Archon release.
+- **Existing bundled community integrations are a transition state, not the extension pattern.** They may receive focused compatibility, correctness, and security fixes. Do not add another bundled community provider or adapter, or substantially expand one, until its external plugin contract and loading path exist. Migration of existing integrations can happen incrementally after those seams are proven.
+- **Build the seams in evidence order.** The forge contract in #2963 goes first, followed by chat/platform and provider contracts. A focused seam does not need to build a generic plugin framework or marketplace before it can prove its runtime contract, but its package shape must not block the shared distribution model that follows.
 
-- **Coding-agent SDK only.** The provider must wrap an existing coding-agent SDK — one that handles file edits, tool use, multi-turn sessions, and planning. Raw LLM API integrations (`chat.completions`-style) are out of scope. Pi already covers ~20 LLM backends via one harness, so single-model wrappers duplicate work that is already done.
-- **Match the Pi pattern.** Structure mirrors `packages/providers/src/community/pi/` — provider class implementing `IAgentProvider`, options translator, event bridge, capability matrix, registered with `builtIn: false`. Tests at parity with the Pi suite (config, options-translator, event-bridge, provider, session-resolver as the baseline).
-- **Docs page.** Add the provider to `packages/docs-web/src/content/docs/getting-started/ai-assistants.md` with setup, capability matrix, and supported config keys.
+Archon maintains the provider and platform integrations it explicitly designates as built-ins. Listing a community plugin is curation and discovery, not a transfer of maintenance responsibility.
 
-**Maintenance policy:**
-
-- We accept any provider that meets the criteria above. There is no cap.
-- The contributor and the community maintain the provider. Archon maintainers do not own upstream-SDK breaks for community providers.
-- A community provider that goes non-functional — CI broken, upstream SDK gone, no maintainer response — is marked deprecated and removed in the next minor release unless someone from the community submits a fix.
-
-When citing this policy in a PR comment: `direction.md §community-providers`.
+When citing this policy in a PR comment: `direction.md §community-plugins`.
 
 ## Workflow language (YAML surface)
 
