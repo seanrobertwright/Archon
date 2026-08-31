@@ -631,7 +631,7 @@ export async function loadCommandPrompt(
  * `executeWorkflow` re-enters with its own (absent) scope, correctly shadowing
  * the parent's adoption.
  */
-const adoptedRunDirContext = new AsyncLocalStorage<string>();
+const adoptedRunDirContext = new AsyncLocalStorage<string | undefined>();
 
 export function runWithAdoptedRunDir<T>(
   adoptedRunDir: string | undefined,
