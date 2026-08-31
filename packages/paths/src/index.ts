@@ -43,6 +43,7 @@ export {
   isInsideArchonHome,
   getRunArtifactsDirForKey,
   getRunArtifactsDirForRoot,
+  getRunLogPathForRoot,
   slugifyFolderName,
   getFolderProjectRoot,
   getFolderProjectArtifactsPath,
