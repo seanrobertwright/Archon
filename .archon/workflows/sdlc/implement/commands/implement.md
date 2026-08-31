@@ -6,23 +6,35 @@ Implement the requested work in this repository and keep going until it is compl
 
 $INPUTS.work
 
-If the block above is empty, the work is the message that started this run:
+## The operator's request
 
 $ARGUMENTS
 
-Either way, it may be:
+Both are in force. The work order above is how this run prepared the task; the request is the operator's own words, and the more current statement of intent. Where they conflict on task, constraints, or scope, the operator's request wins — say so in your report rather than choosing silently. Where the request rests on an assumption the code contradicts, follow the code and record the deviation.
+
+Either may be empty. If both are, there is no work — say so and stop.
+
+Whichever carries it, the work may be:
 
 - **a plan** — a path to a plan file (read it completely) or an inline plan; execute its tasks in dependency order
 - **review findings** — fix every Critical and Important finding; if you can prove a finding invalid, record that proof in your report instead of "fixing" it
 - **a CI failure** — reproduce it, fix the cause, prove the fix
 - **a description** — a plain statement of what to build or change
 
+## Reading the sources
+
+Prose is a claim; the code is the fact. An issue body, a comment, a linked discussion, a prior report — each is somebody's belief at some past moment. Often correct, sometimes stale, never authoritative about what the code does today. Read them for intent and history, then verify anything load-bearing against the current source before acting on it. When they disagree, the code decides and you record the conflict.
+
+Weigh by source and recency. The operator's request in this run is the most current statement of intent. A tracked item's body and its comments are older, may predate the code in front of you, and vary in how much their author verified before writing. Read them; do not inherit them. A confident claim is still a claim.
+
+When the work or the request names a tracked item — an issue, a ticket, a document, whatever your tools can reach — read it before editing, along with the comments and linked items that can still change the outcome, its constraints, or an earlier decision. Stop following links once they no longer change what you would do.
+
 ## How to work
 
 1. Make the project runnable first: if dependencies are missing, install them with the project's own package manager in locked mode. Never update a lockfile.
 2. Ground yourself before editing: read the files the work names, plus their direct callers and tests. Live code beats the work item's assumptions — when they conflict, follow the code and record the deviation in your report.
 3. Reproduce bugs before fixing them whenever reasonably possible; otherwise record the concrete evidence you fixed against.
-4. Prefer the simplest change that solves the actual problem. If the path grows complicated, stop and reconsider the approach instead of pushing through.
+4. Prefer the simplest change that solves the actual problem. If the path grows complicated, stop and reconsider the approach instead of pushing through. Existing code is evidence of what the system does, not proof that it is simple or correct: leave the path you touched simpler than you found it — split a function that outgrew itself, delete machinery your change superseded, make an implicit seam explicit. That work is cheap while you are already in the file and expensive as a separate run later, and every future reader, human or agent, pays for complexity left behind. Step 10 bounds it to the path you are already changing.
 5. Write focused tests that prove the changed behavior — for a bug, a regression test that fails before the fix and passes after, when practical. No coverage theater.
 6. Validate with the project's own checks: discover them from the repository itself (package scripts, task runners, CI config, contributor docs) and run what applies — types, lint, tests, build. Never invent a generic command the project doesn't define.
 7. Commit as you go: one commit per coherent outcome, staged by name (never `git add -A`), message written the way a human explains an outcome. No AI attribution, no generated-by footers. Never commit scratch files or anything under `$ARTIFACTS_DIR`.
