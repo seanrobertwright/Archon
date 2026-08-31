@@ -24,7 +24,7 @@ export interface ExecInputValidationResult {
 
 interface MutableTarget {
   node: ExecNode;
-  slot?: TemplateSlot;
+  slot: TemplateSlot;
   bindingNames: Set<string>;
 }
 
@@ -37,16 +37,7 @@ interface EnvironmentRead {
 export function collectExecInputValidationTargets(
   workflow: WorkflowDefinition
 ): readonly ExecInputValidationTarget[] {
-  const byOwner = new Map<ExecNode, MutableTarget>();
-  const ordered: MutableTarget[] = [];
-  const targetFor = (owner: ExecNode): MutableTarget => {
-    let target = byOwner.get(owner);
-    if (target === undefined) {
-      target = { node: owner, bindingNames: new Set() };
-      byOwner.set(owner, target);
-    }
-    return target;
-  };
+  const targets = new Map<ExecNode, MutableTarget>();
 
   for (const node of workflow.nodes) {
     if (isIncludeDirective(node)) continue;
@@ -55,29 +46,21 @@ export function collectExecInputValidationTargets(
       slot => {
         if (slot.name !== 'exec.bash' && slot.name !== 'exec.script') return;
         if (!isExecNode(slot.owner)) return;
-        const target = targetFor(slot.owner);
-        target.slot = slot;
-        ordered.push(target);
+        targets.set(slot.owner, { node: slot.owner, slot, bindingNames: new Set() });
       },
       {
         bindingVisitor: binding => {
-          if (isExecNode(binding.owner)) targetFor(binding.owner).bindingNames.add(binding.name);
+          if (isExecNode(binding.owner)) targets.get(binding.owner)?.bindingNames.add(binding.name);
         },
       }
     );
   }
 
-  return ordered.flatMap(target =>
-    target.slot === undefined
-      ? []
-      : [
-          {
-            node: target.node,
-            slot: target.slot,
-            bindingNames: [...target.bindingNames],
-          },
-        ]
-  );
+  return [...targets.values()].map(target => ({
+    node: target.node,
+    slot: target.slot,
+    bindingNames: [...target.bindingNames],
+  }));
 }
 
 export function inlineExecInputSource(
@@ -109,6 +92,7 @@ export function validateExecInputTargets(
 
     for (const read of scanEnvironmentReads(source.text, source.runtime)) {
       if (availableEnv.has(read.name)) continue;
+      if (read.name.startsWith('INPUTS_') && workflow.inputs === undefined) continue;
       const location = `${source.label} line ${String(read.line)}`;
       const available =
         availableNames.length === 0 ? 'none' : availableNames.map(name => `'${name}'`).join(', ');

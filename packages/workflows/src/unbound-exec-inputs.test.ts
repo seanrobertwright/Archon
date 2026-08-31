@@ -20,6 +20,8 @@ describe('unbound exec input reads', () => {
     const result = parseWorkflow(
       `name: supported-forms
 description: Exercise every supported static environment accessor
+inputs:
+  declared: {}
 nodes:
   - id: python
     script: |
@@ -120,6 +122,8 @@ nodes:
     const ignored = parseWorkflow(
       `name: bash-ignored
 description: An ignored bash binding cannot provide an input
+inputs:
+  declared: {}
 nodes:
   - id: verify
     bash: printf '%s' "$INPUTS_LOCAL"
@@ -196,6 +200,8 @@ nodes:
     const result = parseWorkflow(
       `name: nested-body
 description: Validate an exec node nested in a loop group
+inputs:
+  declared: {}
 nodes:
   - id: iterate
     loop_group:
@@ -250,7 +256,7 @@ print(fix, repetitions)
       const warnings = result.workflows[0]?.parseWarnings ?? [];
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain('FIX_OUTPUT');
-      expect(warnings[0]).toContain(`${scriptPath} line 3`);
+      expect(warnings[0]).toContain(`${scriptPath.replaceAll('\\', '/')} line 3`);
       expect(warnings[0]).toContain('test_repetitions');
     } finally {
       if (previousHome === undefined) delete process.env.ARCHON_HOME;
@@ -262,6 +268,8 @@ print(fix, repetitions)
     const result = parseWorkflow(
       `name: inline-unbound
 description: Reject an unbound inline input
+inputs:
+  declared: {}
 nodes:
   - id: verify
     script: |
@@ -283,21 +291,22 @@ nodes:
     process.env.ARCHON_HOME = join(root, 'home');
     try {
       const workflowPath = join(root, '.archon', 'workflows', 'named.yaml');
-      const scriptPath = join(root, '.archon', 'scripts', 'verify.py');
+      const scriptPath = join(root, '.archon', 'scripts', 'verify.ts');
       await writeFile(
         scriptPath,
-        `import os
-print(os.environ["INPUTS_FIX"])
+        `console.log(process.env.INPUTS_FIX)
 `
       );
       await writeFile(
         workflowPath,
         `name: named-unbound
 description: Reject an unbound input in a discovered script
+inputs:
+  declared: {}
 nodes:
   - id: verify
     script: verify
-    runtime: uv
+    runtime: bun
 `
       );
 
@@ -305,16 +314,18 @@ nodes:
       expect(unbound.workflows).toEqual([]);
       expect(unbound.errors).toHaveLength(1);
       expect(unbound.errors[0]?.error).toContain('INPUTS_FIX');
-      expect(unbound.errors[0]?.error).toContain(`${scriptPath} line 2`);
+      expect(unbound.errors[0]?.error).toContain(`${scriptPath.replaceAll('\\', '/')} line 1`);
 
       await writeFile(
         workflowPath,
         `name: named-bound
 description: Accept a bound input in a discovered script
+inputs:
+  declared: {}
 nodes:
   - id: verify
     script: verify
-    runtime: uv
+    runtime: bun
     with:
       fix: ready
 `

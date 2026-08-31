@@ -4861,7 +4861,7 @@ nodes:
     expect(childRun(store)).toBeUndefined();
   });
 
-  it('keeps Phase-1 passthrough for a non-exec child that declares no inputs', async () => {
+  it('keeps Phase-1 passthrough for an exec child that declares no inputs', async () => {
     await writeWorkflow(
       'child-undeclared',
       `
@@ -4869,7 +4869,7 @@ name: child-undeclared
 description: no inputs block at all
 nodes:
   - id: emit
-    prompt: echo "v=$INPUTS.v"
+    bash: echo "v=$INPUTS_V"
 `
     );
     await writeWorkflow(
