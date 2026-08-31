@@ -370,6 +370,7 @@ describe('cleanup-service', () => {
         branchName: 'feature-branch',
         canonicalRepoPath: '/workspace/repo',
         deleteRemoteBranch: true,
+        remote: 'origin',
       });
       expect(mockUpdateStatus).toHaveBeenCalledWith(envId, 'destroyed');
     });
@@ -580,11 +581,13 @@ describe('runScheduledCleanup', () => {
     mockGetCodebase.mockClear();
     mockDeleteOldSessions.mockClear();
     mockLoadRepoConfig.mockClear();
+    mockIsPatchEquivalent.mockClear();
     // Reset defaults
     mockHasUncommittedChanges.mockResolvedValue(false);
     mockWorktreeExists.mockResolvedValue(false);
     mockGetDefaultBranch.mockResolvedValue('main');
     mockIsBranchMerged.mockResolvedValue(false);
+    mockIsPatchEquivalent.mockResolvedValue(false);
     mockGetLastCommitDate.mockResolvedValue(null);
     mockLoadRepoConfig.mockResolvedValue({});
   });
@@ -735,6 +738,7 @@ describe('runScheduledCleanup', () => {
       branchName: 'pr-50',
       canonicalRepoPath: '/workspace/repo',
       deleteRemoteBranch: true,
+      remote: 'origin',
     });
   });
 
@@ -993,6 +997,54 @@ describe('runScheduledCleanup', () => {
       error: 'database locked',
     });
   });
+
+  test('detects squash-merged branches via isPatchEquivalent fallback', async () => {
+    mockListAllActiveWithCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-squash',
+        working_path: '/workspace/repo/worktrees/squash-branch',
+        branch_name: 'squash-branch',
+        status: 'active',
+        created_by_platform: 'github',
+        created_at: new Date(),
+        codebase_default_cwd: '/workspace/repo',
+        codebase_id: 'codebase-1',
+        workflow_type: 'issue',
+        workflow_id: '42',
+        provider: 'worktree',
+        metadata: {},
+      },
+    ]);
+    // worktreeExists returns true (path exists)
+    mockWorktreeExists.mockResolvedValue(true);
+    // isBranchMerged returns false — regular merge detection fails
+    mockIsBranchMerged.mockResolvedValueOnce(false);
+    // isPatchEquivalent returns true — squash-merge detected
+    mockIsPatchEquivalent.mockResolvedValueOnce(true);
+    // hasUncommittedChanges returns false (default)
+    // For removeEnvironment: getById returns the env
+    mockGetById.mockResolvedValueOnce({
+      id: 'env-squash',
+      codebase_id: 'codebase-1',
+      working_path: '/workspace/repo/worktrees/squash-branch',
+      status: 'active',
+    });
+    // removeEnvironment: getCodebase for canonical repo path
+    mockGetCodebase.mockResolvedValueOnce({
+      id: 'codebase-1',
+      name: 'test-repo',
+      default_cwd: '/workspace/repo',
+    });
+
+    const report = await runScheduledCleanup();
+
+    expect(report.removed).toContain('env-squash (merged)');
+    expect(mockIsPatchEquivalent).toHaveBeenCalledWith(
+      '/workspace/repo',
+      'squash-branch',
+      'origin/main'
+    );
+  });
 });
 
 describe('SESSION_RETENTION_DAYS', () => {
@@ -1049,9 +1101,11 @@ describe('getWorktreeStatusBreakdown', () => {
     mockIsBranchMerged.mockClear();
     mockListByCodebaseWithAge.mockClear();
     mockLoadRepoConfig.mockClear();
+    mockIsPatchEquivalent.mockClear();
     // Reset defaults
     mockGetDefaultBranch.mockResolvedValue('main');
     mockIsBranchMerged.mockResolvedValue(false);
+    mockIsPatchEquivalent.mockResolvedValue(false);
     mockLoadRepoConfig.mockResolvedValue({});
   });
 
@@ -1100,11 +1154,17 @@ describe('getWorktreeStatusBreakdown', () => {
 
     expect(breakdown.total).toBe(4);
     expect(breakdown.merged).toBe(1);
-    // No worktree.remote configured — default-branch detection gets undefined
-    // (getDefaultBranch falls back to 'origin' internally)
-    expect(mockGetDefaultBranch).toHaveBeenCalledWith('/workspace/repo', undefined);
+    // No worktree.remote configured — default-branch detection gets
+    // 'origin' (the remote default).
+    expect(mockGetDefaultBranch).toHaveBeenCalledWith('/workspace/repo', 'origin');
     expect(breakdown.stale).toBe(1); // env-2 is stale (30 days), env-4 is Telegram so not counted as stale
     expect(breakdown.active).toBe(2); // env-3 active, env-4 Telegram (counted as active, not stale)
+    // Verify the remote-qualified ref is threaded through to isBranchMerged.
+    expect(mockIsBranchMerged).toHaveBeenCalledWith(
+      '/workspace/repo',
+      'merged-branch',
+      'origin/main'
+    );
   });
 
   test('excludes telegram from stale count', async () => {
@@ -1147,6 +1207,32 @@ describe('getWorktreeStatusBreakdown', () => {
     await getWorktreeStatusBreakdown('codebase-1', '/workspace/repo');
 
     expect(mockGetDefaultBranch).toHaveBeenCalledWith('/workspace/repo', 'upstream');
+  });
+
+  test('detects squash-merged branches via isPatchEquivalent fallback', async () => {
+    mockListByCodebaseWithAge.mockResolvedValueOnce([
+      {
+        id: 'env-squash',
+        branch_name: 'squash-branch',
+        created_by_platform: 'github',
+        days_since_activity: 5,
+        working_path: '/path1',
+        status: 'active',
+      },
+    ]);
+    // isBranchMerged returns false — regular merge detection fails
+    mockIsBranchMerged.mockResolvedValueOnce(false);
+    // isPatchEquivalent returns true — squash-merge detected
+    mockIsPatchEquivalent.mockResolvedValueOnce(true);
+
+    const breakdown = await getWorktreeStatusBreakdown('codebase-1', '/workspace/repo');
+
+    expect(breakdown.merged).toBe(1);
+    expect(mockIsPatchEquivalent).toHaveBeenCalledWith(
+      '/workspace/repo',
+      'squash-branch',
+      'origin/main'
+    );
   });
 });
 
@@ -1362,6 +1448,52 @@ describe('cleanupMergedWorktrees', () => {
     const result = await cleanupMergedWorktrees('codebase-1', '/workspace/repo');
 
     expect(result.removed).toContain('squash-branch');
+    // Remote-qualified ref is passed to both signals — the local base may be stale.
+    expect(mockIsBranchMerged).toHaveBeenCalledWith(
+      '/workspace/repo',
+      'squash-branch',
+      'origin/main'
+    );
+    expect(mockIsPatchEquivalent).toHaveBeenCalledWith(
+      '/workspace/repo',
+      'squash-branch',
+      'origin/main'
+    );
+  });
+
+  test('removes squash-merged branch when local base is stale (#3002)', async () => {
+    // Simulate a scenario where the local `main` is behind `origin/main`.
+    // In the pre-#3002 code this would have been classified as unmerged;
+    // now the remote-qualified ref gives the correct answer.
+    mockListByCodebase.mockResolvedValueOnce([
+      {
+        id: 'env-squash-stale-base',
+        branch_name: 'squash-stale-base',
+        working_path: '/workspace/repo/worktrees/squash-stale-base',
+        status: 'active',
+      },
+    ]);
+    // git branch --merged origin/main → false (regular merge check fails against
+    // the remote-qualified ref too — the branch was squash-merged, not ff-merged)
+    mockIsBranchMerged.mockResolvedValueOnce(false);
+    // git cherry origin/main <branch> → true (patch-equivalent, squash-merged)
+    mockIsPatchEquivalent.mockResolvedValueOnce(true);
+    mockGetById.mockResolvedValueOnce({
+      id: 'env-squash-stale-base',
+      working_path: '/workspace/repo/worktrees/squash-stale-base',
+      status: 'active',
+    });
+    mockWorktreeExists.mockResolvedValueOnce(true);
+
+    const result = await cleanupMergedWorktrees('codebase-1', '/workspace/repo');
+
+    expect(result.removed).toContain('squash-stale-base');
+    // The remote-qualified ref was used, not the bare local branch name.
+    expect(mockIsPatchEquivalent).toHaveBeenCalledWith(
+      '/workspace/repo',
+      'squash-stale-base',
+      'origin/main'
+    );
   });
 
   test('removes branch when PR is MERGED', async () => {
@@ -1542,8 +1674,12 @@ describe('resolveBaseBranch via runScheduledCleanup (issue #1419)', () => {
     // Config took over — getDefaultBranch must NOT have been called for this env.
     expect(mockGetDefaultBranch).not.toHaveBeenCalled();
     expect(report.errors).toHaveLength(0);
-    // isBranchMerged called with 'master', not 'main'.
-    expect(mockIsBranchMerged).toHaveBeenCalledWith('/workspace/myrepo', 'feature/foo', 'master');
+    // isBranchMerged called with 'origin/master', not 'main'.
+    expect(mockIsBranchMerged).toHaveBeenCalledWith(
+      '/workspace/myrepo',
+      'feature/foo',
+      'origin/master'
+    );
   });
 
   test('trims whitespace and uses the configured base branch', async () => {
@@ -1572,7 +1708,11 @@ describe('resolveBaseBranch via runScheduledCleanup (issue #1419)', () => {
     await runScheduledCleanup();
 
     expect(mockGetDefaultBranch).not.toHaveBeenCalled();
-    expect(mockIsBranchMerged).toHaveBeenCalledWith('/workspace/repo', 'feature/baz', 'develop');
+    expect(mockIsBranchMerged).toHaveBeenCalledWith(
+      '/workspace/repo',
+      'feature/baz',
+      'origin/develop'
+    );
   });
 
   test('falls back to git detection when worktree.baseBranch is not configured', async () => {
@@ -1599,8 +1739,12 @@ describe('resolveBaseBranch via runScheduledCleanup (issue #1419)', () => {
 
     await runScheduledCleanup();
 
-    expect(mockGetDefaultBranch).toHaveBeenCalledWith('/workspace/mainrepo', undefined);
-    expect(mockIsBranchMerged).toHaveBeenCalledWith('/workspace/mainrepo', 'feature/bar', 'main');
+    expect(mockGetDefaultBranch).toHaveBeenCalledWith('/workspace/mainrepo', 'origin');
+    expect(mockIsBranchMerged).toHaveBeenCalledWith(
+      '/workspace/mainrepo',
+      'feature/bar',
+      'origin/main'
+    );
   });
 
   test('whitespace-only baseBranch falls back to git detection', async () => {
@@ -1629,7 +1773,7 @@ describe('resolveBaseBranch via runScheduledCleanup (issue #1419)', () => {
 
     await runScheduledCleanup();
 
-    expect(mockGetDefaultBranch).toHaveBeenCalledWith('/workspace/repo3', undefined);
+    expect(mockGetDefaultBranch).toHaveBeenCalledWith('/workspace/repo3', 'origin');
   });
 });
 
@@ -1739,6 +1883,7 @@ describe('onConversationClosed', () => {
       branchName: 'feature-x',
       canonicalRepoPath: '/workspace/repo',
       deleteRemoteBranch: true,
+      remote: 'origin',
     });
   });
 
