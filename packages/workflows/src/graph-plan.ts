@@ -16,7 +16,7 @@ function requireResolvedNodes(nodes: readonly (DagNode | IncludeDirective)[]): D
   return resolved;
 }
 
-function planResolvedNodes(nodes: readonly DagNode[]): GraphPlan {
+function planResolvedNodes(nodes: DagNode[]): GraphPlan {
   const inDegree = new Map<string, number>();
   const dependents = new Map<string, string[]>();
 
@@ -54,7 +54,7 @@ function planResolvedNodes(nodes: readonly DagNode[]): GraphPlan {
 
   const dependencies = new Set(nodes.flatMap(node => node.depends_on ?? []));
   const sinks = nodes.filter(node => !dependencies.has(node.id)).map(node => node.id);
-  return { layers, sinks };
+  return { nodes, layers, sinks };
 }
 
 /** Plan an already-authored node set, rejecting any include directive that survived expansion. */
@@ -64,8 +64,14 @@ export function planGraph(nodes: readonly (DagNode | IncludeDirective)[]): Graph
 
 /** Construct the include-free workflow shape accepted by execution boundaries. */
 export function resolveWorkflow(definition: WorkflowDefinition): ResolvedWorkflow {
-  const nodes = requireResolvedNodes(definition.nodes);
-  return { ...definition, nodes, plan: planResolvedNodes(nodes) };
+  const plan = planResolvedNodes(requireResolvedNodes(definition.nodes));
+  const resolved = { ...definition, nodes: plan.nodes, plan };
+  Object.defineProperties(resolved, {
+    nodes: { enumerable: true, get: () => plan.nodes },
+    plan: { enumerable: true, value: plan },
+  });
+  // This constructor is the sole attachment point for the private type identity.
+  return resolved as ResolvedWorkflow;
 }
 
 /** Narrow an expanded loop-group body at its shared execution boundary. */

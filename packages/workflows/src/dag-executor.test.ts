@@ -594,7 +594,9 @@ function loaderBypassingWorkflow(
     modelReasoningEffort: string;
   }
 ): ResolvedWorkflow & { modelReasoningEffort: string } {
-  return { ...resolveTestWorkflow(workflow), modelReasoningEffort: workflow.modelReasoningEffort };
+  return Object.assign(resolveTestWorkflow(workflow), {
+    modelReasoningEffort: workflow.modelReasoningEffort,
+  });
 }
 
 // --- Tests ---
@@ -692,6 +694,16 @@ describe('planGraph', () => {
       ['left', 'right'],
     ]);
     expect(workflow.plan.sinks).toEqual(['left', 'right']);
+    expect(workflow.nodes).toBe(workflow.plan.nodes);
+  });
+
+  it('does not let a typed caller pair a plan with another node set', () => {
+    const first = resolveTestWorkflow({ name: 'first', nodes: [node('first')] });
+    const second = resolveTestWorkflow({ name: 'second', nodes: [node('second')] });
+
+    // @ts-expect-error Object spread loses the factory-only resolved-workflow identity.
+    const mismatched: ResolvedWorkflow = { ...first, nodes: second.nodes };
+    expect(mismatched.plan.nodes).not.toBe(mismatched.nodes);
   });
 
   it('rejects an include directive that survived expansion and names it', () => {

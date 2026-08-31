@@ -498,6 +498,35 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
 });
 
 describe('dryRunWorkflow', () => {
+  test('uses the attached plan for trace order and summary selection', async () => {
+    const workflow = resolveWorkflow(
+      makeTestWorkflow({
+        name: 'authoritative-plan',
+        nodes: [
+          { id: 'first', prompt: 'first' },
+          { id: 'second', prompt: 'second' },
+        ],
+      })
+    );
+    const [first, second] = workflow.nodes;
+    if (first === undefined || second === undefined) throw new Error('invalid test workflow');
+
+    // Deliberately vary both decisions so either production read becoming a
+    // recomputation makes this regression fail.
+    Reflect.set(workflow.plan, 'layers', [[second], [first]]);
+    Reflect.set(workflow.plan, 'sinks', ['second']);
+
+    const result = await dryRunResolvedWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { first: 'first output', second: 'second output' },
+    });
+
+    expect(result.trace.map(entry => entry.nodeId)).toEqual(['second', 'first']);
+    expect(result.summary).toBe('second output');
+  });
+
   test('hydrates object stubs and resolves workflow and strict output variables', async () => {
     const workflow = makeTestWorkflow({
       name: 'structured',

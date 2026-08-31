@@ -818,7 +818,7 @@ describe('orchestrator-agent handleMessage', () => {
       mockDiscoverWorkflows.mockResolvedValue({
         workflows: [
           {
-            workflow: { ...workflowDefinition, name: 'other-workflow' },
+            workflow: makeTestResolvedWorkflow({ name: 'other-workflow' }),
             source: 'bundled' as const,
           },
         ],

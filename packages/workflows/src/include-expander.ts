@@ -898,14 +898,14 @@ function warnDroppedWorkflowLevelFields(
   child: ResolvedWorkflow,
   consumedFields?: ReadonlySet<string>
 ): void {
-  const childRecord = child as Record<string, unknown>;
-  const droppedFields = Object.keys(child)
+  const droppedFields = Object.entries(child)
     .filter(
-      key =>
+      ([key, value]) =>
         !NON_DROPPED_WORKFLOW_KEYS.has(key) &&
         consumedFields?.has(key) !== true &&
-        childRecord[key] !== undefined
+        value !== undefined
     )
+    .map(([key]) => key)
     .sort();
   if (droppedFields.length === 0) return;
 
