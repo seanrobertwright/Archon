@@ -3058,15 +3058,15 @@ export async function executeWorkflow(
     // encloses only the DAG: a child sub-run spawned from a node re-enters
     // `executeWorkflow` and scopes its own (absent) adoption.
     const dagSummary = await runWithAdoptedRunDir(adoptedRunDir, () =>
-      executeDagWorkflow(
+      executeDagWorkflow({
         deps,
         platform,
         conversationId,
         cwd,
-        { ...workflow, nodes: telemetryNodes },
-        runForDag,
-        resolvedProvider,
-        resolvedModel,
+        workflow: { ...workflow, nodes: telemetryNodes },
+        workflowRun: runForDag,
+        workflowProvider: resolvedProvider,
+        workflowModel: resolvedModel,
         artifactsDir,
         stateDir,
         logDir,
@@ -3075,7 +3075,7 @@ export async function executeWorkflow(
         config,
         configuredCommandFolder,
         issueContext,
-        dagPriorCompletedNodes,
+        priorCompletedNodes: dagPriorCompletedNodes,
         source,
         aiProfile,
         workflowPreset,
@@ -3086,7 +3086,7 @@ export async function executeWorkflow(
         // import cycle) so a `workflow:` node can spawn a governed child run in-process.
         // Also captures the per-child isolation resolver (slice 2, PR-A) so an
         // `isolation: 'worktree'` child gets its own worktree cwd.
-        (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
+        runChildWorkflow: (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
           runChildWorkflow(
             deps,
             platform,
@@ -3095,13 +3095,13 @@ export async function executeWorkflow(
             effectiveRunConfig,
             resolveChildIsolation
           ),
-        dagPriorUsage,
+        priorUsage: dagPriorUsage,
         priorNodeSessions,
         // Container runs resolve from the capture like every other run: it is bind-mounted
         // read-only at the SAME absolute path inside the container, so one source-roots
         // value means the same thing on both sides of the boundary.
-        workflowSourceRoots
-      )
+        workflowSourceRoots,
+      })
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

@@ -9634,6 +9634,77 @@ async function buildColdResumeRecoveryPointer(
   }
 }
 
+type ClaimedWorkPausePolicy = 'finish_through_parent_pause';
+
+/** Run-level values the caller supplies verbatim to the DAG boundary. */
+interface RunInputs {
+  deps: WorkflowDeps;
+  platform: IWorkflowPlatform;
+  conversationId: string;
+  /** The workspace nodes ACT on: provider turns, subprocesses, git, output files. */
+  cwd: string;
+  /**
+   * Injected closure that starts a child sub-run for a `workflow:` node (#2121
+   * Phase 2). Undefined when the caller (e.g. a unit test) doesn't wire it — a
+   * `workflow:` node then fails fast rather than silently no-op'ing. Forwarded
+   * into loop_group body contexts too, though a `workflow:` node inside a
+   * loop_group body is rejected at load time.
+   */
+  runChildWorkflow?: RunChildWorkflowFn;
+  workflowRun: WorkflowRun;
+  config: WorkflowConfig;
+  workflowProvider: string;
+  workflowModel: string | undefined;
+  aiProfile?: ResolvedAiProfile;
+  workflowPreset?: ModelAliasPreset;
+  artifactsDir: string;
+  /**
+   * `$STATE_DIR` — the per-PROJECT cross-run state directory (#2200), shared by
+   * every workflow in the project and pre-created by the executor. A run-level
+   * invariant like `artifactsDir`; forwarded unchanged into loop_group bodies.
+   */
+  stateDir: string;
+  logDir: string;
+  baseBranch: string;
+  docsDir: string;
+  configuredCommandFolder?: string;
+  issueContext?: string;
+}
+
+/** Run-level values derived exactly once at the DAG boundary, never supplied by callers. */
+interface RunDerived {
+  /**
+   * The roots nodes READ executable source from — command files and named scripts.
+   *
+   * REQUIRED and concrete: normalized once at the DAG boundary so no leaf lookup can be
+   * reached without them. They were optional at first, and an omitted argument at any one
+   * of six call sites silently recreated the original source/target bug — the resolver
+   * would fall back to `cwd` and look for the workflow's own files inside the workspace it
+   * was executing against. Public discovery helpers keep their live-source defaults; this
+   * internal path does not.
+   */
+  workflowSourceRoots: WorkflowSourceRoots;
+  /** Where nodes in these layers execute (host, or the container in Phase B). Threaded
+   *  into every AI turn's SendQueryOptions and every deterministic subprocess. */
+  execContext: ExecutionContext;
+  /** Workflow name — used for persist_session keying + telemetry. */
+  workflowName: string;
+  workflowLevelOptions: WorkflowLevelOptions;
+  /** Cross-run session-persistence scope key (DB conversation UUID), or undefined to skip. */
+  persistScopeKey: string | undefined;
+  /** Workflow-level default for per-node `persist_session` (opt-in). */
+  workflowPersistSessions: boolean;
+  /**
+   * Stable cross-invocation artifact scope dir (`scopes/<workflow>/<scope>/`), or
+   * undefined when the workflow doesn't use session persistence. When set,
+   * persistence-participating nodes with `output_type` mirror their typed sidecars
+   * here, and a cold session resume points the user at the prior invocation's
+   * artifacts by reference (#1846). Always undefined for loop_group bodies
+   * (which also run with `persistScopeKey: undefined`).
+   */
+  scopeArtifactsDir: string | undefined;
+}
+
 /**
  * Shared context for {@link runLayers}. Bundles the run-level invariants (deps, platform,
  * run record, resolved provider/model/options, paths, config) together with the per-subgraph
@@ -9649,72 +9720,7 @@ async function buildColdResumeRecoveryPointer(
  * executeLoopNode / executeApprovalNode. Body lifecycle rows additionally carry `iteration`
  * in `data`. The in-process emitter payloads stay raw (unprefixed) — see #2090.
  */
-type ClaimedWorkPausePolicy = 'finish_through_parent_pause';
-
-interface RunLayersContext {
-  // --- run-level invariants (shared by top-level DAG and loop_group body) ---
-  deps: WorkflowDeps;
-  platform: IWorkflowPlatform;
-  conversationId: string;
-  /** The workspace nodes ACT on: provider turns, subprocesses, git, output files. */
-  cwd: string;
-  /**
-   * The roots nodes READ executable source from — command files and named scripts.
-   *
-   * REQUIRED and concrete: normalized once at the DAG boundary so no leaf lookup can be
-   * reached without them. They were optional at first, and an omitted argument at any one
-   * of six call sites silently recreated the original source/target bug — the resolver
-   * would fall back to `cwd` and look for the workflow's own files inside the workspace it
-   * was executing against. Public discovery helpers keep their live-source defaults; this
-   * internal path does not.
-   */
-  workflowSourceRoots: WorkflowSourceRoots;
-  /**
-   * Injected closure that starts a child sub-run for a `workflow:` node (#2121
-   * Phase 2). Undefined when the caller (e.g. a unit test) doesn't wire it — a
-   * `workflow:` node then fails fast rather than silently no-op'ing. Forwarded
-   * into loop_group body contexts too, though a `workflow:` node inside a
-   * loop_group body is rejected at load time.
-   */
-  runChildWorkflow?: RunChildWorkflowFn;
-  /** Where nodes in these layers execute (host, or the container in Phase B). Threaded
-   *  into every AI turn's SendQueryOptions and every deterministic subprocess. */
-  execContext: ExecutionContext;
-  workflowRun: WorkflowRun;
-  /** Workflow name — used for persist_session keying + telemetry. */
-  workflowName: string;
-  config: WorkflowConfig;
-  workflowProvider: string;
-  workflowModel: string | undefined;
-  workflowLevelOptions: WorkflowLevelOptions;
-  aiProfile?: ResolvedAiProfile;
-  workflowPreset?: ModelAliasPreset;
-  artifactsDir: string;
-  /**
-   * `$STATE_DIR` — the per-PROJECT cross-run state directory (#2200), shared by
-   * every workflow in the project and pre-created by the executor. A run-level
-   * invariant like `artifactsDir`; forwarded unchanged into loop_group bodies.
-   */
-  stateDir: string;
-  logDir: string;
-  baseBranch: string;
-  docsDir: string;
-  configuredCommandFolder?: string;
-  issueContext?: string;
-  /** Cross-run session-persistence scope key (DB conversation UUID), or undefined to skip. */
-  persistScopeKey: string | undefined;
-  /** Workflow-level default for per-node `persist_session` (opt-in). */
-  workflowPersistSessions: boolean;
-  /**
-   * Stable cross-invocation artifact scope dir (`scopes/<workflow>/<scope>/`), or
-   * undefined when the workflow doesn't use session persistence. When set,
-   * persistence-participating nodes with `output_type` mirror their typed sidecars
-   * here, and a cold session resume points the user at the prior invocation's
-   * artifacts by reference (#1846). Always undefined for loop_group bodies
-   * (which also run with `persistScopeKey: undefined`).
-   */
-  scopeArtifactsDir: string | undefined;
-
+interface RunLayersContext extends RunInputs, RunDerived {
   // --- per-subgraph mutable state (varies between top-level DAG and loop_group body) ---
   /** Pre-computed topological layers (caller builds once — body shape is static). runLayers walks ONLY these; there is deliberately no flat node list here. */
   layers: DagNode[][];
@@ -11508,15 +11514,8 @@ async function raiseWriteBackGate(
   await safeSendMessage(platform, conversationId, message, { workflowId: runId });
 }
 
-/**
- * Execute a complete DAG workflow.
- * Called from executeWorkflow() in executor.ts.
- */
-export async function executeDagWorkflow(
-  deps: WorkflowDeps,
-  platform: IWorkflowPlatform,
-  conversationId: string,
-  cwd: string,
+/** Inputs accepted by {@link executeDagWorkflow}. */
+export interface ExecuteDagWorkflowOptions extends RunInputs {
   workflow: {
     name: string;
     nodes: readonly DagNode[];
@@ -11531,58 +11530,76 @@ export async function executeDagWorkflow(
     returns?: string;
     /** Required boolean property on `returns:` that authors the durable run outcome. */
     outcome_field?: string;
-  } & WorkflowLevelOptions,
-  workflowRun: WorkflowRun,
-  workflowProvider: string,
-  workflowModel: string | undefined,
-  artifactsDir: string,
-  stateDir: string,
-  logDir: string,
-  baseBranch: string,
-  docsDir: string,
-  config: WorkflowConfig,
-  configuredCommandFolder?: string,
-  issueContext?: string,
-  priorCompletedNodes?: Map<string, PersistedNodeOutput>,
+  } & WorkflowLevelOptions;
+  priorCompletedNodes?: Map<string, PersistedNodeOutput>;
   /** Discovery source — telemetry only (custom-vs-default + name redaction). */
-  source?: WorkflowSource,
-  aiProfile?: ResolvedAiProfile,
-  workflowPreset?: ModelAliasPreset,
+  source?: WorkflowSource;
   /**
    * Stable cross-invocation artifact scope dir (`scopes/<workflow>/<scope>/`),
    * resolved by executor.ts when the workflow uses session persistence (#1846).
    * Undefined otherwise — no mirroring, no cold-resume pointer.
    */
-  scopeArtifactsDir?: string,
+  scopeArtifactsDir?: string;
   /**
    * Execution context for this run (host by default; the container backend
    * threads a container context in Phase B). Threaded onto every node's
    * `RunLayersContext` so provider turns and subprocesses exec in the right place.
    */
-  execContext: ExecutionContext = { kind: 'host' },
+  execContext?: ExecutionContext;
   /**
    * Container run context (Phase C): the write-back backend port + env id + policy.
    * Present only for container runs. Drives suspend-on-pause and the engine-level
    * write-back gate that runs after the last node before the run completes.
    */
-  containerCtx?: ContainerRunContext,
-  /**
-   * Injected closure that starts a child sub-run for a `workflow:` node (#2121
-   * Phase 2). executor.ts is the sole caller and passes it; other callers (unit
-   * tests) may omit it, in which case a `workflow:` node fails fast.
-   */
-  runChildWorkflow?: RunChildWorkflowFn,
+  containerCtx?: ContainerRunContext;
   /** Cumulative usage restored on resume, from prior completion AND failure events. */
-  priorUsage?: PriorRunUsage,
+  priorUsage?: PriorRunUsage;
   /** Private run-scoped handles restored before a cold resume transitions to running. */
-  priorNodeSessions?: readonly WorkflowRunNodeSession[],
+  priorNodeSessions?: readonly WorkflowRunNodeSession[];
   /**
    * Roots this run's commands and scripts are read from. Undefined here means the caller
    * has no capture (an in-process caller with a hand-built definition); the boundary below
    * normalizes it to live roots ONCE so nothing downstream has to.
    */
-  workflowSourceRoots?: WorkflowSourceRoots
+  workflowSourceRoots?: WorkflowSourceRoots;
+}
+
+/**
+ * Execute a complete DAG workflow.
+ * Called from executeWorkflow() in executor.ts.
+ */
+export async function executeDagWorkflow(
+  options: ExecuteDagWorkflowOptions
 ): Promise<string | undefined> {
+  const {
+    deps,
+    platform,
+    conversationId,
+    cwd,
+    workflow,
+    workflowRun,
+    workflowProvider,
+    workflowModel,
+    artifactsDir,
+    stateDir,
+    logDir,
+    baseBranch,
+    docsDir,
+    config,
+    configuredCommandFolder,
+    issueContext,
+    priorCompletedNodes,
+    source,
+    aiProfile,
+    workflowPreset,
+    scopeArtifactsDir,
+    execContext = { kind: 'host' },
+    containerCtx,
+    runChildWorkflow,
+    priorUsage,
+    priorNodeSessions,
+    workflowSourceRoots,
+  } = options;
   const dagStartTime = Date.now();
 
   // Container capability fail-fast: before ANY node runs (and before any
@@ -11770,7 +11787,9 @@ export async function executeDagWorkflow(
   // Run the topological layers. runLayers mutates the context's mutable fields in place
   // (nodeOutputs, lastSequentialSession, usage accumulators); we read them back below
   // for the terminal tally. stepNamePrefix is '' for the top-level DAG so node event
-  // step_names are the raw node ids (identical to pre-refactor behavior).
+  // step_names are the raw node ids (identical to pre-refactor behavior). Fields stay
+  // explicit because spreading options would also copy executor-only state into this
+  // context without an excess-property check.
   const runCtx: RunLayersContext = {
     deps,
     platform,
@@ -11780,7 +11799,6 @@ export async function executeDagWorkflow(
     runChildWorkflow,
     workflowRun,
     workflowName: workflow.name,
-    // Normalized once, here. Everything below takes concrete roots.
     workflowSourceRoots: workflowSourceRoots ?? liveSourceRoots(cwd),
     config,
     workflowProvider,
