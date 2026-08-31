@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { makeTestComposedWorkflow, makeTestWorkflow } from './test-utils';
 import {
   createDryRunStubScaffold,
@@ -1058,8 +1058,8 @@ describe('dryRunWorkflow', () => {
     expect(result.outcome).toBe('completed');
     const fields = result.trace[0]?.output?.split('|') ?? [];
     expect(fields.slice(0, 3)).toEqual(['dry-run', 'dry-run-base', 'hello']);
-    expect(fields[3]).toContain('/dry-run-');
-    expect(fields[3]).toEndWith('/logs');
+    expect(fields[3]).toContain(`${sep}dry-run-`);
+    expect(fields[3]).toEndWith(`${sep}logs`);
     expect(fields.slice(4)).toEqual(['', '']);
   });
 
