@@ -1201,7 +1201,7 @@ describe('runScheduledCleanup', () => {
 
   test('detects squash-merged branches via isPatchEquivalent fallback', async () => {
     mockListAllActiveWithCodebase.mockResolvedValueOnce([
-      {
+      makeEnvironmentWithCodebase({
         id: 'env-squash',
         working_path: '/workspace/repo/worktrees/squash-branch',
         branch_name: 'squash-branch',
@@ -1214,7 +1214,7 @@ describe('runScheduledCleanup', () => {
         workflow_id: '42',
         provider: 'worktree',
         metadata: {},
-      },
+      }),
     ]);
     // worktreeExists returns true (path exists)
     mockWorktreeExists.mockResolvedValue(true);
@@ -1224,18 +1224,22 @@ describe('runScheduledCleanup', () => {
     mockIsPatchEquivalent.mockResolvedValueOnce(true);
     // hasUncommittedChanges returns false (default)
     // For removeEnvironment: getById returns the env
-    mockGetById.mockResolvedValueOnce({
-      id: 'env-squash',
-      codebase_id: 'codebase-1',
-      working_path: '/workspace/repo/worktrees/squash-branch',
-      status: 'active',
-    });
+    mockGetById.mockResolvedValueOnce(
+      makeEnvironment({
+        id: 'env-squash',
+        codebase_id: 'codebase-1',
+        working_path: '/workspace/repo/worktrees/squash-branch',
+        status: 'active',
+      })
+    );
     // removeEnvironment: getCodebase for canonical repo path
-    mockGetCodebase.mockResolvedValueOnce({
-      id: 'codebase-1',
-      name: 'test-repo',
-      default_cwd: '/workspace/repo',
-    });
+    mockGetCodebase.mockResolvedValueOnce(
+      makeCodebase({
+        id: 'codebase-1',
+        name: 'test-repo',
+        default_cwd: '/workspace/repo',
+      })
+    );
 
     const report = await runScheduledCleanup();
 
@@ -1412,14 +1416,14 @@ describe('getWorktreeStatusBreakdown', () => {
 
   test('detects squash-merged branches via isPatchEquivalent fallback', async () => {
     mockListByCodebaseWithAge.mockResolvedValueOnce([
-      {
+      makeEnvironmentWithAge({
         id: 'env-squash',
         branch_name: 'squash-branch',
         created_by_platform: 'github',
         days_since_activity: 5,
         working_path: '/path1',
         status: 'active',
-      },
+      }),
     ]);
     // isBranchMerged returns false — regular merge detection fails
     mockIsBranchMerged.mockResolvedValueOnce(false);
@@ -1673,23 +1677,25 @@ describe('cleanupMergedWorktrees', () => {
     // In the pre-#3002 code this would have been classified as unmerged;
     // now the remote-qualified ref gives the correct answer.
     mockListByCodebase.mockResolvedValueOnce([
-      {
+      makeEnvironment({
         id: 'env-squash-stale-base',
         branch_name: 'squash-stale-base',
         working_path: '/workspace/repo/worktrees/squash-stale-base',
         status: 'active',
-      },
+      }),
     ]);
     // git branch --merged origin/main → false (regular merge check fails against
     // the remote-qualified ref too — the branch was squash-merged, not ff-merged)
     mockIsBranchMerged.mockResolvedValueOnce(false);
     // git cherry origin/main <branch> → true (patch-equivalent, squash-merged)
     mockIsPatchEquivalent.mockResolvedValueOnce(true);
-    mockGetById.mockResolvedValueOnce({
-      id: 'env-squash-stale-base',
-      working_path: '/workspace/repo/worktrees/squash-stale-base',
-      status: 'active',
-    });
+    mockGetById.mockResolvedValueOnce(
+      makeEnvironment({
+        id: 'env-squash-stale-base',
+        working_path: '/workspace/repo/worktrees/squash-stale-base',
+        status: 'active',
+      })
+    );
     mockWorktreeExists.mockResolvedValueOnce(true);
 
     const result = await cleanupMergedWorktrees('codebase-1', '/workspace/repo');
