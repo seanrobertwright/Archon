@@ -378,13 +378,14 @@ export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined 
 // Operations
 // ---------------------------------------------------------------------------
 
-/**
- * List all running and paused workflow runs.
- */
-export async function getWorkflowStatus(): Promise<WorkflowStatusData> {
+/** List running and paused workflow runs, optionally scoped to one codebase. */
+export async function getWorkflowStatus(options?: {
+  codebaseId?: string;
+}): Promise<WorkflowStatusData> {
   const { runs } = await workflowDb.listDashboardRuns({
     status: ['running', 'paused'],
     limit: 50,
+    ...(options?.codebaseId ? { codebaseId: options.codebaseId } : {}),
   });
   return { runs };
 }

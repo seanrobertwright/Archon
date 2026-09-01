@@ -1960,9 +1960,7 @@ export async function listWorkflowRuns(options?: {
   }
   if (options?.codebaseId) {
     values.push(options.codebaseId);
-    whereClauses.push(
-      `conversation_id IN (SELECT id FROM remote_agent_conversations WHERE codebase_id = $${String(values.length)})`
-    );
+    whereClauses.push(`remote_agent_workflow_runs.codebase_id = $${String(values.length)}`);
   }
 
   const limit = options?.limit ?? 50;

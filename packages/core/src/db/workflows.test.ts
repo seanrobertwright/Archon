@@ -1550,6 +1550,21 @@ describe('workflows database', () => {
       expect(params[0]).toBe('failed');
     });
 
+    test('filters by the run-owned codebase', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await listWorkflowRuns({
+        status: ['running', 'paused'],
+        codebaseId: 'cb-project-a',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('status IN ($1, $2)');
+      expect(query).toContain('remote_agent_workflow_runs.codebase_id = $3');
+      expect(query).not.toContain('remote_agent_conversations');
+      expect(params).toEqual(['running', 'paused', 'cb-project-a', 50]);
+    });
+
     test('returns results from query', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
 

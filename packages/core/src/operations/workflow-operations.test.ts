@@ -1250,6 +1250,22 @@ describe('getWorkflowStatus', () => {
       limit: 50,
     });
   });
+
+  test('passes an explicit codebase scope to the active-run query', async () => {
+    mockListDashboardRuns.mockResolvedValueOnce({
+      runs: [],
+      total: 0,
+      counts: EMPTY_COUNTS,
+    });
+
+    await getWorkflowStatus({ codebaseId: 'cb-project-a' });
+
+    expect(mockListDashboardRuns).toHaveBeenCalledWith({
+      status: ['running', 'paused'],
+      limit: 50,
+      codebaseId: 'cb-project-a',
+    });
+  });
 });
 
 describe('resumeWorkflow', () => {
