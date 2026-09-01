@@ -3871,29 +3871,6 @@ async function executeScriptNode(
   const stepName = stepNamePrefix + node.id;
   const iterationData = iteration !== undefined ? { iteration } : {};
 
-  // Resolve before deciding whether this is inline or filesystem-backed: substitutions
-  // can turn the authored field into either form. A named source is checked outside the
-  // deterministic retry classifier, so an integrity failure cannot consume retries.
-  // User-controlled variables stay in subprocess env instead of being spliced into
-  // TS/Python source; strict node-output references keep raw substitution (#2115).
-  const { prompt: substitutedScript } = substituteWorkflowVariables(
-    node.script,
-    workflowRun.id,
-    workflowRun.user_message,
-    artifactsDir,
-    baseBranch,
-    docsDir,
-    issueContext,
-    undefined,
-    undefined,
-    undefined,
-    { shellSafe: true, stateDir }
-  );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
-  if (!isInlineScript(finalScript)) {
-    await assertWorkflowSourceIntegrity(workflowSourceRoots);
-  }
-
   getLog().info({ nodeId: node.id, type: 'script', runtime: node.runtime }, 'dag_node_started');
   await logNodeStart(logDir, workflowRun.id, node.id, '<script>');
 
@@ -3918,6 +3895,29 @@ async function executeScriptNode(
     nodeId: node.id,
     nodeName: node.id,
   });
+
+  // Resolve before deciding whether this is inline or filesystem-backed: substitutions
+  // can turn the authored field into either form. A named source is checked outside the
+  // deterministic retry classifier, so an integrity failure cannot consume retries.
+  // User-controlled variables stay in subprocess env instead of being spliced into
+  // TS/Python source; strict node-output references keep raw substitution (#2115).
+  const { prompt: substitutedScript } = substituteWorkflowVariables(
+    node.script,
+    workflowRun.id,
+    workflowRun.user_message,
+    artifactsDir,
+    baseBranch,
+    docsDir,
+    issueContext,
+    undefined,
+    undefined,
+    undefined,
+    { shellSafe: true, stateDir }
+  );
+  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
+  if (!isInlineScript(finalScript)) {
+    await assertWorkflowSourceIntegrity(workflowSourceRoots);
+  }
 
   // One-release migration warn for any literal user-controlled var ref that no
   // longer substitutes now that delivery moved to env vars (#2115).

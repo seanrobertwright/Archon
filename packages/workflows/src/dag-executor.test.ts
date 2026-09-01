@@ -16649,13 +16649,18 @@ describe('executeDagWorkflow -- script nodes', () => {
     );
 
     await expect(readFile(marker, 'utf-8')).rejects.toThrow();
-    const failedEvents = (
-      mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>
-    ).mock.calls.filter(
+    const events = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const startedEvents = events.filter(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string; step_name?: string }).event_type === 'node_started' &&
+        (call[0] as { step_name?: string }).step_name === 'run-check'
+    );
+    const failedEvents = events.filter(
       (call: unknown[]) =>
         (call[0] as { event_type: string; step_name?: string }).event_type === 'node_failed' &&
         (call[0] as { step_name?: string }).step_name === 'run-check'
     );
+    expect(startedEvents).toHaveLength(1);
     expect(failedEvents).toHaveLength(1);
     expect((failedEvents[0][0] as { data: { error: string } }).data.error).toContain(
       'captured source has changed'
