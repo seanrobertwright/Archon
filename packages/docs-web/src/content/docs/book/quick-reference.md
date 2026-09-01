@@ -18,8 +18,9 @@ This chapter collects every CLI command, variable, and YAML option in one place.
 
 | Command | Description |
 |---------|-------------|
-| `archon workflow list` | List all available workflows |
-| `archon workflow list --json` | Machine-readable JSON output |
+| `archon workflow list` | Human-readable compact discovery; shortened descriptions end in ` [truncated]` |
+| `archon workflow list --json` | Machine-readable compact discovery; `descriptionTruncated` reports omitted content |
+| `archon workflow list <name> --full --json` | Exact authored description for one workflow |
 | `archon workflow run <name> "<prompt>"` | Run a workflow |
 | `archon workflow run <name> --branch <name> "<prompt>"` | Run with an explicit branch |
 | `archon workflow run <name> --no-worktree "<prompt>"` | Run in the live checkout (no isolation) |
@@ -105,7 +106,7 @@ archon workflow run my-workflow "auth refresh-tokens"
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
 | `name` | Yes | string | Identifies the workflow in `archon workflow list` |
-| `description` | Yes | string | Shown in listings and used by the router |
+| `description` | Yes | string | Used by the router; compact previews appear in CLI listings |
 | `nodes` | Yes | array | DAG nodes (see Node Options below) |
 | `provider` | No | string | Registered provider identifier (e.g. `claude`, `codex`). Default: `claude` |
 | `model` | No | string | Model for all nodes (`sonnet`, `opus`, `haiku`, or full model ID) |

@@ -102,6 +102,7 @@ import {
 import type {
   DeclaredWorkflowConfig,
   WorkflowDefinition,
+  WorkflowLoadError,
   WorkflowLoadResult,
   WorkflowSource,
   WorkflowWithSource,
@@ -139,6 +140,7 @@ import * as codebaseDb from '@archon/core/db/codebases';
 import * as isolationDb from '@archon/core/db/isolation-environments';
 import * as messageDb from '@archon/core/db/messages';
 import * as workflowDb from '@archon/core/db/workflows';
+import type { DashboardWorkflowRun } from '@archon/core/db/workflows';
 import * as workflowEventsDb from '@archon/core/db/workflow-events';
 import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
 import * as userDb from '@archon/core/db/users';
@@ -1101,6 +1103,7 @@ function countWorkflowSources(
 interface WorkflowJsonEntry {
   name: string;
   description: string;
+  descriptionTruncated: boolean;
   provider?: string;
   model?: string;
   /** Reasoning depth — the one spelling, on every provider that has one (#2556).
@@ -1110,6 +1113,62 @@ interface WorkflowJsonEntry {
   webSearchMode?: string;
   /** Keys the workflow's YAML declares that the engine drops (#2213). */
   parseWarnings?: string[];
+}
+
+export interface WorkflowListOptions {
+  json?: boolean;
+  name?: string;
+  full?: boolean;
+}
+
+const WORKFLOW_DESCRIPTION_PREVIEW_LIMIT = 160;
+const WORKFLOW_DESCRIPTION_TRUNCATION_MARKER = ' [truncated]';
+
+interface WorkflowDescriptionProjection {
+  description: string;
+  truncated: boolean;
+}
+
+function projectWorkflowDescription(
+  description: string,
+  full: boolean
+): WorkflowDescriptionProjection {
+  if (full || Array.from(description).length <= WORKFLOW_DESCRIPTION_PREVIEW_LIMIT) {
+    return { description, truncated: false };
+  }
+
+  const normalized = description.trim().replace(/\s+/gu, ' ');
+  const codePoints = Array.from(normalized);
+  if (codePoints.length <= WORKFLOW_DESCRIPTION_PREVIEW_LIMIT) {
+    return { description: normalized, truncated: true };
+  }
+
+  const firstSentenceEnd = codePoints
+    .slice(0, WORKFLOW_DESCRIPTION_PREVIEW_LIMIT)
+    .findIndex(character => character === '.' || character === '?' || character === '!');
+  if (firstSentenceEnd !== -1) {
+    return {
+      description: codePoints.slice(0, firstSentenceEnd + 1).join(''),
+      truncated: true,
+    };
+  }
+
+  let preview = codePoints.slice(0, WORKFLOW_DESCRIPTION_PREVIEW_LIMIT);
+  if (codePoints[WORKFLOW_DESCRIPTION_PREVIEW_LIMIT] !== ' ') {
+    const lastWordBoundary = preview.lastIndexOf(' ');
+    if (lastWordBoundary > 0) preview = preview.slice(0, lastWordBoundary);
+  }
+  return { description: preview.join(''), truncated: true };
+}
+
+export class WorkflowListLookupError extends Error {
+  readonly loadErrors: readonly WorkflowLoadError[];
+
+  constructor(message: string, loadErrors: readonly WorkflowLoadError[]) {
+    super(message);
+    this.name = 'WorkflowListLookupError';
+    this.loadErrors = loadErrors;
+  }
 }
 
 /**
@@ -1210,20 +1269,48 @@ export async function workflowTestCommand(
 /**
  * List available workflows in the current directory
  */
-export async function workflowListCommand(cwd: string, json?: boolean): Promise<void> {
+export async function workflowListCommand(
+  cwd: string,
+  options: WorkflowListOptions = {}
+): Promise<void> {
   const { workflows: workflowEntries, errors } = await loadWorkflows(cwd);
+  let listedEntries = workflowEntries;
+  if (options.name !== undefined) {
+    let workflow: WorkflowWithSource['workflow'] | undefined;
+    try {
+      workflow = resolveWorkflowName(
+        options.name,
+        workflowEntries.map(entry => entry.workflow)
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new WorkflowListLookupError(message, errors);
+    }
+    if (workflow === undefined) {
+      const availableWorkflows = workflowEntries
+        .map(entry => `  - ${entry.workflow.name}`)
+        .join('\n');
+      throw new WorkflowListLookupError(
+        `Workflow '${options.name}' not found.\n\nAvailable workflows:\n${availableWorkflows || '  (none)'}`,
+        errors
+      );
+    }
+    listedEntries = workflowEntries.filter(entry => entry.workflow.name === workflow.name);
+  }
 
-  if (json) {
+  if (options.json) {
     const output = {
       // `declared` rather than the expanded workflow: composition collapses these fields
       // onto the nodes and removes them (#1764), so the listing reports what the author
       // wrote. `webSearchMode` is the one that stays on the definition — it has no
       // per-node form to collapse onto.
-      workflows: workflowEntries.map(
+      workflows: listedEntries.map(
         ({ workflow: w, parseWarnings, declared }): WorkflowJsonEntry => {
+          const description = projectWorkflowDescription(w.description, options.full === true);
           const entry: WorkflowJsonEntry = {
             name: w.name,
-            description: w.description,
+            description: description.description,
+            descriptionTruncated: description.truncated,
           };
           if (declared?.provider !== undefined) entry.provider = declared.provider;
           if (declared?.model !== undefined) entry.model = declared.model;
@@ -1245,18 +1332,21 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 
   console.log(`Discovering workflows in: ${cwd}`);
 
-  if (workflowEntries.length === 0 && errors.length === 0) {
+  if (listedEntries.length === 0 && errors.length === 0) {
     console.log('\nNo workflows found.');
     console.log('Workflows should be in .archon/workflows/ directory.');
     return;
   }
 
-  if (workflowEntries.length > 0) {
-    console.log(`\nFound ${workflowEntries.length} workflow(s):\n`);
+  if (listedEntries.length > 0) {
+    console.log(`\nFound ${listedEntries.length} workflow(s):\n`);
 
-    for (const { workflow, parseWarnings, declared } of workflowEntries) {
+    for (const { workflow, parseWarnings, declared } of listedEntries) {
+      const description = projectWorkflowDescription(workflow.description, options.full === true);
       console.log(`  ${workflow.name}`);
-      console.log(`    ${workflow.description}`);
+      console.log(
+        `    ${description.description}${description.truncated ? WORKFLOW_DESCRIPTION_TRUNCATION_MARKER : ''}`
+      );
       if (declared?.provider) {
         console.log(`    Provider: ${declared.provider}`);
       }
@@ -3520,7 +3610,7 @@ export async function workflowStatusCommand(
   verbose?: boolean,
   rawEvents?: boolean
 ): Promise<void> {
-  let runs: WorkflowRun[];
+  let runs: DashboardWorkflowRun[];
   try {
     const result = await getWorkflowStatus();
     runs = result.runs;
@@ -3561,6 +3651,11 @@ export async function workflowStatusCommand(
     console.log(`  Status: ${run.status}`);
     if (run.outcome) console.log(`  Authored outcome: ${run.outcome}`);
     console.log(`  Age:    ${age}`);
+    if (run.active_nodes.length > 0) {
+      console.log(
+        `  Active node${run.active_nodes.length === 1 ? '' : 's'}: ${run.active_nodes.join(', ')}`
+      );
+    }
 
     if (verbose) {
       const { events, failed } = await fetchVerboseEvents(run.id);
@@ -4239,13 +4334,11 @@ export async function workflowRunsCommand(
 
   console.log(`\nRecent runs (${result.runs.length} of ${result.total}):\n`);
   for (const run of result.runs) {
-    const step =
-      run.current_step_name !== null
-        ? ` · ${run.current_step_name}${run.total_steps !== null ? `/${String(run.total_steps)}` : ''}`
-        : '';
+    const activeNodes =
+      run.active_nodes.length > 0 ? ` · active node(s): ${run.active_nodes.join(', ')}` : '';
     const outcome = run.outcome ? ` · authored outcome: ${run.outcome}` : '';
     console.log(
-      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${step}${outcome}  (${formatAge(run.started_at)})`
+      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${activeNodes}${outcome}  (${formatAge(run.started_at)})`
     );
   }
   console.log('');

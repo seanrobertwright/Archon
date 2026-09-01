@@ -23115,6 +23115,120 @@ describe('executeDagWorkflow -- loop_group node', () => {
     expect(written).toContain('final result v2');
     expect(written).not.toContain('draft v1');
   });
+
+  it('records iteration on node_failed for a failing loop_group body agent (#3080)', async () => {
+    let callCount = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      callCount++;
+      if (callCount === 1) {
+        yield { type: 'assistant', content: 'iteration 1 done' };
+        yield { type: 'result', sessionId: 'lg-fail-1' };
+      } else {
+        throw new Error('Simulated provider failure on iteration 2');
+      }
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('lg-fail-iter');
+
+    const nodes: DagNode[] = [
+      {
+        id: 'fixer',
+        kind: 'loop_group',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 3,
+          fresh_context: false,
+          nodes: [
+            {
+              id: 'work',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+              depends_on: [],
+            },
+          ],
+        },
+        depends_on: [],
+      },
+    ];
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-lg-fail',
+        cwd: testDir,
+        workflow: { name: 'lg-fail-iter', nodes },
+        workflowRun,
+      })
+    );
+
+    expect(callCount).toBe(2);
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      c => c[0] as { event_type: string; step_name: string; data?: Record<string, unknown> }
+    );
+
+    // Iteration 1 completed normally — started and completed carry iteration.
+    const iter1Started = events.find(
+      e => e.event_type === 'node_started' && e.step_name === 'fixer.work'
+    );
+    const iter1Completed = events.find(
+      e => e.event_type === 'node_completed' && e.step_name === 'fixer.work'
+    );
+    expect(iter1Started?.data?.iteration).toBe(1);
+    expect(iter1Completed?.data?.iteration).toBe(1);
+
+    // Iteration 2 failed — started and failed carry the same iteration.
+    const iter2Started = events.filter(
+      e => e.event_type === 'node_started' && e.step_name === 'fixer.work'
+    )[1];
+    const iter2Failed = events.find(
+      e => e.event_type === 'node_failed' && e.step_name === 'fixer.work'
+    );
+    expect(iter2Started?.data?.iteration).toBe(2);
+    expect(iter2Failed?.data?.iteration).toBe(2);
+    expect(iter2Failed?.data?.error).toContain('Simulated provider failure');
+  });
+
+  it('does not record iteration on node_failed for a non-loop agent (#3080)', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      throw new Error('Simulated provider failure');
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('no-loop-fail');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-noloop',
+        cwd: testDir,
+        workflow: {
+          name: 'no-loop-fail',
+          nodes: [
+            {
+              id: 'agent',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'do work' },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      c => c[0] as { event_type: string; step_name: string; data?: Record<string, unknown> }
+    );
+    const failed = events.find(e => e.event_type === 'node_failed' && e.step_name === 'agent');
+    expect(failed).toBeDefined();
+    expect(failed?.data?.iteration).toBeUndefined();
+  });
 });
 
 // #2090: loop_group body lifecycle events must carry a namespaced persisted `step_name`
