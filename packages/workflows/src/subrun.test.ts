@@ -4711,7 +4711,10 @@ describe('workflow: declared input contract at runtime (#2470)', () => {
   }
 
   /** A child that declares `inputs:` and echoes them, so delivery is observable. */
-  async function writeDeclaringChild(inputsYaml: string): Promise<void> {
+  async function writeDeclaringChild(
+    inputsYaml: string,
+    bash = 'echo "style=$INPUTS_STYLE tone=$INPUTS_TONE"'
+  ): Promise<void> {
     await writeWorkflow(
       'child-declares',
       `
@@ -4721,7 +4724,7 @@ inputs:
 ${inputsYaml}
 nodes:
   - id: emit
-    bash: echo "style=$INPUTS_STYLE tone=$INPUTS_TONE"
+    bash: ${bash}
 `
     );
   }
@@ -4787,7 +4790,7 @@ nodes:
   });
 
   it('fails the node when a required child input is not supplied', async () => {
-    await writeDeclaringChild('  style:\n    required: true');
+    await writeDeclaringChild('  style:\n    required: true', 'echo "style=$INPUTS_STYLE"');
     await writeWorkflow(
       'parent-missing',
       `
@@ -4822,7 +4825,7 @@ nodes:
   });
 
   it('fails the node on a with: key the child does not declare', async () => {
-    await writeDeclaringChild('  style:\n    default: strict');
+    await writeDeclaringChild('  style:\n    default: strict', 'echo "style=$INPUTS_STYLE"');
     await writeWorkflow(
       'parent-undeclared',
       `
@@ -4857,7 +4860,7 @@ nodes:
     expect(childRun(store)).toBeUndefined();
   });
 
-  it('keeps Phase-1 passthrough for a child that declares no inputs', async () => {
+  it('keeps Phase-1 passthrough for an exec child that declares no inputs', async () => {
     await writeWorkflow(
       'child-undeclared',
       `

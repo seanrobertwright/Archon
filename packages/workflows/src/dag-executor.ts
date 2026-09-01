@@ -95,6 +95,7 @@ import {
 } from './schemas';
 import type { BindingDirective } from './schemas';
 import { mapNodeTemplateSlots } from './template-walker';
+import { buildExecNodeEnvironment } from './exec-environment';
 import { planGraph, resolvedBodyNodes } from './graph-plan';
 import { FAN_OUT_CANCEL_REASONS } from './store';
 import type { DagResumeSnapshot, FanOutCancelReason, PersistedNodeOutput } from './store';
@@ -3644,23 +3645,19 @@ async function executeBashNode(
       issueContext,
       nodeOutputs,
     }),
-    ARTIFACTS_DIR: artifactsDir,
-    STATE_DIR: stateDir,
-    LOG_DIR: logDir,
-    ADOPTED_RUN_DIR: currentAdoptedRunDir() ?? '',
-    // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
-    // reads os.environ and found it missing while its siblings above were all
-    // present. Deliver it the same way.
-    WORKFLOW_ID: workflowRun.id,
-    BASE_BRANCH: baseBranch,
-    USER_MESSAGE: workflowRun.user_message,
-    ARGUMENTS: workflowRun.user_message,
-    LOOP_USER_INPUT: loopUserInput,
-    LOOP_PREV_OUTPUT: '',
-    REJECTION_REASON: '',
-    CONTEXT: issueContext ?? '',
-    EXTERNAL_CONTEXT: issueContext ?? '',
-    ISSUE_CONTEXT: issueContext ?? '',
+    ...buildExecNodeEnvironment({
+      artifactsDir,
+      stateDir,
+      logDir,
+      workflowId: workflowRun.id,
+      baseBranch,
+      userMessage: workflowRun.user_message,
+      loopUserInput,
+      loopPrevOutput: '',
+      rejectionReason: '',
+      issueContext,
+      adoptedRunDir: currentAdoptedRunDir(),
+    }),
   };
 
   const bashPath = resolveBashPath();
@@ -3943,23 +3940,19 @@ async function executeScriptNode(
       issueContext,
       nodeOutputs,
     }),
-    ARTIFACTS_DIR: artifactsDir,
-    STATE_DIR: stateDir,
-    LOG_DIR: logDir,
-    ADOPTED_RUN_DIR: currentAdoptedRunDir() ?? '',
-    // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
-    // reads os.environ and found it missing while its siblings above were all
-    // present. Deliver it the same way.
-    WORKFLOW_ID: workflowRun.id,
-    BASE_BRANCH: baseBranch,
-    USER_MESSAGE: workflowRun.user_message,
-    ARGUMENTS: workflowRun.user_message,
-    LOOP_USER_INPUT: loopUserInput,
-    LOOP_PREV_OUTPUT: '',
-    REJECTION_REASON: '',
-    CONTEXT: issueContext ?? '',
-    EXTERNAL_CONTEXT: issueContext ?? '',
-    ISSUE_CONTEXT: issueContext ?? '',
+    ...buildExecNodeEnvironment({
+      artifactsDir,
+      stateDir,
+      logDir,
+      workflowId: workflowRun.id,
+      baseBranch,
+      userMessage: workflowRun.user_message,
+      loopUserInput,
+      loopPrevOutput: '',
+      rejectionReason: '',
+      issueContext,
+      adoptedRunDir: currentAdoptedRunDir(),
+    }),
   };
 
   // Build the command and args based on runtime and inline vs named
@@ -11860,6 +11853,10 @@ export async function executeDagWorkflow(
     tokens: totalTokens,
     loopIterations: totalLoopIterations,
   });
+  const runTranscriptUsage: WorkflowUsage = {
+    ...(totalCostUsd > 0 ? { cost_usd: totalCostUsd } : {}),
+    ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),
+  };
 
   getLog().info(
     { nodeCount: workflow.nodes.length, anyCompleted, anyFailed },
@@ -11901,12 +11898,14 @@ export async function executeDagWorkflow(
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
       return undefined;
     });
-    await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
-      getLog().error(
-        { err: logErr, workflowRunId: workflowRun.id },
-        'dag.workflow_error_log_write_failed'
-      );
-    });
+    await logWorkflowError(logDir, workflowRun.id, failMsg, runTranscriptUsage).catch(
+      (logErr: Error) => {
+        getLog().error(
+          { err: logErr, workflowRunId: workflowRun.id },
+          'dag.workflow_error_log_write_failed'
+        );
+      }
+    );
     const emitterForFail = getWorkflowEventEmitter();
     emitterForFail.emit({
       type: 'workflow_failed',
@@ -11957,12 +11956,14 @@ export async function executeDagWorkflow(
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag.quota_resume_plan_failed');
       return undefined;
     });
-    await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
-      getLog().error(
-        { err: logErr, workflowRunId: workflowRun.id },
-        'dag.workflow_error_log_write_failed'
-      );
-    });
+    await logWorkflowError(logDir, workflowRun.id, failMsg, runTranscriptUsage).catch(
+      (logErr: Error) => {
+        getLog().error(
+          { err: logErr, workflowRunId: workflowRun.id },
+          'dag.workflow_error_log_write_failed'
+        );
+      }
+    );
     const emitterForFail = getWorkflowEventEmitter();
     emitterForFail.emit({
       type: 'workflow_failed',
@@ -12051,12 +12052,14 @@ export async function executeDagWorkflow(
         event_type: 'evidence_validation_failed',
         data: { policy: 'evidence_policy.required', expected_path: evidencePath },
       });
-      await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
-        getLog().error(
-          { err: logErr, workflowRunId: workflowRun.id },
-          'dag.workflow_error_log_write_failed'
-        );
-      });
+      await logWorkflowError(logDir, workflowRun.id, failMsg, runTranscriptUsage).catch(
+        (logErr: Error) => {
+          getLog().error(
+            { err: logErr, workflowRunId: workflowRun.id },
+            'dag.workflow_error_log_write_failed'
+          );
+        }
+      );
       const emitterForEvidence = getWorkflowEventEmitter();
       emitterForEvidence.emit({
         type: 'workflow_failed',
@@ -12155,13 +12158,7 @@ export async function executeDagWorkflow(
   // Emit completion, then record it. The transcript, the live event, and the telemetry
   // do not depend on the status write and used to run whether or not it succeeded, so
   // the (now-throwing) write goes last.
-  await logWorkflowComplete(logDir, workflowRun.id, {
-    // `> 0` rather than `!== undefined`, mirroring persistRunUsage above: the accumulator
-    // is a plain number seeded at 0, so zero is the only way it can say "no AI usage" —
-    // and a bash-only run must not read as a free AI run on the transcript either.
-    ...(totalCostUsd > 0 ? { cost_usd: totalCostUsd } : {}),
-    ...(totalTokens !== undefined ? { tokens: totalTokens } : {}),
-  });
+  await logWorkflowComplete(logDir, workflowRun.id, runTranscriptUsage);
   const emitter = getWorkflowEventEmitter();
   emitter.emit({
     type: 'workflow_completed',

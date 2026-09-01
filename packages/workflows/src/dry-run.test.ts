@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { makeTestComposedWorkflow, makeTestWorkflow } from './test-utils';
 import {
   createDryRunStubScaffold as createResolvedDryRunStubScaffold,
@@ -1089,6 +1089,31 @@ describe('dryRunWorkflow', () => {
       if (previousHome === undefined) delete process.env.ARCHON_HOME;
       else process.env.ARCHON_HOME = previousHome;
     }
+  });
+
+  test('exec-code receives the fixed engine-owned environment', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'engine-env',
+      nodes: [
+        {
+          id: 'code',
+          bash: `printf '%s|%s|%s|%s|%s|%s' "$WORKFLOW_ID" "$BASE_BRANCH" "$ARGUMENTS" "$LOG_DIR" "$LOOP_PREV_OUTPUT" "$REJECTION_REASON"`,
+        },
+      ],
+    });
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: 'hello',
+      cwd: process.cwd(),
+      execCode: true,
+    });
+
+    expect(result.outcome).toBe('completed');
+    const fields = result.trace[0]?.output?.split('|') ?? [];
+    expect(fields.slice(0, 3)).toEqual(['dry-run', 'dry-run-base', 'hello']);
+    expect(fields[3]).toContain(`${sep}dry-run-`);
+    expect(fields[3]).toEndWith(`${sep}logs`);
+    expect(fields.slice(4)).toEqual(['', '']);
   });
 
   test('a dry run that executes nothing creates no temp directory', async () => {

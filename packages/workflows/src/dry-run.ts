@@ -40,6 +40,7 @@ import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
 import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
 import { defaultRunInputs } from './workflow-inputs';
+import { buildExecNodeEnvironment } from './exec-environment';
 import {
   inputEnvKey,
   isGateNode,
@@ -471,13 +472,14 @@ interface DryRunContext {
    */
   inputs?: Record<string, JsonValue>;
   /**
-   * Per-simulation `$ARTIFACTS_DIR` / `$STATE_DIR`, under a uniquely named root in
+   * Per-simulation `$ARTIFACTS_DIR` / `$STATE_DIR` / `$LOG_DIR`, under a uniquely named root in
    * `<archonHome>/temp/` — NEVER inside the simulated repository, which holds source
    * only (#2619). Created lazily before the first `--exec-code` execution (#2617) and
    * removed when the simulation ends; a pure-stub dry run creates nothing.
    */
   artifactsDir: string;
   stateDir: string;
+  logDir: string;
   execCode: boolean;
   defaultStubs: boolean;
   pauseAtGates: boolean;
@@ -703,10 +705,18 @@ async function executeCodeNode(
         PWD: ctx.execWorkspace,
         OLDPWD: ctx.execWorkspace,
         ...inputEnv,
-        USER_MESSAGE: ctx.userMessage,
-        ARGUMENTS: ctx.userMessage,
-        ARTIFACTS_DIR: ctx.artifactsDir,
-        STATE_DIR: ctx.stateDir,
+        ...buildExecNodeEnvironment({
+          artifactsDir: ctx.artifactsDir,
+          stateDir: ctx.stateDir,
+          logDir: ctx.logDir,
+          workflowId: 'dry-run',
+          baseBranch: 'dry-run-base',
+          userMessage: ctx.userMessage,
+          loopUserInput: '',
+          loopPrevOutput: '',
+          rejectionReason: '',
+          issueContext: '',
+        }),
       },
     });
     return { output: result.stdout.replace(/\n$/, '') };
@@ -1260,6 +1270,7 @@ export async function dryRunWorkflow(options: {
     ...(inputs ? { inputs } : {}),
     artifactsDir: join(tempRoot, 'artifacts'),
     stateDir: join(tempRoot, 'state'),
+    logDir: join(tempRoot, 'logs'),
     execCode: options.execCode ?? false,
     defaultStubs: options.defaultStubs ?? false,
     pauseAtGates: options.pauseAtGates ?? false,
