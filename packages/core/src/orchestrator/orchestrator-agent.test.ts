@@ -236,6 +236,19 @@ const mockInspectResumableRun = mock<typeof WorkflowExecutor.inspectResumableRun
     priorUsage: { costUsd: 0 },
   })
 );
+const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
+  project: '/capture/project',
+  globalWorkflows: '/capture/global/workflows',
+  globalCommands: '/capture/global/commands',
+  globalScripts: '/capture/global/scripts',
+  bundledWorkflows: '/capture/bundled',
+  bundledCommands: '/capture/bundled/commands/defaults',
+  kind: 'captured',
+  config: {
+    load_default_workflows: true,
+    load_default_commands: true,
+  },
+};
 const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSource>(() =>
   Promise.resolve({
     runId: 'prepared-run-id',
@@ -255,20 +268,11 @@ const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSo
         load_default_commands: true,
       },
     },
-    roots: {
-      project: '/capture/project',
-      globalWorkflows: '/capture/global/workflows',
-      globalCommands: '/capture/global/commands',
-      globalScripts: '/capture/global/scripts',
-      bundledWorkflows: '/capture/bundled',
-      bundledCommands: '/capture/bundled/commands/defaults',
-      kind: 'captured',
-      config: {
-        load_default_workflows: true,
-        load_default_commands: true,
-      },
-    },
+    roots: CAPTURED_SOURCE_ROOTS,
   })
+);
+const mockResolveContinuationWorkflow = mock<typeof WorkflowExecutor.resolveContinuationWorkflow>(
+  () => Promise.resolve(undefined)
 );
 /** Ownership calls the dispatch path makes on its capture, in order. */
 const capturedSourceOwnerCalls: string[] = [];
@@ -283,7 +287,7 @@ mock.module('@archon/workflows/executor', () => ({
   prepareWorkflowSource: mockPrepareWorkflowSource,
   recordSelectedWorkflow: mock(() => Promise.resolve()),
   disposeWorkflowSource: mock(() => Promise.resolve()),
-  resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
+  resolveContinuationWorkflow: mockResolveContinuationWorkflow,
   withCapturedSource: mock((body: Parameters<typeof withObservableCapturedSource>[1]) =>
     withObservableCapturedSource(capturedSourceOwnerCalls, body)
   ),
@@ -6389,21 +6393,17 @@ describe('continueResolvedGateRun — chat gate continuation source (#2646)', ()
 
   beforeEach(async () => {
     mockExecuteWorkflow.mockClear();
-    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
     // Reset, not clear: a queued `…Once` value that a test never consumes would otherwise
     // leak into the next one. Restores the factory default — a run predating captures.
-    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockReset();
-    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockImplementation(() =>
-      Promise.resolve(undefined)
-    );
+    mockResolveContinuationWorkflow.mockReset();
+    mockResolveContinuationWorkflow.mockImplementation(() => Promise.resolve(undefined));
   });
 
   test("continues with the graph the run froze, not the chat turn's discovery list", async () => {
-    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
-    const frozen = makeTestWorkflow({ name: 'gated', description: 'frozen' });
-    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+    const frozen = makeTestResolvedWorkflow({ name: 'gated', description: 'frozen' });
+    mockResolveContinuationWorkflow.mockResolvedValueOnce({
       workflow: frozen,
-      roots: { kind: 'captured' },
+      roots: CAPTURED_SOURCE_ROOTS,
       workflows: [{ workflow: frozen, source: 'project' }],
       errors: [],
     });
@@ -6430,11 +6430,10 @@ describe('continueResolvedGateRun — chat gate continuation source (#2646)', ()
     // The refusal this replaces was a false one: the chat turn's list describes the
     // checkout, and a workflow deleted or renamed since the run started is missing from
     // it — while the run's own captured source still holds exactly what it was running.
-    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
-    const frozen = makeTestWorkflow({ name: 'gated', description: 'frozen' });
-    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+    const frozen = makeTestResolvedWorkflow({ name: 'gated', description: 'frozen' });
+    mockResolveContinuationWorkflow.mockResolvedValueOnce({
       workflow: frozen,
-      roots: { kind: 'captured' },
+      roots: CAPTURED_SOURCE_ROOTS,
       workflows: [{ workflow: frozen, source: 'project' }],
       errors: [],
     });
@@ -6478,8 +6477,7 @@ describe('continueResolvedGateRun — chat gate continuation source (#2646)', ()
   });
 
   test('an unreadable captured source refuses instead of running something else', async () => {
-    const { resolveContinuationWorkflow } = await import('@archon/workflows/executor');
-    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockRejectedValueOnce(
+    mockResolveContinuationWorkflow.mockRejectedValueOnce(
       new Error('captured source digest mismatch')
     );
 
