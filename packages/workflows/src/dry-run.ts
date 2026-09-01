@@ -1232,6 +1232,13 @@ function resolveDryRunAuthoredOutcome(
   if (selectedOutput?.state !== 'completed' || !('structuredOutput' in selectedOutput)) return null;
 
   const structured = selectedOutput.structuredOutput;
+  const selectedNode = workflow.nodes.find(node => node.id === returns);
+  if (
+    selectedNode?.output_format === undefined ||
+    !validateStructuredOutput(structured, selectedNode.output_format).valid
+  ) {
+    return null;
+  }
   if (!isRecord(structured) || !Object.hasOwn(structured, field)) return null;
 
   const verdict = structured[field];

@@ -588,6 +588,35 @@ describe('dryRunWorkflow', () => {
     }
   );
 
+  test('leaves authored outcome null when the structured result violates its schema', async () => {
+    const result = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'invalid-authored-outcome',
+        returns: 'verdict',
+        outcome_field: 'green',
+        nodes: [
+          {
+            id: 'verdict',
+            prompt: 'verdict',
+            output_format: {
+              type: 'object',
+              properties: {
+                green: { type: 'boolean' },
+                reason: { type: 'string' },
+              },
+              required: ['green', 'reason'],
+            },
+          },
+        ],
+      }),
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { verdict: { green: false } },
+    });
+
+    expect(result).toMatchObject({ outcome: 'completed', authoredOutcome: null });
+  });
+
   test('leaves authored outcome null when the declared result is not reached', async () => {
     const workflow = makeTestWorkflow({
       name: 'authored-outcome-not-reached',
