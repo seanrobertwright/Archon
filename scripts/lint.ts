@@ -21,6 +21,10 @@ async function findTargets(): Promise<LintTarget[]> {
       }))
       .sort((left, right) => left.cacheName.localeCompare(right.cacheName)),
     { cacheName: 'scripts', pattern: 'scripts/**/*.ts' },
+    {
+      cacheName: 'archon-scripts',
+      pattern: '.archon/scripts/{*.ts,__tests__/*.test.ts}',
+    },
   ];
 }
 

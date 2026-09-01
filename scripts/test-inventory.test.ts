@@ -28,7 +28,8 @@ interface SelectorParseResult {
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const PACKAGES_DIR = join(REPO_ROOT, 'packages');
-const TEST_FILE_PATTERN = /\.test\.tsx?$/;
+const TEST_FILE_PATTERN = /\.(?:test|spec)\.tsx?$/;
+const TRACKED_TEST_PATTERNS = ['*.test.ts', '*.spec.ts', '*.test.tsx', '*.spec.tsx'];
 
 function normalizePath(path: string): string {
   return path.replaceAll('\\', '/');
@@ -63,6 +64,14 @@ function readPackageManifest(manifestPath: string): {
   };
 }
 
+function readRootTestScript(): string {
+  const manifest = readPackageManifest(join(REPO_ROOT, 'package.json'));
+  if (manifest.testScript === undefined) {
+    throw new Error('The root package.json does not define scripts.test');
+  }
+  return manifest.testScript;
+}
+
 function sourceSelectors(testScript: string | undefined): SelectorParseResult {
   if (testScript === undefined) return { selectors: [], unsupportedCommands: [] };
 
@@ -90,6 +99,61 @@ function sourceSelectors(testScript: string | undefined): SelectorParseResult {
     selectors: selectors.sort(),
     unsupportedCommands,
   };
+}
+
+function directTestSelectors(testScript: string): string[] {
+  return testScript.split('&&').flatMap((command): string[] => {
+    const tokens = command.trim().split(/\s+/);
+    return tokens[0] === 'bun' && tokens[1] === 'test'
+      ? tokens.slice(2).filter((token): boolean => !token.startsWith('-'))
+      : [];
+  });
+}
+
+function selectorCollects(selector: string, testPath: string, baseDirectory: string): boolean {
+  const selectorPath = normalizePath(
+    relative(REPO_ROOT, resolve(baseDirectory, selector.replace(/^\.\//, '')))
+  ).replace(/\/$/, '');
+  return testPath === selectorPath || testPath.startsWith(`${selectorPath}/`);
+}
+
+function trackedTests(): string[] {
+  const result = Bun.spawnSync(['git', 'ls-files', '-z', '--', ...TRACKED_TEST_PATTERNS], {
+    cwd: REPO_ROOT,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`Could not list tracked tests:\n${result.stderr.toString()}`);
+  }
+  return result.stdout
+    .toString()
+    .split('\0')
+    .filter((path): boolean => path.length > 0)
+    .map(normalizePath)
+    .sort();
+}
+
+function packageDirectoryForTest(testPath: string): string | undefined {
+  const [directory, packageName] = testPath.split('/');
+  if (directory !== 'packages' || packageName === undefined) return undefined;
+
+  const packageDirectory = join(PACKAGES_DIR, packageName);
+  return existsSync(join(packageDirectory, 'package.json')) ? packageDirectory : undefined;
+}
+
+function isCollectedByRepositoryTest(testPath: string, rootSelectors: string[]): boolean {
+  if (rootSelectors.some((selector): boolean => selectorCollects(selector, testPath, REPO_ROOT))) {
+    return true;
+  }
+
+  const packageDirectory = packageDirectoryForTest(testPath);
+  if (packageDirectory === undefined) return false;
+
+  const manifest = readPackageManifest(join(packageDirectory, 'package.json'));
+  return sourceSelectors(manifest.testScript).selectors.some((selector): boolean =>
+    selectorCollects(selector, testPath, packageDirectory)
+  );
 }
 
 function inspectPackage(packageDirectory: string): InventoryMismatch | undefined {
@@ -179,6 +243,25 @@ describe('package test inventory', () => {
       .filter((mismatch): mismatch is InventoryMismatch => mismatch !== undefined);
 
     if (mismatches.length > 0) throw new Error(formatMismatches(mismatches));
+  });
+});
+
+describe('repository test inventory', () => {
+  test('every tracked TypeScript test is selected by bun run test', () => {
+    const rootSelectors = directTestSelectors(readRootTestScript());
+    const uncollectedTests = trackedTests().filter(
+      (testPath): boolean => !isCollectedByRepositoryTest(testPath, rootSelectors)
+    );
+
+    if (uncollectedTests.length > 0) {
+      throw new Error(
+        [
+          'Tracked TypeScript tests are not collected by bun run test:',
+          ...uncollectedTests.map((path): string => `  - ${path}`),
+          'Add each path to a repository test command.',
+        ].join('\n')
+      );
+    }
   });
 });
 

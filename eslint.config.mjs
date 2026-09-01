@@ -20,11 +20,14 @@ export default tseslint.config(
       '.worktrees/**',
       '.claude/worktrees/**',
       '.claude/skills/**',
-      '.archon/**', // User workflow/script/command content — not in any tsconfig project
+      '.archon/commands/**',
+      '.archon/maintainer-standup/**',
+      '.archon/workflows/**',
       '**/*.generated.ts', // Auto-generated source files (content inlined via JSON.stringify)
       '**/*.js',
       '*.mjs',
-      '**/*.test.ts',
+      'packages/**/*.test.ts',
+      'scripts/**/*.test.ts',
       '**/src/test/**', // Test helper files (mock factories, fixtures)
       '*.d.ts', // Root-level declaration files (not in tsconfig project scope)
       '**/*.generated.d.ts', // Auto-generated declaration files (e.g. openapi-typescript output)
@@ -46,7 +49,11 @@ export default tseslint.config(
 
   // Project-specific settings
   {
-    files: ['packages/*/src/**/*.{ts,tsx}', 'scripts/**/*.ts'],
+    files: [
+      'packages/*/src/**/*.{ts,tsx}',
+      'scripts/**/*.ts',
+      '.archon/scripts/{*.ts,__tests__/*.test.ts}',
+    ],
     languageOptions: {
       parserOptions: {
         projectService: true,
@@ -111,6 +118,17 @@ export default tseslint.config(
       '@typescript-eslint/require-await': 'off',
       // Constructor style preference
       '@typescript-eslint/consistent-generic-constructors': 'off',
+    },
+  },
+
+  {
+    files: ['.archon/scripts/{*.ts,__tests__/*.test.ts}'],
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+        project: './.archon/scripts/tsconfig.json',
+        tsconfigRootDir: import.meta.dirname,
+      },
     },
   },
 
