@@ -213,6 +213,13 @@ const commandHelp: HelpEntry[] = [
     subcommand: 'list',
     spec: 'workflow list [name] [--full] [--json]',
     description: 'List compact workflow descriptions\nUse <name> --full for one exact description',
+    scopedFlags: [
+      {
+        spec: '--full',
+        description:
+          'When given with a name, show the exact description instead of the compact preview',
+      },
+    ],
   },
   {
     command: 'workflow',
