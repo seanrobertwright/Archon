@@ -187,8 +187,7 @@ export function DashboardPage(): React.ReactElement {
     paused: 0,
   };
 
-  // Hydrate Zustand store from REST-polled data for active runs.
-  // Only sets initial state if the run isn't already tracked by SSE.
+  // Refresh the authoritative active-node snapshot while the store keeps richer SSE details.
   useEffect(() => {
     for (const run of runs) {
       if (run.status === 'running' || run.status === 'pending' || run.status === 'paused') {
@@ -196,11 +195,8 @@ export function DashboardPage(): React.ReactElement {
           runId: run.id,
           workflowName: run.workflow_name,
           status: run.status,
-          dagNodes: run.active_nodes.map(nodeId => ({
-            nodeId,
-            name: nodeId,
-            status: 'running',
-          })),
+          activeNodeIds: run.active_nodes,
+          dagNodes: [],
           artifacts: [],
           startedAt: new Date(ensureUtc(run.started_at)).getTime(),
           currentTool: null,

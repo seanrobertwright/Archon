@@ -54,6 +54,7 @@ describe('WorkflowRunCard', () => {
       runId: parallelRun.id,
       workflowName: parallelRun.workflow_name,
       status: 'running',
+      activeNodeIds: [],
       dagNodes: [
         { nodeId: 'parallel-a', name: 'parallel-a', status: 'completed' },
         { nodeId: 'parallel-b', name: 'parallel-b', status: 'failed' },

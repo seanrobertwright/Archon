@@ -54,8 +54,7 @@ function StepProgress({
   liveState: WorkflowState | undefined;
 }): React.ReactElement | null {
   const dagNodes = liveState?.dagNodes ?? [];
-  const runningNodeNames = dagNodes.filter(n => n.status === 'running').map(n => n.name);
-  const activeNodeNames = liveState === undefined ? run.active_nodes : runningNodeNames;
+  const activeNodeNames = liveState?.activeNodeIds ?? run.active_nodes;
   const completedCount = dagNodes.filter(n => n.status === 'completed').length;
   const totalNodes = run.total_steps ?? 0;
   const currentTool = liveState?.currentTool ?? null;
