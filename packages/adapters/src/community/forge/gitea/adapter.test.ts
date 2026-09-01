@@ -84,7 +84,10 @@ mock.module('@archon/core/db/codebases', () => ({
 }));
 
 // Mock @archon/git to avoid real git operations in tests
-const mockCloneRepository = mock(async () => ({ ok: true, value: undefined }));
+const mockCloneRepository = mock<(typeof import('@archon/git'))['cloneRepository']>(async () => ({
+  ok: true,
+  value: undefined,
+}));
 const mockSyncRepository = mock(async () => ({ ok: true, value: undefined }));
 const mockAddSafeDirectory = mock(async () => undefined);
 const mockIsWorktreePath = mock(async () => false);
@@ -209,6 +212,78 @@ describe('GiteaAdapter', () => {
 
     test('should stop without errors', () => {
       expect(() => adapter.stop()).not.toThrow();
+    });
+  });
+
+  test('passes Gitea and Forgejo clone credentials outside the repository URL', async () => {
+    const savedToken = process.env.GITEA_TOKEN;
+    const token = 'gitea-clone-token-123';
+    process.env.GITEA_TOKEN = token;
+    const forgejoAdapter = new GiteaAdapter(
+      'https://forgejo.example.test:8443',
+      'api-token',
+      'webhook-secret',
+      mockLockManager
+    );
+
+    try {
+      await (
+        forgejoAdapter as unknown as {
+          ensureRepoReady(
+            owner: string,
+            repo: string,
+            defaultBranch: string,
+            repoPath: string,
+            shouldSync: boolean
+          ): Promise<void>;
+        }
+      ).ensureRepoReady('owner', 'repo', 'main', '/definitely/missing/forgejo-repo', false);
+
+      const [url, , options] = mockCloneRepository.mock.calls.at(-1)!;
+      expect(url).toBe('https://forgejo.example.test:8443/owner/repo.git');
+      expect(options).toEqual({ credentials: { username: token, password: '' } });
+      expect(JSON.stringify(mockCloneRepository.mock.calls)).not.toContain(`${token}@`);
+    } finally {
+      if (savedToken === undefined) delete process.env.GITEA_TOKEN;
+      else process.env.GITEA_TOKEN = savedToken;
+    }
+  });
+
+  describe('clone errors', () => {
+    function ensureRepoReady(): Promise<void> {
+      return (
+        adapter as unknown as {
+          ensureRepoReady(
+            owner: string,
+            repo: string,
+            defaultBranch: string,
+            repoPath: string,
+            shouldSync: boolean
+          ): Promise<void>;
+        }
+      ).ensureRepoReady('owner', 'repo', 'main', '/definitely/missing/gitea-repo', false);
+    }
+
+    test('preserves the clone destination when disk space is exhausted', async () => {
+      mockCloneRepository.mockResolvedValueOnce({
+        ok: false,
+        error: { code: 'no_space', path: '/clone/destination' },
+      });
+
+      await expect(ensureRepoReady()).rejects.toThrow(
+        'No space left while cloning owner/repo to /clone/destination.'
+      );
+    });
+
+    test('surfaces the message from an unknown clone failure', async () => {
+      mockCloneRepository.mockResolvedValueOnce({
+        ok: false,
+        error: { code: 'unknown', message: 'transport helper crashed' },
+      });
+
+      await expect(ensureRepoReady()).rejects.toThrow(
+        'Failed to clone owner/repo: transport helper crashed'
+      );
     });
   });
 
