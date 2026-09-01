@@ -341,6 +341,7 @@ mock.module('@archon/workflows/dry-run', () => ({
     Promise.resolve({
       workflow: 'plan',
       outcome: 'completed',
+      authoredOutcome: null,
       trace: [
         {
           nodeId: 'node',
@@ -861,6 +862,7 @@ describe('workflowRunCommand — dry-run', () => {
     (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValue({
       workflow: 'plan',
       outcome: 'completed',
+      authoredOutcome: null,
       trace: [],
       missingStubs: [],
       toleratedMissingStubs: [],
@@ -909,6 +911,27 @@ describe('workflowRunCommand — dry-run', () => {
       outcome: 'completed',
     });
     expect(consoleSpy).not.toHaveBeenCalled();
+  });
+
+  it('emits authored outcome in JSON without using it as the exit verdict', async () => {
+    const dryRun = await import('@archon/workflows/dry-run');
+    (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflow: 'plan',
+      outcome: 'completed',
+      authoredOutcome: 'failed',
+      trace: [],
+      missingStubs: [],
+      toleratedMissingStubs: [],
+      unusedStubs: [],
+    });
+
+    await expect(
+      workflowRunCommand('/test/path', 'plan', '', { dryRun: true, json: true })
+    ).resolves.toBeUndefined();
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      outcome: 'completed',
+      authoredOutcome: 'failed',
+    });
   });
 
   it('layers acting-user preferences before resolving dry-run model bindings', async () => {
@@ -1116,6 +1139,7 @@ describe('workflowRunCommand — dry-run', () => {
     (dryRun.dryRunWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
       workflow: 'plan',
       outcome: 'failed',
+      authoredOutcome: 'succeeded',
       trace: [],
       missingStubs: ['node'],
       toleratedMissingStubs: [],
@@ -1125,7 +1149,10 @@ describe('workflowRunCommand — dry-run', () => {
     await expect(
       workflowRunCommand('/test/path', 'plan', '', { dryRun: true, json: true })
     ).rejects.toThrow('missing stubs: node');
-    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({ outcome: 'failed' });
+    expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({
+      outcome: 'failed',
+      authoredOutcome: 'succeeded',
+    });
   });
 
   it('names only blocking missing stubs, never one an all_done join tolerated', async () => {
