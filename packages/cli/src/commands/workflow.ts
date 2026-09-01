@@ -84,6 +84,7 @@ import {
   assertWorkflowRequirementsMet,
   resolveTopLevelInputs,
 } from '@archon/workflows/utils/workflow-requirements';
+import type { RequirementBearingWorkflow } from '@archon/workflows/utils/workflow-requirements';
 import { parseInputAssignments } from '@archon/workflows/workflow-inputs';
 import { formatDeprecationNotice } from '@archon/workflows/deprecation';
 import {
@@ -104,7 +105,6 @@ import type {
   WorkflowSource,
   WorkflowWithSource,
 } from '@archon/workflows/schemas/workflow';
-import type { DagNode } from '@archon/workflows/schemas/dag-node';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import {
   workflowRunStatusSchema,
@@ -809,7 +809,9 @@ function assertWorkflowNotWorktreePinnedForFolder(
  * GitHub App + TOKEN_ENCRYPTION_KEY are both configured — identical semantics
  * to the orchestrator gate.
  */
-async function assertCliWorkflowRequirementsMet(workflow: WorkflowDefinition): Promise<void> {
+async function assertCliWorkflowRequirementsMet(
+  workflow: RequirementBearingWorkflow
+): Promise<void> {
   if (!isPerUserGitHubEnabled() || !workflow.requires?.length) return;
 
   // Resolve the acting CLI user (ARCHON_USER_ID, else $USER/$USERNAME) → Archon
@@ -870,7 +872,9 @@ function resolveTitleAssistantType(
  * `archon ai tier list`.
  */
 export async function maybePrintTierNotice(
-  workflow: WorkflowDefinition,
+  workflow: Pick<WorkflowDefinition, 'model'> & {
+    readonly nodes: readonly WorkflowDefinition['nodes'][number][];
+  },
   cwd: string,
   cliUserId: string | undefined,
   quiet: boolean | undefined
@@ -1071,7 +1075,9 @@ export function emitParseWarnings(
  * a user driving runs programmatically still has to learn the default they
  * picked is scheduled for removal.
  */
-export function emitDeprecationNotice(workflow: WorkflowDefinition): void {
+export function emitDeprecationNotice(
+  workflow: Pick<WorkflowDefinition, 'name' | 'deprecated'>
+): void {
   const notice = formatDeprecationNotice(workflow);
   if (notice) console.warn(notice);
 }
@@ -1987,10 +1993,7 @@ async function runWorkflowWithOwnedSource(
     // discoverable via `workflow status`/`runs`, not a silent hang nobody knows exists.
     if (!isContinuation) {
       assertInteractiveClassNotBackgrounded(workflow);
-      // Already-expanded — discoverWorkflowsWithConfig's output never contains an
-      // IncludeDirective (#2486); the type admits one only for the pre-expansion display
-      // shape (`WorkflowWithSource.declared`), which `workflow` here is not.
-      assertComposedGateDriveable(workflow.nodes as DagNode[]);
+      assertComposedGateDriveable(workflow.nodes);
     }
 
     const childConversationId = options.conversationId ?? generateConversationId();

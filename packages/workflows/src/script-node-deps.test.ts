@@ -46,7 +46,8 @@ mock.module('@archon/paths', () => ({
 
 // --- Imports (after all mock.module calls) ---
 import { executeDagWorkflow, type ExecuteDagWorkflowOptions } from './dag-executor';
-import type { ExecNode, WorkflowRun } from './schemas';
+import { resolveWorkflow } from './graph-plan';
+import type { ExecNode, WorkflowDefinition, WorkflowRun } from './schemas';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 
@@ -224,8 +225,14 @@ const minimalConfig: WorkflowConfig = {
  * `deps`, `cwd`, `workflow`, and `workflowRun` carry each test's own fixtures, so every call
  * supplies them; the run directories derive from `cwd` the way every call site built them.
  */
-type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
-  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflow' | 'workflowRun'>;
+type TestWorkflowDefinition = Omit<WorkflowDefinition, 'description'> & {
+  description?: string;
+};
+
+type DagOptionsOverrides = Omit<Partial<ExecuteDagWorkflowOptions>, 'workflow'> &
+  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflowRun'> & {
+    workflow: TestWorkflowDefinition;
+  };
 
 /**
  * Options for a direct `executeDagWorkflow` call, built from only what a test varies. The
@@ -234,7 +241,7 @@ type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
  * own mocks, and the two do not have to agree.
  */
 function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
-  const { cwd } = overrides;
+  const { cwd, workflow, ...rest } = overrides;
   return {
     platform: createMockPlatform(),
     conversationId: 'conv-deps',
@@ -246,7 +253,12 @@ function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
     baseBranch: 'main',
     docsDir: 'docs/',
     config: minimalConfig,
-    ...overrides,
+    ...rest,
+    cwd,
+    workflow: resolveWorkflow({
+      ...workflow,
+      description: workflow.description ?? workflow.name,
+    }),
   };
 }
 

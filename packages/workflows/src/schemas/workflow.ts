@@ -11,7 +11,7 @@ import {
   betasSchema,
   KNOWN_DAG_NODE_KEYS,
 } from './dag-node';
-import type { NestedKeySpec } from './dag-node';
+import type { DagNode, NestedKeySpec } from './dag-node';
 import { jsonValueSchema } from '../output-ref';
 
 // ---------------------------------------------------------------------------
@@ -288,14 +288,27 @@ export const workflowDefinitionSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
 });
 
-/**
- * Workflow definition with fully typed nodes derived from the schema. `nodes`'
- * element type is `DagNode | IncludeDirective` (not `DagNode[]` alone) because
- * `dagNodeSchema` still parses `include:` entries at this pre-expansion stage
- * (#2486) — `expandWorkflowIncludes` consumes every `IncludeDirective` before
- * the executor ever sees a `WorkflowDefinition`.
- */
+/** Authored workflow definition parsed from YAML, before include expansion. */
 export type WorkflowDefinition = z.infer<typeof workflowDefinitionSchema> & { prompt?: never };
+
+/** Static execution plan attached after include expansion and graph validation. */
+export interface GraphPlan {
+  readonly nodes: readonly DagNode[];
+  readonly layers: readonly (readonly DagNode[])[];
+  readonly sinks: readonly string[];
+}
+
+/** Nominal identity retained only by values produced through `resolveWorkflow`. */
+declare class ResolvedWorkflowIdentity {
+  private readonly identity: never;
+}
+
+/** Include-free workflow accepted by execution and simulation boundaries. */
+export type ResolvedWorkflow = Omit<WorkflowDefinition, 'nodes'> &
+  ResolvedWorkflowIdentity & {
+    readonly nodes: readonly DagNode[];
+    readonly plan: GraphPlan;
+  };
 
 // ---------------------------------------------------------------------------
 // Known workflow keys — used by the loader to detect unknown/misplaced keys
@@ -421,7 +434,7 @@ export interface DeclaredWorkflowConfig {
 
 /** A workflow definition paired with its discovery source. */
 export interface WorkflowWithSource {
-  readonly workflow: WorkflowDefinition;
+  readonly workflow: ResolvedWorkflow;
   readonly source: WorkflowSource;
   /** Warnings from YAML parsing (e.g. unknown keys) — never hard-fails. */
   readonly parseWarnings?: readonly string[];

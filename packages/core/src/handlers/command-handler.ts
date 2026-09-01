@@ -25,7 +25,7 @@ import { createWorkflowDeps } from '../workflows/store-adapter';
 import type {
   WorkflowWithSource,
   WorkflowLoadError,
-  WorkflowDefinition,
+  ResolvedWorkflow,
 } from '@archon/workflows/schemas/workflow';
 import { isContainerRun } from '@archon/workflows/schemas/workflow-run';
 import * as workflowDb from '../db/workflows';
@@ -1159,7 +1159,7 @@ async function handleWorkflowCommand(
         'cmd.workflows_discovered'
       );
 
-      let workflow: WorkflowDefinition | undefined;
+      let workflow: ResolvedWorkflow | undefined;
       try {
         workflow = resolveWorkflowName(workflowName, workflows);
       } catch (err) {

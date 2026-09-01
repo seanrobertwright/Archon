@@ -1,7 +1,8 @@
 import { describe, test, expect } from 'bun:test';
 import { expandWorkflowIncludes, INCLUDE_MAX_DEPTH } from './include-expander';
+import { resolvedBodyNodes } from './graph-plan';
 import { dagNodeSchema } from './schemas';
-import type { WorkflowDefinition, DagNode } from './schemas';
+import type { WorkflowDefinition, ResolvedWorkflow, DagNode } from './schemas';
 import { COMPOSE_FAN_OUT_STEP_MARKER } from './fan-out-identity';
 import {
   COMPILED_LOOP_COMMAND,
@@ -31,10 +32,8 @@ function mapOf(...workflows: WorkflowDefinition[]): Map<string, WorkflowDefiniti
   return new Map(workflows.map(w => [w.name, w]));
 }
 
-function nodeById(w: WorkflowDefinition, id: string): DagNode | undefined {
-  // Callers always pass an expandWorkflowIncludes() result, which never contains
-  // an IncludeDirective (#2486).
-  return (w.nodes as DagNode[]).find(n => n.id === id);
+function nodeById(w: ResolvedWorkflow, id: string): DagNode | undefined {
+  return w.nodes.find(node => node.id === id);
 }
 
 function composedMeta(node: DagNode | undefined): ComposedNodeMeta | undefined {
@@ -68,7 +67,7 @@ function loopGroupOf(
   node: DagNode | undefined
 ): { nodes: DagNode[]; until_bash?: string } | undefined {
   if (!node || !('loop_group' in node)) return undefined;
-  return { ...node.loop_group, nodes: node.loop_group.nodes as DagNode[] };
+  return { ...node.loop_group, nodes: [...resolvedBodyNodes(node.loop_group)] };
 }
 
 /** The body nodes of a `loop_group` node, or undefined for any other kind. */
@@ -120,6 +119,11 @@ describe('expandWorkflowIncludes — composed fan-out deferral (#2512)', () => {
 
     const expanded = workflows.get('parent')!;
     expect(expanded.nodes).toHaveLength(2);
+    expect(expanded.plan.layers.map(layer => layer.map(node => node.id))).toEqual([
+      ['list'],
+      ['fan'],
+    ]);
+    expect(expanded.plan.sinks).toEqual(['fan']);
     const deferred = expanded.nodes.find(n => n.id === 'fan');
     expect(deferred).toMatchObject({ kind: 'compose_fan_out', include: 'blk' });
   });

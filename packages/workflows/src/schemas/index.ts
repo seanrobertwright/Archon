@@ -258,6 +258,8 @@ export type {
   WorkflowExecutionResult,
   WorkflowLoadError,
   WorkflowLoadResult,
+  GraphPlan,
+  ResolvedWorkflow,
   WorkflowSource,
   WorkflowWithSource,
   DeclaredWorkflowConfig,

@@ -976,7 +976,7 @@ nodes:
       const yaml = `name: bare\ndescription: no fallbacks\nnodes:\n  - id: only\n    prompt: p\n`;
       await writeFile(join(workflowDir, 'bare.yaml'), yaml);
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
-      const wf = result.workflows[0].workflow as Record<string, unknown>;
+      const wf = result.workflows[0].workflow;
       expect(wf.effort).toBeUndefined();
       expect(wf.thinking).toBeUndefined();
       expect(wf.fallbackModel).toBeUndefined();
@@ -1007,7 +1007,7 @@ nodes:
       const result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toEqual([]);
       expect(result.workflows).toHaveLength(1);
-      const wf = result.workflows[0].workflow as Record<string, unknown>;
+      const wf = result.workflows[0].workflow;
       expect(wf.effort).toBeUndefined();
       expect(wf.thinking).toBeUndefined();
       expect(wf.fallbackModel).toBeUndefined();
