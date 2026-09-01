@@ -531,6 +531,17 @@ describe('bundled-defaults', () => {
         expect(content.includes('nodes:')).toBe(true);
       }
     });
+
+    it('archon-validate marks the validate node as always_run (#3092)', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-validate'], 'archon-validate.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+
+      const validateNode = parsed.workflow.nodes.find(node => node.id === 'validate');
+      if (validateNode === undefined || !('always_run' in validateNode)) {
+        throw new Error('archon-validate has no executable validate node carrying always_run');
+      }
+      expect(validateNode.always_run).toBe(true);
+    });
   });
 
   describe('fork-safe PR creation (#2226)', () => {
