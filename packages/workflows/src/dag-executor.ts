@@ -95,6 +95,7 @@ import {
 } from './schemas';
 import type { BindingDirective } from './schemas';
 import { mapNodeTemplateSlots } from './template-walker';
+import { buildExecNodeEnvironment } from './exec-environment';
 import { planGraph, resolvedBodyNodes } from './graph-plan';
 import { FAN_OUT_CANCEL_REASONS } from './store';
 import type { DagResumeSnapshot, FanOutCancelReason, PersistedNodeOutput } from './store';
@@ -3644,23 +3645,19 @@ async function executeBashNode(
       issueContext,
       nodeOutputs,
     }),
-    ARTIFACTS_DIR: artifactsDir,
-    STATE_DIR: stateDir,
-    LOG_DIR: logDir,
-    ADOPTED_RUN_DIR: currentAdoptedRunDir() ?? '',
-    // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
-    // reads os.environ and found it missing while its siblings above were all
-    // present. Deliver it the same way.
-    WORKFLOW_ID: workflowRun.id,
-    BASE_BRANCH: baseBranch,
-    USER_MESSAGE: workflowRun.user_message,
-    ARGUMENTS: workflowRun.user_message,
-    LOOP_USER_INPUT: loopUserInput,
-    LOOP_PREV_OUTPUT: '',
-    REJECTION_REASON: '',
-    CONTEXT: issueContext ?? '',
-    EXTERNAL_CONTEXT: issueContext ?? '',
-    ISSUE_CONTEXT: issueContext ?? '',
+    ...buildExecNodeEnvironment({
+      artifactsDir,
+      stateDir,
+      logDir,
+      workflowId: workflowRun.id,
+      baseBranch,
+      userMessage: workflowRun.user_message,
+      loopUserInput,
+      loopPrevOutput: '',
+      rejectionReason: '',
+      issueContext,
+      adoptedRunDir: currentAdoptedRunDir(),
+    }),
   };
 
   const bashPath = resolveBashPath();
@@ -3943,23 +3940,19 @@ async function executeScriptNode(
       issueContext,
       nodeOutputs,
     }),
-    ARTIFACTS_DIR: artifactsDir,
-    STATE_DIR: stateDir,
-    LOG_DIR: logDir,
-    ADOPTED_RUN_DIR: currentAdoptedRunDir() ?? '',
-    // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
-    // reads os.environ and found it missing while its siblings above were all
-    // present. Deliver it the same way.
-    WORKFLOW_ID: workflowRun.id,
-    BASE_BRANCH: baseBranch,
-    USER_MESSAGE: workflowRun.user_message,
-    ARGUMENTS: workflowRun.user_message,
-    LOOP_USER_INPUT: loopUserInput,
-    LOOP_PREV_OUTPUT: '',
-    REJECTION_REASON: '',
-    CONTEXT: issueContext ?? '',
-    EXTERNAL_CONTEXT: issueContext ?? '',
-    ISSUE_CONTEXT: issueContext ?? '',
+    ...buildExecNodeEnvironment({
+      artifactsDir,
+      stateDir,
+      logDir,
+      workflowId: workflowRun.id,
+      baseBranch,
+      userMessage: workflowRun.user_message,
+      loopUserInput,
+      loopPrevOutput: '',
+      rejectionReason: '',
+      issueContext,
+      adoptedRunDir: currentAdoptedRunDir(),
+    }),
   };
 
   // Build the command and args based on runtime and inline vs named
