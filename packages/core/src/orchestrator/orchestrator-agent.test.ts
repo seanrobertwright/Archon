@@ -304,7 +304,6 @@ const DEFAULT_PROVIDER_CAPS: ProviderCapabilities = {
   envInjection: true,
   costControl: false,
   effortControl: true,
-  thinkingControl: false,
   fallbackModel: false,
   sandbox: false,
   settingSources: false,

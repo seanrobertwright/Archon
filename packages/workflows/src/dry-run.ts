@@ -51,6 +51,7 @@ import {
   isLoopNode,
   isWaitNode,
   isWorkflowNode,
+  effortLevelSchema,
   type DagNode,
   type NodeOutput,
   type GraphPlan,
@@ -306,7 +307,7 @@ const dryRunNodeTypeSchema = z.enum([
 const dryRunResolutionSchema = z.object({
   provider: z.string(),
   model: z.string().optional(),
-  effort: z.string().optional(),
+  effort: effortLevelSchema.optional(),
   /** Where each value came from — 'node', 'model ref', 'workflow', 'assistant config', … */
   providerFrom: z.string(),
   modelFrom: z.string(),

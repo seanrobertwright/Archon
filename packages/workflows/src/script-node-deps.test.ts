@@ -159,7 +159,6 @@ const mockGetAgentProvider = mock<WorkflowDeps['getAgentProvider']>(_provider =>
     envInjection: true,
     costControl: true,
     effortControl: true,
-    thinkingControl: true,
     fallbackModel: true,
     sandbox: true,
     settingSources: true,

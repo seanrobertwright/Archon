@@ -204,7 +204,6 @@ const providerCapabilities: ProviderCapabilities = {
   envInjection: true,
   costControl: true,
   effortControl: true,
-  thinkingControl: true,
   fallbackModel: true,
   sandbox: true,
   settingSources: true,

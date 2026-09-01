@@ -303,7 +303,6 @@ const mockClaudeCapabilities = () => ({
   envInjection: true,
   costControl: true,
   effortControl: true,
-  thinkingControl: true,
   fallbackModel: true,
   sandbox: true,
   settingSources: true,
@@ -1932,7 +1931,11 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
-    const workflowPreset = { provider: 'codex', model: 'gpt-5.5', effort: 'high' };
+    const workflowPreset = {
+      provider: 'codex',
+      model: 'gpt-5.5',
+      effort: 'high',
+    } as const;
     const aiProfile = buildAiProfile('claude', {
       repoTiers: {
         large: workflowPreset,
@@ -26703,7 +26706,6 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
     provider: string;
     model: unknown;
     effort: unknown;
-    thinking: unknown;
     sandbox: unknown;
     betas: unknown;
     fallbackModel: unknown;
@@ -26818,7 +26820,6 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
         provider,
         model: queryOptions.model,
         effort: nodeConfig.effort,
-        thinking: nodeConfig.thinking,
         sandbox: nodeConfig.sandbox,
         betas: nodeConfig.betas,
         fallbackModel: nodeConfig.fallbackModel,
@@ -26932,7 +26933,9 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
   });
 
   it('AC3 — a tier keyword reproduces through the collapse', async () => {
-    const tiers = { large: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh' } };
+    const tiers = {
+      large: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh' as const },
+    };
     const block = wfDef('tier-blk', [{ id: 'work', prompt: 'work' }], { model: 'large' });
     const parent = wfDef('parent', [{ id: 'inc', include: 'tier-blk' }], {
       provider: 'claude',

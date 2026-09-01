@@ -2557,21 +2557,19 @@ describe('expandWorkflowIncludes — where a workflow-level model: travels (#176
 
   test('every other node-affecting field travels regardless of the node provider', () => {
     // `model` alone carries a provider condition, because it alone is a provider-specific
-    // string the executor already refused to inherit across providers. `effort`/`thinking`/
-    // `sandbox`/`betas`/`fallbackModel` had no such condition before the collapse and must
+    // string the executor already refused to inherit across providers. `effort`/`sandbox`/
+    // `betas`/`fallbackModel` had no such condition before the collapse and must
     // not gain one, or the collapse stops being behaviour-preserving.
     const nodes = collapse({
       ...wf('w', [{ id: 'n', prompt: 'p', provider: 'claude' }]),
       provider: 'codex',
       effort: 'high',
-      thinking: { type: 'enabled', budgetTokens: 4000 },
       sandbox: { enabled: true },
       betas: ['beta-x'],
       fallbackModel: 'fallback-1',
     });
     expect(nodes[0]).toMatchObject({
       effort: 'high',
-      thinking: { type: 'enabled', budgetTokens: 4000 },
       sandbox: { enabled: true },
       betas: ['beta-x'],
       fallbackModel: 'fallback-1',

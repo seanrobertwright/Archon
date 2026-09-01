@@ -331,7 +331,6 @@ const NODE_AFFECTING_WORKFLOW_FIELDS: readonly (readonly [
   ['provider', 'provider'],
   ['model', 'model'],
   ['effort', 'effort'],
-  ['thinking', 'thinking'],
   ['fallbackModel', 'fallbackModel'],
   ['betas', 'betas'],
   ['sandbox', 'sandbox'],

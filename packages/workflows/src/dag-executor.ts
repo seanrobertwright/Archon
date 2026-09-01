@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { basename, isAbsolute, join as joinPath, resolve as resolvePath, sep } from 'path';
 import { execFileAsync, resolveBashPath } from '@archon/git';
+import { isEffortRung } from '@archon/paths/effort';
 import { discoverScriptsForCwd } from './script-discovery';
 import { discoverWorkflowsWithConfig, resolveWorkflowCommandContents } from './workflow-discovery';
 import {
@@ -58,7 +59,6 @@ import type {
   TriggerRule,
   WorkflowRun,
   EffortLevel,
-  ThinkingConfig,
   SandboxSettings,
   WebSearchMode,
   WorkflowSource,
@@ -625,19 +625,10 @@ function applyPresetOptions(
   provider: string,
   preset: ModelAliasPreset | undefined,
   node: DagNode,
-  workflowLevelOptions: WorkflowLevelOptions,
-  declaredEffort: string | undefined,
+  declaredEffort: EffortLevel | undefined,
   nodeConfig: NodeConfig
 ): void {
   if (!preset) return;
-
-  if (
-    preset.thinking !== undefined &&
-    node.thinking === undefined &&
-    workflowLevelOptions.thinking === undefined
-  ) {
-    nodeConfig.thinking = preset.thinking;
-  }
 
   // An effort declared on the node or workflow outranks the preset's. Passed in
   // rather than re-derived so this cannot disagree with the chain that builds
@@ -725,7 +716,6 @@ export async function loadConfiguredMcpServerNames(
  *  all — it carries the workflow's resolved tier keyword for annotation. */
 interface WorkflowLevelOptions {
   effort?: EffortLevel;
-  thinking?: ThinkingConfig;
   fallbackModel?: string;
   betas?: string[];
   sandbox?: SandboxSettings;
@@ -1693,7 +1683,7 @@ async function resolveNodeProviderAndModel(
   model: string | undefined;
   options: SendQueryOptions | undefined;
   tier?: TierName;
-  effort?: string;
+  effort?: EffortLevel;
 }> {
   // The chain itself lives in node-model-resolution.ts so `workflow dry-run` reports the
   // same answer this produces (#1764). Everything below is the part a dry run must NOT
@@ -1790,7 +1780,6 @@ async function resolveNodeProviderAndModel(
     ['skills', 'skills', node.skills !== undefined && node.skills.length > 0],
     ['agents', 'agents', node.agents !== undefined],
     ['effort', 'effortControl', declaredEffort !== undefined],
-    ['thinking', 'thinkingControl', (node.thinking ?? workflowLevelOptions.thinking) !== undefined],
     ['maxBudgetUsd', 'costControl', node.maxBudgetUsd !== undefined],
     [
       'fallbackModel',
@@ -1888,7 +1877,6 @@ async function resolveNodeProviderAndModel(
     // depth that was never applied, and would leave declared and preset effort
     // behaving oppositely on the same provider.
     effort: caps.effortControl ? declaredEffort : undefined,
-    thinking: node.thinking ?? workflowLevelOptions.thinking,
     sandbox: node.sandbox ?? workflowLevelOptions.sandbox,
     betas: node.betas ?? workflowLevelOptions.betas,
     output_format: node.output_format,
@@ -1900,14 +1888,7 @@ async function resolveNodeProviderAndModel(
 
   // Pass assistantConfig from config — provider parses internally
   const assistantConfig: Record<string, unknown> = { ...(config.assistants[provider] ?? {}) };
-  applyPresetOptions(
-    provider,
-    effectivePreset,
-    node,
-    workflowLevelOptions,
-    declaredEffort,
-    nodeConfig
-  );
+  applyPresetOptions(provider, effectivePreset, node, declaredEffort, nodeConfig);
   // `webSearchMode:` has no node-level form and no other consumer, so the
   // workflow-level value is the only value — written only where it is read.
   if (isCodex && workflowLevelOptions.webSearchMode !== undefined) {
@@ -1924,11 +1905,10 @@ async function resolveNodeProviderAndModel(
   // and this reports the declared rung rather than the clamped one — consistent
   // across providers, and no longer able to name a field the provider ignored,
   // which was the #2395 failure mode.
-  const assistantEffort =
-    typeof assistantConfig.modelReasoningEffort === 'string'
-      ? assistantConfig.modelReasoningEffort
-      : undefined;
-  const resolvedEffort: string | undefined = nodeConfig.effort ?? assistantEffort;
+  const assistantEffort = isEffortRung(assistantConfig.modelReasoningEffort)
+    ? assistantConfig.modelReasoningEffort
+    : undefined;
+  const resolvedEffort: EffortLevel | undefined = nodeConfig.effort ?? assistantEffort;
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -2035,7 +2015,7 @@ async function executeNodeInternal(
   resumeSessionId: string | undefined,
   resolvedModel?: string,
   resolvedTier?: TierName,
-  resolvedEffort?: string,
+  resolvedEffort?: EffortLevel,
   stepNamePrefix = '',
   iteration?: number,
   checkpointSession?: SessionCheckpoint
@@ -5490,7 +5470,7 @@ async function executeLoopNode(
   stepNamePrefix = '',
   resolvedModel?: string,
   resolvedTier?: TierName,
-  resolvedEffort?: string,
+  resolvedEffort?: EffortLevel,
   checkpointSession?: SessionCheckpoint
 ): Promise<NodeExecutionResult> {
   const {
@@ -11508,7 +11488,6 @@ export async function executeDagWorkflow(
   const workflowTier = workflow.model && isTierName(workflow.model) ? workflow.model : undefined;
   const workflowLevelOptions = {
     effort: workflow.effort,
-    thinking: workflow.thinking,
     fallbackModel: workflow.fallbackModel,
     betas: workflow.betas,
     sandbox: workflow.sandbox,

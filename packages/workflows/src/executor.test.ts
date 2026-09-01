@@ -1375,7 +1375,7 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
-    it('terminalizes a resumed run before dispatch when persisted thinking is ineffective', async () => {
+    it('terminalizes a resumed run when persisted metadata uses retired thinking config', async () => {
       const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preset = {
         provider: 'copilot',
@@ -1407,11 +1407,11 @@ describe('executeWorkflow', () => {
           'db-conv-1',
           { preCreatedRun, priorCompletedNodes: new Map() }
         )
-      ).rejects.toThrow(/cannot apply Claude-shaped thinking options/);
+      ).rejects.toThrow(/thinking:.*effort:/);
 
       expect(failRun).toHaveBeenCalledWith(
         'resume-ignored-thinking-run',
-        expect.stringContaining('cannot apply Claude-shaped thinking options')
+        expect.stringMatching(/thinking:.*effort:/)
       );
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });

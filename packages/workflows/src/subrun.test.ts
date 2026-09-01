@@ -466,7 +466,6 @@ function makeProvider() {
       envInjection: true,
       costControl: true,
       effortControl: true,
-      thinkingControl: true,
       fallbackModel: true,
       sandbox: true,
     }),

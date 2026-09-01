@@ -41,7 +41,6 @@ import {
   KNOWN_DAG_NODE_KEYS,
   KNOWN_NODE_NESTED_KEYS,
   effortLevelSchema,
-  thinkingConfigSchema,
   sandboxSettingsSchema,
   betasSchema,
 } from './schemas/dag-node';
@@ -108,9 +107,8 @@ export function resetClassPlacementWarningForTests(): void {
  * valid enum options).
  *
  * The return type is inferred from the schema (`z.output<S>`), so
- * preprocess-based schemas (e.g. `thinkingConfigSchema`, whose input is
- * `unknown`) still resolve to their parsed output type rather than their
- * input type. zod v4 removed `ZodTypeDef` as the middle type parameter, so the
+ * preprocess-based schemas still resolve to their parsed output type rather
+ * than their input type. zod v4 removed `ZodTypeDef` as the middle type parameter, so the
  * old `z.ZodType<T, z.ZodTypeDef, unknown>` form no longer compiles.
  */
 function parseOptionalField<S extends z.ZodType>(
@@ -1287,6 +1285,17 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       };
     }
 
+    if (Object.hasOwn(raw, 'thinking')) {
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error: "'thinking:' has been removed; use 'effort:' instead",
+          errorType: 'validation_error',
+        },
+      };
+    }
+
     if (!raw.name || typeof raw.name !== 'string') {
       getLog().warn({ filename }, 'workflow_missing_name');
       return {
@@ -1874,12 +1883,6 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       // persists verbatim as a `workflow_parse_warnings` event (#2213).
       getLog().warn({ filename, warning: message }, 'workflow_model_reasoning_effort_deprecated');
     }
-    const thinking = parseOptionalField(
-      raw.thinking,
-      thinkingConfigSchema,
-      filename,
-      'invalid_workflow_thinking_value_ignored'
-    );
     const sandbox = parseOptionalField(
       raw.sandbox,
       sandboxSettingsSchema,
@@ -1964,7 +1967,6 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       interactive,
       ...(mutatesCheckout !== undefined ? { mutates_checkout: mutatesCheckout } : {}),
       ...(effort !== undefined ? { effort } : {}),
-      ...(thinking !== undefined ? { thinking } : {}),
       ...(fallbackModel !== undefined ? { fallbackModel } : {}),
       ...(betas !== undefined ? { betas } : {}),
       ...(sandbox !== undefined ? { sandbox } : {}),
