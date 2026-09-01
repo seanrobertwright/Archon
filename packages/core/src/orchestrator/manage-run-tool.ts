@@ -284,7 +284,7 @@ function formatRunDetail(run: WorkflowRun): string {
   if (attention?.kind === 'action_required') {
     parts.push(`action required: ${attention.message.slice(0, 300)}`);
     parts.push(
-      `-> complete the action, then resume run ${run.id}; abandon it if it should not continue.`
+      `-> complete the action, then run \`archon workflow resume ${run.id}\`; abandon it if it should not continue.`
     );
   }
   if (

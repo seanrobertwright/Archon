@@ -144,7 +144,7 @@ export function formatPausedGateSection(gate: PausedGateContext): string {
       '## Paused action required\n\n' +
       `Run \`${runId}\` (**${workflowName}**) is paused until someone completes this outside action:\n\n` +
       `> ${attention.message.replace(/\n/g, '\n> ')}\n\n` +
-      `After the action is complete, resume run \`${runId}\`. Abandon it if it should not continue. ` +
+      `After the action is complete, run \`archon workflow resume ${runId}\`. Abandon it if it should not continue. ` +
       'Do not approve or reject this pause.'
     );
   }

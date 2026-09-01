@@ -282,7 +282,7 @@ describe('manage_run — reads', () => {
     const out = await tool.handler({ action: 'get', runId: 'r1abcdef' });
 
     expect(out).toContain('action required: Re-run CI, then resume.');
-    expect(out).toContain('resume run r1abcdef-1234');
+    expect(out).toContain('archon workflow resume r1abcdef-1234');
     expect(out).toContain('abandon it');
   });
 

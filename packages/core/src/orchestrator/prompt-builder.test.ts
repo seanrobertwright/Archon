@@ -408,7 +408,7 @@ describe('formatPausedGateSection', () => {
 
     expect(section).toContain('## Paused action required');
     expect(section).toContain('Re-run the windows check, then resume.');
-    expect(section).toContain('resume run `run-abc`');
+    expect(section).toContain('archon workflow resume run-abc');
     expect(section).toContain('Abandon it');
     expect(section).not.toContain('Paused Approval Gate');
     expect(section).not.toContain('/workflow approve');

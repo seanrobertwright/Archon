@@ -202,7 +202,7 @@ export function WorkflowRunCard({
       ? run.user_message
       : run.user_message.slice(0, 80) + '…'
     : null;
-  const wait = run.metadata.wait;
+  const wait = run.metadata.wait ?? undefined;
   const scheduledResume = readScheduledResumeMetadata(run.metadata?.scheduled_resume);
   const hasApproval = wait === undefined && hasApprovalMetadata(run.metadata?.approval);
 
