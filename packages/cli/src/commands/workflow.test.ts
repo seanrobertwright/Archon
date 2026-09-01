@@ -4561,7 +4561,9 @@ describe('workflowGetCommand', () => {
         output_root: '/old-machine/.archon/workspaces/old/name',
         codebase_id: 'cb-relocated',
       });
-      (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValueOnce({
+      // Both readers in workflow get consult the codebase row; the resolver
+      // re-derives identically on each call against the same id.
+      (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValue({
         id: 'cb-relocated',
         kind: 'repo',
         name: 'new/widget',
@@ -4610,9 +4612,13 @@ describe('workflowGetCommand', () => {
   // last path that still walked `run.output_root` directly. These tests pin
   // both halves of the fix: the resolver is consulted, and the same refusal
   // surface the transcript reader already exposes applies.
-  it('refuses an unresolvable leave-behind artifact root (#3097)', async () => {
+  it('refuses to walk an out-of-tree persisted output_root even when the dir exists (#3097)', async () => {
     const previousHome = process.env.ARCHON_HOME;
     const archonHome = join(tmpdir(), 'archon-get-artifact-refused-home');
+    const decoyRoot = mkdtempSync(join(tmpdir(), 'archon-get-artifact-decoy-'));
+    const decoyArtifactsDir = join(decoyRoot, 'artifacts', 'runs', 'run-artifact-refused');
+    mkdirSync(decoyArtifactsDir, { recursive: true });
+    writeFileSync(join(decoyArtifactsDir, 'should-not-be-listed.txt'), 'poison');
     process.env.ARCHON_HOME = archonHome;
     try {
       const workflowDb = await import('@archon/core/db/workflows');
@@ -4623,7 +4629,7 @@ describe('workflowGetCommand', () => {
         working_path: '/tmp/wt',
         started_at: new Date(),
         metadata: {},
-        output_root: '/etc',
+        output_root: decoyRoot,
         codebase_id: null,
       });
 
@@ -4632,10 +4638,12 @@ describe('workflowGetCommand', () => {
       const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
         leave_behind?: { artifactFiles?: string[] };
       };
-      expect(parsed.leave_behind?.artifactFiles).toEqual([]);
+      expect(parsed.leave_behind?.artifactFiles ?? []).not.toContain('should-not-be-listed.txt');
     } finally {
       if (previousHome === undefined) delete process.env.ARCHON_HOME;
       else process.env.ARCHON_HOME = previousHome;
+      await removeTempTree(archonHome);
+      await removeTempTree(decoyRoot);
     }
   });
 
@@ -4671,7 +4679,9 @@ describe('workflowGetCommand', () => {
         output_root: '/old-machine/.archon/workspaces/old/name',
         codebase_id: 'cb-relocated-artifact',
       });
-      (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValueOnce({
+      // Both readers in workflow get consult the codebase row; the resolver
+      // re-derives identically on each call against the same id.
+      (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValue({
         id: 'cb-relocated-artifact',
         kind: 'repo',
         name: 'new/widget',
