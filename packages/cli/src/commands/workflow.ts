@@ -3894,16 +3894,17 @@ export async function workflowGetCommand(
   // Leave-behind view (#2747): what did this run leave, and where. Assembled
   // from existing data — status/outcome, adoption chain, and its artifact file
   // list resolved through the persisted output_root (read-only by contract).
+  const runCodebase = await fetchCodebaseForRun(run);
   let leaveBehind: LeaveBehind | undefined;
   try {
-    leaveBehind = await buildLeaveBehind(run);
+    leaveBehind = await buildLeaveBehind(run, runCodebase);
   } catch (error) {
     getLog().warn({ err: error as Error, runId: run.id }, 'cli.workflow_get_leave_behind_failed');
   }
 
   let transcriptPath: string | null = null;
   try {
-    transcriptPath = await resolveRunTranscriptPath(run);
+    transcriptPath = await resolveRunTranscriptPath(run, runCodebase);
   } catch (error) {
     getLog().warn({ err: error as Error, runId: run.id }, 'cli.workflow_get_transcript_failed');
   }
@@ -4032,13 +4033,25 @@ interface LeaveBehind {
   artifactFiles: string[];
 }
 
-async function resolveRunTranscriptPath(run: WorkflowRun): Promise<string | null> {
-  const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
-  const root = archonPaths.resolveRunStorageRoot(run, codebase);
+async function fetchCodebaseForRun(
+  run: WorkflowRun
+): Promise<Awaited<ReturnType<typeof codebaseDb.getCodebase>>> {
+  return run.codebase_id ? codebaseDb.getCodebase(run.codebase_id) : null;
+}
+
+async function resolveRunTranscriptPath(
+  run: WorkflowRun,
+  codebase: Awaited<ReturnType<typeof codebaseDb.getCodebase>> = null
+): Promise<string | null> {
+  const cb = codebase ?? (await fetchCodebaseForRun(run));
+  const root = archonPaths.resolveRunStorageRoot(run, cb);
   return root ? archonPaths.getRunLogPathForRoot(root, run.id) : null;
 }
 
-async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
+async function buildLeaveBehind(
+  run: WorkflowRun,
+  codebase: Awaited<ReturnType<typeof codebaseDb.getCodebase>> = null
+): Promise<LeaveBehind> {
   const leaveBehind: LeaveBehind = { adopted_by: [], artifactFiles: [] };
 
   if (run.working_path) {
@@ -4060,9 +4073,16 @@ async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
   }
 
   // Artifact file list — capped walk so `get` stays cheap on big runs.
-  if (run.output_root) {
+  // #3097: route the persisted `output_root` through the shared resolver so
+  // the same `ARCHON_HOME` containment check every other persisted-root
+  // reader in this file already enforces applies here. An unresolvable root
+  // (out-of-tree persisted value with no codebase row to re-derive from)
+  // yields the same null-root refusal the transcript reader exposes.
+  const cb = codebase ?? (await fetchCodebaseForRun(run));
+  const artifactsRoot = archonPaths.resolveRunStorageRoot(run, cb);
+  if (artifactsRoot) {
     try {
-      const artifactsDir = archonPaths.getRunArtifactsDirForRoot(run.output_root, run.id);
+      const artifactsDir = archonPaths.getRunArtifactsDirForRoot(artifactsRoot, run.id);
       leaveBehind.artifactFiles = listArtifactFiles(artifactsDir);
     } catch (error) {
       getLog().debug({ err: error as Error }, 'cli.workflow_get_artifact_walk_failed');
