@@ -452,8 +452,8 @@ function collapseWorkflowScope(raw: WorkflowDefinition): WorkflowDefinition {
  *   - Prompt text (prompt / loop.prompt / approval fields) — canonical `.output` refs are
  *     live everywhere, including Markdown code spans, because runtime substitution is
  *     syntax-agnostic.
- *   - Code/expression (bash / script / wait.until / wait.event / loop.until_bash /
- *     loop_group.until_bash / cancel / workflow.input / workflow.fan_out.items) — canonical
+ *   - Code/expression (bash / script / wait.until / wait.event / wait.attention /
+ *     loop.until_bash / loop_group.until_bash / cancel / workflow.input / workflow.fan_out.items) — canonical
  *     `.output` refs are LIVE (never documentation) → rewritten verbatim.
  *
  * Public runtime node-ref surfaces stay aligned across this rewrite, the loader's

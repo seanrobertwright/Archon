@@ -28,6 +28,7 @@ test('the slot catalogue rejects omitted fixed fields', () => {
     'cancel.reason': { surface: 'prompt' },
     'wait.until': { surface: 'value' },
     'wait.event': { surface: 'value' },
+    'wait.attention': { surface: 'prompt' },
     'workflow.input': { surface: 'value' },
     'workflow.with.*': { surface: 'value' },
     'workflow.fan_out.items': { surface: 'value' },

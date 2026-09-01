@@ -1,6 +1,10 @@
 import type { NativeTool } from '@archon/providers/types';
 import { createLogger } from '@archon/paths';
-import { isApprovalContext, isContainerRun } from '@archon/workflows/schemas/workflow-run';
+import {
+  isApprovalContext,
+  isContainerRun,
+  runAttention,
+} from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { listDashboardRuns, findWorkflowRunsByIdPrefix } from '../db/workflows';
 import {
@@ -276,6 +280,13 @@ function formatRunDetail(run: WorkflowRun): string {
   // Paused interactive-loop gate: surface the structured gate state (#2074) so an
   // AI approver can decide finalize-vs-iterate without parsing prose.
   const rawApproval = run.metadata.approval;
+  const attention = runAttention(run);
+  if (attention?.kind === 'action_required') {
+    parts.push(`action required: ${attention.message.slice(0, 300)}`);
+    parts.push(
+      `-> complete the action, then run \`archon workflow resume ${run.id}\`; abandon it if it should not continue.`
+    );
+  }
   if (
     run.status === 'paused' &&
     isApprovalContext(rawApproval) &&

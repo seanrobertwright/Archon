@@ -79,6 +79,7 @@ export function createWorkflowStore(): IWorkflowStore {
     failWorkflowRun: workflowDb.failWorkflowRun,
     pauseWorkflowRun: workflowDb.pauseWorkflowRun,
     pauseWorkflowRunForWait: workflowDb.pauseWorkflowRunForWait,
+    failPausedAttentionWait: workflowDb.failPausedAttentionWait,
     clearWorkflowWaitContext: workflowDb.clearWorkflowWaitContext,
     rewriteApprovalContext: (id, approvalContext) =>
       workflowDb.resolveApprovalGate(id, { approval: approvalContext }, []),

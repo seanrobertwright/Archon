@@ -388,30 +388,142 @@ describe('toRun — resolved gate (approved/rejected awaiting resume)', () => {
 });
 
 describe('toRun — durable wait', () => {
-  test('parses the active wait and labels it without implying human approval', () => {
-    const r = toRun(
-      raw({
-        id: 'r1',
-        workflow_name: 'await-checks',
-        status: 'paused',
-        metadata: {
-          wait: {
-            owner: 'node',
-            nodeId: 'checks',
-            kind: 'event',
-            event: 'checks.complete',
-            resumeAt: '2026-08-25T10:00:00.000Z',
-          },
-        },
-      })
-    );
+  type RawWait = NonNullable<NonNullable<Raw['metadata']>['wait']>;
+  type NormalizedWait = NonNullable<ReturnType<typeof toRun>['wait']>;
 
-    expect(r.wait).toEqual({
-      nodeId: 'checks',
-      kind: 'event',
-      event: 'checks.complete',
-      resumeAt: '2026-08-25T10:00:00.000Z',
+  const waitingSince = '2026-08-25T09:00:00.000Z';
+  const resumeAt = '2026-08-25T10:00:00.000Z';
+  const cases: Array<{
+    name: string;
+    wait: RawWait;
+    expected: NormalizedWait;
+    label: string;
+  }> = [
+    {
+      name: 'node time',
+      wait: { owner: 'node', nodeId: 'delay', kind: 'time', waitingSince, resumeAt },
+      expected: { nodeId: 'delay', kind: 'time', waitingSince, resumeAt },
+      label: 'Waiting until scheduled time',
+    },
+    {
+      name: 'node event',
+      wait: {
+        owner: 'node',
+        nodeId: 'checks',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+        signaledAt: resumeAt,
+        payload: { conclusion: 'success' },
+      },
+      expected: {
+        nodeId: 'checks',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+        signaledAt: resumeAt,
+        payload: { conclusion: 'success' },
+      },
+      label: 'Waiting for event',
+    },
+    {
+      name: 'node attention',
+      wait: {
+        owner: 'node',
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      expected: {
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      label: 'Waiting for action',
+    },
+    {
+      name: 'loop-group time',
+      wait: {
+        owner: 'loop_group',
+        nodeId: 'poll',
+        bodyWaitId: 'delay',
+        iteration: 2,
+        sessionId: null,
+        sessionProvider: null,
+        kind: 'time',
+        waitingSince,
+        resumeAt,
+      },
+      expected: { nodeId: 'poll.delay', kind: 'time', waitingSince, resumeAt },
+      label: 'Waiting until scheduled time',
+    },
+    {
+      name: 'loop-group event',
+      wait: {
+        owner: 'loop_group',
+        nodeId: 'poll',
+        bodyWaitId: 'checks',
+        iteration: 3,
+        sessionId: 'session-1',
+        sessionProvider: 'claude',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+      },
+      expected: {
+        nodeId: 'poll.checks',
+        kind: 'event',
+        waitingSince,
+        resumeAt,
+        event: 'checks.complete',
+      },
+      label: 'Waiting for event',
+    },
+    {
+      name: 'loop-group attention',
+      wait: {
+        owner: 'loop_group',
+        nodeId: 'recover-ci',
+        bodyWaitId: 'pause',
+        iteration: 14,
+        sessionId: null,
+        sessionProvider: null,
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      expected: {
+        nodeId: 'recover-ci.pause',
+        kind: 'attention',
+        waitingSince,
+        message: 'Re-run CI, then resume.',
+      },
+      label: 'Waiting for action',
+    },
+  ];
+
+  for (const waitCase of cases) {
+    test(`normalizes ${waitCase.name} from the generated wait contract`, () => {
+      const r = toRun(
+        raw({
+          id: 'r1',
+          workflow_name: 'durable-wait',
+          status: 'paused',
+          metadata: {
+            approval: { nodeId: 'old-gate', message: 'Stale approval' },
+            wait: waitCase.wait,
+          },
+        })
+      );
+
+      expect(r.wait).toEqual(waitCase.expected);
+      expect(r.approval).toBeNull();
+      expect(runStatusLabel(r)).toBe(waitCase.label);
     });
-    expect(runStatusLabel(r)).toBe('Waiting for event');
-  });
+  }
 });

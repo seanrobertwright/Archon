@@ -2558,16 +2558,30 @@ export async function executeWorkflow(
     // gate and the $ADOPTED_RUN_DIR resolution that only adoption needs.
     if (effectiveContinuationMode !== 'supersede') {
       const adopted = await deps.store.getWorkflowRun(effectiveAdoptedFromRunId);
+      // Deliberately precedes the resolver below: a missing persisted root is
+      // corruption, not relocation, so adoption refuses rather than re-deriving
+      // from a codebase row the way the display-only CLI/server readers would.
       if (!adopted?.output_root) {
         throw new Error(
           `Cannot adopt run '${effectiveAdoptedFromRunId}': it has no persisted output root, so its ` +
             'artifact directory cannot be addressed.'
         );
       }
-      adoptedRunDir = archonPaths.getRunArtifactsDirForRoot(
-        adopted.output_root,
-        effectiveAdoptedFromRunId
-      );
+      // #3097 — route the adopted run's persisted output_root through the
+      // shared resolver so the same ARCHON_HOME containment check every other
+      // persisted-root reader (CLI leave-behind, server artifact route) already
+      // applies here. An out-of-tree value is refused unless the adopted run's
+      // codebase row can re-derive a root under the current ARCHON_HOME.
+      const adoptedCodebase = adopted.codebase_id
+        ? await deps.store.getCodebase(adopted.codebase_id)
+        : null;
+      const adoptedRoot = archonPaths.resolveRunStorageRoot(adopted, adoptedCodebase);
+      if (!adoptedRoot) {
+        throw new Error(
+          `Cannot adopt run '${effectiveAdoptedFromRunId}': its persisted output root is outside ARCHON_HOME and cannot be re-derived, so its artifact directory cannot be addressed.`
+        );
+      }
+      adoptedRunDir = archonPaths.getRunArtifactsDirForRoot(adoptedRoot, effectiveAdoptedFromRunId);
     }
     if (!isContinuation) {
       try {

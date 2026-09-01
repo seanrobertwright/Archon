@@ -1491,15 +1491,16 @@ async function main(): Promise<number> {
             if (positionals[2] !== undefined) {
               return await fail(
                 jsonFlag,
-                'Usage: archon workflow status [--json] [--verbose] [--events]\n' +
+                'Usage: archon workflow status [--all] [--json] [--verbose] [--events]\n' +
                   'To show a single run, use: archon workflow get <run-id>'
               );
             }
-            await workflowStatusCommand(
-              jsonFlag,
-              values.verbose as boolean | undefined,
-              values.events as boolean | undefined
-            );
+            await workflowStatusCommand(effectiveCwd, {
+              json: jsonFlag,
+              verbose: values.verbose as boolean | undefined,
+              rawEvents: values.events as boolean | undefined,
+              all: values.all as boolean | undefined,
+            });
             break;
 
           case 'get': {

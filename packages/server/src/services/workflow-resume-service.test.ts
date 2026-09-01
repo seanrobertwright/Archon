@@ -227,6 +227,27 @@ describe('workflow continuation scanner', () => {
     ]);
   });
 
+  test('does not schedule an action-required wait even if a malformed due query returns it', async () => {
+    mockListDueWorkflowContinuations.mockResolvedValue([
+      run('attention-1', 'paused', {
+        wait: {
+          owner: 'node',
+          nodeId: 'rerun-ci',
+          kind: 'attention',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          message: 'Re-run CI, then resume.',
+        },
+      }),
+    ]);
+    const resume = mock(async () => true);
+
+    await expect(
+      scanDueWorkflowContinuations(new Date('2026-08-24T11:00:01.000Z'), resume)
+    ).resolves.toBe(0);
+    expect(resume).not.toHaveBeenCalled();
+    expect(mockDeferWorkflowContinuation).not.toHaveBeenCalled();
+  });
+
   test('routes background web execution through its worker and results through the parent', () => {
     const background = {
       ...run('wait-web', 'paused', {}),

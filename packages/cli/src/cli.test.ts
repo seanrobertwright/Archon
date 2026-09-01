@@ -162,6 +162,16 @@ describe('CLI help output', () => {
     expect(help.stdout).toContain('--follow');
   });
 
+  it('documents project-scoped active status and its install-wide override', () => {
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain(
+      'workflow status            Show running/paused workflows for this project'
+    );
+    expect(help.stdout).toContain(
+      "--all                      For 'workflow status/runs': list across all projects"
+    );
+  });
+
   it('documents compact and full workflow discovery', () => {
     expect(help.status).toBe(0);
     expect(help.stdout).toContain('workflow list [name] [--full] [--json]');
@@ -822,10 +832,159 @@ describe('workflow status arguments', () => {
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain(
-      'Usage: archon workflow status [--json] [--verbose] [--events]'
+      'Usage: archon workflow status [--all] [--json] [--verbose] [--events]'
     );
     expect(result.stderr).toContain('archon workflow get <run-id>');
     expect(result.stdout).toBe('');
+  });
+});
+
+describe('workflow status project scope', () => {
+  it('uses the run-owned project after its conversation moves and returns every project with --all', async () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'archon-cli-status-scope-'));
+    const archonHome = join(scratch, 'home');
+    const projectA = join(scratch, 'project-a');
+    const projectB = join(scratch, 'project-b');
+    const unregisteredProject = join(scratch, 'unregistered-project');
+    mkdirSync(archonHome, { recursive: true });
+    mkdirSync(projectA);
+    mkdirSync(projectB);
+    mkdirSync(unregisteredProject);
+
+    try {
+      expect(spawnSync('git', ['init', '-q', '.'], { cwd: projectA }).status).toBe(0);
+      expect(spawnSync('git', ['init', '-q', '.'], { cwd: projectB }).status).toBe(0);
+      expect(spawnSync('git', ['init', '-q', '.'], { cwd: unregisteredProject }).status).toBe(0);
+      const projectARoot = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: projectA,
+        encoding: 'utf8',
+      });
+      const projectBRoot = spawnSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: projectB,
+        encoding: 'utf8',
+      });
+      expect(projectARoot.status).toBe(0);
+      expect(projectBRoot.status).toBe(0);
+      const env = {
+        ...process.env,
+        ARCHON_HOME: archonHome,
+        ARCHON_TELEMETRY_DISABLED: '1',
+        DATABASE_URL: '',
+      };
+      const initialize = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--all', '--json', '--cwd', projectA],
+        { cwd: projectA, env, encoding: 'utf8' }
+      );
+      expect({ status: initialize.status, stderr: initialize.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+
+      const database = new Database(join(archonHome, 'archon.db'));
+      try {
+        const insertCodebase = database.prepare(
+          'INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES (?, ?, ?)'
+        );
+        insertCodebase.run('codebase-a', 'fixture/a', projectARoot.stdout.trim());
+        insertCodebase.run('codebase-b', 'fixture/b', projectBRoot.stdout.trim());
+
+        const insertConversation = database.prepare(
+          'INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, codebase_id) VALUES (?, ?, ?, ?)'
+        );
+        insertConversation.run('conversation-a', 'cli', 'cli-a', 'codebase-a');
+        insertConversation.run('conversation-b', 'cli', 'cli-b', 'codebase-b');
+
+        const insertRun = database.prepare(
+          'INSERT INTO remote_agent_workflow_runs (id, conversation_id, codebase_id, workflow_name, user_message, status) VALUES (?, ?, ?, ?, ?, ?)'
+        );
+        insertRun.run(
+          '00000000-0000-4000-8000-00000000000a',
+          'conversation-a',
+          'codebase-a',
+          'project-a-work',
+          'test',
+          'running'
+        );
+        insertRun.run(
+          '00000000-0000-4000-8000-00000000000b',
+          'conversation-b',
+          'codebase-b',
+          'project-b-work',
+          'test',
+          'paused'
+        );
+        database
+          .prepare('UPDATE remote_agent_conversations SET codebase_id = ? WHERE id = ?')
+          .run('codebase-b', 'conversation-a');
+      } finally {
+        database.close();
+      }
+
+      const scoped = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--json', '--cwd', projectA],
+        { cwd: projectA, env, encoding: 'utf8' }
+      );
+      expect({ status: scoped.status, stderr: scoped.stderr }).toEqual({ status: 0, stderr: '' });
+      const scopedJson = JSON.parse(scoped.stdout) as {
+        scopeFallback: boolean;
+        runs: Array<{ workflow_name: string }>;
+      };
+      expect(scopedJson.scopeFallback).toBe(false);
+      expect(scopedJson.runs.map(run => run.workflow_name)).toEqual(['project-a-work']);
+
+      const otherProject = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--json', '--cwd', projectB],
+        { cwd: projectB, env, encoding: 'utf8' }
+      );
+      expect({ status: otherProject.status, stderr: otherProject.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+      const otherProjectJson = JSON.parse(otherProject.stdout) as {
+        scopeFallback: boolean;
+        runs: Array<{ workflow_name: string }>;
+      };
+      expect(otherProjectJson.scopeFallback).toBe(false);
+      expect(otherProjectJson.runs.map(run => run.workflow_name)).toEqual(['project-b-work']);
+
+      const global = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--all', '--json', '--cwd', projectA],
+        { cwd: projectA, env, encoding: 'utf8' }
+      );
+      expect({ status: global.status, stderr: global.stderr }).toEqual({ status: 0, stderr: '' });
+      const globalJson = JSON.parse(global.stdout) as {
+        scopeFallback: boolean;
+        runs: Array<{ workflow_name: string }>;
+      };
+      expect(globalJson.scopeFallback).toBe(false);
+      expect(new Set(globalJson.runs.map(run => run.workflow_name))).toEqual(
+        new Set(['project-a-work', 'project-b-work'])
+      );
+
+      const fallback = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--json', '--cwd', unregisteredProject],
+        { cwd: unregisteredProject, env, encoding: 'utf8' }
+      );
+      expect({ status: fallback.status, stderr: fallback.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+      const fallbackJson = JSON.parse(fallback.stdout) as {
+        scopeFallback: boolean;
+        runs: Array<{ workflow_name: string }>;
+      };
+      expect(fallbackJson.scopeFallback).toBe(true);
+      expect(new Set(fallbackJson.runs.map(run => run.workflow_name))).toEqual(
+        new Set(['project-a-work', 'project-b-work'])
+      );
+    } finally {
+      await removeTempTree(scratch);
+    }
   });
 });
 

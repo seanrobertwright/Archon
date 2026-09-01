@@ -620,10 +620,11 @@ async function checkFixture(
       )) {
         const traceEntries = result.trace.filter(
           entry =>
-            entry.nodeId === nodeId && (entry.state === 'completed' || entry.state === 'stubbed')
+            entry.nodeId === nodeId &&
+            (entry.state === 'completed' || entry.state === 'stubbed' || entry.state === 'paused')
         );
         if (traceEntries.length === 0) {
-          failureReason = `expected resolved text for node '${nodeId}', but it did not complete`;
+          failureReason = `expected resolved text for node '${nodeId}', but it was not reached`;
           break;
         }
         if (!traceEntries.some(entry => entry.resolvedText?.includes(expectedText) === true)) {

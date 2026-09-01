@@ -556,6 +556,27 @@ describe('runFixtures', () => {
     );
   });
 
+  it('checks resolved text on a wait node that pauses the fixture', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\ninputs:\n  check:\n    default: windows\nnodes:\n' +
+        '  - id: rerun\n    wait:\n      attention: "Re-run $INPUTS.check, then resume."\n',
+      body: [
+        'fixture:',
+        '  expect: paused',
+        '  resolved-text-contains:',
+        '    rerun: "Re-run windows, then resume."',
+      ].join('\n'),
+    });
+
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report.passed).toBe(1);
+  });
+
   it('reports a malformed fixture as a failure, not a crash', async () => {
     const { cwd } = writeTempProject({ body: ['fixture:', '  expect: bogus'].join('\n') });
     const report = await runFixtures({

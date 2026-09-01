@@ -3602,39 +3602,53 @@ function printVerboseNodes(events: WorkflowEventRow[]): void {
   }
 }
 
-/**
- * Show status of all running workflow runs.
- */
+/** Show active workflow runs for the current project, or every project with `--all`. */
 export async function workflowStatusCommand(
-  json?: boolean,
-  verbose?: boolean,
-  rawEvents?: boolean
+  cwd: string,
+  opts: { json?: boolean; verbose?: boolean; rawEvents?: boolean; all?: boolean } = {}
 ): Promise<void> {
+  let codebase = null;
+  if (!opts.all) {
+    try {
+      codebase = await findCodebaseForCheckoutPath(cwd);
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, cwd }, 'cli.workflow_status_codebase_lookup_failed');
+      throw new Error(`Failed to resolve workflow status project: ${err.message}`, { cause: err });
+    }
+  }
+
   let runs: DashboardWorkflowRun[];
   try {
-    const result = await getWorkflowStatus();
+    const result = await getWorkflowStatus(codebase ? { codebaseId: codebase.id } : undefined);
     runs = result.runs;
   } catch (error) {
     const err = error as Error;
-    getLog().error({ err }, 'cli.workflow_status_failed');
+    getLog().error({ err, cwd }, 'cli.workflow_status_failed');
     throw new Error(`Failed to list workflow runs: ${err.message}`);
   }
 
-  if (json) {
-    if (!verbose) {
-      await writeJsonLine({ runs });
+  const scopeFallback = !opts.all && !codebase;
+
+  if (opts.json) {
+    if (!opts.verbose) {
+      await writeJsonLine({ runs, scopeFallback });
       return;
     }
 
     const fetchedPerRun = await Promise.all(runs.map(run => fetchVerboseEvents(run.id)));
     const runsOutput = runs.map((run, i) => {
       const runEvents = fetchedPerRun[i]?.events ?? [];
-      return rawEvents
+      return opts.rawEvents
         ? { ...run, events: runEvents }
         : { ...run, nodes: buildNodeSummaries(runEvents) };
     });
-    await writeJsonLine({ runs: runsOutput });
+    await writeJsonLine({ runs: runsOutput, scopeFallback });
     return;
+  }
+
+  if (scopeFallback) {
+    console.log('(not a registered project — showing all runs)');
   }
 
   if (runs.length === 0) {
@@ -3657,7 +3671,7 @@ export async function workflowStatusCommand(
       );
     }
 
-    if (verbose) {
+    if (opts.verbose) {
       const { events, failed } = await fetchVerboseEvents(run.id);
       if (failed) {
         console.log('  (node events unavailable — see logs)');
@@ -3696,6 +3710,11 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
         ? `Run ${watchedRunId} is waiting for a response at gate '${attention.respondTo.nodeId}'.`
         : `Run ${watchedRunId} is blocked on sub-run ${attention.respondTo.runId}, which is waiting ` +
             `for a response at gate '${attention.respondTo.nodeId}'.`;
+    case 'action_required':
+      return (
+        `Run ${watchedRunId} needs an outside action: ${attention.message} ` +
+        `When it is complete, run: archon workflow resume ${attention.runId}`
+      );
     case 'blocked_on_child':
       // Unreachable through the waiter, which resolves the chain before returning.
       return `Run ${watchedRunId} is blocked on sub-run ${attention.childRunId}.`;
@@ -4040,8 +4059,10 @@ export async function workflowGetCommand(
   // the plain output) sees whether any declared completion condition completed
   // the paused iteration (#2074). --json already carries the full metadata.approval.
   const gateMeta = run.metadata.approval;
+  const waitMeta = run.metadata.wait;
   if (
     run.status === 'paused' &&
+    !isWorkflowWaitContext(waitMeta) &&
     isApprovalContext(gateMeta) &&
     gateMeta.type === 'interactive_loop'
   ) {
@@ -4050,12 +4071,13 @@ export async function workflowGetCommand(
       `  Gate:   awaiting approval — completion condition met: ${completionMet} (iteration ${String(gateMeta.iteration ?? '?')})`
     );
   }
-  const waitMeta = run.metadata.wait;
   if (run.status === 'paused' && isWorkflowWaitContext(waitMeta)) {
     console.log(
-      waitMeta.kind === 'event'
-        ? `  Wait:   event '${waitMeta.event ?? '?'}' until ${waitMeta.resumeAt}`
-        : `  Wait:   until ${waitMeta.resumeAt}`
+      waitMeta.kind === 'attention'
+        ? `  Wait:   action required — ${waitMeta.message} (resume with: archon workflow resume ${run.id})`
+        : waitMeta.kind === 'event'
+          ? `  Wait:   event '${waitMeta.event ?? '?'}' until ${waitMeta.resumeAt}`
+          : `  Wait:   until ${waitMeta.resumeAt}`
     );
   }
   const scheduledResume = run.metadata.scheduled_resume;
@@ -4134,6 +4156,8 @@ async function resolveRunTranscriptPath(run: WorkflowRun): Promise<string | null
 }
 
 async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
+  const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
+
   const leaveBehind: LeaveBehind = { adopted_by: [], artifactFiles: [] };
 
   if (run.working_path) {
@@ -4155,9 +4179,15 @@ async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
   }
 
   // Artifact file list — capped walk so `get` stays cheap on big runs.
-  if (run.output_root) {
+  // #3097: route the persisted `output_root` through the shared resolver so
+  // the same `ARCHON_HOME` containment check every other persisted-root
+  // reader in this file already enforces applies here. An unresolvable root
+  // (out-of-tree persisted value with no codebase row to re-derive from)
+  // yields the same null-root refusal the transcript reader exposes.
+  const artifactsRoot = archonPaths.resolveRunStorageRoot(run, codebase);
+  if (artifactsRoot) {
     try {
-      const artifactsDir = archonPaths.getRunArtifactsDirForRoot(run.output_root, run.id);
+      const artifactsDir = archonPaths.getRunArtifactsDirForRoot(artifactsRoot, run.id);
       leaveBehind.artifactFiles = listArtifactFiles(artifactsDir);
     } catch (error) {
       getLog().debug({ err: error as Error }, 'cli.workflow_get_artifact_walk_failed');

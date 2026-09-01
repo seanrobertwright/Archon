@@ -212,6 +212,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
     pauseWorkflowRunForWait: mock(async () => {}),
+    failPausedAttentionWait: mock(async () => ({ failed: true })),
     clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
@@ -317,6 +318,44 @@ describe('executeWorkflow', () => {
     expect(store.createWorkflowRun).not.toHaveBeenCalled();
     expect(deps.loadConfig).not.toHaveBeenCalled();
     expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('does not report a notification-failed attention wait as a successful pause', async () => {
+    const wait = {
+      owner: 'node' as const,
+      nodeId: 'rerun-ci',
+      kind: 'attention' as const,
+      waitingSince: '2026-09-01T10:00:00.000Z',
+      message: 'Re-run the failing check, then resume.',
+    };
+    const store = makeStore({
+      getWorkflowRun: mock(async () =>
+        makeRun({
+          status: 'failed',
+          metadata: {
+            wait,
+            error: "Wait node 'rerun-ci' could not deliver its action-required notification",
+          },
+        })
+      ),
+      getWorkflowRunStatus: mock(async () => 'failed' as const),
+    });
+
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-1',
+      '/tmp/ops',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1'
+    );
+
+    expect(result).toEqual({
+      success: false,
+      workflowRunId: 'run-123',
+      error: 'Workflow did not complete successfully',
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -447,10 +486,11 @@ describe('executeWorkflow', () => {
 
   describe('adopted run dir on resume', () => {
     it('resolves $ADOPTED_RUN_DIR on a resumed run from its persisted adopted_from_run_id', async () => {
+      const trustedOutputRoot = join(WS, 'workspaces', 'acme', 'widget');
       const store = makeStore({
         getWorkflowRun: mock(async (id: string) =>
           id === 'prior-run'
-            ? makeRun({ id: 'prior-run', status: 'completed', output_root: '/tmp/roots/prior' })
+            ? makeRun({ id: 'prior-run', status: 'completed', output_root: trustedOutputRoot })
             : { ...makeRun(), status: 'completed' as const }
         ),
       });
@@ -484,7 +524,7 @@ describe('executeWorkflow', () => {
       // path.join resolves platform-separator natively; the template's own
       // '/report.md' suffix stays a literal POSIX slash
       expect(substituted).toBe(
-        `Read ${join('/tmp/roots/prior', 'artifacts', 'runs', 'prior-run')}/report.md`
+        `Read ${join(trustedOutputRoot, 'artifacts', 'runs', 'prior-run')}/report.md`
       );
       // The adoption announcement is creation-only — a resume must not re-emit it.
       const adoptedEvents = (
@@ -563,6 +603,7 @@ describe('executeWorkflow', () => {
 
     it('adoption with output_root still works (unchanged)', async () => {
       const adoptedId = 'prior-run';
+      const trustedOutputRoot = join(WS, 'workspaces', 'acme', 'widget');
       let capturedVar: string | undefined;
       mockExecuteDagWorkflow.mockImplementationOnce(async () => {
         capturedVar = substituteWorkflowVariables(
@@ -578,7 +619,7 @@ describe('executeWorkflow', () => {
       const store = makeStore({
         getWorkflowRun: mock(async (id: string) =>
           id === adoptedId
-            ? makeRun({ id: adoptedId, status: 'completed', output_root: '/tmp/roots/prior' })
+            ? makeRun({ id: adoptedId, status: 'completed', output_root: trustedOutputRoot })
             : id === 'run-123'
               ? makeRun({ id: 'run-123', status: 'completed' as const })
               : { ...makeRun(), status: 'completed' as const }
@@ -599,7 +640,7 @@ describe('executeWorkflow', () => {
       );
       expect(result.success).toBe(true);
       expect(capturedVar!).toBe(
-        `Read ${join('/tmp/roots/prior', 'artifacts', 'runs', adoptedId)}/report.md`
+        `Read ${join(trustedOutputRoot, 'artifacts', 'runs', adoptedId)}/report.md`
       );
     });
 
@@ -626,6 +667,208 @@ describe('executeWorkflow', () => {
       const eventData = (eventCalls[0]![0] as { data: Record<string, unknown> }).data;
       expect(eventData.adopted_from_run_id).toBe(supersededId);
       expect(eventData.mode).toBe('supersede');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Adopted-run dir containment (#3097) — the persisted output_root reader in
+  // $ADOPTED_RUN_DIR resolution must go through the shared resolver, matching
+  // the CLI leave-behind and server artifact routes. Out-of-tree values with
+  // no codebase row to re-derive from are refused; relocated roots that the
+  // adopted run's codebase can re-derive under the current ARCHON_HOME resolve
+  // and list as before.
+  // -------------------------------------------------------------------------
+
+  describe('adopted run dir containment (#3097)', () => {
+    it('refuses to adopt from a run whose persisted output_root is outside ARCHON_HOME with no codebase re-derivation', async () => {
+      const adoptedId = 'prior-run';
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                // Out-of-tree root — not under /tmp/ws (this suite's fake
+                // ARCHON_HOME), and no codebase row to re-derive from. The
+                // shared resolver returns null and the executor refuses,
+                // matching the CLI leave-behind and server readers.
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: null,
+              })
+            : { ...makeRun(), status: 'completed' as const }
+        ),
+      });
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          {
+            adoptedFromRunId: adoptedId,
+            continuationMode: 'adopt',
+          }
+        )
+      ).rejects.toThrow(/outside ARCHON_HOME/);
+    });
+
+    it('re-derives a relocated adopted run dir through the adopted codebase', async () => {
+      const adoptedId = 'prior-run';
+      let capturedVar: string | undefined;
+      mockExecuteDagWorkflow.mockImplementationOnce(async () => {
+        capturedVar = substituteWorkflowVariables(
+          'Read $ADOPTED_RUN_DIR/report.md',
+          'run-123',
+          'msg',
+          '/artifacts',
+          'main',
+          'docs'
+        ).prompt;
+        return undefined;
+      });
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                // Out-of-tree persisted root from another machine — must be
+                // re-derived under the current ARCHON_HOME via the adopted
+                // run's codebase row, not walked verbatim.
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: 'cb-adopted',
+              })
+            : id === 'run-123'
+              ? makeRun({ id: 'run-123', status: 'completed' as const })
+              : { ...makeRun(), status: 'completed' as const }
+        ),
+        getCodebase: mock(async (id: string) =>
+          id === 'cb-adopted'
+            ? {
+                id: 'cb-adopted',
+                name: 'acme/widget',
+                repository_url: 'https://github.com/acme/widget',
+                default_cwd: '/repos/widget',
+                kind: 'repo' as const,
+              }
+            : null
+        ),
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          adoptedFromRunId: adoptedId,
+          continuationMode: 'adopt',
+        }
+      );
+      expect(result.success).toBe(true);
+      expect(capturedVar!).toBe(
+        `Read ${join(WS, 'acme', 'widget', 'artifacts', 'runs', adoptedId)}/report.md`
+      );
+    });
+
+    // Same containment rules apply on the RESUME path — `adoptedFromRunId`
+    // is not in opts; the executor reads `adopted_from_run_id` from the
+    // pre-created persisted row. The resolver call site is identical
+    // (executor.ts:2578), but a future regression that adds a resume-specific
+    // bypass before the resolver would not fail the fresh-path tests above.
+
+    it('resume: refuses adoption when the persisted output_root is outside ARCHON_HOME with no codebase', async () => {
+      const adoptedId = 'prior-run';
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: null,
+              })
+            : { ...makeRun(), status: 'completed' as const }
+        ),
+      });
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          {
+            preCreatedRun: makeRun({ status: 'running', adopted_from_run_id: adoptedId }),
+            priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+          }
+        )
+      ).rejects.toThrow(/outside ARCHON_HOME/);
+    });
+
+    it('resume: re-derives a relocated adopted run dir through the adopted codebase', async () => {
+      const adoptedId = 'prior-run';
+      let capturedVar: string | undefined;
+      mockExecuteDagWorkflow.mockImplementationOnce(async () => {
+        capturedVar = substituteWorkflowVariables(
+          'Read $ADOPTED_RUN_DIR/report.md',
+          'run-123',
+          'msg',
+          '/artifacts',
+          'main',
+          'docs'
+        ).prompt;
+        return undefined;
+      });
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: 'cb-adopted',
+              })
+            : id === 'run-123'
+              ? makeRun({ id: 'run-123', status: 'completed' as const })
+              : { ...makeRun(), status: 'completed' as const }
+        ),
+        getCodebase: mock(async (id: string) =>
+          id === 'cb-adopted'
+            ? {
+                id: 'cb-adopted',
+                name: 'acme/widget',
+                repository_url: 'https://github.com/acme/widget',
+                default_cwd: '/repos/widget',
+                kind: 'repo' as const,
+              }
+            : null
+        ),
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({ status: 'running', adopted_from_run_id: adoptedId }),
+          priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+        }
+      );
+      expect(result.success).toBe(true);
+      expect(capturedVar!).toBe(
+        `Read ${join(WS, 'acme', 'widget', 'artifacts', 'runs', adoptedId)}/report.md`
+      );
     });
   });
 

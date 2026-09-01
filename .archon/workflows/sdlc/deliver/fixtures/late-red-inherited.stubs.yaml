@@ -1,12 +1,9 @@
 # Dry-run fixture: CI concludes red after the
 # review converged, but the red is inherited — the branch did not cause it. The
 # convergence pass must classify it through one honest no-change round, pass
-# the gate with the caveat recorded, and carry the still-red state
-# toward the flip preflight, whose live refusal names the rerun-and-resume
-# recovery. The refusal itself is live-only: exec-code runs bash
-# for real against a real origin, so flip-ready stays stubbed and this fixture
-# pins the ROUTE — classification instead of a probe death, the gate accepting
-# the inherited cause, the re-wait exiting on the concluded state.
+# the gate with the caveat recorded, and pause with the rerun-and-resume action
+# visible. The fixture pins the route: classification instead of a probe death,
+# then one fresh check read and an action-required wait rather than flip-ready.
 impl__record-start: '{"start":"recorded"}'
 impl__implement:
   done: true
@@ -14,8 +11,8 @@ impl__implement:
   red_cause: ""
   summary: "stub: implemented and green"
 impl__assert-changed: "3 files changed"
-# gate-green, gate-validated, gate-ci-fix and gate-ci-converged are deliberately
-# unstubbed: the real gates must accept the inherited classification.
+# gate-green, gate-validated, and gate-ci-fix are deliberately unstubbed: the
+# real gates must accept the inherited classification.
 pr__pr: { number: 10, url: "https://github.com/example/repo/pull/10", head: "fixture-branch", base: "dev", is_draft: true }
 classify:
   errors: false
@@ -57,9 +54,10 @@ ci-recheck__synthesize:
   action: none
   findings_summary: "stub: no delta; prior report stands"
 fix-ci-probe: '{"state":"red","detail":"e2e-smoke (fail)"}'
-flip-ready: "https://github.com/example/repo/pull/10"
-outcome: "https://github.com/example/repo/pull/10"
+attention-ci-probe: '{"state":"red","detail":"e2e-smoke (fail)"}'
 fixture:
-  expect: completed
-  reached: [review__synthesize, gate-validated, ci-verdict, ci-fix__assert-changed, gate-ci-fix, ci-recheck__synthesize, ci-recheck-action, fix-ci-probe, flip-ready]
+  expect: paused
+  reached: [review__synthesize, gate-validated, ci-verdict, ci-fix__assert-changed, gate-ci-fix, ci-recheck__synthesize, ci-recheck-action, ci-round-result, fix-ci-probe, ci-attention-route, attention-ci-probe]
+  resolved-text-contains:
+    attention-ci-pause: "pull request #10 after Archon classified the failure as inherited: e2e-smoke (fail) Re-run the failing check, then resume this run."
 exec-code: true

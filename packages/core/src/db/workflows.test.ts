@@ -35,6 +35,7 @@ import {
   resumeWorkflowRun,
   pauseWorkflowRun,
   pauseWorkflowRunForWait,
+  failPausedAttentionWait,
   listDueWorkflowContinuations,
   deferWorkflowContinuation,
   signalWorkflowWait,
@@ -679,6 +680,83 @@ describe('workflows database', () => {
       expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
     });
 
+    test('records an action-required pause without inventing a deadline', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      const attentionWait = {
+        owner: 'node' as const,
+        nodeId: 'rerun-ci',
+        kind: 'attention' as const,
+        waitingSince: '2026-08-24T10:00:00.000Z',
+        message: 'Re-run the failing check, then resume.',
+      };
+
+      await pauseWorkflowRunForWait('workflow-run-123', attentionWait, {
+        kind: 'started',
+        stepName: 'rerun-ci',
+      });
+
+      const [, pauseParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [, eventParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+      expect(JSON.parse(pauseParams[1] as string)).toEqual(attentionWait);
+      const eventData = JSON.parse(eventParams[5] as string) as Record<string, unknown>;
+      expect(eventData).toEqual({ kind: 'attention' });
+      expect(eventData).not.toHaveProperty('resume_at');
+    });
+
+    test('fails only the exact paused attention cursor after notification loss', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      const attentionWait = {
+        owner: 'loop_group' as const,
+        nodeId: 'recover-ci',
+        bodyWaitId: 'pause',
+        iteration: 4,
+        sessionId: null,
+        sessionProvider: null,
+        kind: 'attention' as const,
+        waitingSince: '2026-08-24T10:00:00.000Z',
+        message: 'Re-run the failing check, then resume.',
+      };
+
+      await expect(
+        failPausedAttentionWait('workflow-run-123', attentionWait, 'notification lost')
+      ).resolves.toEqual({ failed: true });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("SET status = 'failed'");
+      expect(query).toContain("status = 'paused'");
+      expect(query).toContain("metadata->'wait'->>'kind' = 'attention'");
+      expect(query).toContain("metadata->'wait'->>'owner' = 'loop_group'");
+      expect(query).toContain("metadata->'wait'->>'bodyWaitId' = $5");
+      expect(query).toContain("(metadata->'wait'->>'iteration')::integer = $6");
+      expect(params).toEqual([
+        'workflow-run-123',
+        JSON.stringify({ error: 'notification lost' }),
+        'recover-ci',
+        '2026-08-24T10:00:00.000Z',
+        'pause',
+        4,
+      ]);
+      expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+    });
+
+    test('leaves a replaced attention cursor untouched', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+      const attentionWait = {
+        owner: 'node' as const,
+        nodeId: 'rerun-ci',
+        kind: 'attention' as const,
+        waitingSince: '2026-08-24T10:00:00.000Z',
+        message: 'Re-run the failing check, then resume.',
+      };
+
+      await expect(
+        failPausedAttentionWait('workflow-run-123', attentionWait, 'notification lost')
+      ).resolves.toEqual({ failed: false });
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
     test('fails the pause transaction when the wait-start audit cannot be recorded', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
       mockQuery.mockRejectedValueOnce(new Error('event insert failed'));
@@ -716,6 +794,7 @@ describe('workflows database', () => {
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain("status = 'paused'");
       expect(query).toContain("status = 'failed'");
+      expect(query).toContain("IN ('time', 'event')");
       expect(query).toContain("metadata->>'continuation_retry_at' IS NULL");
       expect(query).toContain("ORDER BY COALESCE(metadata->>'continuation_retry_at'");
       expect(params).toEqual(['2026-08-25T10:00:00.000Z', 25]);
@@ -782,6 +861,30 @@ describe('workflows database', () => {
       expect(params).toEqual(['workflow-run-123', 'await-ci', wait.resumeAt]);
       expect(mockQuery.mock.calls[1]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
       expect(mockQuery.mock.calls[2]?.[0]).toContain('INSERT INTO remote_agent_workflow_events');
+    });
+
+    test('keys action-required wait consumption to its waiting timestamp', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      const attentionWait = {
+        owner: 'node' as const,
+        nodeId: 'rerun-ci',
+        kind: 'attention' as const,
+        waitingSince: '2026-08-24T10:00:00.000Z',
+        message: 'Re-run the failing check, then resume.',
+      };
+
+      await expect(
+        clearWorkflowWaitContext('workflow-run-123', attentionWait, {
+          stepName: 'rerun-ci',
+          result: { status: 'satisfied', waited_ms: 1000 },
+        })
+      ).resolves.toEqual({ cleared: true });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("metadata->'wait'->>'waitingSince' = $3");
+      expect(params).toEqual(['workflow-run-123', 'rerun-ci', attentionWait.waitingSince]);
     });
 
     test('signals only the matching still-open event wait', async () => {
@@ -1548,6 +1651,21 @@ describe('workflows database', () => {
       const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
       expect(query).toContain('status IN ($1)');
       expect(params[0]).toBe('failed');
+    });
+
+    test('filters by the run-owned codebase', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await listWorkflowRuns({
+        status: ['running', 'paused'],
+        codebaseId: 'cb-project-a',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('status IN ($1, $2)');
+      expect(query).toContain('remote_agent_workflow_runs.codebase_id = $3');
+      expect(query).not.toContain('remote_agent_conversations');
+      expect(params).toEqual(['running', 'paused', 'cb-project-a', 50]);
     });
 
     test('returns results from query', async () => {

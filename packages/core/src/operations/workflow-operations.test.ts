@@ -1223,6 +1223,22 @@ describe('assertApprovable / assertRejectable — shared precondition gate', () 
     );
     expect(assertRejectable(withMeta(waiting))).toBeUndefined();
   });
+
+  test('an action-required wait is neither approvable nor rejectable', () => {
+    const waiting = {
+      wait: {
+        owner: 'node',
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince: '2026-08-28T10:00:00.000Z',
+        message: 'Re-run CI, then resume.',
+      },
+    };
+    for (const assertFn of [assertApprovable, assertRejectable]) {
+      expect(() => assertFn(withMeta(waiting))).toThrow('Complete it, then resume the run');
+      expect(() => assertFn(withMeta(waiting))).toThrow('abandon it');
+    }
+  });
 });
 
 describe('getWorkflowStatus', () => {
@@ -1248,6 +1264,22 @@ describe('getWorkflowStatus', () => {
     expect(mockListDashboardRuns).toHaveBeenCalledWith({
       status: ['running', 'paused'],
       limit: 50,
+    });
+  });
+
+  test('passes an explicit codebase scope to the active-run query', async () => {
+    mockListDashboardRuns.mockResolvedValueOnce({
+      runs: [],
+      total: 0,
+      counts: EMPTY_COUNTS,
+    });
+
+    await getWorkflowStatus({ codebaseId: 'cb-project-a' });
+
+    expect(mockListDashboardRuns).toHaveBeenCalledWith({
+      status: ['running', 'paused'],
+      limit: 50,
+      codebaseId: 'cb-project-a',
     });
   });
 });

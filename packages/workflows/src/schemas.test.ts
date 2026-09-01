@@ -87,6 +87,31 @@ describe('persisted workflow continuation schemas', () => {
       resumeAt: '2026-08-25T10:00:00.000Z',
     });
     expect(workflowWaitStepName(loopEvent)).toBe('release.checks');
+
+    const attention = workflowWaitContextSchema.parse({
+      owner: 'node',
+      nodeId: 'recover-ci',
+      kind: 'attention',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'Rerun CI, then resume.',
+    });
+    expect(workflowWaitStepName(attention)).toBe('recover-ci');
+    expect(
+      workflowWaitContextSchema.safeParse({ ...attention, resumeAt: timeWait.resumeAt }).success
+    ).toBe(false);
+
+    const loopAttention = workflowWaitContextSchema.parse({
+      owner: 'loop_group',
+      nodeId: 'recover',
+      bodyWaitId: 'operator',
+      iteration: 2,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'attention',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'Fix the external failure, then resume.',
+    });
+    expect(workflowWaitStepName(loopAttention)).toBe('recover.operator');
   });
 
   test('rejects quota continuations beyond their attempt or time budget', () => {
@@ -111,7 +136,7 @@ describe('persisted workflow continuation schemas', () => {
 });
 
 describe('dagNodeSchema — durable wait', () => {
-  test('normalizes duration, until, and bounded event waits', () => {
+  test('normalizes duration, until, bounded event, and attention waits', () => {
     const duration = dagNodeSchema.parse({ id: 'later', wait: { duration_ms: 5000 } });
     const until = dagNodeSchema.parse({
       id: 'clock',
@@ -121,10 +146,18 @@ describe('dagNodeSchema — durable wait', () => {
       id: 'ci',
       wait: { event: 'checks.complete', deadline_ms: 60_000 },
     });
+    const attention = dagNodeSchema.parse({
+      id: 'recover',
+      wait: { attention: '  Rerun CI, then resume.  ' },
+    });
     expect(isWaitNode(duration as DagNode)).toBe(true);
     expect((until as DagNode).kind).toBe('wait');
     expect((event as DagNode).kind).toBe('wait');
     expect((event as DagNode).output_format?.required).toEqual(['status', 'waited_ms']);
+    expect((attention as DagNode).kind).toBe('wait');
+    expect((attention as DagNode & { wait: { attention: string } }).wait.attention).toBe(
+      'Rerun CI, then resume.'
+    );
   });
 
   test('rejects ambiguous and unbounded waits', () => {
@@ -140,6 +173,15 @@ describe('dagNodeSchema — durable wait', () => {
     ).toBe(false);
     expect(
       dagNodeSchema.safeParse({ id: 'blank-event', wait: { event: '   ', deadline_ms: 1 } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({ id: 'blank-attention', wait: { attention: '   ' } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'mixed-attention',
+        wait: { attention: 'Resume me', duration_ms: 1 },
+      }).success
     ).toBe(false);
     expect(
       dagNodeSchema.safeParse({ id: 'duration', wait: { duration_ms: 1, deadline_ms: 2 } }).success
@@ -1861,6 +1903,32 @@ describe('runAttention', () => {
       expect(runAttention(run)).toBeNull();
     });
 
+    test('reports an attention wait as an explicit resume action', () => {
+      const run = {
+        id: 'run-1',
+        status: 'paused' as const,
+        metadata: {
+          wait: {
+            owner: 'loop_group' as const,
+            nodeId: 'recover-ci',
+            bodyWaitId: 'operator-action',
+            iteration: 1,
+            sessionId: null,
+            sessionProvider: null,
+            kind: 'attention' as const,
+            waitingSince: '2026-08-28T10:00:00.000Z',
+            message: 'Rerun the failing check, then resume.',
+          },
+        },
+      };
+      expect(runAttention(run)).toEqual({
+        kind: 'action_required',
+        runId: 'run-1',
+        nodeId: 'recover-ci.operator-action',
+        message: 'Rerun the failing check, then resume.',
+      });
+    });
+
     test('a resolved child_workflow gate is still nobody’s decision', () => {
       // Order matters: resolution is checked before the child redirect, so a gate
       // already resolved never re-addresses a human at the child.
@@ -1999,6 +2067,24 @@ describe('runAttention', () => {
       },
     });
     expect(attention?.kind).toBe('awaiting_response');
+  });
+
+  test('an attention wait wins over stale approval metadata', () => {
+    const attention = runAttention({
+      id: 'run-1',
+      status: 'paused',
+      metadata: {
+        approval: gate(),
+        wait: {
+          owner: 'node',
+          nodeId: 'recover',
+          kind: 'attention',
+          waitingSince: '2026-08-28T10:00:00.000Z',
+          message: 'Recover the external dependency.',
+        },
+      },
+    });
+    expect(attention?.kind).toBe('action_required');
   });
 
   test('an absent metadata bag on a paused run is unreadable, not silence', () => {

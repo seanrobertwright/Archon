@@ -184,6 +184,16 @@ describe('buildRunManagementSection', () => {
     expect(section).toContain('state-only cancellation');
   });
 
+  test('states the status fallback without weakening the non-repository boundary', () => {
+    const section = buildRunManagementSection();
+
+    expect(section).toContain('unregistered git checkout');
+    expect(section).toContain('install-wide active runs');
+    expect(section).toContain('scopeFallback: true');
+    expect(section).toContain('non-repo path');
+    expect(section).toContain('Not in a git repository');
+  });
+
   test('tells the CLI-path providers to pass the user’s own words', () => {
     // Codex/OpenCode/Copilot reach the verbs only through this section — without
     // the clause they get less instruction density than Claude/Pi, which also see
@@ -386,5 +396,31 @@ describe('formatPausedGateSection', () => {
     });
 
     expect(section).toBe('');
+  });
+
+  test('describes an action-required wait without offering approval verbs', () => {
+    const section = formatPausedGateSection({
+      run: {
+        id: 'run-abc',
+        workflow_name: 'deliver',
+        status: 'paused',
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'rerun-ci',
+            kind: 'attention',
+            waitingSince: '2026-08-28T10:00:00.000Z',
+            message: 'Re-run the windows check, then resume.',
+          },
+        },
+      },
+    });
+
+    expect(section).toContain('## Paused action required');
+    expect(section).toContain('Re-run the windows check, then resume.');
+    expect(section).toContain('archon workflow resume run-abc');
+    expect(section).toContain('Abandon it');
+    expect(section).not.toContain('Paused Approval Gate');
+    expect(section).not.toContain('/workflow approve');
   });
 });

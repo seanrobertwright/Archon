@@ -5,9 +5,15 @@ import { join, sep } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { DashboardWorkflowRun } from '@archon/core/db/workflows';
+import type { resolveRunContinuation } from '@archon/core/handlers';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import { makeTestResolvedWorkflow } from '@archon/workflows/test-utils';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
+import {
+  dashboardWorkflowRunSchema as apiDashboardWorkflowRunSchema,
+  workflowRunSchema as apiWorkflowRunSchema,
+} from './schemas/workflow.schemas';
 import {
   makeDashboardRunsResult,
   makeListDashboardRunsMock,
@@ -87,6 +93,38 @@ type MockWorkflowEvent = {
   data: Record<string, unknown>;
   created_at: string;
 };
+
+describe('workflow run API wait metadata', () => {
+  const attentionWait = {
+    owner: 'loop_group' as const,
+    nodeId: 'recover-ci',
+    bodyWaitId: 'pause',
+    iteration: 14,
+    sessionId: null,
+    sessionProvider: null,
+    kind: 'attention' as const,
+    waitingSince: '2026-08-31T10:00:00.000Z',
+    message: 'Re-run CI, then resume.',
+  };
+
+  test('projects the engine wait union through regular and dashboard run metadata', () => {
+    const metadata = { wait: attentionWait, custom: 'preserved' };
+
+    expect(apiWorkflowRunSchema.shape.metadata.parse(metadata)).toEqual(metadata);
+    expect(apiDashboardWorkflowRunSchema.shape.metadata.parse(metadata)).toEqual(metadata);
+  });
+
+  test('rejects a malformed projected wait while leaving unrelated metadata open-ended', () => {
+    expect(
+      apiWorkflowRunSchema.shape.metadata.safeParse({
+        wait: { ...attentionWait, waitingSince: undefined },
+      }).success
+    ).toBe(false);
+    expect(apiWorkflowRunSchema.shape.metadata.parse({ custom: { nested: true } })).toEqual({
+      custom: { nested: true },
+    });
+  });
+});
 
 // resumeRunHeadless (#2008) — stubbed so a future change to it or its
 // neighbors can't silently start touching the real workflow store or the
@@ -350,14 +388,12 @@ mock.module('@archon/core/utils/commands', () => ({
 
 // resumeRunHeadless (#2008) — the direct in-process resume fallback used when
 // a run has no parent conversation to dispatch a chat message through.
-type MockContinuationResult =
-  | { ok: true; workflowName: string; workflow: { definition: unknown } }
-  | { ok: false; message: string };
+type RunContinuationResult = Awaited<ReturnType<typeof resolveRunContinuation>>;
 const mockResolveRunContinuation = mock(
-  async (_runId: string, _cwd: string): Promise<MockContinuationResult> => ({
+  async (_runId: string, _cwd: string): Promise<RunContinuationResult> => ({
     ok: true,
     workflowName: 'deploy',
-    workflow: { definition: { name: 'deploy', nodes: [] } },
+    workflow: { definition: makeTestResolvedWorkflow({ name: 'deploy' }), args: '' },
   })
 );
 mock.module('@archon/core/handlers', () => ({
@@ -2163,6 +2199,49 @@ const MOCK_PAUSED_RUN: MockWorkflowRun = {
     },
   },
 };
+
+describe('action-required pause gate routes', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
+  });
+
+  for (const [verb, body] of [
+    ['approve', {}],
+    ['reject', { reason: 'no' }],
+    ['respond', { decision: 'approve' }],
+  ] as const) {
+    test(`${verb} directs the operator to resume or abandon instead`, async () => {
+      mockGetWorkflowRun.mockResolvedValueOnce({
+        ...MOCK_PAUSED_RUN,
+        id: 'run-action-required',
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'rerun-ci',
+            kind: 'attention',
+            waitingSince: '2026-08-24T10:00:00.000Z',
+            message: 'Re-run CI, then resume.',
+          },
+        },
+      });
+      const { app } = makeApp();
+      const response = await app.request(`/api/workflows/runs/run-action-required/${verb}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      expect(response.status).toBe(400);
+      const result = (await response.json()) as { error?: string };
+      expect(result.error).toContain('resume');
+      expect(result.error).toContain('abandon');
+      expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+      expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
+    });
+  }
+});
 
 describe('POST /api/workflows/runs/:runId/approve', () => {
   beforeEach(() => {
