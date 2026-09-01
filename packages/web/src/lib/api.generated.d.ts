@@ -3855,9 +3855,7 @@ export interface components {
       /** @enum {string|null} */
       outcome: 'succeeded' | 'failed' | null;
       user_message: string;
-      metadata: {
-        [key: string]: unknown;
-      };
+      metadata: components['schemas']['WorkflowRunMetadata'];
       started_at: string;
       completed_at: string | null;
       last_activity_at: string | null;
@@ -3878,6 +3876,96 @@ export interface components {
       agents_failed: number | null;
       agents_total: number | null;
     };
+    WorkflowRunMetadata: {
+      wait?: components['schemas']['WorkflowWaitContext'];
+    } & {
+      [key: string]: unknown;
+    };
+    WorkflowWaitContext:
+      | {
+          /** @enum {string} */
+          owner: 'node';
+          nodeId: string;
+          /** @enum {string} */
+          kind: 'time';
+          /** Format: date-time */
+          waitingSince: string;
+          /** Format: date-time */
+          resumeAt: string;
+        }
+      | {
+          /** @enum {string} */
+          owner: 'node';
+          nodeId: string;
+          /** @enum {string} */
+          kind: 'event';
+          /** Format: date-time */
+          waitingSince: string;
+          /** Format: date-time */
+          resumeAt: string;
+          event: string;
+          /** Format: date-time */
+          signaledAt?: string;
+          payload?: unknown;
+        }
+      | {
+          /** @enum {string} */
+          owner: 'node';
+          nodeId: string;
+          /** @enum {string} */
+          kind: 'attention';
+          /** Format: date-time */
+          waitingSince: string;
+          message: string;
+        }
+      | {
+          /** @enum {string} */
+          owner: 'loop_group';
+          nodeId: string;
+          bodyWaitId: string;
+          iteration: number;
+          sessionId: string | null;
+          sessionProvider: string | null;
+          /** @enum {string} */
+          kind: 'time';
+          /** Format: date-time */
+          waitingSince: string;
+          /** Format: date-time */
+          resumeAt: string;
+        }
+      | {
+          /** @enum {string} */
+          owner: 'loop_group';
+          nodeId: string;
+          bodyWaitId: string;
+          iteration: number;
+          sessionId: string | null;
+          sessionProvider: string | null;
+          /** @enum {string} */
+          kind: 'event';
+          /** Format: date-time */
+          waitingSince: string;
+          /** Format: date-time */
+          resumeAt: string;
+          event: string;
+          /** Format: date-time */
+          signaledAt?: string;
+          payload?: unknown;
+        }
+      | {
+          /** @enum {string} */
+          owner: 'loop_group';
+          nodeId: string;
+          bodyWaitId: string;
+          iteration: number;
+          sessionId: string | null;
+          sessionProvider: string | null;
+          /** @enum {string} */
+          kind: 'attention';
+          /** Format: date-time */
+          waitingSince: string;
+          message: string;
+        };
     CancelWorkflowRunResponse: {
       success: boolean;
       message: string;
@@ -3913,9 +4001,7 @@ export interface components {
       status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'paused';
       outcome: components['schemas']['WorkflowRunOutcome'];
       user_message: string;
-      metadata: {
-        [key: string]: unknown;
-      };
+      metadata: components['schemas']['WorkflowRunMetadata'];
       started_at: string;
       completed_at: string | null;
       last_activity_at: string | null;

@@ -22,12 +22,6 @@ interface WorkflowProgressCardProps {
   workerConversationId: string;
 }
 
-function readAttentionMessage(value: unknown): string | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const wait = value as Record<string, unknown>;
-  return wait.kind === 'attention' && typeof wait.message === 'string' ? wait.message : null;
-}
-
 export function WorkflowProgressCard({
   workflowName,
   workerConversationId,
@@ -60,7 +54,8 @@ export function WorkflowProgressCard({
   const dagNodes: DagNodeState[] = liveState?.dagNodes ?? [];
   const currentTool = liveState?.currentTool ?? null;
   const approval = liveState?.approval ?? null;
-  const attentionMessage = readAttentionMessage(runData?.run?.metadata?.wait);
+  const wait = runData?.run?.metadata.wait;
+  const attentionMessage = wait?.kind === 'attention' ? wait.message : null;
   const error = liveState?.error;
   const startedAt = liveState?.startedAt;
 

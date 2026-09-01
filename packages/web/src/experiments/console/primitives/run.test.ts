@@ -367,6 +367,7 @@ describe('toRun — durable wait', () => {
             owner: 'node',
             nodeId: 'checks',
             kind: 'event',
+            waitingSince: '2026-08-25T09:00:00.000Z',
             event: 'checks.complete',
             resumeAt: '2026-08-25T10:00:00.000Z',
           },
@@ -392,8 +393,12 @@ describe('toRun — durable wait', () => {
         metadata: {
           approval: { nodeId: 'old-gate', message: 'Stale approval' },
           wait: {
-            owner: 'node',
-            nodeId: 'rerun-ci',
+            owner: 'loop_group',
+            nodeId: 'recover-ci',
+            bodyWaitId: 'pause',
+            iteration: 14,
+            sessionId: null,
+            sessionProvider: null,
             kind: 'attention',
             waitingSince: '2026-08-25T10:00:00.000Z',
             message: 'Re-run CI, then resume.',
@@ -403,7 +408,7 @@ describe('toRun — durable wait', () => {
     );
 
     expect(r.wait).toEqual({
-      nodeId: 'rerun-ci',
+      nodeId: 'recover-ci.pause',
       kind: 'attention',
       message: 'Re-run CI, then resume.',
     });

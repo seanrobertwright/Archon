@@ -3,6 +3,7 @@ import type { components } from '@/lib/api.generated';
 
 export type RunOrigin = 'web' | 'cli' | 'slack' | 'telegram' | 'discord' | 'github' | 'unknown';
 export type RunOutcome = components['schemas']['WorkflowRunOutcome'];
+type WorkflowRunMetadata = components['schemas']['WorkflowRunMetadata'];
 
 export interface Run {
   id: string;
@@ -104,7 +105,7 @@ interface RawWorkflowRun {
   completed_at?: string | null;
   working_path?: string | null;
   user_message?: string;
-  metadata?: Record<string, unknown>;
+  metadata?: WorkflowRunMetadata;
   /** Only present on dashboard runs — enriched by server-side join. */
   codebase_name?: string | null;
   platform_type?: string | null;
@@ -143,7 +144,7 @@ export function normalizeOrigin(s: string | null | undefined): RunOrigin {
   }
 }
 
-function readCost(meta: Record<string, unknown> | undefined): number | null {
+function readCost(meta: WorkflowRunMetadata | undefined): number | null {
   if (meta === undefined) return null;
   const raw = meta.total_cost_usd;
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
@@ -206,34 +207,21 @@ export function toRun(raw: RawWorkflowRun): Run {
         }
       : null;
   const wait = raw.metadata?.wait;
-  const waitRecord =
-    wait !== null && typeof wait === 'object' && wait !== undefined
-      ? (wait as Record<string, unknown>)
-      : undefined;
-  const isScheduledWaitShape =
-    waitRecord !== undefined &&
-    typeof waitRecord.nodeId === 'string' &&
-    typeof waitRecord.resumeAt === 'string' &&
-    (waitRecord.kind === 'time' || waitRecord.kind === 'event');
-  const isAttentionWaitShape =
-    waitRecord !== undefined &&
-    typeof waitRecord.nodeId === 'string' &&
-    waitRecord.kind === 'attention' &&
-    typeof waitRecord.message === 'string';
-  const parsedWait = isScheduledWaitShape
-    ? {
-        nodeId: waitRecord.nodeId as string,
-        kind: waitRecord.kind as 'time' | 'event',
-        resumeAt: waitRecord.resumeAt as string,
-        ...(typeof waitRecord.event === 'string' ? { event: waitRecord.event } : {}),
-      }
-    : isAttentionWaitShape
-      ? {
-          nodeId: waitRecord.nodeId as string,
-          kind: 'attention' as const,
-          message: waitRecord.message as string,
-        }
-      : null;
+  const parsedWait =
+    wait === undefined
+      ? null
+      : wait.kind === 'attention'
+        ? {
+            nodeId: wait.owner === 'loop_group' ? `${wait.nodeId}.${wait.bodyWaitId}` : wait.nodeId,
+            kind: wait.kind,
+            message: wait.message,
+          }
+        : {
+            nodeId: wait.owner === 'loop_group' ? `${wait.nodeId}.${wait.bodyWaitId}` : wait.nodeId,
+            kind: wait.kind,
+            resumeAt: wait.resumeAt,
+            ...(wait.kind === 'event' ? { event: wait.event } : {}),
+          };
 
   return {
     id: raw.id,

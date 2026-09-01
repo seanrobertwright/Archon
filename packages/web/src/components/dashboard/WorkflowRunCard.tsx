@@ -115,37 +115,10 @@ function isValidNodeCounts(value: unknown): value is NodeCounts {
   );
 }
 
-type WaitMetadata =
-  | {
-      kind: 'time' | 'event';
-      resumeAt: string;
-      event?: string;
-    }
-  | {
-      kind: 'attention';
-      message: string;
-    };
-
 interface ScheduledResumeMetadata {
   resumeAt: string;
   attempt: number;
   maxAttempts: number;
-}
-
-function readWaitMetadata(value: unknown): WaitMetadata | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const wait = value as Record<string, unknown>;
-  if (wait.kind === 'attention' && typeof wait.message === 'string') {
-    return { kind: 'attention', message: wait.message };
-  }
-  if ((wait.kind !== 'time' && wait.kind !== 'event') || typeof wait.resumeAt !== 'string') {
-    return null;
-  }
-  return {
-    kind: wait.kind,
-    resumeAt: wait.resumeAt,
-    ...(typeof wait.event === 'string' ? { event: wait.event } : {}),
-  };
 }
 
 function readScheduledResumeMetadata(value: unknown): ScheduledResumeMetadata | null {
@@ -229,9 +202,9 @@ export function WorkflowRunCard({
       ? run.user_message
       : run.user_message.slice(0, 80) + '…'
     : null;
-  const wait = readWaitMetadata(run.metadata?.wait);
+  const wait = run.metadata.wait;
   const scheduledResume = readScheduledResumeMetadata(run.metadata?.scheduled_resume);
-  const hasApproval = wait === null && hasApprovalMetadata(run.metadata?.approval);
+  const hasApproval = wait === undefined && hasApprovalMetadata(run.metadata?.approval);
 
   return (
     <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
@@ -330,7 +303,7 @@ export function WorkflowRunCard({
         </div>
       )}
 
-      {run.status === 'paused' && wait !== null && (
+      {run.status === 'paused' && wait !== undefined && (
         <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
           <Pause className="h-4 w-4 text-warning shrink-0 mt-0.5" />
           <p className="text-xs text-text-secondary">

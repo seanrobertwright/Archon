@@ -9,6 +9,10 @@ import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 import {
+  dashboardWorkflowRunSchema as apiDashboardWorkflowRunSchema,
+  workflowRunSchema as apiWorkflowRunSchema,
+} from './schemas/workflow.schemas';
+import {
   makeDashboardRunsResult,
   makeListDashboardRunsMock,
   mockAllWorkflowModules,
@@ -87,6 +91,38 @@ type MockWorkflowEvent = {
   data: Record<string, unknown>;
   created_at: string;
 };
+
+describe('workflow run API wait metadata', () => {
+  const attentionWait = {
+    owner: 'loop_group' as const,
+    nodeId: 'recover-ci',
+    bodyWaitId: 'pause',
+    iteration: 14,
+    sessionId: null,
+    sessionProvider: null,
+    kind: 'attention' as const,
+    waitingSince: '2026-08-31T10:00:00.000Z',
+    message: 'Re-run CI, then resume.',
+  };
+
+  test('projects the engine wait union through regular and dashboard run metadata', () => {
+    const metadata = { wait: attentionWait, custom: 'preserved' };
+
+    expect(apiWorkflowRunSchema.shape.metadata.parse(metadata)).toEqual(metadata);
+    expect(apiDashboardWorkflowRunSchema.shape.metadata.parse(metadata)).toEqual(metadata);
+  });
+
+  test('rejects a malformed projected wait while leaving unrelated metadata open-ended', () => {
+    expect(
+      apiWorkflowRunSchema.shape.metadata.safeParse({
+        wait: { ...attentionWait, waitingSince: undefined },
+      }).success
+    ).toBe(false);
+    expect(apiWorkflowRunSchema.shape.metadata.parse({ custom: { nested: true } })).toEqual({
+      custom: { nested: true },
+    });
+  });
+});
 
 // resumeRunHeadless (#2008) — stubbed so a future change to it or its
 // neighbors can't silently start touching the real workflow store or the

@@ -28983,7 +28983,8 @@ function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
 
 function attentionTerminatedLoopGroupWorkflow(
   probeCountPath: string,
-  greenMarkerPath: string
+  greenMarkerPath: string,
+  maxIterations = 2
 ): WorkflowDefinition {
   return {
     name: 'attention-terminated-loop-group',
@@ -28993,7 +28994,7 @@ function attentionTerminatedLoopGroupWorkflow(
         id: 'grp',
         loop_group: {
           until_bash: 'test $probe.output.state = "concluded"',
-          max_iterations: 2,
+          max_iterations: maxIterations,
           nodes: [
             {
               id: 'probe',
@@ -29291,6 +29292,55 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
           nodeId: 'grp',
           bodyWaitId: 'pause',
           iteration: 2,
+          kind: 'attention',
+        },
+      },
+    });
+  });
+
+  it('keeps an action-required loop resumable beyond its autonomous iteration bound', async () => {
+    const probeCountPath = join(testDir, 'attention-unbounded-probe-count');
+    const greenMarkerPath = join(testDir, 'attention-unbounded-green-marker');
+    const workflow = ready(
+      attentionTerminatedLoopGroupWorkflow(probeCountPath, greenMarkerPath, 13)
+    );
+    const thirteenthWait: WorkflowWaitContext = {
+      owner: 'loop_group',
+      nodeId: 'grp',
+      bodyWaitId: 'pause',
+      iteration: 13,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'attention',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'windows tests failed Re-run the check, then resume.',
+    };
+    const store = createEscalationStore('run-attention-unbounded');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun('run-attention-unbounded', {
+          metadata: { wait: thirteenthWait },
+        }),
+        priorCompletedNodes: new Map([
+          ['grp.probe', { output: '{"state":"red","detail":"windows tests failed"}' }],
+        ]),
+      })
+    );
+
+    expect(await Bun.file(probeCountPath).text()).toBe('1');
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.getState()).toMatchObject({
+      status: 'paused',
+      metadata: {
+        wait: {
+          owner: 'loop_group',
+          nodeId: 'grp',
+          bodyWaitId: 'pause',
+          iteration: 14,
           kind: 'attention',
         },
       },

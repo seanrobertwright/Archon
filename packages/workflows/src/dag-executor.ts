@@ -4475,6 +4475,13 @@ async function executeLoopGroupNode(
     isLegacyInteractiveLoopResume || isEscalatedGateResume || isEscalatedWaitResume;
   const resumeIteration = loopGateMeta?.iteration ?? loopOwnedWaitMeta?.iteration ?? 0;
   const startIteration = isLoopResume ? resumeIteration + 1 : 1;
+  // max_iterations bounds autonomous work. An attention wait contributes no work while
+  // paused, so each explicit resume authorizes one fresh iteration even after that bound.
+  // This keeps manual recovery resumable without turning a concluded-red wait into polling.
+  const iterationLimit =
+    isEscalatedWaitResume && loopOwnedWaitMeta?.kind === 'attention'
+      ? Math.max(group.max_iterations, startIteration)
+      : group.max_iterations;
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLegacyInteractiveLoopResume
     ? (loopGateRunMeta.loop_user_input ?? '')
@@ -4775,7 +4782,7 @@ async function executeLoopGroupNode(
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_group_node.iteration_event_failed');
   };
 
-  for (let i = startIteration; i <= group.max_iterations; i++) {
+  for (let i = startIteration; i <= iterationLimit; i++) {
     const iterationStart = Date.now();
 
     // Between-iteration status check (paused tolerated — mirrors executeLoopNode).
@@ -4801,14 +4808,14 @@ async function executeLoopGroupNode(
       runId: workflowRun.id,
       nodeId: node.id,
       iteration: i,
-      maxIterations: group.max_iterations,
+      maxIterations: iterationLimit,
     });
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'loop_iteration_started',
         step_name: stepName,
-        data: { iteration: i, maxIterations: group.max_iterations, nodeId: node.id },
+        data: { iteration: i, maxIterations: iterationLimit, nodeId: node.id },
       })
       .catch((err: Error) => {
         logEventStoreError(err, i);
@@ -5356,9 +5363,9 @@ async function executeLoopGroupNode(
   }
 
   // Max iterations exceeded.
-  const errorMsg = `Loop-group node '${node.id}' exceeded max iterations (${String(group.max_iterations)}) ${describeUnmetCompletion(group)}`;
+  const errorMsg = `Loop-group node '${node.id}' exceeded max iterations (${String(iterationLimit)}) ${describeUnmetCompletion(group)}`;
   getLog().warn(
-    { nodeId: node.id, maxIterations: group.max_iterations, signal: group.until },
+    { nodeId: node.id, maxIterations: iterationLimit, signal: group.until },
     'loop_group_node.max_iterations_reached'
   );
   await safeSendMessage(platform, conversationId, errorMsg, msgContext);
@@ -5368,7 +5375,7 @@ async function executeLoopGroupNode(
     error: errorMsg,
     costUsd: loopTotalCostUsd,
     ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
-    loopIterations: group.max_iterations,
+    loopIterations: iterationLimit,
   };
 }
 
