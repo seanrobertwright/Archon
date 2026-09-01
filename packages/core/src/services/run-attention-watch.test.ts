@@ -194,7 +194,7 @@ describe('waitForRunAttention', () => {
     });
   });
 
-  test('an action-required wait wakes with its message and explicit resume action', async () => {
+  test('an action-required wait wakes with its authored message', async () => {
     putRun('r1', {
       status: 'paused',
       metadata: {
@@ -215,7 +215,6 @@ describe('waitForRunAttention', () => {
         runId: 'r1',
         nodeId: 'rerun-ci',
         message: 'Rerun the failed check.',
-        action: 'resume',
       },
     });
   });

@@ -1926,7 +1926,6 @@ describe('runAttention', () => {
         runId: 'run-1',
         nodeId: 'recover-ci.operator-action',
         message: 'Rerun the failing check, then resume.',
-        action: 'resume',
       });
     });
 

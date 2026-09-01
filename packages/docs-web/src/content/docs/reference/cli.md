@@ -535,8 +535,9 @@ The response a gate is waiting for does not have to come from a person. An
 orchestrating agent can supply it with `workflow respond` just as a reviewer can; the
 engine only reports that one is owed, and who answers is the waiting host's business.
 For an action-required wait, the output carries `attention.kind: "action_required"`,
-the authored message, and `action: "resume"`. Complete the action, then run
-`archon workflow resume <run-id>`; use `workflow abandon` if the run should not continue.
+the authored message, and the paused node id. Complete the action, then run
+`archon workflow resume <run-id>`; use `archon workflow abandon <run-id>` if the run
+should not continue.
 
 ```bash
 archon workflow wait <run-id>
@@ -574,6 +575,8 @@ exit code would make a legitimately cancelled run look like a broken command.
   a parent blocked on a `workflow:` sub-run wakes when the chain below it reaches a gate,
   and `respondTo.runId` is the child you answer. A parent blocked on a child that is
   merely still running wakes nobody.
+- `action_required` — the run needs the outside action described by `message`. Once it is
+  complete, resume `runId`; use the node id to identify the paused workflow step.
 - `unreadable` — the run is parked but cannot describe itself (corrupt gate metadata, a
   gate type this build does not know, a sub-run pointer with no row). `detail` says which.
 

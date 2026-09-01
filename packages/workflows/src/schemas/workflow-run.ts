@@ -781,7 +781,6 @@ export type RunAttention =
       runId: string;
       nodeId: string;
       message: string;
-      action: 'resume';
     }
   | { kind: 'blocked_on_child'; runId: string; childRunId: string; nodeId: string }
   | { kind: 'unreadable'; runId: string; reason: RunAttentionUnreadableReason; detail: string };
@@ -829,7 +828,6 @@ export function runAttention(run: RunAttentionInput): RunAttention | null {
       runId: run.id,
       nodeId: workflowWaitStepName(wait),
       message: wait.message,
-      action: 'resume',
     };
   }
 

@@ -11091,7 +11091,6 @@ describe('workflowWaitCommand', () => {
         runId: FULL_ID,
         nodeId: 'rerun-ci',
         message: 'Re-run CI, then resume.',
-        action: 'resume',
       },
     });
 

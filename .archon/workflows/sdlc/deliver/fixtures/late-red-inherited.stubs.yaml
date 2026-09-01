@@ -59,5 +59,5 @@ fixture:
   expect: paused
   reached: [review__synthesize, gate-validated, ci-verdict, ci-fix__assert-changed, gate-ci-fix, ci-recheck__synthesize, ci-recheck-action, ci-round-result, fix-ci-probe, ci-attention-route, attention-ci-probe]
   resolved-text-contains:
-    attention-ci-pause: "e2e-smoke (fail) Re-run the failing check, then resume this run."
+    attention-ci-pause: "pull request #10 after Archon classified the failure as inherited: e2e-smoke (fail) Re-run the failing check, then resume this run."
 exec-code: true
