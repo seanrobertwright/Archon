@@ -550,7 +550,7 @@ describe('workflow status arguments', () => {
 });
 
 describe('workflow status project scope', () => {
-  it('returns this project by default and every project with --all', async () => {
+  it('uses the run-owned project after its conversation moves and returns every project with --all', async () => {
     const scratch = mkdtempSync(join(tmpdir(), 'archon-cli-status-scope-'));
     const archonHome = join(scratch, 'home');
     const projectA = join(scratch, 'project-a');
@@ -621,6 +621,9 @@ describe('workflow status project scope', () => {
           'test',
           'paused'
         );
+        database
+          .prepare('UPDATE remote_agent_conversations SET codebase_id = ? WHERE id = ?')
+          .run('codebase-b', 'conversation-a');
       } finally {
         database.close();
       }
@@ -637,6 +640,22 @@ describe('workflow status project scope', () => {
       };
       expect(scopedJson.scopeFallback).toBe(false);
       expect(scopedJson.runs.map(run => run.workflow_name)).toEqual(['project-a-work']);
+
+      const otherProject = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--json', '--cwd', projectB],
+        { cwd: projectB, env, encoding: 'utf8' }
+      );
+      expect({ status: otherProject.status, stderr: otherProject.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+      const otherProjectJson = JSON.parse(otherProject.stdout) as {
+        scopeFallback: boolean;
+        runs: Array<{ workflow_name: string }>;
+      };
+      expect(otherProjectJson.scopeFallback).toBe(false);
+      expect(otherProjectJson.runs.map(run => run.workflow_name)).toEqual(['project-b-work']);
 
       const global = spawnSync(
         process.execPath,

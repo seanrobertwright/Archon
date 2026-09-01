@@ -379,7 +379,7 @@ export function buildRunManagementSection(): string {
 
 You can inspect and control this project's workflow runs directly via the \`archon\` CLI (bash) — you do NOT need to invoke a workflow for run management. Add \`--json\` to any command for a single clean, machine-readable line.
 
-Run these from within the project's git repo (any subdirectory works — they resolve to the repo root, which also scopes \`runs\` and \`status\` to this project). They fail with "Not in a git repository" if the working directory is \`~/.archon/workspaces/\` or another non-repo path.
+Run these from within the project's git repo (any subdirectory works — they resolve to the repo root, which also scopes \`runs\` and \`status\` to this project). In an unregistered git checkout, \`workflow status\` falls back to install-wide active runs and reports \`scopeFallback: true\` in JSON. A non-repo path such as \`~/.archon/workspaces/\` still fails with "Not in a git repository".
 
 - \`archon workflow runs [--json]\` — recent runs of ALL statuses for this project
 - \`archon workflow get <run-id> [--json]\` — one run's status/error (add \`--verbose\` for per-node detail)

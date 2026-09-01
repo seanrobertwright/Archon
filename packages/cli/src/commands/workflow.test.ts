@@ -4161,18 +4161,25 @@ describe('workflowStatusCommand', () => {
     expect(consoleSpy).toHaveBeenCalledWith('No active workflows.');
   });
 
-  it('flags a failed project lookup when JSON falls back to install-wide active runs', async () => {
+  it('flags and announces a failed project lookup fallback', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const codebaseDb = await import('@archon/core/db/codebases');
-    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockRejectedValueOnce(
-      new Error('lookup unavailable')
-    );
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockRejectedValueOnce(new Error('lookup unavailable'))
+      .mockRejectedValueOnce(new Error('lookup unavailable'));
+    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
 
     await workflowStatusCommand('/workspace/project-a', { json: true });
 
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { scopeFallback: boolean };
     expect(parsed.scopeFallback).toBe(true);
+
+    await workflowStatusCommand('/workspace/project-a');
+
+    expect(consoleSpy).toHaveBeenCalledWith('(not a registered project — showing all runs)');
+    expect(consoleSpy).toHaveBeenCalledWith('No active workflows.');
   });
 
   it('fetches verbose raw events only for runs selected by the project scope', async () => {
