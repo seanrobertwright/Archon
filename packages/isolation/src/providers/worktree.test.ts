@@ -984,6 +984,103 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('retries same-repo PR fetch on transient ref-lock race and both calls succeed', async () => {
+      // Mirrors syncWorkspace's race-recovery path: two concurrent same-repo PR
+      // launches race on the shared remote-tracking ref. The first fetch
+      // attempt for each call fails with the lock-race error; the retry loop
+      // must absorb it so both launches succeed.
+      const raceError = new Error(
+        "error: cannot lock ref 'refs/remotes/origin/feature/auth': is at de581e24 but expected 8eaa8d42\n" +
+          '! 8eaa8d420..de581e24b feature/auth -> origin/feature/auth (unable to update local ref)'
+      );
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.includes('feature/auth')) {
+          fetchCalls++;
+          if (fetchCalls <= 2) throw raceError;
+          return { stdout: '', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: false,
+      };
+
+      await Promise.all([provider.create(request), provider.create(request)]);
+
+      // Both launches succeeded past the fetch race; retry absorbed it.
+      expect(fetchCalls).toBeGreaterThan(2);
+    });
+
+    test('throws after exhausting retry budget on persistent same-repo PR fetch lock-race error', async () => {
+      // When every same-repo PR fetch attempt fails with the lock-race error,
+      // the launch must throw after 4 total attempts (1 initial + 3 retries)
+      // and never reach the worktree add step.
+      const raceError = new Error(
+        "error: cannot lock ref 'refs/remotes/origin/feature/auth': is at de581e24 but expected 8eaa8d42\n" +
+          '! 8eaa8d420..de581e24b feature/auth -> origin/feature/auth (unable to update local ref)'
+      );
+      let fetchCalls = 0;
+      let worktreeAddCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.includes('feature/auth')) {
+          fetchCalls++;
+          throw raceError;
+        }
+        if (args.includes('worktree') && args.includes('add')) worktreeAddCalls++;
+        return { stdout: '', stderr: '' };
+      });
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: false,
+      };
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42'
+      );
+
+      expect(fetchCalls).toBe(4); // 1 initial + 3 retries
+      // Failed launch must fail before any estate (worktree) is created.
+      expect(worktreeAddCalls).toBe(0);
+    });
+
+    test('does not retry non-race same-repo PR fetch errors', async () => {
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.includes('feature/auth')) {
+          fetchCalls++;
+          throw new Error("fatal: 'origin' does not appear to be a git repository");
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: false,
+      };
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42'
+      );
+
+      expect(fetchCalls).toBe(1);
+    });
+
     test('throws error if PR fetch fails (fork PR)', async () => {
       const request: IsolationRequest = {
         ...baseRequest,
