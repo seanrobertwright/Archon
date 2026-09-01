@@ -5,7 +5,9 @@ import { join, sep } from 'path';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { DashboardWorkflowRun } from '@archon/core/db/workflows';
+import type { resolveRunContinuation } from '@archon/core/handlers';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import { makeTestResolvedWorkflow } from '@archon/workflows/test-utils';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
 import {
@@ -350,14 +352,12 @@ mock.module('@archon/core/utils/commands', () => ({
 
 // resumeRunHeadless (#2008) — the direct in-process resume fallback used when
 // a run has no parent conversation to dispatch a chat message through.
-type MockContinuationResult =
-  | { ok: true; workflowName: string; workflow: { definition: unknown } }
-  | { ok: false; message: string };
+type RunContinuationResult = Awaited<ReturnType<typeof resolveRunContinuation>>;
 const mockResolveRunContinuation = mock(
-  async (_runId: string, _cwd: string): Promise<MockContinuationResult> => ({
+  async (_runId: string, _cwd: string): Promise<RunContinuationResult> => ({
     ok: true,
     workflowName: 'deploy',
-    workflow: { definition: { name: 'deploy', nodes: [] } },
+    workflow: { definition: makeTestResolvedWorkflow({ name: 'deploy' }), args: '' },
   })
 );
 mock.module('@archon/core/handlers', () => ({
