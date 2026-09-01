@@ -570,7 +570,9 @@ async function resolveIncludeBlockCommandContents(
  */
 export async function resolveWorkflowCommandContents(
   roots: WorkflowSourceRoots,
-  workflows: readonly WorkflowDefinition[]
+  workflows: readonly {
+    readonly nodes: readonly (DagNode | IncludeDirective)[];
+  }[]
 ): Promise<Map<string, IncludeCommandContent>> {
   const contents = new Map<string, IncludeCommandContent>();
   for (const workflow of workflows) {

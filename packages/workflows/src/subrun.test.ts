@@ -117,7 +117,7 @@ import { validateWorkflowResources } from './validator';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowRun } from './schemas/workflow-run';
-import type { WorkflowDefinition } from './schemas/workflow';
+import type { ResolvedWorkflow } from './schemas/workflow';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 import type {
   ChildIsolationResolver,
@@ -466,7 +466,6 @@ function makeProvider() {
       envInjection: true,
       costControl: true,
       effortControl: true,
-      thinkingControl: true,
       fallbackModel: true,
       sandbox: true,
     }),
@@ -587,7 +586,7 @@ describe('workflow: sub-run e2e (#2121 Phase 2)', () => {
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -4192,7 +4191,7 @@ describe('workflow: late resolution is a deliberate affordance', () => {
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -4704,7 +4703,7 @@ describe('workflow: declared input contract at runtime (#2470)', () => {
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -4956,7 +4955,7 @@ describe('workflow: runtime $INPUTS delivery and cold resume (#2470)', () => {
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -5435,7 +5434,7 @@ describe('workflow: returns rebinds the child terminal output (#2470)', () => {
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -5589,7 +5588,7 @@ describe('workflow: typed value transport (#2637)', () => {
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -6222,7 +6221,7 @@ describe('sub-run staged capture is reclaimed when the recursive rename fails (#
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -6313,7 +6312,7 @@ describe("a child's terminal status write fails during setup (#2910)", () => {
     await writeFile(join(cwd, '.archon', 'workflows', `${name}.yaml`), yaml);
   }
 
-  async function discover(name: string): Promise<WorkflowDefinition> {
+  async function discover(name: string): Promise<ResolvedWorkflow> {
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
     const wf = result.workflows.find(w => w.workflow.name === name);
     if (!wf) throw new Error(`workflow ${name} not found: ${JSON.stringify(result.errors)}`);
@@ -6332,7 +6331,7 @@ describe("a child's terminal status write fails during setup (#2910)", () => {
     else process.env.ARCHON_HOME = originalArchonHome;
   });
 
-  async function writeSubRunPair(): Promise<WorkflowDefinition> {
+  async function writeSubRunPair(): Promise<ResolvedWorkflow> {
     await writeWorkflow(
       'child-setup-write',
       `

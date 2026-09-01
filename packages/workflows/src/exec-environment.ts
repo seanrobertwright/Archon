@@ -9,6 +9,7 @@ export interface ExecNodeEnvironmentContext {
   loopPrevOutput: string;
   rejectionReason: string;
   issueContext?: string;
+  adoptedRunDir?: string | undefined;
 }
 
 export function buildExecNodeEnvironment(context: ExecNodeEnvironmentContext): NodeJS.ProcessEnv {
@@ -17,6 +18,10 @@ export function buildExecNodeEnvironment(context: ExecNodeEnvironmentContext): N
     ARTIFACTS_DIR: context.artifactsDir,
     STATE_DIR: context.stateDir,
     LOG_DIR: context.logDir,
+    ADOPTED_RUN_DIR: context.adoptedRunDir ?? '',
+    // $WORKFLOW_ID substitutes into the body, but a heredoc'd python/node block
+    // reads os.environ and found it missing while its siblings above were all
+    // present. Deliver it the same way.
     WORKFLOW_ID: context.workflowId,
     BASE_BRANCH: context.baseBranch,
     USER_MESSAGE: context.userMessage,

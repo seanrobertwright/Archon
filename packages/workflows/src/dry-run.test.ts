@@ -4,17 +4,41 @@ import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { makeTestComposedWorkflow, makeTestWorkflow } from './test-utils';
 import {
-  createDryRunStubScaffold,
-  dryRunWorkflow,
+  createDryRunStubScaffold as createResolvedDryRunStubScaffold,
+  dryRunWorkflow as dryRunResolvedWorkflow,
   formatDryRunTrace,
   loadDryRunStubs,
-  writeDryRunStubScaffold,
+  writeDryRunStubScaffold as writeResolvedDryRunStubScaffold,
 } from './dry-run';
 import type { DryRunResolution } from './dry-run';
+import { resolveWorkflow } from './graph-plan';
 import { buildAiProfile } from './model-validation';
 import { resolveWorkflowModelScope } from './node-model-resolution';
 import { expandWorkflowIncludes } from './include-expander';
-import type { WorkflowDefinition } from './schemas';
+import type { ResolvedWorkflow, WorkflowDefinition } from './schemas';
+
+function asResolvedWorkflow(workflow: WorkflowDefinition | ResolvedWorkflow): ResolvedWorkflow {
+  return 'plan' in workflow ? workflow : resolveWorkflow(workflow);
+}
+
+function createDryRunStubScaffold(workflow: WorkflowDefinition | ResolvedWorkflow) {
+  return createResolvedDryRunStubScaffold(asResolvedWorkflow(workflow));
+}
+
+function writeDryRunStubScaffold(workflow: WorkflowDefinition | ResolvedWorkflow, path: string) {
+  return writeResolvedDryRunStubScaffold(asResolvedWorkflow(workflow), path);
+}
+
+type TestDryRunOptions = Omit<Parameters<typeof dryRunResolvedWorkflow>[0], 'workflow'> & {
+  workflow: WorkflowDefinition | ResolvedWorkflow;
+};
+
+function dryRunWorkflow(options: TestDryRunOptions) {
+  return dryRunResolvedWorkflow({
+    ...options,
+    workflow: asResolvedWorkflow(options.workflow),
+  });
+}
 
 const temporaryDirectories: string[] = [];
 
@@ -32,7 +56,7 @@ function temporaryFile(content: string): string {
   return path;
 }
 
-function composedReviewWorkflow(gateNodes: unknown[], includeWhen?: string): WorkflowDefinition {
+function composedReviewWorkflow(gateNodes: unknown[], includeWhen?: string): ResolvedWorkflow {
   const block = makeTestWorkflow({
     name: 'review-block',
     nodes: [
@@ -481,6 +505,35 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
 });
 
 describe('dryRunWorkflow', () => {
+  test('uses the attached plan for trace order and summary selection', async () => {
+    const workflow = resolveWorkflow(
+      makeTestWorkflow({
+        name: 'authoritative-plan',
+        nodes: [
+          { id: 'first', prompt: 'first' },
+          { id: 'second', prompt: 'second' },
+        ],
+      })
+    );
+    const [first, second] = workflow.nodes;
+    if (first === undefined || second === undefined) throw new Error('invalid test workflow');
+
+    // Deliberately vary both decisions so either production read becoming a
+    // recomputation makes this regression fail.
+    Reflect.set(workflow.plan, 'layers', [[second], [first]]);
+    Reflect.set(workflow.plan, 'sinks', ['second']);
+
+    const result = await dryRunResolvedWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { first: 'first output', second: 'second output' },
+    });
+
+    expect(result.trace.map(entry => entry.nodeId)).toEqual(['second', 'first']);
+    expect(result.summary).toBe('second output');
+  });
+
   test('hydrates object stubs and resolves workflow and strict output variables', async () => {
     const workflow = makeTestWorkflow({
       name: 'structured',
