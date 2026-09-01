@@ -3188,9 +3188,39 @@ async function runWorkflowWithOwnedSource(
     throw new Error('Workflow did not produce a result.');
   }
 
+  let presentedRun: WorkflowRun | null = null;
+  let outcomeReadUnavailable = false;
+  if (workflow.outcome_field !== undefined && result.workflowRunId !== undefined) {
+    try {
+      presentedRun = await workflowDb.getWorkflowRun(result.workflowRunId);
+      outcomeReadUnavailable = presentedRun === null;
+    } catch (error) {
+      outcomeReadUnavailable = true;
+      getLog().warn(
+        { err: error as Error, workflowRunId: result.workflowRunId },
+        'cli.workflow_outcome_lookup_failed'
+      );
+    }
+  }
+  const presentRunFacts = (lead: string, executionStatus: WorkflowRunStatus): boolean => {
+    if (outcomeReadUnavailable) {
+      console.log(
+        `${lead}\n  Status: ${executionStatus}\n  Authored outcome: unavailable — failed to read persisted run`
+      );
+      return true;
+    }
+    if (presentedRun?.outcome == null) return false;
+    console.log(
+      `${lead}\n  Status: ${presentedRun.status}\n  Authored outcome: ${presentedRun.outcome}`
+    );
+    return true;
+  };
+
   // Check result and exit appropriately
   if (result.success && 'paused' in result && result.paused) {
-    console.log('\nWorkflow paused — waiting for approval.');
+    if (!presentRunFacts('\nWorkflow paused — waiting for approval.', 'paused')) {
+      console.log('\nWorkflow paused — waiting for approval.');
+    }
   } else if (result.success) {
     // Surface workflow result to Web UI as a result card (mirrors orchestrator.ts result message).
     // Paused workflows are handled in the branch above and intentionally do not get a result card.
@@ -3208,8 +3238,11 @@ async function runWorkflowWithOwnedSource(
         );
       }
     }
-    console.log('\nWorkflow completed successfully.');
+    if (!presentRunFacts('\nWorkflow finished.', 'completed')) {
+      console.log('\nWorkflow completed successfully.');
+    }
   } else {
+    presentRunFacts('\nWorkflow finished.', 'failed');
     throw new WorkflowRunFailedError(result.error, detachedProcessOwner);
   }
 }
@@ -3491,6 +3524,7 @@ export async function workflowStatusCommand(
     console.log(`  Name:   ${run.workflow_name}`);
     console.log(`  Path:   ${run.working_path ?? '(none)'}`);
     console.log(`  Status: ${run.status}`);
+    if (run.outcome) console.log(`  Authored outcome: ${run.outcome}`);
     console.log(`  Age:    ${age}`);
 
     if (verbose) {
@@ -3730,7 +3764,8 @@ export async function workflowGetCommand(
   console.log(`  ID:     ${run.id}`);
   console.log(`  Name:   ${run.workflow_name}`);
   console.log(`  Path:   ${run.working_path ?? '(none)'}`);
-  console.log(`  Status: ${run.status}${run.outcome ? ` (${run.outcome})` : ''}`);
+  console.log(`  Status: ${run.status}`);
+  if (run.outcome) console.log(`  Authored outcome: ${run.outcome}`);
   console.log(`  Age:    ${formatAge(run.started_at)}`);
   // Paused interactive-loop gate: one honest line so a human (or an agent parsing
   // the plain output) sees whether any declared completion condition completed
@@ -3934,8 +3969,9 @@ export async function workflowRunsCommand(
     }
     console.log(`\nOpen work (${String(runs.length)}):\n`);
     for (const run of runs) {
+      const outcome = run.outcome ? ` · authored outcome: ${run.outcome}` : '';
       console.log(
-        `  ${run.id.slice(0, 8)}  ${run.workflow_name}  (${formatAge(run.started_at)})  adopt: workflow run <name> --adopt ${run.id}`
+        `  ${run.id.slice(0, 8)}  ${run.workflow_name}${outcome}  (${formatAge(run.started_at)})  adopt: workflow run <name> --adopt ${run.id}`
       );
     }
     console.log('');
@@ -4019,8 +4055,9 @@ export async function workflowRunsCommand(
       run.current_step_name !== null
         ? ` · ${run.current_step_name}${run.total_steps !== null ? `/${String(run.total_steps)}` : ''}`
         : '';
+    const outcome = run.outcome ? ` · authored outcome: ${run.outcome}` : '';
     console.log(
-      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${step}  (${formatAge(run.started_at)})`
+      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${step}${outcome}  (${formatAge(run.started_at)})`
     );
   }
   console.log('');
