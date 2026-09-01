@@ -102,6 +102,7 @@ import {
 import type {
   DeclaredWorkflowConfig,
   WorkflowDefinition,
+  WorkflowLoadError,
   WorkflowLoadResult,
   WorkflowSource,
   WorkflowWithSource,
@@ -1101,6 +1102,7 @@ function countWorkflowSources(
 interface WorkflowJsonEntry {
   name: string;
   description: string;
+  descriptionTruncated: boolean;
   provider?: string;
   model?: string;
   /** Reasoning depth — the one spelling, on every provider that has one (#2556).
@@ -1121,22 +1123,33 @@ export interface WorkflowListOptions {
 const WORKFLOW_DESCRIPTION_PREVIEW_LIMIT = 160;
 const WORKFLOW_DESCRIPTION_TRUNCATION_MARKER = ' [truncated]';
 
-function formatWorkflowDescription(description: string, full: boolean): string {
+interface WorkflowDescriptionProjection {
+  description: string;
+  truncated: boolean;
+}
+
+function projectWorkflowDescription(
+  description: string,
+  full: boolean
+): WorkflowDescriptionProjection {
   if (full || Array.from(description).length <= WORKFLOW_DESCRIPTION_PREVIEW_LIMIT) {
-    return description;
+    return { description, truncated: false };
   }
 
   const normalized = description.trim().replace(/\s+/gu, ' ');
   const codePoints = Array.from(normalized);
   if (codePoints.length <= WORKFLOW_DESCRIPTION_PREVIEW_LIMIT) {
-    return `${normalized}${WORKFLOW_DESCRIPTION_TRUNCATION_MARKER}`;
+    return { description: normalized, truncated: true };
   }
 
   const firstSentenceEnd = codePoints
     .slice(0, WORKFLOW_DESCRIPTION_PREVIEW_LIMIT)
     .findIndex(character => character === '.' || character === '?' || character === '!');
   if (firstSentenceEnd !== -1) {
-    return `${codePoints.slice(0, firstSentenceEnd + 1).join('')}${WORKFLOW_DESCRIPTION_TRUNCATION_MARKER}`;
+    return {
+      description: codePoints.slice(0, firstSentenceEnd + 1).join(''),
+      truncated: true,
+    };
   }
 
   let preview = codePoints.slice(0, WORKFLOW_DESCRIPTION_PREVIEW_LIMIT);
@@ -1144,7 +1157,17 @@ function formatWorkflowDescription(description: string, full: boolean): string {
     const lastWordBoundary = preview.lastIndexOf(' ');
     if (lastWordBoundary > 0) preview = preview.slice(0, lastWordBoundary);
   }
-  return `${preview.join('')}${WORKFLOW_DESCRIPTION_TRUNCATION_MARKER}`;
+  return { description: preview.join(''), truncated: true };
+}
+
+export class WorkflowListLookupError extends Error {
+  readonly loadErrors: readonly WorkflowLoadError[];
+
+  constructor(message: string, loadErrors: readonly WorkflowLoadError[]) {
+    super(message);
+    this.name = 'WorkflowListLookupError';
+    this.loadErrors = loadErrors;
+  }
 }
 
 /**
@@ -1252,16 +1275,23 @@ export async function workflowListCommand(
   const { workflows: workflowEntries, errors } = await loadWorkflows(cwd);
   let listedEntries = workflowEntries;
   if (options.name !== undefined) {
-    const workflow = resolveWorkflowName(
-      options.name,
-      workflowEntries.map(entry => entry.workflow)
-    );
+    let workflow: WorkflowWithSource['workflow'] | undefined;
+    try {
+      workflow = resolveWorkflowName(
+        options.name,
+        workflowEntries.map(entry => entry.workflow)
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new WorkflowListLookupError(message, errors);
+    }
     if (workflow === undefined) {
       const availableWorkflows = workflowEntries
         .map(entry => `  - ${entry.workflow.name}`)
         .join('\n');
-      throw new Error(
-        `Workflow '${options.name}' not found.\n\nAvailable workflows:\n${availableWorkflows || '  (none)'}`
+      throw new WorkflowListLookupError(
+        `Workflow '${options.name}' not found.\n\nAvailable workflows:\n${availableWorkflows || '  (none)'}`,
+        errors
       );
     }
     listedEntries = workflowEntries.filter(entry => entry.workflow.name === workflow.name);
@@ -1275,9 +1305,11 @@ export async function workflowListCommand(
       // per-node form to collapse onto.
       workflows: listedEntries.map(
         ({ workflow: w, parseWarnings, declared }): WorkflowJsonEntry => {
+          const description = projectWorkflowDescription(w.description, options.full === true);
           const entry: WorkflowJsonEntry = {
             name: w.name,
-            description: formatWorkflowDescription(w.description, options.full === true),
+            description: description.description,
+            descriptionTruncated: description.truncated,
           };
           if (declared?.provider !== undefined) entry.provider = declared.provider;
           if (declared?.model !== undefined) entry.model = declared.model;
@@ -1309,8 +1341,11 @@ export async function workflowListCommand(
     console.log(`\nFound ${listedEntries.length} workflow(s):\n`);
 
     for (const { workflow, parseWarnings, declared } of listedEntries) {
+      const description = projectWorkflowDescription(workflow.description, options.full === true);
       console.log(`  ${workflow.name}`);
-      console.log(`    ${formatWorkflowDescription(workflow.description, options.full === true)}`);
+      console.log(
+        `    ${description.description}${description.truncated ? WORKFLOW_DESCRIPTION_TRUNCATION_MARKER : ''}`
+      );
       if (declared?.provider) {
         console.log(`    Provider: ${declared.provider}`);
       }

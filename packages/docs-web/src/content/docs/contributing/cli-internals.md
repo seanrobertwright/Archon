@@ -112,7 +112,7 @@ packages/cli/
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ Optional name resolution; project errors remain in the result    │
-│ full=false: bounded description preview + ` [truncated]` marker  │
+│ full=false: bounded description + structured truncation state    │
 │ full=true: exact authored description                            │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
@@ -121,7 +121,8 @@ packages/cli/
                ▼                               ▼
 ┌──────────────────────────┐   ┌───────────────────────────────────┐
 │ JSON output to stdout    │   │ Human-readable list to stdout     │
-│ { workflows, errors }    │   │ name, description, type, options  │
+│ descriptionTruncated     │   │ shortened descriptions carry     │
+│ { workflows, errors }    │   │ the ` [truncated]` marker         │
 └──────────────────────────┘   └───────────────────────────────────┘
 ```
 

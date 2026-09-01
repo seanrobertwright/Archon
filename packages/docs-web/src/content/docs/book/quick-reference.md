@@ -18,8 +18,8 @@ This chapter collects every CLI command, variable, and YAML option in one place.
 
 | Command | Description |
 |---------|-------------|
-| `archon workflow list` | Compact discovery list; shortened descriptions end in ` [truncated]` |
-| `archon workflow list --json` | Machine-readable compact discovery output |
+| `archon workflow list` | Human-readable compact discovery; shortened descriptions end in ` [truncated]` |
+| `archon workflow list --json` | Machine-readable compact discovery; `descriptionTruncated` reports omitted content |
 | `archon workflow list <name> --full --json` | Exact authored description for one workflow |
 | `archon workflow run <name> "<prompt>"` | Run a workflow |
 | `archon workflow run <name> --branch <name> "<prompt>"` | Run with an explicit branch |

@@ -6,7 +6,7 @@ How to discover, select, and invoke Archon workflows against real work.
 
 ```bash
 archon workflow list                 # human-readable compact descriptions and errors
-archon workflow list --json          # machine-readable compact discovery
+archon workflow list --json          # compact descriptions + descriptionTruncated state
 archon workflow list <name> --full   # exact description for one candidate
 archon workflow search "pr review"  # search the marketplace (installable packs)
 ```
@@ -16,12 +16,12 @@ The live list is authoritative. Bundled workflows ship under the `archon-` prefi
 `archon-triage`, `archon-upkeep`); user-authored workflows may
 claim any name and override a bundled one in that repo.
 
-Descriptions ending in ` [truncated]` are discovery previews, not the complete routing
-contract. Use the previews to identify plausible candidates, then run `archon workflow
-list <name> --full` for each candidate before choosing or launching. Map intent from
-those full descriptions — never from memory of names you have seen elsewhere. If two
-names plausibly match, read both full descriptions, then say which you picked and why
-in one line.
+In JSON output, `descriptionTruncated: true` means `description` is a discovery preview,
+not the complete routing contract. Human output marks the same state with ` [truncated]`.
+Use the previews to identify plausible candidates, then run `archon workflow list <name>
+--full` for each candidate before choosing or launching. Map intent from those full
+descriptions — never from memory of names you have seen elsewhere. If two names plausibly
+match, read both full descriptions, then say which you picked and why in one line.
 
 ## The input is the contract
 

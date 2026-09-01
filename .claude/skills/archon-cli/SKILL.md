@@ -37,8 +37,9 @@ Routing rules:
 
 Most requests land here. The short version; details in the running reference:
 
-1. Discover what exists with the compact catalog: `archon workflow list`. Use its
-   previews to identify plausible candidates — never assume names from memory.
+1. Discover what exists with the compact catalog: `archon workflow list --json`. Use its
+   previews to identify plausible candidates, and treat `descriptionTruncated: true` as an
+   explicit signal that a description is incomplete — never assume names from memory.
 2. Fetch each plausible candidate's untouched description with `archon workflow list
    <name> --full`. Choose from the full descriptions, not a truncated preview.
 3. **Check the input before spending anything.** The message (or the issue, or the

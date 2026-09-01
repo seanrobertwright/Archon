@@ -147,7 +147,8 @@ Commands:
   chat <message>             Send a message to the orchestrator
   setup                      Interactive setup wizard for credentials and config
   workflow list [name] [--full] [--json]
-                             List workflows or show one workflow's full description
+                             List compact workflow descriptions
+                             Use <name> --full for one exact description
   workflow run <name> [msg]  Run a workflow with optional message
   workflow status            Show status of running/paused workflows
   workflow runs              List recent runs (all statuses) for this project
@@ -653,6 +654,7 @@ async function main(): Promise<number> {
         }
         const {
           workflowListCommand,
+          WorkflowListLookupError: workflowListLookupError,
           workflowRunCommand,
           workflowStatusCommand,
           workflowGetCommand,
@@ -687,11 +689,23 @@ async function main(): Promise<number> {
             if (positionals[3] !== undefined) {
               return await fail(jsonFlag, 'Usage: archon workflow list [name] [--full] [--json]');
             }
-            await workflowListCommand(effectiveCwd, {
-              json: jsonFlag,
-              name: workflowName,
-              full: values.full as boolean | undefined,
-            });
+            try {
+              await workflowListCommand(effectiveCwd, {
+                json: jsonFlag,
+                name: workflowName,
+                full: values.full as boolean | undefined,
+              });
+            } catch (error) {
+              if (jsonFlag && error instanceof workflowListLookupError) {
+                await writeJsonLine({
+                  ok: false,
+                  error: error.message,
+                  errors: error.loadErrors,
+                });
+                return 1;
+              }
+              throw error;
+            }
             break;
           }
 

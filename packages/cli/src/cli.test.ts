@@ -165,6 +165,8 @@ describe('CLI help output', () => {
   it('documents compact and full workflow discovery', () => {
     expect(help.status).toBe(0);
     expect(help.stdout).toContain('workflow list [name] [--full] [--json]');
+    expect(help.stdout).toContain('List compact workflow descriptions');
+    expect(help.stdout).toContain('Use <name> --full for one exact description');
   });
 
   it('distinguishes active cancel from state-only abandon', () => {
@@ -1220,13 +1222,17 @@ describe('workflow list arguments', () => {
 
     expect(status).toBe(0);
     const output = envelope() as {
-      workflows: Array<{ name: string; description: string }>;
+      workflows: Array<{
+        name: string;
+        description: string;
+        descriptionTruncated: boolean;
+      }>;
       errors: unknown[];
     };
     expect(output.workflows).toHaveLength(1);
     expect(output.workflows[0].name).toBe('archon-fix-github-issue-codex');
     expect(Array.from(output.workflows[0].description).length).toBeGreaterThan(160);
-    expect(output.workflows[0].description).not.toEndWith(' [truncated]');
+    expect(output.workflows[0].descriptionTruncated).toBe(false);
   });
 
   it('rejects extra positionals with human-readable usage', () => {
@@ -1283,6 +1289,40 @@ describe('workflow list arguments', () => {
       ok: false,
       error: expect.stringContaining("Workflow 'definitely-not-a-workflow' not found"),
     });
+  });
+
+  it('preserves discovery errors in a missing-workflow JSON error envelope', async () => {
+    const scratchRepo = mkdtempSync(join(tmpdir(), 'archon-workflow-list-errors-'));
+    try {
+      const gitInit = spawnSync('git', ['init', '--quiet', scratchRepo], { encoding: 'utf8' });
+      expect(gitInit.status).toBe(0);
+      const workflowDir = join(scratchRepo, '.archon', 'workflows');
+      mkdirSync(workflowDir, { recursive: true });
+      writeFileSync(join(workflowDir, 'broken.yaml'), 'name: broken\nnodes: [\n');
+
+      const { status, envelope } = spawnJsonError([
+        'workflow',
+        'list',
+        'definitely-not-a-workflow',
+        '--json',
+        '--cwd',
+        scratchRepo,
+      ]);
+
+      expect(status).toBe(1);
+      expect(envelope()).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("Workflow 'definitely-not-a-workflow' not found"),
+        errors: [
+          {
+            filename: 'broken.yaml',
+            errorType: 'parse_error',
+          },
+        ],
+      });
+    } finally {
+      await removeTempTree(scratchRepo);
+    }
   });
 });
 
