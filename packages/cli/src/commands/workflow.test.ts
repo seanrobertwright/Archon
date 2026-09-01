@@ -668,7 +668,7 @@ describe('workflowListCommand', () => {
       errors: [],
     });
 
-    await workflowListCommand('/test/path', true);
+    await workflowListCommand('/test/path', { json: true });
 
     expect(stdoutSpy).toHaveBeenCalledTimes(1);
     const output = firstJsonPayload(stdoutSpy);
@@ -678,12 +678,293 @@ describe('workflowListCommand', () => {
     expect(parsed.workflows[0]).toEqual({
       name: 'assist',
       description: 'General assistance workflow',
+      descriptionTruncated: false,
     });
     expect(parsed.workflows[1]).toEqual({
       name: 'plan',
       description: 'Create implementation plan',
+      descriptionTruncated: false,
       provider: 'claude',
     });
+  });
+
+  it('marks and bounds long descriptions in JSON discovery output', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const description = `Choose this workflow for focused fixes.\n\n${'Detailed routing constraints. '.repeat(20)}`;
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'fix', description })],
+      errors: [],
+    });
+
+    await workflowListCommand('/test/path', { json: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      workflows: Array<{ description: string; descriptionTruncated: boolean }>;
+    };
+    expect(parsed.workflows[0]).toMatchObject({
+      description: 'Choose this workflow for focused fixes.',
+      descriptionTruncated: true,
+    });
+    expect(parsed.workflows[0].description).not.toContain('Detailed routing constraints');
+  });
+
+  it('preserves short descriptions byte-for-byte', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const description = 'Keep this short description\n\nexactly as authored.';
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'short', description })],
+      errors: [],
+    });
+
+    await workflowListCommand('/test/path', { json: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      workflows: Array<{ description: string; descriptionTruncated: boolean }>;
+    };
+    expect(parsed.workflows[0].description).toBe(description);
+    expect(parsed.workflows[0].descriptionTruncated).toBe(false);
+  });
+
+  it('does not infer JSON truncation state from authored description text', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const description = 'Use when the authored label ends in [truncated]';
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'literal-marker', description })],
+      errors: [],
+    });
+
+    await workflowListCommand('/test/path', { json: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      workflows: Array<{ description: string; descriptionTruncated: boolean }>;
+    };
+    expect(parsed.workflows[0]).toMatchObject({
+      description,
+      descriptionTruncated: false,
+    });
+  });
+
+  it('uses the same bounded preview in human-readable output', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const description = `Choose this workflow for focused fixes.\n\n${'Detailed routing constraints. '.repeat(20)}`;
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'fix', description })],
+      errors: [],
+    });
+
+    await workflowListCommand('/test/path');
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      '    Choose this workflow for focused fixes. [truncated]'
+    );
+    expect(consoleSpy.mock.calls.flat().join('\n')).not.toContain('Detailed routing constraints');
+  });
+
+  it('caps fallback previews at Unicode code-point and word boundaries', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const emojiPrefix = '🙂'.repeat(150);
+    const description = `${emojiPrefix} boundaryword continues without punctuation`;
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'unicode', description })],
+      errors: [],
+    });
+
+    await workflowListCommand('/test/path', { json: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      workflows: Array<{ description: string; descriptionTruncated: boolean }>;
+    };
+    expect(parsed.workflows[0].description).toBe(emojiPrefix);
+    expect(parsed.workflows[0].descriptionTruncated).toBe(true);
+    expect(parsed.workflows[0].description).not.toContain('\uFFFD');
+    expect(Array.from(parsed.workflows[0].description)).toHaveLength(150);
+  });
+
+  it('returns untouched descriptions for the full catalog', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const description = `Choose this workflow first.\n\n${'Keep every detail. '.repeat(20)}`;
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'long', description }),
+        makeTestWorkflowWithSource({ name: 'short', description: 'Short description' }),
+      ],
+      errors: [],
+    });
+
+    await workflowListCommand('/test/path', { json: true, full: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      workflows: Array<{
+        name: string;
+        description: string;
+        descriptionTruncated: boolean;
+      }>;
+    };
+    expect(parsed.workflows).toEqual([
+      { name: 'long', description, descriptionTruncated: false },
+      { name: 'short', description: 'Short description', descriptionTruncated: false },
+    ]);
+  });
+
+  it('prints only the selected workflow untouched in human full-detail output', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const description = `Choose this workflow first.\n\n${'Keep every detail. '.repeat(20)}`;
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'selected', description }),
+        makeTestWorkflowWithSource({ name: 'other', description: 'Other workflow' }),
+      ],
+      errors: [],
+    });
+
+    await workflowListCommand('/test/path', { name: 'selected', full: true });
+
+    expect(consoleSpy).toHaveBeenCalledWith('  selected');
+    expect(consoleSpy).toHaveBeenCalledWith(`    ${description}`);
+    expect(consoleSpy.mock.calls.flat().join('\n')).not.toContain('other');
+    expect(consoleSpy.mock.calls.flat().join('\n')).not.toContain(' [truncated]');
+  });
+
+  it('filters by workflow name while preserving metadata, warnings, and discovery errors', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const description = `Complete workflow description.\n\n${'Detailed constraint. '.repeat(20)}`;
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'assist' }),
+        makeTestWorkflowWithSource(
+          {
+            name: 'archon-plan',
+            description,
+            provider: 'codex',
+            model: 'gpt-5.6-sol',
+            effort: 'high',
+            webSearchMode: 'live',
+          },
+          'project',
+          ["Node 'plan': unknown key 'interactive' will be ignored."]
+        ),
+      ],
+      errors: [{ filename: 'bad.yaml', error: 'Invalid YAML', errorType: 'parse_error' }],
+    });
+
+    await workflowListCommand('/test/path', { json: true, name: 'archon-plan', full: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      workflows: unknown[];
+      errors: unknown[];
+    };
+    expect(parsed.workflows).toEqual([
+      {
+        name: 'archon-plan',
+        description,
+        descriptionTruncated: false,
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+        webSearchMode: 'live',
+        parseWarnings: ["Node 'plan': unknown key 'interactive' will be ignored."],
+      },
+    ]);
+    expect(parsed.errors).toEqual([
+      { filename: 'bad.yaml', error: 'Invalid YAML', errorType: 'parse_error' },
+    ]);
+  });
+
+  it('fails when a requested workflow name is missing', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'archon-assist' }),
+        makeTestWorkflowWithSource({ name: 'archon-plan' }),
+      ],
+      errors: [],
+    });
+
+    await expect(workflowListCommand('/test/path', { name: 'missing' })).rejects.toThrow(
+      "Workflow 'missing' not found.\n\nAvailable workflows:\n  - archon-assist\n  - archon-plan"
+    );
+  });
+
+  it('carries discovery errors when a requested workflow name is missing', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const loadError = {
+      filename: 'bad.yaml',
+      error: 'Invalid YAML',
+      errorType: 'parse_error' as const,
+    };
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'archon-plan' })],
+      errors: [loadError],
+    });
+
+    const error = await captureError(
+      workflowListCommand('/test/path', { name: 'missing', json: true })
+    );
+
+    expect(error).toMatchObject({ loadErrors: [loadError] });
+  });
+
+  it('fails when a requested workflow name is ambiguous', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'archon-review' }),
+        makeTestWorkflowWithSource({ name: 'custom-review' }),
+      ],
+      errors: [],
+    });
+
+    await expect(workflowListCommand('/test/path', { name: 'review' })).rejects.toThrow(
+      "Ambiguous workflow 'review'"
+    );
+  });
+
+  it('carries discovery errors when a requested workflow name is ambiguous', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const loadError = {
+      filename: 'bad.yaml',
+      error: 'Invalid YAML',
+      errorType: 'parse_error' as const,
+    };
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({ name: 'archon-review' }),
+        makeTestWorkflowWithSource({ name: 'custom-review' }),
+      ],
+      errors: [loadError],
+    });
+
+    const error = await captureError(
+      workflowListCommand('/test/path', { name: 'review', json: true })
+    );
+
+    expect(error).toMatchObject({ loadErrors: [loadError] });
+  });
+
+  it('reduces catalogs dominated by long descriptions by at least 10x', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const workflows = Array.from({ length: 20 }, (_, index) =>
+      makeTestWorkflowWithSource({
+        name: `workflow-${String(index).padStart(2, '0')}`,
+        description: `Route suitable work here. ${'Detailed routing constraint '.repeat(200)}`,
+      })
+    );
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>)
+      .mockResolvedValueOnce({ workflows, errors: [] })
+      .mockResolvedValueOnce({ workflows, errors: [] });
+
+    await workflowListCommand('/test/path', { json: true });
+    await workflowListCommand('/test/path', { json: true, full: true });
+
+    const compactBytes = Buffer.byteLength(
+      (stdoutSpy.mock.calls[0]?.[0] as string | undefined) ?? '',
+      'utf8'
+    );
+    const fullBytes = Buffer.byteLength(
+      (stdoutSpy.mock.calls[1]?.[0] as string | undefined) ?? '',
+      'utf8'
+    );
+    expect(fullBytes / compactBytes).toBeGreaterThanOrEqual(10);
   });
 
   it('should include errors in JSON output', async () => {
@@ -693,7 +974,7 @@ describe('workflowListCommand', () => {
       errors: [{ filename: 'bad.yaml', error: 'Invalid YAML', errorType: 'parse_error' }],
     });
 
-    await workflowListCommand('/test/path', true);
+    await workflowListCommand('/test/path', { json: true });
 
     const output = firstJsonPayload(stdoutSpy);
     const parsed = JSON.parse(output) as {
@@ -716,7 +997,7 @@ describe('workflowListCommand', () => {
       errors: [],
     });
 
-    await workflowListCommand('/test/path', true);
+    await workflowListCommand('/test/path', { json: true });
 
     // Exactly one JSON document written, and no "Discovering workflows" header
     expect(stdoutSpy).toHaveBeenCalledTimes(1);
@@ -744,16 +1025,17 @@ describe('workflowListCommand', () => {
       errors: [],
     });
 
-    await workflowListCommand('/test/path', true);
+    await workflowListCommand('/test/path', { json: true });
 
     const output = firstJsonPayload(stdoutSpy);
     const parsed = JSON.parse(output) as {
-      workflows: Array<Record<string, string>>;
+      workflows: Array<Record<string, string | boolean>>;
       errors: unknown[];
     };
     expect(parsed.workflows[0]).toEqual({
       name: 'plan',
       description: 'Planning workflow',
+      descriptionTruncated: false,
       provider: 'codex',
       model: 'gpt-5.6-sol',
       effort: 'xhigh',
@@ -770,7 +1052,7 @@ describe('workflowListCommand', () => {
       errors: [],
     });
 
-    await workflowListCommand('/test/path', false);
+    await workflowListCommand('/test/path', { json: false });
 
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Discovering workflows'));
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Found 1 workflow(s)'));
@@ -833,7 +1115,7 @@ describe('workflowListCommand', () => {
       errors: [],
     });
 
-    await workflowListCommand('/test/path', true);
+    await workflowListCommand('/test/path', { json: true });
 
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       workflows: { name: string; parseWarnings?: string[] }[];
