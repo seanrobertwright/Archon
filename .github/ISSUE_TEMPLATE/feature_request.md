@@ -41,3 +41,7 @@ Do not post secrets or undisclosed vulnerabilities. Follow SECURITY.md instead.
 - Known prerequisites or blockers:
 - Related issues or PRs:
 - Solution steering: Hint / Requirement —
+
+## Additional notes
+
+<!-- Add useful context that does not fit above. -->
