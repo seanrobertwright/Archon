@@ -5,9 +5,11 @@
  *
  * Keep the batches explicit. The package-script guard below verifies that every
  * TypeScript test is selected by a file or directory argument and that selected
- * paths still exist. The compiler guard separately protects normal package projects
- * from excluding their tests again. `bun run test` discovers both through its final
- * `bun test ./scripts/` invocation.
+ * paths still exist. The repository guard combines those selectors with the root
+ * test targets and workspace declaration so tracked tests cannot sit outside every
+ * command. The compiler guard separately protects normal package projects from
+ * excluding their tests again. `bun run test` discovers all three through its
+ * explicit `bun test ./scripts/` invocation.
  */
 import { describe, test } from 'bun:test';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
@@ -51,6 +53,7 @@ function listFiles(directory: string): string[] {
 function readPackageManifest(manifestPath: string): {
   name: string | undefined;
   testScript: string | undefined;
+  workspaces: string[] | undefined;
 } {
   const parsed: unknown = JSON.parse(readFileSync(manifestPath, 'utf8'));
   if (!isRecord(parsed)) {
@@ -61,15 +64,23 @@ function readPackageManifest(manifestPath: string): {
   return {
     name: typeof parsed.name === 'string' ? parsed.name : undefined,
     testScript: typeof scripts?.test === 'string' ? scripts.test : undefined,
+    workspaces:
+      Array.isArray(parsed.workspaces) &&
+      parsed.workspaces.every(value => typeof value === 'string')
+        ? parsed.workspaces
+        : undefined,
   };
 }
 
-function readRootTestScript(): string {
+function readRootTestConfig(): { testScript: string; workspaces: string[] } {
   const manifest = readPackageManifest(join(REPO_ROOT, 'package.json'));
   if (manifest.testScript === undefined) {
     throw new Error('The root package.json does not define scripts.test');
   }
-  return manifest.testScript;
+  if (manifest.workspaces === undefined) {
+    throw new Error('The root package.json does not define string-array workspaces');
+  }
+  return { testScript: manifest.testScript, workspaces: manifest.workspaces };
 }
 
 function sourceSelectors(testScript: string | undefined): SelectorParseResult {
@@ -110,6 +121,19 @@ function directTestSelectors(testScript: string): string[] {
   });
 }
 
+function runsAllWorkspaceTests(testScript: string): boolean {
+  return testScript.split('&&').some((command): boolean => {
+    const tokens = command.trim().split(/\s+/);
+    const filterIndex = tokens.indexOf('--filter');
+    return (
+      tokens[0] === 'bun' &&
+      filterIndex !== -1 &&
+      tokens[filterIndex + 1] === "'*'" &&
+      tokens.at(-1) === 'test'
+    );
+  });
+}
+
 function selectorCollects(selector: string, testPath: string, baseDirectory: string): boolean {
   const selectorPath = normalizePath(
     relative(REPO_ROOT, resolve(baseDirectory, selector.replace(/^\.\//, '')))
@@ -134,20 +158,45 @@ function trackedTests(): string[] {
     .sort();
 }
 
-function packageDirectoryForTest(testPath: string): string | undefined {
+function matchesWorkspacePattern(directory: string, pattern: string): boolean {
+  const directorySegments = normalizePath(directory).split('/');
+  const patternSegments = normalizePath(pattern).replace(/^\.\//, '').split('/');
+  return (
+    directorySegments.length === patternSegments.length &&
+    patternSegments.every(
+      (segment, index): boolean => segment === '*' || segment === directorySegments[index]
+    )
+  );
+}
+
+function packageDirectoryForTest(
+  testPath: string,
+  workspacePatterns: string[]
+): string | undefined {
   const [directory, packageName] = testPath.split('/');
   if (directory !== 'packages' || packageName === undefined) return undefined;
+
+  const workspaceDirectory = `${directory}/${packageName}`;
+  if (!workspacePatterns.some(pattern => matchesWorkspacePattern(workspaceDirectory, pattern))) {
+    return undefined;
+  }
 
   const packageDirectory = join(PACKAGES_DIR, packageName);
   return existsSync(join(packageDirectory, 'package.json')) ? packageDirectory : undefined;
 }
 
-function isCollectedByRepositoryTest(testPath: string, rootSelectors: string[]): boolean {
+function isCollectedByRepositoryTest(
+  testPath: string,
+  rootSelectors: string[],
+  workspacePatterns: string[],
+  workspaceTestsRun: boolean
+): boolean {
   if (rootSelectors.some((selector): boolean => selectorCollects(selector, testPath, REPO_ROOT))) {
     return true;
   }
+  if (!workspaceTestsRun) return false;
 
-  const packageDirectory = packageDirectoryForTest(testPath);
+  const packageDirectory = packageDirectoryForTest(testPath, workspacePatterns);
   if (packageDirectory === undefined) return false;
 
   const manifest = readPackageManifest(join(packageDirectory, 'package.json'));
@@ -248,9 +297,12 @@ describe('package test inventory', () => {
 
 describe('repository test inventory', () => {
   test('every tracked TypeScript test is selected by bun run test', () => {
-    const rootSelectors = directTestSelectors(readRootTestScript());
+    const { testScript, workspaces } = readRootTestConfig();
+    const rootSelectors = directTestSelectors(testScript);
+    const workspaceTestsRun = runsAllWorkspaceTests(testScript);
     const uncollectedTests = trackedTests().filter(
-      (testPath): boolean => !isCollectedByRepositoryTest(testPath, rootSelectors)
+      (testPath): boolean =>
+        !isCollectedByRepositoryTest(testPath, rootSelectors, workspaces, workspaceTestsRun)
     );
 
     if (uncollectedTests.length > 0) {
