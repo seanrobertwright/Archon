@@ -11,6 +11,7 @@ import {
   spyOn,
   mock,
   jest,
+  type Mock,
 } from 'bun:test';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -511,19 +512,9 @@ async function captureError(promise: Promise<unknown>): Promise<Error> {
   return error;
 }
 
-interface DetachedSpawnOptions {
+type DetachedSpawnOptions = Bun.Spawn.SpawnOptions<'ignore', 'pipe', 'inherit'> & {
   cmd: string[];
-  cwd?: string;
-  detached?: boolean;
-  windowsHide?: boolean;
-  env?: Record<string, string | undefined>;
-  onExit?: (
-    subprocess: ReturnType<typeof Bun.spawn>,
-    exitCode: number | null,
-    signalCode: number | null,
-    error?: Error
-  ) => void;
-}
+};
 
 function firstDetachedSpawnOptions(spawnSpy: ReturnType<typeof spyOn>): DetachedSpawnOptions {
   const value: unknown = spawnSpy.mock.calls[0]?.[0];
@@ -531,48 +522,14 @@ function firstDetachedSpawnOptions(spawnSpy: ReturnType<typeof spyOn>): Detached
     throw new Error('Expected Bun.spawn to receive an options object');
   }
 
-  const options = value as Record<string, unknown>;
   if (
-    !Array.isArray(options.cmd) ||
-    !options.cmd.every((arg: unknown) => typeof arg === 'string')
+    !('cmd' in value) ||
+    !Array.isArray(value.cmd) ||
+    !value.cmd.every((arg: unknown): arg is string => typeof arg === 'string')
   ) {
     throw new Error('Expected Bun.spawn options to include a string command array');
   }
-  if (options.cwd !== undefined && typeof options.cwd !== 'string') {
-    throw new Error('Expected Bun.spawn cwd to be a string');
-  }
-  if (options.detached !== undefined && typeof options.detached !== 'boolean') {
-    throw new Error('Expected Bun.spawn detached to be a boolean');
-  }
-  if (options.windowsHide !== undefined && typeof options.windowsHide !== 'boolean') {
-    throw new Error('Expected Bun.spawn windowsHide to be a boolean');
-  }
-  if (
-    options.env !== undefined &&
-    (typeof options.env !== 'object' ||
-      options.env === null ||
-      !Object.values(options.env).every(
-        (entry: unknown) => typeof entry === 'string' || entry === undefined
-      ))
-  ) {
-    throw new Error('Expected Bun.spawn env values to be strings or undefined');
-  }
-  if (options.onExit !== undefined && typeof options.onExit !== 'function') {
-    throw new Error('Expected Bun.spawn onExit to be a function');
-  }
-
-  return {
-    cmd: options.cmd,
-    ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
-    ...(options.detached !== undefined ? { detached: options.detached } : {}),
-    ...(options.windowsHide !== undefined ? { windowsHide: options.windowsHide } : {}),
-    ...(options.env !== undefined
-      ? { env: options.env as Record<string, string | undefined> }
-      : {}),
-    ...(options.onExit !== undefined
-      ? { onExit: options.onExit as DetachedSpawnOptions['onExit'] }
-      : {}),
-  };
+  return value as DetachedSpawnOptions;
 }
 
 /**
@@ -5058,7 +5015,7 @@ describe('run-id prefix resolution (short ids from `workflow runs`)', () => {
 });
 
 describe('workflowRunsCommand', () => {
-  let consoleSpy: ReturnType<typeof spyOn>;
+  let consoleSpy: Mock<(...args: unknown[]) => void>;
   let stdoutSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
