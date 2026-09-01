@@ -425,14 +425,17 @@ Ambiguous workflow 'review'. Did you mean:
 
 ### `workflow status`
 
-Show **active** workflow runs (running and paused) across all worktrees. For full history (all statuses) scoped to the current project, use `workflow runs`.
+Show **active** workflow runs (running and paused) for the current project. The project is resolved from `cwd` through the registered checkout, including linked git worktrees. Use `--all` for install-wide active runs. For full history (all statuses), use `workflow runs`.
 
 ```bash
 archon workflow status
 archon workflow status --json
+archon workflow status --all      # active runs across all projects
 archon workflow status --verbose   # add a per-node summary for each run
 archon workflow status --json --verbose
 ```
+
+If `cwd` is not a registered project or project lookup fails, the command falls back to install-wide active runs and says so. Every JSON result carries `scopeFallback`: `true` for that fallback and `false` for a resolved project or explicit `--all` request.
 
 ### `workflow runs`
 

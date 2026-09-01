@@ -6,7 +6,8 @@ description: Inspect, control, and resolve Archon workflow runs: list/get/status
 # Managing Runs
 
 Every run-control verb, what it actually does, and the gate semantics that are
-easy to get wrong. All commands scope to the current project by cwd.
+easy to get wrong. Project listings scope by cwd; full run IDs remain globally
+addressable.
 
 ## Output contract
 
@@ -50,7 +51,8 @@ For reusable alternate setups, prefer a config layer instead of long flag lists
 | One run's status/error | `archon workflow get <run-id> --json` |
 | One run with per-node detail | `archon workflow get <run-id> --verbose --json` |
 | One run with raw event rows | `archon workflow get <run-id> --verbose --events --json` |
-| Active runs only | `archon workflow status --json` |
+| Active runs (this project) | `archon workflow status --json` |
+| Active runs (all projects) | `archon workflow status --all --json` |
 | Block until the run ends or needs a human decision | `archon workflow wait <run-id> --json` |
 | Resolve a gate with any declared decision | `archon workflow respond <run-id> <decision> [text]` |
 | Approve (default vocabulary) | `archon workflow approve <run-id> [text]` |

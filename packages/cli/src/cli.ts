@@ -148,7 +148,7 @@ Commands:
   setup                      Interactive setup wizard for credentials and config
   workflow list              List available workflows in current directory
   workflow run <name> [msg]  Run a workflow with optional message
-  workflow status            Show status of running/paused workflows
+  workflow status            Show running/paused workflows for this project
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
   workflow logs <run-id>     Print or follow a run's JSONL transcript
@@ -221,7 +221,7 @@ Options:
   --json                     Output machine-readable JSON (list/status/get/wait/runs/approve/reject/respond/cancel/abandon/resume)
   --events                   For verbose JSON status/get: output raw event rows instead of node summaries
   --detach                   Run 'workflow run'/'approve'/'reject'/'respond'/'resume' in a detached background child (returns immediately)
-  --all                      For 'workflow runs': list across all projects (ignore cwd scope)
+  --all                      For 'workflow status/runs': list across all projects (ignore cwd scope)
   --status <status>          For 'workflow runs': filter to one status (running, completed, failed, ...)
   --open                     For 'workflow runs': the open-work inbox — failed runs nothing has adopted or superseded
   --limit <n>                For 'workflow runs': max rows (default 20)
@@ -808,15 +808,16 @@ async function main(): Promise<number> {
             if (positionals[2] !== undefined) {
               return await fail(
                 jsonFlag,
-                'Usage: archon workflow status [--json] [--verbose] [--events]\n' +
+                'Usage: archon workflow status [--all] [--json] [--verbose] [--events]\n' +
                   'To show a single run, use: archon workflow get <run-id>'
               );
             }
-            await workflowStatusCommand(
-              jsonFlag,
-              values.verbose as boolean | undefined,
-              values.events as boolean | undefined
-            );
+            await workflowStatusCommand(effectiveCwd, {
+              json: jsonFlag,
+              verbose: values.verbose as boolean | undefined,
+              rawEvents: values.events as boolean | undefined,
+              all: values.all as boolean | undefined,
+            });
             break;
 
           case 'get': {

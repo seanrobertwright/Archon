@@ -4067,11 +4067,159 @@ describe('workflowStatusCommand', () => {
     stdoutSpy.mockRestore();
   });
 
+  it('scopes active runs to the cwd-resolved codebase', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-project-a',
+      name: 'owner/project-a',
+      default_cwd: '/workspace/project-a',
+    });
+    const listSpy = workflowDb.listWorkflowRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce([]);
+
+    await workflowStatusCommand('/workspace/project-a', { json: true });
+
+    expect(listSpy).toHaveBeenCalledWith(expect.objectContaining({ codebaseId: 'cb-project-a' }));
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { scopeFallback: boolean };
+    expect(parsed.scopeFallback).toBe(false);
+  });
+
+  it('scopes a linked worktree to its registered primary checkout', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (git.getCanonicalRepoPath as ReturnType<typeof mock>).mockResolvedValueOnce(
+      '/workspace/project-a'
+    );
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'cb-project-a',
+        name: 'owner/project-a',
+        default_cwd: '/workspace/project-a',
+      });
+    const listSpy = workflowDb.listWorkflowRuns as ReturnType<typeof mock>;
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce([]);
+
+    await workflowStatusCommand('/workspace/project-a-worktree', { json: true });
+
+    expect(git.getCanonicalRepoPath).toHaveBeenCalledWith('/workspace/project-a-worktree');
+    expect(codebaseDb.findCodebaseByDefaultCwd).toHaveBeenCalledWith('/workspace/project-a');
+    expect(listSpy).toHaveBeenCalledWith(expect.objectContaining({ codebaseId: 'cb-project-a' }));
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { scopeFallback: boolean };
+    expect(parsed.scopeFallback).toBe(false);
+  });
+
+  it('uses install-wide active runs for --all without resolving the cwd', async () => {
+    const git = await import('@archon/git');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const findSpy = codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>;
+    const canonicalSpy = git.getCanonicalRepoPath as ReturnType<typeof mock>;
+    const listSpy = workflowDb.listWorkflowRuns as ReturnType<typeof mock>;
+    findSpy.mockClear();
+    canonicalSpy.mockClear();
+    listSpy.mockClear();
+    listSpy.mockResolvedValueOnce([]);
+
+    await workflowStatusCommand('/workspace/project-a', { all: true, json: true });
+
+    expect(findSpy).not.toHaveBeenCalled();
+    expect(canonicalSpy).not.toHaveBeenCalled();
+    expect(listSpy).toHaveBeenCalledWith({
+      status: ['running', 'paused'],
+      limit: 50,
+    });
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { scopeFallback: boolean };
+    expect(parsed.scopeFallback).toBe(false);
+  });
+
+  it('flags an unregistered cwd when JSON falls back to install-wide active runs', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
+
+    await workflowStatusCommand('/workspace/unregistered', { json: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { scopeFallback: boolean };
+    expect(parsed.scopeFallback).toBe(true);
+  });
+
+  it('announces an unregistered-cwd fallback in human output', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce(null);
+    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
+
+    await workflowStatusCommand('/workspace/unregistered');
+
+    expect(consoleSpy).toHaveBeenCalledWith('(not a registered project — showing all runs)');
+    expect(consoleSpy).toHaveBeenCalledWith('No active workflows.');
+  });
+
+  it('flags a failed project lookup when JSON falls back to install-wide active runs', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('lookup unavailable')
+    );
+    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
+
+    await workflowStatusCommand('/workspace/project-a', { json: true });
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as { scopeFallback: boolean };
+    expect(parsed.scopeFallback).toBe(true);
+  });
+
+  it('fetches verbose raw events only for runs selected by the project scope', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const workflowEventsDb = await import('@archon/core/db/workflow-events');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-project-a',
+      name: 'owner/project-a',
+      default_cwd: '/workspace/project-a',
+    });
+    const listSpy = workflowDb.listWorkflowRuns as ReturnType<typeof mock>;
+    listSpy.mockResolvedValueOnce([
+      {
+        id: 'run-project-a',
+        workflow_name: 'implement',
+        working_path: '/workspace/project-a-worktree',
+        status: 'running',
+        started_at: new Date(),
+      },
+    ]);
+    const eventsSpy = workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>;
+    eventsSpy.mockClear();
+    eventsSpy.mockResolvedValueOnce([]);
+
+    await workflowStatusCommand('/workspace/project-a', {
+      json: true,
+      verbose: true,
+      rawEvents: true,
+    });
+
+    expect(listSpy).toHaveBeenCalledWith(expect.objectContaining({ codebaseId: 'cb-project-a' }));
+    expect(eventsSpy).toHaveBeenCalledTimes(1);
+    expect(eventsSpy).toHaveBeenCalledWith('run-project-a');
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      scopeFallback: boolean;
+      runs: Array<{ id: string; events: unknown[] }>;
+    };
+    expect(parsed.scopeFallback).toBe(false);
+    expect(parsed.runs).toEqual([expect.objectContaining({ id: 'run-project-a', events: [] })]);
+  });
+
   it('should print message when no active runs', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
 
-    await workflowStatusCommand();
+    await workflowStatusCommand('/test/path', { all: true });
 
     expect(consoleSpy).toHaveBeenCalledWith('No active workflows.');
   });
@@ -4088,7 +4236,7 @@ describe('workflowStatusCommand', () => {
       },
     ]);
 
-    await workflowStatusCommand();
+    await workflowStatusCommand('/test/path', { all: true });
 
     const calls: string[] = consoleSpy.mock.calls.map((call: unknown[]) => String(call[0]));
     expect(calls.some(c => c.includes('run-abc'))).toBe(true);
@@ -4110,7 +4258,7 @@ describe('workflowStatusCommand', () => {
       },
     ]);
 
-    await workflowStatusCommand();
+    await workflowStatusCommand('/test/path', { all: true });
 
     expect(consoleSpy).toHaveBeenCalledWith('  Status: paused');
     expect(consoleSpy).toHaveBeenCalledWith('  Authored outcome: succeeded');
@@ -4120,10 +4268,10 @@ describe('workflowStatusCommand', () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
 
-    await workflowStatusCommand(true);
+    await workflowStatusCommand('/test/path', { json: true, all: true });
 
     expect(stdoutSpy).toHaveBeenCalledWith(
-      `${JSON.stringify({ runs: [] }, null, 2)}\n`,
+      `${JSON.stringify({ runs: [], scopeFallback: false }, null, 2)}\n`,
       expect.any(Function)
     );
   });
@@ -4165,7 +4313,7 @@ describe('workflowStatusCommand', () => {
       },
     ]);
 
-    await workflowStatusCommand(false, true);
+    await workflowStatusCommand('/test/path', { verbose: true, all: true });
 
     const calls: string[] = consoleSpy.mock.calls.map((call: unknown[]) => String(call[0]));
     expect(calls.some(c => c.includes('Nodes:'))).toBe(true);
@@ -4210,7 +4358,7 @@ describe('workflowStatusCommand', () => {
       },
     ]);
 
-    await workflowStatusCommand(false, true);
+    await workflowStatusCommand('/test/path', { verbose: true, all: true });
 
     const calls: string[] = consoleSpy.mock.calls.map((call: unknown[]) => String(call[0]));
     expect(calls.some(c => c.includes('✗') && c.includes('implement'))).toBe(true);
@@ -4232,7 +4380,7 @@ describe('workflowStatusCommand', () => {
     ]);
     (workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>).mockResolvedValueOnce([]);
 
-    await workflowStatusCommand(false, true);
+    await workflowStatusCommand('/test/path', { verbose: true, all: true });
 
     const calls: string[] = consoleSpy.mock.calls.map((call: unknown[]) => String(call[0]));
     expect(calls.some(c => c.includes('Nodes:'))).toBe(false);
@@ -4255,7 +4403,7 @@ describe('workflowStatusCommand', () => {
       VERBOSE_EVENTS_FIXTURE
     );
 
-    await workflowStatusCommand(true, true);
+    await workflowStatusCommand('/test/path', { json: true, verbose: true, all: true });
 
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       runs: Array<{ nodes: Array<Record<string, unknown>>; events?: unknown[] }>;
@@ -4316,7 +4464,12 @@ describe('workflowStatusCommand', () => {
       VERBOSE_EVENTS_FIXTURE
     );
 
-    await workflowStatusCommand(true, true, true);
+    await workflowStatusCommand('/test/path', {
+      json: true,
+      verbose: true,
+      rawEvents: true,
+      all: true,
+    });
 
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       runs: Array<{ events: WorkflowEventRow[]; nodes?: unknown[] }>;
@@ -4341,7 +4494,7 @@ describe('workflowStatusCommand', () => {
       new Error('events unavailable')
     );
 
-    await workflowStatusCommand(true, true);
+    await workflowStatusCommand('/test/path', { json: true, verbose: true, all: true });
 
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
       runs: Array<{ nodes: unknown[] }>;

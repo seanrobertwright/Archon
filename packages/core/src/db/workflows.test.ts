@@ -1375,6 +1375,22 @@ describe('workflows database', () => {
       expect(params[0]).toBe('failed');
     });
 
+    test('filters runs through their conversation codebase', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await listWorkflowRuns({
+        status: ['running', 'paused'],
+        codebaseId: 'cb-project-a',
+      });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('status IN ($1, $2)');
+      expect(query).toContain(
+        'conversation_id IN (SELECT id FROM remote_agent_conversations WHERE codebase_id = $3)'
+      );
+      expect(params).toEqual(['running', 'paused', 'cb-project-a', 50]);
+    });
+
     test('returns results from query', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
 

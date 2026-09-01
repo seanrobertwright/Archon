@@ -112,7 +112,8 @@ Rules:
 ```bash
 archon workflow wait <run-id> --json        # block until the run ends or needs a human decision
 archon workflow runs --json                 # recent runs for this project
-archon workflow status --json               # active only (running/paused)
+archon workflow status --json               # active only for this project (running/paused)
+archon workflow status --all --json         # active across all projects
 archon workflow get <run-id> --json         # one run: status, error, metadata
 archon workflow get <run-id> --verbose --json  # + per-node detail
 ```

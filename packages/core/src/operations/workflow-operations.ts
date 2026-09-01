@@ -36,6 +36,10 @@ export interface WorkflowStatusData {
   runs: WorkflowRun[];
 }
 
+export interface WorkflowStatusOptions {
+  codebaseId?: string;
+}
+
 export interface ApprovalOperationResult {
   workflowName: string;
   workingPath: string | null;
@@ -377,13 +381,14 @@ export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined 
 // Operations
 // ---------------------------------------------------------------------------
 
-/**
- * List all running and paused workflow runs.
- */
-export async function getWorkflowStatus(): Promise<WorkflowStatusData> {
+/** List running and paused workflow runs, optionally scoped to one codebase. */
+export async function getWorkflowStatus(
+  options?: WorkflowStatusOptions
+): Promise<WorkflowStatusData> {
   const runs = await workflowDb.listWorkflowRuns({
     status: ['running', 'paused'],
     limit: 50,
+    ...(options?.codebaseId ? { codebaseId: options.codebaseId } : {}),
   });
   return { runs };
 }
