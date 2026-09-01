@@ -315,6 +315,28 @@ describe('workflow-events', () => {
       );
     });
 
+    test('preserves activation order when a terminal node retries', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { workflow_run_id: 'run-active', step_name: 'zeta', event_type: 'node_started' },
+          { workflow_run_id: 'run-active', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-retry', step_name: 'zeta', event_type: 'node_started' },
+          { workflow_run_id: 'run-retry', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-retry', step_name: 'zeta', event_type: 'node_failed' },
+          { workflow_run_id: 'run-retry', step_name: 'zeta', event_type: 'node_started' },
+        ])
+      );
+
+      const result = await listActiveWorkflowNodeIds(['run-active', 'run-retry']);
+
+      expect(result).toEqual(
+        new Map([
+          ['run-active', ['zeta', 'alpha']],
+          ['run-retry', ['alpha', 'zeta']],
+        ])
+      );
+    });
+
     test('returns an empty map without querying for an empty run list', async () => {
       expect(await listActiveWorkflowNodeIds([])).toEqual(new Map());
       expect(mockQuery).not.toHaveBeenCalled();
