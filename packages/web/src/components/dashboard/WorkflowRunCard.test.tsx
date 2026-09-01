@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router';
 import type { DashboardRunResponse } from '@/lib/api';
+import { useWorkflowStore } from '@/stores/workflow-store';
 import { WorkflowRunCard } from './WorkflowRunCard';
 
 const parallelRun: DashboardRunResponse = {
@@ -45,5 +46,34 @@ describe('WorkflowRunCard', () => {
 
     expect(html).toContain('Active nodes:');
     expect(html).toContain('parallel-a, parallel-b');
+  });
+
+  test('does not fall back to stale REST nodes after live lifecycle events finish them', () => {
+    const serverWorkflows = useWorkflowStore.getInitialState().workflows;
+    serverWorkflows.set(parallelRun.id, {
+      runId: parallelRun.id,
+      workflowName: parallelRun.workflow_name,
+      status: 'running',
+      dagNodes: [
+        { nodeId: 'parallel-a', name: 'parallel-a', status: 'completed' },
+        { nodeId: 'parallel-b', name: 'parallel-b', status: 'failed' },
+      ],
+      artifacts: [],
+      startedAt: Date.now(),
+      currentTool: null,
+    });
+
+    try {
+      const html = renderToStaticMarkup(
+        <MemoryRouter>
+          <WorkflowRunCard run={parallelRun} onCancel={() => undefined} />
+        </MemoryRouter>
+      );
+
+      expect(html).not.toContain('Active node');
+      expect(html).not.toContain('parallel-a, parallel-b');
+    } finally {
+      serverWorkflows.delete(parallelRun.id);
+    }
   });
 });

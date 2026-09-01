@@ -192,7 +192,7 @@ describe('workflows database', () => {
   });
 
   describe('listDashboardRuns', () => {
-    test('derives active nodes from canonical node lifecycle events', async () => {
+    test('derives active nodes from canonical retries and skip terminals', async () => {
       mockQuery
         .mockResolvedValueOnce(
           createQueryResult([
@@ -215,6 +215,36 @@ describe('workflows database', () => {
               workflow_run_id: mockWorkflowRun.id,
               step_name: 'implement',
               event_type: 'node_started',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'implement',
+              event_type: 'node_failed',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'implement',
+              event_type: 'node_started',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'conditional',
+              event_type: 'node_started',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'conditional',
+              event_type: 'node_skipped',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'cached',
+              event_type: 'node_started',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'cached',
+              event_type: 'node_skipped_prior_success',
             },
           ])
         );

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router';
 import type { Run } from '../primitives/run';
-import { set } from '../store/cache';
+import { invalidate, set } from '../store/cache';
 import { K } from '../store/keys';
 import { WorkflowDock } from './WorkflowDock';
 
@@ -29,7 +29,8 @@ const parallelRun: Run = {
 
 describe('WorkflowDock', () => {
   test('renders every active node for a parallel run', () => {
-    set(K.runs('project-parallel'), {
+    const cacheKey = K.runs('project-parallel');
+    set(cacheKey, {
       runs: [parallelRun],
       counts: {
         all: 1,
@@ -43,13 +44,17 @@ describe('WorkflowDock', () => {
       total: 1,
     });
 
-    const html = renderToStaticMarkup(
-      <MemoryRouter>
-        <WorkflowDock projectId="project-parallel" />
-      </MemoryRouter>
-    );
+    try {
+      const html = renderToStaticMarkup(
+        <MemoryRouter>
+          <WorkflowDock projectId="project-parallel" />
+        </MemoryRouter>
+      );
 
-    expect(html).toContain('nodes:');
-    expect(html).toContain('parallel-a, parallel-b');
+      expect(html).toContain('nodes:');
+      expect(html).toContain('parallel-a, parallel-b');
+    } finally {
+      invalidate(cacheKey);
+    }
   });
 });
