@@ -3,7 +3,7 @@
  * Archon CLI - Run AI workflows from the command line
  *
  * Usage:
- *   archon workflow list              List available workflows
+ *   archon workflow list [name]       List available workflows
  *   archon workflow run <name> [msg]  Run a workflow
  *   archon version                    Show version info
  */
@@ -211,8 +211,8 @@ const commandHelp: HelpEntry[] = [
   {
     command: 'workflow',
     subcommand: 'list',
-    spec: 'workflow list',
-    description: 'List available workflows in current directory',
+    spec: 'workflow list [name] [--full] [--json]',
+    description: 'List compact workflow descriptions\nUse <name> --full for one exact description',
   },
   {
     command: 'workflow',
@@ -1303,6 +1303,7 @@ async function main(): Promise<number> {
         }
         const {
           workflowListCommand,
+          WorkflowListLookupError: workflowListLookupError,
           workflowRunCommand,
           workflowStatusCommand,
           workflowGetCommand,
@@ -1332,9 +1333,30 @@ async function main(): Promise<number> {
           database: true,
         });
         switch (subcommand) {
-          case 'list':
-            await workflowListCommand(effectiveCwd, jsonFlag);
+          case 'list': {
+            const workflowName = positionals[2];
+            if (positionals[3] !== undefined) {
+              return await fail(jsonFlag, 'Usage: archon workflow list [name] [--full] [--json]');
+            }
+            try {
+              await workflowListCommand(effectiveCwd, {
+                json: jsonFlag,
+                name: workflowName,
+                full: values.full as boolean | undefined,
+              });
+            } catch (error) {
+              if (jsonFlag && error instanceof workflowListLookupError) {
+                await writeJsonLine({
+                  ok: false,
+                  error: error.message,
+                  errors: error.loadErrors,
+                });
+                return 1;
+              }
+              throw error;
+            }
             break;
+          }
 
           case 'run': {
             const workflowName = positionals[2];

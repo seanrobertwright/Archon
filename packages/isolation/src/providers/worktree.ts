@@ -1096,10 +1096,25 @@ export class WorktreeProvider implements IIsolationProvider {
     prBranch: string,
     remote = 'origin'
   ): Promise<void> {
-    // Fetch the PR's actual branch
-    await execFileAsync('git', ['-C', repoPath, 'fetch', remote, prBranch], {
-      timeout: GIT_OPERATION_TIMEOUT_MS,
-    });
+    // Fetch the PR's actual branch. Delegate to syncWorkspace so the bounded
+    // ref-lock retry lives in one place — concurrent same-repo launches collide
+    // on Git's shared remote-tracking ref lock file, and the @archon/git owner
+    // already owns the predicate and backoff.
+    try {
+      await syncWorkspace(toRepoPath(repoPath), toBranchName(prBranch), {
+        mode: 'fetch-only',
+        remote,
+      });
+    } catch (error) {
+      const err = error as Error;
+      // syncWorkspace wraps fetch errors as
+      // `Sync fetch from <remote>/<branch> failed: <original>`. Strip that
+      // wrapper so the inner wrap keeps `Fetch <remote>/<branch> failed: <original>`
+      // and operators can still distinguish fetch failures from worktree-add
+      // failures inside the surrounding `createFromPR` prefix.
+      const original = err.message.replace(/^Sync fetch from .+? failed: /, '');
+      throw new Error(`Fetch ${remote}/${prBranch} failed: ${original}`);
+    }
 
     // Try to create worktree with the branch
     try {

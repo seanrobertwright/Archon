@@ -189,15 +189,14 @@ describe('manage_run — reads', () => {
           id: 'abcdef1234',
           workflow_name: 'wf',
           status: 'running',
-          current_step_name: 'plan',
-          total_steps: 3,
+          active_nodes: ['plan', 'implement'],
         },
       ],
     });
     const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
     const out = await tool.handler({ action: 'list' });
     expect(out).toContain('abcdef12');
-    expect(out).toContain('plan/3');
+    expect(out).toContain('active node(s): plan, implement');
     expect(mockListDashboardRuns).toHaveBeenCalledWith({ codebaseId: CODEBASE_ID, limit: 20 });
   });
 
@@ -209,8 +208,7 @@ describe('manage_run — reads', () => {
           workflow_name: 'wf',
           status: 'completed',
           outcome: 'failed',
-          current_step_name: null,
-          total_steps: 3,
+          active_nodes: [],
         },
       ],
     });

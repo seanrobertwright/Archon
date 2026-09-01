@@ -415,6 +415,13 @@ Returns `{ commands: [{ name, source: "bundled" | "project" }] }`.
 
 Query parameters include status filters, date ranges, and pagination. Used by the Command Center UI.
 
+Each run includes `active_nodes`, ordered by unresolved `node_started` event order. Completion,
+failure, and both skip lifecycle events remove a node; a retrying start adds it again. Concurrent
+nodes remain separate entries. The compatibility fields `current_step_name` and
+`current_step_status` are populated only when exactly one node is active, and are `null` for zero
+or multiple active nodes. `total_steps` is `null`; observed lifecycle events do not define the
+workflow's total node count. This state describes node lifecycle, not process-owner liveness.
+
 ---
 
 ## Configuration

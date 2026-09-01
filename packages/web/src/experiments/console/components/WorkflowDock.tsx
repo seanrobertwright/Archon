@@ -143,7 +143,7 @@ function ApprovalDockCard({ run }: { run: Run }): ReactElement {
 function DockCard({ run }: { run: Run }): ReactElement {
   const navigate = useNavigate();
   const elapsed = formatElapsed(elapsedSince(run.startedAt));
-  const node = run.currentNode !== null && run.currentNode !== undefined ? run.currentNode : null;
+  const activeNodes = run.activeNodes;
 
   return (
     <button
@@ -166,10 +166,12 @@ function DockCard({ run }: { run: Run }): ReactElement {
         <span className="mt-0.5 flex items-center gap-2 font-mono text-[11px] text-text-tertiary">
           <span className="text-text-secondary">{runStatusLabel(run)}</span>
           <RunOutcomeBadge outcome={run.outcome} />
-          {node !== null ? (
+          {activeNodes.length > 0 ? (
             <>
               <span aria-hidden>·</span>
-              <span className="truncate">{node}</span>
+              <span className="truncate">
+                {activeNodes.length === 1 ? 'node' : 'nodes'}: {activeNodes.join(', ')}
+              </span>
             </>
           ) : null}
         </span>
