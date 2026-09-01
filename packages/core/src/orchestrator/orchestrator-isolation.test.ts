@@ -228,6 +228,14 @@ const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSo
           load_default_commands: true,
         },
       },
+      anchor: {
+        root: '/capture',
+        digest: 'test-digest',
+        config: {
+          load_default_workflows: true,
+          load_default_commands: true,
+        },
+      },
       roots: {
         project: '/capture/project',
         globalWorkflows: '/capture/global/workflows',
@@ -236,9 +244,13 @@ const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSo
         bundledWorkflows: '/capture/bundled',
         bundledCommands: '/capture/bundled/commands/defaults',
         kind: 'captured',
-        config: {
-          load_default_workflows: true,
-          load_default_commands: true,
+        anchor: {
+          root: '/capture',
+          digest: 'test-digest',
+          config: {
+            load_default_workflows: true,
+            load_default_commands: true,
+          },
         },
       },
     })

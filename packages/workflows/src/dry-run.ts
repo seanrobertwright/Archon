@@ -38,7 +38,11 @@ import {
 } from './node-model-resolution';
 import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  assertWorkflowSourceIntegrity,
+  liveSourceRoots,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 import { defaultRunInputs } from './workflow-inputs';
 import { buildExecNodeEnvironment } from './exec-environment';
 import {
@@ -1287,6 +1291,9 @@ export async function dryRunWorkflow(options: {
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
 }): Promise<DryRunResult> {
+  if (options.sourceRoots !== undefined) {
+    await assertWorkflowSourceIntegrity(options.sourceRoots);
+  }
   const assistantModels = options.config ? assistantModelDefaults(options.config) : {};
   // Same layering as the executor: declared defaults under caller-supplied values
   // (supplied wins). A workflow with no `inputs:` block keeps passthrough semantics.

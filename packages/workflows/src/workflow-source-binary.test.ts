@@ -79,7 +79,7 @@ describe('a binary freezes its embedded bundled source', () => {
       target,
       'archon-assist',
       undefined,
-      capturedSourceRoots(capture.captureRoot, capture.manifest.source_config)
+      capturedSourceRoots(capture.anchor)
     );
     expect(result.success).toBe(true);
   });
@@ -90,7 +90,7 @@ describe('a binary freezes its embedded bundled source', () => {
       captureRoot: join(root, 'capture'),
     });
 
-    const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+    const roots = capturedSourceRoots(capture.anchor);
     const yaml = await readFile(
       join(roots.bundledWorkflows, 'defaults', 'archon-assist.yaml'),
       'utf-8'
@@ -106,7 +106,7 @@ describe('a binary freezes its embedded bundled source', () => {
 
     // No bundled scripts ship today, so the assertion is about WHERE it looked: a captured
     // run must not fall back to the embedded-constant path.
-    const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+    const roots = capturedSourceRoots(capture.anchor);
     expect(roots.kind).toBe('captured');
     await expect(discoverScriptsForCwd(target, roots)).resolves.toBeInstanceOf(Map);
   });

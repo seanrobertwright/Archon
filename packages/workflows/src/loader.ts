@@ -1636,7 +1636,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
           error: {
             filename,
             error:
-              "Invalid evidence_policy: expected { required: boolean }. When required is true, the run is refused terminal 'completed' unless $ARTIFACTS_DIR/evidence.json exists.",
+              "Invalid evidence_policy: expected { required: boolean }. When required is true, the run is refused terminal 'completed' unless the conventional marker file $ARTIFACTS_DIR/evidence.json exists; its contents are not checked.",
             errorType: 'validation_error',
           },
         };

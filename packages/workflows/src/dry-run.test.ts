@@ -16,6 +16,7 @@ import { buildAiProfile } from './model-validation';
 import { resolveWorkflowModelScope } from './node-model-resolution';
 import { expandWorkflowIncludes } from './include-expander';
 import type { ResolvedWorkflow, WorkflowDefinition } from './schemas';
+import { captureWorkflowSource, capturedSourceRoots } from './workflow-source';
 
 function asResolvedWorkflow(workflow: WorkflowDefinition | ResolvedWorkflow): ResolvedWorkflow {
   return 'plan' in workflow ? workflow : resolveWorkflow(workflow);
@@ -505,6 +506,34 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
 });
 
 describe('dryRunWorkflow', () => {
+  test('rejects a changed caller-supplied capture before simulation reads it', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-capture-'));
+    temporaryDirectories.push(cwd);
+    mkdirSync(join(cwd, '.archon', 'commands'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'commands', 'inspect.md'), 'original');
+    const capture = await captureWorkflowSource({
+      sourceRoot: cwd,
+      captureRoot: join(cwd, 'capture'),
+    });
+    writeFileSync(
+      join(capture.captureRoot, 'project', '.archon', 'commands', 'inspect.md'),
+      'changed'
+    );
+
+    await expect(
+      dryRunWorkflow({
+        workflow: makeTestWorkflow({
+          name: 'captured-dry-run',
+          nodes: [{ id: 'inspect', command: 'inspect' }],
+        }),
+        userMessage: '',
+        cwd,
+        sourceRoots: capturedSourceRoots(capture.anchor),
+        stubs: { inspect: 'stubbed' },
+      })
+    ).rejects.toThrow('captured source has changed');
+  });
+
   test('reports every simulation outcome independently from authored outcome', async () => {
     const completed = await dryRunWorkflow({
       workflow: makeTestWorkflow({

@@ -696,12 +696,17 @@ nodes:
     // Parent completed.
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'parent-plain');
     expect(parentRun?.status).toBe('completed');
+    // The parent is a hand-built programmatic definition with no prepared capture.
+    expect(parentRun?.metadata.workflow_source).toBeUndefined();
     // Child row exists, linked to the parent + node.
     const child = [...store.runs.values()].find(r => r.workflow_name === 'child-plain');
     expect(child).toBeDefined();
     expect(child?.parent_run_id).toBe(parentRun?.id);
     expect((child?.metadata as Record<string, unknown>).parent_node_id).toBe('sub');
     expect(child?.status).toBe('completed');
+    expect(
+      (child?.metadata.workflow_source as { source_config?: unknown } | undefined)?.source_config
+    ).toEqual({ load_default_workflows: false, load_default_commands: false });
     // Child persisted its terminal summary + cost for the parent to read back.
     expect((child?.metadata as Record<string, unknown>).summary).toBe('ai-output');
     expect((child?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);

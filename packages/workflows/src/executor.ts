@@ -47,12 +47,12 @@ import {
   captureWorkflowSource,
   capturedSourceRoots,
   getRunSourceCapturePath,
-  loadWorkflowSource,
   recordSelectedWorkflow,
   resolveRunSourceCapture,
   resolveChildDiscoveryRoot,
   workflowSourceConfigFrom,
   type WorkflowSourceManifest,
+  type WorkflowSourceAnchor,
   type WorkflowSourceConfig,
   type WorkflowSourceRoots,
 } from './workflow-source';
@@ -734,6 +734,7 @@ export interface PreparedWorkflowSource {
   captureRoot: string;
   origin: string;
   manifest: WorkflowSourceManifest;
+  anchor: WorkflowSourceAnchor;
   /** Roots to discover from — pass to `discoverWorkflowsWithConfig`. */
   roots: WorkflowSourceRoots;
 }
@@ -887,7 +888,7 @@ export async function resolveContinuationWorkflow(
   // is what made a repo with a custom `commands.folder` re-discover a different DAG.
   const capture = await resolveRunSourceCapture(run.metadata);
   if (!capture) return undefined; // predates capture — the caller keeps live behavior
-  const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+  const roots = capturedSourceRoots(capture.anchor);
 
   const { workflows, errors } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, roots);
   const workflow = resolveWorkflowName(
@@ -958,10 +959,12 @@ export async function finalizeWorkflowSource(
   await mkdir(dirname(finalRoot), { recursive: true });
   await rm(finalRoot, { recursive: true, force: true });
   await rename(prepared.captureRoot, finalRoot);
+  const anchor = { ...prepared.anchor, root: finalRoot };
   return {
     ...prepared,
     captureRoot: finalRoot,
-    roots: capturedSourceRoots(finalRoot, prepared.manifest.source_config),
+    anchor,
+    roots: capturedSourceRoots(anchor),
   };
 }
 
@@ -1027,7 +1030,8 @@ export async function prepareWorkflowSource(
     captureRoot: capture.captureRoot,
     origin: capture.origin,
     manifest: capture.manifest,
-    roots: capturedSourceRoots(capture.captureRoot, capture.manifest.source_config),
+    anchor: capture.anchor,
+    roots: capturedSourceRoots(capture.anchor),
   };
 }
 
@@ -2646,11 +2650,9 @@ export async function executeWorkflow(
     // Verifies the digest against the one the RUN recorded — not merely that the
     // directory exists, and not merely that the capture agrees with itself.
     try {
-      const loaded = await loadWorkflowSource(recordedSource.root, recordedSource.digest);
-      // The settings frozen WITH the capture, not the target's. Without this a resume
-      // would re-read `commands.folder` and `defaults:` from the workspace it acts on and
-      // reinterpret the frozen bytes through them.
-      workflowSourceRoots = capturedSourceRoots(recordedSource.root, loaded.manifest.source_config);
+      const loaded = await resolveRunSourceCapture(workflowRun.metadata);
+      if (!loaded) throw new Error('workflow source record disappeared during resolution');
+      workflowSourceRoots = capturedSourceRoots(loaded.anchor);
       getLog().debug(
         { workflowRunId: workflowRun.id, captureRoot: recordedSource.root },
         'workflow.source_restored'
@@ -2699,16 +2701,15 @@ export async function executeWorkflow(
         `Could not move this run's captured workflow source into place: ${(error as Error).message}`
       );
     }
-    workflowSourceRoots = capturedSourceRoots(
-      finalCaptureRoot,
-      preparedSource.manifest.source_config
-    );
+    const sourceAnchor = { ...preparedSource.anchor, root: finalCaptureRoot };
+    workflowSourceRoots = capturedSourceRoots(sourceAnchor);
     const sourceRecord = {
       version: 1 as const,
       root: finalCaptureRoot,
       origin: preparedSource.origin,
       captured_at: preparedSource.manifest.captured_at,
       digest: preparedSource.manifest.digest,
+      source_config: sourceAnchor.config,
       file_count: preparedSource.manifest.file_count,
       byte_count: preparedSource.manifest.byte_count,
     };

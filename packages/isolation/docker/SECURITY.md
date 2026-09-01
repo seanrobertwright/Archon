@@ -51,12 +51,21 @@ apparmor=unconfined` because the kernel `mount -t overlay` needs it. With
   execution. This is acceptable only on a single-tenant host the operator controls.
   A transient in-container env file is a tracked follow-up.
 
-- **`$ARTIFACTS_DIR` is not mounted into the container.** The run's artifacts dir
-  is created after the container is prepared, so it isn't bind-mounted. Engine-side
-  typed-output sidecars still work (written on the host from captured stdout), but
-  a container node that writes **directly** to `$ARTIFACTS_DIR` will fail (the path
-  is absent inside the container). Workflows should write to the workspace (the
-  overlay), not `$ARTIFACTS_DIR`.
+- **`$ARTIFACTS_DIR` is not mounted as a writable artifact channel.** Engine-side
+  typed-output sidecars still work because the host writes them from captured stdout.
+  The `workflow-source` subtree is a separate read-only bind at the same absolute
+  path, but the rest of the run artifacts directory is not mapped to the host. Its
+  parent path may exist only as part of the container mount target; writes either fail
+  or stay container-local, where the host-side engine cannot use them. A container node
+  therefore cannot reliably create the host marker used by `evidence_policy.required`.
+  Use a deterministic node's exit status and, when needed, an authored outcome instead.
+  Workflows should write ordinary files to the workspace overlay.
+
+- **Captured-source integrity is checkpoint detection, not containment.** Archon
+  hashes the host capture against the run's pinned identity before dispatching each
+  capture-backed read. It refuses a mismatch present then, but a same-UID host process
+  can still change files after the check. The check does not cancel parallel nodes,
+  close a check-to-exec race, or make native mode safe against a hostile agent.
 
 - **Running as root.** In-container work runs as root under `IS_SANDBOX=1`.
   Combined with the CAP_SYS_ADMIN of native mode, the in-container root is

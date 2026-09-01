@@ -348,7 +348,7 @@ async function withCapturedFixtureSource<T>(
     );
   }
   try {
-    return await fn(capturedSourceRoots(capture.captureRoot, capture.manifest.source_config));
+    return await fn(capturedSourceRoots(capture.anchor));
   } finally {
     await rm(captureRoot, { recursive: true, force: true }).catch((error: unknown) => {
       getLog().warn(

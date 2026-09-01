@@ -136,9 +136,9 @@ export const WORKFLOW_EVENT_TYPES = [
   'writeback_requested',
   'writeback_applied',
   'writeback_discarded',
-  // Evidence gate (#2230): `evidence_policy.required` was set but
-  // `$ARTIFACTS_DIR/evidence.json` was absent at completion time — the run was
-  // refused terminal `completed` and marked failed. Data carries the expected path.
+  // File-presence gate (#2230): `evidence_policy.required` was set but its
+  // conventional `$ARTIFACTS_DIR/evidence.json` marker was absent at completion.
+  // Data carries the expected path; the legacy event name is a persisted contract.
   'evidence_validation_failed',
   // #2213 — keys the engine dropped from this run's workflow YAML. Written by the
   // executor at run start for EVERY run that has them, whatever surface started

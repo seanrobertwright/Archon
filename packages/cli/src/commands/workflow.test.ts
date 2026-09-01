@@ -294,9 +294,13 @@ const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
   bundledWorkflows: '/test/capture/bundled',
   bundledCommands: '/test/capture/bundled/commands/defaults',
   kind: 'captured',
-  config: {
-    load_default_workflows: true,
-    load_default_commands: true,
+  anchor: {
+    root: '/test/capture',
+    digest: 'test-digest',
+    config: {
+      load_default_workflows: true,
+      load_default_commands: true,
+    },
   },
 };
 const mockResolveContinuationWorkflow = mock<typeof WorkflowExecutor.resolveContinuationWorkflow>(
@@ -344,7 +348,12 @@ mock.module('@archon/workflows/executor', () => ({
         file_count: 0,
         byte_count: 0,
         scopes: [],
+        source_config: {
+          load_default_workflows: true,
+          load_default_commands: true,
+        },
       },
+      anchor: CAPTURED_SOURCE_ROOTS.anchor,
       roots: CAPTURED_SOURCE_ROOTS,
     })
   ),

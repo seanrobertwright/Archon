@@ -13,8 +13,10 @@ import { isEffortRung } from '@archon/paths/effort';
 import { discoverScriptsForCwd } from './script-discovery';
 import { discoverWorkflowsWithConfig, resolveWorkflowCommandContents } from './workflow-discovery';
 import {
+  assertWorkflowSourceIntegrity,
   liveSourceRoots,
   resolveChildDiscoveryRoot,
+  WorkflowSourceIntegrityError,
   type WorkflowSourceRoots,
 } from './workflow-source';
 import { resolveWorkflowName } from './router';
@@ -2166,6 +2168,7 @@ async function executeNodeInternal(
   // Load prompt
   let rawPrompt: string;
   if (commandName !== undefined) {
+    await assertWorkflowSourceIntegrity(workflowSourceRoots);
     const promptResult = await loadCommandPrompt(
       deps,
       cwd,
@@ -3868,6 +3871,29 @@ async function executeScriptNode(
   const stepName = stepNamePrefix + node.id;
   const iterationData = iteration !== undefined ? { iteration } : {};
 
+  // Resolve before deciding whether this is inline or filesystem-backed: substitutions
+  // can turn the authored field into either form. A named source is checked outside the
+  // deterministic retry classifier, so an integrity failure cannot consume retries.
+  // User-controlled variables stay in subprocess env instead of being spliced into
+  // TS/Python source; strict node-output references keep raw substitution (#2115).
+  const { prompt: substitutedScript } = substituteWorkflowVariables(
+    node.script,
+    workflowRun.id,
+    workflowRun.user_message,
+    artifactsDir,
+    baseBranch,
+    docsDir,
+    issueContext,
+    undefined,
+    undefined,
+    undefined,
+    { shellSafe: true, stateDir }
+  );
+  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
+  if (!isInlineScript(finalScript)) {
+    await assertWorkflowSourceIntegrity(workflowSourceRoots);
+  }
+
   getLog().info({ nodeId: node.id, type: 'script', runtime: node.runtime }, 'dag_node_started');
   await logNodeStart(logDir, workflowRun.id, node.id, '<script>');
 
@@ -3892,29 +3918,6 @@ async function executeScriptNode(
     nodeId: node.id,
     nodeName: node.id,
   });
-
-  // Variable substitution on script field.
-  // shellSafe: true skips literal substitution of the user-controlled variables
-  // ($ARGUMENTS/$USER_MESSAGE/$CONTEXT family/$LOOP_*/$REJECTION_REASON) so
-  // attacker-influenced text is never spliced into the TS/Python source that
-  // `bun -e` / `uv run python -c` executes. Those values ride subprocess env vars
-  // below instead (read via process.env.X / os.environ['X']), mirroring the
-  // executeBashNode hardening. $nodeId.output refs keep raw substitution — the
-  // strict producer contract bounds those values (#2115).
-  const { prompt: substitutedScript } = substituteWorkflowVariables(
-    node.script,
-    workflowRun.id,
-    workflowRun.user_message,
-    artifactsDir,
-    baseBranch,
-    docsDir,
-    issueContext,
-    undefined,
-    undefined,
-    undefined,
-    { shellSafe: true, stateDir }
-  );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   // One-release migration warn for any literal user-controlled var ref that no
   // longer substitutes now that delivery moved to env vars (#2115).
@@ -5709,6 +5712,7 @@ async function executeLoopNode(
       );
       return failLoopNode(errorMsg, { data: { command: loop.command } });
     } else {
+      await assertWorkflowSourceIntegrity(workflowSourceRoots);
       const promptResult = await loadCommandPrompt(
         deps,
         cwd,
@@ -8071,9 +8075,11 @@ async function resolveFanOutChildDefinition(
         unresolved: relevantError?.error ?? `no workflow named '${targetName}' was found`,
       };
     }
+    await assertWorkflowSourceIntegrity(sourceRoots);
     const commandContents = await resolveWorkflowCommandContents(sourceRoots, definitions);
     return { definition, definitions, commandContents };
   } catch (err) {
+    if (err instanceof WorkflowSourceIntegrityError) throw err;
     return { unresolved: (err as Error).message };
   }
 }
@@ -12043,13 +12049,13 @@ export async function executeDagWorkflow(
   // Check if status was changed externally (e.g. cancelled) before marking complete.
   if (await skipIfStatusChanged('dag.skip_complete_status_changed')) return;
 
-  // Evidence gate (#2230): thin terminal-success gate, a sibling of the
+  // Evidence gate (#2230): thin terminal file-presence gate, a sibling of the
   // approval/write-back gates (run-status transitions are engine governance).
   // When the workflow declares `evidence_policy.required: true`, refuse to flip
   // the run to `completed` unless `$ARTIFACTS_DIR/evidence.json` exists — the
-  // workflow's own bash/script nodes compute what counts as evidence; the
-  // engine checks PRESENCE only (no schema validation, no content checks, no
-  // git/gh I/O — constitution: code computes, YAML coordinates). Placed BEFORE
+  // engine checks presence only (no schema validation, no content checks, no
+  // git/gh I/O). Any contents satisfy this convention; deterministic checks
+  // and authored outcomes remain separate. Placed BEFORE
   // the container write-back gate so a run that cannot complete never pauses
   // for (or applies) write-back — mirroring how node-failure runs skip that
   // gate entirely. Resume-safe: the run id (and therefore artifactsDir) is
@@ -12059,10 +12065,10 @@ export async function executeDagWorkflow(
     const evidencePath = joinPath(artifactsDir, 'evidence.json');
     if (!existsSync(evidencePath)) {
       const failMsg =
-        `DAG workflow '${workflow.name}' failed the evidence gate: ` +
-        `evidence_policy.required is true but no evidence file exists at ${evidencePath}. ` +
-        'All nodes succeeded — produce evidence.json from a bash/script node, ' +
-        'then resume the run once the file exists.';
+        `DAG workflow '${workflow.name}' failed the evidence marker gate: ` +
+        `evidence_policy.required is true but its conventional marker file is absent at ${evidencePath}. ` +
+        'The policy checks only that path; create the marker in the host artifacts directory, ' +
+        'then resume the run.';
       getLog().error({ workflowRunId: workflowRun.id, evidencePath }, 'dag.evidence_gate_failed');
       // Anonymous telemetry: terminal failure (evidence missing at completion).
       captureWorkflowCompleted({

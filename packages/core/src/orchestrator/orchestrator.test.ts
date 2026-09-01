@@ -372,6 +372,14 @@ mock.module('@archon/workflows/executor', () => ({
           load_default_commands: true,
         },
       },
+      anchor: {
+        root: '/capture',
+        digest: 'test-digest',
+        config: {
+          load_default_workflows: true,
+          load_default_commands: true,
+        },
+      },
       roots: {
         project: '/capture/project',
         globalWorkflows: '/capture/global/workflows',
@@ -380,9 +388,13 @@ mock.module('@archon/workflows/executor', () => ({
         bundledWorkflows: '/capture/bundled',
         bundledCommands: '/capture/bundled/commands/defaults',
         kind: 'captured',
-        config: {
-          load_default_workflows: true,
-          load_default_commands: true,
+        anchor: {
+          root: '/capture',
+          digest: 'test-digest',
+          config: {
+            load_default_workflows: true,
+            load_default_commands: true,
+          },
         },
       },
     })

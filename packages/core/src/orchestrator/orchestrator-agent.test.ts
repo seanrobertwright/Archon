@@ -244,9 +244,13 @@ const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
   bundledWorkflows: '/capture/bundled',
   bundledCommands: '/capture/bundled/commands/defaults',
   kind: 'captured',
-  config: {
-    load_default_workflows: true,
-    load_default_commands: true,
+  anchor: {
+    root: '/capture',
+    digest: 'test-digest',
+    config: {
+      load_default_workflows: true,
+      load_default_commands: true,
+    },
   },
 };
 const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSource>(() =>
@@ -268,6 +272,7 @@ const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSo
         load_default_commands: true,
       },
     },
+    anchor: CAPTURED_SOURCE_ROOTS.anchor,
     roots: CAPTURED_SOURCE_ROOTS,
   })
 );
@@ -2438,6 +2443,14 @@ describe('workflow dispatch routing — interactive flag', () => {
             load_default_commands: true,
           },
         },
+        anchor: {
+          root: '/capture-branch',
+          digest: 'branch-digest',
+          config: {
+            load_default_workflows: true,
+            load_default_commands: true,
+          },
+        },
         roots: {
           project: '/capture-branch/project',
           globalWorkflows: '/capture-branch/global/workflows',
@@ -2446,9 +2459,13 @@ describe('workflow dispatch routing — interactive flag', () => {
           bundledWorkflows: '/capture-branch/bundled',
           bundledCommands: '/capture-branch/bundled/commands/defaults',
           kind: 'captured',
-          config: {
-            load_default_workflows: true,
-            load_default_commands: true,
+          anchor: {
+            root: '/capture-branch',
+            digest: 'branch-digest',
+            config: {
+              load_default_workflows: true,
+              load_default_commands: true,
+            },
           },
         },
       })

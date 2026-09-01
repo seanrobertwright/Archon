@@ -34,6 +34,7 @@ mock.module('@archon/paths', () => ({
 import {
   captureWorkflowSource,
   capturedSourceRoots,
+  assertWorkflowSourceIntegrity,
   getRunSourceCapturePath,
   loadWorkflowSource,
   recordSelectedWorkflow,
@@ -42,10 +43,15 @@ import {
   WorkflowSourceIntegrityError,
   DEFAULT_WORKFLOW_SOURCE_CONFIG,
 } from './workflow-source';
-import { WORKFLOW_SOURCE_METADATA_KEY } from './schemas/workflow-run';
+import {
+  WORKFLOW_SOURCE_METADATA_KEY,
+  readWorkflowSourceState,
+  type WorkflowSourceConfig,
+} from './schemas/workflow-run';
 import { discoverScriptsForCwd } from './script-discovery';
 import { loadCommandPrompt } from './executor-shared';
 import { withCapturedSource } from './executor';
+import { discoverWorkflows } from './workflow-discovery';
 import type { WorkflowDeps } from './deps';
 import { trackTempRoots } from '@archon/paths/test-utils';
 
@@ -349,7 +355,7 @@ describe('resolving against a capture instead of the target', () => {
       target,
       'review',
       undefined,
-      capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
+      capturedSourceRoots(capture!.anchor)
     );
     expect(fromCapture).toEqual({ success: true, content: 'from authoring' });
   });
@@ -370,7 +376,7 @@ describe('resolving against a capture instead of the target', () => {
       target,
       '__archon_pack__project:pack:flow::step',
       undefined,
-      capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
+      capturedSourceRoots(capture!.anchor)
     );
     expect(result).toEqual({ success: true, content: 'packaged body' });
   });
@@ -385,12 +391,9 @@ describe('resolving against a capture instead of the target', () => {
 
     expect((await discoverScriptsForCwd(target)).get('check')).toBeUndefined();
 
-    const script = (
-      await discoverScriptsForCwd(
-        target,
-        capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
-      )
-    ).get('check');
+    const script = (await discoverScriptsForCwd(target, capturedSourceRoots(capture!.anchor))).get(
+      'check'
+    );
     expect(script?.runtime).toBe('bun');
     // The script runs from the capture while the process still works in the target.
     // `discoverScripts` returns POSIX-separated paths on every platform (normalizeSep),
@@ -415,7 +418,7 @@ describe('resolving against a capture instead of the target', () => {
       target,
       'review',
       undefined,
-      capturedSourceRoots(capture!.captureRoot, capture!.manifest.source_config)
+      capturedSourceRoots(capture!.anchor)
     );
     expect(result).toEqual({ success: true, content: 'authoring version' });
   });
@@ -423,13 +426,19 @@ describe('resolving against a capture instead of the target', () => {
 
 describe("a run's own source versus a child's discovery root", () => {
   /** The metadata a run carries once it has captured. */
-  const recorded = (root: string, origin: string, digest = 'x'): Record<string, unknown> => ({
+  const recorded = (
+    root: string,
+    origin: string,
+    digest = 'x',
+    sourceConfig?: WorkflowSourceConfig
+  ): Record<string, unknown> => ({
     [WORKFLOW_SOURCE_METADATA_KEY]: {
       version: 1,
       root,
       origin,
       captured_at: '2026-08-21T00:00:00.000Z',
       digest,
+      ...(sourceConfig !== undefined ? { source_config: sourceConfig } : {}),
       file_count: 1,
       byte_count: 1,
     },
@@ -445,6 +454,22 @@ describe("a run's own source versus a child's discovery root", () => {
     const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
 
     expect((await resolveRunSourceCapture(metadata))?.captureRoot).toBe(capture!.captureRoot);
+  });
+
+  test('new and pre-change version-1 records both remain readable', async () => {
+    const root = await createTempRoot();
+    const oldRecord = recorded(root, root);
+    const newRecord = recorded(root, root, 'x', DEFAULT_WORKFLOW_SOURCE_CONFIG);
+
+    const oldState = readWorkflowSourceState(oldRecord);
+    expect(oldState.kind).toBe('recorded');
+    if (oldState.kind === 'recorded') {
+      expect('source_config' in oldState.record).toBe(false);
+    }
+    expect(readWorkflowSourceState(newRecord)).toMatchObject({
+      kind: 'recorded',
+      record: { source_config: DEFAULT_WORKFLOW_SOURCE_CONFIG },
+    });
   });
 
   test('a not-yet-started child resolves from LIVE authoring, so a fix can land', async () => {
@@ -509,6 +534,33 @@ describe("a run's own source versus a child's discovery root", () => {
 });
 
 describe('the capture is authoritative, not advisory', () => {
+  test('initial discovery refuses a capture changed after its anchor was pinned', async () => {
+    const { source, target, runArtifacts } = await createSandbox();
+    const workflowPath = join(source, '.archon', 'workflows', 'anchored.yaml');
+    await writeFile(
+      workflowPath,
+      [
+        'name: anchored',
+        'description: source integrity fixture',
+        'nodes:',
+        '  - id: check',
+        '    bash: echo original',
+      ].join('\n')
+    );
+    const capture = await captureWorkflowSource({
+      sourceRoot: source,
+      captureRoot: getRunSourceCapturePath(runArtifacts),
+    });
+    await writeFile(
+      join(capture.captureRoot, 'project', '.archon', 'workflows', 'anchored.yaml'),
+      'name: replacement\ndescription: changed\nnodes: []\n'
+    );
+
+    await expect(
+      discoverWorkflows(target, { sourceRoots: capturedSourceRoots(capture.anchor) })
+    ).rejects.toThrow(WorkflowSourceIntegrityError);
+  });
+
   test('a tampered capture fails to load instead of executing quietly', async () => {
     const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'original');
@@ -553,6 +605,96 @@ describe('the capture is authoritative, not advisory', () => {
     await expect(resolveRunSourceCapture(metadata)).rejects.toThrow(WorkflowSourceIntegrityError);
   });
 
+  test('an internally consistent replacement is rejected by the retained digest', async () => {
+    const { source, runArtifacts } = await createSandbox();
+    const captureRoot = getRunSourceCapturePath(runArtifacts);
+    await writeFile(join(source, '.archon', 'commands', 'review.md'), 'original');
+    const original = await captureWorkflowSource({ sourceRoot: source, captureRoot });
+
+    await writeFile(join(source, '.archon', 'commands', 'review.md'), 'replacement');
+    await captureWorkflowSource({ sourceRoot: source, captureRoot });
+
+    await expect(
+      assertWorkflowSourceIntegrity(capturedSourceRoots(original.anchor))
+    ).rejects.toThrow('capture has been replaced');
+  });
+
+  test('a new run rejects source config drift even when the tree digest still matches', async () => {
+    const { source, runArtifacts } = await createSandbox();
+    const capture = await captureWorkflowSource({
+      sourceRoot: source,
+      captureRoot: getRunSourceCapturePath(runArtifacts),
+      sourceConfig: DEFAULT_WORKFLOW_SOURCE_CONFIG,
+    });
+    const changedConfig: WorkflowSourceConfig = {
+      ...DEFAULT_WORKFLOW_SOURCE_CONFIG,
+      load_default_commands: false,
+    };
+    const manifestPath = join(capture.captureRoot, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify({ ...manifest, source_config: changedConfig }, null, 2)}\n`
+    );
+    const metadata = {
+      [WORKFLOW_SOURCE_METADATA_KEY]: {
+        version: 1,
+        root: capture.captureRoot,
+        origin: source,
+        captured_at: capture.manifest.captured_at,
+        digest: capture.manifest.digest,
+        source_config: DEFAULT_WORKFLOW_SOURCE_CONFIG,
+        file_count: capture.manifest.file_count,
+        byte_count: capture.manifest.byte_count,
+      },
+    };
+
+    await expect(resolveRunSourceCapture(metadata)).rejects.toThrow(
+      'different resolution settings'
+    );
+  });
+
+  test('a pre-change run pins verified manifest config for the resumed process', async () => {
+    const { source, runArtifacts } = await createSandbox();
+    const sourceConfig: WorkflowSourceConfig = {
+      ...DEFAULT_WORKFLOW_SOURCE_CONFIG,
+      command_folder: 'team-commands',
+    };
+    const capture = await captureWorkflowSource({
+      sourceRoot: source,
+      captureRoot: getRunSourceCapturePath(runArtifacts),
+      sourceConfig,
+    });
+    const metadata = {
+      [WORKFLOW_SOURCE_METADATA_KEY]: {
+        version: 1,
+        root: capture.captureRoot,
+        origin: source,
+        captured_at: capture.manifest.captured_at,
+        digest: capture.manifest.digest,
+        file_count: capture.manifest.file_count,
+        byte_count: capture.manifest.byte_count,
+      },
+    };
+
+    const resumed = await resolveRunSourceCapture(metadata);
+    if (!resumed) throw new Error('expected the recorded capture to resolve');
+    expect(resumed.anchor.config).toEqual(sourceConfig);
+    expect(
+      (metadata[WORKFLOW_SOURCE_METADATA_KEY] as Record<string, unknown>).source_config
+    ).toBeUndefined();
+
+    const manifestPath = join(capture.captureRoot, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+    await writeFile(
+      manifestPath,
+      `${JSON.stringify({ ...manifest, source_config: DEFAULT_WORKFLOW_SOURCE_CONFIG }, null, 2)}\n`
+    );
+    await expect(
+      assertWorkflowSourceIntegrity(capturedSourceRoots(resumed.anchor))
+    ).rejects.toThrow('different resolution settings');
+  });
+
   test('freezes every statically reachable scope, not just the project', async () => {
     const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
@@ -568,7 +710,7 @@ describe('the capture is authoritative, not advisory', () => {
     // empty bundled tree is still SCANNED and recorded; if it ever silently stopped being
     // captured, every other assertion here would keep passing.
     expect(capture.manifest.scopes).toContain('bundled');
-    const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+    const roots = capturedSourceRoots(capture.anchor);
     expect(roots.globalWorkflows.startsWith(capture.captureRoot)).toBe(true);
     expect(roots.globalCommands.startsWith(capture.captureRoot)).toBe(true);
   });
@@ -618,7 +760,7 @@ describe("the source's own settings travel with its bytes", () => {
       target,
       'shipit',
       undefined,
-      capturedSourceRoots(capture.captureRoot, capture.manifest.source_config)
+      capturedSourceRoots(capture.anchor)
     );
     expect(result).toEqual({ success: true, content: 'ship it' });
   });
@@ -639,7 +781,7 @@ describe("the source's own settings travel with its bytes", () => {
       target,
       'shipit',
       undefined,
-      capturedSourceRoots(capture.captureRoot, DEFAULT_WORKFLOW_SOURCE_CONFIG)
+      capturedSourceRoots({ ...capture.anchor, config: DEFAULT_WORKFLOW_SOURCE_CONFIG })
     );
     expect(result.success).toBe(false);
   });
@@ -667,8 +809,8 @@ describe('continuing a run resolves with the settings it froze', () => {
     // What a continuation does: read the capture back from its path alone, exactly as
     // `sourceCaptureRoot` gives it, and rebuild roots from the manifest it finds there.
     const reloaded = await loadWorkflowSource(capture.captureRoot);
-    const roots = capturedSourceRoots(reloaded.captureRoot, reloaded.manifest.source_config);
-    expect(roots.config.command_folder).toBe('team-commands');
+    const roots = capturedSourceRoots(reloaded.anchor);
+    expect(roots.anchor.config.command_folder).toBe('team-commands');
 
     const result = await loadCommandPrompt(deps, target, 'shipit', undefined, roots);
     expect(result).toEqual({ success: true, content: 'ship it' });
