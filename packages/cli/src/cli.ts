@@ -231,7 +231,7 @@ const commandHelp: HelpEntry[] = [
     command: 'workflow',
     subcommand: 'status',
     spec: 'workflow status',
-    description: 'Show status of running/paused workflows',
+    description: 'Show running/paused workflows for this project',
   },
   {
     command: 'workflow',
@@ -678,8 +678,11 @@ const orderedFlags: FlagHelp[] = [
   },
   {
     spec: '--all',
-    description: "For 'workflow runs': list across all projects (ignore cwd scope)",
-    owners: [{ command: 'workflow', subcommand: 'runs' }],
+    description: "For 'workflow status/runs': list across all projects (ignore cwd scope)",
+    owners: [
+      { command: 'workflow', subcommand: 'status' },
+      { command: 'workflow', subcommand: 'runs' },
+    ],
   },
   {
     spec: '--status <status>',
