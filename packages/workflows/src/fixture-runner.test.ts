@@ -180,6 +180,31 @@ describe('runFixtures', () => {
     expect(report.passed).toBe(1);
     expect(report.failed).toBe(0);
     expect(report.results[0].outcome).toBe('completed');
+    expect(report.results[0].authoredOutcome).toBeNull();
+  });
+
+  it('reports authored outcome without changing execution-outcome expectations', async () => {
+    const { cwd } = writeTempProject({
+      workflowYaml:
+        'name: test-wf\ndescription: test\nreturns: node-a\noutcome_field: green\nnodes:\n' +
+        '  - id: node-a\n    prompt: verdict\n    output_format:\n' +
+        '      type: object\n      properties:\n        green: { type: boolean }\n' +
+        '      required: [green]\n',
+      body: ['fixture:', '  expect: completed', 'node-a:', '  green: false'].join('\n'),
+    });
+
+    const report = await runFixtures({
+      workflows: [workflowsOnDisk(cwd, ['test-wf'])[0]],
+      cwd,
+    });
+
+    expect(report).toMatchObject({
+      passed: 1,
+      failed: 0,
+      results: [{ outcome: 'completed', authoredOutcome: 'failed', pass: true }],
+    });
+    expect(formatFixtureReport(report)).toContain('Simulation outcome: completed');
+    expect(formatFixtureReport(report)).toContain('Authored outcome: failed');
   });
 
   it('requires declared nodes to complete or be stubbed', async () => {

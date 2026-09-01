@@ -53,10 +53,12 @@ import {
   isWaitNode,
   isWorkflowNode,
   effortLevelSchema,
+  workflowRunOutcomeSchema,
   type DagNode,
   type NodeOutput,
   type GraphPlan,
   type ResolvedWorkflow,
+  type WorkflowRunOutcome,
 } from './schemas';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -363,6 +365,7 @@ export type DryRunTraceEntry = z.infer<typeof dryRunTraceEntrySchema>;
 export const dryRunResultSchema = z.object({
   workflow: z.string(),
   outcome: z.enum(['completed', 'failed', 'paused', 'cancelled']),
+  authoredOutcome: workflowRunOutcomeSchema.nullable(),
   trace: z.array(dryRunTraceEntrySchema),
   missingStubs: z.array(z.string()),
   /**
@@ -1216,6 +1219,32 @@ async function simulateNodes(
   }
 }
 
+function resolveDryRunAuthoredOutcome(
+  workflow: ResolvedWorkflow,
+  outputs: ReadonlyMap<string, NodeOutput>,
+  consumedStubs: ReadonlySet<string>
+): WorkflowRunOutcome | null {
+  const field = workflow.outcome_field;
+  const returns = workflow.returns;
+  if (field === undefined || returns === undefined || !consumedStubs.has(returns)) return null;
+
+  const selectedOutput = outputs.get(returns);
+  if (selectedOutput?.state !== 'completed' || !('structuredOutput' in selectedOutput)) return null;
+
+  const structured = selectedOutput.structuredOutput;
+  const selectedNode = workflow.nodes.find(node => node.id === returns);
+  if (
+    selectedNode?.output_format === undefined ||
+    !validateStructuredOutput(structured, selectedNode.output_format).valid
+  ) {
+    return null;
+  }
+  if (!isRecord(structured) || !Object.hasOwn(structured, field)) return null;
+
+  const verdict = structured[field];
+  return typeof verdict === 'boolean' ? (verdict ? 'succeeded' : 'failed') : null;
+}
+
 export async function dryRunWorkflow(options: {
   workflow: ResolvedWorkflow;
   userMessage: string;
@@ -1317,6 +1346,7 @@ export async function dryRunWorkflow(options: {
   return dryRunResultSchema.parse({
     workflow: options.workflow.name,
     outcome,
+    authoredOutcome: resolveDryRunAuthoredOutcome(options.workflow, outputs, ctx.consumedStubs),
     trace: ctx.trace,
     missingStubs: [...ctx.missingStubs].sort(),
     toleratedMissingStubs: [...ctx.toleratedMissingStubs].sort(),
@@ -1353,7 +1383,11 @@ export function formatDryRunTrace(result: DryRunResult): string {
     if (entry.resolvedText) lines.push(`  resolved: ${entry.resolvedText}`);
     if (entry.output !== undefined) lines.push(`  output: ${entry.output}`);
   }
-  lines.push('', `Outcome: ${result.outcome}`);
+  lines.push(
+    '',
+    `Simulation outcome: ${result.outcome}`,
+    `Authored outcome: ${result.authoredOutcome ?? 'undeclared'}`
+  );
   if (result.missingStubs.length > 0)
     lines.push(`Missing stubs: ${result.missingStubs.join(', ')}`);
   if (result.unusedStubs.length > 0) lines.push(`Unused stubs: ${result.unusedStubs.join(', ')}`);
