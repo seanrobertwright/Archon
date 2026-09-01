@@ -92,12 +92,12 @@ packages/cli/
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ archon workflow list [--json]                                    │
+│ archon workflow list [name] [--full] [--json]                    │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ workflow.ts  workflowListCommand(cwd, json?)                     │
+│ workflow.ts  workflowListCommand(cwd, { name, full, json })      │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
@@ -107,6 +107,13 @@ packages/cli/
 │ - Loads bundled defaults                                         │
 │ - Searches .archon/workflows/ recursively                        │
 │ - Merges (repo overrides defaults by name)                       │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Optional name resolution; project errors remain in the result    │
+│ full=false: bounded description preview + ` [truncated]` marker  │
+│ full=true: exact authored description                            │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                ┌───────────────┴───────────────┐

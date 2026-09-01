@@ -1112,6 +1112,41 @@ interface WorkflowJsonEntry {
   parseWarnings?: string[];
 }
 
+export interface WorkflowListOptions {
+  json?: boolean;
+  name?: string;
+  full?: boolean;
+}
+
+const WORKFLOW_DESCRIPTION_PREVIEW_LIMIT = 160;
+const WORKFLOW_DESCRIPTION_TRUNCATION_MARKER = ' [truncated]';
+
+function formatWorkflowDescription(description: string, full: boolean): string {
+  if (full || Array.from(description).length <= WORKFLOW_DESCRIPTION_PREVIEW_LIMIT) {
+    return description;
+  }
+
+  const normalized = description.trim().replace(/\s+/gu, ' ');
+  const codePoints = Array.from(normalized);
+  if (codePoints.length <= WORKFLOW_DESCRIPTION_PREVIEW_LIMIT) {
+    return `${normalized}${WORKFLOW_DESCRIPTION_TRUNCATION_MARKER}`;
+  }
+
+  const firstSentenceEnd = codePoints
+    .slice(0, WORKFLOW_DESCRIPTION_PREVIEW_LIMIT)
+    .findIndex(character => character === '.' || character === '?' || character === '!');
+  if (firstSentenceEnd !== -1) {
+    return `${codePoints.slice(0, firstSentenceEnd + 1).join('')}${WORKFLOW_DESCRIPTION_TRUNCATION_MARKER}`;
+  }
+
+  let preview = codePoints.slice(0, WORKFLOW_DESCRIPTION_PREVIEW_LIMIT);
+  if (codePoints[WORKFLOW_DESCRIPTION_PREVIEW_LIMIT] !== ' ') {
+    const lastWordBoundary = preview.lastIndexOf(' ');
+    if (lastWordBoundary > 0) preview = preview.slice(0, lastWordBoundary);
+  }
+  return `${preview.join('')}${WORKFLOW_DESCRIPTION_TRUNCATION_MARKER}`;
+}
+
 /**
  * Run every declared dry-run fixture and report per-fixture pass/fail (#2772).
  *
@@ -1210,20 +1245,39 @@ export async function workflowTestCommand(
 /**
  * List available workflows in the current directory
  */
-export async function workflowListCommand(cwd: string, json?: boolean): Promise<void> {
+export async function workflowListCommand(
+  cwd: string,
+  options: WorkflowListOptions = {}
+): Promise<void> {
   const { workflows: workflowEntries, errors } = await loadWorkflows(cwd);
+  let listedEntries = workflowEntries;
+  if (options.name !== undefined) {
+    const workflow = resolveWorkflowName(
+      options.name,
+      workflowEntries.map(entry => entry.workflow)
+    );
+    if (workflow === undefined) {
+      const availableWorkflows = workflowEntries
+        .map(entry => `  - ${entry.workflow.name}`)
+        .join('\n');
+      throw new Error(
+        `Workflow '${options.name}' not found.\n\nAvailable workflows:\n${availableWorkflows || '  (none)'}`
+      );
+    }
+    listedEntries = workflowEntries.filter(entry => entry.workflow.name === workflow.name);
+  }
 
-  if (json) {
+  if (options.json) {
     const output = {
       // `declared` rather than the expanded workflow: composition collapses these fields
       // onto the nodes and removes them (#1764), so the listing reports what the author
       // wrote. `webSearchMode` is the one that stays on the definition — it has no
       // per-node form to collapse onto.
-      workflows: workflowEntries.map(
+      workflows: listedEntries.map(
         ({ workflow: w, parseWarnings, declared }): WorkflowJsonEntry => {
           const entry: WorkflowJsonEntry = {
             name: w.name,
-            description: w.description,
+            description: formatWorkflowDescription(w.description, options.full === true),
           };
           if (declared?.provider !== undefined) entry.provider = declared.provider;
           if (declared?.model !== undefined) entry.model = declared.model;
@@ -1245,18 +1299,18 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 
   console.log(`Discovering workflows in: ${cwd}`);
 
-  if (workflowEntries.length === 0 && errors.length === 0) {
+  if (listedEntries.length === 0 && errors.length === 0) {
     console.log('\nNo workflows found.');
     console.log('Workflows should be in .archon/workflows/ directory.');
     return;
   }
 
-  if (workflowEntries.length > 0) {
-    console.log(`\nFound ${workflowEntries.length} workflow(s):\n`);
+  if (listedEntries.length > 0) {
+    console.log(`\nFound ${listedEntries.length} workflow(s):\n`);
 
-    for (const { workflow, parseWarnings, declared } of workflowEntries) {
+    for (const { workflow, parseWarnings, declared } of listedEntries) {
       console.log(`  ${workflow.name}`);
-      console.log(`    ${workflow.description}`);
+      console.log(`    ${formatWorkflowDescription(workflow.description, options.full === true)}`);
       if (declared?.provider) {
         console.log(`    Provider: ${declared.provider}`);
       }

@@ -3,7 +3,7 @@
  * Archon CLI - Run AI workflows from the command line
  *
  * Usage:
- *   archon workflow list              List available workflows
+ *   archon workflow list [name]       List available workflows
  *   archon workflow run <name> [msg]  Run a workflow
  *   archon version                    Show version info
  */
@@ -146,7 +146,8 @@ Usage:
 Commands:
   chat <message>             Send a message to the orchestrator
   setup                      Interactive setup wizard for credentials and config
-  workflow list              List available workflows in current directory
+  workflow list [name] [--full] [--json]
+                             List workflows or show one workflow's full description
   workflow run <name> [msg]  Run a workflow with optional message
   workflow status            Show status of running/paused workflows
   workflow runs              List recent runs (all statuses) for this project
@@ -681,9 +682,18 @@ async function main(): Promise<number> {
           database: true,
         });
         switch (subcommand) {
-          case 'list':
-            await workflowListCommand(effectiveCwd, jsonFlag);
+          case 'list': {
+            const workflowName = positionals[2];
+            if (positionals[3] !== undefined) {
+              return await fail(jsonFlag, 'Usage: archon workflow list [name] [--full] [--json]');
+            }
+            await workflowListCommand(effectiveCwd, {
+              json: jsonFlag,
+              name: workflowName,
+              full: values.full as boolean | undefined,
+            });
             break;
+          }
 
           case 'run': {
             const workflowName = positionals[2];
