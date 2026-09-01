@@ -164,18 +164,26 @@ archon telemetry reset
 
 Exit code 0 on success; 1 if the ID file cannot be written.
 
-### `workflow list`
+### `workflow list [name]`
 
-List workflows available in target directory.
+List workflows available in the target directory, or inspect one workflow by name.
 
 ```bash
+# Compact discovery output
 archon workflow list --cwd /path/to/repo
 
 # Machine-readable output for scripting
 archon workflow list --cwd /path/to/repo --json
+
+# Exact, untouched description for one candidate
+archon workflow list archon-fix-github-issue-codex --full --json
 ```
 
 Discovers flat, one-level grouped, and exact `<pack>/<workflow>/` packaged layouts from `.archon/workflows/` and `~/.archon/workflows/`, plus bundled defaults. See [Global Workflows](/guides/global-workflows/).
+
+The default output is a compact discovery view. Descriptions of at most 160 Unicode code points are returned unchanged. Longer descriptions are whitespace-normalized and reduced to their first sentence when it fits, or to preview content of at most 160 code points at a word boundary. Human-readable output appends ` [truncated]` after a shortened description. JSON keeps the description text separate from its truncation state: `descriptionTruncated` is `true` when content was omitted. Fetch the full description before choosing or launching a workflow when that field is `true`.
+
+The optional `name` uses the same exact, case-insensitive, suffix, and substring resolution as workflow invocation. Ambiguous names fail instead of choosing a workflow; exact names copied from the discovery output are deterministic.
 
 **Flags:**
 
@@ -183,8 +191,9 @@ Discovers flat, one-level grouped, and exact `<pack>/<workflow>/` packaged layou
 |------|--------|
 | `--cwd <path>` | Target directory (required for most use cases) |
 | `--json` | Output machine-readable JSON instead of formatted text |
+| `--full` | Return exact authored descriptions; combine with `name` for one workflow's full detail |
 
-With `--json`, outputs `{ "workflows": [...], "errors": [...] }`. Optional fields (`provider`, `model`, `effort`, `webSearchMode`, `parseWarnings`) are omitted when not set on a workflow. A workflow written with the deprecated `modelReasoningEffort:` reports its value as `effort`, which is what it is translated to at load — unless it also declares `effort:`, which wins. Each `parseWarnings` entry is a full warning message naming a key the engine dropped or deprecated, the workflow or node where it was found, and what to write instead — see [Unknown keys](/guides/authoring-workflows/#unknown-keys-are-reported-not-rejected).
+With `--json`, outputs `{ "workflows": [...], "errors": [...] }`. Each workflow has a `description` and `descriptionTruncated` boolean. `--full` returns the exact authored description and sets `descriptionTruncated` to `false`. Optional fields (`provider`, `model`, `effort`, `webSearchMode`, `parseWarnings`) are omitted when not set on a workflow. A workflow written with the deprecated `modelReasoningEffort:` reports its value as `effort`, which is what it is translated to at load — unless it also declares `effort:`, which wins. Each `parseWarnings` entry is a full warning message naming a key the engine dropped or deprecated, the workflow or node where it was found, and what to write instead — see [Unknown keys](/guides/authoring-workflows/#unknown-keys-are-reported-not-rejected). Discovery errors remain in the top-level `errors` array when a name filters the workflow list. If the named workflow is missing or ambiguous, the failure envelope is `{ "ok": false, "error": "...", "errors": [...] }`, retaining errors found during the same discovery.
 
 ### `workflow run <name> [message]`
 
@@ -435,7 +444,13 @@ archon workflow status --verbose   # add a per-node summary for each run
 archon workflow status --json --verbose
 ```
 
-If `cwd` is not a registered project or project lookup fails, the command falls back to install-wide active runs and says so. Every JSON result carries `scopeFallback`: `true` for that fallback and `false` for a resolved project or explicit `--all` request.
+If `cwd` is an unregistered Git checkout or project lookup fails after dispatch, the command falls back to install-wide active runs and says so. Every JSON result carries `scopeFallback`: `true` for that fallback and `false` for a resolved project or explicit `--all` request. A registered folder project scopes normally; an unregistered non-repository directory is rejected with `Not in a git repository` before status lookup.
+
+The normal human and JSON views include every active node without fetching each run's event
+history. In JSON, `active_nodes` is the ordered list of unresolved node starts: `node_started` adds
+an identifier, while `node_completed`, `node_failed`, `node_skipped`, and
+`node_skipped_prior_success` remove it. Retries re-add the node in their new start position. This
+is node lifecycle state, not evidence that a process owner is alive.
 
 ### `workflow runs`
 
@@ -450,6 +465,11 @@ archon workflow runs --all             # list across all projects (ignore cwd sc
 ```
 
 If `cwd` is not a registered project, the command falls back to a global list and says so — `--json` carries this as a `scopeFallback: true` field so a consuming agent never mistakes a global result for a project-scoped one.
+
+The run-list JSON uses the same `active_nodes` contract as `workflow status`. The retained singular
+fields are compatibility fields: `current_step_name` and `current_step_status` are populated only
+when exactly one node is active, and are `null` for zero or concurrent active nodes. `total_steps`
+is always `null` because lifecycle events do not own a truthful declared DAG total.
 
 The listing shows short 8-character run ids. Every `<run-id>` command below (`get`, `logs`, `wait`, `resume`, `cancel`, `abandon`, `approve`, `reject`) accepts these short ids when run from the project directory: a unique prefix resolves to the full id, an ambiguous prefix errors, and full ids keep working from any directory. Short ids from `--all` rows belonging to *other* projects can't be resolved — use the full id from `--json` for those.
 

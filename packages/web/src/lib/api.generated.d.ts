@@ -3867,6 +3867,7 @@ export interface components {
       platform_type: string | null;
       worker_platform_id: string | null;
       parent_platform_id: string | null;
+      active_nodes: string[];
       current_step_name: string | null;
       total_steps: number | null;
       /** @enum {string|null} */

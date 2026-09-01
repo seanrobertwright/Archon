@@ -18,6 +18,7 @@ import type {
   LoopGateRunMetadata,
   RunAttention,
 } from '@archon/workflows/schemas/workflow-run';
+import type { DashboardWorkflowRun } from '../schemas/workflow-run';
 import * as workflowDb from '../db/workflows';
 import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
 
@@ -33,11 +34,7 @@ function getLog(): ReturnType<typeof createLogger> {
 // ---------------------------------------------------------------------------
 
 export interface WorkflowStatusData {
-  runs: WorkflowRun[];
-}
-
-export interface WorkflowStatusOptions {
-  codebaseId?: string;
+  runs: DashboardWorkflowRun[];
 }
 
 export interface ApprovalOperationResult {
@@ -382,10 +379,10 @@ export function assertRejectable(run: WorkflowRun): ApprovalContext | undefined 
 // ---------------------------------------------------------------------------
 
 /** List running and paused workflow runs, optionally scoped to one codebase. */
-export async function getWorkflowStatus(
-  options?: WorkflowStatusOptions
-): Promise<WorkflowStatusData> {
-  const runs = await workflowDb.listWorkflowRuns({
+export async function getWorkflowStatus(options?: {
+  codebaseId?: string;
+}): Promise<WorkflowStatusData> {
+  const { runs } = await workflowDb.listDashboardRuns({
     status: ['running', 'paused'],
     limit: 50,
     ...(options?.codebaseId ? { codebaseId: options.codebaseId } : {}),

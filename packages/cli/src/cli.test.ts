@@ -172,6 +172,13 @@ describe('CLI help output', () => {
     );
   });
 
+  it('documents compact and full workflow discovery', () => {
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain('workflow list [name] [--full] [--json]');
+    expect(help.stdout).toContain('List compact workflow descriptions');
+    expect(help.stdout).toContain('Use <name> --full for one exact description');
+  });
+
   it('distinguishes active cancel from state-only abandon', () => {
     expect(help.status).toBe(0);
     expect(help.stdout).toContain(
@@ -1337,6 +1344,124 @@ beforeAll(() => {
 
 afterAll(async () => {
   if (jsonEnvelopeHome) await removeTempTree(jsonEnvelopeHome);
+});
+
+describe('workflow list arguments', () => {
+  it('dispatches a named full-description request', () => {
+    const { status, envelope } = spawnJsonError([
+      'workflow',
+      'list',
+      'archon-fix-github-issue-codex',
+      '--full',
+      '--json',
+      '--cwd',
+      repoRoot,
+    ]);
+
+    expect(status).toBe(0);
+    const output = envelope() as {
+      workflows: Array<{
+        name: string;
+        description: string;
+        descriptionTruncated: boolean;
+      }>;
+      errors: unknown[];
+    };
+    expect(output.workflows).toHaveLength(1);
+    expect(output.workflows[0].name).toBe('archon-fix-github-issue-codex');
+    expect(Array.from(output.workflows[0].description).length).toBeGreaterThan(160);
+    expect(output.workflows[0].descriptionTruncated).toBe(false);
+  });
+
+  it('rejects extra positionals with human-readable usage', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_ENTRY, 'workflow', 'list', 'first', 'second', '--cwd', repoRoot],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ARCHON_TELEMETRY_DISABLED: '1',
+          ARCHON_HOME: jsonEnvelopeHome,
+        },
+      }
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Usage: archon workflow list [name] [--full] [--json]');
+    expect(result.stdout).toBe('');
+  });
+
+  it('rejects extra positionals with one JSON error envelope', () => {
+    const { status, envelope } = spawnJsonError([
+      'workflow',
+      'list',
+      'first',
+      'second',
+      '--json',
+      '--cwd',
+      repoRoot,
+    ]);
+
+    expect(status).toBe(1);
+    expect(envelope).not.toThrow();
+    expect(envelope()).toEqual({
+      ok: false,
+      error: 'Usage: archon workflow list [name] [--full] [--json]',
+    });
+  });
+
+  it('reports an unknown workflow through the JSON error envelope', () => {
+    const { status, envelope } = spawnJsonError([
+      'workflow',
+      'list',
+      'definitely-not-a-workflow',
+      '--json',
+      '--cwd',
+      repoRoot,
+    ]);
+
+    expect(status).toBe(1);
+    expect(envelope).not.toThrow();
+    expect(envelope()).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("Workflow 'definitely-not-a-workflow' not found"),
+    });
+  });
+
+  it('preserves discovery errors in a missing-workflow JSON error envelope', async () => {
+    const scratchRepo = mkdtempSync(join(tmpdir(), 'archon-workflow-list-errors-'));
+    try {
+      const gitInit = spawnSync('git', ['init', '--quiet', scratchRepo], { encoding: 'utf8' });
+      expect(gitInit.status).toBe(0);
+      const workflowDir = join(scratchRepo, '.archon', 'workflows');
+      mkdirSync(workflowDir, { recursive: true });
+      writeFileSync(join(workflowDir, 'broken.yaml'), 'name: broken\nnodes: [\n');
+
+      const { status, envelope } = spawnJsonError([
+        'workflow',
+        'list',
+        'definitely-not-a-workflow',
+        '--json',
+        '--cwd',
+        scratchRepo,
+      ]);
+
+      expect(status).toBe(1);
+      expect(envelope()).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("Workflow 'definitely-not-a-workflow' not found"),
+        errors: [
+          {
+            filename: 'broken.yaml',
+            errorType: 'parse_error',
+          },
+        ],
+      });
+    } finally {
+      await removeTempTree(scratchRepo);
+    }
+  });
 });
 
 describe('workflow search --json error envelope', () => {

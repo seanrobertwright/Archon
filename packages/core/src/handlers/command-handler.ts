@@ -886,6 +886,9 @@ async function handleWorkflowCommand(
           if (run.outcome !== null) msg += `  Authored outcome: ${run.outcome}\n`;
           msg += `  ID: ${run.id}\n`;
           msg += `  Path: ${run.working_path ?? '(unknown)'}\n`;
+          if (run.active_nodes.length > 0) {
+            msg += `  Active node${run.active_nodes.length === 1 ? '' : 's'}: ${run.active_nodes.join(', ')}\n`;
+          }
           msg += `  Started: ${new Date(run.started_at).toISOString()}\n\n`;
         }
 

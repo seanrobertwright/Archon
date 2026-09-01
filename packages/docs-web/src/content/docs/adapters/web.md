@@ -134,7 +134,7 @@ Workflows with `interactive: true` in their YAML definition run in the foregroun
 While a workflow runs, a progress card appears in the conversation showing:
 
 - Current status (running, completed, failed, paused)
-- Which DAG node is currently executing
+- Every DAG node currently executing; parallel active nodes are shown together
 - Per-node status indicators
 - Elapsed time
 

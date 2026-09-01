@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { DashboardWorkflowRun } from '../schemas/workflow-run';
 import type * as WorkflowDb from '../db/workflows';
 import type * as WorkflowEventDb from '../db/workflow-events';
 import type * as WorkflowNodeSessionDb from '../db/workflow-node-sessions';
@@ -10,7 +11,18 @@ import type * as CleanupService from '../services/cleanup-service';
 // ---------------------------------------------------------------------------
 
 const mockGetWorkflowRun = mock<typeof WorkflowDb.getWorkflowRun>(() => Promise.resolve(null));
-const mockListWorkflowRuns = mock<typeof WorkflowDb.listWorkflowRuns>(() => Promise.resolve([]));
+const EMPTY_COUNTS = {
+  all: 0,
+  running: 0,
+  completed: 0,
+  failed: 0,
+  cancelled: 0,
+  pending: 0,
+  paused: 0,
+};
+const mockListDashboardRuns = mock<typeof WorkflowDb.listDashboardRuns>(() =>
+  Promise.resolve({ runs: [], total: 0, counts: EMPTY_COUNTS })
+);
 const mockUpdateWorkflowRun = mock<typeof WorkflowDb.updateWorkflowRun>(() => Promise.resolve());
 const mockCancelWorkflowRun = mock<typeof WorkflowDb.cancelWorkflowRun>(() =>
   Promise.resolve({ cancelled: true })
@@ -32,7 +44,7 @@ const mockResolveAndCancelApprovalGate = mock<typeof WorkflowDb.resolveAndCancel
 
 mock.module('../db/workflows', () => ({
   getWorkflowRun: mockGetWorkflowRun,
-  listWorkflowRuns: mockListWorkflowRuns,
+  listDashboardRuns: mockListDashboardRuns,
   updateWorkflowRun: mockUpdateWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   cancelResumableRunsForConversation: mockCancelResumableRunsForConversation,
@@ -123,6 +135,24 @@ function makePausedRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     parent_run_id: null,
     adopted_from_run_id: null,
     output_root: null,
+    ...overrides,
+  };
+}
+
+function makeDashboardRun(overrides: Partial<DashboardWorkflowRun> = {}): DashboardWorkflowRun {
+  return {
+    ...makePausedRun(),
+    codebase_name: 'Archon',
+    platform_type: 'cli',
+    worker_platform_id: null,
+    parent_platform_id: null,
+    active_nodes: [],
+    current_step_name: null,
+    total_steps: null,
+    current_step_status: null,
+    agents_completed: null,
+    agents_failed: null,
+    agents_total: null,
     ...overrides,
   };
 }
@@ -1197,31 +1227,40 @@ describe('assertApprovable / assertRejectable — shared precondition gate', () 
 
 describe('getWorkflowStatus', () => {
   beforeEach(() => {
-    mockListWorkflowRuns.mockClear();
+    mockListDashboardRuns.mockClear();
   });
 
   test('returns running and paused runs', async () => {
     const runs = [
-      makePausedRun({ status: 'running' }),
-      makePausedRun({ id: 'run-2', status: 'paused' }),
+      makeDashboardRun({ status: 'running', active_nodes: ['plan', 'implement'] }),
+      makeDashboardRun({ id: 'run-2', status: 'paused' }),
     ];
-    mockListWorkflowRuns.mockResolvedValueOnce(runs);
+    mockListDashboardRuns.mockResolvedValueOnce({
+      runs,
+      total: 2,
+      counts: { ...EMPTY_COUNTS, all: 2, running: 1, paused: 1 },
+    });
 
     const result = await getWorkflowStatus();
 
     expect(result.runs).toHaveLength(2);
-    expect(mockListWorkflowRuns).toHaveBeenCalledWith({
+    expect(result.runs[0]?.active_nodes).toEqual(['plan', 'implement']);
+    expect(mockListDashboardRuns).toHaveBeenCalledWith({
       status: ['running', 'paused'],
       limit: 50,
     });
   });
 
   test('passes an explicit codebase scope to the active-run query', async () => {
-    mockListWorkflowRuns.mockResolvedValueOnce([]);
+    mockListDashboardRuns.mockResolvedValueOnce({
+      runs: [],
+      total: 0,
+      counts: EMPTY_COUNTS,
+    });
 
     await getWorkflowStatus({ codebaseId: 'cb-project-a' });
 
-    expect(mockListWorkflowRuns).toHaveBeenCalledWith({
+    expect(mockListDashboardRuns).toHaveBeenCalledWith({
       status: ['running', 'paused'],
       limit: 50,
       codebaseId: 'cb-project-a',
