@@ -3829,6 +3829,8 @@ export function registerApiRoutes(
     const approvalRaw = run.metadata.approval;
     const approval = isApprovalContext(approvalRaw) ? approvalRaw : undefined;
     switch (attention?.kind) {
+      case 'action_required':
+        return 'Run is paused for an outside action. Complete it, then resume the run; abandon it if it should not continue.';
       case 'blocked_on_child':
         // Not an approvable gate — the parent resumes automatically when the child
         // completes. Send the caller to the run where the decision actually lives.

@@ -4476,6 +4476,13 @@ async function executeLoopGroupNode(
     isLegacyInteractiveLoopResume || isEscalatedGateResume || isEscalatedWaitResume;
   const resumeIteration = loopGateMeta?.iteration ?? loopOwnedWaitMeta?.iteration ?? 0;
   const startIteration = isLoopResume ? resumeIteration + 1 : 1;
+  // max_iterations bounds autonomous work. An attention wait contributes no work while
+  // paused, so each explicit resume authorizes one fresh iteration even after that bound.
+  // This keeps manual recovery resumable without turning a concluded-red wait into polling.
+  const iterationLimit =
+    isEscalatedWaitResume && loopOwnedWaitMeta?.kind === 'attention'
+      ? Math.max(group.max_iterations, startIteration)
+      : group.max_iterations;
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLegacyInteractiveLoopResume
     ? (loopGateRunMeta.loop_user_input ?? '')
@@ -4528,6 +4535,8 @@ async function executeLoopGroupNode(
       terminalNode,
       workflowRun,
       deps,
+      platform,
+      conversationId,
       outerNodeOutputs,
       bodyStepNamePrefix,
       {
@@ -4774,7 +4783,7 @@ async function executeLoopGroupNode(
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_group_node.iteration_event_failed');
   };
 
-  for (let i = startIteration; i <= group.max_iterations; i++) {
+  for (let i = startIteration; i <= iterationLimit; i++) {
     const iterationStart = Date.now();
 
     // Between-iteration status check (paused tolerated — mirrors executeLoopNode).
@@ -4800,14 +4809,14 @@ async function executeLoopGroupNode(
       runId: workflowRun.id,
       nodeId: node.id,
       iteration: i,
-      maxIterations: group.max_iterations,
+      maxIterations: iterationLimit,
     });
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'loop_iteration_started',
         step_name: stepName,
-        data: { iteration: i, maxIterations: group.max_iterations, nodeId: node.id },
+        data: { iteration: i, maxIterations: iterationLimit, nodeId: node.id },
       })
       .catch((err: Error) => {
         logEventStoreError(err, i);
@@ -5355,9 +5364,9 @@ async function executeLoopGroupNode(
   }
 
   // Max iterations exceeded.
-  const errorMsg = `Loop-group node '${node.id}' exceeded max iterations (${String(group.max_iterations)}) ${describeUnmetCompletion(group)}`;
+  const errorMsg = `Loop-group node '${node.id}' exceeded max iterations (${String(iterationLimit)}) ${describeUnmetCompletion(group)}`;
   getLog().warn(
-    { nodeId: node.id, maxIterations: group.max_iterations, signal: group.until },
+    { nodeId: node.id, maxIterations: iterationLimit, signal: group.until },
     'loop_group_node.max_iterations_reached'
   );
   await safeSendMessage(platform, conversationId, errorMsg, msgContext);
@@ -5367,7 +5376,7 @@ async function executeLoopGroupNode(
     error: errorMsg,
     costUsd: loopTotalCostUsd,
     ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
-    loopIterations: group.max_iterations,
+    loopIterations: iterationLimit,
   };
 }
 
@@ -7074,6 +7083,8 @@ async function executeWaitNode(
   node: WaitNode,
   workflowRun: WorkflowRun,
   deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
   nodeOutputs: Map<string, NodeOutput>,
   stepNamePrefix = '',
   loopOwner?: WaitLoopOwner
@@ -7136,7 +7147,7 @@ async function executeWaitNode(
       waitingSince: now.toISOString(),
       resumeAt: new Date(resumeAtMs).toISOString(),
     };
-  } else {
+  } else if (condition.kind === 'event') {
     const event = substituteNodeOutputRefs(
       substituteInputRefs(condition.event, resolveRunInputs(workflowRun)),
       nodeOutputs
@@ -7151,12 +7162,28 @@ async function executeWaitNode(
       waitingSince: now.toISOString(),
       resumeAt: new Date(now.getTime() + condition.deadlineMs).toISOString(),
     };
+  } else {
+    const message = substituteNodeOutputRefs(
+      substituteInputRefs(condition.message, resolveRunInputs(workflowRun)),
+      nodeOutputs
+    ).trim();
+    if (message === '') {
+      throw new Error(`Wait node '${node.id}' resolved 'attention' to an empty message`);
+    }
+    context = {
+      ...owner,
+      kind: 'attention',
+      waitingSince: now.toISOString(),
+      message,
+    };
   }
 
-  const resumeAtMs = Date.parse(context.resumeAt);
+  const resumeAtMs = context.kind === 'attention' ? undefined : Date.parse(context.resumeAt);
   const isSignaled = context.kind === 'event' && context.signaledAt !== undefined;
-  const isDue = now.getTime() >= resumeAtMs;
-  if (!isSignaled && !isDue) {
+  const isDue = resumeAtMs !== undefined && now.getTime() >= resumeAtMs;
+  const isAttentionResume = context.kind === 'attention' && persisted !== undefined;
+  if (!isSignaled && !isDue && !isAttentionResume) {
+    let paused = false;
     try {
       await deps.store.pauseWorkflowRunForWait(
         workflowRun.id,
@@ -7165,6 +7192,7 @@ async function executeWaitNode(
           ? { kind: 'started', stepName: stepNamePrefix + node.id }
           : { kind: 'continued' }
       );
+      paused = true;
     } catch (pauseError) {
       const status = await deps.store.getWorkflowRunStatus(workflowRun.id);
       if (status === 'running') throw pauseError;
@@ -7172,6 +7200,25 @@ async function executeWaitNode(
         { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
         'dag.wait_pause_skipped_external_transition'
       );
+    }
+    if (paused && context.kind === 'attention') {
+      const delivered = await safeSendMessage(
+        platform,
+        conversationId,
+        `⏸️ **Action required for workflow run \`${workflowRun.id}\`**\n\n${context.message}\n\nResume this run after the action is complete, or abandon it if it should not continue.`,
+        { workflowId: workflowRun.id, nodeName: node.id }
+      );
+      if (!delivered) {
+        const deliveryError = `Wait node '${node.id}' could not deliver its action-required notification`;
+        const { failed } = await requireTerminalStatusWrite(
+          deps.store.failPausedAttentionWait(workflowRun.id, context, deliveryError),
+          {
+            workflowRunId: workflowRun.id,
+            site: 'dag.attention_notification_fail',
+          }
+        );
+        if (failed) throw new Error(deliveryError);
+      }
     }
     return { state: 'completed', output: '' };
   }
@@ -10304,6 +10351,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   node,
                   ctx.workflowRun,
                   ctx.deps,
+                  ctx.platform,
+                  ctx.conversationId,
                   ctx.nodeOutputs,
                   ctx.stepNamePrefix,
                   loopFrame === undefined

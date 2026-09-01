@@ -116,7 +116,7 @@ import { discoverWorkflows } from './workflow-discovery';
 import { validateWorkflowResources } from './validator';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
-import type { WorkflowRun } from './schemas/workflow-run';
+import type { WorkflowRun, WorkflowWaitContext } from './schemas/workflow-run';
 import type { ResolvedWorkflow } from './schemas/workflow';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 import type {
@@ -302,14 +302,39 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve();
   };
 
+  failPausedAttentionWait: IWorkflowStore['failPausedAttentionWait'] = (id, waitContext, error) => {
+    const r = this.runs.get(id);
+    const wait = r?.metadata.wait as WorkflowWaitContext | undefined;
+    const ownerMatches =
+      wait?.owner === waitContext.owner &&
+      (wait?.owner !== 'loop_group' ||
+        waitContext.owner !== 'loop_group' ||
+        (wait.bodyWaitId === waitContext.bodyWaitId && wait.iteration === waitContext.iteration));
+    if (
+      r?.status === 'paused' &&
+      wait?.kind === 'attention' &&
+      wait.nodeId === waitContext.nodeId &&
+      wait.waitingSince === waitContext.waitingSince &&
+      ownerMatches
+    ) {
+      r.status = 'failed';
+      r.completed_at = new Date();
+      r.metadata = { ...r.metadata, error };
+      return Promise.resolve({ failed: true });
+    }
+    return Promise.resolve({ failed: false });
+  };
+
   clearWorkflowWaitContext: IWorkflowStore['clearWorkflowWaitContext'] = (id, waitContext) => {
     const r = this.runs.get(id);
-    const wait = r?.metadata.wait as { nodeId?: string; resumeAt?: string } | undefined;
-    if (
-      r?.status === 'running' &&
-      wait?.nodeId === waitContext.nodeId &&
-      wait.resumeAt === waitContext.resumeAt
-    ) {
+    const wait = r?.metadata.wait as WorkflowWaitContext | undefined;
+    const cursorMatches =
+      wait?.kind === 'attention' && waitContext.kind === 'attention'
+        ? wait.waitingSince === waitContext.waitingSince
+        : wait?.kind !== 'attention' &&
+          waitContext.kind !== 'attention' &&
+          wait?.resumeAt === waitContext.resumeAt;
+    if (r?.status === 'running' && wait?.nodeId === waitContext.nodeId && cursorMatches) {
       const { wait: _wait, ...metadata } = r.metadata;
       r.metadata = metadata;
       return Promise.resolve({ cleared: true });

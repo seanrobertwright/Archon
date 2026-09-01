@@ -549,14 +549,18 @@ access to the local file as access to the run's input and execution data.
 
 ### `workflow wait`
 
-Block until a run reaches a state it will not leave on its own — it finished, or it
-parked on a gate awaiting a response — then print what it needs. This is the intended
+Block until a run reaches a state it will not leave on its own — it finished, parked
+on a gate awaiting a response, or paused for an outside action — then print what it needs. This is the intended
 partner of `--detach --json`: take the `runId` from the launch ack and wait on it,
 instead of polling `workflow get` in a loop.
 
 The response a gate is waiting for does not have to come from a person. An
 orchestrating agent can supply it with `workflow respond` just as a reviewer can; the
 engine only reports that one is owed, and who answers is the waiting host's business.
+For an action-required wait, the output carries `attention.kind: "action_required"`,
+the authored message, and the paused node id. Complete the action, then run
+`archon workflow resume <run-id>`; use `archon workflow abandon <run-id>` if the run
+should not continue.
 
 ```bash
 archon workflow wait <run-id>
@@ -572,7 +576,7 @@ its own clock would be answering a question only the run can answer. `--timeout
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | The run said something — it finished (`completed`, `failed`, or `cancelled`) or it is waiting for a response. The status is data on stdout. |
+| `0` | The run said something — it finished (`completed`, `failed`, or `cancelled`), is waiting for a response, or needs an outside action. The status is data on stdout. |
 | `3` | The timeout passed with the run still live. The `--json` payload carries `observedStatus`. |
 | `1` | The wait itself failed — unknown run id, database unreachable, or output that could not be delivered. |
 
@@ -594,6 +598,8 @@ exit code would make a legitimately cancelled run look like a broken command.
   a parent blocked on a `workflow:` sub-run wakes when the chain below it reaches a gate,
   and `respondTo.runId` is the child you answer. A parent blocked on a child that is
   merely still running wakes nobody.
+- `action_required` — the run needs the outside action described by `message`. Once it is
+  complete, resume `runId`; use the node id to identify the paused workflow step.
 - `unreadable` — the run is parked but cannot describe itself (corrupt gate metadata, a
   gate type this build does not know, a sub-run pointer with no row). `detail` says which.
 

@@ -119,6 +119,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
     pauseWorkflowRunForWait: mock(async () => {}),
+    failPausedAttentionWait: mock(async () => ({ failed: true })),
     clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),

@@ -724,6 +724,7 @@ describe('CommandHandler', () => {
         expect(result.success).toBe(true);
         expect(result.message).toContain('Archon Orchestrator');
         expect(result.message).toContain('/workflow list');
+        expect(result.message).toContain('/workflow resume <id>` — Resume a failed or paused run');
         expect(result.message).toContain('/status');
       });
     });
@@ -1938,6 +1939,58 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('Authored outcome: succeeded');
       });
 
+      test('should direct an action-required pause to resume instead of approval controls', async () => {
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [
+            makeDashboardRun({
+              id: 'run-attention',
+              workflow_name: 'deliver',
+              status: 'paused',
+              metadata: {
+                wait: {
+                  owner: 'node',
+                  nodeId: 'rerun-ci',
+                  kind: 'attention',
+                  waitingSince: '2026-08-31T10:00:00.000Z',
+                  message: 'Re-run the failing check, then resume this run.',
+                },
+              },
+            }),
+          ],
+          total: 1,
+          counts: { ...EMPTY_DASHBOARD_COUNTS, all: 1, paused: 1 },
+        });
+
+        const result = await handleCommand(baseConversation, '/workflow status');
+
+        expect(result.message).toContain('Re-run the failing check, then resume this run.');
+        expect(result.message).toContain('/workflow resume run-attention');
+        expect(result.message).toContain('/workflow abandon run-attention');
+        expect(result.message).not.toContain('/workflow approve run-attention');
+        expect(result.message).not.toContain('/workflow reject run-attention');
+      });
+
+      test('should direct an approval pause to approve or reject', async () => {
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [
+            makeDashboardRun({
+              id: 'run-approval',
+              workflow_name: 'review',
+              status: 'paused',
+              metadata: { approval: { nodeId: 'gate', message: 'Approve delivery?' } },
+            }),
+          ],
+          total: 1,
+          counts: { ...EMPTY_DASHBOARD_COUNTS, all: 1, paused: 1 },
+        });
+
+        const result = await handleCommand(baseConversation, '/workflow status');
+
+        expect(result.message).toContain('/workflow approve run-approval');
+        expect(result.message).toContain('/workflow reject run-approval <reason>');
+        expect(result.message).not.toContain('/workflow resume run-approval');
+      });
+
       test('should show no-active message when no workflows running', async () => {
         mockListDashboardRuns.mockResolvedValueOnce({
           runs: [],
@@ -2119,6 +2172,7 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toContain('Usage: /workflow resume <id>');
+        expect(result.message).toContain('failed or paused workflow');
       });
 
       test('should handle DB error on resume gracefully', async () => {
@@ -2367,6 +2421,7 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toContain('/workflow status');
+        expect(result.message).toContain('/workflow resume <id> - Resume a failed or paused run');
       });
     });
 

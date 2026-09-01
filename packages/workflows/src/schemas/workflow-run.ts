@@ -54,6 +54,11 @@ const workflowWaitEventFields = {
   signaledAt: z.string().datetime().optional(),
   payload: z.unknown().optional(),
 } as const;
+const workflowWaitAttentionFields = {
+  kind: z.literal('attention'),
+  waitingSince: z.string().datetime(),
+  message: z.string().trim().min(1),
+} as const;
 const workflowWaitNodeOwnerFields = {
   owner: z.literal('node'),
   nodeId: z.string().min(1),
@@ -68,17 +73,20 @@ const workflowWaitLoopOwnerFields = {
 } as const;
 
 /**
- * Persisted reason a run is waiting on the outside world rather than a person.
+ * Persisted reason a run is waiting outside its current execution.
  * Loop-owned cursors carry their complete owner path in the initial pause write;
  * there is no externally visible body-owned intermediate state.
  */
 export const workflowWaitContextSchema = z.union([
   z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitTimeFields }),
   z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitEventFields }),
+  z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitAttentionFields }),
   z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitTimeFields }),
   z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitEventFields }),
+  z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitAttentionFields }),
 ]);
 export type WorkflowWaitContext = z.infer<typeof workflowWaitContextSchema>;
+export type WorkflowAttentionWaitContext = Extract<WorkflowWaitContext, { kind: 'attention' }>;
 
 export function isWorkflowWaitContext(value: unknown): value is WorkflowWaitContext {
   return workflowWaitContextSchema.safeParse(value).success;
@@ -769,6 +777,12 @@ export type RunAttentionUnreadableReason =
 export type RunAttention =
   | { kind: 'terminal'; runId: string; status: RunTerminalStatus; at: Date | null }
   | { kind: 'awaiting_response'; runId: string; respondTo: GateAddress; message: string }
+  | {
+      kind: 'action_required';
+      runId: string;
+      nodeId: string;
+      message: string;
+    }
   | { kind: 'blocked_on_child'; runId: string; childRunId: string; nodeId: string }
   | { kind: 'unreadable'; runId: string; reason: RunAttentionUnreadableReason; detail: string };
 
@@ -808,11 +822,21 @@ export function runAttention(run: RunAttentionInput): RunAttention | null {
   }
   if (run.status !== 'paused') return null;
 
+  const wait = run.metadata?.wait;
+  if (isWorkflowWaitContext(wait) && wait.kind === 'attention') {
+    return {
+      kind: 'action_required',
+      runId: run.id,
+      nodeId: workflowWaitStepName(wait),
+      message: wait.message,
+    };
+  }
+
   const raw = run.metadata?.approval;
   if (raw === undefined) {
-    // No gate recorded. A durable `wait:` owns its own resumption — the clock or the
-    // awaited event, not a person. Anything else is a run parked with nothing that
-    // describes why, which nothing but an outside response can unstick.
+    // No gate recorded. A durable `wait:` owns its own resumption. Anything else is
+    // a run parked with nothing that describes why, which nothing but an outside
+    // response can unstick.
     return isWorkflowWaitContext(run.metadata?.wait)
       ? null
       : unreadableAttention(

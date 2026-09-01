@@ -48,6 +48,7 @@ const {
   cancelFanOutRun,
   pauseWorkflowRun,
   pauseWorkflowRunForWait,
+  failPausedAttentionWait,
   clearWorkflowWaitContext,
   signalWorkflowWait,
   listDueWorkflowContinuations,
@@ -818,6 +819,86 @@ describe('durable wait continuation races — real SQLite', () => {
     resumeAt: '2099-08-25T10:00:00.000Z',
   };
 
+  test('never schedules an action-required wait and consumes it only after explicit resume', async () => {
+    const attentionA = {
+      owner: 'node' as const,
+      nodeId: 'rerun-ci',
+      kind: 'attention' as const,
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'Re-run the failing check, then resume.',
+    };
+    await seed('attention-explicit-resume', 'paused', "datetime('now')", { wait: attentionA });
+
+    const due = await listDueWorkflowContinuations(new Date('2099-08-24T10:00:00.000Z'), 25);
+    expect(due.map(run => run.id)).not.toContain('attention-explicit-resume');
+
+    await expect(resumeWorkflowRun('attention-explicit-resume')).resolves.toMatchObject({
+      id: 'attention-explicit-resume',
+      status: 'running',
+    });
+    await expect(
+      clearWorkflowWaitContext('attention-explicit-resume', attentionA, {
+        stepName: 'rerun-ci',
+        result: { status: 'satisfied', waited_ms: 1000 },
+      })
+    ).resolves.toEqual({ cleared: true });
+
+    const attentionB = {
+      ...attentionA,
+      waitingSince: '2026-08-24T10:01:00.000Z',
+      message: 'The check is still red. Re-run it, then resume.',
+    };
+    await pauseWorkflowRunForWait('attention-explicit-resume', attentionB, {
+      kind: 'started',
+      stepName: 'rerun-ci',
+    });
+    await resumeWorkflowRun('attention-explicit-resume');
+    await expect(
+      clearWorkflowWaitContext('attention-explicit-resume', attentionA, {
+        stepName: 'rerun-ci',
+        result: { status: 'satisfied', waited_ms: 1000 },
+      })
+    ).resolves.toEqual({ cleared: false });
+    expect((await getWorkflowRun('attention-explicit-resume'))?.metadata.wait).toEqual(attentionB);
+  });
+
+  test('makes an undeliverable action-required pause visibly failed', async () => {
+    const attention = {
+      owner: 'node' as const,
+      nodeId: 'rerun-ci',
+      kind: 'attention' as const,
+      waitingSince: '2026-08-24T11:00:00.000Z',
+      message: 'Re-run the failing check, then resume.',
+    };
+    await seed('attention-notification-failed', 'paused', "datetime('now')", { wait: attention });
+
+    await expect(
+      failPausedAttentionWait(
+        'attention-notification-failed',
+        attention,
+        'action-required notification was not delivered'
+      )
+    ).resolves.toEqual({ failed: true });
+
+    const failed = await getWorkflowRun('attention-notification-failed');
+    expect(failed?.status).toBe('failed');
+    expect(failed?.completed_at).not.toBeNull();
+    expect(failed?.metadata).toMatchObject({
+      wait: attention,
+      error: 'action-required notification was not delivered',
+    });
+    expect(await countEvents('attention-notification-failed', 'workflow_failed')).toBe(1);
+
+    await expect(
+      failPausedAttentionWait(
+        'attention-notification-failed',
+        attention,
+        'duplicate notification failure'
+      )
+    ).resolves.toEqual({ failed: false });
+    expect(await countEvents('attention-notification-failed', 'workflow_failed')).toBe(1);
+  });
+
   test('rejects a stale signal after the same event advances to a later occurrence', async () => {
     await seed('wait-signal-cursor', 'paused', "datetime('now')", { wait: waitA });
     await resumeWorkflowRun('wait-signal-cursor', {
@@ -862,7 +943,11 @@ describe('durable wait continuation races — real SQLite', () => {
 
     const due = await listDueWorkflowContinuations(new Date('2026-08-24T10:02:00.000Z'), 25);
     const dueRun = due.find(run => run.id === 'wait-three-way-race');
-    if (!dueRun || !isWorkflowWaitContext(dueRun.metadata.wait)) {
+    if (
+      !dueRun ||
+      !isWorkflowWaitContext(dueRun.metadata.wait) ||
+      dueRun.metadata.wait.kind === 'attention'
+    ) {
       throw new Error('Expected the signaled wait to be selected as a due continuation');
     }
     const cursor = {

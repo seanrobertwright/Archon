@@ -819,7 +819,7 @@ describe('bundled-defaults', () => {
     );
 
     it.skipIf(process.platform === 'win32')(
-      'refuses a non-green check and names the recovery instead of flipping',
+      'refuses a non-green check instead of flipping',
       async () => {
         const { result, ghLog } = await runFlipReady({
           name: 'red-checks-ready-flip',
@@ -847,12 +847,6 @@ describe('bundled-defaults', () => {
         const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
         expect(flip?.state).toBe('failed');
         expect(flip?.reason).toContain('test (windows-latest) (fail)');
-        // A run that dies here is recoverable in seconds, and the operator is the only
-        // one who can start it: a concluded check does not re-run itself, and nothing
-        // in this node waits for one (#2976). So the refusal says so rather than
-        // leaving it as tribal knowledge.
-        expect(flip?.reason).toContain('re-run the failing check');
-        expect(flip?.reason).toContain('resume this run');
         expect(ghLog).not.toContain('pr ready');
       }
     );

@@ -3,6 +3,18 @@ import type { components } from '@/lib/api.generated';
 
 export type RunOrigin = 'web' | 'cli' | 'slack' | 'telegram' | 'discord' | 'github' | 'unknown';
 export type RunOutcome = components['schemas']['WorkflowRunOutcome'];
+type WorkflowRunMetadata = components['schemas']['WorkflowRunMetadata'];
+type WorkflowWait = NonNullable<WorkflowRunMetadata['wait']>;
+type WorkflowWaitOwnerField =
+  | 'owner'
+  | 'nodeId'
+  | 'bodyWaitId'
+  | 'iteration'
+  | 'sessionId'
+  | 'sessionProvider';
+type NormalizedWorkflowWait<T extends WorkflowWait = WorkflowWait> = T extends WorkflowWait
+  ? Omit<T, WorkflowWaitOwnerField> & { nodeId: string }
+  : never;
 
 export interface Run {
   id: string;
@@ -58,12 +70,7 @@ export interface Run {
     decisionsAuthored: boolean;
   } | null;
   /** Active durable wait cursor. Mutually exclusive with approval metadata. */
-  wait?: {
-    nodeId: string;
-    kind: 'time' | 'event';
-    resumeAt: string;
-    event?: string;
-  } | null;
+  wait?: NormalizedWorkflowWait | null;
   /**
    * Set when a paused run's gate was already approved/rejected and the run is
    * only awaiting auto-resume (server: metadata.approval.resolved). The
@@ -98,7 +105,7 @@ interface RawWorkflowRun {
   completed_at?: string | null;
   working_path?: string | null;
   user_message?: string;
-  metadata?: Record<string, unknown>;
+  metadata?: WorkflowRunMetadata;
   /** Only present on dashboard runs — enriched by server-side join. */
   codebase_name?: string | null;
   platform_type?: string | null;
@@ -122,6 +129,20 @@ function normalizeStatus(s: string): RunStatus {
   return (KNOWN_STATUSES as readonly string[]).includes(s) ? (s as RunStatus) : 'running';
 }
 
+function normalizeWorkflowWait(wait: WorkflowWait): NormalizedWorkflowWait {
+  if (wait.owner === 'node') {
+    const { owner, ...normalized } = wait;
+    void owner;
+    return normalized;
+  }
+  const { owner, nodeId, bodyWaitId, iteration, sessionId, sessionProvider, ...normalized } = wait;
+  void owner;
+  void iteration;
+  void sessionId;
+  void sessionProvider;
+  return { ...normalized, nodeId: `${nodeId}.${bodyWaitId}` };
+}
+
 export function normalizeOrigin(s: string | null | undefined): RunOrigin {
   if (s === null || s === undefined) return 'unknown';
   const lower = s.toLowerCase();
@@ -138,7 +159,7 @@ export function normalizeOrigin(s: string | null | undefined): RunOrigin {
   }
 }
 
-function readCost(meta: Record<string, unknown> | undefined): number | null {
+function readCost(meta: WorkflowRunMetadata | undefined): number | null {
   if (meta === undefined) return null;
   const raw = meta.total_cost_usd;
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
@@ -204,25 +225,8 @@ export function toRun(raw: RawWorkflowRun): Run {
         }
       : null;
   const wait = raw.metadata?.wait;
-  const isWaitShape =
-    wait !== null &&
-    typeof wait === 'object' &&
-    wait !== undefined &&
-    'nodeId' in wait &&
-    typeof wait.nodeId === 'string' &&
-    'resumeAt' in wait &&
-    typeof (wait as { resumeAt: unknown }).resumeAt === 'string' &&
-    'kind' in wait &&
-    ((wait as { kind: unknown }).kind === 'time' || (wait as { kind: unknown }).kind === 'event');
-  const waitRecord = isWaitShape ? (wait as Record<string, unknown>) : undefined;
-  const parsedWait = isWaitShape
-    ? {
-        nodeId: (wait as { nodeId: string }).nodeId,
-        kind: (wait as { kind: 'time' | 'event' }).kind,
-        resumeAt: (wait as { resumeAt: string }).resumeAt,
-        ...(typeof waitRecord?.event === 'string' ? { event: waitRecord.event } : {}),
-      }
-    : null;
+  const parsedWait: NormalizedWorkflowWait | null =
+    wait === undefined ? null : normalizeWorkflowWait(wait);
 
   return {
     id: raw.id,
@@ -243,7 +247,7 @@ export function toRun(raw: RawWorkflowRun): Run {
     activeNodes,
     currentNode: activeNodes.length === 1 ? (activeNodes[0] ?? null) : null,
     lastTool: null,
-    approval: parsedApproval,
+    approval: parsedWait === null ? parsedApproval : null,
     wait: parsedWait,
     gateResolved,
     parentRunId: raw.parent_run_id ?? null,

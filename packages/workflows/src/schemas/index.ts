@@ -225,6 +225,7 @@ export type {
   WorkflowRun,
   ArtifactType,
   ApprovalContext,
+  WorkflowAttentionWaitContext,
   WorkflowWaitContext,
   ScheduledWorkflowResume,
   SuspendReason,

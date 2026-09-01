@@ -598,12 +598,6 @@ export const haltNodeSchema = dagNodeBaseSchema.extend({
 /** DAG node that cancels the workflow run with a reason string */
 export type HaltNode = z.infer<typeof haltNodeSchema>;
 
-export const waitConfigFlatSchema = z.object({
-  duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS).optional(),
-  until: z.string().min(1, "'wait.until' must not be empty").optional(),
-  event: z.string().trim().min(1, "'wait.event' must not be empty").optional(),
-  deadline_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS).optional(),
-});
 export const waitUntilTimestampSchema = z.string().datetime();
 const waitUntilValueSchema = z
   .string()
@@ -616,33 +610,40 @@ const waitUntilValueSchema = z
     "'wait.until' must be an ISO-8601 timestamp or contain a runtime reference"
   );
 
-// The transforms preserve the validated wire shape while making sibling fields
-// `never` in the inferred type, so widened programmatic objects cannot combine variants.
-export const waitConfigSchema = z.union([
-  z
-    .strictObject({ duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS) })
-    .transform(
-      value => value as typeof value & { until?: never; event?: never; deadline_ms?: never }
-    ),
-  z
-    .strictObject({ until: waitUntilValueSchema })
-    .transform(
-      value => value as typeof value & { duration_ms?: never; event?: never; deadline_ms?: never }
-    ),
-  z
-    .strictObject({
-      event: z.string().trim().min(1, "'wait.event' must not be empty"),
-      deadline_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS),
-    })
-    .transform(value => value as typeof value & { duration_ms?: never; until?: never }),
-]);
-export type WaitConfig = z.infer<typeof waitConfigSchema>;
+const waitConfigVariantSchemas = [
+  z.strictObject({
+    duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS),
+  }),
+  z.strictObject({ until: waitUntilValueSchema }),
+  z.strictObject({
+    event: z.string().trim().min(1, "'wait.event' must not be empty"),
+    deadline_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS),
+  }),
+  z.strictObject({
+    attention: z.string().trim().min(1, "'wait.attention' must not be empty"),
+  }),
+] as const;
+const waitConfigKeys = new Set(
+  waitConfigVariantSchemas.flatMap(schema => Object.keys(schema.shape))
+);
+
+type WaitConfigVariant = z.infer<(typeof waitConfigVariantSchemas)[number]>;
+type WaitConfigKey<Variant> = Variant extends unknown ? keyof Variant : never;
+type ExclusiveWaitConfig<Variant, All = Variant> = Variant extends unknown
+  ? Variant & Partial<Record<Exclude<WaitConfigKey<All>, keyof Variant>, never>>
+  : never;
+
+export type WaitConfig = ExclusiveWaitConfig<WaitConfigVariant>;
+export const waitConfigSchema = z
+  .union(waitConfigVariantSchemas)
+  .transform(value => value as WaitConfig);
 
 /** Validated engine condition used for exhaustive wait execution. */
 export type WaitCondition =
   | { kind: 'duration'; durationMs: number }
   | { kind: 'until'; timestamp: string }
-  | { kind: 'event'; event: string; deadlineMs: number };
+  | { kind: 'event'; event: string; deadlineMs: number }
+  | { kind: 'attention'; message: string };
 
 export function waitCondition(config: WaitConfig): WaitCondition {
   if (config.duration_ms !== undefined) {
@@ -651,7 +652,10 @@ export function waitCondition(config: WaitConfig): WaitCondition {
   if (config.until !== undefined) {
     return { kind: 'until', timestamp: config.until };
   }
-  return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };
+  if (config.event !== undefined) {
+    return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };
+  }
+  return { kind: 'attention', message: config.attention };
 }
 
 export const workflowWaitResultSchema = z.object({
@@ -2027,7 +2031,7 @@ export const KNOWN_NODE_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = new Ma
   ['context', { kind: 'object', keys: new Set(Object.keys(nodeContextResumeSchema.shape)) }],
   ['loop', { kind: 'object', keys: new Set(Object.keys(loopNodeConfigSchema.shape)) }],
   ['loop_group', { kind: 'object', keys: new Set(Object.keys(loopGroupShape)) }],
-  ['wait', { kind: 'object', keys: new Set(Object.keys(waitConfigFlatSchema.shape)) }],
+  ['wait', { kind: 'object', keys: waitConfigKeys }],
   ['pi', { kind: 'object', keys: new Set(Object.keys(piNodeConfigSchema.shape)) }],
   ['fan_out', { kind: 'object', keys: new Set(Object.keys(fanOutConfigSchema.shape)) }],
   // `agents` keys are author-chosen agent ids; each VALUE is an agentDefinition,

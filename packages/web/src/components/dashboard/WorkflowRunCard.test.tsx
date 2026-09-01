@@ -77,4 +77,28 @@ describe('WorkflowRunCard', () => {
       serverWorkflows.delete(parallelRun.id);
     }
   });
+
+  test('treats a null wait from the runtime boundary as absent', () => {
+    const pausedApprovalRun = {
+      ...parallelRun,
+      status: 'paused',
+      metadata: {
+        wait: null,
+        approval: { message: 'Approve the result?' },
+      },
+    } as unknown as DashboardRunResponse;
+
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <WorkflowRunCard
+          run={pausedApprovalRun}
+          onCancel={() => undefined}
+          onApprove={() => undefined}
+        />
+      </MemoryRouter>
+    );
+
+    expect(html).toContain('Approve the result?');
+    expect(html).toContain('Approve</button>');
+  });
 });

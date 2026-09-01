@@ -10,6 +10,7 @@ import type {
   WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
+  WorkflowAttentionWaitContext,
   WorkflowWaitContext,
   ScheduledWorkflowResume,
 } from '@archon/workflows/schemas/workflow-run';
@@ -935,6 +936,7 @@ export async function resumeWorkflowRun(
           cursor.kind === 'wait'
             ? prior?.status === 'paused' &&
               isWorkflowWaitContext(priorMetadata.wait) &&
+              priorMetadata.wait.kind !== 'attention' &&
               priorMetadata.wait.nodeId === cursor.nodeId &&
               priorMetadata.wait.resumeAt === cursor.resumeAt
             : prior?.status === 'failed' &&
@@ -1434,7 +1436,7 @@ export async function pauseWorkflowRun(
   }
 }
 
-/** Pause a running run on a persisted time/event condition. */
+/** Pause a running run on a persisted wait condition. */
 export async function pauseWorkflowRunForWait(
   id: string,
   waitContext: WorkflowWaitContext,
@@ -1459,7 +1461,9 @@ export async function pauseWorkflowRunForWait(
           step_name: pause.stepName,
           data: {
             kind: parsedWaitContext.kind,
-            resume_at: parsedWaitContext.resumeAt,
+            ...(parsedWaitContext.kind !== 'attention'
+              ? { resume_at: parsedWaitContext.resumeAt }
+              : {}),
             ...(parsedWaitContext.kind === 'event' ? { event: parsedWaitContext.event } : {}),
           },
         });
@@ -1473,6 +1477,68 @@ export async function pauseWorkflowRunForWait(
   }
 }
 
+/** Fail the exact attention cursor whose required notification could not be delivered. */
+export async function failPausedAttentionWait(
+  id: string,
+  waitContext: WorkflowAttentionWaitContext,
+  error: string
+): Promise<{ failed: boolean }> {
+  const parsedWaitContext = workflowWaitContextSchema.parse(waitContext);
+  if (parsedWaitContext.kind !== 'attention') {
+    throw new Error('Only an action-required wait can fail through notification delivery');
+  }
+  const dialect = getDialect();
+  const postgres = getDatabaseType() === 'postgresql';
+  const waitField = (field: string): string =>
+    postgres ? `metadata->'wait'->>'${field}'` : `json_extract(metadata, '$.wait.${field}')`;
+  const params: unknown[] = [
+    id,
+    JSON.stringify({ error }),
+    parsedWaitContext.nodeId,
+    parsedWaitContext.waitingSince,
+  ];
+  const ownerClauses = [`${waitField('owner')} = '${parsedWaitContext.owner}'`];
+  if (parsedWaitContext.owner === 'loop_group') {
+    params.push(parsedWaitContext.bodyWaitId, parsedWaitContext.iteration);
+    const iterationField = postgres
+      ? "(metadata->'wait'->>'iteration')::integer"
+      : "json_extract(metadata, '$.wait.iteration')";
+    ownerClauses.push(`${waitField('bodyWaitId')} = $5`, `${iterationField} = $6`);
+  }
+  const metadataWithoutScheduledResume = postgres
+    ? "metadata - 'scheduled_resume'"
+    : "json_remove(metadata, '$.scheduled_resume')";
+
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge(metadataWithoutScheduledResume, 2)}
+         WHERE id = $1
+           AND status = 'paused'
+           AND ${waitField('kind')} = 'attention'
+           AND ${waitField('nodeId')} = $3
+           AND ${waitField('waitingSince')} = $4
+           AND ${ownerClauses.join('\n           AND ')}`,
+        params
+      );
+      const failed = (result.rowCount ?? 0) > 0;
+      if (failed) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_failed',
+          data: { error },
+        });
+      }
+      return { failed };
+    });
+  } catch (dbError) {
+    const err = dbError as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_attention_notification_fail_error');
+    throw new Error(`Failed to fail paused attention wait: ${err.message}`);
+  }
+}
+
 /** Atomically consume one exact wait cursor and persist its completed node snapshot. */
 export async function clearWorkflowWaitContext(
   id: string,
@@ -1483,10 +1549,11 @@ export async function clearWorkflowWaitContext(
     getDatabaseType() === 'postgresql'
       ? "metadata->'wait'->>'nodeId'"
       : "json_extract(metadata, '$.wait.nodeId')";
-  const resumeAtExpr =
+  const cursorExpr =
     getDatabaseType() === 'postgresql'
-      ? "metadata->'wait'->>'resumeAt'"
-      : "json_extract(metadata, '$.wait.resumeAt')";
+      ? `metadata->'wait'->>'${waitContext.kind === 'attention' ? 'waitingSince' : 'resumeAt'}'`
+      : `json_extract(metadata, '$.wait.${waitContext.kind === 'attention' ? 'waitingSince' : 'resumeAt'}')`;
+  const cursor = waitContext.kind === 'attention' ? waitContext.waitingSince : waitContext.resumeAt;
   const clearWait =
     getDatabaseType() === 'postgresql' ? "metadata - 'wait'" : "json_remove(metadata, '$.wait')";
   try {
@@ -1494,8 +1561,8 @@ export async function clearWorkflowWaitContext(
       const result = await query(
         `UPDATE remote_agent_workflow_runs
          SET metadata = ${clearWait}
-         WHERE id = $1 AND status = 'running' AND ${nodeExpr} = $2 AND ${resumeAtExpr} = $3`,
-        [id, waitContext.nodeId, waitContext.resumeAt]
+         WHERE id = $1 AND status = 'running' AND ${nodeExpr} = $2 AND ${cursorExpr} = $3`,
+        [id, waitContext.nodeId, cursor]
       );
       if ((result.rowCount ?? 0) === 0) return { cleared: false };
       await insertWorkflowEvent(query, {
@@ -1537,6 +1604,10 @@ export async function listDueWorkflowContinuations(
     getDatabaseType() === 'postgresql'
       ? "metadata->'wait'->>'signaledAt'"
       : "json_extract(metadata, '$.wait.signaledAt')";
+  const waitKind =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->>'kind'"
+      : "json_extract(metadata, '$.wait.kind')";
   const scheduledResumeAt =
     getDatabaseType() === 'postgresql'
       ? "metadata->'scheduled_resume'->>'resumeAt'"
@@ -1553,7 +1624,8 @@ export async function listDueWorkflowContinuations(
     const result = await pool.query<WorkflowRun>(
       `SELECT * FROM remote_agent_workflow_runs
        WHERE (${retryAt} IS NULL OR ${retryAt} <= $1)
-         AND ((status = 'paused' AND (${signaledAt} IS NOT NULL OR ${resumeAt} <= $1))
+         AND ((status = 'paused' AND ${waitKind} IN ('time', 'event')
+               AND (${signaledAt} IS NOT NULL OR ${resumeAt} <= $1))
           OR (status = 'failed' AND ${scheduledResumeAt} <= $1 AND ${scheduledTriggeredAt} IS NULL))
        ORDER BY COALESCE(${retryAt}, ${resumeAt}, ${scheduledResumeAt}) ASC
        LIMIT $2`,
