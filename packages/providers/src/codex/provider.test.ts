@@ -104,7 +104,6 @@ describe('CodexProvider', () => {
         envInjection: true,
         costControl: false,
         effortControl: true,
-        thinkingControl: false,
         fallbackModel: false,
         sandbox: false,
         settingSources: false,
@@ -1206,23 +1205,6 @@ describe('CodexProvider', () => {
         );
       }
     );
-
-    test('falls back to config for a value outside the shared ladder', async () => {
-      mockRunStreamed.mockResolvedValue({
-        events: (async function* () {
-          yield { type: 'turn.completed', usage: defaultUsage };
-        })(),
-      });
-      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
-        assistantConfig: { modelReasoningEffort: 'medium' },
-        nodeConfig: { nodeId: 'n1', effort: 'off' },
-      })) {
-        // consume
-      }
-      expect(mockStartThread).toHaveBeenCalledWith(
-        expect.objectContaining({ modelReasoningEffort: 'medium' })
-      );
-    });
 
     test('normalizes outputFormat schema (adds additionalProperties:false) before sending as outputSchema', async () => {
       mockRunStreamed.mockResolvedValue({

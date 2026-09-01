@@ -3308,8 +3308,8 @@ export interface components {
     TierEntry: {
       provider: string;
       model: string;
-      effort?: string;
-      thinking?: unknown;
+      /** @enum {string} */
+      effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
     };
     UpdateUserTiersBody: {
       tiers: {
@@ -3447,20 +3447,6 @@ export interface components {
       interactive?: boolean;
       /** @enum {string} */
       effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
-      thinking?:
-        | {
-            /** @enum {string} */
-            type: 'adaptive';
-          }
-        | {
-            /** @enum {string} */
-            type: 'enabled';
-            budgetTokens?: number;
-          }
-        | {
-            /** @enum {string} */
-            type: 'disabled';
-          };
       fallbackModel?: string;
       betas?: string[];
       sandbox?: {
@@ -3720,20 +3706,6 @@ export interface components {
       };
       /** @enum {string} */
       effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'persistent';
-      thinking?:
-        | {
-            /** @enum {string} */
-            type: 'adaptive';
-          }
-        | {
-            /** @enum {string} */
-            type: 'enabled';
-            budgetTokens?: number;
-          }
-        | {
-            /** @enum {string} */
-            type: 'disabled';
-          };
       maxBudgetUsd?: number;
       systemPrompt?: string;
       fallbackModel?: string;
@@ -4080,6 +4052,16 @@ export interface components {
       displayName: string;
       capabilities: components['schemas']['ProviderCapabilities'];
       builtIn: boolean;
+      effortLevels?: (
+        | 'minimal'
+        | 'low'
+        | 'medium'
+        | 'high'
+        | 'xhigh'
+        | 'max'
+        | 'ultra'
+        | 'persistent'
+      )[];
     };
     ProviderCapabilities: {
       sessionResume: boolean;
@@ -4092,7 +4074,6 @@ export interface components {
       envInjection: boolean;
       costControl: boolean;
       effortControl: boolean;
-      thinkingControl: boolean;
       fallbackModel: boolean;
       sandbox: boolean;
     };

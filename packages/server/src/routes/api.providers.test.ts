@@ -3,6 +3,7 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
+import { EFFORT_LADDER } from '@archon/paths/effort';
 import {
   makeDiscoverWorkflowsMock,
   makeLoaderMock,
@@ -197,6 +198,16 @@ describe('GET /api/providers', () => {
     expect(body.providers.every(p => p.builtIn)).toBe(true);
   });
 
+  test('returns the shared effort ladder for effort-capable providers', async () => {
+    const response = await app.request('/api/providers');
+    const body = (await response.json()) as {
+      providers: { id: string; effortLevels?: string[] }[];
+    };
+    expect(body.providers.find(provider => provider.id === 'codex')?.effortLevels).toEqual([
+      ...EFFORT_LADDER,
+    ]);
+  });
+
   test('returns correct shape per provider (no factory or isModelCompatible)', async () => {
     const response = await app.request('/api/providers');
     const body = (await response.json()) as {
@@ -278,13 +289,13 @@ describe('PATCH /api/config/tiers', () => {
     expect(arg.tiers.large).toBeNull();
   });
 
-  test('drops `thinking` from the written entry (no UI surface)', async () => {
+  test('rejects retired thinking config and names effort', async () => {
     const res = await patch({
       small: { provider: 'claude', model: 'haiku', thinking: { level: 'high' } },
     });
-    expect(res.status).toBe(200);
-    const arg = mockUpdateGlobalConfig.mock.calls[0]?.[0] as { tiers: Record<string, unknown> };
-    expect(arg.tiers.small).toEqual({ provider: 'claude', model: 'haiku' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('effort:');
+    expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
 
   test('is ungated — succeeds with no auth identity', async () => {
@@ -353,13 +364,13 @@ describe('PATCH /api/config/aliases', () => {
     expect(arg.aliases['@fast']).toBeNull();
   });
 
-  test('drops `thinking` from the written entry (no UI surface)', async () => {
+  test('rejects retired thinking config and names effort', async () => {
     const res = await patch({
       '@deep': { provider: 'claude', model: 'opus', thinking: { level: 'high' } },
     });
-    expect(res.status).toBe(200);
-    const arg = mockUpdateGlobalConfig.mock.calls[0]?.[0] as { aliases: Record<string, unknown> };
-    expect(arg.aliases['@deep']).toEqual({ provider: 'claude', model: 'opus' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('effort:');
+    expect(mockUpdateGlobalConfig).not.toHaveBeenCalled();
   });
 
   test('is ungated — succeeds with no auth identity', async () => {
