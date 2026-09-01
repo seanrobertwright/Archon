@@ -1096,37 +1096,24 @@ export class WorktreeProvider implements IIsolationProvider {
     prBranch: string,
     remote = 'origin'
   ): Promise<void> {
-    // Fetch the PR's actual branch. Retry on transient ref-lock races —
-    // concurrent same-repo launches collide on Git's shared remote-tracking
-    // ref lock file. Mirrors the protection in syncWorkspace.
-    const MAX_FETCH_RETRIES = 3;
-
-    for (let attempt = 0; attempt <= MAX_FETCH_RETRIES; attempt++) {
-      try {
-        await execFileAsync('git', ['-C', repoPath, 'fetch', remote, prBranch], {
-          timeout: GIT_OPERATION_TIMEOUT_MS,
-        });
-        break;
-      } catch (error) {
-        const err = error as Error;
-        const errorMessage = err.message.toLowerCase();
-
-        if (
-          attempt < MAX_FETCH_RETRIES &&
-          errorMessage.includes('cannot lock ref') &&
-          errorMessage.includes('unable to update local ref')
-        ) {
-          const backoffMs = 50 * Math.pow(2, attempt);
-          getLog().debug(
-            { err, attempt: attempt + 1, backoffMs, remote, branch: prBranch },
-            'same_repo_pr.fetch_ref_lock_retry'
-          );
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
-          continue;
-        }
-
-        throw new Error(`Fetch ${remote}/${prBranch} failed: ${err.message}`);
-      }
+    // Fetch the PR's actual branch. Delegate to syncWorkspace so the bounded
+    // ref-lock retry lives in one place — concurrent same-repo launches collide
+    // on Git's shared remote-tracking ref lock file, and the @archon/git owner
+    // already owns the predicate and backoff.
+    try {
+      await syncWorkspace(toRepoPath(repoPath), toBranchName(prBranch), {
+        mode: 'fetch-only',
+        remote,
+      });
+    } catch (error) {
+      const err = error as Error;
+      // syncWorkspace wraps fetch errors as
+      // `Sync fetch from <remote>/<branch> failed: <original>`. Strip that
+      // wrapper so the inner wrap keeps `Fetch <remote>/<branch> failed: <original>`
+      // and operators can still distinguish fetch failures from worktree-add
+      // failures inside the surrounding `createFromPR` prefix.
+      const original = err.message.replace(/^Sync fetch from .+? failed: /, '');
+      throw new Error(`Fetch ${remote}/${prBranch} failed: ${original}`);
     }
 
     // Try to create worktree with the branch
