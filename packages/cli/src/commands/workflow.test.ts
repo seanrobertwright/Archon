@@ -5087,7 +5087,9 @@ describe('workflowGetCommand', () => {
         output_root: '/old-machine/.archon/workspaces/old/name',
         codebase_id: 'cb-relocated',
       });
-      (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValueOnce({
+      // Both readers in workflow get consult the codebase row; the resolver
+      // re-derives identically on each call against the same id.
+      (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValue({
         id: 'cb-relocated',
         kind: 'repo',
         name: 'new/widget',
@@ -5129,6 +5131,136 @@ describe('workflowGetCommand', () => {
 
     expect(JSON.parse(firstJsonPayload(stdoutSpy))).toMatchObject({ transcript_path: null });
     expect(code).toBe(0);
+  });
+
+  // #3097 — every persisted-root reader in `workflow get` must go through the
+  // shared resolver's containment check. The leave-behind artifact list was the
+  // last path that still walked `run.output_root` directly. These tests pin
+  // both halves of the fix: the resolver is consulted, and the same refusal
+  // surface the transcript reader already exposes applies.
+  it('refuses to walk an out-of-tree persisted output_root even when the dir exists (#3097)', async () => {
+    const previousHome = process.env.ARCHON_HOME;
+    const archonHome = join(tmpdir(), 'archon-get-artifact-refused-home');
+    const decoyRoot = mkdtempSync(join(tmpdir(), 'archon-get-artifact-decoy-'));
+    const decoyArtifactsDir = join(decoyRoot, 'artifacts', 'runs', 'run-artifact-refused');
+    mkdirSync(decoyArtifactsDir, { recursive: true });
+    writeFileSync(join(decoyArtifactsDir, 'should-not-be-listed.txt'), 'poison');
+    process.env.ARCHON_HOME = archonHome;
+    try {
+      const workflowDb = await import('@archon/core/db/workflows');
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        id: 'run-artifact-refused',
+        workflow_name: 'implement',
+        status: 'completed',
+        working_path: '/tmp/wt',
+        started_at: new Date(),
+        metadata: {},
+        output_root: decoyRoot,
+        codebase_id: null,
+      });
+
+      await workflowGetCommand('run-artifact-refused', true);
+
+      const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+        leave_behind?: { artifactFiles?: string[] };
+      };
+      expect(parsed.leave_behind).toBeDefined();
+      expect(parsed.leave_behind?.artifactFiles).toEqual([]);
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      await removeTempTree(archonHome);
+      await removeTempTree(decoyRoot);
+    }
+  });
+
+  it('re-derives a relocated leave-behind artifact dir through the run codebase (#3097)', async () => {
+    const previousHome = process.env.ARCHON_HOME;
+    const archonHome = join(tmpdir(), 'archon-get-artifact-relocated-home');
+    process.env.ARCHON_HOME = archonHome;
+    const runId = 'run-artifact-relocated';
+    const rederivedArtifactsDir = join(
+      archonHome,
+      'workspaces',
+      'new',
+      'widget',
+      'artifacts',
+      'runs',
+      runId
+    );
+    mkdirSync(rederivedArtifactsDir, { recursive: true });
+    writeFileSync(join(rederivedArtifactsDir, 'marker.txt'), 'ok');
+    try {
+      const workflowDb = await import('@archon/core/db/workflows');
+      const codebaseDb = await import('@archon/core/db/codebases');
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'completed',
+        working_path: '/tmp/wt',
+        started_at: new Date(),
+        metadata: {},
+        // Out-of-tree persisted root — the resolver must re-derive under the
+        // current ARCHON_HOME via the run's codebase row, not walk the original
+        // path.
+        output_root: '/old-machine/.archon/workspaces/old/name',
+        codebase_id: 'cb-relocated-artifact',
+      });
+      // Both readers in workflow get consult the codebase row; the resolver
+      // re-derives identically on each call against the same id.
+      (codebaseDb.getCodebase as ReturnType<typeof mock>).mockResolvedValue({
+        id: 'cb-relocated-artifact',
+        kind: 'repo',
+        name: 'new/widget',
+        default_cwd: '/repos/widget',
+      });
+
+      await workflowGetCommand(runId, true);
+
+      const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+        leave_behind?: { artifactFiles?: string[] };
+      };
+      expect(parsed.leave_behind?.artifactFiles).toContain('marker.txt');
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      await removeTempTree(archonHome);
+    }
+  });
+
+  it('walks the leave-behind artifact dir under a trusted persisted output_root (#3097)', async () => {
+    const previousHome = process.env.ARCHON_HOME;
+    const archonHome = join(tmpdir(), 'archon-get-artifact-trusted-home');
+    process.env.ARCHON_HOME = archonHome;
+    const runId = 'run-artifact-trusted';
+    const outputRoot = join(archonHome, 'workspaces', 'acme', 'widget');
+    const artifactsDir = join(outputRoot, 'artifacts', 'runs', runId);
+    mkdirSync(artifactsDir, { recursive: true });
+    writeFileSync(join(artifactsDir, 'note.txt'), 'ok');
+    try {
+      const workflowDb = await import('@archon/core/db/workflows');
+      (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+        id: runId,
+        workflow_name: 'implement',
+        status: 'completed',
+        working_path: '/tmp/wt',
+        started_at: new Date(),
+        metadata: {},
+        output_root: outputRoot,
+        codebase_id: 'cb-1',
+      });
+
+      await workflowGetCommand(runId, true);
+
+      const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+        leave_behind?: { artifactFiles?: string[] };
+      };
+      expect(parsed.leave_behind?.artifactFiles).toContain('note.txt');
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      await removeTempTree(archonHome);
+    }
   });
 
   it('emits the full metadata.approval (incl. completionSignaled) in --json for a paused interactive_loop run (#2074 E)', async () => {

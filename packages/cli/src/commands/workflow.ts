@@ -4148,6 +4148,8 @@ async function resolveRunTranscriptPath(run: WorkflowRun): Promise<string | null
 }
 
 async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
+  const codebase = run.codebase_id ? await codebaseDb.getCodebase(run.codebase_id) : null;
+
   const leaveBehind: LeaveBehind = { adopted_by: [], artifactFiles: [] };
 
   if (run.working_path) {
@@ -4169,9 +4171,15 @@ async function buildLeaveBehind(run: WorkflowRun): Promise<LeaveBehind> {
   }
 
   // Artifact file list — capped walk so `get` stays cheap on big runs.
-  if (run.output_root) {
+  // #3097: route the persisted `output_root` through the shared resolver so
+  // the same `ARCHON_HOME` containment check every other persisted-root
+  // reader in this file already enforces applies here. An unresolvable root
+  // (out-of-tree persisted value with no codebase row to re-derive from)
+  // yields the same null-root refusal the transcript reader exposes.
+  const artifactsRoot = archonPaths.resolveRunStorageRoot(run, codebase);
+  if (artifactsRoot) {
     try {
-      const artifactsDir = archonPaths.getRunArtifactsDirForRoot(run.output_root, run.id);
+      const artifactsDir = archonPaths.getRunArtifactsDirForRoot(artifactsRoot, run.id);
       leaveBehind.artifactFiles = listArtifactFiles(artifactsDir);
     } catch (error) {
       getLog().debug({ err: error as Error }, 'cli.workflow_get_artifact_walk_failed');
