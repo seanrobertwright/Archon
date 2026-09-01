@@ -336,8 +336,6 @@ export function buildLedger(entries: readonly (readonly [string, number])[]): Ma
  * hole it was recording.
  */
 export const LEGACY_RECURSIVE_CLEANUP: ReadonlyMap<string, number> = buildLedger([
-  ['.archon/scripts/__tests__/marketplace-fetch-source.test.ts', 2],
-  ['.archon/scripts/maintainer-standup-persist.test.ts', 1],
   ['packages/cli/src/commands/doctor.test.ts', 2],
   ['packages/cli/src/commands/serve.test.ts', 1],
   ['packages/cli/src/commands/setup.test.ts', 4],

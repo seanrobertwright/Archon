@@ -474,6 +474,7 @@ function makeDashboardWorkflowRun(run: WorkflowRun): DashboardWorkflowRun {
     platform_type: null,
     worker_platform_id: null,
     parent_platform_id: null,
+    active_nodes: [],
     current_step_name: null,
     total_steps: null,
     current_step_status: null,
@@ -1528,7 +1529,10 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () =>
       makeDashboardRunsResult({
         runs: [
-          makeDashboardWorkflowRun(MOCK_RUNNING_RUN),
+          {
+            ...makeDashboardWorkflowRun(MOCK_RUNNING_RUN),
+            active_nodes: ['parallel-a', 'parallel-b'],
+          },
           makeDashboardWorkflowRun(MOCK_COMPLETED_RUN),
         ],
         total: 2,
@@ -1541,12 +1545,13 @@ describe('GET /api/dashboard/runs', () => {
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
-      runs: Array<{ status: string; outcome: string | null }>;
+      runs: Array<{ status: string; outcome: string | null; active_nodes: string[] }>;
       total: number;
       counts: { all: number };
     };
     expect(Array.isArray(body.runs)).toBe(true);
     expect(body.runs.length).toBe(2);
+    expect(body.runs[0]?.active_nodes).toEqual(['parallel-a', 'parallel-b']);
     expect(body.runs[1]).toMatchObject({ status: 'completed', outcome: 'failed' });
     expect(body.total).toBe(2);
     expect(body.counts.all).toBe(5);

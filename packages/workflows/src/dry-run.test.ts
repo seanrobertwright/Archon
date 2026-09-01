@@ -505,6 +505,218 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
 });
 
 describe('dryRunWorkflow', () => {
+  test('reports every simulation outcome independently from authored outcome', async () => {
+    const completed = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'completed',
+        nodes: [{ id: 'result', prompt: 'result' }],
+      }),
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { result: 'done' },
+    });
+    const failed = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'failed',
+        nodes: [{ id: 'result', prompt: 'result' }],
+      }),
+      userMessage: '',
+      cwd: process.cwd(),
+    });
+    const paused = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'paused',
+        nodes: [{ id: 'hold', wait: { duration_ms: 60_000 } }],
+      }),
+      userMessage: '',
+      cwd: process.cwd(),
+    });
+    const cancelled = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'cancelled',
+        nodes: [{ id: 'stop', cancel: 'stop' }],
+      }),
+      userMessage: '',
+      cwd: process.cwd(),
+    });
+
+    expect([completed, failed, paused, cancelled].map(result => result.outcome)).toEqual([
+      'completed',
+      'failed',
+      'paused',
+      'cancelled',
+    ]);
+    expect([completed, failed, paused, cancelled].map(result => result.authoredOutcome)).toEqual([
+      null,
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  test.each([
+    [true, 'succeeded'],
+    [false, 'failed'],
+  ] as const)(
+    'derives authored outcome from the declared structured boolean %s',
+    async (green, expected) => {
+      const workflow = makeTestWorkflow({
+        name: 'authored-outcome',
+        returns: 'verdict',
+        outcome_field: 'green',
+        nodes: [
+          {
+            id: 'verdict',
+            prompt: 'verdict',
+            output_format: {
+              type: 'object',
+              properties: { green: { type: 'boolean' } },
+              required: ['green'],
+            },
+          },
+        ],
+      });
+
+      const result = await dryRunWorkflow({
+        workflow,
+        userMessage: '',
+        cwd: process.cwd(),
+        stubs: { verdict: { green } },
+      });
+
+      expect(result).toMatchObject({ outcome: 'completed', authoredOutcome: expected });
+    }
+  );
+
+  test('leaves authored outcome null when the structured result violates its schema', async () => {
+    const result = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'invalid-authored-outcome',
+        returns: 'verdict',
+        outcome_field: 'green',
+        nodes: [
+          {
+            id: 'verdict',
+            prompt: 'verdict',
+            output_format: {
+              type: 'object',
+              properties: {
+                green: { type: 'boolean' },
+                reason: { type: 'string' },
+              },
+              required: ['green', 'reason'],
+            },
+          },
+        ],
+      }),
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { verdict: { green: false } },
+    });
+
+    expect(result).toMatchObject({ outcome: 'completed', authoredOutcome: null });
+  });
+
+  test('leaves authored outcome null when the declared result is not reached', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'authored-outcome-not-reached',
+      returns: 'verdict',
+      outcome_field: 'green',
+      nodes: [
+        { id: 'hold', wait: { duration_ms: 60_000 } },
+        {
+          id: 'verdict',
+          prompt: 'verdict',
+          depends_on: ['hold'],
+          output_format: {
+            type: 'object',
+            properties: { green: { type: 'boolean' } },
+            required: ['green'],
+          },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { verdict: { green: true } },
+    });
+
+    expect(result).toMatchObject({ outcome: 'paused', authoredOutcome: null });
+  });
+
+  test('does not infer authored outcome from serialized text', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'authored-outcome-text',
+      returns: 'verdict',
+      outcome_field: 'green',
+      nodes: [
+        {
+          id: 'verdict',
+          bash: 'printf \'{"green":true}\'',
+          output_format: {
+            type: 'object',
+            properties: { green: { type: 'boolean' } },
+            required: ['green'],
+          },
+        },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      execCode: true,
+    });
+
+    expect(result).toMatchObject({ outcome: 'completed', authoredOutcome: null });
+    expect(result.trace[0]?.output).toBe('{"green":true}');
+  });
+
+  test('does not treat generated placeholders as authored fixture values', async () => {
+    const workflow = (name: string, triggerRule?: 'all_done') =>
+      makeTestWorkflow({
+        name,
+        returns: 'verdict',
+        outcome_field: 'green',
+        nodes: [
+          {
+            id: 'verdict',
+            prompt: 'verdict',
+            ...(triggerRule ? { trigger_rule: triggerRule } : {}),
+            output_format: {
+              type: 'object',
+              properties: { green: { type: 'boolean' } },
+              required: ['green'],
+            },
+          },
+        ],
+      });
+
+    const defaulted = await dryRunWorkflow({
+      workflow: workflow('defaulted-authored-outcome'),
+      userMessage: '',
+      cwd: process.cwd(),
+      defaultStubs: true,
+    });
+    const tolerated = await dryRunWorkflow({
+      workflow: workflow('tolerated-authored-outcome', 'all_done'),
+      userMessage: '',
+      cwd: process.cwd(),
+    });
+
+    expect(defaulted).toMatchObject({ outcome: 'completed', authoredOutcome: null });
+    expect(tolerated).toMatchObject({
+      outcome: 'completed',
+      authoredOutcome: null,
+      missingStubs: ['verdict'],
+      toleratedMissingStubs: ['verdict'],
+    });
+  });
+
   test('uses the attached plan for trace order and summary selection', async () => {
     const workflow = resolveWorkflow(
       makeTestWorkflow({
@@ -1507,7 +1719,8 @@ describe('dryRunWorkflow', () => {
     });
 
     expect(formatDryRunTrace(result)).toContain('STUBBED   node (prompt)');
-    expect(formatDryRunTrace(result)).toContain('Outcome: completed');
+    expect(formatDryRunTrace(result)).toContain('Simulation outcome: completed');
+    expect(formatDryRunTrace(result)).toContain('Authored outcome: undeclared');
   });
 });
 

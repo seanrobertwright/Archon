@@ -13,6 +13,7 @@ import { createMockLogger } from '../test/mocks/logger';
 import { makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
 import type { Codebase, Conversation, Session } from '../types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { DashboardWorkflowRun } from '../schemas/workflow-run';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
 import { join } from 'path';
 import * as fsPromises from 'fs/promises';
@@ -104,6 +105,34 @@ function makeWorkflowRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   };
 }
 
+const EMPTY_DASHBOARD_COUNTS = {
+  all: 0,
+  running: 0,
+  completed: 0,
+  failed: 0,
+  cancelled: 0,
+  pending: 0,
+  paused: 0,
+};
+
+function makeDashboardRun(overrides: Partial<DashboardWorkflowRun> = {}): DashboardWorkflowRun {
+  return {
+    ...makeWorkflowRun(),
+    codebase_name: 'Archon',
+    platform_type: 'cli',
+    worker_platform_id: null,
+    parent_platform_id: null,
+    active_nodes: [],
+    current_step_name: null,
+    total_steps: null,
+    current_step_status: null,
+    agents_completed: null,
+    agents_failed: null,
+    agents_total: null,
+    ...overrides,
+  };
+}
+
 function makeIsolationEnvironment(
   overrides: Partial<IsolationEnvironmentRow> = {}
 ): IsolationEnvironmentRow {
@@ -156,7 +185,9 @@ const mockCancelWorkflowRun = mock<typeof WorkflowDb.cancelWorkflowRun>(() =>
 const mockCancelResumableRunsForConversation = mock<
   typeof WorkflowDb.cancelResumableRunsForConversation
 >(() => Promise.resolve([]));
-const mockListWorkflowRuns = mock<typeof WorkflowDb.listWorkflowRuns>(() => Promise.resolve([]));
+const mockListDashboardRuns = mock<typeof WorkflowDb.listDashboardRuns>(() =>
+  Promise.resolve({ runs: [], total: 0, counts: EMPTY_DASHBOARD_COUNTS })
+);
 const mockGetWorkflowRun = mock<typeof WorkflowDb.getWorkflowRun>(() => Promise.resolve(null));
 const mockResumeWorkflowRun = mock<typeof WorkflowDb.resumeWorkflowRun>(() =>
   Promise.resolve(makeWorkflowRun({ id: 'run-id' }))
@@ -231,7 +262,7 @@ mock.module('../db/workflows', () => ({
   getActiveWorkflowRun: mockGetActiveWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   cancelResumableRunsForConversation: mockCancelResumableRunsForConversation,
-  listWorkflowRuns: mockListWorkflowRuns,
+  listDashboardRuns: mockListDashboardRuns,
   getWorkflowRun: mockGetWorkflowRun,
   findChildRuns: mockFindChildRuns,
   resumeWorkflowRun: mockResumeWorkflowRun,
@@ -391,7 +422,7 @@ function clearAllMocks(): void {
   mockGetActiveWorkflowRun.mockClear();
   mockCancelWorkflowRun.mockClear();
   mockCancelResumableRunsForConversation.mockClear();
-  mockListWorkflowRuns.mockClear();
+  mockListDashboardRuns.mockClear();
   mockGetWorkflowRun.mockClear();
   mockResumeWorkflowRun.mockClear();
   mockFailWorkflowRun.mockClear();
@@ -1861,17 +1892,22 @@ describe('CommandHandler', () => {
     describe('/workflow status', () => {
       test('should show all running workflows', async () => {
         const startedAt = new Date(Date.now() - 2 * 60 * 1000);
-        mockListWorkflowRuns.mockResolvedValueOnce([
-          makeWorkflowRun({
-            id: 'run-abc123',
-            workflow_name: 'implement',
-            conversation_id: 'conv-1',
-            user_message: 'add feature',
-            started_at: startedAt,
-            last_activity_at: startedAt,
-            working_path: '/workspace/worktrees/feat-auth',
-          }),
-        ]);
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [
+            makeDashboardRun({
+              id: 'run-abc123',
+              workflow_name: 'implement',
+              conversation_id: 'conv-1',
+              user_message: 'add feature',
+              started_at: startedAt,
+              last_activity_at: startedAt,
+              working_path: '/workspace/worktrees/feat-auth',
+              active_nodes: ['parallel-a', 'parallel-b'],
+            }),
+          ],
+          total: 1,
+          counts: { ...EMPTY_DASHBOARD_COUNTS, all: 1, running: 1 },
+        });
 
         const result = await handleCommand(baseConversation, '/workflow status');
 
@@ -1879,17 +1915,22 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('implement');
         expect(result.message).toContain('run-abc123');
         expect(result.message).toContain('/workspace/worktrees/feat-auth');
+        expect(result.message).toContain('Active nodes: parallel-a, parallel-b');
       });
 
       test('should show authored outcome independently for an active workflow', async () => {
-        mockListWorkflowRuns.mockResolvedValueOnce([
-          makeWorkflowRun({
-            id: 'run-paused',
-            workflow_name: 'review',
-            status: 'paused',
-            outcome: 'succeeded',
-          }),
-        ]);
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [
+            makeDashboardRun({
+              id: 'run-paused',
+              workflow_name: 'review',
+              status: 'paused',
+              outcome: 'succeeded',
+            }),
+          ],
+          total: 1,
+          counts: { ...EMPTY_DASHBOARD_COUNTS, all: 1, paused: 1 },
+        });
 
         const result = await handleCommand(baseConversation, '/workflow status');
 
@@ -1899,22 +1940,26 @@ describe('CommandHandler', () => {
       });
 
       test('should direct an action-required pause to resume instead of approval controls', async () => {
-        mockListWorkflowRuns.mockResolvedValueOnce([
-          makeWorkflowRun({
-            id: 'run-attention',
-            workflow_name: 'deliver',
-            status: 'paused',
-            metadata: {
-              wait: {
-                owner: 'node',
-                nodeId: 'rerun-ci',
-                kind: 'attention',
-                waitingSince: '2026-08-31T10:00:00.000Z',
-                message: 'Re-run the failing check, then resume this run.',
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [
+            makeDashboardRun({
+              id: 'run-attention',
+              workflow_name: 'deliver',
+              status: 'paused',
+              metadata: {
+                wait: {
+                  owner: 'node',
+                  nodeId: 'rerun-ci',
+                  kind: 'attention',
+                  waitingSince: '2026-08-31T10:00:00.000Z',
+                  message: 'Re-run the failing check, then resume this run.',
+                },
               },
-            },
-          }),
-        ]);
+            }),
+          ],
+          total: 1,
+          counts: { ...EMPTY_DASHBOARD_COUNTS, all: 1, paused: 1 },
+        });
 
         const result = await handleCommand(baseConversation, '/workflow status');
 
@@ -1926,14 +1971,18 @@ describe('CommandHandler', () => {
       });
 
       test('should direct an approval pause to approve or reject', async () => {
-        mockListWorkflowRuns.mockResolvedValueOnce([
-          makeWorkflowRun({
-            id: 'run-approval',
-            workflow_name: 'review',
-            status: 'paused',
-            metadata: { approval: { nodeId: 'gate', message: 'Approve delivery?' } },
-          }),
-        ]);
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [
+            makeDashboardRun({
+              id: 'run-approval',
+              workflow_name: 'review',
+              status: 'paused',
+              metadata: { approval: { nodeId: 'gate', message: 'Approve delivery?' } },
+            }),
+          ],
+          total: 1,
+          counts: { ...EMPTY_DASHBOARD_COUNTS, all: 1, paused: 1 },
+        });
 
         const result = await handleCommand(baseConversation, '/workflow status');
 
@@ -1943,7 +1992,11 @@ describe('CommandHandler', () => {
       });
 
       test('should show no-active message when no workflows running', async () => {
-        mockListWorkflowRuns.mockResolvedValueOnce([]);
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [],
+          total: 0,
+          counts: EMPTY_DASHBOARD_COUNTS,
+        });
 
         const result = await handleCommand(baseConversation, '/workflow status');
 
@@ -1952,7 +2005,7 @@ describe('CommandHandler', () => {
       });
 
       test('should handle database errors gracefully', async () => {
-        mockListWorkflowRuns.mockRejectedValueOnce(new Error('Database connection error'));
+        mockListDashboardRuns.mockRejectedValueOnce(new Error('Database connection error'));
 
         const result = await handleCommand(baseConversation, '/workflow status');
 
@@ -1962,16 +2015,20 @@ describe('CommandHandler', () => {
 
       test('should show working_path as (unknown) when null', async () => {
         const startedAt = new Date();
-        mockListWorkflowRuns.mockResolvedValueOnce([
-          makeWorkflowRun({
-            id: 'run-xyz',
-            workflow_name: 'assist',
-            conversation_id: 'conv-1',
-            user_message: 'help',
-            started_at: startedAt,
-            working_path: null,
-          }),
-        ]);
+        mockListDashboardRuns.mockResolvedValueOnce({
+          runs: [
+            makeDashboardRun({
+              id: 'run-xyz',
+              workflow_name: 'assist',
+              conversation_id: 'conv-1',
+              user_message: 'help',
+              started_at: startedAt,
+              working_path: null,
+            }),
+          ],
+          total: 1,
+          counts: { ...EMPTY_DASHBOARD_COUNTS, all: 1, running: 1 },
+        });
 
         const result = await handleCommand(baseConversation, '/workflow status');
 

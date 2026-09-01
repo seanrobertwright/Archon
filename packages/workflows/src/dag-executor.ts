@@ -2132,6 +2132,7 @@ async function executeNodeInternal(
           duration_ms: Date.now() - nodeStartTime,
           ...usage,
           ...namedSessionAuditData,
+          ...iterationData,
           ...(extras.data ?? {}),
         },
       })

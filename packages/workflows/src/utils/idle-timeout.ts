@@ -8,7 +8,7 @@
  * This is the primary defense against subprocess hangs where the AI process
  * completes its work but fails to exit (stuck MCP connection, dangling child
  * process, etc.). Without this, the `for await` loop blocks indefinitely and
- * `step_completed` / `node_completed` is never recorded.
+ * `node_completed` is never recorded.
  */
 
 /**

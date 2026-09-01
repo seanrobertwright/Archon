@@ -248,6 +248,7 @@ export interface FixtureCheckResult {
   readonly workflow: string;
   readonly expect: DryRunResult['outcome'];
   readonly outcome?: DryRunResult['outcome'];
+  readonly authoredOutcome?: DryRunResult['authoredOutcome'];
   readonly pass: boolean;
   readonly failureReason?: string;
   readonly missingStubs: readonly string[];
@@ -649,6 +650,7 @@ async function checkFixture(
     return {
       ...base,
       outcome: result.outcome,
+      authoredOutcome: result.authoredOutcome,
       pass: failureReason === undefined,
       ...(failureReason !== undefined ? { failureReason } : {}),
       missingStubs: result.missingStubs,
@@ -672,8 +674,11 @@ export function formatFixtureReport(report: FixtureReport): string {
   const lines: string[] = [];
   for (const r of report.results) {
     const mark = r.pass ? '✔' : '✘';
-    const outcome = r.outcome ? ` (${r.outcome})` : '';
-    lines.push(`${mark} ${r.fixture} → ${r.workflow}${outcome}`);
+    lines.push(`${mark} ${r.fixture} → ${r.workflow}`);
+    if (r.outcome !== undefined) {
+      lines.push(`    Simulation outcome: ${r.outcome}`);
+      lines.push(`    Authored outcome: ${r.authoredOutcome ?? 'undeclared'}`);
+    }
     if (r.failureReason) lines.push(`    ${r.failureReason}`);
     if (r.unusedStubs.length > 0) {
       lines.push(`    warning: unused stubs — ${r.unusedStubs.join(', ')}`);

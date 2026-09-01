@@ -54,26 +54,26 @@ function StepProgress({
   liveState: WorkflowState | undefined;
 }): React.ReactElement | null {
   const dagNodes = liveState?.dagNodes ?? [];
-  const runningNode = dagNodes
-    .slice()
-    .reverse()
-    .find(n => n.status === 'running');
+  const activeNodeNames = liveState?.activeNodeIds ?? run.active_nodes;
   const completedCount = dagNodes.filter(n => n.status === 'completed').length;
-  const totalNodes = dagNodes.length || run.total_steps || 0;
-  const stepName = runningNode?.name ?? run.current_step_name;
+  const totalNodes = run.total_steps ?? 0;
   const currentTool = liveState?.currentTool ?? null;
 
-  const hasProgress = runningNode != null || totalNodes > 0;
+  const hasProgress = activeNodeNames.length > 0 || totalNodes > 0;
   if (!hasProgress && !currentTool) return null;
 
   return (
     <div className="rounded-md bg-surface-elevated px-3 py-2 space-y-1">
       {hasProgress && (
         <div className="flex items-center gap-2 text-sm text-text-primary">
-          <span className="font-medium">
-            {`${String(completedCount)}${totalNodes ? `/${String(totalNodes)}` : ''} nodes`}
-          </span>
-          {stepName && <span className="text-text-secondary">{stepName}</span>}
+          {totalNodes > 0 && (
+            <span className="font-medium">{`${String(completedCount)}/${String(totalNodes)} nodes`}</span>
+          )}
+          {activeNodeNames.length > 0 && (
+            <span className="text-text-secondary">
+              Active node{activeNodeNames.length === 1 ? '' : 's'}: {activeNodeNames.join(', ')}
+            </span>
+          )}
         </div>
       )}
       {currentTool && (

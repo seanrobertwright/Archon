@@ -180,10 +180,12 @@ export function ActiveRunCard({
                 </span>
               </>
             ) : null}
-            {run.status === 'running' && hasValue(run.currentNode) ? (
+            {run.status === 'running' && run.activeNodes.length > 0 ? (
               <>
-                <span className="font-mono text-text-tertiary">node</span>
-                <span className="font-mono text-text-primary">{run.currentNode}</span>
+                <span className="font-mono text-text-tertiary">
+                  {run.activeNodes.length === 1 ? 'node' : 'nodes'}
+                </span>
+                <span className="font-mono text-text-primary">{run.activeNodes.join(', ')}</span>
               </>
             ) : null}
             {run.status === 'running' && hasValue(run.lastTool) ? (
