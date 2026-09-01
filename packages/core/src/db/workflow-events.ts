@@ -363,12 +363,16 @@ interface NodeLifecycleEventRow extends NodeLifecycleEvent {
   workflow_run_id: string;
 }
 
-function foldActiveNodeIds(activeNodeIds: Set<string>, row: NodeLifecycleEvent): void {
-  if (!row.step_name) return;
-  if (row.event_type === 'node_started') {
-    activeNodeIds.add(row.step_name);
+function foldActiveNodeIds(
+  activeNodeIds: Set<string>,
+  stepName: string | null,
+  eventType: NodeLifecycleEventType
+): void {
+  if (!stepName) return;
+  if (eventType === 'node_started') {
+    activeNodeIds.add(stepName);
   } else {
-    activeNodeIds.delete(row.step_name);
+    activeNodeIds.delete(stepName);
   }
 }
 
@@ -393,7 +397,7 @@ export async function listActiveWorkflowNodeIds(
 
   for (const row of result.rows) {
     const activeNodeIds = activeByRun.get(row.workflow_run_id);
-    if (activeNodeIds) foldActiveNodeIds(activeNodeIds, row);
+    if (activeNodeIds) foldActiveNodeIds(activeNodeIds, row.step_name, row.event_type);
   }
 
   return new Map([...activeByRun].map(([runId, activeNodeIds]) => [runId, [...activeNodeIds]]));
@@ -428,7 +432,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   for (const row of result.rows) {
     if (!row.step_name) continue;
     if (row.event_type !== 'fan_out_instances') {
-      foldActiveNodeIds(unresolvedNodeStarts, row);
+      foldActiveNodeIds(unresolvedNodeStarts, row.step_name, row.event_type);
     }
     let data: Record<string, unknown>;
     try {
