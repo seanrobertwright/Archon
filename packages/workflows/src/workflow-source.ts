@@ -65,7 +65,6 @@ import {
   isBinaryBuild,
 } from './defaults/bundled-defaults';
 import {
-  readWorkflowSourceMetadata,
   readWorkflowSourceState,
   workflowSourceConfigSchema,
   type WorkflowSourceConfig,
@@ -265,8 +264,6 @@ export class WorkflowSourceIntegrityError extends Error {
 
 /** Where a run's executable source came from, and what was frozen. */
 export interface WorkflowSourceCapture {
-  /** Absolute path to the capture, retained separately for callers that manage its lifecycle. */
-  captureRoot: string;
   /** The authoring directory this was captured from. */
   origin: string;
   manifest: WorkflowSourceManifest;
@@ -599,7 +596,6 @@ export async function captureWorkflowSource(opts: {
       'workflow.source_captured'
     );
     return {
-      captureRoot,
       origin: sourceRoot,
       manifest,
       anchor: { root: captureRoot, digest: manifest.digest, config: manifest.source_config },
@@ -712,7 +708,6 @@ export async function loadWorkflowSource(
     );
   }
   return {
-    captureRoot,
     origin: manifest.origin,
     manifest,
     anchor: {
@@ -782,7 +777,7 @@ export async function resolveRunSourceCapture(
 }
 
 /**
- * The AUTHORING directory a run was captured from, if it still exists.
+ * The AUTHORING directory a run was captured from.
  *
  * Deliberately different from {@link resolveRunSourceCapture}, and the difference is the
  * whole contract for sub-runs: a run freezes its own source, but a `workflow:` child that
@@ -795,11 +790,26 @@ export async function resolveRunSourceCapture(
  * parent's frozen copy would re-drive the OLD gated definition forever, so the fix could
  * never take. The child's own run captures at its own start, which is where its
  * determinism begins.
+ *
+ * Returns `undefined` only for a historical parent with no source record. Once a parent
+ * records an authoring directory, an unreadable record or unavailable directory fails
+ * closed so a child cannot silently capture a same-named workflow from the target cwd.
  */
 export async function resolveChildDiscoveryRoot(
   metadata: Record<string, unknown> | undefined
 ): Promise<string | undefined> {
-  const recorded = readWorkflowSourceMetadata(metadata);
-  if (!recorded) return undefined;
-  return (await isDirectory(recorded.origin)) ? recorded.origin : undefined;
+  const state = readWorkflowSourceState(metadata);
+  if (state.kind === 'absent') return undefined;
+  if (state.kind === 'unreadable') {
+    throw new WorkflowSourceIntegrityError(
+      `This run's workflow source record cannot be read by this build: ${state.detail}`
+    );
+  }
+  if (!(await isDirectory(state.record.origin))) {
+    throw new WorkflowSourceIntegrityError(
+      `This run's recorded authoring source is unavailable at ${state.record.origin}. ` +
+        'A child workflow cannot start from a different checkout.'
+    );
+  }
+  return state.record.origin;
 }

@@ -1517,7 +1517,7 @@ async function captureFreshSource(
       }
       resolvedWorkflow = reResolved;
     }
-    await recordSelectedWorkflow(preparedSource.captureRoot, resolvedWorkflow.name);
+    await recordSelectedWorkflow(preparedSource.anchor.root, resolvedWorkflow.name);
     return { preparedSource, workflow: resolvedWorkflow };
   } catch (error) {
     const err = error as Error;

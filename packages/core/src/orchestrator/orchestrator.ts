@@ -554,7 +554,7 @@ async function dispatchBackgroundWorkflowOwned(
       }
       workflow = reResolved;
     }
-    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+    await recordSelectedWorkflow(preparedSource.anchor.root, workflow.name);
   } catch (error) {
     const err = error as Error;
     // Reclaim before returning: this branch is the console's default dispatch path, and

@@ -105,8 +105,8 @@ export async function withObservableCapturedSource<T>(
   try {
     return await body({
       hold: prepared => {
-        held = prepared.captureRoot;
-        calls.push(`hold:${prepared.captureRoot}`);
+        held = prepared.anchor.root;
+        calls.push(`hold:${prepared.anchor.root}`);
       },
       adopt: () => {
         adopted = true;

@@ -731,7 +731,6 @@ export type ExecuteWorkflowOptions = ResumePayload & {
 export interface PreparedWorkflowSource {
   /** Reserved run id; the caller passes it back so the row and the capture agree. */
   runId: string;
-  captureRoot: string;
   origin: string;
   manifest: WorkflowSourceManifest;
   anchor: WorkflowSourceAnchor;
@@ -817,7 +816,7 @@ export interface CapturedSourceOwner {
    * finalizes early and moves the capture out of staging, and reclaiming the pre-move path
    * would leave the real one behind while looking like it cleaned up.
    */
-  hold: (prepared: Pick<PreparedWorkflowSource, 'captureRoot'>) => void;
+  hold: (prepared: Pick<PreparedWorkflowSource, 'anchor'>) => void;
   /**
    * A run now owns the bytes and their lifetime; stop tracking them. Called by the
    * caller from `executeWorkflow`'s rename success site (via
@@ -836,7 +835,7 @@ export async function withCapturedSource<T>(
   let adopted = false;
   const owner: CapturedSourceOwner = {
     hold: prepared => {
-      held = prepared.captureRoot;
+      held = prepared.anchor.root;
     },
     adopt: () => {
       adopted = true;
@@ -898,7 +897,7 @@ export async function resolveContinuationWorkflow(
   if (!workflow) {
     throw new WorkflowSourceIntegrityError(
       `Cannot continue run of '${run.workflow_name}': its captured source at ` +
-        `${capture.captureRoot} no longer contains that workflow.`
+        `${capture.anchor.root} no longer contains that workflow.`
     );
   }
   return { workflow, roots, workflows, errors };
@@ -955,14 +954,13 @@ export async function finalizeWorkflowSource(
     opts.codebaseId
   );
   const finalRoot = getRunSourceCapturePath(artifactsDir);
-  if (finalRoot === prepared.captureRoot) return prepared;
+  if (finalRoot === prepared.anchor.root) return prepared;
   await mkdir(dirname(finalRoot), { recursive: true });
   await rm(finalRoot, { recursive: true, force: true });
-  await rename(prepared.captureRoot, finalRoot);
+  await rename(prepared.anchor.root, finalRoot);
   const anchor = { ...prepared.anchor, root: finalRoot };
   return {
     ...prepared,
-    captureRoot: finalRoot,
     anchor,
     roots: capturedSourceRoots(anchor),
   };
@@ -978,7 +976,7 @@ export async function finalizeWorkflowSource(
  *
  *   1. `prepareWorkflowSource(...)`
  *   2. discover with `discoverWorkflowsWithConfig(cwd, loadConfig, prepared.roots)`
- *   3. `recordSelectedWorkflow(prepared.captureRoot, workflow.name)`
+ *   3. `recordSelectedWorkflow(prepared.anchor.root, workflow.name)`
  *   4. `executeWorkflow(..., { preparedSource: prepared })`
  *
  * Throws when the source cannot be frozen. There is no degraded mode: a run with no
@@ -1027,7 +1025,6 @@ export async function prepareWorkflowSource(
   });
   return {
     runId,
-    captureRoot: capture.captureRoot,
     origin: capture.origin,
     manifest: capture.manifest,
     anchor: capture.anchor,
@@ -1212,7 +1209,7 @@ async function runChildWorkflow(
     // `staged-source`. Safe after the child HAS started too: `executeWorkflow` moves the
     // capture into the child's artifacts, so the staged path is already gone and this is
     // a no-op. Fire-and-forget because cleanup must never mask the failure being reported.
-    if (childSource) void disposeWorkflowSource(childSource);
+    if (childSource) void disposeWorkflowSource({ captureRoot: childSource.anchor.root });
     return { childRunId, status: 'failed', error };
   };
 
@@ -1255,7 +1252,7 @@ async function runChildWorkflow(
       childWorkflowName,
       workflows.map(w => w.workflow)
     );
-    if (childWorkflow) await recordSelectedWorkflow(childSource.captureRoot, childWorkflow.name);
+    if (childWorkflow) await recordSelectedWorkflow(childSource.anchor.root, childWorkflow.name);
   } catch (err) {
     // resolveWorkflowName throws only on ambiguity.
     return failOutcome(
@@ -2686,9 +2683,9 @@ export async function executeWorkflow(
     // reclaims. Same filesystem, so this is a rename.
     const finalCaptureRoot = getRunSourceCapturePath(artifactsDir);
     try {
-      if (preparedSource.captureRoot !== finalCaptureRoot) {
+      if (preparedSource.anchor.root !== finalCaptureRoot) {
         await rm(finalCaptureRoot, { recursive: true, force: true });
-        await rename(preparedSource.captureRoot, finalCaptureRoot);
+        await rename(preparedSource.anchor.root, finalCaptureRoot);
       }
       // The staged capture is now under the run's artifacts directory — the run owns
       // the bytes from this point on. Adopting here (not earlier, at the call site) is

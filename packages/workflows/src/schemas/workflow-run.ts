@@ -447,7 +447,7 @@ export const workflowSourceMetadataSchema = z.object({
    * every command and script lookup somewhere arbitrary, so the record is unreadable.
    */
   root: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
-  /** The authoring directory it was captured from (provenance; never read for lookup). */
+  /** The authoring directory a not-yet-started child captures from. */
   origin: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
   captured_at: z.string(),
   /**

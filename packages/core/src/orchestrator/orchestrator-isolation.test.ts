@@ -212,7 +212,6 @@ const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSo
   (): Promise<PreparedWorkflowSource> =>
     Promise.resolve({
       runId: 'prepared-run-id',
-      captureRoot: '/capture',
       origin: '/origin',
       manifest: {
         version: 1,

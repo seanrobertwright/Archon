@@ -516,7 +516,7 @@ describe('dryRunWorkflow', () => {
       captureRoot: join(cwd, 'capture'),
     });
     writeFileSync(
-      join(capture.captureRoot, 'project', '.archon', 'commands', 'inspect.md'),
+      join(capture.anchor.root, 'project', '.archon', 'commands', 'inspect.md'),
       'changed'
     );
 
@@ -533,6 +533,94 @@ describe('dryRunWorkflow', () => {
       })
     ).rejects.toThrow('captured source has changed');
   });
+
+  test('rechecks a named script after an earlier node changes the capture', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-capture-'));
+    temporaryDirectories.push(cwd);
+    const scriptDir = join(cwd, '.archon', 'scripts');
+    mkdirSync(scriptDir, { recursive: true });
+    writeFileSync(join(scriptDir, 'inspect.ts'), 'console.log("original")');
+    const capture = await captureWorkflowSource({
+      sourceRoot: cwd,
+      captureRoot: join(cwd, 'capture'),
+    });
+    const capturedScript = join(capture.anchor.root, 'project', '.archon', 'scripts', 'inspect.ts');
+    const marker = join(cwd, 'changed-script-ran');
+    const workflow = makeTestWorkflow({
+      name: 'captured-script-dry-run',
+      nodes: [
+        {
+          id: 'mutate',
+          bash: `printf %s 'await Bun.write("${marker}", "ran")' > "${capturedScript}"`,
+        },
+        { id: 'inspect', script: 'inspect', runtime: 'bun', depends_on: ['mutate'] },
+      ],
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd,
+      sourceRoots: capturedSourceRoots(capture.anchor),
+      execCode: true,
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.trace.find(entry => entry.nodeId === 'inspect')).toMatchObject({
+      state: 'failed',
+      reason: expect.stringContaining('captured source has changed'),
+    });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test.each(['agent', 'loop'] as const)(
+    'rechecks a command-backed %s node after an earlier node changes the capture',
+    async kind => {
+      const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-capture-'));
+      temporaryDirectories.push(cwd);
+      const commandDir = join(cwd, '.archon', 'commands');
+      mkdirSync(commandDir, { recursive: true });
+      writeFileSync(join(commandDir, 'inspect.md'), 'original');
+      const capture = await captureWorkflowSource({
+        sourceRoot: cwd,
+        captureRoot: join(cwd, 'capture'),
+      });
+      const capturedCommand = join(
+        capture.anchor.root,
+        'project',
+        '.archon',
+        'commands',
+        'inspect.md'
+      );
+      const inspectedNode =
+        kind === 'agent'
+          ? { id: 'inspect', command: 'inspect', depends_on: ['mutate'] }
+          : {
+              id: 'inspect',
+              loop: { command: 'inspect', until: 'DONE', max_iterations: 1 },
+              depends_on: ['mutate'],
+            };
+      const workflow = makeTestWorkflow({
+        name: `captured-${kind}-command-dry-run`,
+        nodes: [{ id: 'mutate', bash: `printf changed > "${capturedCommand}"` }, inspectedNode],
+      });
+
+      const result = await dryRunWorkflow({
+        workflow,
+        userMessage: '',
+        cwd,
+        sourceRoots: capturedSourceRoots(capture.anchor),
+        stubs: { inspect: 'DONE' },
+        execCode: true,
+      });
+
+      expect(result.outcome).toBe('failed');
+      expect(result.trace.find(entry => entry.nodeId === 'inspect')).toMatchObject({
+        state: 'failed',
+        reason: expect.stringContaining('captured source has changed'),
+      });
+    }
+  );
 
   test('reports every simulation outcome independently from authored outcome', async () => {
     const completed = await dryRunWorkflow({

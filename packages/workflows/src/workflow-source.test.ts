@@ -137,10 +137,10 @@ describe('captureWorkflowSource', () => {
     });
 
     expect(capture.origin).toBe(source);
-    expect(await countScopeFiles(capture.captureRoot, 'project')).toBe(2);
+    expect(await countScopeFiles(capture.anchor.root, 'project')).toBe(2);
     expect(
       await readFile(
-        join(capture!.captureRoot, 'project', '.archon', 'commands', 'review.md'),
+        join(capture!.anchor.root, 'project', '.archon', 'commands', 'review.md'),
         'utf-8'
       )
     ).toBe('review the diff');
@@ -160,7 +160,7 @@ describe('captureWorkflowSource', () => {
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
 
-    const root2 = capture!.captureRoot;
+    const root2 = capture!.anchor.root;
     expect(
       await readFile(join(root2, 'project', '.archon', 'scripts', 'helper.ts'), 'utf-8')
     ).toContain('export const x');
@@ -180,7 +180,7 @@ describe('captureWorkflowSource', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'EDITED');
     expect(
       await readFile(
-        join(capture!.captureRoot, 'project', '.archon', 'commands', 'review.md'),
+        join(capture!.anchor.root, 'project', '.archon', 'commands', 'review.md'),
         'utf-8'
       )
     ).toBe('original');
@@ -188,11 +188,11 @@ describe('captureWorkflowSource', () => {
     await rm(source, { recursive: true, force: true });
     expect(
       await readFile(
-        join(capture!.captureRoot, 'project', '.archon', 'commands', 'review.md'),
+        join(capture!.anchor.root, 'project', '.archon', 'commands', 'review.md'),
         'utf-8'
       )
     ).toBe('original');
-    expect((await loadWorkflowSource(capture!.captureRoot)).origin).toBe(source);
+    expect((await loadWorkflowSource(capture!.anchor.root)).origin).toBe(source);
   });
 
   test('a fresh capture after an edit sees the new bytes', async () => {
@@ -209,10 +209,10 @@ describe('captureWorkflowSource', () => {
     });
 
     expect(
-      await readFile(join(first!.captureRoot, 'project/.archon/commands/review.md'), 'utf-8')
+      await readFile(join(first!.anchor.root, 'project/.archon/commands/review.md'), 'utf-8')
     ).toBe('v1');
     expect(
-      await readFile(join(second!.captureRoot, 'project/.archon/commands/review.md'), 'utf-8')
+      await readFile(join(second!.anchor.root, 'project/.archon/commands/review.md'), 'utf-8')
     ).toBe('v2');
   });
 
@@ -227,7 +227,7 @@ describe('captureWorkflowSource', () => {
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
 
-    const copied = join(capture!.captureRoot, 'project', '.archon', 'commands', 'linked.md');
+    const copied = join(capture!.anchor.root, 'project', '.archon', 'commands', 'linked.md');
     expect((await stat(copied)).isFile()).toBe(true);
     // Mutating the link target must not reach the capture — that is the whole point.
     await writeFile(outside, 'CHANGED');
@@ -253,12 +253,12 @@ describe('captureWorkflowSource', () => {
     // source can change behavior.
     expect(
       await readFile(
-        join(capture.captureRoot, 'project/.archon/scripts/node_modules/dep/i.js'),
+        join(capture.anchor.root, 'project/.archon/scripts/node_modules/dep/i.js'),
         'utf-8'
       )
     ).toBe('dep();');
     await expect(
-      readFile(join(capture.captureRoot, 'project/.archon/scripts/__pycache__/main.pyc'), 'utf-8')
+      readFile(join(capture.anchor.root, 'project/.archon/scripts/__pycache__/main.pyc'), 'utf-8')
     ).rejects.toThrow();
   });
 
@@ -280,7 +280,7 @@ describe('captureWorkflowSource', () => {
     });
 
     // Exactly one copy of the one real file — not one per level of re-entry.
-    expect(await countScopeFiles(capture.captureRoot, 'project')).toBe(1);
+    expect(await countScopeFiles(capture.anchor.root, 'project')).toBe(1);
   });
 
   test('captures nothing under project scope when the source holds none', async () => {
@@ -294,8 +294,8 @@ describe('captureWorkflowSource', () => {
     // Still a valid, verifiable capture — a source with no project files is a legitimate
     // run (bundled workflows only), not a reason to leave the run without one.
     expect(capture.manifest.scopes).not.toContain('project');
-    expect(await countScopeFiles(capture.captureRoot, 'project')).toBe(0);
-    expect((await loadWorkflowSource(capture.captureRoot)).manifest.digest).toBe(
+    expect(await countScopeFiles(capture.anchor.root, 'project')).toBe(0);
+    expect((await loadWorkflowSource(capture.anchor.root)).manifest.digest).toBe(
       capture.manifest.digest
     );
   });
@@ -399,7 +399,7 @@ describe('resolving against a capture instead of the target', () => {
     // `discoverScripts` returns POSIX-separated paths on every platform (normalizeSep),
     // so compare in that form rather than against a raw `join()` result.
     const posix = (p: string) => p.replaceAll('\\', '/');
-    expect(script?.path.startsWith(posix(capture!.captureRoot))).toBe(true);
+    expect(script?.path.startsWith(posix(capture!.anchor.root))).toBe(true);
     expect(script?.path.startsWith(posix(target))).toBe(false);
   });
 
@@ -451,9 +451,9 @@ describe("a run's own source versus a child's discovery root", () => {
       sourceRoot: source,
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
-    const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
+    const metadata = recorded(capture!.anchor.root, source, capture!.manifest.digest);
 
-    expect((await resolveRunSourceCapture(metadata))?.captureRoot).toBe(capture!.captureRoot);
+    expect((await resolveRunSourceCapture(metadata))?.anchor.root).toBe(capture!.anchor.root);
   });
 
   test('new and pre-change version-1 records both remain readable', async () => {
@@ -482,7 +482,7 @@ describe("a run's own source versus a child's discovery root", () => {
       sourceRoot: source,
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
-    const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
+    const metadata = recorded(capture!.anchor.root, source, capture!.manifest.digest);
 
     expect(await resolveChildDiscoveryRoot(metadata)).toBe(source);
     expect(await resolveChildDiscoveryRoot(metadata)).not.toBe(
@@ -490,14 +490,13 @@ describe("a run's own source versus a child's discovery root", () => {
     );
   });
 
-  test('a recorded run FAILS when its capture is gone; a child falls back to live', async () => {
+  test('a recorded run and its not-yet-started child fail when their source is gone', async () => {
     const root = await createTempRoot();
-    // The asymmetry is the contract. A run that recorded a source must execute that
-    // source or stop — falling back would resume it against different bytes. A child's
-    // origin is only a hint about where to capture FROM, so its absence is recoverable.
     const metadata = recorded(join(root, 'no-capture'), join(root, 'no-origin'));
     await expect(resolveRunSourceCapture(metadata)).rejects.toThrow(WorkflowSourceIntegrityError);
-    expect(await resolveChildDiscoveryRoot(metadata)).toBeUndefined();
+    await expect(resolveChildDiscoveryRoot(metadata)).rejects.toThrow(
+      'recorded authoring source is unavailable'
+    );
   });
 
   test('a run with no recorded source resolves live', async () => {
@@ -520,7 +519,7 @@ describe("a run's own source versus a child's discovery root", () => {
     // Unreadable, not absent: the run DID record a source, so resolving live would
     // execute something it never agreed to.
     await expect(resolveRunSourceCapture(relative)).rejects.toThrow(WorkflowSourceIntegrityError);
-    expect(await resolveChildDiscoveryRoot(relative)).toBeUndefined();
+    await expect(resolveChildDiscoveryRoot(relative)).rejects.toThrow(WorkflowSourceIntegrityError);
   });
 
   test('a record from a newer Archon fails closed rather than resuming live', async () => {
@@ -552,7 +551,7 @@ describe('the capture is authoritative, not advisory', () => {
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
     await writeFile(
-      join(capture.captureRoot, 'project', '.archon', 'workflows', 'anchored.yaml'),
+      join(capture.anchor.root, 'project', '.archon', 'workflows', 'anchored.yaml'),
       'name: replacement\ndescription: changed\nnodes: []\n'
     );
 
@@ -572,11 +571,11 @@ describe('the capture is authoritative, not advisory', () => {
     // An edit UNDER the artifacts tree: a directory-exists check cannot see this, which
     // is the whole reason the manifest carries a digest.
     await writeFile(
-      join(capture.captureRoot, 'project', '.archon', 'commands', 'review.md'),
+      join(capture.anchor.root, 'project', '.archon', 'commands', 'review.md'),
       'TAMPERED'
     );
 
-    await expect(loadWorkflowSource(capture.captureRoot)).rejects.toThrow(
+    await expect(loadWorkflowSource(capture.anchor.root)).rejects.toThrow(
       WorkflowSourceIntegrityError
     );
   });
@@ -590,7 +589,7 @@ describe('the capture is authoritative, not advisory', () => {
     const metadata = {
       [WORKFLOW_SOURCE_METADATA_KEY]: {
         version: 1,
-        root: capture.captureRoot,
+        root: capture.anchor.root,
         origin: source,
         captured_at: capture.manifest.captured_at,
         digest: capture.manifest.digest,
@@ -598,9 +597,9 @@ describe('the capture is authoritative, not advisory', () => {
         byte_count: capture.manifest.byte_count,
       },
     };
-    expect((await resolveRunSourceCapture(metadata))?.captureRoot).toBe(capture.captureRoot);
+    expect((await resolveRunSourceCapture(metadata))?.anchor.root).toBe(capture.anchor.root);
 
-    await rm(capture.captureRoot, { recursive: true, force: true });
+    await rm(capture.anchor.root, { recursive: true, force: true });
     // Not `undefined` — that would read as "no record" and fall through to live source.
     await expect(resolveRunSourceCapture(metadata)).rejects.toThrow(WorkflowSourceIntegrityError);
   });
@@ -630,7 +629,7 @@ describe('the capture is authoritative, not advisory', () => {
       ...DEFAULT_WORKFLOW_SOURCE_CONFIG,
       load_default_commands: false,
     };
-    const manifestPath = join(capture.captureRoot, 'manifest.json');
+    const manifestPath = join(capture.anchor.root, 'manifest.json');
     const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
     await writeFile(
       manifestPath,
@@ -639,7 +638,7 @@ describe('the capture is authoritative, not advisory', () => {
     const metadata = {
       [WORKFLOW_SOURCE_METADATA_KEY]: {
         version: 1,
-        root: capture.captureRoot,
+        root: capture.anchor.root,
         origin: source,
         captured_at: capture.manifest.captured_at,
         digest: capture.manifest.digest,
@@ -668,7 +667,7 @@ describe('the capture is authoritative, not advisory', () => {
     const metadata = {
       [WORKFLOW_SOURCE_METADATA_KEY]: {
         version: 1,
-        root: capture.captureRoot,
+        root: capture.anchor.root,
         origin: source,
         captured_at: capture.manifest.captured_at,
         digest: capture.manifest.digest,
@@ -684,7 +683,7 @@ describe('the capture is authoritative, not advisory', () => {
       (metadata[WORKFLOW_SOURCE_METADATA_KEY] as Record<string, unknown>).source_config
     ).toBeUndefined();
 
-    const manifestPath = join(capture.captureRoot, 'manifest.json');
+    const manifestPath = join(capture.anchor.root, 'manifest.json');
     const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
     await writeFile(
       manifestPath,
@@ -711,8 +710,8 @@ describe('the capture is authoritative, not advisory', () => {
     // captured, every other assertion here would keep passing.
     expect(capture.manifest.scopes).toContain('bundled');
     const roots = capturedSourceRoots(capture.anchor);
-    expect(roots.globalWorkflows.startsWith(capture.captureRoot)).toBe(true);
-    expect(roots.globalCommands.startsWith(capture.captureRoot)).toBe(true);
+    expect(roots.globalWorkflows.startsWith(capture.anchor.root)).toBe(true);
+    expect(roots.globalCommands.startsWith(capture.anchor.root)).toBe(true);
   });
 
   test('records the selected workflow without disturbing what was frozen', async () => {
@@ -723,10 +722,10 @@ describe('the capture is authoritative, not advisory', () => {
       captureRoot: getRunSourceCapturePath(runArtifacts),
     });
 
-    await recordSelectedWorkflow(capture.captureRoot, 'chosen-flow');
+    await recordSelectedWorkflow(capture.anchor.root, 'chosen-flow');
 
     // The manifest is outside the digest, so naming the selection cannot invalidate it.
-    const reloaded = await loadWorkflowSource(capture.captureRoot);
+    const reloaded = await loadWorkflowSource(capture.anchor.root);
     expect(reloaded.manifest.workflow_name).toBe('chosen-flow');
     expect(reloaded.manifest.digest).toBe(capture.manifest.digest);
   });
@@ -808,7 +807,7 @@ describe('continuing a run resolves with the settings it froze', () => {
 
     // What a continuation does: read the capture back from its path alone, exactly as
     // `sourceCaptureRoot` gives it, and rebuild roots from the manifest it finds there.
-    const reloaded = await loadWorkflowSource(capture.captureRoot);
+    const reloaded = await loadWorkflowSource(capture.anchor.root);
     const roots = capturedSourceRoots(reloaded.anchor);
     expect(roots.anchor.config.command_folder).toBe('team-commands');
 
@@ -819,11 +818,26 @@ describe('continuing a run resolves with the settings it froze', () => {
 
 describe('a capture is adopted or reclaimed, whichever way the caller leaves', () => {
   /** Stand in for a staged capture: what the owner is handed and may have to reclaim. */
-  async function stage(root: string, name: string): Promise<{ captureRoot: string }> {
+  async function stage(
+    root: string,
+    name: string
+  ): Promise<{
+    anchor: {
+      root: string;
+      digest: string;
+      config: WorkflowSourceConfig;
+    };
+  }> {
     const captureRoot = join(root, name);
     await mkdir(captureRoot, { recursive: true });
     await writeFile(join(captureRoot, 'manifest.json'), '{}');
-    return { captureRoot };
+    return {
+      anchor: {
+        root: captureRoot,
+        digest: 'test-digest',
+        config: DEFAULT_WORKFLOW_SOURCE_CONFIG,
+      },
+    };
   }
 
   const exists = async (p: string): Promise<boolean> =>
@@ -836,17 +850,17 @@ describe('a capture is adopted or reclaimed, whichever way the caller leaves', (
     const root = await createTempRoot();
     // The shape of every early exit that used to leak: an unknown workflow, a refused
     // input contract, the "resume or force?" menu. None of them adopt.
-    let staged: { captureRoot: string } | undefined;
+    let staged: Awaited<ReturnType<typeof stage>> | undefined;
     await withCapturedSource(async owner => {
       staged = await stage(root, 'returned');
       owner.hold(staged);
     });
-    expect(await exists(staged!.captureRoot)).toBe(false);
+    expect(await exists(staged!.anchor.root)).toBe(false);
   });
 
   test('reclaims when the body throws', async () => {
     const root = await createTempRoot();
-    let staged: { captureRoot: string } | undefined;
+    let staged: Awaited<ReturnType<typeof stage>> | undefined;
     await expect(
       withCapturedSource(async owner => {
         staged = await stage(root, 'threw');
@@ -854,18 +868,18 @@ describe('a capture is adopted or reclaimed, whichever way the caller leaves', (
         throw new Error('a gate refused this run');
       })
     ).rejects.toThrow('a gate refused this run');
-    expect(await exists(staged!.captureRoot)).toBe(false);
+    expect(await exists(staged!.anchor.root)).toBe(false);
   });
 
   test('leaves an adopted capture alone — a run owns it now', async () => {
     const root = await createTempRoot();
-    let staged: { captureRoot: string } | undefined;
+    let staged: Awaited<ReturnType<typeof stage>> | undefined;
     await withCapturedSource(async owner => {
       staged = await stage(root, 'adopted');
       owner.hold(staged);
       owner.adopt();
     });
-    expect(await exists(staged!.captureRoot)).toBe(true);
+    expect(await exists(staged!.anchor.root)).toBe(true);
   });
 
   test('reclaims the CURRENT path after a container run moves the capture', async () => {
@@ -873,14 +887,14 @@ describe('a capture is adopted or reclaimed, whichever way the caller leaves', (
     // `finalizeWorkflowSource` moves a container run's capture out of staging early. If
     // the owner kept tracking the pre-move path it would reclaim a directory that is
     // already gone and leave the real one behind, looking like it had cleaned up.
-    let moved: { captureRoot: string } | undefined;
+    let moved: Awaited<ReturnType<typeof stage>> | undefined;
     await withCapturedSource(async owner => {
       const staged = await stage(root, 'pre-move');
       owner.hold(staged);
       moved = await stage(root, 'post-move');
       owner.hold(moved);
     });
-    expect(await exists(moved!.captureRoot)).toBe(false);
+    expect(await exists(moved!.anchor.root)).toBe(false);
   });
 
   test('holding nothing is not an error', async () => {

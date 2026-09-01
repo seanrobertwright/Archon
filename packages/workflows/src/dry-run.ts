@@ -504,6 +504,7 @@ interface DryRunContext {
 }
 
 async function loadDryRunCommand(ctx: DryRunContext, command: string): Promise<string> {
+  await assertWorkflowSourceIntegrity(ctx.sourceRoots);
   const result = await loadCommandPrompt(
     {
       // Unreachable: `loadCommandPrompt` consults `loadConfig` only when its source roots
@@ -675,6 +676,7 @@ async function executeCodeNode(
         args = ['run', ...(node.deps ?? []).flatMap(dep => ['--with', dep]), 'python', '-c', code];
       }
     } else {
+      await assertWorkflowSourceIntegrity(ctx.sourceRoots);
       const script = (await discoverScriptsForCwd(ctx.cwd, ctx.sourceRoots)).get(code);
       if (!script) return { error: `Named script '${code}' was not found` };
       command = script.runtime === 'bun' ? 'bun' : 'uv';

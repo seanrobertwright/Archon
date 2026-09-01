@@ -337,7 +337,6 @@ mock.module('@archon/workflows/executor', () => ({
   prepareWorkflowSource: mock(() =>
     Promise.resolve({
       runId: 'test-run-id',
-      captureRoot: '/test/capture',
       origin: '/test/path',
       manifest: {
         version: 1,
@@ -2252,7 +2251,6 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
     });
     (finalizeWorkflowSource as ReturnType<typeof mock>).mockResolvedValueOnce({
       runId: 'test-run-id',
-      captureRoot: '/test/finalized/workflow-source',
       origin: '/test/path',
       manifest: {
         version: 1,
@@ -2264,12 +2262,30 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
         byte_count: 0,
         scopes: [],
       },
+      anchor: {
+        root: '/test/finalized/workflow-source',
+        digest: 'test-digest',
+        config: {
+          load_default_workflows: true,
+          load_default_commands: true,
+        },
+      },
       roots: {
         project: '/test/finalized/workflow-source/project',
         globalWorkflows: '/test/finalized/workflow-source/global/workflows',
         globalCommands: '/test/finalized/workflow-source/global/commands',
         globalScripts: '/test/finalized/workflow-source/global/scripts',
         bundledWorkflows: '/test/finalized/workflow-source/bundled',
+        bundledCommands: '/test/finalized/workflow-source/bundled/commands/defaults',
+        kind: 'captured',
+        anchor: {
+          root: '/test/finalized/workflow-source',
+          digest: 'test-digest',
+          config: {
+            load_default_workflows: true,
+            load_default_commands: true,
+          },
+        },
       },
     });
     mockFolderBackendPrepare.mockRejectedValueOnce(new Error('container unavailable'));

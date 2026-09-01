@@ -356,7 +356,6 @@ mock.module('@archon/workflows/executor', () => ({
   prepareWorkflowSource: mock(() =>
     Promise.resolve({
       runId: 'prepared-run-id',
-      captureRoot: '/capture',
       origin: '/origin',
       manifest: {
         version: 1,

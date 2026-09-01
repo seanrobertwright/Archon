@@ -1607,8 +1607,8 @@ async function runWorkflowWithOwnedSource(
   // Pinned at the moment of prepare so the SIGINT/SIGTERM cleanup never rm's a
   // path a live run is reading from. For `--container` folder-codebase runs,
   // `finalizeWorkflowSource` (workflow.ts:1749) reassigns `preparedSource` to a
-  // new object whose `captureRoot` is the LIVE artifacts directory the run
-  // executes from — rm-ing `preparedSource.captureRoot` on Ctrl-C mid-run would
+  // new object whose anchor points at the LIVE artifacts directory the run
+  // executes from — rm-ing `preparedSource.anchor.root` on Ctrl-C mid-run would
   // destroy the run's source. The original staged path is renamed away by
   // either `finalizeWorkflowSource` (container) or `executeWorkflow`'s rename
   // (everything else), so an `rm` against it is a no-op once prep has moved it.
@@ -1622,7 +1622,7 @@ async function runWorkflowWithOwnedSource(
       });
       // From here the owner reclaims it unless a run adopts it, whichever way we leave.
       owner.hold(preparedSource);
-      originalStagedRoot = preparedSource.captureRoot;
+      originalStagedRoot = preparedSource.anchor.root;
     } catch (error) {
       throw new Error(
         `Failed to capture workflow source from ${effectiveDiscoveryCwd}: ${(error as Error).message}`
@@ -1677,11 +1677,11 @@ async function runWorkflowWithOwnedSource(
         ...(detachedPreCreatedRun ? { runId: detachedPreCreatedRun.id } : {}),
       });
       owner.hold(replacement);
-      originalStagedRoot = replacement.captureRoot;
+      originalStagedRoot = replacement.anchor.root;
       const stale = preparedSource;
       preparedSource = replacement;
       if (stale) {
-        rmSync(stale.captureRoot, { recursive: true, force: true });
+        rmSync(stale.anchor.root, { recursive: true, force: true });
       }
     } catch (error) {
       throw new Error(
@@ -1707,7 +1707,7 @@ async function runWorkflowWithOwnedSource(
         `Workflow '${workflowName}' not found.\n\nAvailable workflows:\n${availableWorkflows}`
       );
     }
-    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+    await recordSelectedWorkflow(preparedSource.anchor.root, workflow.name);
     emitParseWarnings(workflowEntry?.parseWarnings, workflow.name);
     emitDeprecationNotice(workflow);
     // The gates above ran against the parent checkout's YAML; this lane executes the
@@ -1725,7 +1725,7 @@ async function runWorkflowWithOwnedSource(
   // Name the selection in the capture's manifest, now that it is known. The manifest is
   // outside the digest, so this records provenance without disturbing what was frozen.
   if (workflow && preparedSource) {
-    await recordSelectedWorkflow(preparedSource.captureRoot, workflow.name);
+    await recordSelectedWorkflow(preparedSource.anchor.root, workflow.name);
   }
 
   if (!workflow) {
@@ -2682,7 +2682,7 @@ async function runWorkflowWithOwnedSource(
             codebase: folderCodebase,
             // Read-only, at the same absolute path inside the container, so a named
             // script resolves identically on both sides of the boundary.
-            ...(preparedSource ? { sourceMount: preparedSource.captureRoot } : {}),
+            ...(preparedSource ? { sourceMount: preparedSource.anchor.root } : {}),
           });
         } catch (prepErr) {
           // Map docker/daemon/image failures to an actionable message (daemon down,
@@ -3008,9 +3008,9 @@ async function runWorkflowWithOwnedSource(
       // frozen tree.
       //
       // The rm targets the ORIGINAL staged path pinned at prepare time, not
-      // `preparedSource.captureRoot` (see `originalStagedRoot`'s note above).
+      // `preparedSource.anchor.root` (see `originalStagedRoot`'s note above).
       // For container runs that path was renamed away by `finalizeWorkflowSource`
-      // and `preparedSource.captureRoot` is now the LIVE artifacts directory —
+      // and `preparedSource.anchor.root` is now the LIVE artifacts directory —
       // rm-ing it mid-execution would destroy the run's source.
       .then(async () => {
         if (originalStagedRoot) {
