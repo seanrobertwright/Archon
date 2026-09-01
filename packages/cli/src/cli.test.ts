@@ -215,6 +215,50 @@ describe('CLI help output', () => {
       "--adopt <run-id>           Start a new run adopting a terminal run's worktree/branch + artifacts ($ADOPTED_RUN_DIR)"
     );
   });
+
+  // Issue #3106 acceptance: scoped `--help` is narrower than the global
+  // index. Capture each spawn separately so the two outputs can be compared
+  // directly. The global anchor (`--cwd <path>`) must remain in the index and
+  // drop from the scoped slice, proving routing is narrowing — not just
+  // appending the same content under a different heading.
+  it('produces scoped workflow run --help that differs from archon --help and scopes to run-only flags', () => {
+    const global = spawnSync(process.execPath, [CLI_ENTRY, '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    const scoped = spawnSync(process.execPath, [CLI_ENTRY, 'workflow', 'run', '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(global.status).toBe(0);
+    expect(scoped.status).toBe(0);
+    expect(global.stdout).not.toBe(scoped.stdout);
+    expect(global.stdout).toContain('--cwd <path>');
+    expect(scoped.stdout).not.toContain('--cwd <path>');
+    expect(scoped.stdout).toContain('--workflow-source');
+    expect(scoped.stdout).toContain('--dry-run');
+  });
+
+  it('documents --workflow-source as a run-only flag in workflow run --help', () => {
+    const scoped = spawnSync(process.execPath, [CLI_ENTRY, 'workflow', 'run', '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(scoped.status).toBe(0);
+    expect(scoped.stdout).toContain('--workflow-source');
+  });
+
+  it('scopes workflow logs --help to --follow and excludes run-only flags', () => {
+    // Proves the partition is not a one-off for workflow run: another
+    // subcommand gets only its own flag, while a run-only flag drops out.
+    const scoped = spawnSync(process.execPath, [CLI_ENTRY, 'workflow', 'logs', '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(scoped.status).toBe(0);
+    expect(scoped.stdout).toContain('--follow');
+    expect(scoped.stdout).not.toContain('--dry-run');
+  });
 });
 
 describe('removed continue command', () => {
