@@ -52,6 +52,7 @@ import {
   isLoopNode,
   isWaitNode,
   isWorkflowNode,
+  waitCondition,
   effortLevelSchema,
   type DagNode,
   type NodeOutput,
@@ -1033,12 +1034,16 @@ async function simulateNode(
       return;
     }
     if (isWaitNode(node)) {
+      const condition = waitCondition(node.wait);
+      const resolvedText =
+        condition.kind === 'attention' ? resolveText(condition.message, ctx, outputs) : undefined;
       outputs.set(node.id, { state: 'pending', output: '' });
       ctx.trace.push({
         nodeId: node.id,
         nodeType: 'wait',
         state: 'paused',
         reason: 'durable wait',
+        ...(resolvedText !== undefined ? { resolvedText } : {}),
         ...(iteration ? { iteration } : {}),
       });
       ctx.halted = 'paused';

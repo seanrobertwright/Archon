@@ -1193,6 +1193,22 @@ describe('assertApprovable / assertRejectable — shared precondition gate', () 
     );
     expect(assertRejectable(withMeta(waiting))).toBeUndefined();
   });
+
+  test('an action-required wait is neither approvable nor rejectable', () => {
+    const waiting = {
+      wait: {
+        owner: 'node',
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince: '2026-08-28T10:00:00.000Z',
+        message: 'Re-run CI, then resume.',
+      },
+    };
+    for (const assertFn of [assertApprovable, assertRejectable]) {
+      expect(() => assertFn(withMeta(waiting))).toThrow('Complete it, then resume the run');
+      expect(() => assertFn(withMeta(waiting))).toThrow('abandon it');
+    }
+  });
 });
 
 describe('getWorkflowStatus', () => {

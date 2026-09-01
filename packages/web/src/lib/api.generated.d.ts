@@ -3795,6 +3795,9 @@ export interface components {
         | {
             event: string;
             deadline_ms: number;
+          }
+        | {
+            attention: string;
           };
       cancel?: string;
       include?: string;

@@ -3601,6 +3601,11 @@ function formatWaitOutcome(watchedRunId: string, result: RunWaitResult): string 
         ? `Run ${watchedRunId} is waiting for a response at gate '${attention.respondTo.nodeId}'.`
         : `Run ${watchedRunId} is blocked on sub-run ${attention.respondTo.runId}, which is waiting ` +
             `for a response at gate '${attention.respondTo.nodeId}'.`;
+    case 'action_required':
+      return (
+        `Run ${watchedRunId} needs an outside action: ${attention.message} ` +
+        `When it is complete, run: archon workflow resume ${attention.runId}`
+      );
     case 'blocked_on_child':
       // Unreachable through the waiter, which resolves the chain before returning.
       return `Run ${watchedRunId} is blocked on sub-run ${attention.childRunId}.`;
@@ -3945,8 +3950,10 @@ export async function workflowGetCommand(
   // the plain output) sees whether any declared completion condition completed
   // the paused iteration (#2074). --json already carries the full metadata.approval.
   const gateMeta = run.metadata.approval;
+  const waitMeta = run.metadata.wait;
   if (
     run.status === 'paused' &&
+    !isWorkflowWaitContext(waitMeta) &&
     isApprovalContext(gateMeta) &&
     gateMeta.type === 'interactive_loop'
   ) {
@@ -3955,12 +3962,13 @@ export async function workflowGetCommand(
       `  Gate:   awaiting approval — completion condition met: ${completionMet} (iteration ${String(gateMeta.iteration ?? '?')})`
     );
   }
-  const waitMeta = run.metadata.wait;
   if (run.status === 'paused' && isWorkflowWaitContext(waitMeta)) {
     console.log(
-      waitMeta.kind === 'event'
-        ? `  Wait:   event '${waitMeta.event ?? '?'}' until ${waitMeta.resumeAt}`
-        : `  Wait:   until ${waitMeta.resumeAt}`
+      waitMeta.kind === 'attention'
+        ? `  Wait:   action required — ${waitMeta.message} (resume with: archon workflow resume ${run.id})`
+        : waitMeta.kind === 'event'
+          ? `  Wait:   event '${waitMeta.event ?? '?'}' until ${waitMeta.resumeAt}`
+          : `  Wait:   until ${waitMeta.resumeAt}`
     );
   }
   const scheduledResume = run.metadata.scheduled_resume;

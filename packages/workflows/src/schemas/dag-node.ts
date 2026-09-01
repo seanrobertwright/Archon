@@ -602,6 +602,7 @@ export const waitConfigFlatSchema = z.object({
   duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS).optional(),
   until: z.string().min(1, "'wait.until' must not be empty").optional(),
   event: z.string().trim().min(1, "'wait.event' must not be empty").optional(),
+  attention: z.string().trim().min(1, "'wait.attention' must not be empty").optional(),
   deadline_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS).optional(),
 });
 export const waitUntilTimestampSchema = z.string().datetime();
@@ -619,22 +620,45 @@ const waitUntilValueSchema = z
 // The transforms preserve the validated wire shape while making sibling fields
 // `never` in the inferred type, so widened programmatic objects cannot combine variants.
 export const waitConfigSchema = z.union([
-  z
-    .strictObject({ duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS) })
-    .transform(
-      value => value as typeof value & { until?: never; event?: never; deadline_ms?: never }
-    ),
-  z
-    .strictObject({ until: waitUntilValueSchema })
-    .transform(
-      value => value as typeof value & { duration_ms?: never; event?: never; deadline_ms?: never }
-    ),
+  z.strictObject({ duration_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS) }).transform(
+    value =>
+      value as typeof value & {
+        until?: never;
+        event?: never;
+        attention?: never;
+        deadline_ms?: never;
+      }
+  ),
+  z.strictObject({ until: waitUntilValueSchema }).transform(
+    value =>
+      value as typeof value & {
+        duration_ms?: never;
+        event?: never;
+        attention?: never;
+        deadline_ms?: never;
+      }
+  ),
   z
     .strictObject({
       event: z.string().trim().min(1, "'wait.event' must not be empty"),
       deadline_ms: z.number().int().positive().max(MAX_DURABLE_WAIT_MS),
     })
-    .transform(value => value as typeof value & { duration_ms?: never; until?: never }),
+    .transform(
+      value => value as typeof value & { duration_ms?: never; until?: never; attention?: never }
+    ),
+  z
+    .strictObject({
+      attention: z.string().trim().min(1, "'wait.attention' must not be empty"),
+    })
+    .transform(
+      value =>
+        value as typeof value & {
+          duration_ms?: never;
+          until?: never;
+          event?: never;
+          deadline_ms?: never;
+        }
+    ),
 ]);
 export type WaitConfig = z.infer<typeof waitConfigSchema>;
 
@@ -642,7 +666,8 @@ export type WaitConfig = z.infer<typeof waitConfigSchema>;
 export type WaitCondition =
   | { kind: 'duration'; durationMs: number }
   | { kind: 'until'; timestamp: string }
-  | { kind: 'event'; event: string; deadlineMs: number };
+  | { kind: 'event'; event: string; deadlineMs: number }
+  | { kind: 'attention'; message: string };
 
 export function waitCondition(config: WaitConfig): WaitCondition {
   if (config.duration_ms !== undefined) {
@@ -651,7 +676,10 @@ export function waitCondition(config: WaitConfig): WaitCondition {
   if (config.until !== undefined) {
     return { kind: 'until', timestamp: config.until };
   }
-  return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };
+  if (config.event !== undefined) {
+    return { kind: 'event', event: config.event, deadlineMs: config.deadline_ms };
+  }
+  return { kind: 'attention', message: config.attention };
 }
 
 export const workflowWaitResultSchema = z.object({

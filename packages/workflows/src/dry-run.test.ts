@@ -1201,6 +1201,35 @@ describe('dryRunWorkflow', () => {
     expect(result.unusedStubs).toEqual([]);
   });
 
+  test('resolves an attention wait message before pausing', async () => {
+    const workflow = makeTestWorkflow({
+      name: 'attention-wait',
+      nodes: [
+        { id: 'probe', bash: 'printf failed' },
+        {
+          id: 'recover',
+          wait: { attention: 'Rerun $probe.output, then resume $INPUTS.run_label.' },
+          depends_on: ['probe'],
+        },
+      ],
+      inputs: { run_label: { default: 'this run' } },
+    });
+
+    const result = await dryRunWorkflow({
+      workflow,
+      userMessage: '',
+      cwd: process.cwd(),
+      stubs: { probe: 'e2e-smoke (fail)' },
+    });
+
+    expect(result.outcome).toBe('paused');
+    expect(result.trace.at(-1)).toMatchObject({
+      nodeId: 'recover',
+      state: 'paused',
+      resolvedText: 'Rerun e2e-smoke (fail), then resume this run.',
+    });
+  });
+
   test('simulates loop completion and max-iteration failure', async () => {
     const completing = makeTestWorkflow({
       name: 'loop-ok',

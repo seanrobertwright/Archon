@@ -4527,6 +4527,8 @@ async function executeLoopGroupNode(
       terminalNode,
       workflowRun,
       deps,
+      platform,
+      conversationId,
       outerNodeOutputs,
       bodyStepNamePrefix,
       {
@@ -7073,6 +7075,8 @@ async function executeWaitNode(
   node: WaitNode,
   workflowRun: WorkflowRun,
   deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
   nodeOutputs: Map<string, NodeOutput>,
   stepNamePrefix = '',
   loopOwner?: WaitLoopOwner
@@ -7135,7 +7139,7 @@ async function executeWaitNode(
       waitingSince: now.toISOString(),
       resumeAt: new Date(resumeAtMs).toISOString(),
     };
-  } else {
+  } else if (condition.kind === 'event') {
     const event = substituteNodeOutputRefs(
       substituteInputRefs(condition.event, resolveRunInputs(workflowRun)),
       nodeOutputs
@@ -7150,12 +7154,28 @@ async function executeWaitNode(
       waitingSince: now.toISOString(),
       resumeAt: new Date(now.getTime() + condition.deadlineMs).toISOString(),
     };
+  } else {
+    const message = substituteNodeOutputRefs(
+      substituteInputRefs(condition.message, resolveRunInputs(workflowRun)),
+      nodeOutputs
+    ).trim();
+    if (message === '') {
+      throw new Error(`Wait node '${node.id}' resolved 'attention' to an empty message`);
+    }
+    context = {
+      ...owner,
+      kind: 'attention',
+      waitingSince: now.toISOString(),
+      message,
+    };
   }
 
-  const resumeAtMs = Date.parse(context.resumeAt);
+  const resumeAtMs = context.kind === 'attention' ? undefined : Date.parse(context.resumeAt);
   const isSignaled = context.kind === 'event' && context.signaledAt !== undefined;
-  const isDue = now.getTime() >= resumeAtMs;
-  if (!isSignaled && !isDue) {
+  const isDue = resumeAtMs !== undefined && now.getTime() >= resumeAtMs;
+  const isAttentionResume = context.kind === 'attention' && persisted !== undefined;
+  if (!isSignaled && !isDue && !isAttentionResume) {
+    let paused = false;
     try {
       await deps.store.pauseWorkflowRunForWait(
         workflowRun.id,
@@ -7164,12 +7184,21 @@ async function executeWaitNode(
           ? { kind: 'started', stepName: stepNamePrefix + node.id }
           : { kind: 'continued' }
       );
+      paused = true;
     } catch (pauseError) {
       const status = await deps.store.getWorkflowRunStatus(workflowRun.id);
       if (status === 'running') throw pauseError;
       getLog().warn(
         { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
         'dag.wait_pause_skipped_external_transition'
+      );
+    }
+    if (paused && context.kind === 'attention') {
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `⏸️ **Action required for workflow run \`${workflowRun.id}\`**\n\n${context.message}\n\nResume this run after the action is complete, or abandon it if it should not continue.`,
+        { workflowId: workflowRun.id, nodeName: node.id }
       );
     }
     return { state: 'completed', output: '' };
@@ -10303,6 +10332,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   node,
                   ctx.workflowRun,
                   ctx.deps,
+                  ctx.platform,
+                  ctx.conversationId,
                   ctx.nodeOutputs,
                   ctx.stepNamePrefix,
                   loopFrame === undefined

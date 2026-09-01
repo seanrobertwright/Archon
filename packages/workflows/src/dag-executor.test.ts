@@ -14130,6 +14130,84 @@ describe('executeDagWorkflow -- durable wait node', () => {
     );
   });
 
+  it('pauses for an outside action with a rendered message and no deadline', async () => {
+    const store = createMockStore();
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        platform,
+        conversationId: 'conv-attention',
+        cwd: testDir,
+        workflow: {
+          name: 'attention-wait-test',
+          nodes: [
+            {
+              id: 'rerun-ci',
+              kind: 'wait',
+              wait: { attention: 'Re-run $INPUTS.check, then resume.' },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('attention-wait', {
+          metadata: { inputs: { check: 'windows tests' } },
+        }),
+      })
+    );
+
+    expect(store.pauseWorkflowRunForWait).toHaveBeenCalledWith(
+      'attention-wait',
+      {
+        owner: 'node',
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince: expect.any(String),
+        message: 'Re-run windows tests, then resume.',
+      },
+      { kind: 'started', stepName: 'rerun-ci' }
+    );
+    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(call =>
+      String(call[1])
+    );
+    expect(messages.join('\n')).toContain('Action required for workflow run `attention-wait`');
+    expect(messages.join('\n')).toContain('Re-run windows tests, then resume.');
+  });
+
+  it('consumes an action-required wait on explicit resume', async () => {
+    const store = createMockStore();
+    const persisted: WorkflowWaitContext = {
+      owner: 'node',
+      nodeId: 'rerun-ci',
+      kind: 'attention',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'Re-run CI, then resume.',
+    };
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        conversationId: 'conv-attention-resume',
+        cwd: testDir,
+        workflow: {
+          name: 'attention-resume-test',
+          nodes: [{ id: 'rerun-ci', kind: 'wait', wait: { attention: 'unused on resume' } }],
+        },
+        workflowRun: makeWorkflowRun('attention-resume', { metadata: { wait: persisted } }),
+      })
+    );
+
+    expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
+    expect(store.clearWorkflowWaitContext).toHaveBeenCalledWith(
+      'attention-resume',
+      persisted,
+      expect.objectContaining({
+        stepName: 'rerun-ci',
+        result: expect.objectContaining({ status: 'satisfied' }),
+      })
+    );
+  });
+
   it('completes an expired event wait with typed output on resume', async () => {
     const store = createMockStore();
     const deps = createMockDeps(store);
@@ -14200,6 +14278,7 @@ describe('executeDagWorkflow -- durable wait node', () => {
 
   it('tolerates cancellation that wins the wait pause CAS', async () => {
     const store = createMockStore();
+    const platform = createMockPlatform();
     let pauseAttempted = false;
     store.pauseWorkflowRunForWait = mock(async () => {
       pauseAttempted = true;
@@ -14210,11 +14289,12 @@ describe('executeDagWorkflow -- durable wait node', () => {
     await executeDagWorkflow(
       dagOptions({
         deps: createMockDeps(store),
+        platform,
         conversationId: 'conv-wait-cancelled',
         cwd: testDir,
         workflow: {
           name: 'wait-cancelled-race',
-          nodes: [{ id: 'delay', kind: 'wait', wait: { duration_ms: 60_000 } }],
+          nodes: [{ id: 'delay', kind: 'wait', wait: { attention: 'Complete the action.' } }],
         },
         workflowRun: makeWorkflowRun('wait-cancelled'),
       })
@@ -14224,6 +14304,10 @@ describe('executeDagWorkflow -- durable wait node', () => {
     expect(events).not.toContain('node_failed');
     expect(store.failWorkflowRun).not.toHaveBeenCalled();
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(call =>
+      String(call[1])
+    );
+    expect(messages.join('\n')).not.toContain('Action required');
   });
 });
 
@@ -28897,6 +28981,47 @@ function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
   };
 }
 
+function attentionTerminatedLoopGroupWorkflow(
+  probeCountPath: string,
+  greenMarkerPath: string
+): WorkflowDefinition {
+  return {
+    name: 'attention-terminated-loop-group',
+    description: 'action-required wait escalation shape',
+    nodes: [
+      dagNodeSchema.parse({
+        id: 'grp',
+        loop_group: {
+          until_bash: 'test $probe.output.state = "concluded"',
+          max_iterations: 2,
+          nodes: [
+            {
+              id: 'probe',
+              bash: [
+                'COUNT=0',
+                `[ ! -f ${JSON.stringify(probeCountPath)} ] || COUNT=$(cat ${JSON.stringify(probeCountPath)})`,
+                'COUNT=$((COUNT + 1))',
+                `printf '%s' "$COUNT" > ${JSON.stringify(probeCountPath)}`,
+                `if [ -f ${JSON.stringify(greenMarkerPath)} ]; then`,
+                `  printf '%s' '{"state":"concluded","detail":"green"}'`,
+                'else',
+                `  printf '%s' '{"state":"red","detail":"windows tests failed"}'`,
+                'fi',
+              ].join('\n'),
+            },
+            {
+              id: 'pause',
+              wait: { attention: '$probe.output.detail Re-run the check, then resume.' },
+              when: "$probe.output.state != 'concluded'",
+              depends_on: ['probe'],
+            },
+          ],
+        },
+      }),
+    ],
+  };
+}
+
 function includedProbeWaitTerminatedLoopGroupWorkflow(
   markerPath: string,
   quoteOutputRef = false
@@ -29115,6 +29240,96 @@ describe('#2707 step 3: gate-terminated loop_group pause escalation', () => {
       bodyWaitId: 'delay',
       iteration: 2,
     });
+  });
+
+  it('probes once per explicit action resume and creates a fresh loop wait cursor', async () => {
+    const probeCountPath = join(testDir, 'attention-probe-count');
+    const greenMarkerPath = join(testDir, 'attention-green');
+    const workflow = ready(attentionTerminatedLoopGroupWorkflow(probeCountPath, greenMarkerPath));
+    const initialStore = createEscalationStore('run-attention-loop');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(initialStore),
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun('run-attention-loop'),
+      })
+    );
+
+    expect(await Bun.file(probeCountPath).text()).toBe('1');
+    const firstWait = initialStore.getState().metadata.wait as WorkflowWaitContext;
+    expect(firstWait).toMatchObject({
+      owner: 'loop_group',
+      nodeId: 'grp',
+      bodyWaitId: 'pause',
+      iteration: 1,
+      kind: 'attention',
+      message: 'windows tests failed Re-run the check, then resume.',
+    });
+
+    const resumedStore = createEscalationStore('run-attention-loop');
+    const priorCompletedNodes = new Map<string, PersistedNodeOutput>([
+      ['grp.probe', { output: '{"state":"red","detail":"windows tests failed"}' }],
+    ]);
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(resumedStore),
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun('run-attention-loop', { metadata: { wait: firstWait } }),
+        priorCompletedNodes,
+      })
+    );
+
+    expect(await Bun.file(probeCountPath).text()).toBe('2');
+    expect(resumedStore.getState()).toMatchObject({
+      status: 'paused',
+      metadata: {
+        wait: {
+          owner: 'loop_group',
+          nodeId: 'grp',
+          bodyWaitId: 'pause',
+          iteration: 2,
+          kind: 'attention',
+        },
+      },
+    });
+  });
+
+  it('completes an action-required loop when the explicit-resume probe turns green', async () => {
+    const probeCountPath = join(testDir, 'attention-green-probe-count');
+    const greenMarkerPath = join(testDir, 'attention-green-marker');
+    const workflow = ready(attentionTerminatedLoopGroupWorkflow(probeCountPath, greenMarkerPath));
+    const firstWait: WorkflowWaitContext = {
+      owner: 'loop_group',
+      nodeId: 'grp',
+      bodyWaitId: 'pause',
+      iteration: 1,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'attention',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'windows tests failed Re-run the check, then resume.',
+    };
+    await writeFile(greenMarkerPath, 'green');
+    const store = createEscalationStore('run-attention-green');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun('run-attention-green', { metadata: { wait: firstWait } }),
+        priorCompletedNodes: new Map([
+          ['grp.probe', { output: '{"state":"red","detail":"windows tests failed"}' }],
+        ]),
+      })
+    );
+
+    expect(await Bun.file(probeCountPath).text()).toBe('1');
+    expect(store.pauseWorkflowRunForWait).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
   });
 
   it('#2803: an included wait-resume fails loud when until_bash cannot restore its producer', async () => {

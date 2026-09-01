@@ -382,4 +382,32 @@ describe('toRun — durable wait', () => {
     });
     expect(runStatusLabel(r)).toBe('Waiting for event');
   });
+
+  test('parses an action-required wait without a scheduler deadline', () => {
+    const r = toRun(
+      raw({
+        id: 'r1',
+        workflow_name: 'deliver',
+        status: 'paused',
+        metadata: {
+          approval: { nodeId: 'old-gate', message: 'Stale approval' },
+          wait: {
+            owner: 'node',
+            nodeId: 'rerun-ci',
+            kind: 'attention',
+            waitingSince: '2026-08-25T10:00:00.000Z',
+            message: 'Re-run CI, then resume.',
+          },
+        },
+      })
+    );
+
+    expect(r.wait).toEqual({
+      nodeId: 'rerun-ci',
+      kind: 'attention',
+      message: 'Re-run CI, then resume.',
+    });
+    expect(r.approval).toBeNull();
+    expect(runStatusLabel(r)).toBe('Waiting for action');
+  });
 });

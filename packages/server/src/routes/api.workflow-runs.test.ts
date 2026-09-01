@@ -2159,6 +2159,49 @@ const MOCK_PAUSED_RUN: MockWorkflowRun = {
   },
 };
 
+describe('action-required pause gate routes', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
+  });
+
+  for (const [verb, body] of [
+    ['approve', {}],
+    ['reject', { reason: 'no' }],
+    ['respond', { decision: 'approve' }],
+  ] as const) {
+    test(`${verb} directs the operator to resume or abandon instead`, async () => {
+      mockGetWorkflowRun.mockResolvedValueOnce({
+        ...MOCK_PAUSED_RUN,
+        id: 'run-action-required',
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'rerun-ci',
+            kind: 'attention',
+            waitingSince: '2026-08-24T10:00:00.000Z',
+            message: 'Re-run CI, then resume.',
+          },
+        },
+      });
+      const { app } = makeApp();
+      const response = await app.request(`/api/workflows/runs/run-action-required/${verb}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      expect(response.status).toBe(400);
+      const result = (await response.json()) as { error?: string };
+      expect(result.error).toContain('resume');
+      expect(result.error).toContain('abandon');
+      expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+      expect(mockResolveAndCancelApprovalGate).not.toHaveBeenCalled();
+    });
+  }
+});
+
 describe('POST /api/workflows/runs/:runId/approve', () => {
   beforeEach(() => {
     mockGetWorkflowRun.mockReset();

@@ -139,6 +139,16 @@ export function formatPausedGateSection(gate: PausedGateContext): string {
     );
   }
 
+  if (attention.kind === 'action_required') {
+    return (
+      '## Paused action required\n\n' +
+      `Run \`${runId}\` (**${workflowName}**) is paused until someone completes this outside action:\n\n` +
+      `> ${attention.message.replace(/\n/g, '\n> ')}\n\n` +
+      `After the action is complete, resume run \`${runId}\`. Abandon it if it should not continue. ` +
+      'Do not approve or reject this pause.'
+    );
+  }
+
   // `awaiting_response`. The projection reports it only for a well-formed, unresolved
   // gate; the context read here carries the DETAIL the attention value omits.
   const rawApproval = gate.run.metadata.approval;

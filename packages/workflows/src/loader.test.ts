@@ -2623,6 +2623,24 @@ nodes:
       result = await discoverWorkflows(testDir, { loadDefaults: false });
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0].error).toContain("unknown node '$missing.output'");
+
+      await writeFile(
+        join(workflowDir, 'bad-wait-ref.yaml'),
+        `
+name: bad-wait-ref
+description: Invalid output refs in waits
+nodes:
+  - id: check
+    bash: echo failed
+  - id: wait-for-action
+    wait:
+      attention: "Rerun $check.output, then resume."
+`
+      );
+
+      result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toContain('not an upstream dependency');
     });
 
     it('rejects suspension nodes that can run concurrently', () => {

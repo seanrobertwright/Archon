@@ -213,7 +213,7 @@ nodes:
 | `loop` | object | Iterative AI prompt until a declared completion condition is met. See [Loop Nodes](/guides/loop-nodes/) |
 | `loop_group` | object | Multi-node sub-DAG body repeated per iteration until a declared completion condition is met. See [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group) |
 | `approval` | object | Pauses workflow for human review. See [Approval Nodes](/guides/approval-nodes/) |
-| `wait` | object | Durably pauses the run until a time or bounded external event. The server resumes due waits without keeping a worker or subprocess alive. See [Durable waits](#durable-waits) |
+| `wait` | object | Durably pauses the run until a time, bounded external event, or explicit outside action. See [Durable waits](#durable-waits) |
 | `cancel` | string | Terminates the workflow run with a reason string. Uses existing cancellation plumbing — in-flight parallel nodes are stopped |
 | `include` | string | Name of another workflow whose nodes are inlined into this DAG at load time as a namespaced sub-DAG. Optional `with:` (named inputs → the block's `$INPUTS.<name>`) and, to fan the composed body out over a runtime list **inside this run**, `fan_out` — see [Composing Another Workflow](#composing-another-workflow-with-include) and [Fanning out a composed block](#fanning-out-a-composed-block-inside-the-run-include--fan_out) |
 | `workflow` | string | Name of another workflow to run as a governed **child sub-run** at execution time — its own run record, gates, artifacts, and cost. Optional `input` (untyped data string → child's `$ARGUMENTS`) **or** `with:` (named inputs → child's `$INPUTS.<name>`; mutually exclusive with `input`), `isolation` (`'inherit'` \| `'worktree'`), and `fan_out` (one child per item of a runtime list; optional `as:` names the per-item `$INPUTS` channel). See [Launching a Separate Governed Run](#launching-a-separate-governed-run-with-workflow) and [Workflow Signature](#workflow-signature-inputs-returns-and-inputs) |
@@ -658,7 +658,7 @@ Both sources coexist — inline agents and on-disk agents are both available to 
 
 ## Durable waits
 
-A `wait:` node records an absolute deadline in the workflow run, changes the run to `paused`, and returns the worker slot. The server scans persisted waits and resumes due runs through the ordinary DAG resume path. Restarting Archon does not reset the clock.
+A `wait:` node records its condition in the workflow run, changes the run to `paused`, and returns the worker slot. Time and event waits carry an absolute deadline; the server resumes them through the ordinary DAG resume path. An action-required wait has no deadline and resumes only when an operator explicitly resumes the run. Restarting Archon preserves either kind.
 
 Declare exactly one condition:
 
@@ -678,14 +678,21 @@ nodes:
     wait:
       event: checks.complete
       deadline_ms: 86400000
+
+  - id: rerun-checks
+    depends_on: [checks]
+    wait:
+      attention: >-
+        Re-run the failed external check, then resume this run.
 ```
 
 - `duration_ms` starts once, then persists the resulting absolute time. An early manual resume pauses again against the same time; it does not restart the duration.
 - `until` accepts an ISO-8601 timestamp after `$node.output` substitution.
 - `event` requires `deadline_ms`. If no matching signal arrives by the deadline, the node completes with `status: expired`; event waits cannot remain open forever.
+- `attention` is a non-empty message describing an outside action. Archon shows it with the run id and offers Resume and Abandon. It is never selected by the continuation scheduler; after completing the action, run `archon workflow resume <run-id>` or use the Web UI Resume action.
 - `duration_ms` and `deadline_ms` are capped at 1000 years so their persisted RFC3339 timestamps always remain executable.
 
-A satisfied wait produces the fixed structured output `{ status, waited_ms, event?, payload? }`. `status` is `satisfied` or `expired`, so downstream `when:` or `until_bash` wiring can branch without parsing prose. `output_format`, `retry`, and `always_run` cannot be set on a wait; the engine owns its output and continuation lifecycle.
+A satisfied wait produces the fixed structured output `{ status, waited_ms, event?, payload? }`. `status` is `satisfied` or `expired`; an explicitly resumed `attention` wait is `satisfied`. Downstream `when:` or `until_bash` wiring can branch without parsing prose. `output_format`, `retry`, and `always_run` cannot be set on a wait; the engine owns its output and continuation lifecycle.
 
 Signal one exact run through the authenticated API:
 

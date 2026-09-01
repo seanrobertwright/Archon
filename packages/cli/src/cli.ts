@@ -152,7 +152,7 @@ Commands:
   workflow runs              List recent runs (all statuses) for this project
   workflow get <run-id>      Show detail for a single run (any status)
   workflow logs <run-id>     Print or follow a run's JSONL transcript
-  workflow wait <run-id>     Block until the run ends or needs a human decision
+  workflow wait <run-id>     Block until the run ends or needs outside action
   workflow resume <run-id>   Resume a failed or paused run from completed nodes
   workflow cancel <run-id>   Stop a running workflow started with --detach
   workflow abandon <run-id>  Mark a run cancelled without stopping host work

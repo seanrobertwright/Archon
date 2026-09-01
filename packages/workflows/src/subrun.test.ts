@@ -116,7 +116,7 @@ import { discoverWorkflows } from './workflow-discovery';
 import { validateWorkflowResources } from './validator';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
-import type { WorkflowRun } from './schemas/workflow-run';
+import type { WorkflowRun, WorkflowWaitContext } from './schemas/workflow-run';
 import type { ResolvedWorkflow } from './schemas/workflow';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 import type {
@@ -304,12 +304,14 @@ class InMemoryStore implements IWorkflowStore {
 
   clearWorkflowWaitContext: IWorkflowStore['clearWorkflowWaitContext'] = (id, waitContext) => {
     const r = this.runs.get(id);
-    const wait = r?.metadata.wait as { nodeId?: string; resumeAt?: string } | undefined;
-    if (
-      r?.status === 'running' &&
-      wait?.nodeId === waitContext.nodeId &&
-      wait.resumeAt === waitContext.resumeAt
-    ) {
+    const wait = r?.metadata.wait as WorkflowWaitContext | undefined;
+    const cursorMatches =
+      wait?.kind === 'attention' && waitContext.kind === 'attention'
+        ? wait.waitingSince === waitContext.waitingSince
+        : wait?.kind !== 'attention' &&
+          waitContext.kind !== 'attention' &&
+          wait?.resumeAt === waitContext.resumeAt;
+    if (r?.status === 'running' && wait?.nodeId === waitContext.nodeId && cursorMatches) {
       const { wait: _wait, ...metadata } = r.metadata;
       r.metadata = metadata;
       return Promise.resolve({ cleared: true });

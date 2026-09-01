@@ -4712,6 +4712,39 @@ describe('workflowGetCommand', () => {
     );
   });
 
+  it('prints an action-required wait with its explicit resume command', async (): Promise<void> => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-action-human',
+      workflow_name: 'deliver',
+      status: 'paused',
+      working_path: '/tmp/wt',
+      started_at: new Date(),
+      metadata: {
+        approval: {
+          type: 'interactive_loop',
+          nodeId: 'old-gate',
+          message: 'Stale approval',
+          iteration: 1,
+        },
+        wait: {
+          owner: 'node',
+          nodeId: 'rerun-ci',
+          kind: 'attention',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          message: 'Re-run CI, then resume.',
+        },
+      },
+    });
+
+    await workflowGetCommand('run-action-human');
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      '  Wait:   action required — Re-run CI, then resume. (resume with: archon workflow resume run-action-human)'
+    );
+    expect(consoleSpy.mock.calls.flat().join(' ')).not.toContain('Gate:');
+  });
+
   it('emits the same shared node summaries in verbose JSON by default', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     const eventsDb = await import('@archon/core/db/workflow-events');
@@ -11048,6 +11081,26 @@ describe('workflowWaitCommand', () => {
     const printed = consoleSpy.mock.calls.flat().join(' ');
     expect(printed).toContain('blocked on sub-run child-9');
     expect(printed).toContain("gate 'review'");
+  });
+
+  it('names the outside action and explicit resume command', async () => {
+    mockWaitForRunAttention.mockResolvedValueOnce({
+      kind: 'attention',
+      attention: {
+        kind: 'action_required',
+        runId: FULL_ID,
+        nodeId: 'rerun-ci',
+        message: 'Re-run CI, then resume.',
+        action: 'resume',
+      },
+    });
+
+    const code = await workflowWaitCommand(FULL_ID, undefined, '/repo');
+
+    expect(code).toBe(0);
+    const printed = consoleSpy.mock.calls.flat().join(' ');
+    expect(printed).toContain('Re-run CI, then resume.');
+    expect(printed).toContain(`archon workflow resume ${FULL_ID}`);
   });
 
   it('exits 3 with the observed status when the deadline passes', async () => {

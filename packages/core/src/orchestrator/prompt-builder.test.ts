@@ -387,4 +387,30 @@ describe('formatPausedGateSection', () => {
 
     expect(section).toBe('');
   });
+
+  test('describes an action-required wait without offering approval verbs', () => {
+    const section = formatPausedGateSection({
+      run: {
+        id: 'run-abc',
+        workflow_name: 'deliver',
+        status: 'paused',
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'rerun-ci',
+            kind: 'attention',
+            waitingSince: '2026-08-28T10:00:00.000Z',
+            message: 'Re-run the windows check, then resume.',
+          },
+        },
+      },
+    });
+
+    expect(section).toContain('## Paused action required');
+    expect(section).toContain('Re-run the windows check, then resume.');
+    expect(section).toContain('resume run `run-abc`');
+    expect(section).toContain('Abandon it');
+    expect(section).not.toContain('Paused Approval Gate');
+    expect(section).not.toContain('/workflow approve');
+  });
 });

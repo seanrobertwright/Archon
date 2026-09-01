@@ -20,8 +20,8 @@ States, on stdout as JSON so `when:`/`until_bash` can branch without prose:
                                          check is not a green check (R4).
 Red is a report, never a verdict: this probe declares the state and the
 deliver tail's convergence pass decides what it means — introduced red is
-correction work, any other red terminates at the flip preflight with the
-recovery named. Nothing here retries: a concluded check does not re-run itself.
+correction work, while inherited or environment red pauses for explicit
+operator action. Nothing here retries: a concluded check does not re-run itself.
 
 The one in-process wait left: when CI is configured but nothing has started
 yet, registration gets a single 60 s grace before the maintainer-gated skip is

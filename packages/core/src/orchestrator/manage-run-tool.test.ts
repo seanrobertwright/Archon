@@ -265,6 +265,29 @@ describe('manage_run — reads', () => {
     expect(out).toContain('authored outcome: succeeded');
   });
 
+  test('get surfaces an outside action with resume and abandon guidance', async () => {
+    mockFindByPrefix.mockResolvedValue([
+      makeRun({
+        status: 'paused',
+        metadata: {
+          wait: {
+            owner: 'node',
+            nodeId: 'rerun-ci',
+            kind: 'attention',
+            waitingSince: '2026-08-28T10:00:00.000Z',
+            message: 'Re-run CI, then resume.',
+          },
+        },
+      }),
+    ]);
+    const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });
+    const out = await tool.handler({ action: 'get', runId: 'r1abcdef' });
+
+    expect(out).toContain('action required: Re-run CI, then resume.');
+    expect(out).toContain('resume run r1abcdef-1234');
+    expect(out).toContain('abandon it');
+  });
+
   test('get preserves the prior detail shape when outcome is undeclared', async () => {
     mockFindByPrefix.mockResolvedValue([makeRun({ status: 'completed' })]);
     const tool = buildManageRunTool({ codebaseId: CODEBASE_ID });

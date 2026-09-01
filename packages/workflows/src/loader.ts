@@ -966,6 +966,8 @@ export function validateDagStructure(
       const waitSources: (readonly [string, string])[] = [];
       if (node.wait.until !== undefined) waitSources.push(['wait.until', node.wait.until]);
       if (node.wait.event !== undefined) waitSources.push(['wait.event', node.wait.event]);
+      if (node.wait.attention !== undefined)
+        waitSources.push(['wait.attention', node.wait.attention]);
       for (const [field, text] of waitSources) {
         outputRefPattern.lastIndex = 0;
         let m: RegExpExecArray | null;

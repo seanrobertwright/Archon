@@ -57,12 +57,19 @@ export interface Run {
     decisionsAuthored: boolean;
   } | null;
   /** Active durable wait cursor. Mutually exclusive with approval metadata. */
-  wait?: {
-    nodeId: string;
-    kind: 'time' | 'event';
-    resumeAt: string;
-    event?: string;
-  } | null;
+  wait?:
+    | {
+        nodeId: string;
+        kind: 'time' | 'event';
+        resumeAt: string;
+        event?: string;
+      }
+    | {
+        nodeId: string;
+        kind: 'attention';
+        message: string;
+      }
+    | null;
   /**
    * Set when a paused run's gate was already approved/rejected and the run is
    * only awaiting auto-resume (server: metadata.approval.resolved). The
@@ -199,25 +206,34 @@ export function toRun(raw: RawWorkflowRun): Run {
         }
       : null;
   const wait = raw.metadata?.wait;
-  const isWaitShape =
-    wait !== null &&
-    typeof wait === 'object' &&
-    wait !== undefined &&
-    'nodeId' in wait &&
-    typeof wait.nodeId === 'string' &&
-    'resumeAt' in wait &&
-    typeof (wait as { resumeAt: unknown }).resumeAt === 'string' &&
-    'kind' in wait &&
-    ((wait as { kind: unknown }).kind === 'time' || (wait as { kind: unknown }).kind === 'event');
-  const waitRecord = isWaitShape ? (wait as Record<string, unknown>) : undefined;
-  const parsedWait = isWaitShape
+  const waitRecord =
+    wait !== null && typeof wait === 'object' && wait !== undefined
+      ? (wait as Record<string, unknown>)
+      : undefined;
+  const isScheduledWaitShape =
+    waitRecord !== undefined &&
+    typeof waitRecord.nodeId === 'string' &&
+    typeof waitRecord.resumeAt === 'string' &&
+    (waitRecord.kind === 'time' || waitRecord.kind === 'event');
+  const isAttentionWaitShape =
+    waitRecord !== undefined &&
+    typeof waitRecord.nodeId === 'string' &&
+    waitRecord.kind === 'attention' &&
+    typeof waitRecord.message === 'string';
+  const parsedWait = isScheduledWaitShape
     ? {
-        nodeId: (wait as { nodeId: string }).nodeId,
-        kind: (wait as { kind: 'time' | 'event' }).kind,
-        resumeAt: (wait as { resumeAt: string }).resumeAt,
-        ...(typeof waitRecord?.event === 'string' ? { event: waitRecord.event } : {}),
+        nodeId: waitRecord.nodeId as string,
+        kind: waitRecord.kind as 'time' | 'event',
+        resumeAt: waitRecord.resumeAt as string,
+        ...(typeof waitRecord.event === 'string' ? { event: waitRecord.event } : {}),
       }
-    : null;
+    : isAttentionWaitShape
+      ? {
+          nodeId: waitRecord.nodeId as string,
+          kind: 'attention' as const,
+          message: waitRecord.message as string,
+        }
+      : null;
 
   return {
     id: raw.id,
@@ -237,7 +253,7 @@ export function toRun(raw: RawWorkflowRun): Run {
     userMessage: raw.user_message ?? '',
     currentNode: raw.current_step_name ?? null,
     lastTool: null,
-    approval: parsedApproval,
+    approval: parsedWait === null ? parsedApproval : null,
     wait: parsedWait,
     gateResolved,
     parentRunId: raw.parent_run_id ?? null,

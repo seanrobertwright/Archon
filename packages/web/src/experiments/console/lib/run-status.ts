@@ -20,6 +20,7 @@ export const statusLabel: Record<RunStatus, string> = {
 
 export function runStatusLabel(run: Run): string {
   if (run.status !== 'paused' || run.wait == null) return statusLabel[run.status];
+  if (run.wait.kind === 'attention') return 'Waiting for action';
   return run.wait.kind === 'event' ? 'Waiting for event' : 'Waiting until scheduled time';
 }
 

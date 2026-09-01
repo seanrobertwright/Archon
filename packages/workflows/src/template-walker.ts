@@ -52,6 +52,7 @@ export type TemplateSlotName =
   | 'cancel.reason'
   | 'wait.until'
   | 'wait.event'
+  | 'wait.attention'
   | 'workflow.input'
   | 'workflow.with.*'
   | 'workflow.fan_out.items'
@@ -97,6 +98,7 @@ const SLOT_SPEC = {
   'cancel.reason': { surface: 'prompt', outputReference: true },
   'wait.until': { surface: 'value', outputReference: true },
   'wait.event': { surface: 'value', outputReference: true },
+  'wait.attention': { surface: 'prompt', outputReference: true },
   'workflow.input': { surface: 'value', outputReference: true },
   'workflow.with.*': { surface: 'value', outputReference: true, valuePosition: 'workflow_with' },
   'workflow.fan_out.items': { surface: 'value', outputReference: true },
@@ -304,6 +306,10 @@ function walk(
         node.wait.event,
         value => (node.wait = { event: value, deadline_ms: deadlineMs })
       );
+    if (node.wait.attention !== undefined)
+      slot('wait.attention', 'wait.attention', node.wait.attention, value => {
+        node.wait = { attention: value };
+      });
   } else if (isWorkflowNode(node) || isComposeFanOutNode(node)) {
     if (isWorkflowNode(node) && node.input !== undefined)
       slot('workflow.input', 'input', node.input, value => (node.input = value));
