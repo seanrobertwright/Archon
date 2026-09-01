@@ -3602,39 +3602,53 @@ function printVerboseNodes(events: WorkflowEventRow[]): void {
   }
 }
 
-/**
- * Show status of all running workflow runs.
- */
+/** Show active workflow runs for the current project, or every project with `--all`. */
 export async function workflowStatusCommand(
-  json?: boolean,
-  verbose?: boolean,
-  rawEvents?: boolean
+  cwd: string,
+  opts: { json?: boolean; verbose?: boolean; rawEvents?: boolean; all?: boolean } = {}
 ): Promise<void> {
+  let codebase = null;
+  if (!opts.all) {
+    try {
+      codebase = await findCodebaseForCheckoutPath(cwd);
+    } catch (error) {
+      const err = error as Error;
+      getLog().error({ err, cwd }, 'cli.workflow_status_codebase_lookup_failed');
+      throw new Error(`Failed to resolve workflow status project: ${err.message}`, { cause: err });
+    }
+  }
+
   let runs: DashboardWorkflowRun[];
   try {
-    const result = await getWorkflowStatus();
+    const result = await getWorkflowStatus(codebase ? { codebaseId: codebase.id } : undefined);
     runs = result.runs;
   } catch (error) {
     const err = error as Error;
-    getLog().error({ err }, 'cli.workflow_status_failed');
+    getLog().error({ err, cwd }, 'cli.workflow_status_failed');
     throw new Error(`Failed to list workflow runs: ${err.message}`);
   }
 
-  if (json) {
-    if (!verbose) {
-      await writeJsonLine({ runs });
+  const scopeFallback = !opts.all && !codebase;
+
+  if (opts.json) {
+    if (!opts.verbose) {
+      await writeJsonLine({ runs, scopeFallback });
       return;
     }
 
     const fetchedPerRun = await Promise.all(runs.map(run => fetchVerboseEvents(run.id)));
     const runsOutput = runs.map((run, i) => {
       const runEvents = fetchedPerRun[i]?.events ?? [];
-      return rawEvents
+      return opts.rawEvents
         ? { ...run, events: runEvents }
         : { ...run, nodes: buildNodeSummaries(runEvents) };
     });
-    await writeJsonLine({ runs: runsOutput });
+    await writeJsonLine({ runs: runsOutput, scopeFallback });
     return;
+  }
+
+  if (scopeFallback) {
+    console.log('(not a registered project — showing all runs)');
   }
 
   if (runs.length === 0) {
@@ -3657,7 +3671,7 @@ export async function workflowStatusCommand(
       );
     }
 
-    if (verbose) {
+    if (opts.verbose) {
       const { events, failed } = await fetchVerboseEvents(run.id);
       if (failed) {
         console.log('  (node events unavailable — see logs)');

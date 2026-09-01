@@ -184,6 +184,16 @@ describe('buildRunManagementSection', () => {
     expect(section).toContain('state-only cancellation');
   });
 
+  test('states the status fallback without weakening the non-repository boundary', () => {
+    const section = buildRunManagementSection();
+
+    expect(section).toContain('unregistered git checkout');
+    expect(section).toContain('install-wide active runs');
+    expect(section).toContain('scopeFallback: true');
+    expect(section).toContain('non-repo path');
+    expect(section).toContain('Not in a git repository');
+  });
+
   test('tells the CLI-path providers to pass the user’s own words', () => {
     // Codex/OpenCode/Copilot reach the verbs only through this section — without
     // the clause they get less instruction density than Claude/Pi, which also see
