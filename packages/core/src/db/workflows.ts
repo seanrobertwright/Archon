@@ -2,7 +2,7 @@
  * Database operations for workflow runs
  */
 import { pool, getDialect, getDatabaseType, getDatabase } from './connection';
-import { insertWorkflowEvent } from './workflow-events';
+import { insertWorkflowEvent, listActiveWorkflowNodeIds } from './workflow-events';
 import { toHydratedTimestamp } from './timestamps';
 import type { IDatabase, SqlDialect } from './adapters/types';
 import type {
@@ -1755,6 +1755,12 @@ export type {
   DashboardRunsResult,
 } from '../schemas/workflow-run';
 
+function dashboardStatuses(
+  status: NonNullable<ListDashboardRunsOptions['status']>
+): WorkflowRunStatus[] {
+  return [...new Set(Array.isArray(status) ? status : [status])];
+}
+
 /**
  * Build WHERE clauses shared between the list and count queries.
  * Returns the clauses array and values array (mutated in place).
@@ -1766,8 +1772,11 @@ function buildDashboardWhereClauses(
   const whereClauses: string[] = [];
 
   if (options?.status) {
-    values.push(options.status);
-    whereClauses.push(`r.status = $${String(values.length)}`);
+    const placeholders = dashboardStatuses(options.status).map(status => {
+      values.push(status);
+      return `$${String(values.length)}`;
+    });
+    whereClauses.push(`r.status IN (${placeholders.join(', ')})`);
   }
   if (options?.codebaseId) {
     values.push(options.codebaseId);
@@ -1835,30 +1844,17 @@ export async function listDashboardRuns(
 
   try {
     const [listResult, countResult] = await Promise.all([
-      pool.query<DashboardWorkflowRun>(
+      pool.query<
+        Omit<
+          DashboardWorkflowRun,
+          'active_nodes' | 'current_step_name' | 'current_step_status' | 'total_steps'
+        >
+      >(
         `SELECT r.*,
                 c.platform_type,
                 c.platform_conversation_id AS worker_platform_id,
                 pc.platform_conversation_id AS parent_platform_id,
                 cb.name AS codebase_name,
-                (SELECT e.step_name
-                 FROM remote_agent_workflow_events e
-                 WHERE e.workflow_run_id = r.id AND e.event_type = 'step_started'
-                 ORDER BY e.created_at DESC LIMIT 1) AS current_step_name,
-                (SELECT ${jsonIntExtract('e.data', 'total_steps')}
-                 FROM remote_agent_workflow_events e
-                 WHERE e.workflow_run_id = r.id AND e.event_type = 'step_started'
-                 ORDER BY e.created_at DESC LIMIT 1) AS total_steps,
-                CASE (SELECT e2.event_type
-                      FROM remote_agent_workflow_events e2
-                      WHERE e2.workflow_run_id = r.id
-                        AND e2.event_type IN ('step_completed','step_failed','step_started')
-                      ORDER BY e2.created_at DESC LIMIT 1)
-                  WHEN 'step_completed' THEN 'completed'
-                  WHEN 'step_failed' THEN 'failed'
-                  WHEN 'step_started' THEN 'running'
-                  ELSE NULL
-                END AS current_step_status,
                 (SELECT COUNT(*) FROM remote_agent_workflow_events e
                  WHERE e.workflow_run_id = r.id AND e.event_type = 'parallel_agent_completed') AS agents_completed,
                 (SELECT COUNT(*) FROM remote_agent_workflow_events e
@@ -1904,10 +1900,23 @@ export async function listDashboardRuns(
 
     // Total for the current filter (with status applied)
     const total = options?.status
-      ? (counts[options.status as keyof typeof counts] ?? 0)
+      ? dashboardStatuses(options.status).reduce((sum, status) => sum + counts[status], 0)
       : counts.all;
 
-    return { runs: listResult.rows.map(normalizeWorkflowRun), total, counts };
+    const activeByRun = await listActiveWorkflowNodeIds(listResult.rows.map(run => run.id));
+    const runs = listResult.rows.map(run => {
+      const activeNodes = activeByRun.get(run.id) ?? [];
+      const hasSingleActiveNode = activeNodes.length === 1;
+      return normalizeWorkflowRun({
+        ...run,
+        active_nodes: activeNodes,
+        current_step_name: hasSingleActiveNode ? (activeNodes[0] ?? null) : null,
+        current_step_status: hasSingleActiveNode ? ('running' as const) : null,
+        total_steps: null,
+      });
+    });
+
+    return { runs, total, counts };
   } catch (error) {
     const err = error as Error;
     getLog().error({ err }, 'list_dashboard_runs_failed');

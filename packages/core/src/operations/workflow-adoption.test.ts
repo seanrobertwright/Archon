@@ -239,7 +239,7 @@ describe('resolveWorkflowAdoption', () => {
     });
   });
 
-  test("bounds estate history by the adopted run's start time", async () => {
+  test("bounds estate history by the adopted run's completion upper bound", async () => {
     const startedAt = new Date('2026-08-25T09:00:00.000Z');
     const completedAt = new Date('2026-08-25T12:00:00.000Z');
     const lookupCalls: Array<{ codebaseId: string; workingPath: string; cutoff: Date }> = [];
@@ -253,6 +253,47 @@ describe('resolveWorkflowAdoption', () => {
               working_path: '/ws/repo/.worktrees/vanished',
               started_at: startedAt,
               completed_at: completedAt,
+            }),
+          }),
+          findEnvironmentByPath: async (codebaseId, workingPath, cutoff) => {
+            lookupCalls.push({ codebaseId, workingPath, cutoff });
+            return envRow({
+              working_path: workingPath,
+              branch_name:
+                cutoff.getTime() === completedAt.getTime() ? 'alive-branch' : 'later-branch',
+              status: 'destroyed',
+            });
+          },
+        },
+      })
+    ).lane;
+
+    expect(lookupCalls).toEqual([
+      {
+        codebaseId: 'cb-1',
+        workingPath: '/ws/repo/.worktrees/vanished',
+        cutoff: completedAt,
+      },
+    ]);
+    expect(lane).toEqual({
+      kind: 'checkout-branch',
+      taskBranch: { kind: 'existing', branch: toBranchName('alive-branch') },
+    });
+  });
+
+  test('falls back to start time when completed_at is unset', async () => {
+    const startedAt = new Date('2026-08-25T09:00:00.000Z');
+    const lookupCalls: Array<{ codebaseId: string; workingPath: string; cutoff: Date }> = [];
+    const lane = (
+      await resolveWorkflowAdoption({
+        ...baseArgs,
+        adoptedRunId: 'run-1',
+        deps: {
+          ...makeDeps({
+            run: runRow({
+              working_path: '/ws/repo/.worktrees/vanished',
+              started_at: startedAt,
+              completed_at: null,
             }),
           }),
           findEnvironmentByPath: async (codebaseId, workingPath, cutoff) => {
