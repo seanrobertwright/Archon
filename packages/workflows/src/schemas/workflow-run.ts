@@ -86,6 +86,7 @@ export const workflowWaitContextSchema = z.union([
   z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitAttentionFields }),
 ]);
 export type WorkflowWaitContext = z.infer<typeof workflowWaitContextSchema>;
+export type WorkflowAttentionWaitContext = Extract<WorkflowWaitContext, { kind: 'attention' }>;
 
 export function isWorkflowWaitContext(value: unknown): value is WorkflowWaitContext {
   return workflowWaitContextSchema.safeParse(value).success;

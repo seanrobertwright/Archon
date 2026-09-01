@@ -10,6 +10,7 @@ import type {
   WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
+  WorkflowAttentionWaitContext,
   WorkflowWaitContext,
   ScheduledWorkflowResume,
 } from '@archon/workflows/schemas/workflow-run';
@@ -1473,6 +1474,68 @@ export async function pauseWorkflowRunForWait(
     const err = error as Error;
     getLog().error({ err, workflowRunId: id }, 'db.workflow_run_wait_pause_failed');
     throw new Error(`Failed to pause workflow run for wait: ${err.message}`);
+  }
+}
+
+/** Fail the exact attention cursor whose required notification could not be delivered. */
+export async function failPausedAttentionWait(
+  id: string,
+  waitContext: WorkflowAttentionWaitContext,
+  error: string
+): Promise<{ failed: boolean }> {
+  const parsedWaitContext = workflowWaitContextSchema.parse(waitContext);
+  if (parsedWaitContext.kind !== 'attention') {
+    throw new Error('Only an action-required wait can fail through notification delivery');
+  }
+  const dialect = getDialect();
+  const postgres = getDatabaseType() === 'postgresql';
+  const waitField = (field: string): string =>
+    postgres ? `metadata->'wait'->>'${field}'` : `json_extract(metadata, '$.wait.${field}')`;
+  const params: unknown[] = [
+    id,
+    JSON.stringify({ error }),
+    parsedWaitContext.nodeId,
+    parsedWaitContext.waitingSince,
+  ];
+  const ownerClauses = [`${waitField('owner')} = '${parsedWaitContext.owner}'`];
+  if (parsedWaitContext.owner === 'loop_group') {
+    params.push(parsedWaitContext.bodyWaitId, parsedWaitContext.iteration);
+    const iterationField = postgres
+      ? "(metadata->'wait'->>'iteration')::integer"
+      : "json_extract(metadata, '$.wait.iteration')";
+    ownerClauses.push(`${waitField('bodyWaitId')} = $5`, `${iterationField} = $6`);
+  }
+  const metadataWithoutScheduledResume = postgres
+    ? "metadata - 'scheduled_resume'"
+    : "json_remove(metadata, '$.scheduled_resume')";
+
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge(metadataWithoutScheduledResume, 2)}
+         WHERE id = $1
+           AND status = 'paused'
+           AND ${waitField('kind')} = 'attention'
+           AND ${waitField('nodeId')} = $3
+           AND ${waitField('waitingSince')} = $4
+           AND ${ownerClauses.join('\n           AND ')}`,
+        params
+      );
+      const failed = (result.rowCount ?? 0) > 0;
+      if (failed) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'workflow_failed',
+          data: { error },
+        });
+      }
+      return { failed };
+    });
+  } catch (dbError) {
+    const err = dbError as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_attention_notification_fail_error');
+    throw new Error(`Failed to fail paused attention wait: ${err.message}`);
   }
 }
 

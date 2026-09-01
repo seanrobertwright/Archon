@@ -70,6 +70,7 @@ import type {
   WorkflowLoadError,
   WorkflowSource,
 } from '@archon/workflows/schemas/workflow';
+import { isWorkflowWaitContext } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import { isPerUserGitHubEnabled } from '../github-auth/config';
@@ -821,18 +822,19 @@ async function dispatchOrchestratorWorkflowOwned(
   // This function continues an existing run in TWO ways: an explicit
   // `/workflow resume <id>` (which arrives as `resumeRunId`/`resumeRun`), and an
   // IMPLICIT auto-detection that fires for a plain `/workflow run <name>` on every
-  // platform — the lookup that used to live further down, next to the dispatch. The
-  // gate below has to know about both: gating only against the explicit form wrongly
-  // refused a required-input workflow that was merely being continued (the run row
-  // already holds its validated inputs, and the caller supplies nothing when they
-  // just say "run it" again).
+  // platform — the lookup that used to live further down, next to the dispatch. An
+  // action-required wait is excluded from that implicit path: only the explicit form
+  // may consume it. The gate below still has to know about both continuation forms:
+  // gating only against the explicit form wrongly refused a required-input workflow
+  // that was merely being continued (the run row already holds its validated inputs,
+  // and the caller supplies nothing when they just say "run it" again).
   //
   // It has to be hoisted rather than the gate pushed down: `validateAndResolveIsolation`
   // sits between here and the old lookup site and CREATES WORKTREES, so gating after it
   // would forfeit the pre-cost refusal. This lookup is a single indexed DB read — no
   // worktree, no clone, no AI — so it is safe to do before gating. Its inputs
   // (`conversation.id`, `codebase.id`) are parameters and nothing below mutates them.
-  const resumableRun = options?.force
+  const resumeCandidate = options?.force
     ? null
     : (options?.resumeRun ??
       (await workflowDb.findResumableRunByParentConversation(
@@ -840,6 +842,15 @@ async function dispatchOrchestratorWorkflowOwned(
         conversation.id,
         codebase.id
       )));
+  const explicitResumeRequested =
+    options?.resumeRun !== undefined || options?.resumeRunId !== undefined;
+  const resumableRun =
+    !explicitResumeRequested &&
+    resumeCandidate !== null &&
+    isWorkflowWaitContext(resumeCandidate.metadata.wait) &&
+    resumeCandidate.metadata.wait.kind === 'attention'
+      ? null
+      : resumeCandidate;
   // Whether this dispatch will CONTINUE existing work rather than create a fresh run
   // row. Deliberately the exact negation of the resume/abandon/force menu's condition
   // below: a candidate that is neither paused nor the explicitly-targeted run does not
@@ -1139,10 +1150,10 @@ async function dispatchOrchestratorWorkflowOwned(
   // Dispatch workflow.
   // `resumableRun` was resolved above the signature gate (see the comment there):
   // resume detection runs for ALL platforms, so a prior run for this workflow in a
-  // resumable state (paused — including approved-awaiting-resume — or failed) in this
-  // conversation+codebase is continued rather than dispatched fresh. This ensures chat
-  // platforms (slack, telegram, discord, github) resume after approval gates just like
-  // web does.
+  // resumable state (paused — including approved-awaiting-resume, but excluding an
+  // action-required wait unless explicitly resumed — or failed) in this conversation+
+  // codebase is continued rather than dispatched fresh. This ensures chat platforms
+  // (slack, telegram, discord, github) resume after approval gates just like web does.
   if (options?.resumeRun && !options.resumeRun.working_path) {
     getLog().warn(
       {

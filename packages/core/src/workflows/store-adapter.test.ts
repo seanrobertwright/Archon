@@ -23,6 +23,7 @@ const mockCancelWorkflowRun = mock(() => Promise.resolve());
 const mockCancelFanOutRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRun = mock(() => Promise.resolve());
 const mockPauseWorkflowRunForWait = mock(() => Promise.resolve());
+const mockFailPausedAttentionWait = mock(() => Promise.resolve({ failed: true }));
 const mockClearWorkflowWaitContext = mock(() => Promise.resolve({ cleared: true }));
 // Backs createWorkflowStore()'s rewriteApprovalContext (#2707 step 3 pause
 // escalation) — per AGENTS.md's mock.module rule, an export the factory omits
@@ -48,6 +49,7 @@ mock.module('../db/workflows', () => ({
   cancelFanOutRun: mockCancelFanOutRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
   pauseWorkflowRunForWait: mockPauseWorkflowRunForWait,
+  failPausedAttentionWait: mockFailPausedAttentionWait,
   clearWorkflowWaitContext: mockClearWorkflowWaitContext,
   resolveApprovalGate: mockResolveApprovalGate,
   claimWriteback: mock(() => Promise.resolve({ claimed: true })),
@@ -180,6 +182,7 @@ describe('createWorkflowStore', () => {
       'failWorkflowRun',
       'pauseWorkflowRun',
       'pauseWorkflowRunForWait',
+      'failPausedAttentionWait',
       'clearWorkflowWaitContext',
       'rewriteApprovalContext',
       'claimWriteback',

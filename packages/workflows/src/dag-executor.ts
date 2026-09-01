@@ -7209,9 +7209,15 @@ async function executeWaitNode(
         { workflowId: workflowRun.id, nodeName: node.id }
       );
       if (!delivered) {
-        throw new Error(
-          `Wait node '${node.id}' could not deliver its action-required notification`
+        const deliveryError = `Wait node '${node.id}' could not deliver its action-required notification`;
+        const { failed } = await requireTerminalStatusWrite(
+          deps.store.failPausedAttentionWait(workflowRun.id, context, deliveryError),
+          {
+            workflowRunId: workflowRun.id,
+            site: 'dag.attention_notification_fail',
+          }
         );
+        if (failed) throw new Error(deliveryError);
       }
     }
     return { state: 'completed', output: '' };

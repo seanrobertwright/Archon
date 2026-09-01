@@ -302,6 +302,29 @@ class InMemoryStore implements IWorkflowStore {
     return Promise.resolve();
   };
 
+  failPausedAttentionWait: IWorkflowStore['failPausedAttentionWait'] = (id, waitContext, error) => {
+    const r = this.runs.get(id);
+    const wait = r?.metadata.wait as WorkflowWaitContext | undefined;
+    const ownerMatches =
+      wait?.owner === waitContext.owner &&
+      (wait?.owner !== 'loop_group' ||
+        waitContext.owner !== 'loop_group' ||
+        (wait.bodyWaitId === waitContext.bodyWaitId && wait.iteration === waitContext.iteration));
+    if (
+      r?.status === 'paused' &&
+      wait?.kind === 'attention' &&
+      wait.nodeId === waitContext.nodeId &&
+      wait.waitingSince === waitContext.waitingSince &&
+      ownerMatches
+    ) {
+      r.status = 'failed';
+      r.completed_at = new Date();
+      r.metadata = { ...r.metadata, error };
+      return Promise.resolve({ failed: true });
+    }
+    return Promise.resolve({ failed: false });
+  };
+
   clearWorkflowWaitContext: IWorkflowStore['clearWorkflowWaitContext'] = (id, waitContext) => {
     const r = this.runs.get(id);
     const wait = r?.metadata.wait as WorkflowWaitContext | undefined;

@@ -48,6 +48,7 @@ const {
   cancelFanOutRun,
   pauseWorkflowRun,
   pauseWorkflowRunForWait,
+  failPausedAttentionWait,
   clearWorkflowWaitContext,
   signalWorkflowWait,
   listDueWorkflowContinuations,
@@ -859,6 +860,43 @@ describe('durable wait continuation races — real SQLite', () => {
       })
     ).resolves.toEqual({ cleared: false });
     expect((await getWorkflowRun('attention-explicit-resume'))?.metadata.wait).toEqual(attentionB);
+  });
+
+  test('makes an undeliverable action-required pause visibly failed', async () => {
+    const attention = {
+      owner: 'node' as const,
+      nodeId: 'rerun-ci',
+      kind: 'attention' as const,
+      waitingSince: '2026-08-24T11:00:00.000Z',
+      message: 'Re-run the failing check, then resume.',
+    };
+    await seed('attention-notification-failed', 'paused', "datetime('now')", { wait: attention });
+
+    await expect(
+      failPausedAttentionWait(
+        'attention-notification-failed',
+        attention,
+        'action-required notification was not delivered'
+      )
+    ).resolves.toEqual({ failed: true });
+
+    const failed = await getWorkflowRun('attention-notification-failed');
+    expect(failed?.status).toBe('failed');
+    expect(failed?.completed_at).not.toBeNull();
+    expect(failed?.metadata).toMatchObject({
+      wait: attention,
+      error: 'action-required notification was not delivered',
+    });
+    expect(await countEvents('attention-notification-failed', 'workflow_failed')).toBe(1);
+
+    await expect(
+      failPausedAttentionWait(
+        'attention-notification-failed',
+        attention,
+        'duplicate notification failure'
+      )
+    ).resolves.toEqual({ failed: false });
+    expect(await countEvents('attention-notification-failed', 'workflow_failed')).toBe(1);
   });
 
   test('rejects a stale signal after the same event advances to a later occurrence', async () => {

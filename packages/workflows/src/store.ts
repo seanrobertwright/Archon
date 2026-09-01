@@ -10,6 +10,7 @@ import type {
   WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
+  WorkflowAttentionWaitContext,
   WorkflowWaitContext,
   WorkflowWaitResult,
   ScheduledWorkflowResume,
@@ -313,6 +314,12 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     waitContext: WorkflowWaitContext,
     pause: WorkflowWaitPause
   ): Promise<void>;
+  /** Fail the exact paused action-required cursor after its required notification is lost. */
+  failPausedAttentionWait(
+    id: string,
+    waitContext: WorkflowAttentionWaitContext,
+    error: string
+  ): Promise<{ failed: boolean }>;
   /** Consume the exact wait cursor and persist its completion snapshot atomically. */
   clearWorkflowWaitContext(
     id: string,

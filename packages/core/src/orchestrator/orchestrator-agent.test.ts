@@ -2810,6 +2810,63 @@ describe('workflow dispatch routing — interactive flag', () => {
     expect(opts.priorCompletedNodes?.size).toBeGreaterThan(0);
   });
 
+  test('a plain workflow run does not consume an action-required pause', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
+    mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    mockFindResumableRunByParentConversation.mockReturnValueOnce(
+      Promise.resolve(
+        makeResumableRun({
+          status: 'paused',
+          metadata: {
+            wait: {
+              owner: 'node',
+              nodeId: 'rerun-ci',
+              kind: 'attention',
+              waitingSince: '2026-09-01T10:00:00.000Z',
+              message: 'Re-run the failing check, then resume.',
+            },
+          },
+        })
+      )
+    );
+
+    await handleMessage(makePlatform(), 'conv-1', '/workflow run test-workflow');
+
+    expect(mockFindResumableRunByParentConversation).toHaveBeenCalled();
+    expect(mockHydrateResumableRun).not.toHaveBeenCalled();
+  });
+
+  test('an explicit workflow resume consumes an action-required pause', async () => {
+    const requestedRun = makeResumableRun({
+      status: 'paused',
+      metadata: {
+        wait: {
+          owner: 'node',
+          nodeId: 'rerun-ci',
+          kind: 'attention',
+          waitingSince: '2026-09-01T10:00:00.000Z',
+          message: 'Re-run the failing check, then resume.',
+        },
+      },
+    });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve(
+        makeWorkflowResult(true, { resumeRunId: requestedRun.id, resumeRun: requestedRun })
+      )
+    );
+
+    await handleMessage(makePlatform(), 'conv-1', `/workflow resume ${requestedRun.id}`);
+
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockHydrateResumableRun).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: requestedRun.id })
+    );
+  });
+
   test('foreground_resume_detected: falls through to fresh run when hydration returns null', async () => {
     // When findResumableRunByParentConversation returns a run but
     // hydrateResumableRun finds nothing worth resuming (zero completed nodes,

@@ -22,6 +22,66 @@ interface WorkflowProgressCardProps {
   workerConversationId: string;
 }
 
+interface AttentionWaitControlsProps {
+  runId: string | undefined;
+  workflowName: string;
+  message: string;
+  busy: boolean;
+  onResume: (runId: string) => void;
+  onAbandon: (runId: string) => void;
+}
+
+export function AttentionWaitControls({
+  runId,
+  workflowName,
+  message,
+  busy,
+  onResume,
+  onAbandon,
+}: AttentionWaitControlsProps): React.ReactElement {
+  return (
+    <>
+      <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
+        <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
+        <p className="text-xs text-text-secondary">{message}</p>
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => {
+            if (runId !== undefined) onResume(runId);
+          }}
+          disabled={runId === undefined || busy}
+          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors disabled:opacity-50"
+        >
+          <PlayCircle className="h-3.5 w-3.5" />
+          Resume
+        </button>
+        <ConfirmRunActionDialog
+          trigger={
+            <button
+              disabled={runId === undefined || busy}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors disabled:opacity-50"
+            >
+              <XCircle className="h-3.5 w-3.5" />
+              Abandon
+            </button>
+          }
+          title="Abandon workflow?"
+          description={
+            <>
+              Abandon <strong>{workflowName}</strong> instead of completing the outside action.
+            </>
+          }
+          confirmLabel="Abandon"
+          onConfirm={(): void => {
+            if (runId !== undefined) onAbandon(runId);
+          }}
+        />
+      </div>
+    </>
+  );
+}
+
 export function WorkflowProgressCard({
   workflowName,
   workerConversationId,
@@ -91,7 +151,7 @@ export function WorkflowProgressCard({
     };
   }, [isRunning, startedAt]);
 
-  // Approve/reject mutations
+  // Paused-run mutations
   const approveMutation = useMutation({
     mutationFn: () => approveWorkflowRun(runId ?? ''),
   });
@@ -99,10 +159,10 @@ export function WorkflowProgressCard({
     mutationFn: (reason?: string) => rejectWorkflowRun(runId ?? '', reason),
   });
   const resumeMutation = useMutation({
-    mutationFn: () => resumeWorkflowRun(runId ?? ''),
+    mutationFn: resumeWorkflowRun,
   });
   const abandonMutation = useMutation({
-    mutationFn: () => abandonWorkflowRun(runId ?? ''),
+    mutationFn: abandonWorkflowRun,
   });
   const mutationError =
     approveMutation.error ?? rejectMutation.error ?? resumeMutation.error ?? abandonMutation.error;
@@ -216,53 +276,31 @@ export function WorkflowProgressCard({
             </div>
           )}
 
-          {/* Approval request banner */}
+          {/* Paused-run controls */}
           {isPaused && (
             <div className="border-t border-border px-3 py-2 space-y-2">
-              <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
-                <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
-                <p className="text-xs text-text-secondary">
-                  {attentionMessage ?? approval?.message ?? 'Waiting for approval'}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                {attentionMessage !== null ? (
-                  <>
-                    <button
-                      onClick={() => {
-                        resumeMutation.mutate();
-                      }}
-                      disabled={!runId || resumeMutation.isPending || abandonMutation.isPending}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors disabled:opacity-50"
-                    >
-                      <PlayCircle className="h-3.5 w-3.5" />
-                      Resume
-                    </button>
-                    <ConfirmRunActionDialog
-                      trigger={
-                        <button
-                          disabled={!runId || resumeMutation.isPending || abandonMutation.isPending}
-                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors disabled:opacity-50"
-                        >
-                          <XCircle className="h-3.5 w-3.5" />
-                          Abandon
-                        </button>
-                      }
-                      title="Abandon workflow?"
-                      description={
-                        <>
-                          Abandon <strong>{workflowName}</strong> instead of completing the outside
-                          action.
-                        </>
-                      }
-                      confirmLabel="Abandon"
-                      onConfirm={(): void => {
-                        abandonMutation.mutate();
-                      }}
-                    />
-                  </>
-                ) : (
-                  <>
+              {attentionMessage !== null ? (
+                <AttentionWaitControls
+                  runId={runId}
+                  workflowName={workflowName}
+                  message={attentionMessage}
+                  busy={resumeMutation.isPending || abandonMutation.isPending}
+                  onResume={id => {
+                    resumeMutation.mutate(id);
+                  }}
+                  onAbandon={id => {
+                    abandonMutation.mutate(id);
+                  }}
+                />
+              ) : (
+                <>
+                  <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
+                    <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
+                    <p className="text-xs text-text-secondary">
+                      {approval?.message ?? 'Waiting for approval'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
                     <button
                       onClick={() => {
                         approveMutation.mutate();
@@ -300,9 +338,9 @@ export function WorkflowProgressCard({
                         rejectMutation.mutate(reason);
                       }}
                     />
-                  </>
-                )}
-              </div>
+                  </div>
+                </>
+              )}
               {(approveMutation.isError ||
                 rejectMutation.isError ||
                 resumeMutation.isError ||

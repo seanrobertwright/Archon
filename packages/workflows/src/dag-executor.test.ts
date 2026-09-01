@@ -106,7 +106,7 @@ import type {
   ApprovalContext,
   WorkflowWaitContext,
 } from './schemas';
-import { dagNodeSchema, workflowDefinitionSchema } from './schemas';
+import { dagNodeSchema, isWorkflowWaitContext, workflowDefinitionSchema } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
 import { expandWorkflowIncludes } from './include-expander';
@@ -210,6 +210,9 @@ function createMockStore(): MockWorkflowStore {
     ),
     pauseWorkflowRunForWait: mock<NonNullable<IWorkflowStore['pauseWorkflowRunForWait']>>(
       async (_id, _waitContext) => {}
+    ),
+    failPausedAttentionWait: mock<IWorkflowStore['failPausedAttentionWait']>(
+      async (_id, _waitContext, _error) => ({ failed: true })
     ),
     clearWorkflowWaitContext: mock<IWorkflowStore['clearWorkflowWaitContext']>(
       async (_id, _waitContext) => ({ cleared: true })
@@ -14174,7 +14177,7 @@ describe('executeDagWorkflow -- durable wait node', () => {
     expect(messages.join('\n')).toContain('Re-run windows tests, then resume.');
   });
 
-  it('records a failed action notification while preserving the attention cursor', async () => {
+  it('fails an action-required pause when its notification cannot be delivered', async () => {
     const store = createEscalationStore('attention-delivery-failed');
     const platform = createMockPlatform();
     platform.sendMessage.mockImplementation(async () => {
@@ -14202,7 +14205,7 @@ describe('executeDagWorkflow -- durable wait node', () => {
     );
 
     expect(store.getState()).toMatchObject({
-      status: 'paused',
+      status: 'failed',
       metadata: {
         wait: {
           owner: 'node',
@@ -14222,7 +14225,15 @@ describe('executeDagWorkflow -- durable wait node', () => {
         }),
       })
     );
-    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.failPausedAttentionWait).toHaveBeenCalledWith(
+      'attention-delivery-failed',
+      expect.objectContaining({
+        owner: 'node',
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+      }),
+      "Wait node 'rerun-ci' could not deliver its action-required notification"
+    );
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
   });
 
@@ -29081,6 +29092,28 @@ function createEscalationStore(
           ...metadata,
           wait: { ...(onWaitPaused?.(waitContext) ?? waitContext) },
         };
+      }
+    ),
+    failPausedAttentionWait: mock<IWorkflowStore['failPausedAttentionWait']>(
+      async (_id, waitContext, error) => {
+        const active = metadata.wait;
+        if (
+          status !== 'paused' ||
+          !isWorkflowWaitContext(active) ||
+          active.kind !== 'attention' ||
+          active.owner !== waitContext.owner ||
+          active.nodeId !== waitContext.nodeId ||
+          active.waitingSince !== waitContext.waitingSince ||
+          (active.owner === 'loop_group' &&
+            waitContext.owner === 'loop_group' &&
+            (active.bodyWaitId !== waitContext.bodyWaitId ||
+              active.iteration !== waitContext.iteration))
+        ) {
+          return { failed: false };
+        }
+        status = 'failed';
+        metadata = { ...metadata, error };
+        return { failed: true };
       }
     ),
     rewriteApprovalContext: mock<IWorkflowStore['rewriteApprovalContext']>(

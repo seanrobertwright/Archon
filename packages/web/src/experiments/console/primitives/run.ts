@@ -4,6 +4,17 @@ import type { components } from '@/lib/api.generated';
 export type RunOrigin = 'web' | 'cli' | 'slack' | 'telegram' | 'discord' | 'github' | 'unknown';
 export type RunOutcome = components['schemas']['WorkflowRunOutcome'];
 type WorkflowRunMetadata = components['schemas']['WorkflowRunMetadata'];
+type WorkflowWait = NonNullable<WorkflowRunMetadata['wait']>;
+type WorkflowWaitOwnerField =
+  | 'owner'
+  | 'nodeId'
+  | 'bodyWaitId'
+  | 'iteration'
+  | 'sessionId'
+  | 'sessionProvider';
+type NormalizedWorkflowWait<T extends WorkflowWait = WorkflowWait> = T extends WorkflowWait
+  ? Omit<T, WorkflowWaitOwnerField> & { nodeId: string }
+  : never;
 
 export interface Run {
   id: string;
@@ -59,19 +70,7 @@ export interface Run {
     decisionsAuthored: boolean;
   } | null;
   /** Active durable wait cursor. Mutually exclusive with approval metadata. */
-  wait?:
-    | {
-        nodeId: string;
-        kind: 'time' | 'event';
-        resumeAt: string;
-        event?: string;
-      }
-    | {
-        nodeId: string;
-        kind: 'attention';
-        message: string;
-      }
-    | null;
+  wait?: NormalizedWorkflowWait | null;
   /**
    * Set when a paused run's gate was already approved/rejected and the run is
    * only awaiting auto-resume (server: metadata.approval.resolved). The
@@ -128,6 +127,20 @@ function normalizeStatus(s: string): RunStatus {
   // Treat 'pending' as 'running' for UI purposes — it's transient.
   if (s === 'pending') return 'running';
   return (KNOWN_STATUSES as readonly string[]).includes(s) ? (s as RunStatus) : 'running';
+}
+
+function normalizeWorkflowWait(wait: WorkflowWait): NormalizedWorkflowWait {
+  if (wait.owner === 'node') {
+    const { owner, ...normalized } = wait;
+    void owner;
+    return normalized;
+  }
+  const { owner, nodeId, bodyWaitId, iteration, sessionId, sessionProvider, ...normalized } = wait;
+  void owner;
+  void iteration;
+  void sessionId;
+  void sessionProvider;
+  return { ...normalized, nodeId: `${nodeId}.${bodyWaitId}` };
 }
 
 export function normalizeOrigin(s: string | null | undefined): RunOrigin {
@@ -212,21 +225,8 @@ export function toRun(raw: RawWorkflowRun): Run {
         }
       : null;
   const wait = raw.metadata?.wait;
-  const parsedWait =
-    wait === undefined
-      ? null
-      : wait.kind === 'attention'
-        ? {
-            nodeId: wait.owner === 'loop_group' ? `${wait.nodeId}.${wait.bodyWaitId}` : wait.nodeId,
-            kind: wait.kind,
-            message: wait.message,
-          }
-        : {
-            nodeId: wait.owner === 'loop_group' ? `${wait.nodeId}.${wait.bodyWaitId}` : wait.nodeId,
-            kind: wait.kind,
-            resumeAt: wait.resumeAt,
-            ...(wait.kind === 'event' ? { event: wait.event } : {}),
-          };
+  const parsedWait: NormalizedWorkflowWait | null =
+    wait === undefined ? null : normalizeWorkflowWait(wait);
 
   return {
     id: raw.id,
