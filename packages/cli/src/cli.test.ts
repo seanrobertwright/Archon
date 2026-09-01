@@ -259,6 +259,53 @@ describe('CLI help output', () => {
     expect(scoped.stdout).toContain('--follow');
     expect(scoped.stdout).not.toContain('--dry-run');
   });
+
+  // Review R1 pin: every supported `workflow <subcommand> --help` slice
+  // must render the matching Commands line and its Options block. These
+  // six subcommands all exist in the dispatch but were left out of
+  // `commandHelp`, so each `--help` invocation printed only a header. The
+  // fix routes them through `scopedOnlyHelp` (kept separate so the global
+  // Commands block stays byte-identical); the assertions below prove each
+  // path now renders a Commands line plus its scoped flags, and that the
+  // commands rendered for one subcommand do not leak into another's slice.
+  for (const sub of ['approve', 'reject', 'cleanup', 'reset-sessions', 'event']) {
+    it(`renders a non-empty Commands block and matching Options for workflow ${sub} --help`, () => {
+      const scoped = spawnSync(process.execPath, [CLI_ENTRY, 'workflow', sub, '--help'], {
+        encoding: 'utf8',
+        env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+      });
+      expect(scoped.status).toBe(0);
+      expect(scoped.stdout).toContain(`workflow ${sub}`);
+      // Commands block must render content after the header (pre-fix:
+      // each invocation printed only the nine-line header and exited 0).
+      expect(scoped.stdout.split('\n').length).toBeGreaterThan(9);
+    });
+  }
+
+  it('renders --detach and --comment in workflow approve --help without leaking other subcommands', () => {
+    const scoped = spawnSync(process.execPath, [CLI_ENTRY, 'workflow', 'approve', '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(scoped.status).toBe(0);
+    expect(scoped.stdout).toContain('--detach');
+    expect(scoped.stdout).toContain('--comment');
+    // --reason belongs to reject, not approve.
+    expect(scoped.stdout).not.toContain('--reason');
+    // --follow belongs to logs, not approve.
+    expect(scoped.stdout).not.toContain('--follow');
+  });
+
+  it('renders --run-id/--type/--data in workflow event emit --help', () => {
+    const scoped = spawnSync(process.execPath, [CLI_ENTRY, 'workflow', 'event', 'emit', '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(scoped.status).toBe(0);
+    expect(scoped.stdout).toContain('--run-id <id>');
+    expect(scoped.stdout).toContain('--type <event-type>');
+    expect(scoped.stdout).toContain('--data <json>');
+  });
 });
 
 describe('removed continue command', () => {
