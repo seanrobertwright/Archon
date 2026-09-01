@@ -3,5 +3,11 @@
   "compilerOptions": {
     "allowImportingTsExtensions": true
   },
-  "include": ["*.ts", "__tests__/*.test.ts"]
+  "include": [
+    "*.ts",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "**/*.test.tsx",
+    "**/*.spec.tsx"
+  ]
 }

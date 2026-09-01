@@ -1,6 +1,14 @@
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
 import prettierConfig from 'eslint-config-prettier';
+import { readFileSync } from 'node:fs';
+
+const archonScriptsTsconfig = JSON.parse(
+  readFileSync(new URL('./.archon/scripts/tsconfig.json', import.meta.url), 'utf8')
+);
+const archonScriptFiles = archonScriptsTsconfig.include.map(
+  pattern => `.archon/scripts/${pattern}`
+);
 
 export default tseslint.config(
   // Global ignores (applied to all configs)
@@ -49,11 +57,7 @@ export default tseslint.config(
 
   // Project-specific settings
   {
-    files: [
-      'packages/*/src/**/*.{ts,tsx}',
-      'scripts/**/*.ts',
-      '.archon/scripts/{*.ts,__tests__/*.test.ts}',
-    ],
+    files: ['packages/*/src/**/*.{ts,tsx}', 'scripts/**/*.ts', ...archonScriptFiles],
     languageOptions: {
       parserOptions: {
         projectService: true,
@@ -122,7 +126,7 @@ export default tseslint.config(
   },
 
   {
-    files: ['.archon/scripts/{*.ts,__tests__/*.test.ts}'],
+    files: archonScriptFiles,
     languageOptions: {
       parserOptions: {
         projectService: false,
