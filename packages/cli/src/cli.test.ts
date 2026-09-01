@@ -562,13 +562,16 @@ describe('workflow status project scope', () => {
     const archonHome = join(scratch, 'home');
     const projectA = join(scratch, 'project-a');
     const projectB = join(scratch, 'project-b');
+    const unregisteredProject = join(scratch, 'unregistered-project');
     mkdirSync(archonHome, { recursive: true });
     mkdirSync(projectA);
     mkdirSync(projectB);
+    mkdirSync(unregisteredProject);
 
     try {
       expect(spawnSync('git', ['init', '-q', '.'], { cwd: projectA }).status).toBe(0);
       expect(spawnSync('git', ['init', '-q', '.'], { cwd: projectB }).status).toBe(0);
+      expect(spawnSync('git', ['init', '-q', '.'], { cwd: unregisteredProject }).status).toBe(0);
       const projectARoot = spawnSync('git', ['rev-parse', '--show-toplevel'], {
         cwd: projectA,
         encoding: 'utf8',
@@ -676,6 +679,24 @@ describe('workflow status project scope', () => {
       };
       expect(globalJson.scopeFallback).toBe(false);
       expect(new Set(globalJson.runs.map(run => run.workflow_name))).toEqual(
+        new Set(['project-a-work', 'project-b-work'])
+      );
+
+      const fallback = spawnSync(
+        process.execPath,
+        [CLI_ENTRY, 'workflow', 'status', '--json', '--cwd', unregisteredProject],
+        { cwd: unregisteredProject, env, encoding: 'utf8' }
+      );
+      expect({ status: fallback.status, stderr: fallback.stderr }).toEqual({
+        status: 0,
+        stderr: '',
+      });
+      const fallbackJson = JSON.parse(fallback.stdout) as {
+        scopeFallback: boolean;
+        runs: Array<{ workflow_name: string }>;
+      };
+      expect(fallbackJson.scopeFallback).toBe(true);
+      expect(new Set(fallbackJson.runs.map(run => run.workflow_name))).toEqual(
         new Set(['project-a-work', 'project-b-work'])
       );
     } finally {

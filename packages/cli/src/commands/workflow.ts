@@ -3612,7 +3612,9 @@ export async function workflowStatusCommand(
     try {
       codebase = await findCodebaseForCheckoutPath(cwd);
     } catch (error) {
-      getLog().warn({ err: error as Error, cwd }, 'cli.workflow_status_codebase_lookup_failed');
+      const err = error as Error;
+      getLog().error({ err, cwd }, 'cli.workflow_status_codebase_lookup_failed');
+      throw new Error(`Failed to resolve workflow status project: ${err.message}`, { cause: err });
     }
   }
 

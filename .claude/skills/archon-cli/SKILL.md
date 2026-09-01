@@ -79,9 +79,11 @@ Four hard rules:
 - The current directory selects the project for workflow discovery, launches, and
   project listings. `workflow status` and `workflow runs` default to that project;
   use `--all` only when install-wide visibility is intended. Their JSON output sets
-  `scopeFallback: true` if project lookup failed and the result is install-wide.
-  Commands given a full run ID remain globally addressable. For a git project, run
-  from the repo root. Register a non-git project with `workflow run --folder`.
+  `scopeFallback: true` when an unregistered project produces an install-wide result.
+  `workflow status` fails if the registry lookup itself fails; it does not disguise
+  the error as an unregistered-project fallback. Commands given a full run ID remain
+  globally addressable. For a git project, run from the repo root. Register a non-git
+  project with `workflow run --folder`.
 - A completed run does not mean the work succeeded. Use `workflow get <run-id>
   --json` for the normalized `outcome` and `leave_behind.artifactFiles`; use a
   separate `--verbose --json` call for node summaries.

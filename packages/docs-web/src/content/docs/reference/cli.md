@@ -444,7 +444,7 @@ archon workflow status --verbose   # add a per-node summary for each run
 archon workflow status --json --verbose
 ```
 
-If `cwd` is an unregistered Git checkout or project lookup fails after dispatch, the command falls back to install-wide active runs and says so. Every JSON result carries `scopeFallback`: `true` for that fallback and `false` for a resolved project or explicit `--all` request. A registered folder project scopes normally; an unregistered non-repository directory is rejected with `Not in a git repository` before status lookup.
+If `cwd` is an unregistered Git checkout, the command falls back to install-wide active runs and says so. Every successful JSON result carries `scopeFallback`: `true` for that fallback and `false` for a resolved project or explicit `--all` request. A registry lookup failure fails the command instead of returning install-wide runs under the fallback label. A registered folder project scopes normally; an unregistered non-repository directory is rejected with `Not in a git repository` before status lookup.
 
 The normal human and JSON views include every active node without fetching each run's event
 history. In JSON, `active_nodes` is the ordered list of unresolved node starts: `node_started` adds
