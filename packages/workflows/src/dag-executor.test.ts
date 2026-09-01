@@ -25382,7 +25382,7 @@ describe('subprocess credential redaction', () => {
   });
 
   afterEach(async () => {
-    await rm(testDir, { recursive: true, force: true });
+    await removeTempTree(testDir);
   });
 
   it('removes exact injected credentials from every rejection field before persistence', async () => {
@@ -25603,6 +25603,136 @@ describe('subprocess credential redaction', () => {
       }
     }
   });
+
+  it.each([
+    [
+      'bash',
+      'sh',
+      `printf 'node output\\n'; printf 'visible before %s visible after\\nsecond unchanged line\\n' "$NODE_SECRET" >&2`,
+      'Bash',
+    ],
+    [
+      'script',
+      'bun',
+      `console.log("node output"); console.error("visible before " + process.env.NODE_SECRET + " visible after\\nsecond unchanged line")`,
+      'Script',
+    ],
+  ] as const)(
+    "redacts a successful %s node's stderr broadcast exactly like its retained copy",
+    async (_kind, runtime, script, nodeLabel) => {
+      const secret = `successful-${runtime}-credential`;
+      const nodeId = `${runtime}-leaky-stderr`;
+      const workflowRun = makeWorkflowRun(`success-${runtime}-broadcast-redaction`, {
+        workflow_name: `success-${runtime}-broadcast-redaction`,
+        conversation_id: `conv-success-${runtime}-broadcast-redaction`,
+      });
+      const platform = createMockPlatform();
+      const logDir = join(testDir, `success-${runtime}-broadcast-logs`);
+
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(),
+          platform,
+          conversationId: workflowRun.conversation_id,
+          cwd: testDir,
+          workflow: {
+            name: workflowRun.workflow_name,
+            nodes: [{ id: nodeId, kind: 'exec', runtime, script }],
+          },
+          workflowRun,
+          artifactsDir: join(testDir, `success-${runtime}-broadcast-artifacts`),
+          stateDir: join(testDir, `success-${runtime}-broadcast-state`),
+          logDir,
+          config: {
+            ...minimalConfig,
+            envVars: { NODE_SECRET: secret, BASE_BRANCH: 'main' },
+          },
+        })
+      );
+
+      const expectedStderr = 'visible before [REDACTED] visible after\nsecond unchanged line';
+      const stderrMessages = platform.sendMessage.mock.calls
+        .map(([, message]) => message)
+        .filter(message => message.includes(`${nodeLabel} node '${nodeId}' stderr:`));
+      expect(stderrMessages).toEqual([
+        `${nodeLabel} node '${nodeId}' stderr:\n\`\`\`\n${expectedStderr}\n\`\`\``,
+      ]);
+
+      const row = (await readTranscript(logDir, workflowRun.id)).find(
+        candidate => candidate.type === 'exec_output' && candidate.step === nodeId
+      );
+      expect(row?.stdout_tail).toBe('node output');
+      expect(row?.stderr_tail).toBe(expectedStderr);
+    }
+  );
+
+  it.each([
+    [
+      'bash',
+      'sh',
+      `printf 'failure before %s failure after\\nsecond unchanged failure line\\n' "$NODE_SECRET" >&2; exit 7`,
+    ],
+    [
+      'script',
+      'bun',
+      `console.error("failure before " + process.env.NODE_SECRET + " failure after\\nsecond unchanged failure line"); process.exit(7)`,
+    ],
+  ] as const)(
+    "keeps a failed %s node's stderr redacted when the workflow broadcasts its error",
+    async (_kind, runtime, script) => {
+      const secret = `failed-${runtime}-credential`;
+      const nodeId = `${runtime}-failed-stderr`;
+      const workflowRun = makeWorkflowRun(`failed-${runtime}-broadcast-redaction`, {
+        workflow_name: `failed-${runtime}-broadcast-redaction`,
+        conversation_id: `conv-failed-${runtime}-broadcast-redaction`,
+      });
+      const platform = createMockPlatform();
+      const logDir = join(testDir, `failed-${runtime}-broadcast-logs`);
+
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(),
+          platform,
+          conversationId: workflowRun.conversation_id,
+          cwd: testDir,
+          workflow: {
+            name: workflowRun.workflow_name,
+            nodes: [
+              { id: 'completed-first', kind: 'exec', runtime: 'sh', script: 'true' },
+              {
+                id: nodeId,
+                kind: 'exec',
+                runtime,
+                script,
+                depends_on: ['completed-first'],
+              },
+            ],
+          },
+          workflowRun,
+          artifactsDir: join(testDir, `failed-${runtime}-broadcast-artifacts`),
+          stateDir: join(testDir, `failed-${runtime}-broadcast-state`),
+          logDir,
+          config: {
+            ...minimalConfig,
+            envVars: { NODE_SECRET: secret, BASE_BRANCH: 'main' },
+          },
+        })
+      );
+
+      const expectedStderr =
+        'failure before [REDACTED] failure after\nsecond unchanged failure line';
+      const failureMessage = platform.sendMessage.mock.calls
+        .map(([, message]) => message)
+        .find(message => message.includes('completed with failures'));
+      expect(failureMessage).toContain(expectedStderr);
+      expect(JSON.stringify(platform.sendMessage.mock.calls)).not.toContain(secret);
+
+      const row = (await readTranscript(logDir, workflowRun.id)).find(
+        candidate => candidate.type === 'exec_output' && candidate.step === nodeId
+      );
+      expect(row?.stderr_tail).toBe(expectedStderr);
+    }
+  );
 
   it('removes a credential a SUCCESSFUL subprocess echoed, before it reaches the retained evidence', async () => {
     // The failure path has been redacting since #2431. Retention (#2967) writes on the
