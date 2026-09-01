@@ -29,6 +29,7 @@ import type {
   ProviderCapabilities,
   TokenUsage,
   ResolvedModel,
+  MessageChunk,
   ExecutionContext,
   OverlayChangeSummary,
 } from '@archon/providers/types';
@@ -135,6 +136,7 @@ import {
   logTool,
   logWorkflowComplete,
   logWorkflowError,
+  logWatchdogReset,
   type WorkflowUsage,
 } from './logger';
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
@@ -596,6 +598,17 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.dag-executor');
   return cachedLog;
+}
+
+interface WatchdogReset {
+  type: MessageChunk['type'];
+  at: number;
+}
+
+function formatWatchdogResetDiagnostic(lastReset: WatchdogReset | undefined): string {
+  return lastReset
+    ? ` Last watchdog reset: ${new Date(lastReset.at).toISOString()} from chunk type '${lastReset.type}'.`
+    : ' No provider chunk reset the watchdog after the stream opened.';
 }
 
 const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
@@ -2274,6 +2287,8 @@ async function executeNodeInternal(
     ...(shouldForkSession ? { forkSession: true } : {}),
   };
   let nodeIdleTimedOut = false;
+  let lastWatchdogReset: WatchdogReset | undefined;
+  let watchdogResetLog = Promise.resolve();
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
   const runningTools = new Map<string, RunningTool>();
   let anonymousToolSequence = 0;
@@ -2311,6 +2326,8 @@ async function executeNodeInternal(
     nodeCostUsd = undefined;
     nodeTokens = undefined;
     nodeIdleTimedOut = false;
+    lastWatchdogReset = undefined;
+    watchdogResetLog = Promise.resolve();
     backgroundTasksIncomplete = [];
     const backgroundTasks = createBackgroundTaskTracker();
     for await (const msg of withIdleTimeout(
@@ -2319,10 +2336,27 @@ async function executeNodeInternal(
       () => {
         nodeIdleTimedOut = true;
         getLog().warn(
-          { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
+          {
+            nodeId: node.id,
+            timeoutMs: effectiveIdleTimeout,
+            ...(lastWatchdogReset
+              ? {
+                  lastResetType: lastWatchdogReset.type,
+                  lastResetAt: new Date(lastWatchdogReset.at).toISOString(),
+                }
+              : {}),
+          },
           'dag_node_idle_timeout_reached'
         );
         nodeAbortController.abort();
+      },
+      undefined,
+      (msg, resetAt) => {
+        const type = msg.type;
+        lastWatchdogReset = { type, at: resetAt };
+        watchdogResetLog = watchdogResetLog.then(() =>
+          logWatchdogReset(logDir, workflowRun.id, node.id, type, resetAt)
+        );
       }
     )) {
       const tickNow = Date.now();
@@ -2931,6 +2965,7 @@ async function executeNodeInternal(
       try {
         await runStreamPass(reaskPrompt, reaskResumeSessionId);
       } finally {
+        await watchdogResetLog;
         if (nodeCostUsd !== undefined) {
           accumulatedCostUsd = (accumulatedCostUsd ?? 0) + nodeCostUsd;
         }
@@ -3018,7 +3053,7 @@ async function executeNodeInternal(
       // and reporting it as "the model replied with prose" would mislead.
       if (nodeIdleTimedOut) {
         throw new Error(
-          `Node '${node.id}': timed out (no output for ${String(effectiveIdleTimeout / 60000)} min) before producing the required structured output.`
+          `Node '${node.id}': timed out (no output for ${String(effectiveIdleTimeout / 60000)} min) before producing the required structured output.${formatWatchdogResetDiagnostic(lastWatchdogReset)}`
         );
       }
       throw new Error(
@@ -3036,7 +3071,7 @@ async function executeNodeInternal(
       await safeSendMessage(
         platform,
         conversationId,
-        `⚠️ Node \`${node.id}\` completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min). The AI likely finished but the subprocess didn't exit cleanly.`,
+        `⚠️ Node \`${node.id}\` completed via idle timeout (no output for ${String(effectiveIdleTimeout / 60000)} min).${formatWatchdogResetDiagnostic(lastWatchdogReset)} The AI likely finished but the subprocess didn't exit cleanly.`,
         nodeContext
       );
     }
@@ -3072,7 +3107,7 @@ async function executeNodeInternal(
     if (nodeOutputText.trim() === '' && structuredOutput === undefined) {
       const duration = Date.now() - nodeStartTime;
       const emptyError = nodeIdleTimedOut
-        ? `Node '${node.id}' timed out with no output (idle for ${String(effectiveIdleTimeout / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
+        ? `Node '${node.id}' timed out with no output (idle for ${String(effectiveIdleTimeout / 60000)} min).${formatWatchdogResetDiagnostic(lastWatchdogReset)} Consider increasing idle_timeout or reducing prompt size.`
         : `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
       return await failAgentNode(emptyError);
@@ -5825,6 +5860,7 @@ async function executeLoopNode(
     let fullOutput = ''; // raw, for signal detection
     let cleanOutput = ''; // stripped, for platform display
     let iterationIdleTimedOut = false;
+    let lastWatchdogReset: WatchdogReset | undefined;
     let iterationPayload: unknown;
 
     // Per-attempt transient retry for AI-loop iterations (#2706): a plain AI node's
@@ -5930,6 +5966,7 @@ async function executeLoopNode(
         fullOutput = '';
         cleanOutput = '';
         iterationIdleTimedOut = false;
+        lastWatchdogReset = undefined;
         streamStopStatus = undefined;
         attemptStructured = undefined;
         iterationAbortController = new AbortController();
@@ -5939,6 +5976,7 @@ async function executeLoopNode(
         iterationTokens = undefined;
         iterationNumTurns = undefined;
         iterationUsageFolded = false;
+        let watchdogResetLog = Promise.resolve();
 
         try {
           // Build prompt — substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
@@ -5988,14 +6026,42 @@ async function executeLoopNode(
 
           const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
 
-          for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
-            iterationIdleTimedOut = true;
-            getLog().warn(
-              { nodeId: node.id, iteration: i, timeoutMs: effectiveIdleTimeout },
-              'loop_node.idle_timeout_reached'
-            );
-            iterationAbortController.abort();
-          })) {
+          for await (const msg of withIdleTimeout(
+            generator,
+            effectiveIdleTimeout,
+            () => {
+              iterationIdleTimedOut = true;
+              getLog().warn(
+                {
+                  nodeId: node.id,
+                  iteration: i,
+                  timeoutMs: effectiveIdleTimeout,
+                  ...(lastWatchdogReset
+                    ? {
+                        lastResetType: lastWatchdogReset.type,
+                        lastResetAt: new Date(lastWatchdogReset.at).toISOString(),
+                      }
+                    : {}),
+                },
+                'loop_node.idle_timeout_reached'
+              );
+              iterationAbortController.abort();
+            },
+            undefined,
+            (msg, resetAt) => {
+              const type = msg.type;
+              lastWatchdogReset = { type, at: resetAt };
+              watchdogResetLog = watchdogResetLog.then(() =>
+                logWatchdogReset(
+                  logDir,
+                  workflowRun.id,
+                  `${node.id}-iteration-${String(i)}`,
+                  type,
+                  resetAt
+                )
+              );
+            }
+          )) {
             // Mid-stream cancel/pause check (every CANCEL_CHECK_INTERVAL_MS) —
             // lifted from the AI-node stream loop in executeNodeInternal. Same
             // posture: `paused` is tolerated (a sibling approval node may pause
@@ -6378,12 +6444,14 @@ async function executeLoopNode(
           if (await tryIterationTransientRetry(err.message, iterRetry)) {
             continue iterationAttempt;
           }
-          return failLoopNode(`Loop iteration ${String(i)} failed: ${err.message}`, {
+          return await failLoopNode(`Loop iteration ${String(i)} failed: ${err.message}`, {
             costUsd: loopTotalCostUsd,
             ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
             loopIterations: i,
             data: { iteration: i },
           });
+        } finally {
+          await watchdogResetLog;
         }
 
         // Empty assistant output is an iteration failure for AI loops — same
@@ -6411,7 +6479,7 @@ async function executeLoopNode(
         if (!structuredTimeout && fullOutput.trim() === '' && attemptStructured === undefined) {
           const iterationDuration = Date.now() - iterationStart;
           const emptyError = iterationIdleTimedOut
-            ? `Loop node '${node.id}' iteration ${String(i)} timed out with no output (idle for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
+            ? `Loop node '${node.id}' iteration ${String(i)} timed out with no output (idle for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min).${formatWatchdogResetDiagnostic(lastWatchdogReset)} Consider increasing idle_timeout or reducing prompt size.`
             : 'Loop iteration produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.';
           getLog().error(
             { nodeId: node.id, iteration: i, durationMs: iterationDuration },
@@ -6461,7 +6529,7 @@ async function executeLoopNode(
           await safeSendMessage(
             platform,
             conversationId,
-            `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min)`,
+            `Loop node '${node.id}' iteration ${String(i)} completed via idle timeout (no output for ${String((node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS) / 60000)} min).${formatWatchdogResetDiagnostic(lastWatchdogReset)}`,
             msgContext
           );
         }
@@ -6557,7 +6625,7 @@ async function executeLoopNode(
         // that "the model replied with prose" would send the author down the wrong path.
         return await failLoopNode(
           iterationIdleTimedOut
-            ? `Loop node '${node.id}' iteration ${String(i)}: timed out before producing the required structured output.`
+            ? `Loop node '${node.id}' iteration ${String(i)}: timed out before producing the required structured output.${formatWatchdogResetDiagnostic(lastWatchdogReset)}`
             : `Loop node '${node.id}' iteration ${String(i)}: output_format declared but the provider returned no schema-valid structured output. The model likely replied with prose, refused, or emitted unparseable JSON.`,
           {
             output: lastIterationOutput,
