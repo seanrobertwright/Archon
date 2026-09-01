@@ -6947,6 +6947,31 @@ nodes:
       expect(pw[0]).toContain("unknown key 'context.fork'");
     });
 
+    it('should accept every strict wait key at the nested warning boundary', async () => {
+      const pw = await warningsFor([
+        'name: test',
+        'description: test',
+        'nodes:',
+        '  - id: duration',
+        '    wait:',
+        '      duration_ms: 1000',
+        '  - id: until',
+        '    depends_on: [duration]',
+        '    wait:',
+        "      until: '2026-09-01T12:00:00Z'",
+        '  - id: event',
+        '    depends_on: [until]',
+        '    wait:',
+        '      event: checks.complete',
+        '      deadline_ms: 60000',
+        '  - id: attention',
+        '    depends_on: [event]',
+        '    wait:',
+        '      attention: Re-run CI, then resume.',
+      ]);
+      expect(pw).toEqual([]);
+    });
+
     it('should warn on an unknown key inside an agents entry', async () => {
       const pw = await warningsFor([
         'name: test',

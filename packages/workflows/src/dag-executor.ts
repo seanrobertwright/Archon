@@ -7201,12 +7201,17 @@ async function executeWaitNode(
       );
     }
     if (paused && context.kind === 'attention') {
-      await safeSendMessage(
+      const delivered = await safeSendMessage(
         platform,
         conversationId,
         `⏸️ **Action required for workflow run \`${workflowRun.id}\`**\n\n${context.message}\n\nResume this run after the action is complete, or abandon it if it should not continue.`,
         { workflowId: workflowRun.id, nodeName: node.id }
       );
+      if (!delivered) {
+        throw new Error(
+          `Wait node '${node.id}' could not deliver its action-required notification`
+        );
+      }
     }
     return { state: 'completed', output: '' };
   }
