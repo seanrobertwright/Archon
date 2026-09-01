@@ -2558,6 +2558,9 @@ export async function executeWorkflow(
     // gate and the $ADOPTED_RUN_DIR resolution that only adoption needs.
     if (effectiveContinuationMode !== 'supersede') {
       const adopted = await deps.store.getWorkflowRun(effectiveAdoptedFromRunId);
+      // Deliberately precedes the resolver below: a missing persisted root is
+      // corruption, not relocation, so adoption refuses rather than re-deriving
+      // from a codebase row the way the display-only CLI/server readers would.
       if (!adopted?.output_root) {
         throw new Error(
           `Cannot adopt run '${effectiveAdoptedFromRunId}': it has no persisted output root, so its ` +

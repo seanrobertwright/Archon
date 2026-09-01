@@ -4998,7 +4998,8 @@ describe('workflowGetCommand', () => {
       const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
         leave_behind?: { artifactFiles?: string[] };
       };
-      expect(parsed.leave_behind?.artifactFiles ?? []).not.toContain('should-not-be-listed.txt');
+      expect(parsed.leave_behind).toBeDefined();
+      expect(parsed.leave_behind?.artifactFiles).toEqual([]);
     } finally {
       if (previousHome === undefined) delete process.env.ARCHON_HOME;
       else process.env.ARCHON_HOME = previousHome;
