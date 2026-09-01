@@ -3,7 +3,6 @@
  */
 import { z } from '@hono/zod-openapi';
 import { workflowRunSchema, workflowRunStatusSchema } from '@archon/workflows/schemas/workflow-run';
-import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 
 // ---------------------------------------------------------------------------
 // DashboardWorkflowRun
@@ -30,7 +29,9 @@ export type DashboardWorkflowRun = z.infer<typeof dashboardWorkflowRunSchema>;
 // ---------------------------------------------------------------------------
 
 export const listDashboardRunsOptionsSchema = z.object({
-  status: z.union([workflowRunStatusSchema, z.array(workflowRunStatusSchema).min(1)]).optional(),
+  status: z
+    .union([workflowRunStatusSchema, z.tuple([workflowRunStatusSchema], workflowRunStatusSchema)])
+    .optional(),
   codebaseId: z.string().optional(),
   search: z.string().optional(),
   after: z.string().optional(),
@@ -39,11 +40,7 @@ export const listDashboardRunsOptionsSchema = z.object({
   offset: z.number().optional(),
 });
 
-type ParsedListDashboardRunsOptions = z.infer<typeof listDashboardRunsOptionsSchema>;
-
-export type ListDashboardRunsOptions = Omit<ParsedListDashboardRunsOptions, 'status'> & {
-  status?: WorkflowRunStatus | [WorkflowRunStatus, ...WorkflowRunStatus[]];
-};
+export type ListDashboardRunsOptions = z.infer<typeof listDashboardRunsOptionsSchema>;
 
 // ---------------------------------------------------------------------------
 // DashboardRunsResult
