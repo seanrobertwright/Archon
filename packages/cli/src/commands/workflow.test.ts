@@ -36,9 +36,11 @@ import {
 } from '@archon/paths/archon-paths';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
 import type * as WorkflowDiscovery from '@archon/workflows/workflow-discovery';
+import type * as WorkflowExecutor from '@archon/workflows/executor';
 import type * as DetachedRunControl from '../utils/detached-run-control';
 import {
   makeTestComposedWorkflow,
+  makeTestResolvedWorkflow,
   makeTestWorkflow,
   makeTestWorkflowWithSource,
   withObservableCapturedSource,
@@ -281,6 +283,28 @@ mock.module('@archon/workflows/fixture-runner', () => ({
  * the owner would let a dropped `adopt()` — which deletes a live run's source — pass here.
  */
 const capturedSourceOwnerCalls: string[] = [];
+/** The full owned roots shape a continuation carries — shared between the prepare and
+ *  continuation mocks so the two cannot drift on which fields a `ResolvedContinuation`
+ *  promises its consumer. */
+const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
+  project: '/test/capture/project',
+  globalWorkflows: '/test/capture/global/workflows',
+  globalCommands: '/test/capture/global/commands',
+  globalScripts: '/test/capture/global/scripts',
+  bundledWorkflows: '/test/capture/bundled',
+  bundledCommands: '/test/capture/bundled/commands/defaults',
+  kind: 'captured',
+  config: {
+    load_default_workflows: true,
+    load_default_commands: true,
+  },
+};
+const mockResolveContinuationWorkflow = mock<typeof WorkflowExecutor.resolveContinuationWorkflow>(
+  // Default: the run predates captures, so the caller keeps live discovery — what the
+  // resume tests below already assume. Tests that care about the frozen graph override
+  // it per invocation.
+  () => Promise.resolve(undefined)
+);
 
 mock.module('@archon/workflows/executor', () => ({
   // Mirrors the real executor's adopt site (#2690): rename happens, then the wrap's
@@ -303,7 +327,7 @@ mock.module('@archon/workflows/executor', () => ({
   // Every resume form reaches this now, including `run <name> --resume`. Default: the run
   // predates captures, so the caller keeps live discovery — what the resume tests below
   // already assume. Tests that care about the frozen graph override it per invocation.
-  resolveContinuationWorkflow: mock(() => Promise.resolve(undefined)),
+  resolveContinuationWorkflow: mockResolveContinuationWorkflow,
   // Source capture is real filesystem work the run path now performs BEFORE discovery.
   // Stubbed so these tests keep exercising flag validation and gating rather than disk.
   prepareWorkflowSource: mock(() =>
@@ -1764,10 +1788,9 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
   beforeEach(async () => {
     consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
     capturedSourceOwnerCalls.length = 0;
-    const { executeWorkflow, resolveContinuationWorkflow } =
-      await import('@archon/workflows/executor');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
     (executeWorkflow as ReturnType<typeof mock>).mockClear();
-    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockClear();
+    mockResolveContinuationWorkflow.mockClear();
   });
 
   afterEach(() => {
@@ -1779,14 +1802,13 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
     // after the graph was already chosen from live discovery — while the executor still
     // fed that graph the frozen commands and scripts. Two vintages in one run, on the one
     // resume form that never carried a run object.
-    const { executeWorkflow, hydrateResumableRun, resolveContinuationWorkflow } =
-      await import('@archon/workflows/executor');
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
     const conversationDb = await import('@archon/core/db/conversations');
     const codebaseDb = await import('@archon/core/db/codebases');
     const workflowDb = await import('@archon/core/db/workflows');
     const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
 
-    const frozen = makeTestWorkflow({ name: 'review-block', description: 'frozen' });
+    const frozen = makeTestResolvedWorkflow({ name: 'review-block', description: 'frozen' });
     // What the checkout holds NOW: same name, edited since the run paused. Set as the
     // standing answer rather than a queued one — a continuation must never consume it, and
     // a queued value nothing consumes leaks into the next test.
@@ -1796,9 +1818,9 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
       workflows: [makeTestWorkflowWithSource({ name: 'review-block', description: 'edited' })],
       errors: [],
     });
-    (resolveContinuationWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+    mockResolveContinuationWorkflow.mockResolvedValueOnce({
       workflow: frozen,
-      roots: { project: '/test/capture/project', kind: 'captured' },
+      roots: CAPTURED_SOURCE_ROOTS,
       workflows: [{ workflow: frozen, source: 'project' }],
       errors: [],
     });
@@ -1833,9 +1855,10 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
     // Live discovery never even runs: the continuation carries the discovery it paid for.
     expect(discoverMock).not.toHaveBeenCalled();
     // The row is resolved before discovery and handed to the shared entry point...
-    expect(resolveContinuationWorkflow).toHaveBeenCalledTimes(1);
-    const continuedRun = (resolveContinuationWorkflow as ReturnType<typeof mock>).mock
-      .calls[0][1] as { id: string };
+    expect(mockResolveContinuationWorkflow).toHaveBeenCalledTimes(1);
+    const continuedRun = mockResolveContinuationWorkflow.mock.calls[0]?.[1] as unknown as {
+      id: string;
+    };
     expect(continuedRun.id).toBe('run-prior');
     // ...and its answer, not the edited checkout, is what runs.
     const executed = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][4] as {
