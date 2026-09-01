@@ -3,8 +3,7 @@ import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import type { WorkflowResumeCursor } from '@archon/workflows/store';
 import type { resolveRunContinuation } from '@archon/core/handlers';
-import { makeTestWorkflow } from '@archon/workflows/test-utils';
-import { resolveWorkflow } from '@archon/workflows/graph-plan';
+import { makeTestResolvedWorkflow } from '@archon/workflows/test-utils';
 
 type RunContinuationResult = Awaited<ReturnType<typeof resolveRunContinuation>>;
 
@@ -119,7 +118,7 @@ describe('workflow continuation scanner', () => {
       mockResolveRunContinuation.mockResolvedValueOnce({
         ok: true,
         workflowName: 'deliver',
-        workflow: { definition: resolveWorkflow(makeTestWorkflow({ name: 'deliver' })), args: '' },
+        workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
       });
       mockHydrateResumableRun.mockResolvedValueOnce({
         preCreatedRun: { ...paused, status: 'running' },
@@ -153,7 +152,7 @@ describe('workflow continuation scanner', () => {
       mockResolveRunContinuation.mockResolvedValueOnce({
         ok: true,
         workflowName: 'deliver',
-        workflow: { definition: resolveWorkflow(makeTestWorkflow({ name: 'deliver' })), args: '' },
+        workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
       });
       mockHydrateResumableRun.mockResolvedValueOnce({
         preCreatedRun: { ...paused, status: 'running' },
@@ -334,7 +333,7 @@ describe('workflow continuation scanner', () => {
     mockResolveRunContinuation.mockResolvedValueOnce({
       ok: true,
       workflowName: 'deliver',
-      workflow: { definition: resolveWorkflow(makeTestWorkflow({ name: 'deliver' })), args: '' },
+      workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
     });
     mockHydrateResumableRun.mockResolvedValueOnce({
       preCreatedRun: { ...paused, status: 'running' },
@@ -371,7 +370,7 @@ describe('workflow continuation scanner', () => {
     mockResolveRunContinuation.mockResolvedValueOnce({
       ok: true,
       workflowName: 'deliver',
-      workflow: { definition: resolveWorkflow(makeTestWorkflow({ name: 'deliver' })), args: '' },
+      workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
     });
     mockHydrateResumableRun.mockResolvedValueOnce({
       preCreatedRun: { ...paused, status: 'running' },
