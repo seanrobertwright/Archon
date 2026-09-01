@@ -7,6 +7,7 @@ import {
   makeDiscoverWorkflowsMock,
   makeLoaderMock,
   makeCommandValidationMock,
+  makeListDashboardRunsMock,
 } from '../test/workflow-mock-factories';
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,7 @@ mock.module('@archon/core/db/isolation-environments', () => ({
 }));
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
-  listDashboardRuns: mock(async () => ({ runs: [], total: 0, counts: {} })),
+  listDashboardRuns: makeListDashboardRunsMock(),
   getWorkflowRun: mock(async () => null),
   cancelWorkflowRun: mock(async () => {}),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
@@ -242,8 +243,8 @@ describe('PATCH /api/config/tiers', () => {
     mockUpdateGlobalConfig.mockClear();
   });
 
-  function patch(tiers: unknown): Promise<Response> {
-    return app.request('/api/config/tiers', {
+  async function patch(tiers: unknown): Promise<Response> {
+    return await app.request('/api/config/tiers', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tiers }),
@@ -305,8 +306,8 @@ describe('PATCH /api/config/aliases', () => {
     mockUpdateGlobalConfig.mockClear();
   });
 
-  function patch(aliases: unknown): Promise<Response> {
-    return app.request('/api/config/aliases', {
+  async function patch(aliases: unknown): Promise<Response> {
+    return await app.request('/api/config/aliases', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ aliases }),
