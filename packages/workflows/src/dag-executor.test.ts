@@ -61,7 +61,7 @@ import {
   getProviderCapabilities,
 } from '@archon/providers';
 import type { SendQueryOptions } from '@archon/providers';
-import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
+import { mergeTokenUsage, type MessageChunk, type TokenUsage } from '@archon/providers/types';
 clearRegistry();
 registerBuiltinProviders();
 // Pi is a community provider (best-effort structured output) — register it so the
@@ -74,7 +74,6 @@ registerOpencodeProvider();
 
 // --- Imports (after mocks) ---
 import {
-  buildTopologicalLayers,
   checkTriggerRule,
   substituteNodeOutputRefs,
   substituteLoopPrevRefs,
@@ -87,6 +86,7 @@ import {
   type ExecuteDagWorkflowOptions,
   type RunChildWorkflowFn,
 } from './dag-executor';
+import { planGraph, resolveWorkflow, resolvedBodyNodes } from './graph-plan';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import { getWorkflowEventEmitter, type WorkflowEmitterEvent } from './event-emitter';
 import { loadMcpConfig } from '@archon/providers/mcp/config';
@@ -95,11 +95,13 @@ import type {
   AgentNode,
   ExecNode,
   LoopGroupNode,
+  LoopGroupNodeConfig,
   IncludeDirective,
   NodeOutput,
   WorkflowRun,
   WorkflowRunNodeSession,
   WorkflowDefinition,
+  ResolvedWorkflow,
   WorkflowRunStatus,
   ApprovalContext,
   WorkflowWaitContext,
@@ -301,7 +303,6 @@ const mockClaudeCapabilities = () => ({
   envInjection: true,
   costControl: true,
   effortControl: true,
-  thinkingControl: true,
   fallbackModel: true,
   sandbox: true,
   settingSources: true,
@@ -382,8 +383,23 @@ const minimalConfig: WorkflowConfig = {
  * `deps`, `cwd`, `workflow`, and `workflowRun` carry each test's own fixtures, so every call
  * supplies them; the run directories derive from `cwd` the way every call site built them.
  */
-type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
-  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflow' | 'workflowRun'>;
+type TestWorkflowDefinition = Omit<WorkflowDefinition, 'description' | 'nodes'> & {
+  description?: string;
+  nodes: readonly (DagNode | IncludeDirective)[];
+};
+
+type DagOptionsOverrides = Omit<Partial<ExecuteDagWorkflowOptions>, 'workflow'> &
+  Pick<ExecuteDagWorkflowOptions, 'deps' | 'cwd' | 'workflowRun'> & {
+    workflow: TestWorkflowDefinition;
+  };
+
+function resolveTestWorkflow(workflow: TestWorkflowDefinition): ResolvedWorkflow {
+  return resolveWorkflow({
+    ...workflow,
+    description: workflow.description ?? workflow.name,
+    nodes: [...workflow.nodes],
+  });
+}
 
 /**
  * Options for a direct `executeDagWorkflow` call, built from only what a test varies. The
@@ -395,7 +411,7 @@ type DagOptionsOverrides = Partial<ExecuteDagWorkflowOptions> &
  * resolved model decision (#2302); this builder is not that guard's audience.
  */
 function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
-  const { cwd } = overrides;
+  const { cwd, workflow, ...rest } = overrides;
   return {
     platform: createMockPlatform(),
     conversationId: 'conv-dag',
@@ -407,7 +423,9 @@ function dagOptions(overrides: DagOptionsOverrides): ExecuteDagWorkflowOptions {
     baseBranch: 'main',
     docsDir: 'docs/',
     config: minimalConfig,
-    ...overrides,
+    ...rest,
+    cwd,
+    workflow: resolveTestWorkflow(workflow),
   };
 }
 
@@ -418,7 +436,7 @@ describe('executeDagWorkflow options type contract', () => {
       platform: createMockPlatform(),
       conversationId: 'type-contract',
       cwd: '/tmp/type-contract',
-      workflow: { name: 'type-contract', nodes: [] },
+      workflow: resolveTestWorkflow({ name: 'type-contract', nodes: [] }),
       workflowRun: makeWorkflowRun('type-contract'),
       workflowProvider: 'claude',
       workflowModel: undefined,
@@ -476,14 +494,8 @@ describe('executeDagWorkflow options type contract', () => {
 
 // --- Helpers ---
 
-/**
- * A parsed `WorkflowDefinition`'s `nodes` admits `IncludeDirective` for the general
- * pre-expansion case (#2486); every workflow built for these tests is a flat,
- * already-expanded fixture with no `include:` nodes, so this narrows it back to what
- * `executeDagWorkflow` actually requires.
- */
-function ready(wf: WorkflowDefinition): Omit<WorkflowDefinition, 'nodes'> & { nodes: DagNode[] } {
-  return { ...wf, nodes: wf.nodes as DagNode[] };
+function ready(wf: TestWorkflowDefinition): ResolvedWorkflow {
+  return resolveTestWorkflow(wf);
 }
 
 function node(id: string, depends_on?: string[], opts?: Partial<AgentNode>): AgentNode {
@@ -582,11 +594,13 @@ function expectLoopGateEvidence(
 }
 
 function loaderBypassingWorkflow(
-  workflow: Parameters<typeof executeDagWorkflow>[0]['workflow'] & {
+  workflow: TestWorkflowDefinition & {
     modelReasoningEffort: string;
   }
-): Parameters<typeof executeDagWorkflow>[0]['workflow'] {
-  return workflow;
+): ResolvedWorkflow & { modelReasoningEffort: string } {
+  return Object.assign(resolveTestWorkflow(workflow), {
+    modelReasoningEffort: workflow.modelReasoningEffort,
+  });
 }
 
 // --- Tests ---
@@ -604,15 +618,15 @@ const readTranscript = async (
     .split('\n')
     .map(line => JSON.parse(line) as Record<string, unknown>);
 
-describe('buildTopologicalLayers', () => {
+describe('planGraph', () => {
   it('single node with no dependencies -> one layer', () => {
-    const layers = buildTopologicalLayers([node('a')]);
+    const layers = planGraph([node('a')]).layers;
     expect(layers).toHaveLength(1);
     expect(layers[0].map(n => n.id)).toEqual(['a']);
   });
 
   it('linear chain -> one node per layer', () => {
-    const layers = buildTopologicalLayers([node('a'), node('b', ['a']), node('c', ['b'])]);
+    const layers = planGraph([node('a'), node('b', ['a']), node('c', ['b'])]).layers;
     expect(layers).toHaveLength(3);
     expect(layers[0].map(n => n.id)).toEqual(['a']);
     expect(layers[1].map(n => n.id)).toEqual(['b']);
@@ -620,11 +634,11 @@ describe('buildTopologicalLayers', () => {
   });
 
   it('fan-out: classify -> [investigate, plan] in same layer', () => {
-    const layers = buildTopologicalLayers([
+    const layers = planGraph([
       node('classify'),
       node('investigate', ['classify']),
       node('plan', ['classify']),
-    ]);
+    ]).layers;
     expect(layers).toHaveLength(2);
     expect(layers[0].map(n => n.id)).toEqual(['classify']);
     const layer1Ids = layers[1].map(n => n.id).sort();
@@ -632,45 +646,98 @@ describe('buildTopologicalLayers', () => {
   });
 
   it('fan-in: [a, b] -> implement in its own layer', () => {
-    const layers = buildTopologicalLayers([node('a'), node('b'), node('implement', ['a', 'b'])]);
+    const layers = planGraph([node('a'), node('b'), node('implement', ['a', 'b'])]).layers;
     expect(layers).toHaveLength(2);
     expect(layers[0].map(n => n.id).sort()).toEqual(['a', 'b']);
     expect(layers[1].map(n => n.id)).toEqual(['implement']);
   });
 
   it('diamond: classify -> [investigate, plan] -> implement', () => {
-    const layers = buildTopologicalLayers([
+    const layers = planGraph([
       node('classify'),
       node('investigate', ['classify']),
       node('plan', ['classify']),
       node('implement', ['investigate', 'plan']),
-    ]);
+    ]).layers;
     expect(layers).toHaveLength(3);
     expect(layers[0].map(n => n.id)).toEqual(['classify']);
     expect(layers[1].map(n => n.id).sort()).toEqual(['investigate', 'plan']);
     expect(layers[2].map(n => n.id)).toEqual(['implement']);
   });
 
-  it('throws on cyclic graph (runtime safety check)', () => {
+  it('throws on a cyclic graph', () => {
     const cyclic = [node('a', ['b']), node('b', ['a'])];
-    expect(() => buildTopologicalLayers(cyclic)).toThrow('Cycle detected');
+    expect(() => planGraph(cyclic)).toThrow('Cycle detected');
   });
 
   it('self-referential node throws', () => {
     const selfRef = [node('a', ['a'])];
-    expect(() => buildTopologicalLayers(selfRef)).toThrow('Cycle detected');
+    expect(() => planGraph(selfRef)).toThrow('Cycle detected');
   });
 
   it('two independent chains share layers correctly', () => {
-    const layers = buildTopologicalLayers([
-      node('a'),
-      node('b', ['a']),
-      node('c'),
-      node('d', ['c']),
-    ]);
+    const layers = planGraph([node('a'), node('b', ['a']), node('c'), node('d', ['c'])]).layers;
     expect(layers).toHaveLength(2);
     expect(layers[0].map(n => n.id).sort()).toEqual(['a', 'c']);
     expect(layers[1].map(n => n.id).sort()).toEqual(['b', 'd']);
+  });
+
+  it('records every sink in definition order', () => {
+    const plan = planGraph([node('root'), node('left', ['root']), node('right', ['root'])]);
+    expect(plan.sinks).toEqual(['left', 'right']);
+  });
+
+  it('attaches the complete plan to a resolved workflow', () => {
+    const workflow = resolveTestWorkflow({
+      name: 'representative',
+      nodes: [node('root'), node('left', ['root']), node('right', ['root'])],
+    });
+
+    expect(workflow.plan.layers.map(layer => layer.map(item => item.id))).toEqual([
+      ['root'],
+      ['left', 'right'],
+    ]);
+    expect(workflow.plan.sinks).toEqual(['left', 'right']);
+    expect(workflow.nodes).toBe(workflow.plan.nodes);
+
+    if (false) {
+      // @ts-expect-error Resolved workflow nodes are immutable after planning.
+      workflow.nodes.push(node('late'));
+      // @ts-expect-error The plan exposes the same immutable node set.
+      workflow.plan.nodes.splice(0, 1);
+      // @ts-expect-error Planned layers cannot be mutated after construction.
+      workflow.plan.layers[0]?.push(node('late'));
+    }
+  });
+
+  it('does not let a typed caller pair a plan with another node set', () => {
+    const first = resolveTestWorkflow({ name: 'first', nodes: [node('first')] });
+    const second = resolveTestWorkflow({ name: 'second', nodes: [node('second')] });
+
+    // @ts-expect-error Object spread loses the factory-only resolved-workflow identity.
+    const mismatched: ResolvedWorkflow = { ...first, nodes: second.nodes };
+    expect(mismatched.plan.nodes).not.toBe(mismatched.nodes);
+  });
+
+  it('rejects an include directive that survived expansion and names it', () => {
+    const include: IncludeDirective = { id: 'block', kind: 'include', include: 'child' };
+    expect(() => planGraph([include])).toThrow("include node 'block'");
+    expect(() =>
+      resolveWorkflow({ name: 'invalid', description: 'invalid', nodes: [include] })
+    ).toThrow("include node 'block'");
+  });
+});
+
+describe('resolvedBodyNodes', () => {
+  it('rejects an include directive in a nested body and names it', () => {
+    const include: IncludeDirective = { id: 'nested', kind: 'include', include: 'child' };
+    const group: LoopGroupNodeConfig = {
+      until: 'DONE',
+      max_iterations: 1,
+      fresh_context: false,
+      nodes: [include],
+    };
+    expect(() => resolvedBodyNodes(group)).toThrow("include node 'nested'");
   });
 });
 
@@ -1864,7 +1931,11 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun();
-    const workflowPreset = { provider: 'codex', model: 'gpt-5.5', effort: 'high' };
+    const workflowPreset = {
+      provider: 'codex',
+      model: 'gpt-5.5',
+      effort: 'high',
+    } as const;
     const aiProfile = buildAiProfile('claude', {
       repoTiers: {
         large: workflowPreset,
@@ -12444,6 +12515,150 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     );
     expect(nodeCompletedEvents.length).toBe(0);
     expect(store.failWorkflowRun).toHaveBeenCalled();
+    const transcript = await readTranscript(join(testDir, 'logs'), workflowRun.id);
+    expect(transcript.filter(event => event.type === 'watchdog_reset')).toHaveLength(0);
+    expect(failedData.error).toContain('No provider chunk reset the watchdog');
+  });
+
+  it('a thinking-only stream renews the watchdog and persists a type-only timeout diagnostic', async () => {
+    const privateThinking = 'reasoning that must not be logged';
+    let yielded = 0;
+    mockSendQueryDag.mockImplementation(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: { abortSignal?: AbortSignal }
+    ) {
+      for (let i = 0; i < 3; i++) {
+        await new Promise(resolve => setTimeout(resolve, 30));
+        if (options?.abortSignal?.aborted) return;
+        yielded++;
+        yield { type: 'thinking', content: `${privateThinking} ${String(i)}` };
+      }
+      await new Promise<void>(resolve => {
+        if (options?.abortSignal?.aborted) resolve();
+        else options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+
+    const store = createMockStore();
+    const workflowRun = makeWorkflowRun('thinking-only-timeout');
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: {
+          name: 'thinking-only-timeout',
+          nodes: [
+            {
+              id: 'review',
+              kind: 'agent',
+              source: { kind: 'command', name: 'my-cmd' },
+              idle_timeout: 70,
+              retry: { max_attempts: 0 },
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    expect(yielded).toBe(3);
+    const transcript = await readTranscript(join(testDir, 'logs'), workflowRun.id);
+    const resetEvents = transcript.filter(event => event.type === 'watchdog_reset');
+    expect(resetEvents).toHaveLength(3);
+    expect(resetEvents.map(event => event.chunk_type)).toEqual([
+      'thinking',
+      'thinking',
+      'thinking',
+    ]);
+    expect(resetEvents.every(event => !('content' in event))).toBe(true);
+    expect(resetEvents.every(event => !Number.isNaN(Date.parse(String(event.ts))))).toBe(true);
+    expect(JSON.stringify(transcript)).not.toContain(privateThinking);
+
+    const failed = transcript.find(event => event.type === 'node_error' && event.step === 'review');
+    expect(failed?.error).toContain("chunk type 'thinking'");
+  });
+
+  it('loop timeout diagnostics retain the latest reset and distinguish tool progress from assistant output', async () => {
+    const runCase = async (
+      runId: string,
+      chunks: MessageChunk[]
+    ): Promise<{ transcript: Array<Record<string, unknown>>; error: string }> => {
+      mockSendQueryDag.mockImplementationOnce(async function* (
+        _prompt: string,
+        _cwd: string,
+        _resumeSessionId?: string,
+        options?: { abortSignal?: AbortSignal }
+      ) {
+        for (const chunk of chunks) yield chunk;
+        await new Promise<void>(resolve => {
+          if (options?.abortSignal?.aborted) resolve();
+          else options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      });
+
+      const store = createMockStore();
+      const workflowRun = makeWorkflowRun(runId);
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          cwd: testDir,
+          workflow: {
+            name: runId,
+            nodes: [
+              {
+                id: 'implement',
+                kind: 'loop',
+                output_format: {
+                  type: 'object',
+                  properties: { done: { type: 'boolean' } },
+                  required: ['done'],
+                },
+                loop: {
+                  fresh_context: false,
+                  prompt: 'Implement the change.',
+                  max_iterations: 1,
+                  until_field: 'done',
+                },
+                idle_timeout: 50,
+              },
+            ],
+          },
+          workflowRun,
+        })
+      );
+
+      const transcript = await readTranscript(join(testDir, 'logs'), workflowRun.id);
+      const failed = transcript.find(event => event.type === 'node_error');
+      return { transcript, error: String(failed?.error) };
+    };
+
+    const tool = await runCase('loop-tool-timeout', [
+      { type: 'thinking', content: 'private reasoning' },
+      {
+        type: 'tool',
+        toolName: 'Bash',
+        toolInput: { command: 'private tool input' },
+      },
+    ]);
+    const assistant = await runCase('loop-assistant-timeout', [
+      {
+        type: 'assistant',
+        content: 'user-visible output',
+      },
+    ]);
+
+    const toolReset = tool.transcript.filter(event => event.type === 'watchdog_reset');
+    const assistantReset = assistant.transcript.filter(event => event.type === 'watchdog_reset');
+    expect(toolReset.map(event => event.chunk_type)).toEqual(['thinking', 'tool']);
+    expect(assistantReset.map(event => event.chunk_type)).toEqual(['assistant']);
+    expect(toolReset.every(event => !('content' in event) && !('tool_input' in event))).toBe(true);
+    expect(assistantReset.every(event => !('content' in event))).toBe(true);
+    expect(tool.error).toContain("chunk type 'tool'");
+    expect(assistant.error).toContain("chunk type 'assistant'");
+    expect(tool.transcript.some(event => event.type === 'assistant')).toBe(false);
+    expect(assistant.transcript.some(event => event.type === 'assistant')).toBe(true);
   });
 
   it('idle-timeout with zero output fails a loop iteration instead of consuming its iteration budget', async () => {
@@ -13611,6 +13826,7 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     const deps = createMockDeps(store);
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('credit-exhaustion-run');
+    const logDir = join(testDir, 'logs');
 
     await executeDagWorkflow(
       dagOptions({
@@ -13629,15 +13845,27 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
           ],
         },
         workflowRun,
+        logDir,
       })
     );
 
     // node_failed (not node_completed) must have been stored
-    const events = (
-      store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
-    ).mock.calls.map((c: unknown[]) => (c[0] as { event_type: string }).event_type);
+    const eventCalls = (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>)
+      .mock.calls;
+    const events = eventCalls.map((c: unknown[]) => (c[0] as { event_type: string }).event_type);
     expect(events).toContain('node_failed');
     expect(events).not.toContain('node_completed');
+    const failedEvent = eventCalls.find(
+      (c: unknown[]) => (c[0] as { event_type: string }).event_type === 'node_failed'
+    );
+    expect(
+      typeof (failedEvent?.[0] as { data?: { duration_ms?: unknown } }).data?.duration_ms
+    ).toBe('number');
+
+    const transcriptFailures = (await readTranscript(logDir, workflowRun.id)).filter(
+      row => row.type === 'node_error' && row.step === 'investigate'
+    );
+    expect(transcriptFailures).toHaveLength(1);
 
     // Overall workflow should be marked failed
     expect(store.failWorkflowRun).toHaveBeenCalled();
@@ -15593,6 +15821,9 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     );
     expect(failedEvents.length).toBe(1);
     expect((failedEvents[0][0] as { data: Record<string, unknown> }).data.cost_usd).toBe(0.02);
+    expect(typeof (failedEvents[0][0] as { data: Record<string, unknown> }).data.duration_ms).toBe(
+      'number'
+    );
 
     // And the run total is the money burned across both nodes.
     expect(runUsageWrites(store)).toEqual([
@@ -15657,6 +15888,11 @@ describe('executeDagWorkflow -- run usage survives every disposition', () => {
     expect(cancelRow?.error).toBe('Cancelled by user');
     expect(cancelRow?.cost_usd).toBe(0.02);
     expect(cancelRow?.tokens).toEqual({ input: 30, output: 3 });
+
+    const failedEvent = store.createWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .find(event => event.event_type === 'node_failed' && event.step_name === 'only');
+    expect(typeof failedEvent?.data?.duration_ms).toBe('number');
   });
 
   it('a cancel that surfaces as a thrown error still leaves a transcript row', async () => {
@@ -16544,6 +16780,58 @@ describe('executeDagWorkflow -- script nodes', () => {
     const prompt = mockSendQueryDag.mock.calls[0][0] as string;
     expect(prompt).toContain(`script=${runId}`);
     expect(prompt).toContain(`bash=${runId}`);
+  });
+
+  it('ADOPTED_RUN_DIR reaches script and bash subprocesses as an env var (empty on non-adopting runs)', async () => {
+    // ADOPTED_RUN_DIR (#3017) joins the deterministic-node env bag so packaged
+    // script: files can read it from process.env / os.environ. On a non-adopting
+    // run it is the empty string — a script can test for it without KeyError.
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('wf-adopted-env', {
+      workflow_name: 'adopted-env-test',
+      conversation_id: 'conv-adopted',
+      user_message: 'adopted env test',
+    });
+
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(
+      join(commandsDir, 'check-adopted.md'),
+      'script=$from-script.output bash=$from-bash.output'
+    );
+
+    const nodes: DagNode[] = [
+      {
+        id: 'from-script',
+        kind: 'exec',
+        script: 'console.log(process.env.ADOPTED_RUN_DIR)',
+        runtime: 'bun',
+      },
+      { id: 'from-bash', kind: 'exec', runtime: 'sh', script: 'printf %s "${ADOPTED_RUN_DIR}"' },
+      {
+        id: 'check',
+        kind: 'agent',
+        source: { kind: 'command', name: 'check-adopted' },
+        depends_on: ['from-script', 'from-bash'],
+      },
+    ];
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-adopted',
+        cwd: testDir,
+        workflow: { name: 'adopted-env-test', nodes },
+        workflowRun,
+      })
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const prompt = mockSendQueryDag.mock.calls[0][0] as string;
+    // Non-adopting run: both nodes produce the empty string.
+    expect(prompt).toContain('script= bash=');
   });
 
   it('named script not found at runtime results in failed state and platform message', async () => {
@@ -24736,104 +25024,6 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
 });
 
 // ---------------------------------------------------------------------------
-// An unexpanded include node must FAIL LOUDLY, never silently skip — the
-// fail-fast guard runs before resume-skip / when / trigger-rule handling.
-// ---------------------------------------------------------------------------
-
-describe('executeDagWorkflow -- unexpanded include node fail-fast guard', () => {
-  let testDir: string;
-
-  beforeEach(async () => {
-    testDir = join(tmpdir(), `dag-inc-guard-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(testDir, { recursive: true });
-  });
-
-  afterEach(async () => {
-    try {
-      await rm(testDir, { recursive: true, force: true });
-    } catch {
-      // ignore cleanup errors
-    }
-  });
-
-  function events(
-    deps: WorkflowDeps
-  ): Array<{ event_type: string; step_name: string; data: unknown }> {
-    return (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
-      (call: unknown[]) => call[0] as { event_type: string; step_name: string; data: unknown }
-    );
-  }
-
-  it('fails (not skips) an unexpanded include node that matches a prior-completed entry', async () => {
-    const mockDeps = createMockDeps();
-    const platform = createMockPlatform();
-    const workflowRun = makeWorkflowRun('inc-guard-resume', { workflow_name: 'inc-guard' });
-
-    // A raw include node reaching the executor with a resume entry for its own id: the
-    // guard must fire BEFORE the resume-skip check, so it fails instead of being skipped.
-    const includeNode = dagNodeSchema.parse({ id: 'inc', include: 'some-block' }) as DagNode;
-    const prior = new Map([['inc', { output: 'stale prior output' }]]);
-
-    await executeDagWorkflow(
-      dagOptions({
-        deps: mockDeps,
-        platform,
-        conversationId: 'conv-inc-guard',
-        cwd: testDir,
-        workflow: { name: 'inc-guard', nodes: [includeNode] },
-        workflowRun,
-        priorCompletedNodes: prior,
-      })
-    );
-
-    const evs = events(mockDeps);
-    const failed = evs.find(e => e.event_type === 'node_failed' && e.step_name === 'inc');
-    expect(failed).toBeDefined();
-    expect((failed!.data as { error: string }).error).toContain('reached the executor unexpanded');
-    // Crucially, it was NOT silently skipped as a prior success.
-    expect(evs.some(e => e.event_type === 'node_skipped_prior_success')).toBe(false);
-  });
-
-  it('fails (not skips) an unexpanded include node whose when: would evaluate false', async () => {
-    const mockDeps = createMockDeps();
-    const platform = createMockPlatform();
-    const workflowRun = makeWorkflowRun('inc-guard-when', { workflow_name: 'inc-guard' });
-
-    // `flag` emits NO; the include's when checks == YES (false → would normally skip). The
-    // guard must fire first and fail the node instead.
-    const nodes = [
-      dagNodeSchema.parse({ id: 'flag', bash: 'echo NO' }),
-      dagNodeSchema.parse({
-        id: 'inc',
-        include: 'some-block',
-        depends_on: ['flag'],
-        when: "$flag.output == 'YES'",
-      }),
-    ];
-
-    await executeDagWorkflow(
-      dagOptions({
-        deps: mockDeps,
-        platform,
-        conversationId: 'conv-inc-guard',
-        cwd: testDir,
-        // Deliberately includes an unexpanded include directive — the test exercises the
-        // `when:` guard firing BEFORE the executor would ever need to resolve it.
-        workflow: { name: 'inc-guard', nodes: nodes as DagNode[] },
-        workflowRun,
-      })
-    );
-
-    const evs = events(mockDeps);
-    const failed = evs.find(e => e.event_type === 'node_failed' && e.step_name === 'inc');
-    expect(failed).toBeDefined();
-    expect((failed!.data as { error: string }).error).toContain('reached the executor unexpanded');
-    // It was NOT skipped via the when: gate.
-    expect(evs.some(e => e.event_type === 'node_skipped' && e.step_name === 'inc')).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // An approval node inside an included block: pause + capture_response + no
 // cross-talk when the same block is included twice.
 // ---------------------------------------------------------------------------
@@ -26545,7 +26735,6 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
     provider: string;
     model: unknown;
     effort: unknown;
-    thinking: unknown;
     sandbox: unknown;
     betas: unknown;
     fallbackModel: unknown;
@@ -26585,7 +26774,7 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
     runName: string,
     options: { expand?: boolean; profileProvider?: string; tiers?: RawTiersConfig } = {}
   ): Promise<Map<string, EffectiveConfig>> {
-    let workflow: WorkflowDefinition;
+    let workflow: TestWorkflowDefinition;
     if (options.expand === false) {
       workflow = defs.find(d => d.name === runName)!;
     } else {
@@ -26660,7 +26849,6 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
         provider,
         model: queryOptions.model,
         effort: nodeConfig.effort,
-        thinking: nodeConfig.thinking,
         sandbox: nodeConfig.sandbox,
         betas: nodeConfig.betas,
         fallbackModel: nodeConfig.fallbackModel,
@@ -26774,7 +26962,9 @@ describe('executeDagWorkflow -- a workflow runs as authored, standalone or compo
   });
 
   it('AC3 — a tier keyword reproduces through the collapse', async () => {
-    const tiers = { large: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh' } };
+    const tiers = {
+      large: { provider: 'codex', model: 'gpt-5.6-sol', effort: 'xhigh' as const },
+    };
     const block = wfDef('tier-blk', [{ id: 'work', prompt: 'work' }], { model: 'large' });
     const parent = wfDef('parent', [{ id: 'inc', include: 'tier-blk' }], {
       provider: 'claude',
@@ -28710,7 +28900,7 @@ function waitTerminatedLoopGroupWorkflow(): WorkflowDefinition {
 function includedProbeWaitTerminatedLoopGroupWorkflow(
   markerPath: string,
   quoteOutputRef = false
-): WorkflowDefinition {
+): ResolvedWorkflow {
   const stateRef = quoteOutputRef ? '"$ci-probe.output.state"' : '$ci-probe.output.state';
   const block = workflowDefinitionSchema.parse({
     name: 'probe-wait-block',

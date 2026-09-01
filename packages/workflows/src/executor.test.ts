@@ -166,10 +166,16 @@ import {
   resolveProjectPaths,
   resolveScopeArtifactsDir,
 } from './executor';
+import { resolveWorkflow } from './graph-plan';
 import { keepAwake } from './utils/keep-awake';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
-import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './schemas';
+import type {
+  ResolvedWorkflow,
+  WorkflowDefinition,
+  WorkflowRun,
+  WorkflowRunNodeSession,
+} from './schemas';
 import { RUN_METADATA_KEYS, workflowDefinitionSchema } from './schemas';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 import { substituteWorkflowVariables } from './executor-shared';
@@ -248,13 +254,13 @@ function makeDeps(store?: IWorkflowStore): WorkflowDeps {
   } as unknown as WorkflowDeps;
 }
 
-function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
-  return {
+function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): ResolvedWorkflow {
+  return resolveWorkflow({
     name: 'test-workflow',
     description: 'Test',
     nodes: [{ id: 'node1', kind: 'agent', source: { kind: 'inline', prompt: 'Do something' } }],
     ...overrides,
-  };
+  });
 }
 
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
@@ -293,12 +299,14 @@ describe('executeWorkflow', () => {
   });
 
   it('rejects a structurally valid but semantically invalid outcome declaration before side effects', async () => {
-    const workflow = workflowDefinitionSchema.parse({
-      name: 'invalid-authored-outcome',
-      description: 'missing selected return node',
-      outcome_field: 'green',
-      nodes: [{ id: 'node1', prompt: 'Do something' }],
-    });
+    const workflow = resolveWorkflow(
+      workflowDefinitionSchema.parse({
+        name: 'invalid-authored-outcome',
+        description: 'missing selected return node',
+        outcome_field: 'green',
+        nodes: [{ id: 'node1', prompt: 'Do something' }],
+      })
+    );
     const store = makeStore();
     const deps = makeDeps(store);
 
@@ -317,11 +325,13 @@ describe('executeWorkflow', () => {
 
   describe('container resume guard', () => {
     it('rejects a fresh container workflow with a durable wait before creating a run', async () => {
-      const workflow = workflowDefinitionSchema.parse({
-        name: 'container-wait',
-        description: 'unsupported durable wait in container isolation',
-        nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
-      });
+      const workflow = resolveWorkflow(
+        workflowDefinitionSchema.parse({
+          name: 'container-wait',
+          description: 'unsupported durable wait in container isolation',
+          nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+        })
+      );
       const store = makeStore();
 
       await expect(
@@ -344,11 +354,13 @@ describe('executeWorkflow', () => {
     // The guard keys on "is this a fresh dispatch", not on who wrote the row. A row
     // pre-created by a launching process (#2872, `--detach`) is still a fresh dispatch.
     it('refuses the same durable wait when the fresh run row was pre-created', async () => {
-      const workflow = workflowDefinitionSchema.parse({
-        name: 'container-wait',
-        description: 'unsupported durable wait in container isolation',
-        nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
-      });
+      const workflow = resolveWorkflow(
+        workflowDefinitionSchema.parse({
+          name: 'container-wait',
+          description: 'unsupported durable wait in container isolation',
+          nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+        })
+      );
 
       await expect(
         executeWorkflow(
@@ -1363,7 +1375,7 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
-    it('terminalizes a resumed run before dispatch when persisted thinking is ineffective', async () => {
+    it('terminalizes a resumed run when persisted metadata uses retired thinking config', async () => {
       const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preset = {
         provider: 'copilot',
@@ -1395,11 +1407,11 @@ describe('executeWorkflow', () => {
           'db-conv-1',
           { preCreatedRun, priorCompletedNodes: new Map() }
         )
-      ).rejects.toThrow(/cannot apply Claude-shaped thinking options/);
+      ).rejects.toThrow(/thinking:.*effort:/);
 
       expect(failRun).toHaveBeenCalledWith(
         'resume-ignored-thinking-run',
-        expect.stringContaining('cannot apply Claude-shaped thinking options')
+        expect.stringMatching(/thinking:.*effort:/)
       );
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
