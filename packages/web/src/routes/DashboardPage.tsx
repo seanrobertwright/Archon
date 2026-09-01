@@ -196,7 +196,11 @@ export function DashboardPage(): React.ReactElement {
           runId: run.id,
           workflowName: run.workflow_name,
           status: run.status,
-          dagNodes: [],
+          dagNodes: run.active_nodes.map(nodeId => ({
+            nodeId,
+            name: nodeId,
+            status: 'running',
+          })),
           artifacts: [],
           startedAt: new Date(ensureUtc(run.started_at)).getTime(),
           currentTool: null,

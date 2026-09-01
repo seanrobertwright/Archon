@@ -434,6 +434,12 @@ archon workflow status --verbose   # add a per-node summary for each run
 archon workflow status --json --verbose
 ```
 
+The normal human and JSON views include every active node without fetching each run's event
+history. In JSON, `active_nodes` is the ordered list of unresolved node starts: `node_started` adds
+an identifier, while `node_completed`, `node_failed`, `node_skipped`, and
+`node_skipped_prior_success` remove it. Retries re-add the node in their new start position. This
+is node lifecycle state, not evidence that a process owner is alive.
+
 ### `workflow runs`
 
 List recent runs of **every** status (completed, failed, cancelled, running, paused) for the current project. The project is resolved from `cwd` the same way `workflow run` does. Complements `workflow status` (which is active-only).
@@ -447,6 +453,11 @@ archon workflow runs --all             # list across all projects (ignore cwd sc
 ```
 
 If `cwd` is not a registered project, the command falls back to a global list and says so — `--json` carries this as a `scopeFallback: true` field so a consuming agent never mistakes a global result for a project-scoped one.
+
+The run-list JSON uses the same `active_nodes` contract as `workflow status`. The retained singular
+fields are compatibility fields: `current_step_name` and `current_step_status` are populated only
+when exactly one node is active, and are `null` for zero or concurrent active nodes. `total_steps`
+is always `null` because lifecycle events do not own a truthful declared DAG total.
 
 The listing shows short 8-character run ids. Every `<run-id>` command below (`get`, `logs`, `wait`, `resume`, `cancel`, `abandon`, `approve`, `reject`) accepts these short ids when run from the project directory: a unique prefix resolves to the full id, an ambiguous prefix errors, and full ids keep working from any directory. Short ids from `--all` rows belonging to *other* projects can't be resolved — use the full id from `--json` for those.
 

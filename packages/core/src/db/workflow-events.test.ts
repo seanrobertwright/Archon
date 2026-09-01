@@ -40,6 +40,7 @@ import {
   persistWorkflowEventIfRunning,
   listWorkflowEvents,
   listRecentEvents,
+  listActiveWorkflowNodeIds,
   getDagResumeSnapshot,
 } from './workflow-events';
 
@@ -264,6 +265,68 @@ describe('workflow-events', () => {
     });
   });
 
+  describe('listActiveWorkflowNodeIds', () => {
+    test('folds parallel, terminal, skipped, duplicate, and retry lifecycle rows in order', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'completed', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'completed', event_type: 'node_completed' },
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_failed' },
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'skipped', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'skipped', event_type: 'node_skipped' },
+          { workflow_run_id: 'run-a', step_name: 'cached', event_type: 'node_started' },
+          {
+            workflow_run_id: 'run-a',
+            step_name: 'cached',
+            event_type: 'node_skipped_prior_success',
+          },
+          { workflow_run_id: 'run-b', step_name: 'parallel-a', event_type: 'node_started' },
+          { workflow_run_id: 'run-b', step_name: 'parallel-b', event_type: 'node_started' },
+          { workflow_run_id: 'run-b', step_name: null, event_type: 'node_started' },
+        ])
+      );
+
+      const result = await listActiveWorkflowNodeIds(['run-a', 'run-b', 'run-c']);
+
+      expect(result).toEqual(
+        new Map([
+          ['run-a', ['alpha']],
+          ['run-b', ['parallel-a', 'parallel-b']],
+          ['run-c', []],
+        ])
+      );
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'ORDER BY workflow_run_id, created_at ASC, COALESCE(event_order, 0) ASC, id ASC'
+        ),
+        [
+          'run-a',
+          'run-b',
+          'run-c',
+          'node_started',
+          'node_completed',
+          'node_failed',
+          'node_skipped',
+          'node_skipped_prior_success',
+        ]
+      );
+    });
+
+    test('returns an empty map without querying for an empty run list', async () => {
+      expect(await listActiveWorkflowNodeIds([])).toEqual(new Map());
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('propagates query failures', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('connection refused'));
+
+      await expect(listActiveWorkflowNodeIds(['run-a'])).rejects.toThrow('connection refused');
+    });
+  });
+
   describe('getDagResumeSnapshot', () => {
     test('returns outputs and summed tokens from node_completed events', async () => {
       mockQuery.mockResolvedValueOnce(
@@ -301,9 +364,10 @@ describe('workflow-events', () => {
         cacheRead: 50,
         cacheWrite: 5,
       });
-      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('node_completed'), [
-        'run-123',
-      ]);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('event_type IN'),
+        expect.arrayContaining(['run-123', 'node_completed'])
+      );
     });
 
     test('carries structured_output back out; rows without it stay text-only (#2637)', async () => {
@@ -467,9 +531,10 @@ describe('workflow-events', () => {
         cacheWrite: 0,
         cachePartial: true,
       });
-      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining("'node_failed'"), [
-        'run-failed-usage',
-      ]);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('event_type IN'),
+        expect.arrayContaining(['run-failed-usage', 'node_failed'])
+      );
     });
 
     test('a later node_failed row supersedes an earlier node_completed row for the same step (#2705 R2)', async () => {
@@ -588,8 +653,8 @@ describe('workflow-events', () => {
       expect(result.completedNodeOutputs.get('node-b')).toEqual({ output: 'output B' });
       expect(result.tokens).toEqual({ input: 40, output: 4 });
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining('node_skipped_prior_success'),
-        ['run-resume']
+        expect.stringContaining('event_type IN'),
+        expect.arrayContaining(['run-resume', 'node_skipped_prior_success'])
       );
     });
 

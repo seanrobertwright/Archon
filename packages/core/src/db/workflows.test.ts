@@ -44,6 +44,7 @@ import {
   findChildRuns,
   getRunAncestry,
   listWorkflowRuns,
+  listDashboardRuns,
   findOpenWorkRuns,
   findAdoptingRuns,
   deleteOldWorkflowRuns,
@@ -187,6 +188,150 @@ describe('workflows database', () => {
       const result = await getWorkflowRun('non-existent');
 
       expect(result).toBeNull();
+    });
+  });
+
+  describe('listDashboardRuns', () => {
+    test('derives active nodes from canonical node lifecycle events', async () => {
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([
+            {
+              ...mockWorkflowRun,
+              codebase_name: 'Archon',
+              platform_type: 'web',
+              worker_platform_id: 'worker-1',
+              parent_platform_id: null,
+              agents_completed: 0,
+              agents_failed: 0,
+              agents_total: null,
+            },
+          ])
+        )
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running', cnt: '1' }]))
+        .mockResolvedValueOnce(
+          createQueryResult([
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'implement',
+              event_type: 'node_started',
+            },
+          ])
+        );
+
+      const result = await listDashboardRuns({ status: 'running' });
+
+      expect(result.runs[0]).toMatchObject({
+        active_nodes: ['implement'],
+        current_step_name: 'implement',
+        current_step_status: 'running',
+        total_steps: null,
+      });
+      const listSql = String(mockQuery.mock.calls[0]?.[0]);
+      expect(listSql).not.toContain('step_started');
+      expect(listSql).not.toContain('step_completed');
+      expect(listSql).not.toContain('step_failed');
+    });
+
+    test('does not collapse parallel active nodes into the singular compatibility fields', async () => {
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([
+            {
+              ...mockWorkflowRun,
+              codebase_name: 'Archon',
+              platform_type: 'web',
+              worker_platform_id: 'worker-1',
+              parent_platform_id: null,
+              agents_completed: 0,
+              agents_failed: 0,
+              agents_total: null,
+            },
+          ])
+        )
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running', cnt: '1' }]))
+        .mockResolvedValueOnce(
+          createQueryResult([
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'parallel-a',
+              event_type: 'node_started',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'parallel-b',
+              event_type: 'node_started',
+            },
+          ])
+        );
+
+      const result = await listDashboardRuns();
+
+      expect(result.runs[0]).toMatchObject({
+        active_nodes: ['parallel-a', 'parallel-b'],
+        current_step_name: null,
+        current_step_status: null,
+        total_steps: null,
+      });
+    });
+
+    test('returns empty active state when all observed nodes are terminal', async () => {
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([
+            {
+              ...mockWorkflowRun,
+              codebase_name: 'Archon',
+              platform_type: 'web',
+              worker_platform_id: 'worker-1',
+              parent_platform_id: null,
+              agents_completed: 0,
+              agents_failed: 0,
+              agents_total: null,
+            },
+          ])
+        )
+        .mockResolvedValueOnce(createQueryResult([{ status: 'running', cnt: '1' }]))
+        .mockResolvedValueOnce(
+          createQueryResult([
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'plan',
+              event_type: 'node_started',
+            },
+            {
+              workflow_run_id: mockWorkflowRun.id,
+              step_name: 'plan',
+              event_type: 'node_completed',
+            },
+          ])
+        );
+
+      const result = await listDashboardRuns();
+
+      expect(result.runs[0]).toMatchObject({
+        active_nodes: [],
+        current_step_name: null,
+        current_step_status: null,
+        total_steps: null,
+      });
+    });
+
+    test('filters by multiple statuses and totals their counts', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([])).mockResolvedValueOnce(
+        createQueryResult([
+          { status: 'running', cnt: '2' },
+          { status: 'paused', cnt: '3' },
+          { status: 'completed', cnt: '4' },
+        ])
+      );
+
+      const result = await listDashboardRuns({ status: ['running', 'paused'] });
+
+      expect(result.total).toBe(5);
+      expect(String(mockQuery.mock.calls[0]?.[0])).toContain('r.status IN ($1, $2)');
+      expect(mockQuery.mock.calls[0]?.[1]).toEqual(['running', 'paused', 50, 0]);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
     });
   });
 
