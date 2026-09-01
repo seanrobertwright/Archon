@@ -345,13 +345,7 @@ mock.module('@archon/workflows/executor', () => ({
         byte_count: 0,
         scopes: [],
       },
-      roots: {
-        project: '/test/capture/project',
-        globalWorkflows: '/test/capture/global/workflows',
-        globalCommands: '/test/capture/global/commands',
-        globalScripts: '/test/capture/global/scripts',
-        bundledWorkflows: '/test/capture/bundled',
-      },
+      roots: CAPTURED_SOURCE_ROOTS,
     })
   ),
   recordSelectedWorkflow: mock(() => Promise.resolve()),
