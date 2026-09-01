@@ -3409,20 +3409,17 @@ async function runSubprocess(
             env: subprocessEnv,
           });
 
-    const redactedStreams = {
-      stdout: redactCredentialValues(result.stdout, credentialValues),
-      stderr: redactCredentialValues(result.stderr, credentialValues),
-    };
+    const redactedStderr = redactCredentialValues(result.stderr, credentialValues);
     // Retention is the EVIDENCE copy, taken from a redacted-then-capped copy of the
     // streams. The caller's `stdout` remains the node's full-fidelity value channel
     // (#2726), while `stderr` shares the exact redacted copy used for retention because
     // callers broadcast it to the operator.
     await logExecOutput(logDir, workflowRunId, nodeId, label, {
-      stdoutTail: retainStreamTail(redactedStreams.stdout),
-      stderrTail: retainStreamTail(redactedStreams.stderr),
+      stdoutTail: retainStreamTail(redactCredentialValues(result.stdout, credentialValues)),
+      stderrTail: retainStreamTail(redactedStderr),
       exitCode: 0,
     });
-    return { stdout: result.stdout, stderr: redactedStreams.stderr };
+    return { stdout: result.stdout, stderr: redactedStderr };
   } catch (err) {
     const rejection = redactSubprocessError(err as RawSubprocessRejection, credentialValues);
     // `redactSubprocessError` already scrubbed these fields in place, so retention reads
