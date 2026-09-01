@@ -451,6 +451,26 @@ const mockCreateWorkflowRun = mock((data: { workflow_name: string; conversation_
   })
 );
 
+const EMPTY_STATUS_COUNTS = {
+  all: 0,
+  running: 0,
+  completed: 0,
+  failed: 0,
+  cancelled: 0,
+  pending: 0,
+  paused: 0,
+};
+const mockListDashboardRuns = mock(() =>
+  Promise.resolve({ runs: [] as unknown[], total: 0, counts: EMPTY_STATUS_COUNTS })
+);
+function statusRuns(runs: unknown[]): {
+  runs: unknown[];
+  total: number;
+  counts: typeof EMPTY_STATUS_COUNTS;
+} {
+  return { runs, total: runs.length, counts: EMPTY_STATUS_COUNTS };
+}
+
 mock.module('@archon/core/db/workflows', () => ({
   createWorkflowRun: mockCreateWorkflowRun,
   getActiveWorkflowRun: mock(() => Promise.resolve(null)),
@@ -469,13 +489,7 @@ mock.module('@archon/core/db/workflows', () => ({
   resolveApprovalGate: mock(() => Promise.resolve({ resolved: true })),
   resolveAndCancelApprovalGate: mock(() => Promise.resolve({ resolved: true })),
   listWorkflowRuns: mock(() => Promise.resolve([])),
-  listDashboardRuns: mock(() =>
-    Promise.resolve({
-      runs: [],
-      total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
-    })
-  ),
+  listDashboardRuns: mockListDashboardRuns,
   deleteOldWorkflowRuns: mock(() => Promise.resolve({ count: 0 })),
 }));
 
@@ -4350,8 +4364,7 @@ describe('workflowStatusCommand', () => {
   });
 
   it('should print message when no active runs', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
+    mockListDashboardRuns.mockResolvedValueOnce(statusRuns([]));
 
     await workflowStatusCommand();
 
@@ -4359,16 +4372,18 @@ describe('workflowStatusCommand', () => {
   });
 
   it('should list active runs with ID, name, path, status, and age', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-abc',
-        workflow_name: 'implement',
-        working_path: '/path/to/worktree',
-        status: 'running',
-        started_at: new Date(Date.now() - 5 * 60 * 1000), // 5 minutes ago
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-abc',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(Date.now() - 5 * 60 * 1000), // 5 minutes ago
+          active_nodes: ['parallel-a', 'parallel-b'],
+        },
+      ])
+    );
 
     await workflowStatusCommand();
 
@@ -4377,20 +4392,23 @@ describe('workflowStatusCommand', () => {
     expect(calls.some(c => c.includes('implement'))).toBe(true);
     expect(calls.some(c => c.includes('/path/to/worktree'))).toBe(true);
     expect(calls.some(c => c.includes('running'))).toBe(true);
+    expect(calls.some(c => c.includes('Active nodes: parallel-a, parallel-b'))).toBe(true);
   });
 
   it('should label authored outcome separately from active execution status', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-paused',
-        workflow_name: 'review',
-        working_path: '/path/to/worktree',
-        status: 'paused',
-        outcome: 'succeeded',
-        started_at: new Date(),
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-paused',
+          workflow_name: 'review',
+          working_path: '/path/to/worktree',
+          status: 'paused',
+          outcome: 'succeeded',
+          started_at: new Date(),
+          active_nodes: ['parallel-a', 'parallel-b'],
+        },
+      ])
+    );
 
     await workflowStatusCommand();
 
@@ -4399,8 +4417,7 @@ describe('workflowStatusCommand', () => {
   });
 
   it('should output JSON when json=true', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([]);
+    mockListDashboardRuns.mockResolvedValueOnce(statusRuns([]));
 
     await workflowStatusCommand(true);
 
@@ -4410,19 +4427,43 @@ describe('workflowStatusCommand', () => {
     );
   });
 
+  it('keeps parallel active nodes in non-verbose JSON', async () => {
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-parallel',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(),
+          active_nodes: ['parallel-a', 'parallel-b'],
+        },
+      ])
+    );
+
+    await workflowStatusCommand(true);
+
+    const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
+      runs: Array<{ active_nodes: string[] }>;
+    };
+    expect(parsed.runs[0]?.active_nodes).toEqual(['parallel-a', 'parallel-b']);
+  });
+
   it('should show node summaries in verbose mode', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
     const workflowEventsDb = await import('@archon/core/db/workflow-events');
 
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-verbose',
-        workflow_name: 'implement',
-        working_path: '/path/to/worktree',
-        status: 'running',
-        started_at: new Date(Date.now() - 30 * 1000),
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-verbose',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(Date.now() - 30 * 1000),
+          active_nodes: ['plan'],
+        },
+      ])
+    );
 
     const startTime = new Date(Date.now() - 25 * 1000).toISOString();
     const endTime = new Date(Date.now() - 15 * 1000).toISOString();
@@ -4456,18 +4497,20 @@ describe('workflowStatusCommand', () => {
   });
 
   it('should show error message for failed node in verbose mode', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
     const workflowEventsDb = await import('@archon/core/db/workflow-events');
 
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-failed',
-        workflow_name: 'implement',
-        working_path: '/path/to/worktree',
-        status: 'running',
-        started_at: new Date(Date.now() - 30 * 1000),
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-failed',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(Date.now() - 30 * 1000),
+          active_nodes: ['implement'],
+        },
+      ])
+    );
 
     const startTime = new Date(Date.now() - 20 * 1000).toISOString();
     const endTime = new Date(Date.now() - 10 * 1000).toISOString();
@@ -4500,18 +4543,20 @@ describe('workflowStatusCommand', () => {
   });
 
   it('should not show nodes section when no events in verbose mode', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
     const workflowEventsDb = await import('@archon/core/db/workflow-events');
 
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-empty',
-        workflow_name: 'implement',
-        working_path: '/path/to/worktree',
-        status: 'running',
-        started_at: new Date(Date.now() - 5 * 1000),
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-empty',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(Date.now() - 5 * 1000),
+          active_nodes: [],
+        },
+      ])
+    );
     (workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>).mockResolvedValueOnce([]);
 
     await workflowStatusCommand(false, true);
@@ -4521,18 +4566,20 @@ describe('workflowStatusCommand', () => {
   });
 
   it('emits the shared ordered node summaries in verbose JSON by default', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
     const workflowEventsDb = await import('@archon/core/db/workflow-events');
 
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-verbose-json',
-        workflow_name: 'implement',
-        working_path: '/path/to/worktree',
-        status: 'running',
-        started_at: new Date(),
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-verbose-json',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(),
+          active_nodes: ['beta'],
+        },
+      ])
+    );
     (workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>).mockResolvedValueOnce(
       VERBOSE_EVENTS_FIXTURE
     );
@@ -4583,17 +4630,19 @@ describe('workflowStatusCommand', () => {
   });
 
   it('emits raw events in verbose JSON when events=true', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
     const workflowEventsDb = await import('@archon/core/db/workflow-events');
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-verbose-json',
-        workflow_name: 'implement',
-        working_path: '/path/to/worktree',
-        status: 'running',
-        started_at: new Date(),
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-verbose-json',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(),
+          active_nodes: ['beta'],
+        },
+      ])
+    );
     (workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>).mockResolvedValueOnce(
       VERBOSE_EVENTS_FIXTURE
     );
@@ -4608,17 +4657,19 @@ describe('workflowStatusCommand', () => {
   });
 
   it('degrades a verbose JSON event-query failure to an empty node payload', async () => {
-    const workflowDb = await import('@archon/core/db/workflows');
     const workflowEventsDb = await import('@archon/core/db/workflow-events');
-    (workflowDb.listWorkflowRuns as ReturnType<typeof mock>).mockResolvedValueOnce([
-      {
-        id: 'run-unavailable',
-        workflow_name: 'implement',
-        working_path: '/path/to/worktree',
-        status: 'running',
-        started_at: new Date(),
-      },
-    ]);
+    mockListDashboardRuns.mockResolvedValueOnce(
+      statusRuns([
+        {
+          id: 'run-unavailable',
+          workflow_name: 'implement',
+          working_path: '/path/to/worktree',
+          status: 'running',
+          started_at: new Date(),
+          active_nodes: ['beta'],
+        },
+      ])
+    );
     (workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>).mockRejectedValueOnce(
       new Error('events unavailable')
     );
@@ -5822,6 +5873,7 @@ describe('workflowRunsCommand', () => {
           workflow_name: 'assist',
           status: 'completed',
           outcome: 'failed',
+          active_nodes: ['parallel-a', 'parallel-b'],
           current_step_name: null,
           total_steps: null,
           started_at: new Date(),
@@ -5835,13 +5887,14 @@ describe('workflowRunsCommand', () => {
 
     expect(stdoutSpy).toHaveBeenCalledTimes(1);
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as {
-      runs: Array<{ status: string; outcome: string | null }>;
+      runs: Array<{ status: string; outcome: string | null; active_nodes: string[] }>;
       total: number;
       scopeFallback: boolean;
     };
     expect(parsed.total).toBe(1);
     expect(parsed.runs).toHaveLength(1);
     expect(parsed.runs[0]).toMatchObject({ status: 'completed', outcome: 'failed' });
+    expect(parsed.runs[0]?.active_nodes).toEqual(['parallel-a', 'parallel-b']);
     // codebase did not resolve → result is a global fallback, flagged for agents
     expect(parsed.scopeFallback).toBe(true);
   });
@@ -5861,6 +5914,7 @@ describe('workflowRunsCommand', () => {
           workflow_name: 'review',
           status: 'completed',
           outcome: 'failed',
+          active_nodes: ['parallel-a', 'parallel-b'],
           current_step_name: null,
           total_steps: null,
           started_at: new Date(),
@@ -5875,6 +5929,7 @@ describe('workflowRunsCommand', () => {
     const output = consoleSpy.mock.calls.map(call => String(call[0])).join('\n');
     expect(output).toContain('completed');
     expect(output).toContain('authored outcome: failed');
+    expect(output).toContain('active node(s): parallel-a, parallel-b');
   });
 
   it('marks scopeFallback false in --json when the project scope resolves', async () => {

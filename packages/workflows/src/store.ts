@@ -64,6 +64,16 @@ export interface WorkflowNodeSessionKey {
   provider: string;
 }
 
+export const NODE_LIFECYCLE_EVENT_TYPES = [
+  'node_started',
+  'node_completed',
+  'node_failed',
+  'node_skipped',
+  'node_skipped_prior_success',
+] as const;
+
+export type NodeLifecycleEventType = (typeof NODE_LIFECYCLE_EVENT_TYPES)[number];
+
 export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
   'workflow_completed',
@@ -77,11 +87,7 @@ export const WORKFLOW_EVENT_TYPES = [
   // Between-run continuation (#2747) — written on the ADOPTING run's log when it
   // starts with `--adopt`/`--supersedes`, so the chain renders from events alone.
   'workflow.run_adopted',
-  'node_started',
-  'node_completed',
-  'node_failed',
-  'node_skipped',
-  'node_skipped_prior_success',
+  ...NODE_LIFECYCLE_EVENT_TYPES,
   // #2402 — written when a cached prior-success node is invalidated because a
   // dependency re-executed during the current resume (e.g. an `always_run: true`
   // upstream, or any dep that re-ran with fresh output). `data.prior_output` is the

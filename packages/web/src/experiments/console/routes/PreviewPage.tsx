@@ -26,6 +26,7 @@ const baseRun: Omit<Run, 'id' | 'workflow' | 'status'> = {
   finishedAt: null,
   workingPath: null,
   userMessage: '',
+  activeNodes: [],
 };
 
 const SAMPLE_RUNS: Run[] = [
@@ -34,6 +35,7 @@ const SAMPLE_RUNS: Run[] = [
     id: 'a4f2c918-running',
     workflow: 'plan',
     status: 'running',
+    activeNodes: ['plan/draft'],
     currentNode: 'plan/draft',
     lastTool: 'read_file',
   },

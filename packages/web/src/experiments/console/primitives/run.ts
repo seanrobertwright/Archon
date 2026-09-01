@@ -35,7 +35,8 @@ export interface Run {
   /** workflow_runs.working_path — used to join against worktrees. */
   workingPath: string | null;
   userMessage: string;
-  /** Derived from metadata/events at runtime; initially undefined. */
+  activeNodes: string[];
+  /** Singular compatibility view, populated only when exactly one node is active. */
   currentNode?: string | null;
   lastTool?: string | null;
   /**
@@ -101,6 +102,7 @@ interface RawWorkflowRun {
   /** Only present on dashboard runs — enriched by server-side join. */
   codebase_name?: string | null;
   platform_type?: string | null;
+  active_nodes?: string[];
   current_step_name?: string | null;
   /** Run-tree parent id (#2121 Phase 2); null/absent for top-level runs. */
   parent_run_id?: string | null;
@@ -156,6 +158,9 @@ export function runMessageConversationId(run: Run | undefined): string | null {
 }
 
 export function toRun(raw: RawWorkflowRun): Run {
+  const activeNodes = Array.isArray(raw.active_nodes)
+    ? raw.active_nodes.filter(nodeId => typeof nodeId === 'string' && nodeId.length > 0)
+    : [];
   const approval = raw.metadata?.approval;
   const isApprovalShape =
     approval !== null &&
@@ -235,7 +240,8 @@ export function toRun(raw: RawWorkflowRun): Run {
     finishedAt: raw.completed_at ?? null,
     workingPath: raw.working_path ?? null,
     userMessage: raw.user_message ?? '',
-    currentNode: raw.current_step_name ?? null,
+    activeNodes,
+    currentNode: activeNodes.length === 1 ? (activeNodes[0] ?? null) : null,
     lastTool: null,
     approval: parsedApproval,
     wait: parsedWait,

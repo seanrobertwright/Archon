@@ -52,6 +52,7 @@ function buildDemoRuns(scope: Scope, projectName: string | null): Run[] {
     outcome: null,
     workingPath: null,
     userMessage: '',
+    activeNodes: [] as string[],
     finishedAt: null as string | null,
   };
   return [
@@ -62,6 +63,7 @@ function buildDemoRuns(scope: Scope, projectName: string | null): Run[] {
       origin: 'cli',
       status: 'running',
       startedAt: iso(4 * 60 + 12),
+      activeNodes: ['plan/draft'],
       currentNode: 'plan/draft',
       lastTool: 'read_file',
     },
@@ -72,6 +74,7 @@ function buildDemoRuns(scope: Scope, projectName: string | null): Run[] {
       origin: 'web',
       status: 'running',
       startedAt: iso(9 * 60 + 38),
+      activeNodes: ['implement/loop'],
       currentNode: 'implement/loop',
       lastTool: 'edit_file',
     },

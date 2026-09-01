@@ -140,6 +140,7 @@ import * as codebaseDb from '@archon/core/db/codebases';
 import * as isolationDb from '@archon/core/db/isolation-environments';
 import * as messageDb from '@archon/core/db/messages';
 import * as workflowDb from '@archon/core/db/workflows';
+import type { DashboardWorkflowRun } from '@archon/core/db/workflows';
 import * as workflowEventsDb from '@archon/core/db/workflow-events';
 import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
 import * as userDb from '@archon/core/db/users';
@@ -3609,7 +3610,7 @@ export async function workflowStatusCommand(
   verbose?: boolean,
   rawEvents?: boolean
 ): Promise<void> {
-  let runs: WorkflowRun[];
+  let runs: DashboardWorkflowRun[];
   try {
     const result = await getWorkflowStatus();
     runs = result.runs;
@@ -3650,6 +3651,11 @@ export async function workflowStatusCommand(
     console.log(`  Status: ${run.status}`);
     if (run.outcome) console.log(`  Authored outcome: ${run.outcome}`);
     console.log(`  Age:    ${age}`);
+    if (run.active_nodes.length > 0) {
+      console.log(
+        `  Active node${run.active_nodes.length === 1 ? '' : 's'}: ${run.active_nodes.join(', ')}`
+      );
+    }
 
     if (verbose) {
       const { events, failed } = await fetchVerboseEvents(run.id);
@@ -4320,13 +4326,11 @@ export async function workflowRunsCommand(
 
   console.log(`\nRecent runs (${result.runs.length} of ${result.total}):\n`);
   for (const run of result.runs) {
-    const step =
-      run.current_step_name !== null
-        ? ` · ${run.current_step_name}${run.total_steps !== null ? `/${String(run.total_steps)}` : ''}`
-        : '';
+    const activeNodes =
+      run.active_nodes.length > 0 ? ` · active node(s): ${run.active_nodes.join(', ')}` : '';
     const outcome = run.outcome ? ` · authored outcome: ${run.outcome}` : '';
     console.log(
-      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${step}${outcome}  (${formatAge(run.started_at)})`
+      `  ${run.id.slice(0, 8)}  ${run.status.padEnd(9)}  ${run.workflow_name}${activeNodes}${outcome}  (${formatAge(run.started_at)})`
     );
   }
   console.log('');
