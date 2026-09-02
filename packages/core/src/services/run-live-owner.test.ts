@@ -9,6 +9,7 @@ import {
   RunLiveOwnerStopUnavailableError,
   startRunLiveOwner,
   watchRunLiveOwner,
+  withRunLiveOwner,
   type RunLiveOwnerWatchEvent,
 } from './run-live-owner';
 
@@ -88,6 +89,29 @@ describe('run live owner', () => {
 
     expect(first).toEqual(['attention']);
     expect(second).toEqual(['attention']);
+  });
+
+  test('closes and rings the owner when its wrapped execution rejects', async () => {
+    const runId = `rejected-${crypto.randomUUID()}`;
+    const path = runLiveOwnerPath(runId);
+    const events: RunLiveOwnerWatchEvent[] = [];
+    const executionError = new Error('execution failed');
+    let rejection: unknown;
+
+    try {
+      await withRunLiveOwner(runId, {}, async () => {
+        const watch = await watchRunLiveOwner(runId, event => events.push(event));
+        expect(watch).not.toBeNull();
+        throw executionError;
+      });
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toBe(executionError);
+    await waitFor(() => events.length === 1);
+    expect(events).toEqual(['attention']);
+    expect(await canConnectToRunLiveOwner(path)).toBe(false);
   });
 
   test('foreground and server owners refuse active stop without changing owner state', async () => {

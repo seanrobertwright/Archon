@@ -448,8 +448,9 @@ describe('workflow continuation scanner', () => {
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
   });
 
-  test('surfaces a resumed background-web terminal result on the visible conversation', async () => {
+  test('surfaces a resumed background-web result when owner cleanup fails', async () => {
     const paused = run('wait-web', 'paused', {});
+    const cleanupError = new Error('owner cleanup failed');
     mockResolveRunContinuation.mockResolvedValueOnce({
       ok: true,
       workflowName: 'deliver',
@@ -466,6 +467,10 @@ describe('workflow continuation scanner', () => {
       getStreamingMode: () => 'batch' as const,
       getPlatformType: () => 'web',
     } satisfies IWorkflowPlatform;
+    mockCloseRunLiveOwner.mockImplementationOnce(async () => {
+      runLiveOwnerCalls.push('close');
+      throw cleanupError;
+    });
 
     await expect(
       resumeWorkflowRunFromServer(paused, undefined, {

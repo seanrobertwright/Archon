@@ -594,6 +594,10 @@ persisted non-terminal `observedStatus` and no `attention` or terminal `status` 
 After verifying that the run's work has stopped, release its persisted state with
 `archon workflow abandon <run-id>`.
 
+Live-owner detection is local to the host running `workflow wait`. With a shared remote
+PostgreSQL database, `owner_lost` means no owner endpoint is reachable on this host; the
+run may still be executing on another host. Check the owning host before abandoning it.
+
 `--json` emits one document. On a wake it carries the attention value:
 
 ```json

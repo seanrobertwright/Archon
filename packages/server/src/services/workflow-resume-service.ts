@@ -130,7 +130,12 @@ export async function resumeWorkflowRunFromServer(
     const runLiveOwner = await startRunLiveOwner(run.id);
     let runLiveOwnerClose: Promise<void> | undefined;
     const closeRunLiveOwner = (): Promise<void> => {
-      runLiveOwnerClose ??= runLiveOwner.close();
+      runLiveOwnerClose ??= runLiveOwner.close().catch((error: unknown) => {
+        log.error(
+          { err: error as Error, runId: run.id },
+          'workflow_resume_headless_owner_close_failed'
+        );
+      });
       return runLiveOwnerClose;
     };
     let executionStarted = false;
@@ -261,7 +266,7 @@ export async function resumeWorkflowRunFromServer(
         .catch((error: unknown) => {
           log.error(
             { err: error as Error, runId: run.id },
-            'workflow_resume_headless_owner_close_failed'
+            'workflow_resume_headless_completion_failed'
           );
         });
       return true;

@@ -46,6 +46,8 @@ export interface RunLiveOwnerStopLease {
   isLive(): boolean;
 }
 
+type StopResponse = { kind: 'unsupported' } | { kind: 'detached'; pid: number };
+
 export class RunLiveOwnerStopUnavailableError extends Error {
   constructor(
     readonly runId: string,
@@ -208,6 +210,10 @@ function writeFinalFrame(socket: Socket, frame: string): Promise<void> {
   });
 }
 
+function stopResponseFrame(response: StopResponse): string {
+  return `${JSON.stringify(response)}\n`;
+}
+
 /** Publish the exact process entry that currently owns execution of one run. */
 export async function startRunLiveOwner(
   runId: string,
@@ -252,15 +258,13 @@ export async function startRunLiveOwner(
           socket.write(WATCH_READY);
         } else if (phase === 'request' && frame === STOP_REQUEST) {
           if (options.detachedProcessPid === undefined) {
-            socket.end(`${JSON.stringify({ kind: 'unsupported' })}\n`);
+            socket.end(stopResponseFrame({ kind: 'unsupported' }));
             return;
           }
           phase = 'lease';
           stopSockets.add(socket);
           socket.setTimeout(RUN_LIVE_OWNER_IPC_TIMEOUT_MS, () => socket.destroy());
-          socket.write(
-            `${JSON.stringify({ kind: 'detached', pid: options.detachedProcessPid })}\n`
-          );
+          socket.write(stopResponseFrame({ kind: 'detached', pid: options.detachedProcessPid }));
         } else if (phase === 'lease' && frame === TERMINATE_REQUEST) {
           phase = 'terminating';
           socket.setTimeout(TERMINATION_LEASE_MS, () => socket.destroy());
@@ -424,7 +428,7 @@ export function watchRunLiveOwner(
   });
 }
 
-function parseStopResponse(runId: string, raw: string): number {
+function parseStopResponse(runId: string, raw: string): StopResponse {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -435,10 +439,12 @@ function parseStopResponse(runId: string, raw: string): number {
     throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid response');
   }
   if (parsed.kind === 'unsupported') {
-    throw new RunLiveOwnerStopUnavailableError(runId, 'the live owner is not a detached CLI');
+    return { kind: 'unsupported' };
+  }
+  if (parsed.kind !== 'detached') {
+    throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid response');
   }
   if (
-    parsed.kind !== 'detached' ||
     !('pid' in parsed) ||
     typeof parsed.pid !== 'number' ||
     !Number.isInteger(parsed.pid) ||
@@ -446,7 +452,7 @@ function parseStopResponse(runId: string, raw: string): number {
   ) {
     throw new RunLiveOwnerStopUnavailableError(runId, 'owner returned an invalid PID');
   }
-  return parsed.pid;
+  return { kind: 'detached', pid: parsed.pid };
 }
 
 /** Ask the exact-run owner for the detached process's termination lease. */
@@ -489,7 +495,10 @@ export function requestRunLiveOwnerStop(runId: string): Promise<RunLiveOwnerStop
       const newline = response.indexOf('\n');
       if (newline === -1) return;
       try {
-        const pid = parseStopResponse(runId, response.slice(0, newline));
+        const stopResponse = parseStopResponse(runId, response.slice(0, newline));
+        if (stopResponse.kind === 'unsupported') {
+          throw new RunLiveOwnerStopUnavailableError(runId, 'the live owner is not a detached CLI');
+        }
         settled = true;
         socket.off('end', onEnd);
         socket.off('close', onClose);
@@ -502,7 +511,7 @@ export function requestRunLiveOwnerStop(runId: string): Promise<RunLiveOwnerStop
           socket.destroy();
         };
         resolve({
-          pid,
+          pid: stopResponse.pid,
           commit: async (): Promise<void> => {
             if (committed) throw new Error('Run termination lease is already committed');
             if (released || socket.destroyed || socket.readableEnded) {
