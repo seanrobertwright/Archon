@@ -1507,10 +1507,20 @@ describe('GET /api/commands', () => {
       const projectOnly = first.commands.filter(c => c.name.endsWith('-order')).map(c => c.name);
       expect(projectOnly).toEqual(['aa-order', 'mm-order', 'zz-order']);
 
-      // The project copy wins the name; it keeps the bundled entry's position,
-      // which is what makes the collision resolution observable rather than a
-      // silent reorder.
-      expect(first.commands).toContainEqual({ name: 'archon-assist', source: 'project' });
+      // The project copy wins the name AND keeps the bundled entry's position:
+      // precedence changes the source, never the order. Asserting only that the
+      // entry exists with source 'project' would stay green if the merge
+      // re-sorted the response, which is the regression this pins.
+      mockListCodebases.mockImplementation(async () => []);
+      const bundledOnly = (await (await app.request('/api/commands')).json()) as {
+        commands: Array<{ name: string; source: string }>;
+      };
+      const bundledIndex = bundledOnly.commands.findIndex(c => c.name === 'archon-assist');
+      expect(bundledOnly.commands[bundledIndex]).toEqual({
+        name: 'archon-assist',
+        source: 'bundled',
+      });
+      expect(first.commands[bundledIndex]).toEqual({ name: 'archon-assist', source: 'project' });
     } finally {
       mockListCodebases.mockReset();
       await removeTempTree(projectDir);
