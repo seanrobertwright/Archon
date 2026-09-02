@@ -678,3 +678,182 @@ describe('ContainerBackend source mount', () => {
     ).rejects.toThrow(/overlaps the workspace root/);
   });
 });
+
+describe('ContainerBackend artifacts mount', () => {
+  const RUN_ROOT = join(getArchonHome(), 'workspaces', '_folder', 'ops-client');
+  const ARTIFACTS_MOUNT = join(RUN_ROOT, 'artifacts', 'runs', 'run-1');
+  const SOURCE_MOUNT = join(RUN_ROOT, 'workflow-source', 'runs', 'run-1');
+  const HOST = { uid: 1000, gid: 1000 };
+
+  function readyDocker(
+    extra?: (args: string[]) => DockerExecResult | undefined
+  ): ReturnType<typeof fakeDocker> {
+    return fakeDocker(args => {
+      const handled = extra?.(args);
+      if (handled) return handled;
+      if (args[0] === 'version') return { stdout: '28', stderr: '' };
+      if (args[0] === 'image') return { stdout: '[]', stderr: '' };
+      if (args[0] === 'volume') return { stdout: '', stderr: '' };
+      if (args[0] === 'run') return { stdout: 'abc123containerid\n', stderr: '' };
+      if (args[0] === 'exec') return { stdout: '', stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+  }
+
+  test('binds the run artifacts read-write at the same absolute path, beside the source', async () => {
+    const store = fakeStore();
+    const docker = readyDocker();
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: docker });
+
+    await backend.prepare({
+      codebase: FOLDER,
+      sourceMount: SOURCE_MOUNT,
+      artifactsMount: ARTIFACTS_MOUNT,
+    });
+
+    const runArgs = docker.calls.find(c => c[0] === 'run') ?? [];
+    // `$ARTIFACTS_DIR` means one host directory on both sides of the boundary, and a
+    // node must be able to write there — no `:ro`.
+    expect(runArgs).toContain(`${ARTIFACTS_MOUNT}:${ARTIFACTS_MOUNT}`);
+    expect(runArgs).not.toContain(`${ARTIFACTS_MOUNT}:${ARTIFACTS_MOUNT}:ro`);
+    expect(runArgs).toContain(`${SOURCE_MOUNT}:${SOURCE_MOUNT}:ro`);
+  });
+
+  test('records the mount so a recreated container can restore it', async () => {
+    const store = fakeStore();
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: readyDocker() });
+
+    await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
+
+    expect(store.created?.metadata).toMatchObject({ artifactsMount: ARTIFACTS_MOUNT });
+  });
+
+  test('re-applies the mount when resume has to recreate the container', async () => {
+    // The failure this guards: a recreated container without the bind writes artifacts
+    // into a container-local directory the host engine and operator never see.
+    const store = fakeStore();
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: readyDocker() });
+    const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
+
+    const resumeDocker = fakeDocker(args => {
+      if (args[0] === 'inspect' && args.includes('{{.State.Running}}')) {
+        throw new Error('Error: No such object: archon-res-1'); // container gone
+      }
+      if (args[0] === 'volume' && args[1] === 'inspect') return { stdout: '[]', stderr: '' };
+      if (args[0] === 'run') return { stdout: 'recreatedid\n', stderr: '' };
+      if (args[0] === 'exec') return { stdout: '', stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+    const resumeBackend = new ContainerBackend({
+      store,
+      config: CONFIG,
+      dockerRunner: resumeDocker,
+    });
+
+    await resumeBackend.resumeEnv(prepared.envId!);
+
+    const runArgs = resumeDocker.calls.find(c => c[0] === 'run');
+    expect(runArgs).toContain(`${ARTIFACTS_MOUNT}:${ARTIFACTS_MOUNT}`);
+  });
+
+  test('refuses a mount outside ARCHON_HOME, before any docker work', async () => {
+    const store = fakeStore();
+    const docker = readyDocker();
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: docker });
+
+    await expect(
+      backend.prepare({ codebase: FOLDER, artifactsMount: '/var/tmp/artifacts' })
+    ).rejects.toThrow(/artifacts mount .* outside ARCHON_HOME/);
+    expect(docker.calls.some(c => c[0] === 'volume' && c[1] === 'create')).toBe(false);
+  });
+
+  test('hands artifacts back to the host user before suspending', async () => {
+    // In-container work runs as root. On a rootful Linux daemon that leaves root-owned
+    // files under ~/.archon the operator cannot remove; the hand-back runs while the
+    // container can still execute it, i.e. before `docker stop`.
+    const store = fakeStore();
+    const docker = readyDocker();
+    const backend = new ContainerBackend({
+      store,
+      config: CONFIG,
+      dockerRunner: docker,
+      hostIdentity: HOST,
+    });
+    const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
+
+    await backend.suspend(prepared.envId!);
+
+    const chown = docker.calls.findIndex(c => c[0] === 'exec' && c.includes('chown'));
+    const stop = docker.calls.findIndex(c => c[0] === 'stop');
+    expect(chown).toBeGreaterThan(-1);
+    expect(docker.calls[chown]).toEqual([
+      'exec',
+      expect.any(String),
+      'chown',
+      '-R',
+      '1000:1000',
+      ARTIFACTS_MOUNT,
+    ]);
+    expect(chown).toBeLessThan(stop);
+  });
+
+  test('hands artifacts back before destroying a still-running container', async () => {
+    const store = fakeStore();
+    const docker = readyDocker(args =>
+      args[0] === 'inspect' && args.includes('{{.State.Running}}')
+        ? { stdout: 'true\n', stderr: '' }
+        : undefined
+    );
+    const backend = new ContainerBackend({
+      store,
+      config: CONFIG,
+      dockerRunner: docker,
+      hostIdentity: HOST,
+    });
+    const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
+
+    await backend.destroy(prepared.envId!);
+
+    const chown = docker.calls.findIndex(c => c[0] === 'exec' && c.includes('chown'));
+    const rm = docker.calls.findIndex(c => c[0] === 'rm');
+    expect(chown).toBeGreaterThan(-1);
+    expect(chown).toBeLessThan(rm);
+  });
+
+  test('skips the hand-back when the host user is root', async () => {
+    const store = fakeStore();
+    const docker = readyDocker();
+    const backend = new ContainerBackend({
+      store,
+      config: CONFIG,
+      dockerRunner: docker,
+      hostIdentity: { uid: 0, gid: 0 },
+    });
+    const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
+
+    await backend.suspend(prepared.envId!);
+
+    expect(docker.calls.some(c => c[0] === 'exec' && c.includes('chown'))).toBe(false);
+    expect(docker.calls.some(c => c[0] === 'stop')).toBe(true);
+  });
+
+  test('a failed hand-back is logged, not fatal', async () => {
+    const store = fakeStore();
+    const docker = readyDocker(args => {
+      if (args[0] === 'exec' && args.includes('chown')) {
+        throw new Error('chown: Operation not permitted');
+      }
+      return undefined;
+    });
+    const backend = new ContainerBackend({
+      store,
+      config: CONFIG,
+      dockerRunner: docker,
+      hostIdentity: HOST,
+    });
+    const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
+
+    await expect(backend.suspend(prepared.envId!)).resolves.toBeUndefined();
+    expect(docker.calls.some(c => c[0] === 'stop')).toBe(true);
+  });
+});

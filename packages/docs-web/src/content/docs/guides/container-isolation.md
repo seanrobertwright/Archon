@@ -101,6 +101,8 @@ The container is the isolation boundary: read-only lower bind + overlay upper on
 
 Overlay mount mode is chosen least-privilege-first: `fuse-overlayfs` (only `--device /dev/fuse`, no `CAP_SYS_ADMIN`) is attempted first and works on rootless / userns-remap daemons; a standard rootful daemon falls back to `native` (kernel overlay + `CAP_SYS_ADMIN`), which lets in-container root remount the read-only lower — so `native` is isolation-hardening, **not** a sandbox against a hostile agent. The full threat model, the `native` caveat, and the `docker exec -e` secrets-in-`ps` limitation are documented in `packages/isolation/docker/SECURITY.md` — read it before running untrusted work.
 
+Two Archon-owned host directories are bound into the container at their host paths: the run's frozen workflow source, read-only, and `$ARTIFACTS_DIR`, read-write. The artifacts bind is what lets an in-container node leave screenshots, reports, or the `evidence_policy` marker where the engine and the operator read them. It is the only host directory the container can write; its contents are run output and the host never executes them. On a rootful Linux daemon the container's root user owns what it writes there, so Archon hands the directory back to the host user when the container is suspended or destroyed.
+
 ## macOS / Linux notes
 
 The overlay upper/work dirs live on a VM-local named volume, never a host bind mount (a host-bind upperdir hits `EACCES` on macOS). The merged overlay is mounted at the **same absolute path** as the host cwd, so `working_path` and every path substitution are unchanged inside the container. On a standard Docker Desktop / rootful Engine daemon, expect the `native` (CAP_SYS_ADMIN) overlay mode.
