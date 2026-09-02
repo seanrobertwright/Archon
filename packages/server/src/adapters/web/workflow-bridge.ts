@@ -229,6 +229,7 @@ function dataSkipReason(data: Record<string, unknown>): NodeSkipReason | undefin
     case 'when_condition':
     case 'when_condition_parse_error':
     case 'trigger_rule':
+    case 'timeout':
       return reason;
     default:
       return undefined;

@@ -15,13 +15,15 @@ export type ArtifactType = 'pr' | 'commit' | 'file_created' | 'file_modified' | 
 export type SkipCause =
   | { kind: 'condition'; expr: string }
   | { kind: 'condition_parse_error'; expr: string }
+  | { kind: 'timeout' }
   | { kind: 'upstream_failed'; origin: string }
   | { kind: 'upstream_skipped'; origin: string };
 export type NodeSkipReason =
   | 'prior_success'
   | 'when_condition'
   | 'when_condition_parse_error'
-  | 'trigger_rule';
+  | 'trigger_rule'
+  | 'timeout';
 
 /**
  * Framework category the server attaches to a message it emitted itself (as

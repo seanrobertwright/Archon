@@ -105,6 +105,24 @@ describe('mapWorkflowEventRow', () => {
     });
   });
 
+  test('node_skipped carries a timeout reason and cause', () => {
+    const e = JSON.parse(
+      mapWorkflowEventRow(
+        row({
+          event_type: 'node_skipped',
+          step_name: 'ci-note',
+          data: { reason: 'timeout', cause: { kind: 'timeout' } },
+        })
+      ) as string
+    );
+    expect(e).toMatchObject({
+      type: 'dag_node',
+      status: 'skipped',
+      reason: 'timeout',
+      cause: { kind: 'timeout' },
+    });
+  });
+
   test('omits a cause for legacy, malformed, and prior-success skip rows', () => {
     const rows = [
       row({ event_type: 'node_skipped', data: { reason: 'trigger_rule' } }),

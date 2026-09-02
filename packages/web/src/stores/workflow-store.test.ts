@@ -162,6 +162,26 @@ describe('handleDagNode', () => {
       cause: { kind: 'upstream_failed', origin: 'validate' },
     });
   });
+
+  test('retains timeout provenance from node events', () => {
+    useWorkflowStore
+      .getState()
+      .handleWorkflowStatus(statusEvent({ runId: 'run-d5', workflowName: 'dag-wf' }));
+    useWorkflowStore.getState().handleDagNode(
+      dagNodeEvent({
+        runId: 'run-d5',
+        nodeId: 'ci-note',
+        status: 'skipped',
+        reason: 'timeout',
+        cause: { kind: 'timeout' },
+      })
+    );
+
+    expect(useWorkflowStore.getState().workflows.get('run-d5')?.dagNodes[0]).toMatchObject({
+      reason: 'timeout',
+      cause: { kind: 'timeout' },
+    });
+  });
 });
 
 describe('handleWorkflowArtifact', () => {
