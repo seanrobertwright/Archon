@@ -1,7 +1,12 @@
 import { expect, test } from 'bun:test';
 import { z } from '@hono/zod-openapi';
 import type { DagNode } from './schemas';
-import { bindingDirectiveSchema, dagNodeFlatSchema, dagNodeSchema } from './schemas';
+import {
+  bindingDirectiveSchema,
+  dagNodeFlatSchema,
+  dagNodeSchema,
+  WORKFLOW_HOOK_EVENTS,
+} from './schemas';
 import type { TemplateSlotName, TemplateSurface } from './template-walker';
 import {
   mapNodeTemplateSlots,
@@ -16,6 +21,12 @@ type StringFieldClassification =
 
 const HOOK_MATCHER_REASON = 'Hook matcher is an SDK regex, not execution template text';
 const HOOK_RESPONSE_REASON = 'Hook response is static provider configuration';
+const HOOK_FIELD_CLASSIFICATIONS = Object.fromEntries(
+  WORKFLOW_HOOK_EVENTS.flatMap(event => [
+    [`hooks.${event}.*.matcher`, { kind: 'literal', reason: HOOK_MATCHER_REASON }] as const,
+    [`hooks.${event}.*.response.*`, { kind: 'literal', reason: HOOK_RESPONSE_REASON }] as const,
+  ])
+) satisfies Record<string, StringFieldClassification>;
 
 const STRING_FIELD_CLASSIFICATIONS = {
   id: { kind: 'literal', reason: 'Node identifier anchors graph edges and output references' },
@@ -34,48 +45,7 @@ const STRING_FIELD_CLASSIFICATIONS = {
   'allowed_tools.*': { kind: 'literal', reason: 'Allowed-tool entries are capability names' },
   'denied_tools.*': { kind: 'literal', reason: 'Denied-tool entries are capability names' },
   'retry.on_error': { kind: 'literal', reason: 'Retry error class is an engine policy enum' },
-  'hooks.PreToolUse.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.PreToolUse.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.PostToolUse.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.PostToolUse.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.PostToolUseFailure.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.PostToolUseFailure.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.Notification.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.Notification.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.UserPromptSubmit.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.UserPromptSubmit.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.SessionStart.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.SessionStart.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.SessionEnd.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.SessionEnd.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.Stop.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.Stop.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.SubagentStart.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.SubagentStart.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.SubagentStop.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.SubagentStop.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.PreCompact.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.PreCompact.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.PermissionRequest.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.PermissionRequest.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.Setup.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.Setup.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.TeammateIdle.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.TeammateIdle.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.TaskCompleted.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.TaskCompleted.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.Elicitation.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.Elicitation.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.ElicitationResult.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.ElicitationResult.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.ConfigChange.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.ConfigChange.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.WorktreeCreate.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.WorktreeCreate.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.WorktreeRemove.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.WorktreeRemove.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
-  'hooks.InstructionsLoaded.*.matcher': { kind: 'literal', reason: HOOK_MATCHER_REASON },
-  'hooks.InstructionsLoaded.*.response.*': { kind: 'literal', reason: HOOK_RESPONSE_REASON },
+  ...HOOK_FIELD_CLASSIFICATIONS,
   mcp: { kind: 'literal', reason: 'MCP value is a configuration path' },
   'skills.*': { kind: 'literal', reason: 'Skill entries are capability identifiers' },
   'agents.*.description': { kind: 'template', slots: ['agents.*.description'] },
@@ -454,6 +424,42 @@ test('a classification fails when its template slot leaves the catalogue', () =>
     completenessProblems(dagNodeSchema, STRING_FIELD_CLASSIFICATIONS, incompleteCatalogue)
       .templateSlotsMissingFromCatalogue
   ).toEqual(['when']);
+});
+
+test('workflow and composed fan-out bindings use their classified slot names', () => {
+  const workflowNode = {
+    id: 'child',
+    kind: 'workflow',
+    workflow: 'child-workflow',
+    with: { topic: '$source.output' },
+  } satisfies DagNode;
+  const composedFanOutNode = {
+    id: 'fan',
+    kind: 'compose_fan_out',
+    include: 'worker-block',
+    with: { topic: '$source.output' },
+    fan_out: {
+      items: '$source.output',
+      as: 'topic',
+      max_parallel: 1,
+      join: 'all_done',
+    },
+  } satisfies DagNode;
+
+  const slotIdentity = (node: DagNode): { name: TemplateSlotName; path: string }[] => {
+    const slots: { name: TemplateSlotName; path: string }[] = [];
+    visitNodeTemplateSlots(node, ({ name, path }) => slots.push({ name, path }));
+    return slots;
+  };
+
+  expect(slotIdentity(workflowNode)).toContainEqual({
+    name: 'workflow.with.*',
+    path: 'with.topic',
+  });
+  expect(slotIdentity(composedFanOutNode)).toContainEqual({
+    name: 'compose_fan_out.with.*',
+    path: 'with.topic',
+  });
 });
 
 test('the slot catalogue rejects omitted fixed fields', () => {
