@@ -42,6 +42,7 @@ export { InvalidProviderRunConfigError, UnknownProviderError } from './errors';
 // Shared structured-output helpers (cross-provider; the dag-executor validates
 // every provider's output_format result against the declared schema).
 export {
+  compileOutputSchema,
   validateStructuredOutput,
   formatSchemaErrors,
   type StructuredValidationResult,
