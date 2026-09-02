@@ -29899,6 +29899,38 @@ describe('exec result contracts (#2453)', () => {
     expect((await readFile(attempts, 'utf8')).length).toBe(1);
   });
 
+  it('a contract failure quotes stdout with credentials redacted', async () => {
+    // The preview lands in node_failed.data.error, the one place a contract failure copies
+    // stdout verbatim. It must redact against the same set the subprocess runner resolved.
+    const secret = 'contract-preview-secret-value';
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflowRun: makeWorkflowRun('contract-redaction'),
+        workflow: {
+          name: 'contract-redaction',
+          nodes: [
+            dagNodeSchema.parse({
+              id: 'producer',
+              output_format: RESULT_SCHEMA,
+              bash: `printf '%s' 'token=${secret} and more text'`,
+            }),
+          ],
+        },
+        config: { ...minimalConfig, protectedCredentialValues: [secret] },
+      })
+    );
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('must be a single JSON document');
+    expect(error).toContain('[REDACTED]');
+    expect(error).not.toContain(secret);
+  });
+
   it('a certified exec value survives cold resume identically', async () => {
     const freshPrompts: string[] = [];
     captureConsumerPrompts(freshPrompts);

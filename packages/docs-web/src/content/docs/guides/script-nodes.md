@@ -260,7 +260,8 @@ With a schema declared, the node:
 That is the same contract an AI node's `output_format` carries, so a script and
 an agent are interchangeable as the producer behind a `returns:` node.
 
-A schemaless script is unchanged: stdout stays raw text, byte for byte.
+A schemaless script is unchanged: stdout stays raw text, trimmed only of its trailing
+newline as before.
 
 ### Variable Substitution in Scripts
 

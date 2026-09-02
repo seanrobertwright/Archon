@@ -240,6 +240,28 @@ describe('compileOutputSchema', () => {
   });
 });
 
+describe('compileOutputSchema registry hygiene', () => {
+  test('a failed compile does not leave its $id registered for the next attempt', () => {
+    // ajv registers `$id` before resolving references, so the dangling `$ref` throws
+    // with the id already in the registry. The author's corrected schema, a distinct
+    // object with the same `$id`, must then get a clean compile rather than
+    // "schema with key or id ... already exists".
+    const broken = {
+      $id: 'https://example.test/broken.json',
+      type: 'object',
+      properties: { a: { $ref: '#/$defs/missing' } },
+    };
+    const fixed = {
+      $id: 'https://example.test/broken.json',
+      type: 'object',
+      properties: { a: { type: 'string' } },
+    };
+    expect(compileOutputSchema(broken)).toContain("can't resolve reference");
+    expect(compileOutputSchema(fixed)).toBeNull();
+    expect(validateStructuredOutput({ a: 'x' }, fixed).valid).toBe(true);
+  });
+});
+
 describe('formatSchemaErrors', () => {
   test('renders root-level missing-property failures with the property name', () => {
     const r = validateStructuredOutput(

@@ -610,7 +610,7 @@ nodes:
       required: [ready, units]
 ```
 
-The node's stdout must parse as **one strict JSON document** and satisfy the schema. There is no code-fence stripping, no repair pass and no reask — stdout that does not match its own declaration is a bug in the script, so the node fails, naming the offending JSON path and quoting the start of stdout. On success the canonical document becomes `$plan.output`, the logical value feeds bindings and `fan_out.items`, and `$plan.output.units` is strict in exactly the same way as an AI node's field access.
+The node's stdout must parse as **one strict JSON document** and satisfy the schema. There is no code-fence stripping, no repair pass and no reask — stdout that does not match its own declaration is a bug in the script, so the node fails, naming the offending JSON path and quoting the start of stdout. That failure is never retried: a `retry:` block re-runs subprocess and transient failures, not a script whose stdout is deterministically wrong. On success the canonical document becomes `$plan.output`, the logical value feeds bindings and `fan_out.items`, and `$plan.output.units` is strict in exactly the same way as an AI node's field access.
 
 This is what makes a script and an agent interchangeable as the producer behind a `returns:` node: the contract belongs to whichever node produces the result, not to its kind. A `bash:`/`script:` node with **no** `output_format` is unchanged — stdout stays raw text.
 

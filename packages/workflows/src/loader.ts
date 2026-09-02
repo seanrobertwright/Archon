@@ -1282,14 +1282,20 @@ export function validateWorkflowClassPlacement(
  * genuinely rejects, such as a dangling `$ref`, is an error here.
  *
  * Loop_group bodies are walked too: a body node runs its own provider turn with
- * its own schema. Returns the first failure message, or `null`.
+ * its own schema, while the group's own `output_format` stays inert and is skipped.
+ * Returns the first failure message, or `null`.
  */
 export function validateNodeOutputFormats(
   nodes: readonly (DagNode | IncludeDirective)[]
 ): string | null {
   for (const node of nodes) {
     if (isIncludeDirective(node)) continue;
-    if (node.output_format !== undefined) {
+    // Only a schema the engine will enforce is worth rejecting: agent, exec, and `loop:`
+    // nodes certify their output against it. On a loop_group, gate, or halt the field
+    // is inert (warned and ignored), so a dangling `$ref` there governs nothing and must
+    // not fail the file.
+    const enforced = isAgentNode(node) || isExecNode(node) || isLoopNode(node);
+    if (enforced && node.output_format !== undefined) {
       const compileError = compileOutputSchema(node.output_format);
       if (compileError !== null) {
         return `Node '${node.id}' declares an output_format that cannot be compiled: ${compileError}`;

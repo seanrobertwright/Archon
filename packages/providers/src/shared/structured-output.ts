@@ -266,10 +266,16 @@ const validatorCache = new WeakMap<object, ValidateFunction>();
  * `$ref` against another node's schema, so the registry has no other job.
  */
 function compileAndCache(schema: Record<string, unknown>): ValidateFunction {
-  const validate = ajv.compile(schema);
-  validatorCache.set(schema, validate);
-  ajv.removeSchema(schema);
-  return validate;
+  try {
+    const validate = ajv.compile(schema);
+    validatorCache.set(schema, validate);
+    return validate;
+  } finally {
+    // ajv registers a `$id` BEFORE it resolves references, so a compile that throws on
+    // a dangling `$ref` still leaves the id registered; without this the author's next
+    // attempt with the same `$id` fails with "already exists" instead of their real error.
+    ajv.removeSchema(schema);
+  }
 }
 
 /**

@@ -3385,7 +3385,7 @@ async function runSubprocess(
     protectedCredentialValues?: readonly string[];
     retention: SubprocessRetention;
   }
-): Promise<{ stdout: string; stderr: string }> {
+): Promise<{ stdout: string; stderr: string; credentialValues: readonly string[] }> {
   const subprocessEnv =
     execContext.kind === 'container' ? options.env : { ...process.env, ...options.env };
   // Both outcomes redact against the same values, so the credential set is resolved
@@ -3428,7 +3428,9 @@ async function runSubprocess(
       stderrTail: retainStreamTail(redactedStderr),
       exitCode: 0,
     });
-    return { stdout: result.stdout, stderr: redactedStderr };
+    // `credentialValues` rides along so a caller that quotes stdout back (a contract
+    // failure's preview) redacts against exactly this set rather than resolving its own.
+    return { stdout: result.stdout, stderr: redactedStderr, credentialValues };
   } catch (err) {
     const rejection = redactSubprocessError(err as RawSubprocessRejection, credentialValues);
     // `redactSubprocessError` already scrubbed these fields in place, so retention reads
@@ -3562,9 +3564,13 @@ class ExecOutputContractError extends Error {}
 /** How much of the offending stdout a contract failure quotes back to the author. */
 const EXEC_CONTRACT_STDOUT_PREVIEW = 200;
 
-function execStdoutPreview(stdout: string): string {
-  const head = stdout.slice(0, EXEC_CONTRACT_STDOUT_PREVIEW);
-  return `${JSON.stringify(head)}${stdout.length > head.length ? ' …[truncated]' : ''}`;
+function execStdoutPreview(stdout: string, credentialValues: readonly string[]): string {
+  // Redact BEFORE slicing: the preview lands in `node_failed.data.error`, and a credential
+  // that straddles the cut would otherwise leak its head. Retention (#2967) already applies
+  // the same set to the tails; the quoted excerpt must not be the one unredacted copy.
+  const redacted = redactCredentialValues(stdout, credentialValues);
+  const head = redacted.slice(0, EXEC_CONTRACT_STDOUT_PREVIEW);
+  return `${JSON.stringify(head)}${redacted.length > head.length ? ' …[truncated]' : ''}`;
 }
 
 /**
@@ -3583,7 +3589,8 @@ function execStdoutPreview(stdout: string): string {
  */
 function certifyExecOutput(
   node: ExecNode,
-  stdout: string
+  stdout: string,
+  credentialValues: readonly string[]
 ): { output: string; structuredOutput?: JsonValue; declaredFields?: string[] } {
   if (node.output_format === undefined) return { output: stdout };
 
@@ -3593,7 +3600,7 @@ function certifyExecOutput(
     parsed = JSON.parse(stdout) as unknown;
   } catch (parseErr) {
     throw new ExecOutputContractError(
-      `${label} declares an output_format, so its stdout must be a single JSON document, but it did not parse: ${(parseErr as Error).message}. stdout began: ${execStdoutPreview(stdout)}`
+      `${label} declares an output_format, so its stdout must be a single JSON document, but it did not parse: ${(parseErr as Error).message}. stdout began: ${execStdoutPreview(stdout, credentialValues)}`
     );
   }
   // `JSON.parse` can only yield a JsonValue — no undefined, no non-finite number, no
@@ -3613,7 +3620,7 @@ function certifyExecOutput(
   }
   if (!validation.valid) {
     throw new ExecOutputContractError(
-      `${label}: stdout did not satisfy its declared output_format: ${validation.errors.join('; ')}. stdout began: ${execStdoutPreview(stdout)}`
+      `${label}: stdout did not satisfy its declared output_format: ${validation.errors.join('; ')}. stdout began: ${execStdoutPreview(stdout, credentialValues)}`
     );
   }
 
@@ -3751,19 +3758,24 @@ async function executeBashNode(
 
   const bashPath = resolveBashPath();
   try {
-    const { stdout, stderr } = await runSubprocess(execContext, bashPath, ['-c', finalScript], {
-      cwd,
-      timeout,
-      env: subprocessEnv,
-      protectedEnvKeys,
-      protectedCredentialValues,
-      retention: {
-        logDir,
-        workflowRunId: workflowRun.id,
-        nodeId: node.id,
-        label: '<bash>',
-      },
-    });
+    const { stdout, stderr, credentialValues } = await runSubprocess(
+      execContext,
+      bashPath,
+      ['-c', finalScript],
+      {
+        cwd,
+        timeout,
+        env: subprocessEnv,
+        protectedEnvKeys,
+        protectedCredentialValues,
+        retention: {
+          logDir,
+          workflowRunId: workflowRun.id,
+          nodeId: node.id,
+          label: '<bash>',
+        },
+      }
+    );
 
     // Trim trailing newline from stdout (common shell behavior)
     const trimmedStdout = stdout.replace(/\n$/, '');
@@ -3782,7 +3794,7 @@ async function executeBashNode(
     // and hand downstream consumers the canonical document instead of raw text (#2453).
     // Runs AFTER the stderr relay so a contract failure never swallows the script's own
     // diagnostics; it throws an ExecOutputContractError, handled by this function's catch.
-    const certified = certifyExecOutput(node, trimmedStdout);
+    const certified = certifyExecOutput(node, trimmedStdout, credentialValues);
     const output = certified.output;
 
     const duration = Date.now() - nodeStartTime;
@@ -4185,7 +4197,7 @@ async function executeScriptNode(
       }
     }
 
-    const { stdout, stderr } = await runSubprocess(execContext, cmd, args, {
+    const { stdout, stderr, credentialValues } = await runSubprocess(execContext, cmd, args, {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -4214,7 +4226,7 @@ async function executeScriptNode(
 
     // Identical certification to executeBashNode (#2453): a declared output_format makes
     // this node's stdout a contract, and the canonical document replaces the raw text.
-    const certified = certifyExecOutput(node, trimmedStdout);
+    const certified = certifyExecOutput(node, trimmedStdout, credentialValues);
     const output = certified.output;
 
     const duration = Date.now() - nodeStartTime;

@@ -8683,6 +8683,31 @@ nodes:
     expect(error?.error).toContain('missing');
   });
 
+  it('does not compile the inert output_format on a loop_group itself', () => {
+    // The group's own schema governs nothing (warned and ignored), so a dangling $ref
+    // there must not reject the file; only enforced schemas are compiled at load.
+    const result = parseWorkflow(
+      `
+name: inert-group-schema
+description: A loop_group whose own schema is inert
+nodes:
+  - id: group
+    output_format:
+      type: object
+      properties: { done: { $ref: '#/$defs/missing' } }
+    loop_group:
+      until_bash: exit 0
+      max_iterations: 1
+      nodes:
+        - id: work
+          bash: echo done
+`,
+      'inert-group-schema.yaml'
+    );
+    expect(result.error).toBeNull();
+    expect(result.workflow?.nodes).toHaveLength(1);
+  });
+
   it('rejects an uncompilable output_format on a loop_group body node', () => {
     const { workflow, error } = parseWorkflow(
       `
