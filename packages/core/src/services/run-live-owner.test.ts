@@ -207,9 +207,13 @@ describe('run live owner', () => {
     try {
       const lease = await requestRunLiveOwnerStop(runId);
       try {
-        await expect(lease.commit()).rejects.toThrow(
-          /owner (?:ended|closed) before committing termination/
-        );
+        // Bun reports a destroyed Windows named pipe through the bounded idle timeout;
+        // POSIX sockets report their peer's EOF immediately.
+        const expectedFailure =
+          process.platform === 'win32'
+            ? /owner did not commit the termination lease/
+            : /owner (?:ended|closed) before committing termination/;
+        await expect(lease.commit()).rejects.toThrow(expectedFailure);
       } finally {
         lease.release();
       }
