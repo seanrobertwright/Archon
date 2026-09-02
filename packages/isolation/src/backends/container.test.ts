@@ -550,16 +550,15 @@ describe('ContainerBackend.finalize / applyChanges / discardChanges', () => {
 });
 
 describe('ContainerBackend source mount', () => {
-  /** A capture path under ARCHON_HOME, which is what the engine actually passes. */
+  /** A capture path under ARCHON_HOME, shaped the way the engine actually passes it. */
   const SOURCE_MOUNT = join(
     getArchonHome(),
     'workspaces',
     '_folder',
     'ops-client',
-    'artifacts',
+    'workflow-source',
     'runs',
-    'run-1',
-    'workflow-source'
+    'run-1'
   );
 
   function readyDocker(): ReturnType<typeof fakeDocker> {
