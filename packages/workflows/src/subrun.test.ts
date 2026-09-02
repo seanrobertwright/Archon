@@ -6595,23 +6595,63 @@ nodes:
     ).toBeUndefined();
   });
 
-  it('a fan-out aggregate carries one validated pointer per child', async () => {
-    await writePointerChild('plan.md');
+  it('a fan-out aggregate relays one per-child pointer per item, each naming its own child run', async () => {
+    // Each child is a SEPARATE run: it writes a per-item file under its own artifacts
+    // directory and points at it with its own run id. The parent's aggregate must carry
+    // that pointer unrewritten — the relay rule: the child proved it, the parent does
+    // not re-validate.
+    await writeWorkflow(
+      'child-unit',
+      `
+name: child-unit
+description: certifies a per-item result pointing at the file this child wrote
+mutates_checkout: false
+returns: check
+nodes:
+  - id: check
+    runtime: bun
+    script: |
+      import { mkdirSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const item = process.env.ARGUMENTS;
+      mkdirSync(join(process.env.ARTIFACTS_DIR, 'units'), { recursive: true });
+      writeFileSync(join(process.env.ARTIFACTS_DIR, 'units', item + '.md'), '# ' + item);
+      console.log(JSON.stringify({
+        id: item,
+        ok: true,
+        report: { type: 'archon_artifact', run_id: process.env.WORKFLOW_ID, path: 'units/' + item + '.md' },
+      }));
+    output_format:
+      type: object
+      properties:
+        id: { type: string }
+        ok: { type: boolean }
+        report:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [id, ok, report]
+`
+    );
     await writeWorkflow(
       'parent-pointer-fan',
       `
 name: parent-pointer-fan
-description: fans out over two items, each child pointing at its own plan file
+description: fans out over two items, each child pointing at its own per-item file
 nodes:
   - id: items
     bash: |
       printf '%s' '["one","two"]'
   - id: work
-    workflow: child-pointer
+    workflow: child-unit
     depends_on: [items]
     fan_out:
       items: "$items.output"
       max_parallel: 2
+      join: all_success
 `
     );
 
@@ -6628,7 +6668,7 @@ nodes:
 
     expect(result.success).toBe(true);
     const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-pointer-fan');
-    const children = [...store.runs.values()].filter(r => r.workflow_name === 'child-pointer');
+    const children = [...store.runs.values()].filter(r => r.workflow_name === 'child-unit');
     expect(children).toHaveLength(2);
     const workCompleted = store.events.find(
       e =>
@@ -6637,12 +6677,31 @@ nodes:
         e.step_name === 'work'
     );
     const aggregate = workCompleted?.data?.structured_output as {
-      plan: { run_id: string; path: string };
+      id: string;
+      ok: boolean;
+      report: { type: string; run_id: string; path: string };
     }[];
-    // Each element points at ITS OWN child run — the only run a producer may name —
-    // and the aggregate relays them exactly as the children certified them.
-    expect(aggregate.map(element => element.plan.path)).toEqual(['plan.md', 'plan.md']);
-    expect(new Set(aggregate.map(element => element.plan.run_id))).toEqual(
+    // Ordered by item, one pointer per element, unrewritten: each names the child run
+    // that produced it (never the parent) and the relative path that child wrote.
+    expect(aggregate.map(element => element.id)).toEqual(['one', 'two']);
+    for (const element of aggregate) {
+      const child = children.find(c => c.id === element.report.run_id);
+      if (!child) throw new Error(`no child run produced element '${element.id}'`);
+      expect(child.user_message).toBe(element.id);
+      expect(element.report).toEqual({
+        type: 'archon_artifact',
+        run_id: child.id,
+        path: `units/${element.id}.md`,
+      });
+      // The file lives under the CHILD's artifacts directory — the run the pointer
+      // names — not the parent's.
+      const childArtifacts = realArchonPaths.getRunArtifactsDirForRoot(
+        child.output_root ?? '',
+        child.id
+      );
+      expect(existsSync(join(childArtifacts, 'units', `${element.id}.md`))).toBe(true);
+    }
+    expect(new Set(aggregate.map(element => element.report.run_id))).toEqual(
       new Set(children.map(c => c.id))
     );
   });
@@ -6676,10 +6735,13 @@ describe('workflow: a child contract drives the parent composed path (#2453)', (
     { id: 'unit-a', title: 'first unit of work' },
     { id: 'unit-b', title: 'second unit of work' },
   ];
-  const AGGREGATE = [
-    { id: 'unit-a', ok: true },
-    { id: 'unit-b', ok: true },
-  ];
+  /** The instances run inside the PARENT run, so each per-item pointer names that run. */
+  const aggregateFor = (runId: string) =>
+    UNITS.map(unit => ({
+      id: unit.id,
+      ok: true,
+      report: { type: 'archon_artifact', run_id: runId, path: `units/${unit.id}.md` },
+    }));
 
   beforeEach(async () => {
     cwd = join(tmpdir(), `subcomposed-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -6731,7 +6793,8 @@ nodes:
     );
 
     // The per-item body the parent fans out inside its own run. It owns its own
-    // per-item contract, exactly as it would with any other producer upstream.
+    // per-item contract, exactly as it would with any other producer upstream, and
+    // points at a per-item file it wrote under the run it runs in.
     await writeWorkflow(
       'unit-block',
       `
@@ -6746,14 +6809,29 @@ nodes:
   - id: check
     runtime: bun
     script: |
+      import { mkdirSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
       const unit = JSON.parse(process.env.INPUTS_UNIT);
-      console.log(JSON.stringify({ id: unit.id, ok: typeof unit.title === 'string' }));
+      mkdirSync(join(process.env.ARTIFACTS_DIR, 'units'), { recursive: true });
+      writeFileSync(join(process.env.ARTIFACTS_DIR, 'units', unit.id + '.md'), '# ' + unit.title);
+      console.log(JSON.stringify({
+        id: unit.id,
+        ok: typeof unit.title === 'string',
+        report: { type: 'archon_artifact', run_id: process.env.WORKFLOW_ID, path: 'units/' + unit.id + '.md' },
+      }));
     output_format:
       type: object
       properties:
         id: { type: string }
         ok: { type: boolean }
-      required: [id, ok]
+        report:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [id, ok, report]
 `
     );
   });
@@ -6813,12 +6891,22 @@ nodes:
     expect(child?.metadata?.summary_declared_fields).toEqual(['units', 'plan']);
     expect(parentEvent('node_completed', 'sub')?.data?.declared_fields).toEqual(['units', 'plan']);
 
-    // `fan_out.items` read the child-declared `units` field as a real array.
-    expect(parentEvent('node_completed', 'work')?.data?.structured_output).toEqual(AGGREGATE);
+    // `fan_out.items` read the child-declared `units` field as a real array, and the
+    // aggregate relays each instance's per-item pointer unrewritten: one per item,
+    // naming the PARENT run (the instances ran inside it) and a real file under it.
+    const aggregate = aggregateFor(parent?.id ?? '');
+    expect(parentEvent('node_completed', 'work')?.data?.structured_output).toEqual(aggregate);
+    const parentArtifacts = realArchonPaths.getRunArtifactsDirForRoot(
+      parent?.output_root ?? '',
+      parent?.id ?? ''
+    );
+    for (const unit of UNITS) {
+      expect(existsSync(join(parentArtifacts, 'units', `${unit.id}.md`))).toBe(true);
+    }
 
-    // The pointer names the CHILD's run and stayed a run id plus a relative path.
+    // The plan pointer names the CHILD's run and stayed a run id plus a relative path.
     expect(String(parentEvent('node_completed', 'verify')?.data?.node_output)).toBe(
-      `aggregate=${JSON.stringify(AGGREGATE)} pointer=${JSON.stringify({
+      `aggregate=${JSON.stringify(aggregate)} pointer=${JSON.stringify({
         type: 'archon_artifact',
         run_id: child?.id,
         path: 'plan.md',
@@ -6901,7 +6989,9 @@ nodes:
     );
     // The fan-out ran for the FIRST time on the resumed run, so its item list came
     // from the rehydrated child contract rather than from a live child return.
-    expect(String(verify?.data?.node_output)).toBe(`aggregate=${JSON.stringify(AGGREGATE)}`);
+    expect(String(verify?.data?.node_output)).toBe(
+      `aggregate=${JSON.stringify(aggregateFor(parent?.id ?? ''))}`
+    );
     // The child ran once: the resumed parent reused its persisted result and contract.
     expect([...store.runs.values()].filter(r => r.workflow_name === 'child-plan')).toHaveLength(1);
   });

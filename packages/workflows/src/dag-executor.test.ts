@@ -11,7 +11,7 @@ import {
 } from 'bun:test';
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
 import { removeTempTree } from '@archon/paths/test-utils';
-import { unlinkSync } from 'fs';
+import { existsSync, unlinkSync } from 'fs';
 import { join, normalize, sep } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
@@ -30094,10 +30094,13 @@ describe('a result contract survives the whole composed path (#2453)', () => {
   ];
   const POINTER = { type: 'archon_artifact', run_id: RUN_ID, path: 'plan.md' };
   const PLAN_RESULT = { units: UNITS, plan: POINTER };
-  const AGGREGATE = [
-    { id: 'unit-a', ok: true },
-    { id: 'unit-b', ok: true },
-  ];
+  // Each instance points at the per-item file it wrote. Instances run INSIDE this run,
+  // so every pointer names this run — the only run a producer may name.
+  const AGGREGATE = UNITS.map(unit => ({
+    id: unit.id,
+    ok: true,
+    report: { type: 'archon_artifact', run_id: RUN_ID, path: `units/${unit.id}.md` },
+  }));
 
   type PersistedEvent = {
     event_type: string;
@@ -30172,7 +30175,8 @@ nodes:
     );
 
     // The per-item body. It owns its own contract, so the aggregate is an array of
-    // validated objects rather than an array of prose.
+    // validated objects rather than an array of prose — each pointing at a per-item file
+    // the instance wrote, proved at that producer against the run it runs in.
     await writeFile(
       join(testDir, '.archon', 'workflows', 'unit-block.yaml'),
       `
@@ -30187,14 +30191,29 @@ nodes:
   - id: check
     runtime: bun
     script: |
+      import { mkdirSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
       const unit = JSON.parse(process.env.INPUTS_UNIT);
-      console.log(JSON.stringify({ id: unit.id, ok: typeof unit.title === 'string' }));
+      mkdirSync(join(process.env.ARTIFACTS_DIR, 'units'), { recursive: true });
+      writeFileSync(join(process.env.ARTIFACTS_DIR, 'units', unit.id + '.md'), '# ' + unit.title);
+      console.log(JSON.stringify({
+        id: unit.id,
+        ok: typeof unit.title === 'string',
+        report: { type: 'archon_artifact', run_id: process.env.WORKFLOW_ID, path: 'units/' + unit.id + '.md' },
+      }));
     output_format:
       type: object
       properties:
         id: { type: string }
         ok: { type: boolean }
-      required: [id, ok]
+        report:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [id, ok, report]
 `
     );
 
@@ -30288,10 +30307,15 @@ nodes:
       expect.arrayContaining(AGGREGATE)
     );
 
-    // The wrapper aggregate is the ordered logical array, serialized exactly once.
+    // The wrapper aggregate is the ordered logical array, serialized exactly once, and
+    // it relays each instance's pointer unrewritten: one per item, naming this run and
+    // the relative path the instance wrote — a real file under this run's artifacts.
     const wrapper = completionOf(events, 'work');
     expect(wrapper?.data?.structured_output).toEqual(AGGREGATE);
     expect(JSON.parse(String(wrapper?.data?.node_output))).toEqual(AGGREGATE);
+    for (const unit of UNITS) {
+      expect(existsSync(join(runArtifactsDir, 'units', `${unit.id}.md`))).toBe(true);
+    }
 
     // Downstream, the aggregate is one JSON array and the pointer is still a run id
     // plus a relative path — never expanded, never replaced by the file's contents.
