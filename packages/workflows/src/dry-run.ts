@@ -38,7 +38,11 @@ import {
 } from './node-model-resolution';
 import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  assertWorkflowSourceIntegrity,
+  liveSourceRoots,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 import { defaultRunInputs } from './workflow-inputs';
 import { buildExecNodeEnvironment } from './exec-environment';
 import {
@@ -500,6 +504,7 @@ interface DryRunContext {
 }
 
 async function loadDryRunCommand(ctx: DryRunContext, command: string): Promise<string> {
+  await assertWorkflowSourceIntegrity(ctx.sourceRoots);
   const result = await loadCommandPrompt(
     {
       // Unreachable: `loadCommandPrompt` consults `loadConfig` only when its source roots
@@ -671,6 +676,7 @@ async function executeCodeNode(
         args = ['run', ...(node.deps ?? []).flatMap(dep => ['--with', dep]), 'python', '-c', code];
       }
     } else {
+      await assertWorkflowSourceIntegrity(ctx.sourceRoots);
       const script = (await discoverScriptsForCwd(ctx.cwd, ctx.sourceRoots)).get(code);
       if (!script) return { error: `Named script '${code}' was not found` };
       command = script.runtime === 'bun' ? 'bun' : 'uv';

@@ -420,13 +420,21 @@ export function readIdentityUnresolved(
  */
 export const WORKFLOW_SOURCE_METADATA_KEY = 'workflow_source';
 
+/** Source-side settings that decide which executable files a workflow resolves. */
+export const workflowSourceConfigSchema = z.object({
+  load_default_workflows: z.boolean(),
+  load_default_commands: z.boolean(),
+  command_folder: z.string().optional(),
+});
+
+export type WorkflowSourceConfig = Readonly<z.infer<typeof workflowSourceConfigSchema>>;
+
 /**
  * A run's recorded executable source.
  *
  * `version` exists so a future capture layout can be recognized rather than
- * misread. A reader that does not know a version treats the record as absent and
- * falls back to live discovery with a warning — never as an error, because a paused
- * run must stay resumable across an Archon upgrade.
+ * misread. An unrecognized record fails closed: only a run with no source record
+ * may resume against live discovery.
  */
 export const workflowSourceMetadataSchema = z.object({
   version: z.literal(1),
@@ -436,11 +444,10 @@ export const workflowSourceMetadataSchema = z.object({
    * Absoluteness is enforced rather than assumed: every root reaching here is built from
    * the run's own workspace path, so a relative or blank one means the record is corrupt
    * or foreign. Resolving it against whatever `process.cwd()` happens to be would send
-   * every command and script lookup somewhere arbitrary, so it reads as absent instead
-   * and the run falls back to live source with a warning.
+   * every command and script lookup somewhere arbitrary, so the record is unreadable.
    */
   root: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
-  /** The authoring directory it was captured from (provenance; never read for lookup). */
+  /** The authoring directory a not-yet-started child captures from. */
   origin: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
   captured_at: z.string(),
   /**
@@ -451,23 +458,16 @@ export const workflowSourceMetadataSchema = z.object({
    * which may since have been reclaimed. Verification still reads the manifest.
    */
   digest: z.string(),
+  /**
+   * Resolution settings pinned beside the digest, outside the mutable capture.
+   * Optional only for runs created before this field shipped.
+   */
+  source_config: workflowSourceConfigSchema.optional(),
   file_count: z.number(),
   byte_count: z.number(),
 });
 
 export type WorkflowSourceMetadata = z.infer<typeof workflowSourceMetadataSchema>;
-
-/**
- * Typed view of a run's recorded source, or `undefined` when it has none this reader
- * understands. Validation is deliberately total: an unparseable record means "resolve
- * live", not "fail the resume", so a shape change cannot strand paused work.
- */
-export function readWorkflowSourceMetadata(
-  metadata: Record<string, unknown> | undefined
-): WorkflowSourceMetadata | undefined {
-  const state = readWorkflowSourceState(metadata);
-  return state.kind === 'recorded' ? state.record : undefined;
-}
 
 /**
  * What a run says about its executable source.

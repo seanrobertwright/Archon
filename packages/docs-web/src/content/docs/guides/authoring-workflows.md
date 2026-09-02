@@ -1501,6 +1501,25 @@ return node's structured fixture value. Its existing `outcome` remains the simul
 continues to control CLI exit codes and fixture `expect` checks. Generated placeholder stubs never
 author a verdict.
 
+### Deterministic checks, authored outcomes, and evidence markers
+
+These are independent signals:
+
+- A deterministic check is an ordinary `bash:` or `script:` node. Exit zero completes the node;
+  any other exit fails it and therefore affects lifecycle status. A named script read from captured
+  source is also rejected if the run's full source capture no longer matches its pinned identity.
+- `outcome_field` records the workflow author's schema-declared boolean verdict. It does not control
+  lifecycle status. A succeeded outcome can remain on a run that later fails, and a failed outcome can
+  coexist with a completed run.
+- `evidence_policy: { required: true }` is only a terminal file-presence convention. It requires a
+  host file at `$ARTIFACTS_DIR/evidence.json` before lifecycle completion. Any contents, including a
+  self-asserted or unsupported claim, satisfy it. The marker proves neither that a check ran nor that
+  an outcome was authored.
+
+There is no special verification node or verification status. Put a check in a deterministic node
+when its execution must govern success, and use `outcome_field` only when the workflow must record its
+own conclusion. Use `evidence_policy` only when a conventionally named deliverable must exist.
+
 ### Binding time: includes resolve at load, runs at runtime
 
 `$INPUTS.<name>` is delivered by **two deliberately separate paths**, and the difference decides

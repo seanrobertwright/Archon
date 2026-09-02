@@ -210,8 +210,8 @@ export {
   RUN_METADATA_KEYS,
   readIdentityUnresolved,
   WORKFLOW_SOURCE_METADATA_KEY,
+  workflowSourceConfigSchema,
   workflowSourceMetadataSchema,
-  readWorkflowSourceMetadata,
   readWorkflowSourceState,
   CONTINUATION_METADATA_KEY,
   readContinuationMode,
@@ -236,6 +236,7 @@ export type {
   GateAddress,
   LoopGateRunMetadata,
   WorkflowSourceMetadata,
+  WorkflowSourceConfig,
   WorkflowSourceState,
   ContinuationMode,
 } from './workflow-run';

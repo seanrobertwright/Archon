@@ -46,12 +46,12 @@ import {
   WorkflowSourceIntegrityError,
   captureWorkflowSource,
   capturedSourceRoots,
-  loadWorkflowSource,
   recordSelectedWorkflow,
   resolveRunSourceCapture,
   resolveChildDiscoveryRoot,
   workflowSourceConfigFrom,
   type WorkflowSourceManifest,
+  type WorkflowSourceAnchor,
   type WorkflowSourceConfig,
   type WorkflowSourceRoots,
 } from './workflow-source';
@@ -733,9 +733,9 @@ export type ExecuteWorkflowOptions = ResumePayload & {
 export interface PreparedWorkflowSource {
   /** Reserved run id; the caller passes it back so the row and the capture agree. */
   runId: string;
-  captureRoot: string;
   origin: string;
   manifest: WorkflowSourceManifest;
+  anchor: WorkflowSourceAnchor;
   /** Roots to discover from — pass to `discoverWorkflowsWithConfig`. */
   roots: WorkflowSourceRoots;
 }
@@ -818,7 +818,7 @@ export interface CapturedSourceOwner {
    * finalizes early and moves the capture out of staging, and reclaiming the pre-move path
    * would leave the real one behind while looking like it cleaned up.
    */
-  hold: (prepared: Pick<PreparedWorkflowSource, 'captureRoot'>) => void;
+  hold: (prepared: Pick<PreparedWorkflowSource, 'anchor'>) => void;
   /**
    * A run now owns the bytes and their lifetime; stop tracking them. Called by the
    * caller from `executeWorkflow`'s rename success site (via
@@ -837,7 +837,7 @@ export async function withCapturedSource<T>(
   let adopted = false;
   const owner: CapturedSourceOwner = {
     hold: prepared => {
-      held = prepared.captureRoot;
+      held = prepared.anchor.root;
     },
     adopt: () => {
       adopted = true;
@@ -889,7 +889,7 @@ export async function resolveContinuationWorkflow(
   // is what made a repo with a custom `commands.folder` re-discover a different DAG.
   const capture = await resolveRunSourceCapture(run.metadata);
   if (!capture) return undefined; // predates capture — the caller keeps live behavior
-  const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+  const roots = capturedSourceRoots(capture.anchor);
 
   const { workflows, errors } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig, roots);
   const workflow = resolveWorkflowName(
@@ -899,7 +899,7 @@ export async function resolveContinuationWorkflow(
   if (!workflow) {
     throw new WorkflowSourceIntegrityError(
       `Cannot continue run of '${run.workflow_name}': its captured source at ` +
-        `${capture.captureRoot} no longer contains that workflow.`
+        `${capture.anchor.root} no longer contains that workflow.`
     );
   }
   return { workflow, roots, workflows, errors };
@@ -955,14 +955,15 @@ export async function finalizeWorkflowSource(
     prepared.runId,
     opts.codebaseId
   );
-  if (finalRoot === prepared.captureRoot) return prepared;
+  if (finalRoot === prepared.anchor.root) return prepared;
   await mkdir(dirname(finalRoot), { recursive: true });
   await rm(finalRoot, { recursive: true, force: true });
-  await rename(prepared.captureRoot, finalRoot);
+  await rename(prepared.anchor.root, finalRoot);
+  const anchor = { ...prepared.anchor, root: finalRoot };
   return {
     ...prepared,
-    captureRoot: finalRoot,
-    roots: capturedSourceRoots(finalRoot, prepared.manifest.source_config),
+    anchor,
+    roots: capturedSourceRoots(anchor),
   };
 }
 
@@ -976,7 +977,7 @@ export async function finalizeWorkflowSource(
  *
  *   1. `prepareWorkflowSource(...)`
  *   2. discover with `discoverWorkflowsWithConfig(cwd, loadConfig, prepared.roots)`
- *   3. `recordSelectedWorkflow(prepared.captureRoot, workflow.name)`
+ *   3. `recordSelectedWorkflow(prepared.anchor.root, workflow.name)`
  *   4. `executeWorkflow(..., { preparedSource: prepared })`
  *
  * Throws when the source cannot be frozen. There is no degraded mode: a run with no
@@ -1025,10 +1026,10 @@ export async function prepareWorkflowSource(
   });
   return {
     runId,
-    captureRoot: capture.captureRoot,
     origin: capture.origin,
     manifest: capture.manifest,
-    roots: capturedSourceRoots(capture.captureRoot, capture.manifest.source_config),
+    anchor: capture.anchor,
+    roots: capturedSourceRoots(capture.anchor),
   };
 }
 
@@ -1200,8 +1201,10 @@ async function runChildWorkflow(
     inputs,
   } = args;
 
-  // Every failure below returns a `{ status: 'failed' }` outcome (never throws);
-  // `childRunId` defaults to '' for failures before a child row exists.
+  // Every failure below returns a `{ status: 'failed' }` outcome; `childRunId` defaults
+  // to '' for failures before a child row exists. The one throw is
+  // `resolveChildDiscoveryRoot` refusing an unreadable or missing authoring record, which
+  // the `workflow:` node catches into the same failed outcome.
   const failOutcome = (error: string, childRunId = ''): ChildWorkflowOutcome => {
     // Reclaim the child's staged capture. Several ordinary refusals happen between
     // capturing and creating the child row — an unknown name, a cycle, the depth cap, a
@@ -1209,7 +1212,7 @@ async function runChildWorkflow(
     // `staged-source`. Safe after the child HAS started too: `executeWorkflow` moves the
     // capture into the child's artifacts, so the staged path is already gone and this is
     // a no-op. Fire-and-forget because cleanup must never mask the failure being reported.
-    if (childSource) void disposeWorkflowSource(childSource);
+    if (childSource) void disposeWorkflowSource({ captureRoot: childSource.anchor.root });
     return { childRunId, status: 'failed', error };
   };
 
@@ -1252,7 +1255,7 @@ async function runChildWorkflow(
       childWorkflowName,
       workflows.map(w => w.workflow)
     );
-    if (childWorkflow) await recordSelectedWorkflow(childSource.captureRoot, childWorkflow.name);
+    if (childWorkflow) await recordSelectedWorkflow(childSource.anchor.root, childWorkflow.name);
   } catch (err) {
     // resolveWorkflowName throws only on ambiguity.
     return failOutcome(
@@ -2654,15 +2657,29 @@ export async function executeWorkflow(
     // Verifies the digest against the one the RUN recorded — not merely that the
     // directory exists, and not merely that the capture agrees with itself.
     try {
-      const loaded = await loadWorkflowSource(recordedSource.root, recordedSource.digest);
-      // The settings frozen WITH the capture, not the target's. Without this a resume
-      // would re-read `commands.folder` and `defaults:` from the workspace it acts on and
-      // reinterpret the frozen bytes through them.
-      workflowSourceRoots = capturedSourceRoots(recordedSource.root, loaded.manifest.source_config);
+      const loaded = await resolveRunSourceCapture(workflowRun.metadata);
+      if (!loaded) throw new Error('workflow source record disappeared during resolution');
+      workflowSourceRoots = capturedSourceRoots(loaded.anchor);
       getLog().debug(
         { workflowRunId: workflowRun.id, captureRoot: recordedSource.root },
         'workflow.source_restored'
       );
+      if (recordedSource.source_config === undefined) {
+        // A run from before the row carried `source_config`. The manifest sits outside
+        // the digest, so nothing can prove these settings are the ones the run started
+        // with; what pinning them now buys is closing the window. From here on they are
+        // held beside the digest, and a later edit to the manifest is refused like any
+        // other drift instead of being re-read on every resume for the life of the run.
+        const pinned = { ...recordedSource, source_config: loaded.anchor.config };
+        workflowRun.metadata = { ...workflowRun.metadata, [WORKFLOW_SOURCE_METADATA_KEY]: pinned };
+        await deps.store.updateWorkflowRun(workflowRun.id, {
+          metadata: { [WORKFLOW_SOURCE_METADATA_KEY]: pinned },
+        });
+        getLog().warn(
+          { workflowRunId: workflowRun.id, captureRoot: recordedSource.root },
+          'workflow.source_config_pinned_from_manifest'
+        );
+      }
     } catch (error) {
       return await failRunOnSource(
         `This run's captured workflow source at ${recordedSource.root} is missing or altered ` +
@@ -2694,11 +2711,11 @@ export async function executeWorkflow(
     // a node should reach by that path. Same filesystem, so this is a rename.
     const finalCaptureRoot = workflowSourceDir;
     try {
-      if (preparedSource.captureRoot !== finalCaptureRoot) {
+      if (preparedSource.anchor.root !== finalCaptureRoot) {
         // Unlike `artifactsDir`, nothing earlier in the run creates this parent.
         await mkdir(dirname(finalCaptureRoot), { recursive: true });
         await rm(finalCaptureRoot, { recursive: true, force: true });
-        await rename(preparedSource.captureRoot, finalCaptureRoot);
+        await rename(preparedSource.anchor.root, finalCaptureRoot);
       }
       // The staged capture is now at the run's own source path — the run owns the
       // bytes from this point on. Adopting here (not earlier, at the call site) is
@@ -2711,16 +2728,15 @@ export async function executeWorkflow(
         `Could not move this run's captured workflow source into place: ${(error as Error).message}`
       );
     }
-    workflowSourceRoots = capturedSourceRoots(
-      finalCaptureRoot,
-      preparedSource.manifest.source_config
-    );
+    const sourceAnchor = { ...preparedSource.anchor, root: finalCaptureRoot };
+    workflowSourceRoots = capturedSourceRoots(sourceAnchor);
     const sourceRecord = {
       version: 1 as const,
       root: finalCaptureRoot,
       origin: preparedSource.origin,
       captured_at: preparedSource.manifest.captured_at,
       digest: preparedSource.manifest.digest,
+      source_config: sourceAnchor.config,
       file_count: preparedSource.manifest.file_count,
       byte_count: preparedSource.manifest.byte_count,
     };

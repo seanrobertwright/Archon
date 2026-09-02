@@ -356,7 +356,6 @@ mock.module('@archon/workflows/executor', () => ({
   prepareWorkflowSource: mock(() =>
     Promise.resolve({
       runId: 'prepared-run-id',
-      captureRoot: '/capture',
       origin: '/origin',
       manifest: {
         version: 1,
@@ -372,17 +371,29 @@ mock.module('@archon/workflows/executor', () => ({
           load_default_commands: true,
         },
       },
+      anchor: {
+        root: '/capture',
+        digest: 'test-digest',
+        config: {
+          load_default_workflows: true,
+          load_default_commands: true,
+        },
+      },
       roots: {
         project: '/capture/project',
         globalWorkflows: '/capture/global/workflows',
         globalCommands: '/capture/global/commands',
         globalScripts: '/capture/global/scripts',
-        bundledWorkflows: '/capture/bundled',
+        bundledWorkflows: '/capture/bundled/workflows',
         bundledCommands: '/capture/bundled/commands/defaults',
         kind: 'captured',
-        config: {
-          load_default_workflows: true,
-          load_default_commands: true,
+        anchor: {
+          root: '/capture',
+          digest: 'test-digest',
+          config: {
+            load_default_workflows: true,
+            load_default_commands: true,
+          },
         },
       },
     })

@@ -12,7 +12,7 @@
  * which does (mock.module is process-global and irreversible).
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll, mock } from 'bun:test';
-import { mkdir, writeFile, rm, cp, readdir } from 'fs/promises';
+import { mkdir, writeFile, rm, cp, readdir, readFile } from 'fs/promises';
 import { removeTempTree } from '@archon/paths/test-utils';
 import { existsSync } from 'fs';
 import { join, sep } from 'path';
@@ -112,6 +112,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 import { executeWorkflow, hydrateResumableRun } from './executor';
+import { captureWorkflowSource, resolveRunSourceCapture } from './workflow-source';
 import { discoverWorkflows } from './workflow-discovery';
 import { validateWorkflowResources } from './validator';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
@@ -630,6 +631,84 @@ describe('workflow: sub-run e2e (#2121 Phase 2)', () => {
     else process.env.ARCHON_HOME = originalArchonHome;
   });
 
+  it("pins a pre-change run's source settings on its row at the first resume", async () => {
+    // A row written before `source_config` lived beside the digest carries only the
+    // digest. The manifest holding the settings is outside that digest, so until they are
+    // pinned any node could rewrite them between resumes without detection.
+    await writeWorkflow(
+      'legacy-resume',
+      `
+name: legacy-resume
+description: resumes a run recorded before source settings were pinned
+nodes:
+  - id: work
+    bash: "echo resumed"
+`
+    );
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const workflow = await discover('legacy-resume');
+    const sourceConfig = {
+      load_default_workflows: false,
+      load_default_commands: false,
+      command_folder: 'team-commands',
+    };
+    const capture = await captureWorkflowSource({
+      sourceRoot: cwd,
+      captureRoot: join(cwd, 'home', 'workflow-source', 'runs', 'legacy'),
+      sourceConfig,
+    });
+    const run = await store.createWorkflowRun({
+      workflow_name: 'legacy-resume',
+      conversation_id: 'conv-db',
+      user_message: 'goal',
+      working_path: cwd,
+    });
+    await store.updateWorkflowRun(run.id, {
+      metadata: {
+        workflow_source: {
+          version: 1,
+          root: capture.anchor.root,
+          origin: cwd,
+          captured_at: capture.manifest.captured_at,
+          digest: capture.manifest.digest,
+          file_count: capture.manifest.file_count,
+          byte_count: capture.manifest.byte_count,
+        },
+      },
+    });
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      workflow,
+      'goal',
+      'conv-db',
+      { preCreatedRun: await store.resumeWorkflowRun(run.id) }
+    );
+    expect(result.success).toBe(true);
+
+    const row = (await store.getWorkflowRun(run.id))!;
+    const record = row.metadata.workflow_source as { source_config?: unknown };
+    expect(record.source_config).toEqual(sourceConfig);
+
+    // The pin holds: the manifest is no longer the authority, so editing it is drift.
+    const manifestPath = join(capture.anchor.root, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as Record<string, unknown>;
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        ...manifest,
+        source_config: { ...sourceConfig, load_default_commands: true },
+      })
+    );
+    await expect(resolveRunSourceCapture(row.metadata)).rejects.toThrow(
+      'different resolution settings'
+    );
+  });
+
   it('runs a gateless child synchronously, threads output + cost + tokens, links parent_run_id', async () => {
     await writeWorkflow(
       'child-plain',
@@ -696,12 +775,17 @@ nodes:
     // Parent completed.
     const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'parent-plain');
     expect(parentRun?.status).toBe('completed');
+    // The parent is a hand-built programmatic definition with no prepared capture.
+    expect(parentRun?.metadata.workflow_source).toBeUndefined();
     // Child row exists, linked to the parent + node.
     const child = [...store.runs.values()].find(r => r.workflow_name === 'child-plain');
     expect(child).toBeDefined();
     expect(child?.parent_run_id).toBe(parentRun?.id);
     expect((child?.metadata as Record<string, unknown>).parent_node_id).toBe('sub');
     expect(child?.status).toBe('completed');
+    expect(
+      (child?.metadata.workflow_source as { source_config?: unknown } | undefined)?.source_config
+    ).toEqual({ load_default_workflows: false, load_default_commands: false });
     // Child persisted its terminal summary + cost for the parent to read back.
     expect((child?.metadata as Record<string, unknown>).summary).toBe('ai-output');
     expect((child?.metadata as Record<string, unknown>).total_cost_usd).toBeCloseTo(0.01, 5);

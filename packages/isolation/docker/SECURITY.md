@@ -61,6 +61,12 @@ apparmor=unconfined` because the kernel `mount -t overlay` needs it. With
   (`isolation.container_artifacts_chown_failed`). The run's frozen workflow source is a
   separate read-only bind, never under `$ARTIFACTS_DIR`.
 
+- **Captured-source integrity is checkpoint detection, not containment.** Archon
+  hashes the host capture against the run's pinned identity before dispatching each
+  capture-backed read. It refuses a mismatch present then, but a same-UID host process
+  can still change files after the check. The check does not cancel parallel nodes,
+  close a check-to-exec race, or make native mode safe against a hostile agent.
+
 - **Running as root.** In-container work runs as root under `IS_SANDBOX=1`.
   Combined with the CAP_SYS_ADMIN of native mode, the in-container root is
   powerful; the boundary is the container + the daemon's own confinement, not the

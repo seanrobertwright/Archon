@@ -293,12 +293,16 @@ const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
   globalWorkflows: '/test/capture/global/workflows',
   globalCommands: '/test/capture/global/commands',
   globalScripts: '/test/capture/global/scripts',
-  bundledWorkflows: '/test/capture/bundled',
+  bundledWorkflows: '/test/capture/bundled/workflows',
   bundledCommands: '/test/capture/bundled/commands/defaults',
   kind: 'captured',
-  config: {
-    load_default_workflows: true,
-    load_default_commands: true,
+  anchor: {
+    root: '/test/capture',
+    digest: 'test-digest',
+    config: {
+      load_default_workflows: true,
+      load_default_commands: true,
+    },
   },
 };
 const mockResolveContinuationWorkflow = mock<typeof WorkflowExecutor.resolveContinuationWorkflow>(
@@ -340,7 +344,6 @@ mock.module('@archon/workflows/executor', () => ({
   prepareWorkflowSource: mock(() =>
     Promise.resolve({
       runId: 'test-run-id',
-      captureRoot: '/test/capture',
       origin: '/test/path',
       manifest: {
         version: 1,
@@ -351,7 +354,12 @@ mock.module('@archon/workflows/executor', () => ({
         file_count: 0,
         byte_count: 0,
         scopes: [],
+        source_config: {
+          load_default_workflows: true,
+          load_default_commands: true,
+        },
       },
+      anchor: CAPTURED_SOURCE_ROOTS.anchor,
       roots: CAPTURED_SOURCE_ROOTS,
     })
   ),
@@ -2263,7 +2271,6 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
     });
     (finalizeWorkflowSource as ReturnType<typeof mock>).mockResolvedValueOnce({
       runId: 'test-run-id',
-      captureRoot: '/test/finalized/workflow-source',
       origin: '/test/path',
       manifest: {
         version: 1,
@@ -2275,12 +2282,30 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
         byte_count: 0,
         scopes: [],
       },
+      anchor: {
+        root: '/test/finalized/workflow-source',
+        digest: 'test-digest',
+        config: {
+          load_default_workflows: true,
+          load_default_commands: true,
+        },
+      },
       roots: {
         project: '/test/finalized/workflow-source/project',
         globalWorkflows: '/test/finalized/workflow-source/global/workflows',
         globalCommands: '/test/finalized/workflow-source/global/commands',
         globalScripts: '/test/finalized/workflow-source/global/scripts',
-        bundledWorkflows: '/test/finalized/workflow-source/bundled',
+        bundledWorkflows: '/test/finalized/workflow-source/bundled/workflows',
+        bundledCommands: '/test/finalized/workflow-source/bundled/commands/defaults',
+        kind: 'captured',
+        anchor: {
+          root: '/test/finalized/workflow-source',
+          digest: 'test-digest',
+          config: {
+            load_default_workflows: true,
+            load_default_commands: true,
+          },
+        },
       },
     });
     mockFolderBackendPrepare.mockRejectedValueOnce(new Error('container unavailable'));

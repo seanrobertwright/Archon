@@ -133,6 +133,7 @@ import {
   type ModelAliasPreset,
   type RawTiersConfig,
 } from './model-validation';
+import { captureWorkflowSource, capturedSourceRoots } from './workflow-source';
 
 function composeScope(
   nodeId = 'fan',
@@ -16604,6 +16605,292 @@ describe('executeDagWorkflow -- script nodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(0);
   });
 
+  it('refuses a captured named script changed by an earlier node without consuming retries', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('script-capture-integrity-run');
+    const scriptsDir = join(testDir, '.archon', 'scripts');
+    const captureRoot = join(testDir, 'capture');
+    const marker = join(testDir, 'changed-script-ran');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(join(scriptsDir, 'check.ts'), 'console.log("original")');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    const capturedScript = join(captureRoot, 'project', '.archon', 'scripts', 'check.ts');
+
+    const nodes: DagNode[] = [
+      {
+        id: 'change-capture',
+        kind: 'exec',
+        runtime: 'bun',
+        script: `Bun.write(${JSON.stringify(capturedScript)}, ${JSON.stringify(
+          `Bun.write(${JSON.stringify(marker)}, "ran")`
+        )})`,
+      },
+      {
+        id: 'run-check',
+        kind: 'exec',
+        runtime: 'bun',
+        script: 'check',
+        depends_on: ['change-capture'],
+        retry: { max_attempts: 3, delay_ms: 0, on_error: 'all' },
+      },
+    ];
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-capture-integrity',
+        cwd: testDir,
+        workflow: { name: 'capture-integrity', nodes },
+        workflowRun,
+        workflowSourceRoots: capturedSourceRoots(capture.anchor),
+      })
+    );
+
+    await expect(readFile(marker, 'utf-8')).rejects.toThrow();
+    const events = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const startedEvents = events.filter(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string; step_name?: string }).event_type === 'node_started' &&
+        (call[0] as { step_name?: string }).step_name === 'run-check'
+    );
+    const failedEvents = events.filter(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string; step_name?: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name?: string }).step_name === 'run-check'
+    );
+    expect(startedEvents).toHaveLength(1);
+    expect(failedEvents).toHaveLength(1);
+    expect((failedEvents[0][0] as { data: { error: string } }).data.error).toContain(
+      'captured source has changed'
+    );
+  });
+
+  it('refuses a replaced capture even when its new manifest is internally consistent', async () => {
+    const mockDeps = createMockDeps();
+    const scriptsDir = join(testDir, '.archon', 'scripts');
+    const captureRoot = join(testDir, 'capture');
+    const marker = join(testDir, 'replacement-script-ran');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(join(scriptsDir, 'check.ts'), 'console.log("original")');
+    const original = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    await writeFile(join(scriptsDir, 'check.ts'), `Bun.write(${JSON.stringify(marker)}, "ran")`);
+    await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        cwd: testDir,
+        workflow: {
+          name: 'replaced-capture',
+          nodes: [{ id: 'run-check', kind: 'exec', runtime: 'bun', script: 'check' }],
+        },
+        workflowRun: makeWorkflowRun('replaced-capture-run'),
+        workflowSourceRoots: capturedSourceRoots(original.anchor),
+      })
+    );
+
+    await expect(readFile(marker, 'utf-8')).rejects.toThrow();
+    const failed = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string; step_name?: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name?: string }).step_name === 'run-check'
+    );
+    expect((failed?.[0] as { data: { error: string } }).data.error).toContain(
+      'capture has been replaced'
+    );
+  });
+
+  it('refuses changed captured command text before an agent receives it', async () => {
+    const mockDeps = createMockDeps();
+    const commandsDir = join(testDir, '.archon', 'commands');
+    const captureRoot = join(testDir, 'capture');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'review.md'), 'original prompt');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    const capturedCommand = join(captureRoot, 'project', '.archon', 'commands', 'review.md');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        cwd: testDir,
+        workflow: {
+          name: 'changed-command',
+          nodes: [
+            {
+              id: 'change-capture',
+              kind: 'exec',
+              runtime: 'bun',
+              script: `Bun.write(${JSON.stringify(capturedCommand)}, "changed prompt")`,
+            },
+            {
+              id: 'read-command',
+              kind: 'agent',
+              source: { kind: 'command', name: 'review' },
+              depends_on: ['change-capture'],
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('changed-command-run'),
+        workflowSourceRoots: capturedSourceRoots(capture.anchor),
+      })
+    );
+
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    const failed = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string; step_name?: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name?: string }).step_name === 'read-command'
+    );
+    expect((failed?.[0] as { data: { error: string } }).data.error).toContain(
+      'captured source has changed'
+    );
+  });
+
+  it('refuses a changed captured loop command before the first iteration', async () => {
+    const mockDeps = createMockDeps();
+    const commandsDir = join(testDir, '.archon', 'commands');
+    const captureRoot = join(testDir, 'capture');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'iterate.md'), 'original loop prompt');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    const capturedCommand = join(captureRoot, 'project', '.archon', 'commands', 'iterate.md');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        cwd: testDir,
+        workflow: {
+          name: 'changed-loop-command',
+          nodes: [
+            {
+              id: 'change-capture',
+              kind: 'exec',
+              runtime: 'bun',
+              script: `Bun.write(${JSON.stringify(capturedCommand)}, "changed loop prompt")`,
+            },
+            {
+              id: 'iterate',
+              kind: 'loop',
+              depends_on: ['change-capture'],
+              loop: {
+                command: 'iterate',
+                until: 'DONE',
+                max_iterations: 1,
+                fresh_context: false,
+              },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('changed-loop-command-run'),
+        workflowSourceRoots: capturedSourceRoots(capture.anchor),
+      })
+    );
+
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    const failed = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string; step_name?: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name?: string }).step_name === 'iterate'
+    );
+    expect((failed?.[0] as { data: { error: string } }).data.error).toContain(
+      'captured source has changed'
+    );
+  });
+
+  it('does not dispatch a named script to a container after the host capture changes', async () => {
+    const dockerSpy = spyOn(git, 'execFileAsync');
+    const scriptsDir = join(testDir, '.archon', 'scripts');
+    const captureRoot = join(testDir, 'capture');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(join(scriptsDir, 'check.ts'), 'console.log("original")');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    await writeFile(
+      join(captureRoot, 'project', '.archon', 'scripts', 'check.ts'),
+      'console.log("changed")'
+    );
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(),
+        cwd: testDir,
+        workflow: {
+          name: 'container-capture-integrity',
+          nodes: [{ id: 'run-check', kind: 'exec', runtime: 'bun', script: 'check' }],
+        },
+        workflowRun: makeWorkflowRun('container-capture-integrity-run'),
+        workflowSourceRoots: capturedSourceRoots(capture.anchor),
+        execContext: { kind: 'container', containerId: 'capture-integrity-container' },
+      })
+    );
+
+    expect(dockerSpy.mock.calls.filter((call: unknown[]) => call[0] === 'docker')).toHaveLength(0);
+  });
+
+  it('disables Python bytecode caching for script subprocesses', async () => {
+    // A named Python script runs from the frozen capture; a `__pycache__` written beside
+    // an imported sibling would change the capture under the run. The flag rides the
+    // same env both inline and named scripts receive, so an inline probe proves delivery.
+    const marker = join(testDir, 'bytecode-flag');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(),
+        cwd: testDir,
+        workflow: {
+          name: 'bytecode-flag',
+          nodes: [
+            {
+              id: 'probe',
+              kind: 'exec',
+              runtime: 'bun',
+              script: `Bun.write(${JSON.stringify(marker)}, process.env.PYTHONDONTWRITEBYTECODE ?? "unset")`,
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('bytecode-flag-run'),
+      })
+    );
+
+    expect(await readFile(marker, 'utf-8')).toBe('1');
+  });
+
+  it('keeps inline scripts in memory even when an unrelated captured file changes', async () => {
+    const scriptsDir = join(testDir, '.archon', 'scripts');
+    const captureRoot = join(testDir, 'capture');
+    const marker = join(testDir, 'inline-script-ran');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(join(scriptsDir, 'unused.ts'), 'console.log("original")');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    await writeFile(
+      join(captureRoot, 'project', '.archon', 'scripts', 'unused.ts'),
+      'console.log("changed")'
+    );
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(),
+        cwd: testDir,
+        workflow: {
+          name: 'inline-script-memory',
+          nodes: [
+            {
+              id: 'inline',
+              kind: 'exec',
+              runtime: 'bun',
+              script: `Bun.write(${JSON.stringify(marker)}, "ran")`,
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('inline-script-memory-run'),
+        workflowSourceRoots: capturedSourceRoots(capture.anchor),
+      })
+    );
+
+    expect(await readFile(marker, 'utf-8')).toBe('ran');
+  });
+
   it('non-zero exit code results in failed state', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
@@ -17387,6 +17674,7 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
       workflowRun?: WorkflowRun;
       declared?: boolean;
       priorCompletedNodes?: Map<string, PersistedNodeOutput>;
+      workflowSourceRoots?: ExecuteDagWorkflowOptions['workflowSourceRoots'];
     } = {}
   ): Promise<void> => {
     await executeDagWorkflow(
@@ -17401,6 +17689,7 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
         },
         workflowRun: options.workflowRun ?? makeWorkflowRun('authored-outcome-run'),
         priorCompletedNodes: options.priorCompletedNodes,
+        workflowSourceRoots: options.workflowSourceRoots,
       })
     );
   };
@@ -17589,6 +17878,42 @@ describe('executeDagWorkflow -- authored run outcome (#2618)', () => {
     });
 
     expect(authoredOutcomeWrites(store)).toEqual(['failed']);
+  });
+
+  it('keeps an earlier outcome when source integrity stops the selected node', async () => {
+    const scriptsDir = join(testDir, '.archon', 'scripts');
+    const captureRoot = join(testDir, 'capture');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(join(scriptsDir, 'result.ts'), 'console.log(\'{"green":false}\')');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    await writeFile(
+      join(captureRoot, 'project', '.archon', 'scripts', 'result.ts'),
+      'console.log(\'{"green":true}\')'
+    );
+    const store = createMockStore();
+    const selectedScript: ExecNode = {
+      id: 'result',
+      kind: 'exec',
+      runtime: 'bun',
+      script: 'result',
+      output_format: {
+        type: 'object',
+        properties: { green: { type: 'boolean' } },
+        required: ['green'],
+      },
+    };
+    const workflowRun = makeWorkflowRun('integrity-existing-outcome', {
+      outcome: 'succeeded',
+    });
+
+    await run(store, [selectedScript], {
+      workflowRun,
+      workflowSourceRoots: capturedSourceRoots(capture.anchor),
+    });
+
+    expect(authoredOutcomeWrites(store)).toEqual([]);
+    expect(workflowRun.outcome).toBe('succeeded');
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
   });
 
   it('leaves undeclared workflows and unreached selected outputs unchanged', async () => {
@@ -17825,13 +18150,26 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
     store: IWorkflowStore;
     platform: IWorkflowPlatform;
     evidencePolicy?: { required: boolean };
+    authoredGreen?: boolean;
     priorCompletedNodes?: Map<string, PersistedNodeOutput>;
     priorUsage?: ExecuteDagWorkflowOptions['priorUsage'];
   }): Promise<void> {
     const mockDeps = createMockDeps(opts.store);
     const workflowRun = makeWorkflowRun('dag-evidence-run');
     const nodes: DagNode[] = [
-      { id: 'work', kind: 'exec', runtime: 'sh', script: 'echo done' } as ExecNode,
+      opts.authoredGreen === undefined
+        ? ({ id: 'work', kind: 'exec', runtime: 'sh', script: 'echo done' } as ExecNode)
+        : ({
+            id: 'work',
+            kind: 'exec',
+            runtime: 'sh',
+            script: `printf '{"green":${String(opts.authoredGreen)}}'`,
+            output_format: {
+              type: 'object',
+              properties: { green: { type: 'boolean' } },
+              required: ['green'],
+            },
+          } as ExecNode),
     ];
 
     await executeDagWorkflow(
@@ -17844,6 +18182,7 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
           name: 'evidence-test',
           nodes,
           ...(opts.evidencePolicy ? { evidence_policy: opts.evidencePolicy } : {}),
+          ...(opts.authoredGreen !== undefined ? { returns: 'work', outcome_field: 'green' } : {}),
         },
         workflowRun,
         artifactsDir,
@@ -17949,11 +18288,14 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
     });
   });
 
-  it('required: true + evidence.json present -> completeWorkflowRun', async () => {
+  it('any evidence.json contents satisfy the file-presence convention', async () => {
     const mockStore = createMockStore();
     const platform = createMockPlatform();
     await mkdir(artifactsDir, { recursive: true });
-    await writeFile(join(artifactsDir, 'evidence.json'), '{"proof": "landed"}');
+    await writeFile(
+      join(artifactsDir, 'evidence.json'),
+      '{"verified":true,"checks":["nothing was run"]}'
+    );
 
     await runEvidenceWorkflow({
       store: mockStore,
@@ -17963,6 +18305,38 @@ describe('executeDagWorkflow -- evidence gate (#2230)', () => {
 
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
     expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  it('authored succeeded coexists with lifecycle failure when the marker is absent', async () => {
+    const mockStore = createMockStore();
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform: createMockPlatform(),
+      evidencePolicy: { required: true },
+      authoredGreen: true,
+    });
+
+    expect(authoredOutcomeWrites(mockStore)).toEqual(['succeeded']);
+    expect(mockStore.failWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockStore.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('authored failed coexists with lifecycle completion when the marker exists', async () => {
+    const mockStore = createMockStore();
+    await mkdir(artifactsDir, { recursive: true });
+    await writeFile(join(artifactsDir, 'evidence.json'), 'self-asserted');
+
+    await runEvidenceWorkflow({
+      store: mockStore,
+      platform: createMockPlatform(),
+      evidencePolicy: { required: true },
+      authoredGreen: false,
+    });
+
+    expect(authoredOutcomeWrites(mockStore)).toEqual(['failed']);
+    expect(mockStore.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockStore.failWorkflowRun).not.toHaveBeenCalled();
   });
 
   it('surfaces a failed completion write', async () => {
@@ -30493,6 +30867,60 @@ describe('executeDagWorkflow -- composed fan-out (include + fan_out, #2512)', ()
     expect(wrapper).toBeDefined();
     expect(wrapper?.data.structured_output).toEqual(['done-a', 'done-b']);
     expect(JSON.parse(String(wrapper?.data.node_output))).toEqual(['done-a', 'done-b']);
+  });
+
+  it('refuses runtime composed fan-out resolution after the capture changes', async () => {
+    await writeBlock(
+      'name: compose-blk\ndescription: original block\nmutates_checkout: false\nnodes:\n  - id: work\n    bash: "echo original"'
+    );
+    const captureRoot = join(testDir, 'capture');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    const capturedBlock = join(captureRoot, 'project', '.archon', 'workflows', 'compose-blk.yaml');
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: {
+          name: 'compose-capture-integrity',
+          nodes: [
+            {
+              id: 'change-capture',
+              kind: 'exec',
+              runtime: 'bun',
+              script: `Bun.write(${JSON.stringify(capturedBlock)}, ${JSON.stringify(
+                'name: compose-blk\ndescription: changed block\nmutates_checkout: false\nnodes:\n  - id: work\n    bash: "echo changed"'
+              )})`,
+            },
+            {
+              id: 'list',
+              kind: 'exec',
+              runtime: 'sh',
+              script: `echo '["a"]'`,
+              depends_on: ['change-capture'],
+            },
+            {
+              id: 'fan',
+              kind: 'compose_fan_out',
+              include: 'compose-blk',
+              depends_on: ['list'],
+              fan_out: { items: '$list.output', as: 'item', max_parallel: 1, join: 'all_done' },
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('compose-capture-integrity-run'),
+        workflowSourceRoots: capturedSourceRoots(capture.anchor),
+      })
+    );
+
+    const events = eventsOf(store);
+    const failed = events.find(
+      event => event.event_type === 'node_failed' && event.step_name === 'fan'
+    );
+    expect(String(failed?.data.error)).toContain('captured source has changed');
+    expect(events.some(event => event.event_type === 'fan_out_instances')).toBe(false);
+    expect(events.some(event => /__work$/.test(event.step_name))).toBe(false);
   });
 
   it('honors a declared non-sink return from every instance', async () => {

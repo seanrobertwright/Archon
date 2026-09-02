@@ -111,17 +111,17 @@ export type WorkflowContainerPolicy = z.infer<typeof workflowContainerPolicySche
 // ---------------------------------------------------------------------------
 
 /**
- * Terminal-success evidence gate. When `required: true`, the DAG executor
+ * Terminal file-presence gate. When `required: true`, the DAG executor
  * refuses to flip the run to `completed` unless `$ARTIFACTS_DIR/evidence.json`
  * exists — a missing file marks the run `failed` with a structured note at
- * `metadata.evidence_validation`. The engine gates ONLY on file presence:
- * producing (and validating the content of) the evidence belongs to the
- * workflow's own bash/script nodes (constitution: code computes, YAML
- * coordinates). Deliberately narrow — no schema validation, no content checks,
- * no configurable path (deferred until the gate sees adoption; see #2230).
+ * `metadata.evidence_validation`. The engine gates only on file presence; any
+ * contents satisfy it, and their presence does not prove that a check ran or
+ * author a workflow outcome. Deterministic checks remain ordinary bash/script
+ * nodes. Deliberately narrow — no schema validation, no content checks, and no
+ * configurable path (see #2230).
  */
 export const workflowEvidencePolicySchema = z.object({
-  /** Refuse terminal `completed` unless `$ARTIFACTS_DIR/evidence.json` exists. */
+  /** Refuse terminal `completed` unless the conventional marker file exists. */
   required: z.boolean(),
 });
 

@@ -145,6 +145,12 @@ Named scripts use one of two resolution modes:
 
 Workflow-local lookup is scoped to the workflow that declared the node, including through `include:` expansion. Authors still write only the bare name (`script: publish`); the ownership key is internal.
 
+A named script is one self-contained file. Declare its dependencies inline (`deps:` for `uv`; Bun resolves imports from its own cache) rather than beside it: no imports of sibling scripts, and no `node_modules` or virtual environment next to the file. Python bytecode caching is disabled for named scripts, so a script cannot write into the capture it runs from.
+
+When a run uses captured source, Archon rechecks the full capture against the run's pinned digest and source-resolution settings before each named-script attempt, including retries, and before lookup or subprocess dispatch. Any change to the capture refuses the node before it starts. Inline scripts are already held in the workflow definition and do not read the capture at execution time.
+
+This is checkpoint detection, not sealing or sandboxing. A process running as the Archon user can change source after the check, and a parallel node that already started is not cancelled.
+
 Each shared scripts directory is walked one subfolder deep (e.g. `.archon/scripts/triage/foo.ts`
 resolves as `foo`). Deeper nesting is ignored. On a same-name collision the
 repo-local entry wins silently — see [Global Workflows](/guides/global-workflows/)

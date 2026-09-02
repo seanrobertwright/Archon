@@ -30,7 +30,12 @@ import type {
 } from './schemas';
 import { isComposeFanOutNode, isIncludeDirective, isLoopGroupNode } from './schemas';
 import * as archonPaths from '@archon/paths';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  assertWorkflowSourceIntegrity,
+  liveSourceRoots,
+  workflowSourceConfigForRoots,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 // Re-exported here because this is the module callers already import to discover with.
 export { liveSourceRoots } from './workflow-source';
 export type { WorkflowSourceRoots } from './workflow-source';
@@ -574,6 +579,7 @@ export async function resolveWorkflowCommandContents(
     readonly nodes: readonly (DagNode | IncludeDirective)[];
   }[]
 ): Promise<Map<string, IncludeCommandContent>> {
+  const sourceConfig = workflowSourceConfigForRoots(roots);
   const contents = new Map<string, IncludeCommandContent>();
   for (const workflow of workflows) {
     for (const commandName of collectFileBackedCommandNames(workflow.nodes)) {
@@ -581,8 +587,8 @@ export async function resolveWorkflowCommandContents(
       contents.set(
         commandName,
         await resolveCommandContentForScan(roots, commandName, {
-          commandFolder: roots.config.command_folder,
-          loadDefaultCommands: roots.config.load_default_commands,
+          commandFolder: sourceConfig.command_folder,
+          loadDefaultCommands: sourceConfig.load_default_commands,
         })
       );
     }
@@ -625,6 +631,7 @@ export async function discoverWorkflows(
   }
 ): Promise<WorkflowLoadResult> {
   const roots = options?.sourceRoots ?? liveSourceRoots(cwd);
+  await assertWorkflowSourceIntegrity(roots);
   const projectRoot = roots.project;
   // Map of filename -> workflow + source + parse warnings, for deduplication.
   // A later scope's `set()` replaces all three together, so a clean project file
@@ -1001,7 +1008,7 @@ export async function discoverWorkflowsWithConfig(
    */
   sourceRoots?: WorkflowSourceRoots
 ): Promise<WorkflowLoadResult> {
-  const sourceConfig = sourceRoots?.config;
+  const sourceConfig = sourceRoots && workflowSourceConfigForRoots(sourceRoots);
   let loadDefaults = sourceConfig?.load_default_workflows ?? true;
   // Command-scan parity: pass the repo's configured command folder + loadDefaultCommands
   // opt-out through so the include safety scan resolves the same command files the

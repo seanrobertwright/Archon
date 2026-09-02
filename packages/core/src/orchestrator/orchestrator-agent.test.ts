@@ -241,18 +241,21 @@ const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
   globalWorkflows: '/capture/global/workflows',
   globalCommands: '/capture/global/commands',
   globalScripts: '/capture/global/scripts',
-  bundledWorkflows: '/capture/bundled',
+  bundledWorkflows: '/capture/bundled/workflows',
   bundledCommands: '/capture/bundled/commands/defaults',
   kind: 'captured',
-  config: {
-    load_default_workflows: true,
-    load_default_commands: true,
+  anchor: {
+    root: '/capture',
+    digest: 'test-digest',
+    config: {
+      load_default_workflows: true,
+      load_default_commands: true,
+    },
   },
 };
 const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSource>(() =>
   Promise.resolve({
     runId: 'prepared-run-id',
-    captureRoot: '/capture',
     origin: '/origin',
     manifest: {
       version: 1,
@@ -268,6 +271,7 @@ const mockPrepareWorkflowSource = mock<typeof WorkflowExecutor.prepareWorkflowSo
         load_default_commands: true,
       },
     },
+    anchor: CAPTURED_SOURCE_ROOTS.anchor,
     roots: CAPTURED_SOURCE_ROOTS,
   })
 );
@@ -2422,7 +2426,6 @@ describe('workflow dispatch routing — interactive flag', () => {
     mockPrepareWorkflowSource.mockImplementationOnce(() =>
       Promise.resolve({
         runId: 'prepared-run-id',
-        captureRoot: '/capture-branch',
         origin: '/wt/from-branch',
         manifest: {
           version: 1,
@@ -2438,17 +2441,29 @@ describe('workflow dispatch routing — interactive flag', () => {
             load_default_commands: true,
           },
         },
+        anchor: {
+          root: '/capture-branch',
+          digest: 'branch-digest',
+          config: {
+            load_default_workflows: true,
+            load_default_commands: true,
+          },
+        },
         roots: {
           project: '/capture-branch/project',
           globalWorkflows: '/capture-branch/global/workflows',
           globalCommands: '/capture-branch/global/commands',
           globalScripts: '/capture-branch/global/scripts',
-          bundledWorkflows: '/capture-branch/bundled',
+          bundledWorkflows: '/capture-branch/bundled/workflows',
           bundledCommands: '/capture-branch/bundled/commands/defaults',
           kind: 'captured',
-          config: {
-            load_default_workflows: true,
-            load_default_commands: true,
+          anchor: {
+            root: '/capture-branch',
+            digest: 'branch-digest',
+            config: {
+              load_default_workflows: true,
+              load_default_commands: true,
+            },
           },
         },
       })
@@ -2907,7 +2922,7 @@ describe('workflow dispatch routing — interactive flag', () => {
       baseBranch?: string;
       preCreatedRun?: unknown;
       priorCompletedNodes?: unknown;
-      preparedSource?: { captureRoot?: string; manifest?: { captured_at?: string } };
+      preparedSource?: { anchor?: { root?: string }; manifest?: { captured_at?: string } };
     };
     expect(opts.parentConversationId).toBe('conv-1-db');
     // The fresh-run-in-same-worktree branch still threads the codebase default.
@@ -2920,7 +2935,7 @@ describe('workflow dispatch routing — interactive flag', () => {
     // was undefined here because the outer `if (!willContinueExistingRun)` block
     // was skipped.
     expect(opts.preparedSource).toBeDefined();
-    expect(opts.preparedSource?.captureRoot).toBe('/capture');
+    expect(opts.preparedSource?.anchor?.root).toBe('/capture');
     expect(opts.preparedSource?.manifest?.captured_at).toBe('2026-08-21T00:00:00.000Z');
   });
 
@@ -3017,7 +3032,6 @@ describe('workflow dispatch routing — interactive flag', () => {
     (prepareWorkflowSource as ReturnType<typeof mock>).mockImplementationOnce(() =>
       Promise.resolve({
         runId: 'prepared-run-id',
-        captureRoot: '/capture',
         origin: '/origin',
         manifest: {
           version: 1,
@@ -3029,12 +3043,16 @@ describe('workflow dispatch routing — interactive flag', () => {
           byte_count: 1,
           scopes: ['project'],
         },
+        anchor: CAPTURED_SOURCE_ROOTS.anchor,
         roots: {
           project: '/capture/project',
           globalWorkflows: '/capture/global/workflows',
           globalCommands: '/capture/global/commands',
           globalScripts: '/capture/global/scripts',
-          bundledWorkflows: '/capture/bundled',
+          bundledWorkflows: '/capture/bundled/workflows',
+          bundledCommands: '/capture/bundled/commands/defaults',
+          kind: 'captured',
+          anchor: CAPTURED_SOURCE_ROOTS.anchor,
         },
       })
     );
