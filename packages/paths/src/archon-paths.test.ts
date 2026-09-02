@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { homedir, tmpdir } from 'os';
-import { join } from 'path';
+import { join, sep } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { mkdir, rm, writeFile, lstat, readlink, symlink as fsSymlink } from 'fs/promises';
 import { removeTempTree } from './test-utils';
@@ -48,6 +48,9 @@ import {
   resolveRunStorageRoot,
   getRunArtifactsDirForKey,
   getRunLogPathForRoot,
+  getRunWorkflowSourceDirForRoot,
+  getRunArtifactsDirForRoot,
+  getStoragePathsForRoot,
   slugifyFolderName,
   getFolderProjectRoot,
   getFolderProjectArtifactsPath,
@@ -676,23 +679,25 @@ describe('archon-paths', () => {
       process.env.ARCHON_HOME = '/custom/archon';
     });
 
-    test('repo key composes all four roots under owner/repo', () => {
+    test('repo key composes every root under owner/repo', () => {
       const root = join('/custom/archon', 'workspaces', 'acme', 'widget');
       expect(getProjectStoragePaths({ kind: 'repo', owner: 'acme', repo: 'widget' })).toEqual({
         root,
         artifactsRoot: join(root, 'artifacts'),
         logsDir: join(root, 'logs'),
         stateRoot: join(root, 'state'),
+        workflowSourceRoot: join(root, 'workflow-source'),
       });
     });
 
-    test('folder key composes all four roots under _folder/<slug>', () => {
+    test('folder key composes every root under _folder/<slug>', () => {
       const root = join('/custom/archon', 'workspaces', '_folder', 'my-ops-folder');
       expect(getProjectStoragePaths({ kind: 'folder', slug: 'my-ops-folder' })).toEqual({
         root,
         artifactsRoot: join(root, 'artifacts'),
         logsDir: join(root, 'logs'),
         stateRoot: join(root, 'state'),
+        workflowSourceRoot: join(root, 'workflow-source'),
       });
     });
 
@@ -704,6 +709,7 @@ describe('archon-paths', () => {
         artifactsRoot: join(root, 'artifacts'),
         logsDir: join(root, 'logs'),
         stateRoot: join(root, 'state'),
+        workflowSourceRoot: join(root, 'workflow-source'),
       });
       // Build both expectations with join() — on Windows the separators differ
       // from the POSIX literals and a hard-coded '/custom/archon' never matches.
@@ -807,6 +813,24 @@ describe('archon-paths', () => {
     test('agrees with the repo-specific helper', () => {
       const root = join('/custom/archon', 'workspaces', 'acme', 'widget');
       expect(getRunLogPath('acme', 'widget', 'run-1')).toBe(getRunLogPathForRoot(root, 'run-1'));
+    });
+  });
+
+  describe('getRunWorkflowSourceDirForRoot', () => {
+    beforeEach(() => {
+      delete process.env.WORKSPACE_PATH;
+      delete process.env.ARCHON_DOCKER;
+      process.env.ARCHON_HOME = '/custom/archon';
+    });
+
+    test('composes a run source path beside, not inside, the run artifacts', () => {
+      const root = join('/custom/archon', 'workspaces', 'acme', 'widget');
+      const source = getRunWorkflowSourceDirForRoot(root, 'run-1');
+      expect(source).toBe(join(root, 'workflow-source', 'runs', 'run-1'));
+      // The failure this guards: a capture placed under `$ARTIFACTS_DIR` is handed to
+      // every node by path and listed as the run's output.
+      expect(source.startsWith(getRunArtifactsDirForRoot(root, 'run-1') + sep)).toBe(false);
+      expect(getStoragePathsForRoot(root).workflowSourceRoot).toBe(join(root, 'workflow-source'));
     });
   });
 

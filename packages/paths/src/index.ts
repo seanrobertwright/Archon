@@ -45,6 +45,7 @@ export {
   getRunArtifactsDirForKey,
   getRunArtifactsDirForRoot,
   getRunLogPathForRoot,
+  getRunWorkflowSourceDirForRoot,
   slugifyFolderName,
   getFolderProjectRoot,
   getFolderProjectArtifactsPath,

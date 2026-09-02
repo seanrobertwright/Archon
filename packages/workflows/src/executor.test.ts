@@ -64,6 +64,7 @@ function fakeStoragePathsForRoot(root: string): {
   artifactsRoot: string;
   logsDir: string;
   stateRoot: string;
+  workflowSourceRoot: string;
 } {
   // join(), not template literals — production composes these with join(), so a
   // forward-slash fake would never match on Windows.
@@ -72,6 +73,7 @@ function fakeStoragePathsForRoot(root: string): {
     artifactsRoot: join(root, 'artifacts'),
     logsDir: join(root, 'logs'),
     stateRoot: join(root, 'state'),
+    workflowSourceRoot: join(root, 'workflow-source'),
   };
 }
 function fakeGetProjectStoragePaths(

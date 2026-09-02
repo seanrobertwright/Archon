@@ -34,7 +34,6 @@ mock.module('@archon/paths', () => ({
 import {
   captureWorkflowSource,
   capturedSourceRoots,
-  getRunSourceCapturePath,
   loadWorkflowSource,
   recordSelectedWorkflow,
   resolveChildDiscoveryRoot,
@@ -90,6 +89,9 @@ async function createSandbox(): Promise<Sandbox> {
   return sandbox;
 }
 
+/** A capture root inside a sandbox run directory. The real layout is the paths package's. */
+const captureRootIn = (runDir: string): string => join(runDir, 'workflow-source');
+
 /**
  * Files captured under one scope.
  *
@@ -127,7 +129,7 @@ describe('captureWorkflowSource', () => {
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     expect(capture.origin).toBe(source);
@@ -151,7 +153,7 @@ describe('captureWorkflowSource', () => {
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     const root2 = capture!.captureRoot;
@@ -168,7 +170,7 @@ describe('captureWorkflowSource', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'original');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'EDITED');
@@ -218,7 +220,7 @@ describe('captureWorkflowSource', () => {
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     const copied = join(capture!.captureRoot, 'project', '.archon', 'commands', 'linked.md');
@@ -238,7 +240,7 @@ describe('captureWorkflowSource', () => {
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     // A packaged script may genuinely import from a sibling `node_modules`, so excluding
@@ -270,7 +272,7 @@ describe('captureWorkflowSource', () => {
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     // Exactly one copy of the one real file — not one per level of re-entry.
@@ -283,7 +285,7 @@ describe('captureWorkflowSource', () => {
     await mkdir(empty, { recursive: true });
     const capture = await captureWorkflowSource({
       sourceRoot: empty,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
     // Still a valid, verifiable capture — a source with no project files is a legitimate
     // run (bundled workflows only), not a reason to leave the run without one.
@@ -297,7 +299,7 @@ describe('captureWorkflowSource', () => {
   test('leaves no usable capture behind when it cannot finish', async () => {
     const { source, runArtifacts } = await createSandbox();
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
-    const captureRoot = getRunSourceCapturePath(runArtifacts);
+    const captureRoot = captureRootIn(runArtifacts);
     // A file where the staging directory must go: the copy fails part-way through.
     await writeFile(`${captureRoot}.partial`, 'in the way');
 
@@ -313,7 +315,7 @@ describe('captureWorkflowSource', () => {
 
   test('replaces a stale capture rather than merging two vintages', async () => {
     const { source, runArtifacts } = await createSandbox();
-    const captureRoot = getRunSourceCapturePath(runArtifacts);
+    const captureRoot = captureRootIn(runArtifacts);
     await writeFile(join(source, '.archon', 'commands', 'gone.md'), 'old');
     await captureWorkflowSource({ sourceRoot: source, captureRoot });
 
@@ -337,7 +339,7 @@ describe('resolving against a capture instead of the target', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'from authoring');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     // Without a source root the target is searched, and the target never had it.
@@ -362,7 +364,7 @@ describe('resolving against a capture instead of the target', () => {
     );
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     const result = await loadCommandPrompt(
@@ -380,7 +382,7 @@ describe('resolving against a capture instead of the target', () => {
     await writeFile(join(source, '.archon', 'scripts', 'check.ts'), 'console.log(1)');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     expect((await discoverScriptsForCwd(target)).get('check')).toBeUndefined();
@@ -408,7 +410,7 @@ describe('resolving against a capture instead of the target', () => {
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
     const result = await loadCommandPrompt(
       deps,
@@ -440,7 +442,7 @@ describe("a run's own source versus a child's discovery root", () => {
     await writeFile(join(source, '.archon', 'commands', 'c.md'), 'x');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
     const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
 
@@ -455,7 +457,7 @@ describe("a run's own source versus a child's discovery root", () => {
     await writeFile(join(source, '.archon', 'commands', 'c.md'), 'x');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
     const metadata = recorded(capture!.captureRoot, source, capture!.manifest.digest);
 
@@ -514,7 +516,7 @@ describe('the capture is authoritative, not advisory', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'original');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     // An edit UNDER the artifacts tree: a directory-exists check cannot see this, which
@@ -533,7 +535,7 @@ describe('the capture is authoritative, not advisory', () => {
     const { source, runArtifacts } = await createSandbox();
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
     const metadata = {
       [WORKFLOW_SOURCE_METADATA_KEY]: {
@@ -558,7 +560,7 @@ describe('the capture is authoritative, not advisory', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
     // A project workflow can `include:` a global or bundled one, so leaving those live
     // would let an included workflow change shape across a resume.
@@ -578,7 +580,7 @@ describe('the capture is authoritative, not advisory', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
     });
 
     await recordSelectedWorkflow(capture.captureRoot, 'chosen-flow');
@@ -600,7 +602,7 @@ describe("the source's own settings travel with its bytes", () => {
 
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
       commandFolder: 'team-commands',
       sourceConfig: {
         load_default_workflows: true,
@@ -629,7 +631,7 @@ describe("the source's own settings travel with its bytes", () => {
     await writeFile(join(source, 'team-commands', 'shipit.md'), 'ship it');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
       commandFolder: 'team-commands',
     });
 
@@ -655,7 +657,7 @@ describe('continuing a run resolves with the settings it froze', () => {
     await writeFile(join(source, 'team-commands', 'shipit.md'), 'ship it');
     const capture = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: getRunSourceCapturePath(runArtifacts),
+      captureRoot: captureRootIn(runArtifacts),
       commandFolder: 'team-commands',
       sourceConfig: {
         load_default_workflows: true,

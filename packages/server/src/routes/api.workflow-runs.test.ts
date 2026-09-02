@@ -232,12 +232,14 @@ function storagePathsForRootFake(root: string): {
   artifactsRoot: string;
   logsDir: string;
   stateRoot: string;
+  workflowSourceRoot: string;
 } {
   return {
     root,
     artifactsRoot: join(root, 'artifacts'),
     logsDir: join(root, 'logs'),
     stateRoot: join(root, 'state'),
+    workflowSourceRoot: join(root, 'workflow-source'),
   };
 }
 

@@ -704,11 +704,6 @@ export async function loadWorkflowSource(
   return { captureRoot, origin: manifest.origin, manifest };
 }
 
-/** Canonical location of a run's captured source, under that run's artifacts. */
-export function getRunSourceCapturePath(artifactsDir: string): string {
-  return join(artifactsDir, 'workflow-source');
-}
-
 /**
  * The verified capture a run recorded at start, manifest included.
  *

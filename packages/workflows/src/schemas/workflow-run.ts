@@ -434,7 +434,7 @@ export const workflowSourceMetadataSchema = z.object({
    * Absolute path to the captured source; usable directly as a project root.
    *
    * Absoluteness is enforced rather than assumed: every root reaching here is built from
-   * the run's own artifacts path, so a relative or blank one means the record is corrupt
+   * the run's own workspace path, so a relative or blank one means the record is corrupt
    * or foreign. Resolving it against whatever `process.cwd()` happens to be would send
    * every command and script lookup somewhere arbitrary, so it reads as absent instead
    * and the run falls back to live source with a warning.
