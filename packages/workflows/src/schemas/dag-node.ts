@@ -358,7 +358,9 @@ export type AgentNode = z.infer<typeof agentNodeSchema>;
  * `runtime: 'sh'`; `deps`/`with` are only ever populated by the transform for a
  * `script:` input (a `bash:` input never sets them, matching today's `BashNode`
  * behavior — see `dagNodeSchema`'s transform).
- * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
+ * AI-specific fields from the base are present in the type but ignored at runtime with a
+ * warning — except `output_format`, which the transform keeps and the executor enforces
+ * against the node's own stdout (#2453).
  *
  * The EXECUTOR deliberately did not follow this collapse: `executeBashNode`/
  * `executeScriptNode` in dag-executor.ts stay two separate functions rather than
@@ -962,12 +964,18 @@ export type DagNode =
 // AI-specific fields that are meaningless on non-AI nodes
 // ---------------------------------------------------------------------------
 
-/** AI-specific fields that are meaningless on bash nodes — exported for loader warnings */
+/**
+ * AI-specific fields that are meaningless on bash nodes — exported for loader warnings.
+ *
+ * `output_format` is deliberately ABSENT since #2453: an exec node that declares one
+ * certifies its own stdout (strict JSON + the shared ajv gate), so the field is enforced
+ * rather than warned-and-dropped. The three lists below that derive from this one and
+ * have no execution site for a schema re-add it explicitly.
+ */
 export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'provider',
   'model',
   'context',
-  'output_format',
   'allowed_tools',
   'denied_tools',
   'hooks',
@@ -998,12 +1006,11 @@ export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
  * a `loop:` node makes its own sendQuery, so the schema reaches the provider, each
  * iteration's payload is validated against it, and `loop.until_field` can terminate
  * on a declared boolean. It stays listed for `loop_group`, which never calls
- * sendQuery — its body nodes carry their own.
+ * sendQuery — its body nodes carry their own. (Since #2453 `output_format` is no
+ * longer in the base list either, so nothing has to be filtered out here for it.)
  */
 export const LOOP_NODE_AI_FIELDS: readonly string[] = [
-  ...BASH_NODE_AI_FIELDS.filter(
-    f => f !== 'model' && f !== 'provider' && f !== 'pi' && f !== 'output_format'
-  ),
+  ...BASH_NODE_AI_FIELDS.filter(f => f !== 'model' && f !== 'provider' && f !== 'pi'),
   // The tree-integrity assertion (#2771) is enforced only on exec/agent nodes; on a
   // loop it would have to cover every iteration's body, which no execution path does.
   'mutates_checkout',
@@ -1018,6 +1025,10 @@ export const LOOP_NODE_AI_FIELDS: readonly string[] = [
  */
 export const LOOP_GROUP_NODE_AI_FIELDS: readonly string[] = [
   ...BASH_NODE_AI_FIELDS.filter(f => f !== 'model' && f !== 'provider'),
+  // Still inert here after #2453 made it live on exec nodes: a group never calls
+  // sendQuery and never certifies a payload of its own — its output is the last
+  // iteration's raw text — so a schema declared on the group governs nothing.
+  'output_format',
   // Same as `loop:` above — body-node enforcement is the only real coverage.
   'mutates_checkout',
 ];
@@ -1029,12 +1040,19 @@ export const LOOP_GROUP_NODE_AI_FIELDS: readonly string[] = [
  */
 export const GATE_AND_HALT_IGNORED_FIELDS: readonly string[] = [
   ...BASH_NODE_AI_FIELDS,
+  // Still inert after #2453: a gate/halt produces no payload to certify.
+  'output_format',
   'mutates_checkout',
 ];
 
-/** Fields a wait cannot consume; its output contract and lifecycle are engine-owned. */
+/**
+ * Fields a wait cannot consume; its output contract and lifecycle are engine-owned.
+ * `output_format` is absent because a wait node REJECTS it outright (the schema's
+ * superRefine: the engine fixes the wait's own `{ status, waited_ms, … }` contract),
+ * so it never reaches this warn set.
+ */
 export const WAIT_NODE_IGNORED_FIELDS: readonly string[] = [
-  ...BASH_NODE_AI_FIELDS.filter(field => field !== 'output_format'),
+  ...BASH_NODE_AI_FIELDS,
   'idle_timeout',
   // The tree-integrity assertion is enforced only on exec/agent nodes (#2771); a
   // wait's lifecycle is engine-owned and touches no checkout-scoped payload.
@@ -1051,6 +1069,9 @@ export const WAIT_NODE_IGNORED_FIELDS: readonly string[] = [
  */
 export const INCLUDE_NODE_IGNORED_FIELDS: readonly string[] = [
   ...BASH_NODE_AI_FIELDS,
+  // Still inert after #2453: an include has no execution site, and the transform
+  // drops the field — the included workflow's selected node owns the contract.
+  'output_format',
   'retry',
   'output_type',
   'always_run',
@@ -1775,6 +1796,12 @@ export const dagNodeSchema = z
         ...shared,
         kind: 'exec',
         ...resolveBashExecAuthoring(bashExecAuthoringSchema.parse(data)),
+        // Kept for the same reason as on a `loop:` node: since #2453 an exec node with a
+        // declared schema certifies its OWN stdout — strict JSON, the shared ajv gate,
+        // then canonical text plus the logical value — so the schema must survive the
+        // transform to reach `certifyExecOutput`. It is a base field, not exec authoring,
+        // which is why it rides beside the resolved authoring rather than inside it.
+        ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
       } satisfies ExecNode;
     }
     if (data.script !== undefined && data.script.trim().length > 0) {
@@ -1783,6 +1810,8 @@ export const dagNodeSchema = z
         ...shared,
         kind: 'exec',
         ...resolveScriptExecAuthoring(scriptExecAuthoringSchema.parse(data)),
+        // Same as the bash branch above (#2453) — the node certifies its own stdout.
+        ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
       } satisfies ExecNode;
     }
     if (data.approval !== undefined) {
@@ -1979,6 +2008,43 @@ export function isWorkflowNode(node: DagNode): node is WorkflowNode {
  * than an executable `DagNode`. Normalized includes have their own discriminant even
  * though they are not executable `DagNode`s (#2486).
  */
+/**
+ * Which AI-level fields a node kind accepts in YAML but ignores at runtime, with the
+ * label the loader's warning uses. The one mapping from node kind to its ignored-field
+ * list, so the load-time warning and {@link isOutputFormatEnforced} cannot disagree.
+ * Agent nodes have no such list: every AI field is live there.
+ */
+export function ignoredFieldsForNode(
+  node: DagNode | IncludeDirective
+): { type: string; fields: readonly string[] } | undefined {
+  if (isIncludeDirective(node)) return { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
+  // Same execution-less posture as a static include: the composed body's own nodes
+  // carry their config, so AI-level fields declared here are ignored (#2512).
+  if (isComposeFanOutNode(node)) return { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
+  if (isHaltNode(node)) return { type: 'cancel', fields: GATE_AND_HALT_IGNORED_FIELDS };
+  if (isWorkflowNode(node)) return { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
+  if (isGateNode(node)) return { type: 'approval', fields: GATE_AND_HALT_IGNORED_FIELDS };
+  if (isWaitNode(node)) return { type: 'wait', fields: WAIT_NODE_IGNORED_FIELDS };
+  if (isLoopNode(node)) return { type: 'loop', fields: LOOP_NODE_AI_FIELDS };
+  if (isLoopGroupNode(node)) return { type: 'loop_group', fields: LOOP_GROUP_NODE_AI_FIELDS };
+  if (isExecNode(node)) {
+    return { type: node.runtime === 'sh' ? 'bash' : 'script', fields: BASH_NODE_AI_FIELDS };
+  }
+  return undefined;
+}
+
+/**
+ * Whether the engine enforces this node's `output_format` against its output. Derived
+ * from the ignored-field lists rather than enumerated again: a kind whose list names
+ * the field (loop_group, gate, halt, include, composed fan-out) is inert, everything
+ * else (agent, exec, `loop:`, `workflow:`) certifies or validates against it. The
+ * load-time compile gate and the resource validator both read this, so a schema is
+ * rejected at load exactly where a broken one would later fail a node.
+ */
+export function isOutputFormatEnforced(node: DagNode | IncludeDirective): boolean {
+  return !ignoredFieldsForNode(node)?.fields.includes('output_format');
+}
+
 export function isIncludeDirective(node: DagNode | IncludeDirective): node is IncludeDirective {
   const candidate = node as { kind?: unknown; include?: unknown };
   return (

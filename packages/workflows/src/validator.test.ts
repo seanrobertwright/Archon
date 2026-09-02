@@ -1487,3 +1487,66 @@ describe('validateWorkflowResources — skills search roots', () => {
     expect(missingSkillIssues(issues)).toHaveLength(1);
   });
 });
+
+// =============================================================================
+// validateWorkflowResources — declared contract compiles (#2453)
+// =============================================================================
+
+describe('validateWorkflowResources — output_format compiles', () => {
+  test('no issue for the inert output_format on a loop_group itself', async () => {
+    // The loader and this pass must agree: a group's own schema governs nothing, so a
+    // dangling $ref there is not a contract failure here either.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'group',
+        kind: 'loop_group',
+        output_format: { type: 'object', properties: { done: { $ref: '#/$defs/missing' } } },
+        loop_group: {
+          until_bash: 'exit 0',
+          max_iterations: 1,
+          nodes: [{ id: 'work', kind: 'exec', runtime: 'sh', script: 'echo done' }],
+        },
+      } as unknown as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+
+    expect(issues.filter(i => i.field === 'output_format')).toHaveLength(0);
+  });
+
+  test('error when a declared output_format cannot be compiled', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'plan',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'emit the plan result' },
+        output_format: { type: 'object', properties: { ready: { $ref: '#/$defs/missing' } } },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const errors = issues.filter(i => i.field === 'output_format');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].level).toBe('error');
+    expect(errors[0].nodeId).toBe('plan');
+    expect(errors[0].message).toContain('cannot be compiled');
+  });
+
+  test('no issue for a compilable schema', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'plan',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'emit the plan result' },
+        output_format: {
+          type: 'object',
+          properties: { ready: { type: 'boolean' } },
+          required: ['ready'],
+        },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(issues.filter(i => i.field === 'output_format')).toHaveLength(0);
+  });
+});

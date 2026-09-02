@@ -12817,6 +12817,62 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     }
   });
 
+  it('loop output_format that ajv cannot compile fails the iteration (#2453)', async () => {
+    // Same contract as the ordinary AI gate: an unenforceable schema is a failure,
+    // not a warning that lets the iteration payload through unchecked.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: '{"done":true}' };
+      yield { type: 'result', sessionId: 's', structuredOutput: { done: true } };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflowRun,
+        workflow: {
+          name: 'loop-uncompilable-schema',
+          nodes: [
+            {
+              id: 'implement',
+              kind: 'loop',
+              output_format: {
+                type: 'object',
+                properties: { done: { type: 'boolean' }, detail: { $ref: '#/$defs/missing' } },
+                required: ['done'],
+              },
+              loop: {
+                fresh_context: false,
+                prompt: 'Implement the change.',
+                max_iterations: 2,
+                until_field: 'done',
+              },
+            },
+          ],
+        },
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_failed' &&
+        (call[0] as Record<string, unknown>).step_name === 'implement'
+    );
+    expect(failed).toBeDefined();
+    expect(
+      String(((failed![0] as Record<string, unknown>).data as Record<string, unknown>).error)
+    ).toContain('output_format schema cannot be compiled');
+    // One iteration only: an unenforceable contract does not get retried.
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+  });
+
   it('output_format set but provider returns no structured output → node_failed (Task 8 fail-fast)', async () => {
     // Provider replied with prose only; no structuredOutput on the result chunk.
     mockSendQueryDag.mockImplementation(async function* () {
@@ -12909,6 +12965,60 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     const errMsg = ((failed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
       .error as string;
     expect(errMsg).toContain('failed schema validation');
+  });
+
+  it('output_format that ajv cannot compile → node_failed, never an unenforced pass (#2453)', async () => {
+    // The provider returned a perfectly shaped object. It still fails: the schema
+    // is uncompilable, so "valid" here would only mean nothing was checked. The
+    // loader rejects this file up front — this gate covers a definition that
+    // reached the executor without it.
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: '{"verdict":"ship"}' };
+      yield { type: 'result', sessionId: 's', structuredOutput: { verdict: 'ship' } };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflowRun,
+        workflow: {
+          name: 'outfmt-uncompilable',
+          nodes: [
+            {
+              id: 'classify',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'classify it' },
+              output_format: {
+                type: 'object',
+                properties: { verdict: { $ref: '#/$defs/missing' } },
+              },
+              retry: { max_attempts: 0 },
+            },
+          ],
+        },
+      })
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const eventTypes = eventCalls.map(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type
+    );
+    expect(eventTypes).not.toContain('node_completed');
+    const failed = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(failed.length).toBeGreaterThan(0);
+    const errMsg = ((failed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
+      .error as string;
+    expect(errMsg).toContain("Node 'classify'");
+    expect(errMsg).toContain('output_format schema cannot be compiled');
   });
 
   it('when: referencing a field not in the producer schema FAILS the node (not a silent skip)', async () => {
@@ -27430,18 +27540,27 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
       expect(eventTypes(store)).not.toContain('node_failed');
     });
 
-    it('warns instead of failing on an uncompilable schema', async () => {
+    it('fails the node on an uncompilable schema (#2453)', async () => {
+      // The loader rejects this schema before a run starts; reaching the boundary
+      // means the definition bypassed it, and a contract nobody can enforce must
+      // not certify the child's value by doing nothing.
       const store = setupCompletedChild({ summary_value: { verdict: 'SHIP' } });
 
-      const platform = await runSubNode(store, {
+      await runSubNode(store, {
         type: 'object',
         properties: { verdict: { $ref: '#/definitions/missing' } },
       });
 
-      expect(eventTypes(store)).toContain('node_completed');
-      expect(eventTypes(store)).not.toContain('node_failed');
-      const sent = platform.sendMessage.mock.calls.map(([, message]) => message);
-      expect(sent.some(m => m.includes('could not be compiled'))).toBe(true);
+      expect(eventTypes(store)).toContain('node_failed');
+      expect(eventTypes(store)).not.toContain('node_completed');
+      const failed = (
+        store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
+      ).mock.calls
+        .map((c: unknown[]) => c[0] as { event_type: string; data: { error: string } })
+        .filter(c => c.event_type === 'node_failed');
+      expect(failed.length).toBeGreaterThan(0);
+      expect(failed[0].data.error).toContain("Node 'sub'");
+      expect(failed[0].data.error).toContain('output_format schema cannot be compiled');
     });
   });
 
@@ -29576,6 +29695,319 @@ describe('value transport (#2637): persistence, resume, and node-local bindings'
       .join('\n');
     expect(sent).toContain("node 'corrections'");
     expect(sent).toContain('failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2453 — a deterministic producer owns its result contract. A bash/script node
+// that declares output_format parses its stdout as strict JSON, validates it
+// through the shared ajv gate, and emits the same logical + text + declared-field
+// triple an AI producer emits. A schemaless exec node is untouched.
+// ---------------------------------------------------------------------------
+
+describe('exec result contracts (#2453)', () => {
+  let testDir: string;
+
+  type PersistedEvent = {
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  };
+
+  const RESULT = { ready: true, units: ['a', 'b'] };
+  const RESULT_SCHEMA = {
+    type: 'object',
+    properties: { ready: { type: 'boolean' }, units: { type: 'array' } },
+    required: ['ready', 'units'],
+  };
+  const RESULT_JSON = JSON.stringify(RESULT);
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-exec-contract-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    await removeTempTree(testDir);
+  });
+
+  /** Captures every consumer prompt so the downstream view of the certified value is observable. */
+  function captureConsumerPrompts(into: string[]): void {
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      into.push(prompt);
+      yield { type: 'assistant', content: 'consumer done' };
+      yield { type: 'result', sessionId: 'sid-cons' };
+    });
+  }
+
+  async function runDag(
+    workflow: WorkflowDefinition,
+    runId: string,
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>
+  ): Promise<PersistedEvent[]> {
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        conversationId: 'conv-2453',
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun(runId),
+        ...(priorCompletedNodes !== undefined ? { priorCompletedNodes } : {}),
+      })
+    );
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+  }
+
+  /** producer (bash or script, emitting `stdout`) → consumer prompt reading `refs`. */
+  function contractWorkflow(
+    producer: Record<string, unknown>,
+    refs = 'ready=[$producer.output.ready] units=[$producer.output.units] whole=[$producer.output]'
+  ): WorkflowDefinition {
+    return {
+      name: 'exec-contract',
+      description: 'a deterministic producer certifying its own result',
+      nodes: [
+        dagNodeSchema.parse({ id: 'producer', output_format: RESULT_SCHEMA, ...producer }),
+        dagNodeSchema.parse({ id: 'consumer', prompt: refs, depends_on: ['producer'] }),
+      ],
+    };
+  }
+
+  // Single-quoted so the JSON's double quotes reach printf untouched; no fixture below
+  // contains a single quote.
+  const bashEmitting = (stdout: string): Record<string, unknown> => ({
+    bash: `printf '%s' '${stdout}'`,
+  });
+  const scriptEmitting = (stdout: string): Record<string, unknown> => ({
+    runtime: 'bun',
+    script: `process.stdout.write(${JSON.stringify(stdout)});`,
+  });
+
+  const producerCompletion = (events: PersistedEvent[]): PersistedEvent | undefined =>
+    events.find(e => e.event_type === 'node_completed' && e.step_name === 'producer');
+  const producerFailure = (events: PersistedEvent[]): PersistedEvent | undefined =>
+    events.find(e => e.event_type === 'node_failed' && e.step_name === 'producer');
+
+  it.each([
+    ['bash', bashEmitting],
+    ['script', scriptEmitting],
+  ] as const)(
+    'a %s node certifies its stdout: canonical text, logical value, and strict field access',
+    async (kind, emitting) => {
+      const prompts: string[] = [];
+      captureConsumerPrompts(prompts);
+
+      // Padding whitespace proves the certified text is the canonical document, not raw stdout.
+      const events = await runDag(
+        contractWorkflow(emitting(`  ${RESULT_JSON}  `)),
+        `contract-fresh-${kind}`
+      );
+
+      const completed = producerCompletion(events);
+      expect(completed?.data?.structured_output).toEqual(RESULT);
+      expect(String(completed?.data?.node_output)).toBe(RESULT_JSON);
+      expect(prompts).toEqual([`ready=[true] units=[["a","b"]] whole=[${RESULT_JSON}]`]);
+    }
+  );
+
+  it.each([
+    ['bash', bashEmitting],
+    ['script', scriptEmitting],
+  ] as const)('a %s node emitting non-JSON stdout fails the node', async (kind, emitting) => {
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+
+    const events = await runDag(
+      contractWorkflow(emitting('not json at all')),
+      `contract-nonjson-${kind}`
+    );
+
+    const failed = producerFailure(events);
+    expect(producerCompletion(events)).toBeUndefined();
+    const error = String((failed?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain("node 'producer'");
+    expect(error).toContain('must be a single JSON document');
+    expect(error).toContain('not json at all');
+    // The consumer depends on a failed producer, so it never runs.
+    expect(prompts).toEqual([]);
+  });
+
+  it.each([
+    ['bash', bashEmitting],
+    ['script', scriptEmitting],
+  ] as const)('a %s node whose JSON misses the schema fails the node', async (kind, emitting) => {
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+
+    const events = await runDag(
+      contractWorkflow(emitting('{"ready":"yes"}')),
+      `contract-mismatch-${kind}`
+    );
+
+    expect(producerCompletion(events)).toBeUndefined();
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('did not satisfy its declared output_format');
+    // Both ajv failures are named: the wrong type AND the missing required field.
+    expect(error).toContain('/ready');
+    expect(error).toContain('units');
+    expect(prompts).toEqual([]);
+  });
+
+  it('a stdout excerpt that mentions a timeout is still reported as a contract failure', async () => {
+    // The exec catch reads `err.message.includes('timed out')` to detect a killed
+    // subprocess; a contract failure quotes stdout back, so it must not be misread.
+    const events = await runDag(
+      contractWorkflow(bashEmitting('the job timed out')),
+      'contract-timeout-lookalike'
+    );
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('must be a single JSON document');
+    expect(error).not.toContain('timed out after');
+  });
+
+  it('a contract failure is never retried, even under on_error: all', async () => {
+    // The failure text quotes stdout, and stdout is whatever the script printed, so the
+    // retry loop must not classify it: a transient-looking excerpt would re-run a script
+    // whose stdout is deterministically wrong. The producer says so in the type instead.
+    const attempts = join(testDir, 'contract-attempts.log').replace(/\\/g, '/');
+    const events = await runDag(
+      contractWorkflow({
+        bash: `printf 'a' >> '${attempts}'; printf '%s' 'rate limit exceeded, timed out'`,
+        // delay_ms sits at the schema minimum; it never elapses because no retry happens.
+        retry: { max_attempts: 2, delay_ms: 1000, on_error: 'all' },
+      }),
+      'contract-no-retry'
+    );
+
+    expect(producerCompletion(events)).toBeUndefined();
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('must be a single JSON document');
+    // on_error: all with max_attempts: 2 would otherwise run three times.
+    expect((await readFile(attempts, 'utf8')).length).toBe(1);
+  });
+
+  it('a contract failure quotes stdout with credentials redacted', async () => {
+    // The preview lands in node_failed.data.error, the one place a contract failure copies
+    // stdout verbatim. It must redact against the same set the subprocess runner resolved.
+    const secret = 'contract-preview-secret-value';
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflowRun: makeWorkflowRun('contract-redaction'),
+        workflow: {
+          name: 'contract-redaction',
+          nodes: [
+            dagNodeSchema.parse({
+              id: 'producer',
+              output_format: RESULT_SCHEMA,
+              bash: `printf '%s' 'token=${secret} and more text'`,
+            }),
+          ],
+        },
+        config: { ...minimalConfig, protectedCredentialValues: [secret] },
+      })
+    );
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('must be a single JSON document');
+    expect(error).toContain('[REDACTED]');
+    expect(error).not.toContain(secret);
+  });
+
+  it('a certified exec value survives cold resume identically', async () => {
+    const freshPrompts: string[] = [];
+    captureConsumerPrompts(freshPrompts);
+    const fresh = await runDag(
+      contractWorkflow(bashEmitting(RESULT_JSON)),
+      'contract-resume-fresh'
+    );
+    const completed = producerCompletion(fresh);
+
+    const resumedPrompts: string[] = [];
+    captureConsumerPrompts(resumedPrompts);
+    const resumed = await runDag(
+      contractWorkflow(bashEmitting(RESULT_JSON)),
+      'contract-resume-resumed',
+      new Map<string, PersistedNodeOutput>([
+        [
+          'producer',
+          {
+            output: String(completed?.data?.node_output),
+            structuredOutput: completed?.data?.structured_output,
+          },
+        ],
+      ])
+    );
+
+    expect(resumedPrompts).toEqual(freshPrompts);
+    // The re-emit copies the logical value forward so a SECOND resume still sees it.
+    const replayed = resumed.find(e => e.event_type === 'node_skipped_prior_success');
+    expect(replayed?.data?.structured_output).toEqual(RESULT);
+  });
+
+  it('a resumed contracted producer still rejects a field it never declared', async () => {
+    // declaredFields is re-derived from the loaded definition on resume, so the typo
+    // strictness a live run has must not degrade to the lenient schemaless branch.
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+    const events = await runDag(
+      contractWorkflow(bashEmitting(RESULT_JSON), 'typo=[$producer.output.redy]'),
+      'contract-resume-typo',
+      new Map<string, PersistedNodeOutput>([
+        ['producer', { output: RESULT_JSON, structuredOutput: RESULT }],
+      ])
+    );
+
+    const consumerFailed = events.find(
+      e => e.event_type === 'node_failed' && e.step_name === 'consumer'
+    );
+    expect(String((consumerFailed?.data as { error?: string } | undefined)?.error)).toContain(
+      'redy'
+    );
+    expect(prompts).toEqual([]);
+  });
+
+  it('a schemaless exec node still returns raw text and persists no logical value', async () => {
+    const prompts: string[] = [];
+    captureConsumerPrompts(prompts);
+
+    const events = await runDag(
+      {
+        name: 'exec-schemaless',
+        description: 'no declared contract, byte-identical behavior',
+        nodes: [
+          dagNodeSchema.parse({ id: 'producer', bash: "printf '%s' '  not json  '" }),
+          dagNodeSchema.parse({
+            id: 'consumer',
+            prompt: 'raw=[$producer.output]',
+            depends_on: ['producer'],
+          }),
+        ],
+      },
+      'contract-schemaless'
+    );
+
+    const completed = producerCompletion(events);
+    expect(completed?.data?.structured_output).toBeUndefined();
+    expect(String(completed?.data?.node_output)).toBe('  not json  ');
+    expect(prompts).toEqual(['raw=[  not json  ]']);
   });
 });
 

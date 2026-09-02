@@ -1101,6 +1101,12 @@ function shouldRetryNodeFailure(
   if (output.state !== 'failed') {
     return { shouldRetry: false, isTransient: false };
   }
+  // A producer that diagnosed its own output (an exec contract failure, #2453) says so
+  // in the type; its error text quotes stdout, so classifying that text would let a
+  // transient-looking excerpt re-run a script whose stdout is deterministically wrong.
+  if (output.retryable === false) {
+    return { shouldRetry: false, isTransient: false };
+  }
   const errorType = output.error ? classifyError(new Error(output.error)) : undefined;
   const isFatal = errorType === 'FATAL';
   const isTransient = errorType === 'TRANSIENT';
@@ -2978,7 +2984,10 @@ async function executeNodeInternal(
       if (structuredOutput !== undefined) {
         // Validate against the declared schema for EVERY provider — SDK-enforced
         // ones still bypass grammar-constrained decoding on a refusal / max_tokens
-        // truncation. Fail-SAFE on an uncompilable schema, but surface it.
+        // truncation. An uncompilable schema FAILS the node (#2453): the loader
+        // compiles every declared `output_format`, so reaching this branch means a
+        // definition bypassed the loader — continuing would let a declared contract
+        // cross the boundary unenforced, after the turn was already paid for.
         let schemaCompileError: string | undefined;
         const validation = validateStructuredOutput(
           structuredOutput,
@@ -2992,11 +3001,8 @@ async function executeNodeInternal(
             { nodeId: node.id, workflowRunId: workflowRun.id, compileMsg: schemaCompileError },
             'dag.structured_output_schema_uncompilable'
           );
-          await safeSendMessage(
-            platform,
-            conversationId,
-            `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so the structured output was NOT validated against it. Fix the schema to enforce it.`,
-            nodeContext
+          throw new Error(
+            `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), so its declared contract cannot be enforced. Fix the schema.`
           );
         }
         if (validation.valid) {
@@ -3379,7 +3385,7 @@ async function runSubprocess(
     protectedCredentialValues?: readonly string[];
     retention: SubprocessRetention;
   }
-): Promise<{ stdout: string; stderr: string }> {
+): Promise<{ stdout: string; stderr: string; credentialValues: readonly string[] }> {
   const subprocessEnv =
     execContext.kind === 'container' ? options.env : { ...process.env, ...options.env };
   // Both outcomes redact against the same values, so the credential set is resolved
@@ -3422,7 +3428,9 @@ async function runSubprocess(
       stderrTail: retainStreamTail(redactedStderr),
       exitCode: 0,
     });
-    return { stdout: result.stdout, stderr: redactedStderr };
+    // `credentialValues` rides along so a caller that quotes stdout back (a contract
+    // failure's preview) redacts against exactly this set rather than resolving its own.
+    return { stdout: result.stdout, stderr: redactedStderr, credentialValues };
   } catch (err) {
     const rejection = redactSubprocessError(err as RawSubprocessRejection, credentialValues);
     // `redactSubprocessError` already scrubbed these fields in place, so retention reads
@@ -3541,6 +3549,88 @@ function persistedOutputEventFields(
             : {}),
         }
       : {}),
+  };
+}
+
+/**
+ * A deterministic producer's stdout did not satisfy the contract it declared.
+ *
+ * Its own class so the exec catch blocks report Archon's diagnosis verbatim instead of
+ * running it through `formatSubprocessFailure` — which would re-label it as a subprocess
+ * diagnostic and, worse, read a stdout excerpt containing "timed out" as a timeout.
+ */
+class ExecOutputContractError extends Error {}
+
+/** How much of the offending stdout a contract failure quotes back to the author. */
+const EXEC_CONTRACT_STDOUT_PREVIEW = 200;
+
+function execStdoutPreview(stdout: string, credentialValues: readonly string[]): string {
+  // Redact BEFORE slicing: the preview lands in `node_failed.data.error`, and a credential
+  // that straddles the cut would otherwise leak its head. Retention (#2967) already applies
+  // the same set to the tails; the quoted excerpt must not be the one unredacted copy.
+  const redacted = redactCredentialValues(stdout, credentialValues);
+  const head = redacted.slice(0, EXEC_CONTRACT_STDOUT_PREVIEW);
+  return `${JSON.stringify(head)}${redacted.length > head.length ? ' …[truncated]' : ''}`;
+}
+
+/**
+ * Certify a `bash:`/`script:` node's stdout against the schema it declared (#2453).
+ *
+ * A deterministic producer that declares `output_format` owns a result contract exactly
+ * like an AI producer does: its stdout must parse as ONE strict JSON document, satisfy the
+ * shared ajv gate, and become the same logical-value + canonical-text + declared-fields
+ * triple `executeAgentNode` returns. There is no fence stripping, no `jsonrepair` tier and
+ * no reask — those exist because a model improvises; stdout that does not match the script's
+ * own declaration is a bug in the script, and retrying it would only cost time.
+ *
+ * A node with no `output_format` returns its stdout byte-for-byte, as it always has.
+ *
+ * @throws ExecOutputContractError when stdout is not JSON, or fails the declared schema.
+ */
+function certifyExecOutput(
+  node: ExecNode,
+  stdout: string,
+  credentialValues: readonly string[]
+): { output: string; structuredOutput?: JsonValue; declaredFields?: string[] } {
+  if (node.output_format === undefined) return { output: stdout };
+
+  const label = `${node.runtime === 'sh' ? 'Bash' : 'Script'} node '${node.id}'`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout) as unknown;
+  } catch (parseErr) {
+    throw new ExecOutputContractError(
+      `${label} declares an output_format, so its stdout must be a single JSON document, but it did not parse: ${(parseErr as Error).message}. stdout began: ${execStdoutPreview(stdout, credentialValues)}`
+    );
+  }
+  // `JSON.parse` can only yield a JsonValue — no undefined, no non-finite number, no
+  // exotic prototype — so the value satisfies the logical domain by construction.
+  const value = parsed as JsonValue;
+
+  let schemaCompileError: string | undefined;
+  const validation = validateStructuredOutput(value, node.output_format, compileMsg => {
+    schemaCompileError = compileMsg;
+  });
+  if (schemaCompileError !== undefined) {
+    // Same posture as the AI gate: the loader compiles every declared schema, so reaching
+    // this branch means a definition bypassed it and the contract cannot be enforced.
+    throw new ExecOutputContractError(
+      `${label}: its output_format schema cannot be compiled (${schemaCompileError}), so its declared contract cannot be enforced. Fix the schema.`
+    );
+  }
+  if (!validation.valid) {
+    throw new ExecOutputContractError(
+      `${label}: stdout did not satisfy its declared output_format: ${validation.errors.join('; ')}. stdout began: ${execStdoutPreview(stdout, credentialValues)}`
+    );
+  }
+
+  // Same projection an AI producer captures: it lets a downstream `.field` ref tell a
+  // declared-but-absent optional field ('') from a typo (throws).
+  const declaredFields = declaredFieldsFromSchema(node.output_format);
+  return {
+    output: canonicalValueText(value),
+    structuredOutput: value,
+    ...(declaredFields !== undefined ? { declaredFields } : {}),
   };
 }
 
@@ -3668,22 +3758,27 @@ async function executeBashNode(
 
   const bashPath = resolveBashPath();
   try {
-    const { stdout, stderr } = await runSubprocess(execContext, bashPath, ['-c', finalScript], {
-      cwd,
-      timeout,
-      env: subprocessEnv,
-      protectedEnvKeys,
-      protectedCredentialValues,
-      retention: {
-        logDir,
-        workflowRunId: workflowRun.id,
-        nodeId: node.id,
-        label: '<bash>',
-      },
-    });
+    const { stdout, stderr, credentialValues } = await runSubprocess(
+      execContext,
+      bashPath,
+      ['-c', finalScript],
+      {
+        cwd,
+        timeout,
+        env: subprocessEnv,
+        protectedEnvKeys,
+        protectedCredentialValues,
+        retention: {
+          logDir,
+          workflowRunId: workflowRun.id,
+          nodeId: node.id,
+          label: '<bash>',
+        },
+      }
+    );
 
     // Trim trailing newline from stdout (common shell behavior)
-    const output = stdout.replace(/\n$/, '');
+    const trimmedStdout = stdout.replace(/\n$/, '');
 
     if (stderr.trim()) {
       getLog().warn({ nodeId: node.id, stderr: stderr.trim() }, 'bash_node_stderr');
@@ -3694,6 +3789,13 @@ async function executeBashNode(
         nodeContext
       );
     }
+
+    // A declared output_format makes this node's stdout a contract: parse it, validate it,
+    // and hand downstream consumers the canonical document instead of raw text (#2453).
+    // Runs AFTER the stderr relay so a contract failure never swallows the script's own
+    // diagnostics; it throws an ExecOutputContractError, handled by this function's catch.
+    const certified = certifyExecOutput(node, trimmedStdout, credentialValues);
+    const output = certified.output;
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
@@ -3710,6 +3812,11 @@ async function executeBashNode(
           duration_ms: duration,
           type: 'bash',
           ...persistedOutputEventFields(persistedOutput, 'node_output'),
+          // The certified logical value beside its text (#2453), so a cold resume
+          // rehydrates typed field access instead of re-parsing the persisted preview.
+          ...(certified.structuredOutput !== undefined
+            ? { structured_output: certified.structuredOutput }
+            : {}),
           ...iterationData,
         },
       })
@@ -3728,17 +3835,33 @@ async function executeBashNode(
       duration,
     });
 
-    return { state: 'completed', output };
+    return {
+      state: 'completed',
+      output,
+      ...(certified.structuredOutput !== undefined
+        ? { structuredOutput: certified.structuredOutput }
+        : {}),
+      ...(certified.declaredFields !== undefined
+        ? { declaredFields: certified.declaredFields }
+        : {}),
+    };
   } catch (error) {
     const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
-    const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    // A contract failure (#2453) is Archon's own diagnosis of stdout, not a subprocess
+    // diagnostic: it is reported verbatim and must not be read as a timeout because the
+    // quoted stdout happens to contain that phrase.
+    const contractFailure = error instanceof ExecOutputContractError;
+    const isTimeout =
+      !contractFailure && (err.killed === true || (err.message ?? '').includes('timed out'));
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the
     // full `Command failed: bash -c <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (contractFailure) {
+      errorMsg = err.message;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
       errorMsg =
@@ -3779,7 +3902,12 @@ async function executeBashNode(
       error: errorMsg,
     });
 
-    return { state: 'failed', output: '', error: errorMsg };
+    return {
+      state: 'failed',
+      output: '',
+      error: errorMsg,
+      ...(contractFailure ? { retryable: false as const } : {}),
+    };
   }
 }
 
@@ -4069,7 +4197,7 @@ async function executeScriptNode(
       }
     }
 
-    const { stdout, stderr } = await runSubprocess(execContext, cmd, args, {
+    const { stdout, stderr, credentialValues } = await runSubprocess(execContext, cmd, args, {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -4084,7 +4212,7 @@ async function executeScriptNode(
     });
 
     // Trim trailing newline from stdout (common shell behavior)
-    const output = stdout.replace(/\n$/, '');
+    const trimmedStdout = stdout.replace(/\n$/, '');
 
     if (stderr.trim()) {
       getLog().warn({ nodeId: node.id, stderr: stderr.trim() }, 'script_node_stderr');
@@ -4095,6 +4223,11 @@ async function executeScriptNode(
         nodeContext
       );
     }
+
+    // Identical certification to executeBashNode (#2453): a declared output_format makes
+    // this node's stdout a contract, and the canonical document replaces the raw text.
+    const certified = certifyExecOutput(node, trimmedStdout, credentialValues);
+    const output = certified.output;
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
@@ -4111,6 +4244,10 @@ async function executeScriptNode(
           duration_ms: duration,
           type: 'script',
           ...persistedOutputEventFields(persistedOutput, 'node_output'),
+          // The certified logical value beside its text (#2453) — see executeBashNode.
+          ...(certified.structuredOutput !== undefined
+            ? { structured_output: certified.structuredOutput }
+            : {}),
           ...iterationData,
         },
       })
@@ -4129,17 +4266,32 @@ async function executeScriptNode(
       duration,
     });
 
-    return { state: 'completed', output };
+    return {
+      state: 'completed',
+      output,
+      ...(certified.structuredOutput !== undefined
+        ? { structuredOutput: certified.structuredOutput }
+        : {}),
+      ...(certified.declaredFields !== undefined
+        ? { declaredFields: certified.declaredFields }
+        : {}),
+    };
   } catch (error) {
     const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
-    const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    // See executeBashNode: a contract failure (#2453) is reported verbatim and is never a
+    // timeout, however the quoted stdout reads.
+    const contractFailure = error instanceof ExecOutputContractError;
+    const isTimeout =
+      !contractFailure && (err.killed === true || (err.message ?? '').includes('timed out'));
     const label = `Script node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the
     // full `Command failed: bun -e <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (contractFailure) {
+      errorMsg = err.message;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: '${cmd}' executable not found in PATH`;
@@ -4177,7 +4329,12 @@ async function executeScriptNode(
       error: errorMsg,
     });
 
-    return { state: 'failed', output: '', error: errorMsg };
+    return {
+      state: 'failed',
+      output: '',
+      error: errorMsg,
+      ...(contractFailure ? { retryable: false as const } : {}),
+    };
   }
 }
 
@@ -6542,7 +6699,9 @@ async function executeLoopNode(
         if (attemptStructured !== undefined) {
           // Validate against the declared schema for EVERY provider — an SDK-enforced
           // one still bypasses grammar-constrained decoding on a refusal or a
-          // max_tokens truncation. Fail-SAFE on an uncompilable schema, but say so.
+          // max_tokens truncation. An uncompilable schema FAILS the node (#2453),
+          // same contract as the ordinary AI gate: the loader already rejects one,
+          // so continuing here would enforce nothing after paying for the iteration.
           let schemaCompileError: string | undefined;
           const validation = validateStructuredOutput(
             attemptStructured,
@@ -6561,11 +6720,15 @@ async function executeLoopNode(
               },
               'loop_node.structured_output_schema_uncompilable'
             );
-            await safeSendMessage(
-              platform,
-              conversationId,
-              `⚠️ Loop \`${node.id}\`: its \`output_format\` schema could not be compiled (${schemaCompileError}), so the iteration output was NOT validated against it. Fix the schema to enforce it.`,
-              msgContext
+            return await failLoopNode(
+              `Loop node '${node.id}' iteration ${String(i)}: its output_format schema cannot be compiled (${schemaCompileError}), so its declared contract cannot be enforced. Fix the schema.`,
+              {
+                output: lastIterationOutput,
+                costUsd: loopTotalCostUsd,
+                ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+                loopIterations: i,
+                data: { iteration: i },
+              }
             );
           }
           if (validation.valid) {
@@ -7670,28 +7833,23 @@ async function executeWorkflowNode(
       const validation = validateStructuredOutput(logicalValue, node.output_format, compileMsg => {
         schemaCompileError = compileMsg;
       });
-      if (schemaCompileError === undefined) {
-        schemaCompiled = true;
-        certifiedLogicalValue = logicalValue;
-      } else {
-        // Fail-safe on an uncompilable schema, same contract as the AI-node gate:
-        // surface it loudly but never turn it into a spurious node failure.
+      if (schemaCompileError !== undefined) {
+        // An uncompilable schema fails the node (#2453), same contract as the
+        // AI-node gate: the loader compiles every declared `output_format`, so a
+        // refusal here means an unenforceable contract would otherwise certify the
+        // child's value by doing nothing.
         getLog().warn(
           { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
           'workflow.subrun_schema_uncompilable'
         );
-        void safeSendMessage(
-          platform,
-          conversationId,
-          `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so the sub-run '${node.workflow}' output was NOT validated against it. Fix the schema to enforce it.`,
-          msgContext
-        ).catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: parentRun.id, nodeId: node.id },
-            'workflow.subrun_schema_warn_send_failed'
-          );
-        });
+        return failResult(
+          `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), so the sub-run '${node.workflow}' output cannot be validated against it. Fix the schema.`,
+          outcome.costUsd,
+          outcome.tokens
+        );
       }
+      schemaCompiled = true;
+      certifiedLogicalValue = logicalValue;
       if (!validation.valid) {
         const errors = (validation.errors ?? ['value does not match the declared schema']).join(
           '; '
@@ -8723,8 +8881,8 @@ async function executeFanOutWorkflowNode(
   // match it — the join aggregates children, so one invalid element would otherwise be
   // persisted inside a "completed" node_completed row. Fails the node BEFORE any
   // writeCompleted so resume re-runs into the same named failure. An uncompilable
-  // schema warn-skips like the 1:1 gate; failed/paused/cancelled children are not
-  // validated (they never contribute a payload element).
+  // schema fails the node like the 1:1 gate (#2453); failed/paused/cancelled children
+  // are not validated (they never contribute a payload element).
   if (node.output_format) {
     for (const [index, outcome] of outcomes.entries()) {
       if (outcome.status !== 'completed') continue;
@@ -8738,10 +8896,11 @@ async function executeFanOutWorkflowNode(
           { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
           'workflow.subrun_schema_uncompilable'
         );
-        await notify(
-          `⚠️ Node '${node.id}': its \`output_format\` schema could not be compiled (${schemaCompileError}), so fan-out child ${String(index)} of '${node.workflow}' was NOT validated against it. Fix the schema to enforce it.`
-        );
-        continue;
+        const msg =
+          `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), ` +
+          `so fan-out child ${String(index)} of '${node.workflow}' cannot be validated against it. Fix the schema.`;
+        await notify(`❌ **Fan-out output_format uncompilable** (node \`${node.id}\`): ${msg}`);
+        return failResult(msg, totalCostUsd, totalTokens);
       }
       if (!validation.valid) {
         const errors = (validation.errors ?? ['value does not match the declared schema']).join(

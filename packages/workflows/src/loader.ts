@@ -15,7 +15,6 @@ import {
   isLoopGroupNode,
   isGateNode,
   isWaitNode,
-  isHaltNode,
   isWorkflowNode,
   isIncludeDirective,
   isComposeFanOutNode,
@@ -25,19 +24,15 @@ import {
 import { COMPOSE_FAN_OUT_STEP_MARKER } from './fan-out-identity';
 import { createLogger } from '@archon/paths';
 import {
+  compileOutputSchema,
   isRegisteredProvider,
   getRegisteredProviders,
   getProviderCapabilities,
 } from '@archon/providers';
 import {
   dagNodeSchema,
-  BASH_NODE_AI_FIELDS,
-  LOOP_NODE_AI_FIELDS,
-  LOOP_GROUP_NODE_AI_FIELDS,
-  GATE_AND_HALT_IGNORED_FIELDS,
-  WAIT_NODE_IGNORED_FIELDS,
-  INCLUDE_NODE_IGNORED_FIELDS,
-  WORKFLOW_NODE_IGNORED_FIELDS,
+  ignoredFieldsForNode,
+  isOutputFormatEnforced,
   KNOWN_DAG_NODE_KEYS,
   KNOWN_NODE_NESTED_KEYS,
   effortLevelSchema,
@@ -679,28 +674,7 @@ function parseDagNode(
   }
 
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
-  let nonAiNode: { type: string; fields: readonly string[] } | undefined;
-  if (isIncludeDirective(node)) {
-    nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
-  } else if (isComposeFanOutNode(node)) {
-    // Same execution-less posture as a static include: the composed body's own nodes
-    // carry their config, so AI-level fields declared here are ignored (#2512).
-    nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
-  } else if (isHaltNode(node)) {
-    nonAiNode = { type: 'cancel', fields: GATE_AND_HALT_IGNORED_FIELDS };
-  } else if (isWorkflowNode(node)) {
-    nonAiNode = { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
-  } else if (isGateNode(node)) {
-    nonAiNode = { type: 'approval', fields: GATE_AND_HALT_IGNORED_FIELDS };
-  } else if (isWaitNode(node)) {
-    nonAiNode = { type: 'wait', fields: WAIT_NODE_IGNORED_FIELDS };
-  } else if (isLoopNode(node)) {
-    nonAiNode = { type: 'loop', fields: LOOP_NODE_AI_FIELDS };
-  } else if (isLoopGroupNode(node)) {
-    nonAiNode = { type: 'loop_group', fields: LOOP_GROUP_NODE_AI_FIELDS };
-  } else if (isExecNode(node)) {
-    nonAiNode = { type: node.runtime === 'sh' ? 'bash' : 'script', fields: BASH_NODE_AI_FIELDS };
-  }
+  const nonAiNode = ignoredFieldsForNode(node);
   if (nonAiNode) {
     const presentAiFields = nonAiNode.fields.filter(
       f => (raw as Record<string, unknown>)[f] !== undefined
@@ -1266,6 +1240,47 @@ export function validateWorkflowClassPlacement(
   return null;
 }
 
+/**
+ * Compile every declared `output_format` so a contract that cannot be enforced
+ * is rejected at LOAD time, before a provider is paid (#2453).
+ *
+ * `output_format` is free-form JSON Schema to Zod (`z.record`), so nothing before
+ * this point can tell a real schema from one ajv will refuse. The runtime gates
+ * used to warn and continue on that refusal, which silently turned a declared
+ * contract into no contract at all after the spend. They now fail the node, and
+ * this check is what keeps that failure from being the author's first signal.
+ *
+ * ajv stays `strict: false`, so a schema carrying tolerated annotations (unknown
+ * keywords, unknown formats) still compiles and still loads — only a schema ajv
+ * genuinely rejects, such as a dangling `$ref`, is an error here.
+ *
+ * Loop_group bodies are walked too: a body node runs its own provider turn with
+ * its own schema, while the group's own `output_format` stays inert and is skipped.
+ * Returns the first failure message, or `null`.
+ */
+export function validateNodeOutputFormats(
+  nodes: readonly (DagNode | IncludeDirective)[]
+): string | null {
+  for (const node of nodes) {
+    if (isIncludeDirective(node)) continue;
+    // Only a schema the engine will enforce is worth rejecting. Where the field is
+    // inert (warned and ignored) a dangling `$ref` governs nothing and must not fail
+    // the file; the predicate derives from the ignored-field lists, so it stays true
+    // as those lists change.
+    if (isOutputFormatEnforced(node) && node.output_format !== undefined) {
+      const compileError = compileOutputSchema(node.output_format);
+      if (compileError !== null) {
+        return `Node '${node.id}' declares an output_format that cannot be compiled: ${compileError}`;
+      }
+    }
+    if (isLoopGroupNode(node)) {
+      const bodyError = validateNodeOutputFormats(node.loop_group.nodes);
+      if (bodyError) return bodyError;
+    }
+  }
+  return null;
+}
+
 export type ParseResult =
   | { workflow: WorkflowDefinition; error: null; warnings: string[] }
   | { workflow: null; error: WorkflowLoadError; warnings?: never };
@@ -1378,6 +1393,15 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       return {
         workflow: null,
         error: { filename, error: structureError, errorType: 'validation_error' },
+      };
+    }
+
+    const outputFormatError = validateNodeOutputFormats(dagNodes);
+    if (outputFormatError) {
+      getLog().warn({ filename, outputFormatError }, 'output_format_uncompilable');
+      return {
+        workflow: null,
+        error: { filename, error: outputFormatError, errorType: 'validation_error' },
       };
     }
 
