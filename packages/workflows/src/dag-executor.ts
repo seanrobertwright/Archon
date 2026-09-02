@@ -809,10 +809,10 @@ export interface ChildWorkflowOutcome {
   structuredOutput?: unknown;
   /**
    * Top-level field names the child's selected `returns:` node declared (#2453), read
-   * from `metadata.summary_declared_fields`. This is what lets a parent read
-   * `$<node>.output.field` under the CHILD's contract instead of repeating the child's
-   * schema in its own `output_format`. Absent for schemaless children and pre-#2453
-   * rows — those keep the caller-schema-or-nothing behavior.
+   * from `metadata.summary_declared_fields`. This is what authorizes a parent's
+   * `$<node>.output.field`: the child owns the contract, and a `workflow:` node cannot
+   * declare one of its own. Absent for schemaless children and pre-#2453 rows — those
+   * carry no field contract at all.
    */
   declaredFields?: readonly string[];
   /** Child run's total cost, rolled up into the parent node's costUsd (D8). */
@@ -7751,10 +7751,9 @@ async function executeApprovalNode(
  *    parent auto-resumes after the child terminates.
  */
 /**
- * The child's terminal LOGICAL value for `output_format` validation (#2774): prefer the
- * typed `structuredOutput` (#2637); fall back to parsing the text summary, and treat
- * non-JSON text as a raw string — which then correctly fails an object-typed schema,
- * since a string IS what the child returned.
+ * The child's terminal LOGICAL value as a fan-out aggregate element: prefer the typed
+ * `structuredOutput` (#2637); fall back to parsing the text summary, and keep non-JSON
+ * text as the raw string, since a string IS what the child returned.
  */
 function subrunLogicalValue(outcome: ChildWorkflowOutcome): unknown {
   if (outcome.structuredOutput !== undefined) return outcome.structuredOutput;
@@ -7891,10 +7890,6 @@ async function executeWorkflowNode(
     }
   }
 
-  // The CALLER's declared field set, from this node's own `output_format`. Since #2453
-  // it is only the fallback: a child that stamped its own contract authorizes field
-  // access, and this stands in solely for a schemaless or pre-#2453 child.
-  const callerDeclaredFields = declaredFieldsFromSchema(node.output_format);
   // Build the completed result AND write the node_completed event. Unlike
   // command/prompt/bash/script nodes (which write their own inside their executor)
   // and unlike approval nodes (written by the approve handler), the workflow node
@@ -7902,73 +7897,11 @@ async function executeWorkflowNode(
   // branch — so the resume snapshot skips a truly-finished sub-run on resume
   // but re-runs one still blocked on its child.
   const asCompleted = async (outcome: ChildWorkflowOutcome): Promise<NodeExecutionResult> => {
-    const childDeclaredFields = outcome.declaredFields;
-    // Declared boundary contract (#2774): when the node declares `output_format`, the
-    // child's terminal value must match it — a mismatch fails the node HERE, before any
-    // node_completed row exists, so resume re-runs into the same named failure instead
-    // of rehydrating an invalid "completed" payload. Mirrors the AI/loop structured-
-    // output gates; no reask loop (a child rerun costs a full run and may have side
-    // effects), one validation, one hard failure.
-    let certifiedLogicalValue: unknown;
-    let schemaCompiled = false;
-    if (node.output_format) {
-      const logicalValue = subrunLogicalValue(outcome);
-      let schemaCompileError: string | undefined;
-      const validation = validateStructuredOutput(logicalValue, node.output_format, compileMsg => {
-        schemaCompileError = compileMsg;
-      });
-      if (schemaCompileError !== undefined) {
-        // An uncompilable schema fails the node (#2453), same contract as the
-        // AI-node gate: the loader compiles every declared `output_format`, so a
-        // refusal here means an unenforceable contract would otherwise certify the
-        // child's value by doing nothing.
-        getLog().warn(
-          { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
-          'workflow.subrun_schema_uncompilable'
-        );
-        return failResult(
-          `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), so the sub-run '${node.workflow}' output cannot be validated against it. Fix the schema.`,
-          outcome.costUsd,
-          outcome.tokens
-        );
-      }
-      schemaCompiled = true;
-      certifiedLogicalValue = logicalValue;
-      if (!validation.valid) {
-        const errors = (validation.errors ?? ['value does not match the declared schema']).join(
-          '; '
-        );
-        const received =
-          logicalValue === null
-            ? 'null'
-            : Array.isArray(logicalValue)
-              ? 'array'
-              : typeof logicalValue;
-        return failResult(
-          `Node '${node.id}': sub-run '${node.workflow}' output does not match its declared output_format: ${errors}. Expected: ${JSON.stringify(node.output_format)}. Received: ${received}.`,
-          outcome.costUsd,
-          outcome.tokens
-        );
-      }
-    }
-    // Receiver-side narrowing only (#2453). When the child stamped its own contract, that
-    // contract owns which fields exist; the caller schema may re-check the value and may
-    // name FEWER fields, but a caller that names a field the child never declared would
-    // otherwise authorize `$node.output.<that field>` to resolve to '' forever. Fail with
-    // both sides named instead of inventing a field the sub-run cannot produce.
-    if (childDeclaredFields !== undefined && callerDeclaredFields !== undefined) {
-      const broadened = callerDeclaredFields.filter(f => !childDeclaredFields.includes(f));
-      if (broadened.length > 0) {
-        return failResult(
-          `Node '${node.id}': its output_format declares field${broadened.length > 1 ? 's' : ''} ${broadened.map(f => `'${f}'`).join(', ')}, which sub-run '${node.workflow}' does not declare in its own result contract (it declares: ${childDeclaredFields.length > 0 ? childDeclaredFields.map(f => `'${f}'`).join(', ') : 'no fields'}). A caller output_format may narrow the sub-run's contract, never broaden it — drop the extra field${broadened.length > 1 ? 's' : ''} here, or declare ${broadened.length > 1 ? 'them' : 'it'} on the node '${node.workflow}' returns.`,
-          outcome.costUsd,
-          outcome.tokens
-        );
-      }
-    }
-    // The contract this node completed under: the child's when it stamped one, otherwise
-    // the caller's assertion (a schemaless or pre-#2453 child — today's behavior).
-    const declaredFields = childDeclaredFields ?? callerDeclaredFields;
+    // The contract this node completes under is the CHILD's (#2453): its `returns:` node
+    // certified the value and stamped the field projection beside it. Nothing is
+    // re-validated here — a `workflow:` node cannot declare a schema of its own (that is
+    // a load error), so there is no caller side to check against.
+    const declaredFields = outcome.declaredFields;
     // A child may point at its own artifacts, and its run is a descendant of this one, so
     // the pointer stays addressable in the parent's scope. Validated HERE as well as in the
     // child, because the child's producer proved it against the CHILD's tree (#2453).
@@ -8006,19 +7939,13 @@ async function executeWorkflowNode(
           type: 'workflow',
           child_run_id: outcome.childRunId,
           // The child's terminal logical value (#2637), so parent cold resume
-          // rehydrates typed access to `$<node>.output.field`. When the child
-          // carried no typed value but the output_format gate certified a parsed
-          // one, persist THAT — otherwise an array-typed certified output would
-          // pass its own gate yet stay unreadable downstream (parity with the
-          // fan-out join's childElement fallback).
+          // rehydrates typed access to `$<node>.output.field`.
           ...(outcome.structuredOutput !== undefined
             ? { structured_output: outcome.structuredOutput }
-            : schemaCompiled && certifiedLogicalValue !== outcome.output
-              ? { structured_output: certifiedLogicalValue as JsonValue }
-              : {}),
+            : {}),
           // The field contract this node completed under (#2453). Persisted because a
-          // resume cannot re-derive it: the child owns it, and a parent that declares no
-          // `output_format` at all would otherwise lose field access after a resume.
+          // resume cannot re-derive it: the child owns it, and this node's own
+          // definition never states it.
           ...(declaredFields !== undefined ? { declared_fields: [...declaredFields] } : {}),
           ...(outcome.costUsd !== undefined ? { cost_usd: outcome.costUsd } : {}),
           // Rolled up from the child run's persisted totals, exactly like cost_usd —
@@ -8052,9 +7979,7 @@ async function executeWorkflowNode(
       ...(outcome.tokens !== undefined ? { tokens: outcome.tokens } : {}),
       ...(outcome.structuredOutput !== undefined
         ? { structuredOutput: outcome.structuredOutput }
-        : schemaCompiled && certifiedLogicalValue !== outcome.output
-          ? { structuredOutput: certifiedLogicalValue }
-          : {}),
+        : {}),
       ...(declaredFields !== undefined ? { declaredFields: [...declaredFields] } : {}),
     };
   };
@@ -8944,12 +8869,12 @@ async function executeFanOutWorkflowNode(
   const totalCostUsd = sumFanOutCost(outcomes);
   const totalTokens = sumFanOutTokens(outcomes);
 
-  // A completed child's aggregate ELEMENT (#2637): its terminal LOGICAL value —
-  // exactly what the #2774 output_format gate above certified via
-  // {@link subrunLogicalValue} — so a structured child lands single-encoded
+  // A completed child's aggregate ELEMENT (#2637): its terminal LOGICAL value via
+  // {@link subrunLogicalValue}, so a structured child lands single-encoded
   // (`[{"v":1}]`, never `["{\"v\":1}"]`), a text-only child whose summary happens
-  // to be JSON lands parsed like the validator saw it, and any other child stays
-  // the exact string it always was.
+  // to be JSON lands parsed, and any other child stays the exact string it always was.
+  // Each child certified its own element against its own `returns:` contract (#2453);
+  // the aggregate is engine-owned and asserts nothing further.
   // I3: parity with the 1:1 asCompleted path — a completed child with no terminal
   // output is indistinguishable downstream from an intentional empty result, so
   // leave a trace before falling back to ''. A structured child always has text too
@@ -8991,51 +8916,6 @@ async function executeFanOutWorkflowNode(
     const msg = fanOutAutonomousGateMessage(node, outcomes[pausedIdx].childRunId, pausedIdx);
     await notify(`⏸→❌ **Fan-out gate rejected** (node \`${node.id}\`): ${msg}`);
     return failResult(msg, totalCostUsd, totalTokens);
-  }
-
-  // Declared boundary contract (#2774), fan-out parity with the 1:1 asCompleted path:
-  // when the node declares `output_format`, EVERY completed child's terminal value must
-  // match it — the join aggregates children, so one invalid element would otherwise be
-  // persisted inside a "completed" node_completed row. Fails the node BEFORE any
-  // writeCompleted so resume re-runs into the same named failure. An uncompilable
-  // schema fails the node like the 1:1 gate (#2453); failed/paused/cancelled children
-  // are not validated (they never contribute a payload element).
-  if (node.output_format) {
-    for (const [index, outcome] of outcomes.entries()) {
-      if (outcome.status !== 'completed') continue;
-      const logicalValue = subrunLogicalValue(outcome);
-      let schemaCompileError: string | undefined;
-      const validation = validateStructuredOutput(logicalValue, node.output_format, compileMsg => {
-        schemaCompileError = compileMsg;
-      });
-      if (schemaCompileError !== undefined) {
-        getLog().warn(
-          { nodeId: node.id, workflowRunId: parentRun.id, compileMsg: schemaCompileError },
-          'workflow.subrun_schema_uncompilable'
-        );
-        const msg =
-          `Node '${node.id}': its output_format schema cannot be compiled (${schemaCompileError}), ` +
-          `so fan-out child ${String(index)} of '${node.workflow}' cannot be validated against it. Fix the schema.`;
-        await notify(`❌ **Fan-out output_format uncompilable** (node \`${node.id}\`): ${msg}`);
-        return failResult(msg, totalCostUsd, totalTokens);
-      }
-      if (!validation.valid) {
-        const errors = (validation.errors ?? ['value does not match the declared schema']).join(
-          '; '
-        );
-        const received =
-          logicalValue === null
-            ? 'null'
-            : Array.isArray(logicalValue)
-              ? 'array'
-              : typeof logicalValue;
-        const msg =
-          `Node '${node.id}': fan-out child ${String(index)} of sub-run '${node.workflow}' output does not match the node's declared output_format: ${errors}. ` +
-          `Expected: ${JSON.stringify(node.output_format)}. Received: ${received}.`;
-        await notify(`❌ **Fan-out output_format violation** (node \`${node.id}\`): ${msg}`);
-        return failResult(msg, totalCostUsd, totalTokens);
-      }
-    }
   }
 
   // Artifact-pointer gate (#2453), fan-out parity with the 1:1 path: each completed

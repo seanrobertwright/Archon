@@ -2447,81 +2447,15 @@ nodes:
     ]);
   });
 
-  it('fails the fan-out node when a child output violates the node output_format (#2774)', async () => {
+  it('refuses to load a fan-out workflow: node that declares output_format (#2453)', async () => {
+    // The per-item contract belongs to each child's own `returns:` node; the caller
+    // has nothing to assert, so the load rejects the workflow before a single child
+    // run is created.
     await writeWorkflow(
-      'fan-child-json',
+      'fan-parent-caller-schema',
       `
-name: fan-child-json
-description: emits a structured-looking terminal value
-mutates_checkout: false
-nodes:
-  - id: emit
-    bash: |
-      printf '%s' '{"verdict":42}'
-`
-    );
-    await writeWorkflow(
-      'fan-parent-schema',
-      `
-name: fan-parent-schema
-description: fan-out with a declared output_format the children violate
-nodes:
-  - id: plan
-    bash: |
-      printf '%s' '["a","b"]'
-  - id: work
-    workflow: fan-child-json
-    depends_on: [plan]
-    mutates_checkout: false
-    output_format:
-      type: object
-      properties:
-        verdict: { type: string }
-      required: [verdict]
-    fan_out:
-      items: "$plan.output"
-      join: all_success
-`
-    );
-
-    const store = new InMemoryStore();
-    const deps = makeDeps(store);
-    const result = await executeWorkflow(
-      deps,
-      makePlatform(),
-      'conv-plat',
-      cwd,
-      await discover('fan-parent-schema'),
-      'goal',
-      'conv-db',
-      { resolveChildIsolation: makeFanResolver(cwd).resolver }
-    );
-
-    expect(result.success).toBe(false);
-    const failed = store.events.find(e => e.event_type === 'node_failed' && e.step_name === 'work');
-    expect(failed).toBeDefined();
-    const error = String(failed?.data?.error);
-    expect(error).toContain("Node 'work'");
-    expect(error).toContain('fan-out child');
-    expect(error).toContain('/verdict');
-    expect(error).toContain('must be string');
-    // No node_completed row may exist — resume must re-run into the same failure.
-    expect(
-      store.events.find(e => e.event_type === 'node_completed' && e.step_name === 'work')
-    ).toBeUndefined();
-    const parent = [...store.runs.values()].find(r => r.workflow_name === 'fan-parent-schema');
-    expect(parent?.status).toBe('failed');
-  });
-
-  it('refuses to load a fan-out node whose output_format cannot be compiled (#2453)', async () => {
-    // The uncompilable-schema gate inside the fan-out join is a backstop; an
-    // authored file never reaches it, because the load rejects the workflow
-    // before a single child run is created.
-    await writeWorkflow(
-      'fan-parent-broken-schema',
-      `
-name: fan-parent-broken-schema
-description: fan-out declaring a contract ajv cannot compile
+name: fan-parent-caller-schema
+description: fan-out declaring a contract the children own
 nodes:
   - id: plan
     bash: |
@@ -2533,8 +2467,7 @@ nodes:
     output_format:
       type: object
       properties:
-        verdict:
-          $ref: "#/$defs/missing"
+        verdict: { type: string }
     fan_out:
       items: "$plan.output"
       join: all_success
@@ -2542,137 +2475,11 @@ nodes:
     );
 
     const result = await discoverWorkflows(cwd, { loadDefaults: false });
-    expect(result.workflows.some(w => w.workflow.name === 'fan-parent-broken-schema')).toBe(false);
-    const loadError = result.errors.find(e => e.filename.includes('fan-parent-broken-schema'));
-    expect(loadError?.error).toContain(
-      "Node 'work' declares an output_format that cannot be compiled"
+    expect(result.workflows.some(w => w.workflow.name === 'fan-parent-caller-schema')).toBe(false);
+    const loadError = result.errors.find(e => e.filename.includes('fan-parent-caller-schema'));
+    expect(loadError?.error).toBe(
+      "Node 'work' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there"
     );
-  });
-
-  it('completes the fan-out when every child matches the declared output_format (#2774)', async () => {
-    await writeWorkflow(
-      'fan-child-ok',
-      `
-name: fan-child-ok
-description: emits a schema-conformant terminal value
-mutates_checkout: false
-nodes:
-  - id: emit
-    bash: |
-      printf '%s' '{"verdict":"ship"}'
-`
-    );
-    await writeWorkflow(
-      'fan-parent-ok',
-      `
-name: fan-parent-ok
-description: fan-out whose children satisfy the declared output_format
-nodes:
-  - id: plan
-    bash: |
-      printf '%s' '["a","b"]'
-  - id: work
-    workflow: fan-child-ok
-    depends_on: [plan]
-    mutates_checkout: false
-    output_format:
-      type: object
-      properties:
-        verdict: { type: string }
-      required: [verdict]
-    fan_out:
-      items: "$plan.output"
-      join: all_success
-`
-    );
-
-    const store = new InMemoryStore();
-    const deps = makeDeps(store);
-    const result = await executeWorkflow(
-      deps,
-      makePlatform(),
-      'conv-plat',
-      cwd,
-      await discover('fan-parent-ok'),
-      'goal',
-      'conv-db',
-      { resolveChildIsolation: makeFanResolver(cwd).resolver }
-    );
-
-    expect(result.success).toBe(true);
-    const completed = store.events.find(
-      e => e.event_type === 'node_completed' && e.step_name === 'work'
-    );
-    expect(completed).toBeDefined();
-    // Text-only bash children land PARSED in the aggregate (no typed summary_value):
-    // the join persists exactly the value the output_format gate validated, so
-    // downstream typed access ($work.output[i].verdict) sees what was certified.
-    expect(JSON.parse(String(completed?.data?.node_output))).toEqual([
-      { verdict: 'ship' },
-      { verdict: 'ship' },
-    ]);
-    expect(
-      store.events.find(e => e.event_type === 'node_failed' && e.step_name === 'work')
-    ).toBeUndefined();
-  });
-
-  it('persists the certified logical value on the 1:1 path when the child had no typed summary (#2774)', async () => {
-    await writeWorkflow(
-      'array-child',
-      `
-name: array-child
-description: terminal node emits a bare JSON array as text
-nodes:
-  - id: emit
-    bash: |
-      printf '%s' '[{"verdict":"ship"},{"verdict":"hold"}]'
-`
-    );
-    await writeWorkflow(
-      'array-parent',
-      `
-name: array-parent
-description: declares an array output_format over a text-only child
-nodes:
-  - id: sub
-    workflow: array-child
-    mutates_checkout: false
-    output_format:
-      type: array
-      items:
-        type: object
-        properties:
-          verdict: { type: string }
-        required: [verdict]
-`
-    );
-
-    const store = new InMemoryStore();
-    const deps = makeDeps(store);
-    const result = await executeWorkflow(
-      deps,
-      makePlatform(),
-      'conv-plat',
-      cwd,
-      await discover('array-parent'),
-      'goal',
-      'conv-db'
-    );
-
-    expect(result.success).toBe(true);
-    const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'array-parent');
-    const subCompleted = store.events.find(
-      e =>
-        e.workflow_run_id === parentRun?.id &&
-        e.event_type === 'node_completed' &&
-        e.step_name === 'sub'
-    );
-    // The gate certified the PARSED array, so that — not the raw text — is what a
-    // cold resume rehydrates and downstream `$sub.output[0].verdict` reads.
-    expect(subCompleted?.data?.structured_output).toEqual([
-      { verdict: 'ship' },
-      { verdict: 'hold' },
-    ]);
   });
 
   it('read-only children (mutates_checkout: false) fan out IN the parent checkout, no worktrees', async () => {
@@ -6361,10 +6168,9 @@ nodes:
 
 // ---------------------------------------------------------------------------
 // #2453 — the child's selected node owns the result contract. Its derived field
-// projection travels to the parent as `summary_declared_fields`, so a caller no
-// longer has to repeat the child's schema to read `$<node>.output.field`. A
-// caller `output_format` stays an optional receiver assertion: it may narrow,
-// never broaden.
+// projection travels to the parent as `summary_declared_fields`, which is what
+// authorizes `$<node>.output.field` in the parent. A `workflow:` node cannot
+// declare a schema of its own (that is a load error, see loader.test.ts).
 // ---------------------------------------------------------------------------
 
 describe('workflow: callee-owned result contracts (#2453)', () => {
@@ -6508,113 +6314,6 @@ nodes:
     );
   });
 
-  it('a narrowing caller output_format still validates, and the CHILD contract authorizes fields', async () => {
-    await writeContractChild();
-    await writeWorkflow(
-      'parent-narrow',
-      `
-name: parent-narrow
-description: asserts only one of the child's fields, then reads the other
-nodes:
-  - id: sub
-    workflow: child-contract
-    output_format:
-      type: object
-      properties:
-        green: { type: boolean }
-      required: [green]
-  - id: read
-    bash: |
-      printf 'note=%s' $sub.output.note
-    depends_on: [sub]
-`
-    );
-
-    const store = new InMemoryStore();
-    const deps = makeDeps(store);
-    const result = await executeWorkflow(
-      deps,
-      makePlatform(),
-      'conv-plat',
-      cwd,
-      await discover('parent-narrow'),
-      'goal',
-      'conv-db'
-    );
-
-    expect(result.success).toBe(true);
-    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-narrow');
-    // The caller narrowed its assertion to `green`, but field access is still the
-    // child's full contract — otherwise narrowing would silently delete `note`.
-    const read = store.events.find(
-      e =>
-        e.workflow_run_id === parent?.id &&
-        e.event_type === 'node_completed' &&
-        e.step_name === 'read'
-    );
-    expect(String(read?.data?.node_output)).toBe('note=ok');
-    const subCompleted = store.events.find(
-      e =>
-        e.workflow_run_id === parent?.id &&
-        e.event_type === 'node_completed' &&
-        e.step_name === 'sub'
-    );
-    expect(subCompleted?.data?.declared_fields).toEqual(['green', 'note']);
-  });
-
-  it('a broadening caller output_format fails the node, naming both contracts', async () => {
-    await writeContractChild();
-    await writeWorkflow(
-      'parent-broaden',
-      `
-name: parent-broaden
-description: invents an optional field the child does not declare
-nodes:
-  - id: sub
-    workflow: child-contract
-    output_format:
-      type: object
-      properties:
-        green: { type: boolean }
-        verdict: { type: string }
-      required: [green]
-`
-    );
-
-    const store = new InMemoryStore();
-    const deps = makeDeps(store);
-    const result = await executeWorkflow(
-      deps,
-      makePlatform(),
-      'conv-plat',
-      cwd,
-      await discover('parent-broaden'),
-      'goal',
-      'conv-db'
-    );
-
-    expect(result.success).toBe(false);
-    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-broaden');
-    const failed = store.events.find(
-      e =>
-        e.workflow_run_id === parent?.id && e.event_type === 'node_failed' && e.step_name === 'sub'
-    );
-    const error = String(failed?.data?.error);
-    // Both sides named: the invented field, and what the sub-run actually declares.
-    expect(error).toContain("output_format declares field 'verdict'");
-    expect(error).toContain("sub-run 'child-contract' does not declare");
-    expect(error).toContain("'green', 'note'");
-    // Failed before any completion row could rehydrate an unauthorized contract.
-    expect(
-      store.events.some(
-        e =>
-          e.workflow_run_id === parent?.id &&
-          e.event_type === 'node_completed' &&
-          e.step_name === 'sub'
-      )
-    ).toBe(false);
-  });
-
   it('a cold-resumed parent resolves child-declared fields exactly like a live one', async () => {
     await writeContractChild();
     await writeWorkflow(
@@ -6679,7 +6378,7 @@ nodes:
     expect(replayed?.data?.declared_fields).toEqual(['green', 'note']);
   });
 
-  it('a schemaless child keeps the caller output_format as its field contract', async () => {
+  it('a schemaless child carries no field contract, and the parent reads it leniently', async () => {
     await writeWorkflow(
       'child-schemaless',
       `
@@ -6693,18 +6392,13 @@ nodes:
 `
     );
     await writeWorkflow(
-      'parent-legacy-assert',
+      'parent-schemaless',
       `
-name: parent-legacy-assert
-description: the pre-#2453 shape — only the caller declares a schema
+name: parent-schemaless
+description: reads a JSON field from a child that declared nothing
 nodes:
   - id: sub
     workflow: child-schemaless
-    output_format:
-      type: object
-      properties:
-        green: { type: boolean }
-      required: [green]
   - id: read
     bash: |
       printf 'green=%s' $sub.output.green
@@ -6719,22 +6413,24 @@ nodes:
       makePlatform(),
       'conv-plat',
       cwd,
-      await discover('parent-legacy-assert'),
+      await discover('parent-schemaless'),
       'goal',
       'conv-db'
     );
 
     expect(result.success).toBe(true);
+    // No contract anywhere: the child stamped no projection, the parent persisted none,
+    // and the caller has no way to add one. Field access stays the schemaless parse.
     const child = [...store.runs.values()].find(r => r.workflow_name === 'child-schemaless');
     expect(child?.metadata?.summary_declared_fields).toBeUndefined();
-    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-legacy-assert');
+    const parent = [...store.runs.values()].find(r => r.workflow_name === 'parent-schemaless');
     const subCompleted = store.events.find(
       e =>
         e.workflow_run_id === parent?.id &&
         e.event_type === 'node_completed' &&
         e.step_name === 'sub'
     );
-    expect(subCompleted?.data?.declared_fields).toEqual(['green']);
+    expect(subCompleted?.data?.declared_fields).toBeUndefined();
     const read = store.events.find(
       e =>
         e.workflow_run_id === parent?.id &&

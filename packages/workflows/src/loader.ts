@@ -651,7 +651,6 @@ function parseDagNode(
     );
     return null;
   }
-
   collectUnknownNodeKeys(raw, id, `Node '${id}'`, warnings);
   collectGateAndLoopDeprecationWarnings(node, raw, id, warnings);
 
@@ -1241,6 +1240,20 @@ export function validateWorkflowClassPlacement(
 }
 
 /**
+ * A `workflow:` node may not declare `output_format` (#2453). The result contract
+ * belongs to the node that produces the value — the child's `returns:` node — and
+ * its declared field names travel back with the result, so the caller has nothing
+ * to assert. Checked before the compile gate in both the file-fed loader and the
+ * in-memory validator, through this one function, so both name the same owner and
+ * a caller schema never reaches the compile branch. Returns the load error, or
+ * `null` for every other node.
+ */
+export function workflowNodeOutputFormatError(node: DagNode): string | null {
+  if (!isWorkflowNode(node) || node.output_format === undefined) return null;
+  return `Node '${node.id}' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there`;
+}
+
+/**
  * Compile every declared `output_format` so a contract that cannot be enforced
  * is rejected at LOAD time, before a provider is paid (#2453).
  *
@@ -1263,6 +1276,10 @@ export function validateNodeOutputFormats(
 ): string | null {
   for (const node of nodes) {
     if (isIncludeDirective(node)) continue;
+    // Ownership first (#2453): a `workflow:` node's schema is rejected outright, so the
+    // compile gate below never sees one.
+    const ownershipError = workflowNodeOutputFormatError(node);
+    if (ownershipError !== null) return ownershipError;
     // Only a schema the engine will enforce is worth rejecting. Where the field is
     // inert (warned and ignored) a dangling `$ref` governs nothing and must not fail
     // the file; the predicate derives from the ignored-field lists, so it stays true
@@ -1398,7 +1415,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
 
     const outputFormatError = validateNodeOutputFormats(dagNodes);
     if (outputFormatError) {
-      getLog().warn({ filename, outputFormatError }, 'output_format_uncompilable');
+      getLog().warn({ filename, outputFormatError }, 'output_format_rejected');
       return {
         workflow: null,
         error: { filename, error: outputFormatError, errorType: 'validation_error' },

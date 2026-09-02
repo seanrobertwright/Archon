@@ -313,11 +313,11 @@ export type WorkflowRun = z.infer<typeof workflowRunSchema>;
  *                    so a parent `workflow:` node threads the logical value back.
  * `summary_declared_fields` — additive sibling of `summary_value` (#2453): the top-level
  *                    field names the child's selected `returns:` node declared, so a
- *                    parent reads `$<node>.output.field` under the CHILD's contract
- *                    instead of repeating that schema in its own `output_format`. Only
- *                    the derived projection travels; the schema itself stays in captured
+ *                    parent reads `$<node>.output.field` under the CHILD's contract — a
+ *                    `workflow:` node cannot declare a schema of its own. Only the
+ *                    derived projection travels; the schema itself stays in captured
  *                    workflow source. Absent on schemaless children and pre-#2453 rows,
- *                    which keep today's caller-schema-or-nothing behavior.
+ *                    which carry no field contract.
  */
 export const SUBRUN_METADATA_KEYS = {
   parentNodeId: 'parent_node_id',
@@ -360,7 +360,7 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
       : undefined;
   // A field projection is only usable as a field-access contract when it is exactly an
   // array of strings. Anything else is corrupt or foreign metadata: degrade to
-  // "no contract" (today's behavior) rather than authorize access from a shape nobody wrote.
+  // "no contract" rather than authorize access from a shape nobody wrote.
   const rawDeclaredFields = metadata?.[SUBRUN_METADATA_KEYS.summaryDeclaredFields];
   const summaryDeclaredFields =
     Array.isArray(rawDeclaredFields) && rawDeclaredFields.every(f => typeof f === 'string')
