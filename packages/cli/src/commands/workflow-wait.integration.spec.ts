@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { removeTempTree } from '@archon/paths/test-utils';
+import { requestRunLiveOwnerStop } from '@archon/core/services/run-live-owner';
 import { requestDetachedRunStop } from '../utils/detached-run-control';
 
 const cleanupPaths: string[] = [];
@@ -450,6 +451,47 @@ describe('archon workflow wait against a detached run', () => {
       result: 'attention',
       attention: { kind: 'terminal', runId, status: 'cancelled' },
     });
+  }, 120_000);
+
+  test('reports owner_lost after abrupt process death and leaves lifecycle operator-owned', async () => {
+    if (process.platform === 'win32') return;
+    const fixture = makeFixture('archon-wait-owner-lost-', {
+      'wait-orphan':
+        'name: wait-orphan\ndescription: Owner-loss fixture.\n' +
+        'nodes:\n  - id: hold\n    bash: "sleep 60; echo done"\n',
+    });
+    const { runId } = await launchDetached(fixture, 'wait-orphan');
+    await waitFor('the detached owner to start running', () =>
+      readRunStatus(fixture.archonHome, runId) === 'running' ? true : undefined
+    );
+
+    const waiter = startWait(fixture, runId, 60);
+    expect(await waiter.attached()).toEqual({ observedStatus: 'running' });
+
+    // Acquire only long enough to learn the exact owner PID. Do not commit the
+    // cancellation handoff: SIGKILL models the external death this result detects.
+    const lease = await requestRunLiveOwnerStop(runId);
+    const ownerPid = lease.pid;
+    lease.release();
+    process.kill(-ownerPid, 'SIGKILL');
+
+    const settled = await waiter.settled();
+    expectWaitExit(settled, 0);
+    expect(settled.payload).toEqual({
+      ok: true,
+      action: 'wait',
+      runId,
+      result: 'owner_lost',
+      observedStatus: 'running',
+    });
+    expect(readRunStatus(fixture.archonHome, runId)).toBe('running');
+
+    const abandoned = await runCli(fixture, ['workflow', 'abandon', runId]);
+    if (abandoned.exitCode !== 0) {
+      throw new Error(`abandon failed: ${abandoned.stderr || abandoned.stdout}`);
+    }
+    expect(readRunStatus(fixture.archonHome, runId)).toBe('cancelled');
+    activeRunIds.delete(runId);
   }, 120_000);
 
   test('exits 3 with the observed status when the timeout passes first', async () => {
