@@ -788,12 +788,14 @@ describe('bundled-defaults', () => {
             '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
             'esac',
           ],
-          // `gh pr checks` exits 1 and explains itself on stderr when a PR carries
-          // no checks — a repository with no CI, or checks a fork PR never starts.
+          // The node reads the check context count via gh's GraphQL API.
+          // A zero count means the PR carries no checks — a repository with no
+          // CI, or checks a fork PR never starts. No `pr checks` call follows.
           gh: [
             '#!/bin/sh',
             'printf "%s\\n" "$*" >> "$GH_LOG"',
             'case "$*" in',
+            '  "api graphql"*) printf "%s\\n" "0" ;;',
             '  "pr checks"*)',
             '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
             '    exit 1',
@@ -829,15 +831,16 @@ describe('bundled-defaults', () => {
             '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
             'esac',
           ],
-          // Already jq-filtered, the way the node's own `--jq` leaves it: one failing
-          // check, exit 1 the way gh reports red.
+          // The count read sees checks; the classification returns one
+          // non-green check. Real gh with --json exits 0 on red (the --json
+          // exporter succeeds regardless of check outcome).
           gh: [
             '#!/bin/sh',
             'printf "%s\\n" "$*" >> "$GH_LOG"',
             'case "$*" in',
+            '  "api graphql"*) printf "%s\\n" "1" ;;',
             '  "pr checks"*)',
             '    printf "%s\\n" "test (windows-latest) (fail)"',
-            '    exit 1',
             '    ;;',
             'esac',
           ],
@@ -887,6 +890,7 @@ describe('bundled-defaults', () => {
             gh: [
               '#!/bin/sh',
               'case "$*" in',
+              '  "api graphql"*) printf "%s\\n" "0" ;;',
               '  "pr checks"*)',
               '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
               '    exit 1',
