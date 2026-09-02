@@ -77,6 +77,27 @@ import {
 
 /** The file's one temp-root creator, so every fixture tree is tracked for teardown. */
 const trackTempRoot = trackTempRoots();
+const STUB_FIXTURE = ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n');
+
+const stubWorkflowYaml = (name: string) =>
+  `name: ${name}\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n`;
+
+/**
+ * Write one workflow and its fixture per slash-separated path, so a tree is declared
+ * rather than assembled: `'sdlc/plan'` produces
+ * `.archon/workflows/sdlc/plan/plan-wf.yaml` and `.../fixtures/plan.stubs.yaml`.
+ */
+function writeWorkflowDirs(cwd: string, paths: readonly string[]): void {
+  for (const path of paths) {
+    const segments = path.split('/');
+    const leaf = segments[segments.length - 1];
+    const dir = join(cwd, '.archon', 'workflows', ...segments);
+    mkdirSync(join(dir, 'fixtures'), { recursive: true });
+    writeFileSync(join(dir, `${leaf}-wf.yaml`), stubWorkflowYaml(`${leaf}-wf`));
+    writeFileSync(join(dir, 'fixtures', `${leaf}.stubs.yaml`), STUB_FIXTURE);
+  }
+}
+
 function makeTempProject(prefix = 'fixture-runner-'): string {
   return trackTempRoot(mkdtempSync(join(tmpdir(), prefix)));
 }
@@ -717,30 +738,30 @@ describe('runFixtures', () => {
   /** Pack layout like the bundled SDLC pack: `<pack>/<workflow-folder>/fixtures/`, plus a sibling pack whose name extends `sdlc` so the path-containment anchor cannot drift. */
   function writeNestedPackProject(): { cwd: string } {
     const cwd = makeTempProject();
-    for (const folder of ['plan', 'ship']) {
-      const workflowDir = join(cwd, '.archon', 'workflows', 'sdlc', folder);
-      mkdirSync(join(workflowDir, 'fixtures'), { recursive: true });
-      writeFileSync(
-        join(workflowDir, `${folder}-wf.yaml`),
-        `name: ${folder}-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n`
-      );
-      writeFileSync(
-        join(workflowDir, 'fixtures', `${folder}.stubs.yaml`),
-        ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
-      );
-    }
-    const extDir = join(cwd, '.archon', 'workflows', 'sdlc-ext', 'ext');
-    mkdirSync(join(extDir, 'fixtures'), { recursive: true });
-    writeFileSync(
-      join(extDir, 'ext-wf.yaml'),
-      'name: ext-wf\ndescription: test\nnodes:\n  - id: node-a\n    prompt: hello\n'
-    );
-    writeFileSync(
-      join(extDir, 'fixtures', 'ext.stubs.yaml'),
-      ['fixture:', '  expect: completed', 'node-a: "stub output"', ''].join('\n')
-    );
+    writeWorkflowDirs(cwd, ['sdlc/plan', 'sdlc/ship', 'sdlc-ext/ext']);
     return { cwd };
   }
+
+  // `readdir` yields filesystem order, which varies by machine and filesystem. Two CI
+  // runs on unrelated PRs failed here with the same fixtures in swapped order before
+  // discovery defined one. Creation order below is deliberately reverse-alphabetical.
+  it('reports fixtures in label order, not filesystem order', async () => {
+    const cwd = makeTempProject();
+    writeWorkflowDirs(cwd, ['pack/zulu', 'pack/mike', 'pack/alfa']);
+    const workflows = [
+      ...workflowsOnDisk(cwd, ['zulu-wf'], 'pack/zulu'),
+      ...workflowsOnDisk(cwd, ['mike-wf'], 'pack/mike'),
+      ...workflowsOnDisk(cwd, ['alfa-wf'], 'pack/alfa'),
+    ];
+
+    const report = await runFixtures({ workflows, cwd });
+
+    expect(report.results.map(r => r.fixture)).toEqual([
+      'pack/alfa/fixtures/alfa.stubs.yaml',
+      'pack/mike/fixtures/mike.stubs.yaml',
+      'pack/zulu/fixtures/zulu.stubs.yaml',
+    ]);
+  });
 
   it('resolves a nested pack by name, workflow folder, and pack directory path', async () => {
     const { cwd } = writeNestedPackProject();
