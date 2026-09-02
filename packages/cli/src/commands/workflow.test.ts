@@ -293,7 +293,7 @@ const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
   globalWorkflows: '/test/capture/global/workflows',
   globalCommands: '/test/capture/global/commands',
   globalScripts: '/test/capture/global/scripts',
-  bundledWorkflows: '/test/capture/bundled',
+  bundledWorkflows: '/test/capture/bundled/workflows',
   bundledCommands: '/test/capture/bundled/commands/defaults',
   kind: 'captured',
   anchor: {
@@ -2295,7 +2295,7 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
         globalWorkflows: '/test/finalized/workflow-source/global/workflows',
         globalCommands: '/test/finalized/workflow-source/global/commands',
         globalScripts: '/test/finalized/workflow-source/global/scripts',
-        bundledWorkflows: '/test/finalized/workflow-source/bundled',
+        bundledWorkflows: '/test/finalized/workflow-source/bundled/workflows',
         bundledCommands: '/test/finalized/workflow-source/bundled/commands/defaults',
         kind: 'captured',
         anchor: {

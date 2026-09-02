@@ -241,7 +241,7 @@ const CAPTURED_SOURCE_ROOTS: WorkflowExecutor.WorkflowSourceRoots = {
   globalWorkflows: '/capture/global/workflows',
   globalCommands: '/capture/global/commands',
   globalScripts: '/capture/global/scripts',
-  bundledWorkflows: '/capture/bundled',
+  bundledWorkflows: '/capture/bundled/workflows',
   bundledCommands: '/capture/bundled/commands/defaults',
   kind: 'captured',
   anchor: {
@@ -2454,7 +2454,7 @@ describe('workflow dispatch routing — interactive flag', () => {
           globalWorkflows: '/capture-branch/global/workflows',
           globalCommands: '/capture-branch/global/commands',
           globalScripts: '/capture-branch/global/scripts',
-          bundledWorkflows: '/capture-branch/bundled',
+          bundledWorkflows: '/capture-branch/bundled/workflows',
           bundledCommands: '/capture-branch/bundled/commands/defaults',
           kind: 'captured',
           anchor: {
@@ -3049,7 +3049,7 @@ describe('workflow dispatch routing — interactive flag', () => {
           globalWorkflows: '/capture/global/workflows',
           globalCommands: '/capture/global/commands',
           globalScripts: '/capture/global/scripts',
-          bundledWorkflows: '/capture/bundled',
+          bundledWorkflows: '/capture/bundled/workflows',
           bundledCommands: '/capture/bundled/commands/defaults',
           kind: 'captured',
           anchor: CAPTURED_SOURCE_ROOTS.anchor,
