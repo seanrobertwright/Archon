@@ -55,7 +55,7 @@ import {
 import { isAbsolute, join, resolve } from 'node:path';
 import { applyWorkflowRunConfigLayer } from '@archon/workflows/run-config';
 import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeSync } from 'node:fs';
-import { open as openFile } from 'node:fs/promises';
+import { mkdir, open as openFile } from 'node:fs/promises';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
@@ -73,6 +73,7 @@ import {
   prepareWorkflowSource,
   recordSelectedWorkflow,
   resolveContinuationWorkflow,
+  resolveProjectPaths,
   withCapturedSource,
   workflowSourceConfigFrom,
   type CapturedSourceOwner,
@@ -2678,12 +2679,24 @@ async function runWorkflowWithOwnedSource(
             // finalized capture instead of the already-renamed staging path.
             owner.hold(preparedSource);
           }
-          prepared = await backend.prepare({
-            codebase: folderCodebase,
-            // Read-only, at the same absolute path inside the container, so a named
-            // script resolves identically on both sides of the boundary.
-            ...(preparedSource ? { sourceMount: preparedSource.captureRoot } : {}),
-          });
+          // `$ARTIFACTS_DIR` is the run's output channel on both sides of the boundary,
+          // so it is bound read-write at the same absolute path. Created here by the host
+          // user: a bind target Docker has to create itself would be owned by root.
+          let mounts: { sourceMount: string; artifactsMount: string } | undefined;
+          if (preparedSource) {
+            const { artifactsDir } = await resolveProjectPaths(
+              createWorkflowDeps(),
+              folderCodebase.defaultCwd,
+              preparedSource.runId,
+              folderCodebase.id
+            );
+            await mkdir(artifactsDir, { recursive: true });
+            // Read-only source and read-write artifacts, both at the same absolute path
+            // inside the container, so a path means one thing on either side of the
+            // boundary.
+            mounts = { sourceMount: preparedSource.captureRoot, artifactsMount: artifactsDir };
+          }
+          prepared = await backend.prepare({ codebase: folderCodebase, ...(mounts ?? {}) });
         } catch (prepErr) {
           // Map docker/daemon/image failures to an actionable message (daemon down,
           // runner image missing, docker-group permission — see errors.ts).

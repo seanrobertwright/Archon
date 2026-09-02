@@ -296,7 +296,7 @@ The one exception is a run that started before Archon captured source at all. It
 
 **Compiled binaries.** A binary embeds its bundled workflows, commands, and scripts as constants rather than files. Those get written into the capture alongside everything else, so they are covered by the same digest — which means upgrading Archon between pausing and resuming a run is fine: the run keeps executing the bundled content it started with, and a change to those bytes would be caught like any other.
 
-`--container` runs get the same treatment: the capture is bind-mounted **read-only at the same absolute path** inside the container, so a named script resolves identically whether a node runs on the host or in the container, and a container recreated on resume gets the mount back. `--workflow-source` is refused with `--container` — a folder project runs in place, so its source and its target are the same directory by definition.
+`--container` runs get the same treatment: the capture is bind-mounted **read-only at the same absolute path** inside the container, so a named script resolves identically whether a node runs on the host or in the container, and a container recreated on resume gets the mount back. `$ARTIFACTS_DIR` is bound the same way but read-write, so a node's outputs land on the host. `--workflow-source` is refused with `--container` — a folder project runs in place, so its source and its target are the same directory by definition.
 
 #### Deterministic dry-run
 
