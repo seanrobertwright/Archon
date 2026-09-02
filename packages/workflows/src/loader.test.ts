@@ -8645,8 +8645,7 @@ description: with on bash is dropped with a visible warning
 nodes:
   - id: run
     bash: echo hi
-    with:
-      v: x
+    with: [ignored]
 `);
     expect(workflow.nodes).toHaveLength(1);
     expect(

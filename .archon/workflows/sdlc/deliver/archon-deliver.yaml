@@ -560,20 +560,33 @@ nodes:
       PR_NUMBER=$pr.output.number
       # Public-surface preflight: the flip is the one irreversible
       # step, so it re-verifies CI itself instead of trusting the loop above —
-      # any pending or non-green check refuses the flip loudly. An empty result
-      # (no CI configured, or gated checks that never started) proceeds,
-      # matching the probe's permission-agnostic skip. `gh pr checks` exits
-      # non-zero and says "no checks reported" for exactly that case, so this
-      # read is the one that tolerates failure — reporting the checks it found
-      # is what refuses the flip, never the exit code.
-      # `|| true` here and nowhere else: every other read must fail the node.
-      # Dropping gh's explanation for the tolerated case hides nothing: a gh that
-      # cannot read this PR's checks cannot flip it either, and the flip below
-      # fails loudly carrying gh's own words.
-      NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>/dev/null || true)
-      if [ -n "$NOT_GREEN" ]; then
-        printf '%s\n' "flip-ready: refusing to flip with non-green checks: $NOT_GREEN" >&2
+      # any pending or non-green check refuses the flip loudly. The check count
+      # is read through gh's GraphQL API, whose exit code is the structured
+      # signal: success returns the JSON totalCount (0 = no checks configured,
+      # or gated checks that never started — both proceed, matching the probe's
+      # permission-agnostic skip), and a non-zero exit is a failed read that
+      # refuses. A failed observation is not evidence that no CI exists, and the
+      # flip below must never run on one. stderr is dropped like every other
+      # value read in this node — a gh notice must never become the count.
+      if ! CHECK_COUNT=$(gh api graphql \
+        -f query='query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { commits(last: 1) { nodes { commit { statusCheckRollup { contexts { totalCount } } } } } } } }' \
+        -f owner="${ORIGIN_REPO%/*}" -f repo="${ORIGIN_REPO#*/}" -F number="$PR_NUMBER" \
+        --jq '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.totalCount // 0)' 2>/dev/null); then
+        printf '%s\n' "flip-ready: could not read check state." >&2
         exit 1
+      fi
+      if [ "$CHECK_COUNT" -gt 0 ]; then
+        # Checks exist: classify them with gh's structured bucket mapping. This
+        # read cannot legitimately be empty (the count above saw checks), so a
+        # failure here is a failed read too, never a no-checks case.
+        if ! NOT_GREEN=$(gh pr checks "$PR_NUMBER" --repo "$ORIGIN_REPO" --json name,bucket --jq '.[] | select(.bucket != "pass" and .bucket != "skipping") | "\(.name) (\(.bucket))"' 2>/dev/null); then
+          printf '%s\n' "flip-ready: checks exist but their state could not be read." >&2
+          exit 1
+        fi
+        if [ -n "$NOT_GREEN" ]; then
+          printf '%s\n' "flip-ready: refusing to flip with non-green checks: $NOT_GREEN" >&2
+          exit 1
+        fi
       fi
       # The flip prints a confirmation this node has no use for, and its stdout is
       # not a value, so both streams are captured together and re-emitted only if
