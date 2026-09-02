@@ -5,7 +5,7 @@
 import { describe, test, expect, afterAll, mock } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, rm, readFile, readdir, symlink, stat } from 'fs/promises';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 
 // Capture-cost control, same lever and same reason as `subrun.test.ts` (#2882):
 // every `captureWorkflowSource` call here copies and digests the repo's OWN bundled
@@ -89,8 +89,12 @@ async function createSandbox(): Promise<Sandbox> {
   return sandbox;
 }
 
-/** A capture root inside a sandbox run directory. The real layout is the paths package's. */
-const captureRootIn = (runDir: string): string => join(runDir, 'workflow-source');
+/**
+ * Where a run's capture lands in a sandbox: BESIDE the artifacts tree, never inside it,
+ * mirroring the layout the paths package owns (`<project>/workflow-source/runs/<id>`).
+ */
+const captureRootIn = (artifactsRoot: string, runId = 'run-1'): string =>
+  join(dirname(artifactsRoot), 'workflow-source', 'runs', runId);
 
 /**
  * Files captured under one scope.
@@ -196,12 +200,12 @@ describe('captureWorkflowSource', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'v1');
     const first = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: join(runArtifacts, 'run-1', 'workflow-source'),
+      captureRoot: captureRootIn(runArtifacts, 'run-1'),
     });
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'v2');
     const second = await captureWorkflowSource({
       sourceRoot: source,
-      captureRoot: join(runArtifacts, 'run-2', 'workflow-source'),
+      captureRoot: captureRootIn(runArtifacts, 'run-2'),
     });
 
     expect(
