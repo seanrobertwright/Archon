@@ -59,6 +59,7 @@ export {
   getRemoteUrl,
   listChildRepos,
   syncWorkspace,
+  fetchWithRefLockRetry,
   cloneRepository,
   validateCloneUrl,
   syncRepository,
