@@ -74,7 +74,7 @@ interface SlotDefinition {
 }
 
 /** The complete engine-owned template surface. */
-const SLOT_SPEC = {
+export const SLOT_SPEC = {
   when: { surface: 'condition', outputReference: true },
   systemPrompt: { surface: 'prompt', outputReference: true },
   'agents.*.prompt': { surface: 'prompt', outputReference: true },
