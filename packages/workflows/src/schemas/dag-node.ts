@@ -1391,7 +1391,11 @@ export const dagNodeSchema = z
       if (bindings !== undefined) validateNodeBindings('command', bindings);
     }
     if (scriptAuthoring?.success && scriptAuthoring.data.with !== undefined) {
-      validateNodeBindings('script', scriptAuthoring.data.with);
+      // Shape, input-name, and JSON-value checks live in validateWithShape; the
+      // command path above calls it for the same reason. Skipping it here would
+      // accept a script `with:` key that command rejects.
+      const bindings = validateWithShape('script');
+      if (bindings !== undefined) validateNodeBindings('script', bindings);
     }
     // A `workflow:` node has ONE input channel per invocation: either the untyped
     // `input:` string ($ARGUMENTS) or the named `with:` map ($INPUTS.<name>). Accepting

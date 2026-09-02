@@ -1109,6 +1109,35 @@ describe('dagNodeSchema — ExecNode', () => {
     }
   });
 
+  // The command and script paths must reject the same authored input names. They
+  // reached one validator before the owner-derived split; a script path that skips
+  // validateWithShape silently widens the accepted key grammar for scripts only.
+  test('rejects an invalid input name on script with, exactly as command does', () => {
+    const script = dagNodeSchema.safeParse({
+      id: 'script',
+      script: 'console.log("hi")',
+      runtime: 'bun',
+      with: { '1bad': 'value' },
+    });
+    const command = dagNodeSchema.safeParse({
+      id: 'command',
+      command: 'thing',
+      with: { '1bad': 'value' },
+    });
+    expect(script.success).toBe(false);
+    expect(command.success).toBe(false);
+    if (!script.success && !command.success) {
+      const nameIssue = (issues: readonly { message: string }[]) =>
+        issues.find(i => /invalid (script|command) input name/.test(i.message))?.message;
+      expect(nameIssue(script.error.issues)).toBe(
+        "invalid script input name '1bad'; use letters, numbers, underscores, or hyphens and start with a letter or underscore"
+      );
+      expect(nameIssue(command.error.issues)).toBe(
+        "invalid command input name '1bad'; use letters, numbers, underscores, or hyphens and start with a letter or underscore"
+      );
+    }
+  });
+
   test('rejects empty script string', () => {
     const result = dagNodeSchema.safeParse({ id: 's', script: '', runtime: 'bun' });
     expect(result.success).toBe(false);
