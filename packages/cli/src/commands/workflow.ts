@@ -122,7 +122,10 @@ import type {
   WorkflowRunStatus,
   ContinuationMode,
 } from '@archon/workflows/schemas/workflow-run';
-import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
+import {
+  TERMINAL_WORKFLOW_STATUSES,
+  isTerminalRunStatus,
+} from '@archon/workflows/schemas/workflow-run';
 import {
   approveWorkflow,
   rejectWorkflow,
@@ -2484,8 +2487,8 @@ async function runWorkflowWithOwnedSource(
   // longer performs implicit resume detection on its own.
   let resumable: WorkflowRun | null = null;
   // Branch of the prior run's worktree, from the isolation record the resume path
-  // matches (or git in the worktree when no record does) — used only by the
-  // no-completed-nodes refusal to name the relaunch command (#3154).
+  // matches. Only a worktree-isolated run has one; the no-completed-nodes refusal
+  // names it in the relaunch command it suggests (#3154).
   let resumeBranch: string | undefined;
   if (options.resume) {
     if (!codebase) {
@@ -3113,32 +3116,28 @@ async function runWorkflowWithOwnedSource(
       );
     }
     if (!prepared) {
-      // Best-effort only: the message must still refuse when the branch cannot be
-      // determined, so a failed probe degrades to a <branch> placeholder.
-      if (!resumeBranch) {
-        try {
-          const { stdout } = await git.execFileAsync('git', [
-            '-C',
-            workingCwd,
-            'rev-parse',
-            '--abbrev-ref',
-            'HEAD',
-          ]);
-          const branch = stdout.trim();
-          if (branch && branch !== 'HEAD') resumeBranch = branch;
-        } catch (error) {
-          getLog().debug(
-            { err: error as Error, workingPath: workingCwd },
-            'cli.workflow_resume_branch_probe_failed'
-          );
-        }
-      }
-      const relaunch = resumeBranch
-        ? `archon workflow run ${workflowName} --branch ${resumeBranch} --supersedes ${resumable.id}`
-        : `archon workflow run ${workflowName} --branch <branch> --supersedes ${resumable.id}`;
+      // `--branch` is only runnable when the prior run used worktree isolation:
+      // folder projects reject worktree options outright, and an in-place repo run
+      // cannot be relaunched onto the branch its own checkout holds. A stale-running
+      // orphan cannot be superseded until it is released, so name that step first.
+      const worktreeBranch = isFolderCodebase ? undefined : resumeBranch;
+      const unblock = isTerminalRunStatus(resumable.status)
+        ? ''
+        : `The run is still marked ${resumable.status}; release it before relaunching:\n` +
+          `  archon workflow abandon ${resumable.id}\n`;
+      const relaunch = [
+        'archon workflow run',
+        workflowName,
+        ...(worktreeBranch ? ['--branch', worktreeBranch] : []),
+        '--supersedes',
+        resumable.id,
+      ].join(' ');
       throw new Error(
         `Cannot resume: the prior run for '${workflowName}' has no completed nodes and no interactive-loop state.\n` +
-          'Nothing can be skipped, so relaunch on the same branch instead:\n' +
+          unblock +
+          (worktreeBranch
+            ? 'Nothing can be skipped, so relaunch on the same branch instead:\n'
+            : 'Nothing can be skipped, so start a fresh run instead:\n') +
           `  ${relaunch}`
       );
     }
