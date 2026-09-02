@@ -3587,10 +3587,10 @@ describe('GET /api/artifacts/:runId/* storage-key resolution', () => {
 
   test('an artifact pointer from a run result addresses this route with no extra machinery', async () => {
     // #2453 — a workflow result may carry { type, run_id, path }, validated by the
-    // engine (packages/workflows/src/artifact-pointer.ts) against the run tree and the
-    // run's artifacts root. Those two fields ARE this route's parameters: the pointer
-    // needs no resolution surface of its own, and the route repeats the containment
-    // checks server-side for the untrusted request path.
+    // producing node (packages/workflows/src/artifact-pointer.ts) against its own run's
+    // artifacts root. Those two fields ARE this route's parameters: the pointer needs no
+    // resolution surface of its own, and the route owns the read-side checks —
+    // containment and real-path resolution — for the untrusted request path.
     const runId = 'run-serve-pointer';
     const dir = join(wsRoot(), '_local', 'workspace', 'artifacts', 'runs', runId);
     await mkdir(join(dir, 'review'), { recursive: true });

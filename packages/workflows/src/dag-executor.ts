@@ -3143,7 +3143,7 @@ async function executeNodeInternal(
     // result naming a file it may not address fails this node instead of handing a
     // downstream consumer a location the engine never checked (#2453).
     if (structuredOutput !== undefined) {
-      const badPointer = await rejectedArtifactPointer(deps, workflowRun, structuredOutput);
+      const badPointer = await rejectedArtifactPointer(workflowRun, structuredOutput);
       if (badPointer !== null) throw new Error(`Node '${node.id}': ${badPointer}.`);
     }
 
@@ -3576,20 +3576,17 @@ function persistedOutputEventFields(
 /**
  * Prove every reserved artifact pointer in a value the engine is about to persist (#2453).
  *
- * Called at each place a producer's LOGICAL value becomes readable downstream — an AI node,
- * a loop iteration, a certified `bash:`/`script:` stdout, a `workflow:` child result, and
- * each fan-out element before it is aggregated. A value carrying no pointer costs one walk
- * and no I/O, so the check is unconditional rather than gated on a declared `output_format`:
+ * Called ONLY where a value is PRODUCED — an AI node, a loop iteration, a certified
+ * `bash:`/`script:` stdout — and validated against that producer's own run. A `workflow:`
+ * parent and a fan-out aggregate relay a child's value as-is: the child already proved it
+ * against the only run a pointer may name. A value carrying no pointer costs one walk and
+ * no I/O, so the check is unconditional rather than gated on a declared `output_format`:
  * the `archon_artifact` discriminator is reserved everywhere, not only inside a contract.
  *
  * Returns the rejection reason, phrased to complete `Node '<id>': <reason>.`, or `null`.
  */
-async function rejectedArtifactPointer(
-  deps: WorkflowDeps,
-  run: WorkflowRun,
-  value: unknown
-): Promise<string | null> {
-  return validateArtifactPointers(value, run, runId => deps.store.getWorkflowRun(runId));
+async function rejectedArtifactPointer(run: WorkflowRun, value: unknown): Promise<string | null> {
+  return validateArtifactPointers(value, run);
 }
 
 /**
@@ -3685,13 +3682,12 @@ function certifyExecOutput(
  * @throws ExecOutputContractError when the stdout value names an artifact it cannot address.
  */
 async function assertExecArtifactPointers(
-  deps: WorkflowDeps,
   workflowRun: WorkflowRun,
   node: ExecNode,
   value: JsonValue | undefined
 ): Promise<void> {
   if (value === undefined) return;
-  const badPointer = await rejectedArtifactPointer(deps, workflowRun, value);
+  const badPointer = await rejectedArtifactPointer(workflowRun, value);
   if (badPointer === null) return;
   const label = `${node.runtime === 'sh' ? 'Bash' : 'Script'} node '${node.id}'`;
   throw new ExecOutputContractError(`${label}: ${badPointer}.`);
@@ -3859,7 +3855,7 @@ async function executeBashNode(
     // diagnostics; it throws an ExecOutputContractError, handled by this function's catch.
     const certified = certifyExecOutput(node, trimmedStdout, credentialValues);
     const output = certified.output;
-    await assertExecArtifactPointers(deps, workflowRun, node, certified.structuredOutput);
+    await assertExecArtifactPointers(workflowRun, node, certified.structuredOutput);
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
@@ -4292,7 +4288,7 @@ async function executeScriptNode(
     // this node's stdout a contract, and the canonical document replaces the raw text.
     const certified = certifyExecOutput(node, trimmedStdout, credentialValues);
     const output = certified.output;
-    await assertExecArtifactPointers(deps, workflowRun, node, certified.structuredOutput);
+    await assertExecArtifactPointers(workflowRun, node, certified.structuredOutput);
 
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
@@ -6802,7 +6798,7 @@ async function executeLoopNode(
             // Same gate the ordinary AI node applies before its value is persisted:
             // an unaddressable artifact pointer fails the node rather than riding
             // into this iteration's payload (#2453).
-            const badPointer = await rejectedArtifactPointer(deps, workflowRun, attemptStructured);
+            const badPointer = await rejectedArtifactPointer(workflowRun, attemptStructured);
             if (badPointer !== null) {
               return await failLoopNode(
                 `Loop node '${node.id}' iteration ${String(i)}: ${badPointer}.`,
@@ -7902,17 +7898,8 @@ async function executeWorkflowNode(
     // re-validated here — a `workflow:` node cannot declare a schema of its own (that is
     // a load error), so there is no caller side to check against.
     const declaredFields = outcome.declaredFields;
-    // A child may point at its own artifacts, and its run is a descendant of this one, so
-    // the pointer stays addressable in the parent's scope. Validated HERE as well as in the
-    // child, because the child's producer proved it against the CHILD's tree (#2453).
-    const badPointer = await rejectedArtifactPointer(deps, parentRun, subrunLogicalValue(outcome));
-    if (badPointer !== null) {
-      return failResult(
-        `Node '${node.id}': sub-run '${node.workflow}' returned a result where ${badPointer}.`,
-        outcome.costUsd,
-        outcome.tokens
-      );
-    }
+    // The same holds for an artifact pointer in the child's value (#2453): the child's
+    // producer proved it against the child's own run, and this node relays it unchanged.
     if (outcome.output === undefined) {
       // A completed child with no non-blank terminal output threads '' into
       // $<node>.output — legal, but indistinguishable downstream from an
@@ -8916,19 +8903,6 @@ async function executeFanOutWorkflowNode(
     const msg = fanOutAutonomousGateMessage(node, outcomes[pausedIdx].childRunId, pausedIdx);
     await notify(`⏸→❌ **Fan-out gate rejected** (node \`${node.id}\`): ${msg}`);
     return failResult(msg, totalCostUsd, totalTokens);
-  }
-
-  // Artifact-pointer gate (#2453), fan-out parity with the 1:1 path: each completed
-  // child's element is validated in the PARENT's scope before the join aggregates it, so
-  // one unaddressable pointer cannot be persisted inside a "completed" aggregate.
-  for (const [index, outcome] of outcomes.entries()) {
-    if (outcome.status !== 'completed') continue;
-    const badPointer = await rejectedArtifactPointer(deps, parentRun, subrunLogicalValue(outcome));
-    if (badPointer !== null) {
-      const msg = `Node '${node.id}': fan-out child ${String(index)} of sub-run '${node.workflow}' returned a result where ${badPointer}.`;
-      await notify(`❌ **Fan-out artifact pointer rejected** (node \`${node.id}\`): ${msg}`);
-      return failResult(msg, totalCostUsd, totalTokens);
-    }
   }
 
   // 8. Join.

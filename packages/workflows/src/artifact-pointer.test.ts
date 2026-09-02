@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { removeTempTree } from '@archon/paths/test-utils';
@@ -11,25 +11,18 @@ import {
 import type { WorkflowRun } from './schemas';
 
 /**
- * #2453 — an artifact pointer is a run id plus a relative path, and the engine proves it
- * addresses a real file inside a run this run may see BEFORE the value crosses a boundary.
+ * #2453 — an artifact pointer is a run id plus a relative path. The producing node proves
+ * it against its OWN run, once: this run's id, a regular file that exists under this run's
+ * artifacts directory. No store is consulted; reachability and physical resolution belong
+ * to the read side.
  */
 describe('artifact pointers (#2453)', () => {
   let home: string;
   let outputRoot: string;
   const originalArchonHome = process.env.ARCHON_HOME;
 
-  /** Every run the fake lookup can resolve, by id. */
-  let runs: Map<string, WorkflowRun>;
-  let lookups: string[];
-
-  const lookup = async (runId: string): Promise<WorkflowRun | null> => {
-    lookups.push(runId);
-    return runs.get(runId) ?? null;
-  };
-
   function makeRun(id: string, overrides?: Partial<WorkflowRun>): WorkflowRun {
-    const run: WorkflowRun = {
+    return {
       id,
       workflow_name: 'wf',
       conversation_id: 'conv',
@@ -49,8 +42,6 @@ describe('artifact pointers (#2453)', () => {
       output_root: outputRoot,
       ...overrides,
     };
-    runs.set(id, run);
-    return run;
   }
 
   /** This run's artifacts directory, laid out exactly as the executor writes it. */
@@ -74,8 +65,6 @@ describe('artifact pointers (#2453)', () => {
     home = await mkdtemp(join(tmpdir(), 'artifact-pointer-'));
     process.env.ARCHON_HOME = home;
     outputRoot = join(home, 'workspaces', '_cwd', 'proj');
-    runs = new Map();
-    lookups = [];
   });
 
   afterEach(async () => {
@@ -84,103 +73,45 @@ describe('artifact pointers (#2453)', () => {
     else process.env.ARCHON_HOME = originalArchonHome;
   });
 
-  describe('which runs a pointer may address', () => {
-    it('accepts a pointer at the current run and never reads a row for it', async () => {
+  describe('which run a pointer may name', () => {
+    it('accepts a pointer at the current run whose target is an existing regular file', async () => {
       const current = makeRun('run-self');
       await writeArtifact('run-self', 'plan.md');
 
-      const result = await validateArtifactPointers(
-        { ready: true, plan: pointer('run-self', 'plan.md') },
-        current,
-        lookup
-      );
-
-      expect(result).toBeNull();
-      // The current run is already in hand — reaching for the store would be a round trip
-      // that can only return what the caller passed in.
-      expect(lookups).toEqual([]);
-    });
-
-    it('accepts a pointer at an ancestor run', async () => {
-      makeRun('run-parent');
-      const child = makeRun('run-child', { parent_run_id: 'run-parent' });
-      await writeArtifact('run-parent', 'plan.md');
-
+      // The run in hand is all the validation needs: no store, no lookup.
       expect(
-        await validateArtifactPointers(pointer('run-parent', 'plan.md'), child, lookup)
+        await validateArtifactPointers(
+          { ready: true, plan: pointer('run-self', 'plan.md') },
+          current
+        )
       ).toBeNull();
     });
 
-    it('accepts a pointer at a descendant run', async () => {
-      const parent = makeRun('run-parent');
-      makeRun('run-child', { parent_run_id: 'run-parent' });
-      await writeArtifact('run-child', 'report.md');
-
-      expect(
-        await validateArtifactPointers(pointer('run-child', 'report.md'), parent, lookup)
-      ).toBeNull();
-    });
-
-    it('accepts a pointer at a run this one explicitly adopted', async () => {
-      makeRun('run-prior');
-      const adopting = makeRun('run-next', { adopted_from_run_id: 'run-prior' });
-      await writeArtifact('run-prior', 'plan.md');
-
-      expect(
-        await validateArtifactPointers(pointer('run-prior', 'plan.md'), adopting, lookup)
-      ).toBeNull();
-    });
-
-    it('rejects a pointer at an unrelated run whose file exists', async () => {
+    it('rejects a pointer at any other run, even when that file exists', async () => {
       const current = makeRun('run-a');
-      makeRun('run-b');
-      await writeArtifact('run-b', 'secrets.md');
+      await writeArtifact('run-b', 'plan.md');
 
-      const result = await validateArtifactPointers(
-        pointer('run-b', 'secrets.md'),
-        current,
-        lookup
-      );
+      const result = await validateArtifactPointers(pointer('run-b', 'plan.md'), current);
 
-      expect(result).toContain("names a run outside this run's tree");
+      expect(result).toContain("a result may only point at its own run's artifacts today");
       expect(result).toContain("run 'run-b'");
+      expect(result).toContain("this run is 'run-a'");
     });
 
-    it('rejects a sibling fan-out child of the same parent', async () => {
-      makeRun('run-parent');
-      const first = makeRun('run-child-0', { parent_run_id: 'run-parent' });
-      makeRun('run-child-1', { parent_run_id: 'run-parent' });
-      await writeArtifact('run-child-1', 'plan.md');
+    it('rejects a pointer when this run never recorded its artifacts location', async () => {
+      const current = makeRun('run-self', { output_root: null });
 
-      expect(
-        await validateArtifactPointers(pointer('run-child-1', 'plan.md'), first, lookup)
-      ).toContain("outside this run's tree");
-    });
-
-    it('rejects a pointer at a run that does not exist', async () => {
-      const current = makeRun('run-a');
-
-      expect(await validateArtifactPointers(pointer('run-gone', 'plan.md'), current, lookup)).toBe(
-        "the artifact pointer at $ (run 'run-gone', path 'plan.md') names a run that does not exist"
+      expect(await validateArtifactPointers(pointer('run-self', 'plan.md'), current)).toContain(
+        'output_root is null'
       );
     });
 
-    it('rejects a pointer at a run whose artifacts location was never recorded', async () => {
-      makeRun('run-parent', { output_root: null });
-      const child = makeRun('run-child', { parent_run_id: 'run-parent' });
+    it('rejects a pointer when this run recorded a location outside the Archon home', async () => {
+      const current = makeRun('run-self', { output_root: join(tmpdir(), 'somewhere-else') });
 
-      expect(
-        await validateArtifactPointers(pointer('run-parent', 'plan.md'), child, lookup)
-      ).toContain('output_root is null');
-    });
-
-    it('rejects a pointer at a run whose recorded location is outside the Archon home', async () => {
-      makeRun('run-parent', { output_root: join(tmpdir(), 'somewhere-else') });
-      const child = makeRun('run-child', { parent_run_id: 'run-parent' });
-
-      expect(
-        await validateArtifactPointers(pointer('run-parent', 'plan.md'), child, lookup)
-      ).toContain('outside the Archon home directory');
+      expect(await validateArtifactPointers(pointer('run-self', 'plan.md'), current)).toContain(
+        'outside the Archon home directory'
+      );
     });
   });
 
@@ -192,8 +123,7 @@ describe('artifact pointers (#2453)', () => {
       expect(
         await validateArtifactPointers(
           pointer('run-self', join(artifactsDir('run-self'), 'plan.md')),
-          current,
-          lookup
+          current
         )
       ).toContain('must use a path relative');
     });
@@ -202,7 +132,7 @@ describe('artifact pointers (#2453)', () => {
       const current = makeRun('run-self');
 
       expect(
-        await validateArtifactPointers(pointer('run-self', '../../plan.md'), current, lookup)
+        await validateArtifactPointers(pointer('run-self', '../../plan.md'), current)
       ).toContain("may not contain '..' path segments");
     });
 
@@ -210,7 +140,7 @@ describe('artifact pointers (#2453)', () => {
       const current = makeRun('run-self');
 
       expect(
-        await validateArtifactPointers(pointer('run-self', 'plan.md\0.txt'), current, lookup)
+        await validateArtifactPointers(pointer('run-self', 'plan.md\0.txt'), current)
       ).toContain('contains a NUL byte');
     });
 
@@ -218,18 +148,18 @@ describe('artifact pointers (#2453)', () => {
       const current = makeRun('run-self');
       await mkdir(artifactsDir('run-self'), { recursive: true });
 
-      expect(
-        await validateArtifactPointers(pointer('run-self', 'nope.md'), current, lookup)
-      ).toContain('refers to a file that does not exist');
+      expect(await validateArtifactPointers(pointer('run-self', 'nope.md'), current)).toContain(
+        'refers to a file that does not exist'
+      );
     });
 
     it('rejects a directory', async () => {
       const current = makeRun('run-self');
       await writeArtifact('run-self', join('review', 'report.md'));
 
-      expect(
-        await validateArtifactPointers(pointer('run-self', 'review'), current, lookup)
-      ).toContain('does not refer to a regular file');
+      expect(await validateArtifactPointers(pointer('run-self', 'review'), current)).toContain(
+        'does not refer to a regular file'
+      );
     });
 
     it('accepts a nested relative path', async () => {
@@ -237,40 +167,9 @@ describe('artifact pointers (#2453)', () => {
       await writeArtifact('run-self', join('review', 'report.md'));
 
       expect(
-        await validateArtifactPointers(pointer('run-self', 'review/report.md'), current, lookup)
+        await validateArtifactPointers(pointer('run-self', 'review/report.md'), current)
       ).toBeNull();
     });
-
-    it.skipIf(process.platform === 'win32')(
-      'rejects a symlink whose target escapes the run artifacts directory',
-      async () => {
-        const current = makeRun('run-self');
-        const outside = join(home, 'outside.md');
-        await writeFile(outside, 'not an artifact');
-        await mkdir(artifactsDir('run-self'), { recursive: true });
-        await symlink(outside, join(artifactsDir('run-self'), 'escape.md'));
-
-        expect(
-          await validateArtifactPointers(pointer('run-self', 'escape.md'), current, lookup)
-        ).toContain("resolves outside that run's artifacts directory");
-      }
-    );
-
-    it.skipIf(process.platform === 'win32')(
-      'accepts a symlink whose target stays inside the run artifacts directory',
-      async () => {
-        const current = makeRun('run-self');
-        await writeArtifact('run-self', 'plan.md');
-        await symlink(
-          join(artifactsDir('run-self'), 'plan.md'),
-          join(artifactsDir('run-self'), 'latest.md')
-        );
-
-        expect(
-          await validateArtifactPointers(pointer('run-self', 'latest.md'), current, lookup)
-        ).toBeNull();
-      }
-    );
   });
 
   describe('where pointers are found in a value', () => {
@@ -285,7 +184,7 @@ describe('artifact pointers (#2453)', () => {
         ],
       };
 
-      expect(await validateArtifactPointers(value, current, lookup)).toContain(
+      expect(await validateArtifactPointers(value, current)).toContain(
         'the artifact pointer at $.units[1].plan'
       );
     });
@@ -295,8 +194,7 @@ describe('artifact pointers (#2453)', () => {
 
       const result = await validateArtifactPointers(
         { plan: { type: ARTIFACT_POINTER_TYPE, run_id: 'run-self' } },
-        current,
-        lookup
+        current
       );
 
       expect(result).toContain('$.plan is tagged');
@@ -310,39 +208,22 @@ describe('artifact pointers (#2453)', () => {
       expect(
         await validateArtifactPointers(
           { plan: { ...pointer('run-self', 'plan.md'), label: 'the plan' } },
-          current,
-          lookup
+          current
         )
       ).toBeNull();
     });
 
-    it('does no I/O at all for a value carrying no pointer', async () => {
+    it('never resolves a root for a value carrying no pointer', async () => {
+      // A run with no recorded location would reject any pointer; a value with none
+      // passes without the root ever being consulted.
       const current = makeRun('run-self', { output_root: null });
 
       expect(
         await validateArtifactPointers(
           { ready: true, units: ['a', 'b'], nested: { type: 'plan', note: null } },
-          current,
-          lookup
+          current
         )
       ).toBeNull();
-      expect(lookups).toEqual([]);
-    });
-
-    it('reads one row per named run however many pointers name it', async () => {
-      const parent = makeRun('run-parent');
-      makeRun('run-child', { parent_run_id: 'run-parent' });
-      await writeArtifact('run-child', 'a.md');
-      await writeArtifact('run-child', 'b.md');
-
-      expect(
-        await validateArtifactPointers(
-          [pointer('run-child', 'a.md'), pointer('run-child', 'b.md')],
-          parent,
-          lookup
-        )
-      ).toBeNull();
-      expect(lookups.filter(id => id === 'run-child')).toEqual(['run-child']);
     });
   });
 });

@@ -29859,10 +29859,10 @@ describe('exec result contracts (#2453)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// #2453 — a result may point at a file instead of carrying it. The engine proves
-// every reserved `archon_artifact` pointer addresses a real regular file inside a
-// run this run may see, before the value is persisted, and keeps the value a run
-// id plus a relative path.
+// #2453 — a result may point at a file instead of carrying it. The producing node
+// proves every reserved `archon_artifact` pointer names its own run and a real
+// regular file under that run's artifacts directory, before the value is
+// persisted, and keeps the value a run id plus a relative path.
 // ---------------------------------------------------------------------------
 
 describe('artifact pointers (#2453)', () => {
@@ -30033,14 +30033,9 @@ describe('artifact pointers (#2453)', () => {
     expect(error).toContain("may not contain '..' path segments");
   });
 
-  it('a pointer at an unrelated run fails the producing node even when that file exists', async () => {
+  it('a pointer at another run fails the producing node even when that file exists', async () => {
     await writeArtifact('some-other-run', 'plan.md');
     const store = createMockStore();
-    store.getWorkflowRun.mockImplementation(async (id: string) =>
-      id === 'some-other-run'
-        ? makeWorkflowRun('some-other-run', { output_root: outputRoot })
-        : null
-    );
 
     const { events } = await runPointerDag(
       pointerWorkflow(result('some-other-run', 'plan.md')),
@@ -30048,7 +30043,11 @@ describe('artifact pointers (#2453)', () => {
       { store }
     );
 
-    expect(producerError(events)).toContain("names a run outside this run's tree");
+    // Own run only: the producer never asks the store about the other run.
+    expect(producerError(events)).toContain(
+      "a result may only point at its own run's artifacts today"
+    );
+    expect(store.getWorkflowRun).not.toHaveBeenCalled();
   });
 
   it('a validated pointer resolves identically after a cold resume', async () => {

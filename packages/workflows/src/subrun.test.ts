@@ -6444,8 +6444,8 @@ nodes:
 // ---------------------------------------------------------------------------
 // #2453 — a child's small result may point at the large file it wrote. The pointer
 // names the CHILD's run and a path relative to that run's artifacts directory; the
-// parent accepts it because the child is a descendant, and rejects a pointer that
-// does not resolve to a real file there.
+// child's producer proves it against its own run, and the parent relays the value
+// without re-validating it.
 // ---------------------------------------------------------------------------
 
 describe('workflow: artifact pointers across the child boundary (#2453)', () => {
@@ -6639,8 +6639,8 @@ nodes:
     const aggregate = workCompleted?.data?.structured_output as {
       plan: { run_id: string; path: string };
     }[];
-    // Each element points at ITS OWN child run, and every one of those runs is a
-    // descendant of this parent — which is what makes the pointers addressable here.
+    // Each element points at ITS OWN child run — the only run a producer may name —
+    // and the aggregate relays them exactly as the children certified them.
     expect(aggregate.map(element => element.plan.path)).toEqual(['plan.md', 'plan.md']);
     expect(new Set(aggregate.map(element => element.plan.run_id))).toEqual(
       new Set(children.map(c => c.id))
