@@ -305,6 +305,8 @@ describe('captureWorkflowSource', () => {
     await writeFile(join(source, '.archon', 'commands', 'review.md'), 'x');
     const captureRoot = captureRootIn(runArtifacts);
     // A file where the staging directory must go: the copy fails part-way through.
+    // The capture creates this parent itself; the blocker has to be planted first.
+    await mkdir(dirname(captureRoot), { recursive: true });
     await writeFile(`${captureRoot}.partial`, 'in the way');
 
     await expect(
