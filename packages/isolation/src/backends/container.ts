@@ -71,12 +71,6 @@ export interface ContainerBackendDeps {
   config: ContainerBackendConfig;
   /** Injectable docker runner (real `dockerCli` in prod; a fake in tests). */
   dockerRunner?: DockerRunner;
-  /**
-   * The host user that must end up owning files the container writes into host binds.
-   * Defaults to the current process; injectable so tests can exercise the ownership
-   * hand-back without depending on the uid the test runner happens to have.
-   */
-  hostIdentity?: HostIdentity;
 }
 
 /** A host uid/gid pair, or `undefined` where the platform has none (Windows). */
@@ -85,7 +79,11 @@ export interface HostIdentity {
   readonly gid: number;
 }
 
-function currentHostIdentity(): HostIdentity | undefined {
+/**
+ * The host user that must end up owning files the container writes into host binds.
+ * Exported so tests can pin it with `spyOn` instead of depending on the runner's uid.
+ */
+export function currentHostIdentity(): HostIdentity | undefined {
   if (typeof process.getuid !== 'function' || typeof process.getgid !== 'function') {
     return undefined;
   }
@@ -177,13 +175,11 @@ export class ContainerBackend implements IIsolationBackend {
   private readonly store: IIsolationStore;
   private readonly config: ContainerBackendConfig;
   private readonly docker: DockerRunner;
-  private readonly hostIdentity: HostIdentity | undefined;
 
   constructor(deps: ContainerBackendDeps) {
     this.store = deps.store;
     this.config = deps.config;
     this.docker = deps.dockerRunner ?? dockerCli;
-    this.hostIdentity = deps.hostIdentity ?? currentHostIdentity();
   }
 
   /**
@@ -329,12 +325,11 @@ export class ContainerBackend implements IIsolationBackend {
       );
     }
 
+    // Attempted unconditionally, as in `suspend`: the helper reports a stopped or gone
+    // container itself, and a pre-check that could not tell would otherwise skip the
+    // hand-back silently.
     if (containerName && meta.artifactsMount !== undefined) {
-      // Only a running container can execute the chown. A suspended one already handed
-      // ownership back on its way down; a vanished one has nothing left to write.
-      if ((await this.containerState(containerName)) === 'running') {
-        await this.restoreHostOwnership(envId, containerName, meta.artifactsMount);
-      }
+      await this.restoreHostOwnership(envId, containerName, meta.artifactsMount);
     }
 
     const failures: string[] = [];
@@ -447,6 +442,15 @@ export class ContainerBackend implements IIsolationBackend {
     // named script, and would write artifacts into a container-local directory the host
     // never sees — both at paths the run's own metadata reports as intact.
     const mounts: HostMounts = { source: meta.sourceMount, artifacts: meta.artifactsMount };
+    if (mounts.source !== undefined && mounts.artifacts === undefined) {
+      // A row from before the artifacts bind existed: the engine has always sent both
+      // mounts together since it did. The run continues exactly as it would have before
+      // the upgrade, which means `$ARTIFACTS_DIR` writes stay inside the container.
+      log.warn(
+        { envId, containerName, workspacePath },
+        'isolation.container_resume_without_artifacts_mount'
+      );
+    }
     assertMountableHostMounts(mounts, workspacePath);
     const { containerId, mode } = await this.startContainerWithOverlay(
       containerName,
@@ -535,15 +539,26 @@ export class ContainerBackend implements IIsolationBackend {
     handle: string,
     artifactsMount: string
   ): Promise<void> {
-    const identity = this.hostIdentity;
+    const identity = currentHostIdentity();
     if (identity === undefined || identity.uid === 0) return;
     const owner = `${String(identity.uid)}:${String(identity.gid)}`;
     try {
       await this.docker(['exec', handle, 'chown', '-R', owner, artifactsMount]);
       log.debug({ envId, handle, artifactsMount, owner }, 'isolation.container_artifacts_owned');
     } catch (err) {
+      const detail = extractDockerError(err);
+      // A container that already stopped or vanished cannot run the chown; that is the
+      // normal destroy-after-suspend path, not a failed hand-back. Same reading of the
+      // daemon's answer that `suspend` uses.
+      if (/no such container|is not running/i.test(detail)) {
+        log.debug(
+          { envId, handle, artifactsMount, detail },
+          'isolation.container_artifacts_chown_skipped_stopped'
+        );
+        return;
+      }
       log.warn(
-        { envId, handle, artifactsMount, owner, detail: extractDockerError(err) },
+        { envId, handle, artifactsMount, owner, detail },
         'isolation.container_artifacts_chown_failed'
       );
     }

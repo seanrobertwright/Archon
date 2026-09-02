@@ -1,7 +1,8 @@
-import { describe, test, expect } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { join } from 'path';
 import { getArchonHome } from '@archon/paths';
 import { ContainerBackend } from './container';
+import * as containerModule from './container';
 import type { ContainerBackendConfig } from '../types';
 import type { IIsolationStore } from '../store';
 import type { IsolationEnvironmentRow, CreateEnvironmentParams } from '../types';
@@ -683,6 +684,15 @@ describe('ContainerBackend artifacts mount', () => {
   const ARTIFACTS_MOUNT = join(RUN_ROOT, 'artifacts', 'runs', 'run-1');
   const SOURCE_MOUNT = join(RUN_ROOT, 'workflow-source', 'runs', 'run-1');
   const HOST = { uid: 1000, gid: 1000 };
+  let identitySpy: ReturnType<typeof spyOn> | undefined;
+  afterEach(() => {
+    identitySpy?.mockRestore();
+    identitySpy = undefined;
+  });
+  /** Pin the host identity the hand-back targets, independent of this runner's uid. */
+  function hostIs(identity: { uid: number; gid: number } | undefined): void {
+    identitySpy = spyOn(containerModule, 'currentHostIdentity').mockReturnValue(identity);
+  }
 
   function readyDocker(
     extra?: (args: string[]) => DockerExecResult | undefined
@@ -772,12 +782,8 @@ describe('ContainerBackend artifacts mount', () => {
     // container can still execute it, i.e. before `docker stop`.
     const store = fakeStore();
     const docker = readyDocker();
-    const backend = new ContainerBackend({
-      store,
-      config: CONFIG,
-      dockerRunner: docker,
-      hostIdentity: HOST,
-    });
+    hostIs(HOST);
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: docker });
     const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
 
     await backend.suspend(prepared.envId!);
@@ -796,19 +802,16 @@ describe('ContainerBackend artifacts mount', () => {
     expect(chown).toBeLessThan(stop);
   });
 
-  test('hands artifacts back before destroying a still-running container', async () => {
+  test('hands artifacts back before destroying, without gating on container state', async () => {
+    // A pre-check that cannot read the state (`inspect` fails on a flaky daemon) must not
+    // skip the hand-back silently; the helper reports a stopped container itself.
     const store = fakeStore();
-    const docker = readyDocker(args =>
-      args[0] === 'inspect' && args.includes('{{.State.Running}}')
-        ? { stdout: 'true\n', stderr: '' }
-        : undefined
-    );
-    const backend = new ContainerBackend({
-      store,
-      config: CONFIG,
-      dockerRunner: docker,
-      hostIdentity: HOST,
+    const docker = readyDocker(args => {
+      if (args[0] === 'inspect') throw new Error('Error response from daemon: timeout');
+      return undefined;
     });
+    hostIs(HOST);
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: docker });
     const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
 
     await backend.destroy(prepared.envId!);
@@ -822,18 +825,44 @@ describe('ContainerBackend artifacts mount', () => {
   test('skips the hand-back when the host user is root', async () => {
     const store = fakeStore();
     const docker = readyDocker();
-    const backend = new ContainerBackend({
-      store,
-      config: CONFIG,
-      dockerRunner: docker,
-      hostIdentity: { uid: 0, gid: 0 },
-    });
+    hostIs({ uid: 0, gid: 0 });
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: docker });
     const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
 
     await backend.suspend(prepared.envId!);
 
     expect(docker.calls.some(c => c[0] === 'exec' && c.includes('chown'))).toBe(false);
     expect(docker.calls.some(c => c[0] === 'stop')).toBe(true);
+  });
+
+  test('recreating a container from a row without an artifacts mount keeps the source bind only', async () => {
+    // A row written before the artifacts bind existed carries only `sourceMount`. The run
+    // resumes as it always did, with `$ARTIFACTS_DIR` writes staying in the container, and
+    // the backend says so in its log rather than refusing a run that was fine before.
+    const store = fakeStore();
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: readyDocker() });
+    const prepared = await backend.prepare({ codebase: FOLDER, sourceMount: SOURCE_MOUNT });
+
+    const resumeDocker = fakeDocker(args => {
+      if (args[0] === 'inspect' && args.includes('{{.State.Running}}')) {
+        throw new Error('Error: No such object: archon-res-1'); // container gone
+      }
+      if (args[0] === 'volume' && args[1] === 'inspect') return { stdout: '[]', stderr: '' };
+      if (args[0] === 'run') return { stdout: 'recreatedid\n', stderr: '' };
+      if (args[0] === 'exec') return { stdout: '', stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+    const resumeBackend = new ContainerBackend({
+      store,
+      config: CONFIG,
+      dockerRunner: resumeDocker,
+    });
+
+    await expect(resumeBackend.resumeEnv(prepared.envId!)).resolves.toBeDefined();
+
+    const runArgs = resumeDocker.calls.find(c => c[0] === 'run') ?? [];
+    expect(runArgs).toContain(`${SOURCE_MOUNT}:${SOURCE_MOUNT}:ro`);
+    expect(runArgs.some(a => a.startsWith(`${ARTIFACTS_MOUNT}:`))).toBe(false);
   });
 
   test('a failed hand-back is logged, not fatal', async () => {
@@ -844,12 +873,8 @@ describe('ContainerBackend artifacts mount', () => {
       }
       return undefined;
     });
-    const backend = new ContainerBackend({
-      store,
-      config: CONFIG,
-      dockerRunner: docker,
-      hostIdentity: HOST,
-    });
+    hostIs(HOST);
+    const backend = new ContainerBackend({ store, config: CONFIG, dockerRunner: docker });
     const prepared = await backend.prepare({ codebase: FOLDER, artifactsMount: ARTIFACTS_MOUNT });
 
     await expect(backend.suspend(prepared.envId!)).resolves.toBeUndefined();

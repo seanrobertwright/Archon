@@ -2682,7 +2682,7 @@ async function runWorkflowWithOwnedSource(
           // `$ARTIFACTS_DIR` is the run's output channel on both sides of the boundary,
           // so it is bound read-write at the same absolute path. Created here by the host
           // user: a bind target Docker has to create itself would be owned by root.
-          let artifactsMount: string | undefined;
+          let mounts: { sourceMount: string; artifactsMount: string } | undefined;
           if (preparedSource) {
             const { artifactsDir } = await resolveProjectPaths(
               createWorkflowDeps(),
@@ -2691,15 +2691,12 @@ async function runWorkflowWithOwnedSource(
               folderCodebase.id
             );
             await mkdir(artifactsDir, { recursive: true });
-            artifactsMount = artifactsDir;
+            // Read-only source and read-write artifacts, both at the same absolute path
+            // inside the container, so a path means one thing on either side of the
+            // boundary.
+            mounts = { sourceMount: preparedSource.captureRoot, artifactsMount: artifactsDir };
           }
-          prepared = await backend.prepare({
-            codebase: folderCodebase,
-            // Read-only, at the same absolute path inside the container, so a named
-            // script resolves identically on both sides of the boundary.
-            ...(preparedSource ? { sourceMount: preparedSource.captureRoot } : {}),
-            ...(artifactsMount !== undefined ? { artifactsMount } : {}),
-          });
+          prepared = await backend.prepare({ codebase: folderCodebase, ...(mounts ?? {}) });
         } catch (prepErr) {
           // Map docker/daemon/image failures to an actionable message (daemon down,
           // runner image missing, docker-group permission — see errors.ts).
