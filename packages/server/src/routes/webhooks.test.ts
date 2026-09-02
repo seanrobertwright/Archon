@@ -123,7 +123,7 @@ describe('POST /webhooks/github', () => {
     expect(mockHandleWebhook).not.toHaveBeenCalled();
   });
 
-  test('returns 200 even when async webhook processing rejects (fire-and-forget)', async () => {
+  test('returns 200 when conversational webhook processing later rejects', async () => {
     const app = createWebhookApp();
     mockHandleWebhook.mockImplementation(async () => {
       throw new Error('downstream processing failed');
@@ -136,6 +136,22 @@ describe('POST /webhooks/github', () => {
     });
 
     expect(res.status).toBe(200);
+    expect(mockHandleWebhook).toHaveBeenCalledTimes(1);
+  });
+
+  test('returns 500 when check-run processing rejects', async () => {
+    const app = createWebhookApp();
+    mockHandleWebhook.mockImplementation(async () => {
+      throw new Error('workflow signal failed');
+    });
+
+    const res = await postWebhook(app, {
+      'x-github-event': 'check_run',
+      'x-hub-signature-256': 'sha256=abc123',
+      'x-github-delivery': 'guid-1',
+    });
+
+    expect(res.status).toBe(500);
     expect(mockHandleWebhook).toHaveBeenCalledTimes(1);
   });
 });
