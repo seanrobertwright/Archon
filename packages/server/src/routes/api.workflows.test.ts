@@ -6,6 +6,7 @@ import { access, mkdir, readFile, rm, writeFile, symlink as fsSymlink } from 'fs
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import * as archonPaths from '@archon/paths';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { validationErrorHook } from './openapi-defaults';
 import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
 
@@ -1472,6 +1473,48 @@ describe('GET /api/commands', () => {
     const archonAssist = body.commands.find(c => c.name === 'archon-assist');
     expect(archonAssist).toBeDefined();
     expect(archonAssist?.source).toBe('bundled');
+  });
+
+  test('orders project commands by name and keeps project precedence on a collision', async () => {
+    const projectDir = join(
+      tmpdir(),
+      `archon-api-commands-order-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+
+    try {
+      const commandsDir = join(projectDir, '.archon', 'commands');
+      await mkdir(commandsDir, { recursive: true });
+      // Created in reverse-alphabetical order. `archon-assist` also exists as a
+      // bundled command, so it exercises precedence as well as ordering.
+      for (const name of ['zz-order', 'mm-order', 'archon-assist', 'aa-order']) {
+        await writeFile(join(commandsDir, `${name}.md`), `# ${name}`);
+      }
+      mockListCodebases.mockImplementation(async () => [{ default_cwd: projectDir }]);
+
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      const url = `/api/commands?cwd=${encodeURIComponent(projectDir)}`;
+      const first = (await (await app.request(url)).json()) as {
+        commands: Array<{ name: string; source: string }>;
+      };
+      const second = (await (await app.request(url)).json()) as {
+        commands: Array<{ name: string; source: string }>;
+      };
+
+      expect(second.commands).toEqual(first.commands);
+
+      const projectOnly = first.commands.filter(c => c.name.endsWith('-order')).map(c => c.name);
+      expect(projectOnly).toEqual(['aa-order', 'mm-order', 'zz-order']);
+
+      // The project copy wins the name; it keeps the bundled entry's position,
+      // which is what makes the collision resolution observable rather than a
+      // silent reorder.
+      expect(first.commands).toContainEqual({ name: 'archon-assist', source: 'project' });
+    } finally {
+      mockListCodebases.mockReset();
+      await removeTempTree(projectDir);
+    }
   });
 
   test.skipIf(process.platform === 'win32')(
