@@ -17766,6 +17766,11 @@ describe('executeDagWorkflow -- exec timeout outcomes', () => {
     'skips an opted-in %s timeout and resolves a downstream if_skipped binding',
     async (kind, producerInput) => {
       const store = createMockStore();
+      const workflowRun = makeWorkflowRun(`exec-timeout-${kind}`);
+      const emitted: WorkflowEmitterEvent[] = [];
+      const unsubscribe = getWorkflowEventEmitter().subscribe(event => {
+        if (event.runId === workflowRun.id) emitted.push(event);
+      });
       const consumer = dagNodeSchema.parse({
         id: 'consumer',
         script: 'console.log(process.env.INPUTS_VALUE)',
@@ -17775,17 +17780,21 @@ describe('executeDagWorkflow -- exec timeout outcomes', () => {
         with: { value: { from: '$slow.output', if_skipped: 'fallback' } },
       });
 
-      await executeDagWorkflow(
-        dagOptions({
-          deps: createMockDeps(store),
-          cwd: testDir,
-          workflowRun: makeWorkflowRun(`exec-timeout-${kind}`),
-          workflow: {
-            name: `exec-timeout-${kind}`,
-            nodes: [dagNodeSchema.parse(producerInput), consumer],
-          },
-        })
-      );
+      try {
+        await executeDagWorkflow(
+          dagOptions({
+            deps: createMockDeps(store),
+            cwd: testDir,
+            workflowRun,
+            workflow: {
+              name: `exec-timeout-${kind}`,
+              nodes: [dagNodeSchema.parse(producerInput), consumer],
+            },
+          })
+        );
+      } finally {
+        unsubscribe();
+      }
 
       const events = store.createWorkflowEvent.mock.calls.map(
         ([event]) =>
@@ -17809,10 +17818,45 @@ describe('executeDagWorkflow -- exec timeout outcomes', () => {
       });
       expect(completed?.data?.node_output).toBe('fallback');
       expect(events.some(event => event.event_type === 'node_failed')).toBe(false);
+      expect(emitted).toContainEqual(
+        expect.objectContaining({
+          type: 'node_skipped',
+          nodeId: 'slow',
+          reason: 'timeout',
+          cause: { kind: 'timeout' },
+        })
+      );
       expect(store.completeWorkflowRun).toHaveBeenCalled();
     },
     10000
   );
+
+  it('fails a bash timeout without the opt-in', async () => {
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflowRun: makeWorkflowRun('bash-timeout-default'),
+        workflow: {
+          name: 'bash-timeout-default',
+          nodes: [dagNodeSchema.parse({ id: 'slow', bash: 'sleep 30', timeout: 100 })],
+        },
+      })
+    );
+
+    const events = store.createWorkflowEvent.mock.calls.map(([event]) => event);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        event_type: 'node_failed',
+        step_name: 'slow',
+        data: expect.objectContaining({ error: "Bash node 'slow' timed out after 100ms" }),
+      })
+    );
+    expect(events.some(event => event.event_type === 'node_skipped')).toBe(false);
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+  });
 
   it('does not misclassify a non-timeout failure whose diagnostic mentions a timeout', async () => {
     const store = createMockStore();
